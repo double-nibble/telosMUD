@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,6 +23,11 @@ type Config struct {
 	GateListen  string `yaml:"gate_listen"`  // telnet listen, e.g. ":4000"
 	WorldListen string `yaml:"world_listen"` // gRPC Play listen, e.g. ":9090"
 	WorldTarget string `yaml:"world_target"` // the gate dials this world shard
+
+	// Phase 2 shard identity (multi-shard + handoff).
+	ShardID   string   `yaml:"shard_id"`   // this shard's id, e.g. "shard-a"
+	ShardAddr string   `yaml:"shard_addr"` // public address others dial (gate + peer handoff)
+	Zones     []string `yaml:"zones"`      // zone ids this shard hosts
 }
 
 type PostgresConfig struct {
@@ -50,6 +56,10 @@ func Default() Config {
 		GateListen:  ":4000",
 		WorldListen: ":9090",
 		WorldTarget: "localhost:9090",
+
+		ShardID:   "shard-1",
+		ShardAddr: "localhost:9090",
+		Zones:     []string{"midgaard"},
 	}
 }
 
@@ -103,4 +113,25 @@ func (c *Config) applyEnv() {
 	if v, ok := os.LookupEnv("TELOS_WORLD_TARGET"); ok {
 		c.WorldTarget = v
 	}
+	if v, ok := os.LookupEnv("TELOS_SHARD_ID"); ok {
+		c.ShardID = v
+	}
+	if v, ok := os.LookupEnv("TELOS_SHARD_ADDR"); ok {
+		c.ShardAddr = v
+	}
+	if v, ok := os.LookupEnv("TELOS_ZONES"); ok {
+		c.Zones = splitCSV(v)
+	}
+}
+
+// splitCSV parses a comma-separated env value into a trimmed, non-empty list.
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

@@ -50,6 +50,31 @@ func TestYAMLOverride(t *testing.T) {
 	}
 }
 
+func TestZonesDefaultAndEnv(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Zones) != 1 || cfg.Zones[0] != "midgaard" {
+		t.Errorf("default Zones = %v, want [midgaard]", cfg.Zones)
+	}
+
+	t.Setenv("TELOS_ZONES", "midgaard, darkwood ,, sewers")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"midgaard", "darkwood", "sewers"}
+	if len(cfg.Zones) != len(want) {
+		t.Fatalf("Zones = %v, want %v", cfg.Zones, want)
+	}
+	for i, z := range want {
+		if cfg.Zones[i] != z {
+			t.Fatalf("Zones = %v, want %v", cfg.Zones, want)
+		}
+	}
+}
+
 func TestEnvOverridesYAML(t *testing.T) {
 	t.Setenv("TELOS_NATS_URL", "nats://example:4222")
 	cfg, err := Load("")

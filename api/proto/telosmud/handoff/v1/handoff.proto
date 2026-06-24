@@ -19,6 +19,10 @@ message PrepareRequest {
   string target_room_id = 4;
   uint64 epoch = 5; // ownership epoch; destination records it
   string from_shard_id = 6;
+  // Highest input seq the source had APPLIED at freeze. The destination seeds its
+  // dedup high-water mark from this and drops replayed lines with seq <= applied_seq.
+  // Ties the freeze-point to the gate's replay-point (Redirect.resume_input_seq).
+  uint64 applied_seq = 7;
 }
 
 message PrepareResponse {

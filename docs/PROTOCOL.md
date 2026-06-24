@@ -217,3 +217,66 @@ while in combat** (classic MUD rule), so there is no fight to transfer.
   event; making it a DB read would couple movement latency to store latency and add load
   exactly where players congregate (zone borders). The snapshot is small (one character) and
   self-contained.
+
+---
+
+## 5. Handoff implementation decisions (Phase 2 pressure-test)
+
+A pre-implementation pressure-test found the exactly-once invariants below were asserted but
+**unwired** in the Phase 1 code, plus several gaps. These are the resolutions the Phase 2
+implementation follows.
+
+- **Build order — substrate first.** The redirect/replay substrate (stable per-session input
+  seq, a gate-side input buffer pruned on ack, world-side dedup by seq, and
+  `Attached.ack_input_seq`) is built and tested on a *single shard* — simulating a re-dial to
+  the same shard — before any cross-shard exit exists. Exactly-once is proven in isolation,
+  then distribution is layered on.
+
+- **`applied_seq` is the linchpin.** `PrepareRequest.applied_seq` carries the highest input
+  seq the source had applied at freeze. `Redirect.resume_input_seq == applied_seq`; the
+  destination initializes its dedup high-water mark from it and drops any replayed line with
+  `seq <= applied_seq`. Freeze + snapshot + read-`applied_seq` happen atomically in a single
+  zone-inbox handler.
+
+- **The gate owns the input buffer.** `session_id` and the input seq are **session-scoped**
+  (generated once at login, stable across re-dials), not per-stream. The gate holds un-acked
+  input in an ordered buffer keyed by seq, pruned on ack; on re-attach it replays
+  `(ack_input_seq, …]` in order, *then* resumes live forwarding. Input not yet acked when the
+  gate *process* dies is forfeit — "no lost input" is scoped to graceful redirect, not gate
+  crash.
+
+- **FROZEN is a real state.** On beginning a handoff the source enters FROZEN and must **not**
+  `leave()` the player on stream-drop; the only exits are Commit-confirmed → discard, or
+  Abort → thaw. This stops the frozen copy being destroyed when the gate re-dials away.
+
+- **B drives Commit; Commit is the point of no return.** The destination self-commits the
+  instant the gate's stream binds and replay completes. Abort is illegal once Commit begins;
+  the source only consumes a "you may discard" signal.
+
+- **Idempotent Prepare/Commit.** `handoff_token` is derived deterministically from
+  `(session_id, epoch)`, so a retried Prepare returns the same token and one pending entity.
+  Prepare rejects `epoch < current`; the same `(session_id, epoch)` is an idempotent return.
+  Commit is idempotent on the token; pending→active is a one-way latch.
+
+- **Abort rewrites the directory.** On Abort / Commit-failure the source reclaims ownership by
+  writing `player→A` with a *higher* epoch (CAS) and thaws, so a zombie destination can't
+  believe it still owns the player.
+
+- **Monotonic epoch via the directory.** Epoch is allocated by the directory's compare-and-set
+  on player placement (`internal/directory`), so it is globally monotonic per player and never
+  rolls back. Epoch (in-flight ownership) and `state_version` (DB optimistic lock) stay
+  separate counters.
+
+- **Source-side freeze timeout.** Beyond the destination's `pending_ttl_ms`, the source holds a
+  frozen player only for a bounded time; on timeout it Aborts (reclaim directory + bump epoch)
+  so a dead gate can't leak frozen players. The pending-bind vs TTL-reap race is resolved under
+  one lock on the pending entity.
+
+- **Single-session lock held across the handoff.** The session lock does **not** release when
+  the source's stream drops mid-handoff. A second login during an in-flight handoff is
+  **rejected** until the handoff commits or aborts; normal take-over applies only once the
+  player is settled on one shard.
+
+- **Combat exclusion enforced at the exit.** Because position/target are omitted from the
+  snapshot, the cross-shard exit resolver refuses the move while the player is in combat (no
+  fleeing across a zone boundary mid-fight).
