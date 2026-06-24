@@ -54,6 +54,8 @@ services:
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
       TELOS_WORLD_LISTEN: ":9090"
+      TELOS_SHARD_ADDR: world:9090
+      TELOS_ZONES: midgaard
       TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
       TELOS_REDIS_ADDR: redis:6379
       TELOS_NATS_URL: nats://nats:4222

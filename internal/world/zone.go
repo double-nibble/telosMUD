@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
 
@@ -32,6 +33,12 @@ type Zone struct {
 	startRoom string
 	inbox     chan msg     // message queue; the only ingress to zone state
 	log       *slog.Logger // scoped logger: component=zone, zone=<id>
+
+	// handoff, if set, initiates a cross-shard handoff when a player walks into a
+	// zone this shard does not own (set by the Shard). It runs asynchronously and
+	// posts results back as redirectMsg / handoffFailMsg. nil on a single-shard zone,
+	// where cross-shard exits are sealed.
+	handoff func(snap *handoffv1.PlayerSnapshot, destZone, destRoom string, epoch uint64)
 }
 
 // msg is anything the zone goroutine processes off its inbox. The interface keeps
@@ -78,12 +85,32 @@ type reapMsg struct {
 // leaveMsg removes a player from the zone immediately.
 type leaveMsg struct{ id string }
 
-func (joinMsg) zoneMsg()   {}
-func (attachMsg) zoneMsg() {}
-func (inputMsg) zoneMsg()  {}
-func (detachMsg) zoneMsg() {}
-func (reapMsg) zoneMsg()   {}
-func (leaveMsg) zoneMsg()  {}
+// redirectMsg is posted back by the async handoff coordinator once the destination
+// shard is chosen and the directory updated: the zone sends the player a Redirect
+// frame (the gate will re-dial the new shard). The player stays frozen.
+type redirectMsg struct {
+	id         string
+	targetAddr string
+	token      string
+	resumeSeq  uint64
+	epoch      uint64
+}
+
+// handoffFailMsg is posted back if the handoff could not be initiated, so the zone
+// thaws the otherwise-stuck frozen player.
+type handoffFailMsg struct {
+	id     string
+	reason string
+}
+
+func (joinMsg) zoneMsg()       {}
+func (attachMsg) zoneMsg()     {}
+func (inputMsg) zoneMsg()      {}
+func (detachMsg) zoneMsg()     {}
+func (reapMsg) zoneMsg()       {}
+func (leaveMsg) zoneMsg()      {}
+func (redirectMsg) zoneMsg()   {}
+func (handoffFailMsg) zoneMsg() {}
 
 func newZone(id string) *Zone {
 	return &Zone{
@@ -135,6 +162,10 @@ func (z *Zone) handle(m msg) {
 		z.detach(v.id, v.out)
 	case reapMsg:
 		z.reap(v.id, v.gen)
+	case redirectMsg:
+		z.redirect(v)
+	case handoffFailMsg:
+		z.handoffFailed(v)
 	case leaveMsg:
 		z.log.Debug("inbox: leave", "player", v.id)
 		z.leave(v.id)
@@ -150,6 +181,13 @@ func (z *Zone) handleInput(v inputMsg) {
 	if p == nil {
 		// Input for a player the zone no longer knows about (e.g. leave/input race).
 		z.log.Debug("inbox: input for unknown player", "player", v.id)
+		return
+	}
+	if p.frozen {
+		// A cross-shard handoff is in progress: this shard no longer acts for the
+		// player. The gate buffers input typed during the redirect and replays it to
+		// the destination shard (PROTOCOL.md §5); applying it here would double-act.
+		z.log.Debug("input dropped: player frozen (handoff in progress)", "player", v.id, "seq", v.seq)
 		return
 	}
 	if v.seq != 0 && v.seq <= p.appliedSeq {
@@ -209,7 +247,8 @@ func (z *Zone) attach(character string, out chan *playv1.ServerFrame) {
 		p.out = out
 		p.detached = false
 	} else {
-		p = &player{id: character, name: character, out: out}
+		// epoch starts at 1 (initial ownership); each handoff bumps it.
+		p = &player{id: character, name: character, out: out, epoch: 1}
 	}
 	p.attachGen++
 
@@ -239,6 +278,12 @@ func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
 		z.log.Debug("detach from superseded stream ignored", "player", id)
 		return
 	}
+	if p.frozen {
+		// Mid-handoff: the gate is re-dialing the destination shard. Do NOT remove the
+		// player — the handoff owns its fate (commit -> discard, abort -> thaw).
+		z.log.Debug("detach ignored: player frozen (handoff in progress)", "player", id)
+		return
+	}
 	if p.quitting {
 		z.log.Debug("clean quit, removing player", "player", id)
 		z.leave(id)
@@ -258,6 +303,32 @@ func (z *Zone) reap(id string, gen uint64) {
 		z.log.Debug("reaping link-dead player", "player", id)
 		z.leave(id)
 	}
+}
+
+// redirect tells a frozen player's client to re-dial the destination shard. Posted
+// by the async handoff coordinator (Shard.beginHandoff) once the directory has
+// recorded the new owner; the player stays frozen until the gate re-attaches there.
+func (z *Zone) redirect(v redirectMsg) {
+	p := z.players[v.id]
+	if p == nil {
+		return
+	}
+	p.epoch = v.epoch
+	p.send(redirectFrame(v.targetAddr, v.token, v.resumeSeq))
+	z.log.Debug("redirect sent", "player", v.id, "target", v.targetAddr, "epoch", v.epoch)
+}
+
+// handoffFailed thaws a player whose cross-shard move could not be initiated, so they
+// are not left stuck frozen.
+func (z *Zone) handoffFailed(v handoffFailMsg) {
+	p := z.players[v.id]
+	if p == nil {
+		return
+	}
+	p.frozen = false
+	z.log.Debug("handoff failed, thawing player", "player", v.id, "reason", v.reason)
+	p.send(textFrame("The way is barred. (" + v.reason + ")"))
+	p.send(promptFrame())
 }
 
 // broadcast sends markup to every occupant of r except exceptID (the actor who

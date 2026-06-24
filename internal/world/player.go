@@ -38,6 +38,15 @@ type player struct {
 	// dropping removes the player immediately rather than entering the link-death
 	// grace window.
 	quitting bool
+
+	// Cross-shard handoff (docs/PROTOCOL.md §3, §5). When a player walks through an
+	// exit into a zone this shard does not own, the source FREEZES them: it stops
+	// applying their input and refuses to remove them on stream-drop until the
+	// handoff commits or aborts. epoch is the player's current ownership epoch,
+	// bumped on each handoff so the directory's compare-and-set can reject stale
+	// routing.
+	frozen bool
+	epoch  uint64
 }
 
 // send queues a frame for delivery to this player's stream writer, stamping the

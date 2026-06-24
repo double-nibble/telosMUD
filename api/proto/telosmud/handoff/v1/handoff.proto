@@ -19,10 +19,7 @@ message PrepareRequest {
   string target_room_id = 4;
   uint64 epoch = 5; // ownership epoch; destination records it
   string from_shard_id = 6;
-  // Highest input seq the source had APPLIED at freeze. The destination seeds its
-  // dedup high-water mark from this and drops replayed lines with seq <= applied_seq.
-  // Ties the freeze-point to the gate's replay-point (Redirect.resume_input_seq).
-  uint64 applied_seq = 7;
+  reserved 7; // applied_seq moved onto PlayerSnapshot (it is player freeze-state)
 }
 
 message PrepareResponse {
@@ -58,4 +55,8 @@ message PlayerSnapshot {
   repeated telosmud.common.v1.SkillState skills = 9;
   map<string, string> flags = 10;
   uint64 state_version = 11; // optimistic-concurrency guard vs the DB
+  // Highest input seq the source had APPLIED at freeze. The destination seeds its
+  // dedup high-water mark from this and drops replayed lines with seq <= applied_seq,
+  // tying the freeze-point to the gate's replay-point (Redirect.resume_input_seq).
+  uint64 applied_seq = 12;
 }

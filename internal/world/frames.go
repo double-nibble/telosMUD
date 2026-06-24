@@ -36,3 +36,14 @@ func disconnectFrame(reason string) *playv1.ServerFrame {
 		Reason: reason,
 	}}}
 }
+
+// redirectFrame tells the gate to re-dial another shard (a cross-shard handoff,
+// docs/PROTOCOL.md §5): the target address, the handoff token to present, and the
+// input seq to replay from.
+func redirectFrame(targetAddr, token string, resumeSeq uint64) *playv1.ServerFrame {
+	return &playv1.ServerFrame{Payload: &playv1.ServerFrame_Redirect{Redirect: &playv1.Redirect{
+		TargetShardAddr: targetAddr,
+		HandoffToken:    token,
+		ResumeInputSeq:  resumeSeq,
+	}}}
+}

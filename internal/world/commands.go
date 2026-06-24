@@ -91,21 +91,46 @@ func (z *Zone) move(p *player, dir string) {
 		return
 	}
 	from := z.rooms[p.room]
-	dest, ok := from.exits[dir]
+	ref, ok := from.exits[dir]
 	if !ok {
 		z.log.Debug("move blocked: no exit", "player", p.id, "room", p.room, "dir", dir)
+		p.send(textFrame("You can't go that way."))
+		return
+	}
+	destZone, destRoom := parseRef(ref)
+
+	// Cross-shard (cross-zone) move: hand the player off rather than moving locally.
+	if destZone != "" && destZone != z.id {
+		if z.handoff == nil {
+			// Single-shard zone with no directory: the boundary is sealed.
+			p.send(textFrame("The way is sealed."))
+			return
+		}
+		// Combat exclusion would be checked here (PROTOCOL.md §5); no combat in Phase 2.
+		// Freeze first: from now on this shard stops acting for the player. Build the
+		// snapshot on this (zone) goroutine, then kick off the async handoff.
+		p.frozen = true
+		z.broadcast(from, p.id, p.name+" departs "+dir+".")
+		z.log.Debug("cross-shard move initiated", "player", p.id, "dest_zone", destZone, "dest_room", destRoom, "epoch", p.epoch)
+		z.handoff(buildSnapshot(p), destZone, destRoom, p.epoch)
+		return
+	}
+
+	// Local move within this zone.
+	to, ok := z.rooms[destRoom]
+	if !ok {
+		z.log.Debug("move blocked: unknown local room", "player", p.id, "ref", ref)
 		p.send(textFrame("You can't go that way."))
 		return
 	}
 	delete(from.occupants, p.id)
 	z.broadcast(from, p.id, p.name+" leaves "+dir+".")
 
-	p.room = dest
-	to := z.rooms[dest]
+	p.room = destRoom
 	to.occupants[p.id] = true
 	z.broadcast(to, p.id, p.name+" arrives.")
 	z.lookRoom(p)
-	z.log.Debug("player moved", "player", p.id, "dir", dir, "from", from.id, "to", dest)
+	z.log.Debug("player moved", "player", p.id, "dir", dir, "from", from.id, "to", destRoom)
 }
 
 // who lists every player currently online in the zone.
