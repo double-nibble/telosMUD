@@ -10,6 +10,9 @@ lint:
     - RPC_REQUEST_STANDARD_NAME
     - RPC_RESPONSE_STANDARD_NAME
     - RPC_REQUEST_RESPONSE_UNIQUE
+    # Services are intentionally named Play/Handoff (docs/PROTOCOL.md), not
+    # *Service; the suffix would be redundant and churn the generated API.
+    - SERVICE_SUFFIX
 breaking:
   use:
     - FILE

@@ -8,8 +8,8 @@ import "telosmud/common/v1/common.proto";
 // single-writer invariant under failure. See docs/PROTOCOL.md §2.
 service Handoff {
   rpc Prepare(PrepareRequest) returns (PrepareResponse); // rehydrate in PENDING state
-  rpc Commit(CommitRequest) returns (CommitResponse);    // activate after gate re-attaches
-  rpc Abort(AbortRequest) returns (AbortResponse);       // roll back on failure/timeout
+  rpc Commit(CommitRequest) returns (CommitResponse); // activate after gate re-attaches
+  rpc Abort(AbortRequest) returns (AbortResponse); // roll back on failure/timeout
 }
 
 message PrepareRequest {

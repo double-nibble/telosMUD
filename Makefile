@@ -2,14 +2,17 @@ GO ?= go
 COMPOSE ?= docker compose -f deploy/docker-compose.yml
 
 .DEFAULT_GOAL := help
-.PHONY: help up down logs test vet lint build tidy proto
+.PHONY: help up deps down logs test vet lint build tidy proto
 
 help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | \
 		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-up: ## Start dev dependencies (Postgres, Redis, NATS)
-	$(COMPOSE) up -d
+up: ## Build & start the full stack (deps + world + gate)
+	$(COMPOSE) up -d --build
+
+deps: ## Start only the backing services (Postgres, Redis, NATS)
+	$(COMPOSE) up -d postgres redis nats
 
 down: ## Stop dev dependencies
 	$(COMPOSE) down

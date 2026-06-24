@@ -1,0 +1,10 @@
+# Keep the build context small. Note: api/gen (generated code) is intentionally
+# NOT ignored — the image build compiles it.
+.git
+.github
+.claude
+docs
+bin
+deploy/data
+*.log
+*.md

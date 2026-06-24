@@ -43,3 +43,45 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  world:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-world
+    environment:
+      TELOS_SERVICE: telos-world
+      TELOS_ENV: dev
+      TELOS_WORLD_LISTEN: ":9090"
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
+      TELOS_REDIS_ADDR: redis:6379
+      TELOS_NATS_URL: nats://nats:4222
+    expose:
+      - "9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  gate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-gate
+    environment:
+      TELOS_SERVICE: telos-gate
+      TELOS_ENV: dev
+      TELOS_GATE_LISTEN: ":4000"
+      TELOS_WORLD_TARGET: world:9090
+    ports:
+      - "4000:4000" # telnet: connect with `telnet localhost 4000`
+    depends_on:
+      world:
+        condition: service_started
+    restart: unless-stopped

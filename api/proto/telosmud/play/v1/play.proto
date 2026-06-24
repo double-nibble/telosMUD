@@ -31,7 +31,7 @@ message Attach {
   string character_id = 3;
   ClientInfo client = 4;
   string handoff_token = 5; // set ONLY when re-dialing after a Redirect
-  uint64 input_seq = 6;     // next input seq the gate will send (resume point)
+  uint64 input_seq = 6; // next input seq the gate will send (resume point)
 }
 
 message ClientInfo {

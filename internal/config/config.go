@@ -17,6 +17,11 @@ type Config struct {
 	Postgres PostgresConfig `yaml:"postgres"`
 	Redis    RedisConfig    `yaml:"redis"`
 	NATS     NATSConfig     `yaml:"nats"`
+
+	// Phase 1 service addresses.
+	GateListen  string `yaml:"gate_listen"`  // telnet listen, e.g. ":4000"
+	WorldListen string `yaml:"world_listen"` // gRPC Play listen, e.g. ":9090"
+	WorldTarget string `yaml:"world_target"` // the gate dials this world shard
 }
 
 type PostgresConfig struct {
@@ -41,6 +46,10 @@ func Default() Config {
 		Postgres: PostgresConfig{DSN: "postgres://telos:telos@localhost:5432/telosmud?sslmode=disable"},
 		Redis:    RedisConfig{Addr: "localhost:6379"},
 		NATS:     NATSConfig{URL: "nats://localhost:4222"},
+
+		GateListen:  ":4000",
+		WorldListen: ":9090",
+		WorldTarget: "localhost:9090",
 	}
 }
 
@@ -84,5 +93,14 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_NATS_URL"); ok {
 		c.NATS.URL = v
+	}
+	if v, ok := os.LookupEnv("TELOS_GATE_LISTEN"); ok {
+		c.GateListen = v
+	}
+	if v, ok := os.LookupEnv("TELOS_WORLD_LISTEN"); ok {
+		c.WorldListen = v
+	}
+	if v, ok := os.LookupEnv("TELOS_WORLD_TARGET"); ok {
+		c.WorldTarget = v
 	}
 }

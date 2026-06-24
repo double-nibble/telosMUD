@@ -1,9 +1,6 @@
-// Command telos-gate is the edge service: it terminates telnet/TLS/SSH
-// connections, runs protocol/GMCP negotiation, and proxies players to world
-// shards over the gRPC Play stream.
-//
-// Phase 0: boot config + observability and block until shutdown. The telnet
-// listener and Play client arrive in Phase 1 — see docs/ROADMAP.md.
+// Command telos-gate is the edge service: it terminates telnet connections and
+// proxies players to world shards over the gRPC Play stream. TLS/SSH, GMCP, and
+// real auth arrive in later phases (docs/ACCOUNT.md, GMCP.md).
 package main
 
 import (
@@ -13,7 +10,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/config"
+	"github.com/double-nibble/telosmud/internal/directory"
+	"github.com/double-nibble/telosmud/internal/gate"
 	"github.com/double-nibble/telosmud/internal/obs"
 )
 
@@ -31,11 +34,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("starting", "env", cfg.Env)
-	// TODO(phase1): start the telnet listener and the gRPC Play client.
+	cc, err := grpc.NewClient(cfg.WorldTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		slog.Error("world client failed", "target", cfg.WorldTarget, "err", err)
+		os.Exit(1)
+	}
+	defer cc.Close()
 
-	<-ctx.Done()
-	slog.Info("shutting down")
+	srv := gate.New(cfg.GateListen, directory.Static{Addr: cfg.WorldTarget}, playv1.NewPlayClient(cc))
+	slog.Info("starting", "env", cfg.Env, "listen", cfg.GateListen, "world", cfg.WorldTarget)
+	if err := srv.ListenAndServe(ctx); err != nil {
+		slog.Error("gate serve failed", "err", err)
+	}
 	if err := shutdown(context.Background()); err != nil {
 		slog.Error("shutdown error", "err", err)
 	}
