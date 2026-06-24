@@ -1,6 +1,18 @@
 // Command telos-gate is the edge service: it terminates telnet connections and
 // proxies players to world shards over the gRPC Play stream. TLS/SSH, GMCP, and
 // real auth arrive in later phases (docs/ACCOUNT.md, GMCP.md).
+//
+// Startup wiring:
+//
+//  1. Load config (path from env) and normalize the service name.
+//  2. obs.Init installs the process-wide slog default logger and applies the
+//     DEBUG env flag (DEBUG=1 lowers the level to Debug; see internal/obs).
+//     From here on every package — gate, telnet, directory — just calls slog
+//     and inherits this logger; none of them take a logger argument.
+//  3. Dial the world (a single lazy gRPC client shared by all connections).
+//  4. Build the gate Server and serve until SIGINT/SIGTERM cancels ctx.
+//
+// Run with DEBUG=1 to watch the edge narrate every connection end to end.
 package main
 
 import (

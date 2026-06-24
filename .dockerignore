@@ -1,10 +1,11 @@
-# Keep the build context small. Note: api/gen (generated code) is intentionally
-# NOT ignored — the image build compiles it.
+# Keep the build context small. Generated code (api/gen) is intentionally
+# excluded — the image's `proto` stage regenerates it via buf generate.
 .git
 .github
 .claude
 docs
 bin
 deploy/data
+api/gen
 *.log
 *.md

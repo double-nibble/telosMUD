@@ -57,6 +57,7 @@ services:
       TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
       TELOS_REDIS_ADDR: redis:6379
       TELOS_NATS_URL: nats://nats:4222
+      DEBUG: true
     expose:
       - "9090"
     depends_on:
@@ -79,6 +80,7 @@ services:
       TELOS_ENV: dev
       TELOS_GATE_LISTEN: ":4000"
       TELOS_WORLD_TARGET: world:9090
+      DEBUG: true
     ports:
       - "4000:4000" # telnet: connect with `telnet localhost 4000`
     depends_on:

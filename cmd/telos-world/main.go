@@ -1,5 +1,10 @@
 // Command telos-world runs a world-simulation shard: the zone actor loop plus the
 // gRPC Play server. Phase 1 serves one hardcoded two-room zone (docs/ROADMAP.md).
+//
+// Startup order: load config -> obs.Init (installs the slog default logger; honors
+// DEBUG=1 to enable Debug-level world tracing) -> start the zone actor goroutine ->
+// serve gRPC. SIGINT/SIGTERM cancels ctx, which both stops the zone loop and
+// gracefully drains the gRPC server.
 package main
 
 import (
@@ -32,7 +37,8 @@ func main() {
 	defer stop()
 
 	shard := world.NewDemoShard()
-	go shard.Run(ctx)
+	go shard.Run(ctx) // the zone actor loop owns all world state from here on
+	slog.Debug("demo shard started")
 
 	lis, err := net.Listen("tcp", cfg.WorldListen)
 	if err != nil {

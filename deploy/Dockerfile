@@ -1,5 +1,13 @@
 # syntax=docker/dockerfile:1
 
+# Generate protobuf/gRPC code. Generated *.pb.go is gitignored, so the image
+# (re)generates it here rather than relying on the build context to carry it.
+FROM bufbuild/buf:1.71.0 AS proto
+WORKDIR /work
+COPY buf.yaml buf.gen.yaml ./
+COPY api/proto ./api/proto
+RUN ["buf", "generate"]
+
 # Build one service binary, selected by the SERVICE build arg (telos-gate / telos-world).
 FROM golang:1.25-alpine AS build
 WORKDIR /src
@@ -7,6 +15,7 @@ ENV GOWORK=off CGO_ENABLED=0
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+COPY --from=proto /work/api/gen ./api/gen
 ARG SERVICE
 RUN test -n "$SERVICE" && go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
 
