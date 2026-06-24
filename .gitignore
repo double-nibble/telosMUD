@@ -1,0 +1,24 @@
+# Binaries & build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+go.work.sum
+coverage.*
+*.prof
+
+# Local service data (Postgres/Redis/NATS volumes, etc.)
+/deploy/data/
+*.local.env
+.env
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
