@@ -28,6 +28,9 @@ func (z *Zone) dispatch(p *player, line string) {
 		z.who(p)
 	case "quit":
 		z.log.Debug("player quit", "player", p.id, "room", p.room)
+		// Mark a clean, intentional disconnect so when the stream drops the zone
+		// removes the player immediately instead of waiting out the link-death grace.
+		p.quitting = true
 		p.send(textFrame("Farewell."))
 		p.send(disconnectFrame("quit"))
 		return // no prompt; the stream will close

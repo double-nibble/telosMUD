@@ -45,8 +45,12 @@ func registerPlay(gs *grpc.Server, z *Zone) {
 //	     -> Zone.Run -> dispatch -> player.send -> out channel
 //	     -> writer goroutine -> stream.Send -> wire
 //
-// On EOF/error or Detach, the reader loop exits and a leaveMsg is posted so the zone
-// removes the player. The writer goroutine stops when the stream context is done.
+// The zone, not the server, owns the player: the server posts attachMsg (which
+// creates a new player or re-binds an existing one on a re-dial) and forwards each
+// input with the gate's session-scoped seq so the zone can dedup replays. On a clean
+// Detach the player is removed at once; on an unexpected drop a detachMsg starts the
+// link-death grace (a reconnect/handoff may resume). The writer goroutine stops when
+// the stream context is done.
 func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	s.log.Debug("play stream connect")
 	first, err := stream.Recv()
@@ -58,66 +62,67 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		return status.Error(codes.InvalidArgument, "first frame must be Attach")
 	}
 
-	name := attach.GetCharacterId()
-	if name == "" {
+	character := attach.GetCharacterId()
+	if character == "" {
 		// No character id supplied: invent an anonymous one.
-		name = "Wanderer-" + uuid.NewString()[:8]
+		character = "Wanderer-" + uuid.NewString()[:8]
 	}
-	s.log.Debug("attach parsed", "character", name)
-	p := &player{
-		id:   name,
-		name: name,
-		out:  make(chan *playv1.ServerFrame, 256),
-	}
+	s.log.Debug("attach parsed", "character", character)
 
 	ctx := stream.Context()
-
-	// Writer goroutine: the ONLY goroutine that calls stream.Send. It drains the
-	// player's out channel until the stream context is cancelled or Send fails.
+	// out is this stream's outbound channel; the zone binds it to the character's
+	// player. The writer goroutine below is the ONLY caller of stream.Send.
+	out := make(chan *playv1.ServerFrame, 256)
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
-				s.log.Debug("stream writer stop (ctx done)", "player", p.id)
+				s.log.Debug("stream writer stop (ctx done)", "character", character)
 				return
-			case f := <-p.out:
+			case f := <-out:
 				if err := stream.Send(f); err != nil {
-					s.log.Debug("stream writer stop (send error)", "player", p.id, "err", err)
+					s.log.Debug("stream writer stop (send error)", "character", character, "err", err)
 					return
 				}
 			}
 		}
 	}()
 
-	// Acknowledge the attach, then hand the player to the zone to be placed.
-	p.send(attachedFrame(s.zone.id))
-	s.zone.post(joinMsg{p: p})
-	s.log.Debug("player stream ready", "player", p.id, "zone", s.zone.id)
+	// Hand the stream to the zone: it creates a new player or re-binds an existing one
+	// (a re-dial within the link-death window) and sends Attached + the room.
+	s.zone.post(attachMsg{character: character, out: out})
+	s.log.Debug("player stream ready", "character", character, "zone", s.zone.id)
 
 	// Reader loop: translate client frames into zone inbox messages.
-	var seq int
+	cleanQuit := false
 	for {
 		f, err := stream.Recv()
 		if err != nil {
-			s.log.Debug("stream recv ended", "player", p.id, "err", err)
+			s.log.Debug("stream recv ended", "character", character, "err", err)
 			break // EOF or transport error
 		}
 		switch pl := f.Payload.(type) {
 		case *playv1.ClientFrame_Input:
-			seq++
-			text := pl.Input.GetText()
-			s.log.Debug("input received", "player", p.id, "seq", seq, "text", text)
-			s.zone.post(inputMsg{id: p.id, line: text})
+			in := pl.Input
+			s.log.Debug("input received", "character", character, "seq", in.GetSeq(), "text", in.GetText())
+			s.zone.post(inputMsg{id: character, seq: in.GetSeq(), line: in.GetText()})
 		case *playv1.ClientFrame_Detach:
-			s.log.Debug("detach received", "player", p.id)
+			s.log.Debug("detach received (clean)", "character", character)
+			cleanQuit = true
 			goto done
 		default:
 			// Phase 1 ignores gmcp/resize/pong/attach-after-first.
 		}
 	}
 done:
-	// Stream is closing: tell the zone to remove the player.
-	s.log.Debug("stream closing", "player", p.id)
-	s.zone.post(leaveMsg{id: p.id})
+	if cleanQuit {
+		// Explicit client disconnect: remove now.
+		s.zone.post(leaveMsg{id: character})
+	} else {
+		// Unexpected loss: enter link-death (the zone removes immediately only if the
+		// player was quitting; otherwise it waits out the grace for a re-attach).
+		s.zone.post(detachMsg{id: character, out: out})
+	}
+	s.log.Debug("stream closing", "character", character, "clean", cleanQuit)
 	return nil
 }

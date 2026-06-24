@@ -3,7 +3,16 @@ package world
 import (
 	"context"
 	"log/slog"
+	"time"
+
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
+
+// linkDeadGrace is how long a player's in-zone presence survives after its stream
+// drops unexpectedly (no clean quit). A re-dial (handoff, docs/PROTOCOL.md §5) or a
+// reconnect within this window re-binds to the same player and resumes; otherwise
+// the player is reaped. Tunable later.
+const linkDeadGrace = 60 * time.Second
 
 // Zone is the actor (docs/ARCHITECTURE.md §3). A single goroutine — Run — owns all
 // rooms and players within the zone and is the *only* code that ever reads or
@@ -29,21 +38,52 @@ type Zone struct {
 // the inbox a single typed channel while letting handle switch on concrete type.
 type msg interface{ zoneMsg() }
 
-// joinMsg adds a connected player to the zone (posted once, after Attach).
+// joinMsg adds a pre-built player to the zone directly. Used by tests; the network
+// path uses attachMsg (which creates or re-binds and then joins).
 type joinMsg struct{ p *player }
 
-// inputMsg carries one line of player input to be parsed and run in the zone.
+// attachMsg binds a player's gRPC stream (its out channel) to a character. If the
+// character is unknown it creates and joins a new player; if it already exists
+// (a re-dial/reconnect within the link-death window) it re-binds the stream to the
+// existing player, preserving appliedSeq so input replay dedups correctly.
+type attachMsg struct {
+	character string
+	out       chan *playv1.ServerFrame
+}
+
+// inputMsg carries one line of player input. seq is the gate's session-scoped input
+// sequence (docs/PROTOCOL.md §5); seq==0 means unsequenced (tests/internal) and is
+// always applied. A seq <= the player's appliedSeq is a replay and is dropped.
 type inputMsg struct {
 	id   string
+	seq  uint64
 	line string
 }
 
-// leaveMsg removes a player from the zone (stream closed or detached).
+// detachMsg signals that a player's stream dropped. out identifies which stream, so
+// a stale detach from a superseded stream (after a re-attach) is ignored. A clean
+// quit removes the player immediately; an unexpected drop starts the link-death grace.
+type detachMsg struct {
+	id  string
+	out chan *playv1.ServerFrame
+}
+
+// reapMsg fires after the link-death grace to remove a player that never re-attached.
+// gen guards against reaping a player that has since re-attached (new generation).
+type reapMsg struct {
+	id  string
+	gen uint64
+}
+
+// leaveMsg removes a player from the zone immediately.
 type leaveMsg struct{ id string }
 
-func (joinMsg) zoneMsg()  {}
-func (inputMsg) zoneMsg() {}
-func (leaveMsg) zoneMsg() {}
+func (joinMsg) zoneMsg()   {}
+func (attachMsg) zoneMsg() {}
+func (inputMsg) zoneMsg()  {}
+func (detachMsg) zoneMsg() {}
+func (reapMsg) zoneMsg()   {}
+func (leaveMsg) zoneMsg()  {}
 
 func newZone(id string) *Zone {
 	return &Zone{
@@ -85,19 +125,44 @@ func (z *Zone) handle(m msg) {
 	case joinMsg:
 		z.log.Debug("inbox: join", "player", v.p.id)
 		z.join(v.p)
+	case attachMsg:
+		z.log.Debug("inbox: attach", "player", v.character)
+		z.attach(v.character, v.out)
 	case inputMsg:
-		if p := z.players[v.id]; p != nil {
-			z.log.Debug("inbox: input", "player", v.id, "line", v.line)
-			z.dispatch(p, v.line)
-		} else {
-			// Input arrived for a player the zone no longer knows about (e.g. a
-			// race between leave and a late input). Nothing to do but note it.
-			z.log.Debug("inbox: input for unknown player", "player", v.id)
-		}
+		z.handleInput(v)
+	case detachMsg:
+		z.log.Debug("inbox: detach", "player", v.id)
+		z.detach(v.id, v.out)
+	case reapMsg:
+		z.reap(v.id, v.gen)
 	case leaveMsg:
 		z.log.Debug("inbox: leave", "player", v.id)
 		z.leave(v.id)
 	}
+}
+
+// handleInput applies one input line with exactly-once semantics. A sequenced line
+// (seq>0) at or below the player's high-water mark is a replay — dropped before it
+// can run a second time (docs/PROTOCOL.md §5). Otherwise the high-water advances and
+// the line is dispatched.
+func (z *Zone) handleInput(v inputMsg) {
+	p := z.players[v.id]
+	if p == nil {
+		// Input for a player the zone no longer knows about (e.g. leave/input race).
+		z.log.Debug("inbox: input for unknown player", "player", v.id)
+		return
+	}
+	if v.seq != 0 && v.seq <= p.appliedSeq {
+		// Replay of an already-applied line: drop it. No dispatch, no output, so the
+		// command's side effects happen exactly once across a re-dial.
+		z.log.Debug("duplicate input dropped", "player", v.id, "seq", v.seq, "applied", p.appliedSeq)
+		return
+	}
+	if v.seq != 0 {
+		p.appliedSeq = v.seq
+	}
+	z.log.Debug("inbox: input", "player", v.id, "seq", v.seq, "line", v.line)
+	z.dispatch(p, v.line)
 }
 
 // join places a newly connected player into the world: it picks a valid room
@@ -130,6 +195,69 @@ func (z *Zone) leave(id string) {
 	}
 	delete(z.players, id)
 	z.log.Debug("player left", "player", id, "room", p.room, "population", len(z.players))
+}
+
+// attach binds a stream's out channel to a character. A new character is created and
+// joined; an existing one (a re-dial or reconnect within the link-death window) is
+// re-bound to the *same* player, preserving appliedSeq so replayed input dedups
+// correctly. Either way an Attached frame goes out first; player.send stamps it with
+// the resume point (appliedSeq) via ServerFrame.ack_input_seq.
+func (z *Zone) attach(character string, out chan *playv1.ServerFrame) {
+	p := z.players[character]
+	reattach := p != nil
+	if reattach {
+		p.out = out
+		p.detached = false
+	} else {
+		p = &player{id: character, name: character, out: out}
+	}
+	p.attachGen++
+
+	// Attached first: conveys the shard id and (via the ack stamp) the resume point.
+	p.send(attachedFrame(z.id))
+
+	if reattach {
+		z.log.Debug("player re-attached", "player", character, "applied_seq", p.appliedSeq, "gen", p.attachGen)
+		z.lookRoom(p) // re-show the room to the reconnected client
+		p.send(promptFrame())
+	} else {
+		z.join(p) // registers, places, announces arrival, looks, prompts
+	}
+}
+
+// detach handles a player's stream dropping. out identifies which stream, so a stale
+// detach from a stream already superseded by a re-attach is ignored. A clean quit
+// removes the player at once; an unexpected drop marks the player link-dead and
+// schedules a reap after the grace window (cancelled implicitly if it re-attaches and
+// bumps attachGen).
+func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
+	p := z.players[id]
+	if p == nil {
+		return
+	}
+	if p.out != out {
+		z.log.Debug("detach from superseded stream ignored", "player", id)
+		return
+	}
+	if p.quitting {
+		z.log.Debug("clean quit, removing player", "player", id)
+		z.leave(id)
+		return
+	}
+	p.detached = true
+	gen := p.attachGen
+	z.log.Debug("player link-dead", "player", id, "grace", linkDeadGrace)
+	time.AfterFunc(linkDeadGrace, func() { z.post(reapMsg{id: id, gen: gen}) })
+}
+
+// reap removes a link-dead player that never re-attached within the grace window. The
+// generation check ensures a player that has since re-attached (bumping attachGen) is
+// not removed by a stale timer.
+func (z *Zone) reap(id string, gen uint64) {
+	if p := z.players[id]; p != nil && p.detached && p.attachGen == gen {
+		z.log.Debug("reaping link-dead player", "player", id)
+		z.leave(id)
+	}
 }
 
 // broadcast sends markup to every occupant of r except exceptID (the actor who

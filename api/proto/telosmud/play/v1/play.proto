@@ -89,11 +89,16 @@ message ServerFrame {
     Redirect redirect = 7;
     Disconnect disconnect = 8;
   }
+  // ack_input_seq piggybacks the world's input high-water mark on EVERY frame: the
+  // highest InputLine.seq this shard has applied for the player. The gate prunes its
+  // replay buffer up to this value; on the Attached frame it is also the resume
+  // point. It lives outside the oneof so it rides along with any payload.
+  uint64 ack_input_seq = 9;
 }
 
 message Attached {
   string shard_id = 1;
-  uint64 ack_input_seq = 2;
+  reserved 2; // was ack_input_seq; the ack now rides on every ServerFrame (field 9)
 }
 
 message Output {

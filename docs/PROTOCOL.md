@@ -81,9 +81,10 @@ message ServerFrame {
     Redirect     redirect   = 7;  // migrate to another shard
     Disconnect   disconnect = 8;  // server-initiated close
   }
+  uint64 ack_input_seq = 9;        // piggybacked on EVERY frame: input high-water mark
 }
 
-message Attached     { string shard_id = 1; uint64 ack_input_seq = 2; }
+message Attached     { string shard_id = 1; /* ack rides on ServerFrame.ack_input_seq */ }
 message Output {
   string       markup       = 1;  // semantic markup; gate renders to the terminal
   OutputClass  class        = 2;  // lets clients/gate route or style
@@ -109,7 +110,9 @@ message Disconnect { string reason = 1; bool reconnectable = 2; }
 - **First frame must be `Attach`.** The world replies `Attached` with the input offset it has
   already consumed (nonzero on a migration resume), so the gate knows where to replay from.
 - **Input sequencing.** `InputLine.seq` is monotonic per `session_id` (not per stream). After
-  a redirect the gate replays any input the new shard hasn't acked. Shards dedupe by `seq`.
+  a redirect the gate replays any input the new shard hasn't acked. Shards dedupe by `seq`
+  (drop `seq <= applied`) and report their high-water mark on every `ServerFrame.ack_input_seq`;
+  the gate prunes its replay buffer to that value. `seq == 0` means unsequenced (always apply).
 - **GMCP is structured, not bytes.** `GmcpIn/Out` carry `package` + raw JSON; the gate does
   telnet subnegotiation framing. The world never sees `IAC SB 201...`.
 - **Keepalive.** Server `Ping`/client `Pong` measures real latency and detects half-open
