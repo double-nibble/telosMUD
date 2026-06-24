@@ -1,0 +1,45 @@
+name: telosmud-dev
+
+# Local development dependencies. Data lives under deploy/data/ (gitignored).
+#   make up   -> start    make down -> stop    make logs -> tail
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-telos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-telos}
+      POSTGRES_DB: ${POSTGRES_DB:-telosmud}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telos} -d ${POSTGRES_DB:-telosmud}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2.10-alpine
+    # -js enables JetStream (durable cross-scope events); -m exposes monitoring.
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

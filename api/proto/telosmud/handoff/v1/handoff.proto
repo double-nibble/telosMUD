@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package telosmud.handoff.v1;
+
+import "telosmud/common/v1/common.proto";
+
+// Cross-shard player migration. Two-phase (Prepare/Commit) + epoch preserves the
+// single-writer invariant under failure. See docs/PROTOCOL.md §2.
+service Handoff {
+  rpc Prepare(PrepareRequest) returns (PrepareResponse); // rehydrate in PENDING state
+  rpc Commit(CommitRequest) returns (CommitResponse);    // activate after gate re-attaches
+  rpc Abort(AbortRequest) returns (AbortResponse);       // roll back on failure/timeout
+}
+
+message PrepareRequest {
+  string session_id = 1;
+  PlayerSnapshot snapshot = 2;
+  string target_zone_id = 3;
+  string target_room_id = 4;
+  uint64 epoch = 5; // ownership epoch; destination records it
+  string from_shard_id = 6;
+}
+
+message PrepareResponse {
+  string handoff_token = 1;
+  string target_shard_addr = 2;
+  uint64 pending_ttl_ms = 3;
+}
+
+message CommitRequest {
+  string handoff_token = 1;
+}
+
+message CommitResponse {}
+
+message AbortRequest {
+  string handoff_token = 1;
+  string reason = 2;
+}
+
+message AbortResponse {}
+
+// PlayerSnapshot is the authoritative in-memory player state carried in a
+// handoff, so the destination resumes with zero DB round-trips.
+message PlayerSnapshot {
+  string character_id = 1;
+  string account_id = 2;
+  string name = 3;
+  telosmud.common.v1.CoreStats stats = 4;
+  telosmud.common.v1.Vitals vitals = 5;
+  repeated telosmud.common.v1.Item inventory = 6;
+  repeated telosmud.common.v1.Equipped equipment = 7;
+  repeated telosmud.common.v1.Affect affects = 8;
+  repeated telosmud.common.v1.SkillState skills = 9;
+  map<string, string> flags = 10;
+  uint64 state_version = 11; // optimistic-concurrency guard vs the DB
+}

@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package telosmud.common.v1;
+
+// Shared value types. Per the extensibility pillar (docs/PRINCIPLES.md), no
+// game concept is enumerated here: attributes and resources are content-defined
+// names, carried as maps.
+
+// CoreStats holds content-defined numeric attributes (e.g. "strength",
+// "intellect", "level", "xp").
+message CoreStats {
+  map<string, sint64> attributes = 1;
+}
+
+// Vitals holds content-defined resource pools (e.g. "hp", "mana", "stamina").
+message Vitals {
+  map<string, Resource> resources = 1;
+}
+
+message Resource {
+  sint64 cur = 1;
+  sint64 max = 2;
+}
+
+// Item is a flyweight instance: a prototype reference plus a copy-on-write delta
+// (affixes, durability, quantity), with nested contents for containers.
+message Item {
+  string proto_ref = 1;
+  bytes delta_json = 2;
+  string persist_id = 3; // set only for persistent instances
+  repeated Item contents = 4;
+}
+
+message Equipped {
+  string slot = 1;
+  Item item = 2;
+}
+
+// Affect is an active timed modifier (buff/debuff/DoT).
+message Affect {
+  string id = 1;
+  sint64 duration_pulses = 2;
+  double magnitude = 3;
+  uint32 stacks = 4;
+  string source = 5;
+}
+
+message SkillState {
+  string id = 1;
+  uint32 proficiency = 2;
+}

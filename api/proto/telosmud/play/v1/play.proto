@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package telosmud.play.v1;
+
+// The per-player I/O contract between telos-gate and telos-world.
+// See docs/PROTOCOL.md §1.
+
+// Play carries one bidirectional stream per connected player. The gate decodes
+// telnet/GMCP into ClientFrames; the world emits semantic ServerFrames the gate
+// renders for the specific terminal.
+service Play {
+  rpc Connect(stream ClientFrame) returns (stream ServerFrame);
+}
+
+// ---- gate -> world ----
+
+message ClientFrame {
+  oneof payload {
+    Attach attach = 1; // ALWAYS the first frame on a stream
+    InputLine input = 2;
+    GmcpIn gmcp = 3;
+    Resize resize = 4;
+    Pong pong = 5;
+    Detach detach = 6;
+  }
+}
+
+message Attach {
+  string session_id = 1; // gate-generated, STABLE across a redirect
+  string account_id = 2;
+  string character_id = 3;
+  ClientInfo client = 4;
+  string handoff_token = 5; // set ONLY when re-dialing after a Redirect
+  uint64 input_seq = 6;     // next input seq the gate will send (resume point)
+}
+
+message ClientInfo {
+  string remote_addr = 1;
+  string terminal_type = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  string charset = 5;
+  bool mccp = 6;
+  bool gmcp = 7;
+  repeated string gmcp_supports = 8;
+  uint32 mtts = 9;
+}
+
+message InputLine {
+  uint64 seq = 1;
+  string text = 2;
+  int64 client_ts_ms = 3;
+}
+
+message GmcpIn {
+  string pkg = 1; // GMCP package name, e.g. "Core.Supports.Set"
+  bytes json = 2;
+}
+
+message Resize {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+message Detach {
+  DetachReason reason = 1;
+}
+
+enum DetachReason {
+  DETACH_REASON_UNSPECIFIED = 0;
+  DETACH_REASON_QUIT = 1;
+  DETACH_REASON_LINKDEAD = 2;
+}
+
+// ---- world -> gate ----
+
+message ServerFrame {
+  oneof payload {
+    Attached attached = 1;
+    Output output = 2;
+    GmcpOut gmcp = 3;
+    PromptUpdate prompt = 4;
+    Control control = 5;
+    Ping ping = 6;
+    Redirect redirect = 7;
+    Disconnect disconnect = 8;
+  }
+}
+
+message Attached {
+  string shard_id = 1;
+  uint64 ack_input_seq = 2;
+}
+
+message Output {
+  string markup = 1; // semantic markup; the gate renders to the terminal
+  OutputClass class = 2;
+  bool preformatted = 3; // true = do NOT word-wrap (maps, tables, ascii art)
+  bool no_newline = 4;
+}
+
+enum OutputClass {
+  OUTPUT_CLASS_UNSPECIFIED = 0;
+  OUTPUT_CLASS_NORMAL = 1;
+  OUTPUT_CLASS_SYSTEM = 2;
+  OUTPUT_CLASS_COMBAT = 3;
+  OUTPUT_CLASS_CHANNEL = 4;
+  OUTPUT_CLASS_TELL = 5;
+}
+
+message GmcpOut {
+  string pkg = 1;
+  bytes json = 2;
+}
+
+message PromptUpdate {
+  string markup = 1; // emitted without a trailing newline
+}
+
+message Control {
+  oneof kind {
+    bool echo = 1; // false during password entry
+    bytes mssp = 2;
+  }
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Redirect {
+  string target_shard_addr = 1;
+  string handoff_token = 2;
+  uint64 resume_input_seq = 3;
+}
+
+message Disconnect {
+  string reason = 1;
+  bool reconnectable = 2;
+}

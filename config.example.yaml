@@ -1,0 +1,12 @@
+# Copy to a local file and point TELOS_CONFIG at it. Any field can also be
+# overridden by a TELOS_* env var (e.g. TELOS_NATS_URL).
+service: telos-world
+env: dev
+log_level: info
+
+postgres:
+  dsn: postgres://telos:telos@localhost:5432/telosmud?sslmode=disable
+redis:
+  addr: localhost:6379
+nats:
+  url: nats://localhost:4222

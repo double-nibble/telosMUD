@@ -11,6 +11,9 @@ go.work.sum
 coverage.*
 *.prof
 
+# Generated protobuf files
+*.pb.go
+
 # Local service data (Postgres/Redis/NATS volumes, etc.)
 /deploy/data/
 *.local.env
