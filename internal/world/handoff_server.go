@@ -46,7 +46,7 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 	reply := make(chan error, 1)
 	m := prepareMsg{
 		snap:  snap,
-		room:  req.GetTargetRoomId(),
+		room:  ProtoRef(req.GetTargetRoomId()),
 		epoch: req.GetEpoch(),
 		token: token,
 		reply: reply,

@@ -258,32 +258,47 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 	}()
 }
 
-// newDemoZone builds one of the hardcoded demo zones. midgaard's market has a
-// cross-shard exit north into darkwood; darkwood's grove leads back south.
+// newRoom authors one room ENTITY (docs/MUDLIB.md §2, §4): an Entity with a Room
+// component, keyed in the zone by its ProtoRef and carrying its display name (short)
+// and description (long) as entity data, decoupled from the ref (MUDLIB §3). It has no
+// location — its container is the zone — and starts with empty contents. This is the
+// slice-1 inline authoring that slice 3 replaces with prototype spawning; callers wire
+// exits onto the returned Room component and register the entity in z.rooms.
+func (z *Zone) newRoom(ref ProtoRef, name, desc string) *Entity {
+	e := z.newEntity(ref)
+	e.short = name
+	e.long = desc
+	Add(e, &Room{exits: map[string]ProtoRef{}})
+	z.rooms[ref] = e
+	return e
+}
+
+// newDemoZone builds one of the hardcoded demo zones, authoring its rooms as entities
+// keyed by ProtoRef. midgaard's market has a cross-shard exit north into darkwood;
+// darkwood's grove leads back south. Phase 4's content loader replaces this function
+// body (prototype authoring) without touching callers.
 func newDemoZone(id string) *Zone {
 	z := newZone(id)
 	switch id {
 	case "darkwood":
-		grove := newRoom("grove", "A Moonlit Grove",
+		grove := z.newRoom("darkwood:room:grove", "A Moonlit Grove",
 			"Silver birches ring a still clearing; the air hums with quiet magic.")
-		hollow := newRoom("hollow", "A Dark Hollow",
+		hollow := z.newRoom("darkwood:room:hollow", "A Dark Hollow",
 			"The trees crowd close and the moonlight fails. Something rustles, unseen.")
-		grove.exits["south"] = "midgaard:market" // back across the shard boundary
-		grove.exits["north"] = "darkwood:hollow"
-		hollow.exits["south"] = "darkwood:grove"
-		z.rooms["grove"], z.rooms["hollow"] = grove, hollow
-		z.startRoom = "grove"
+		grove.room.exits["south"] = "midgaard:room:market" // back across the shard boundary
+		grove.room.exits["north"] = "darkwood:room:hollow"
+		hollow.room.exits["south"] = "darkwood:room:grove"
+		z.startRoom = "darkwood:room:grove"
 	default: // "midgaard"
-		temple := newRoom("temple", "The Temple Square",
+		temple := z.newRoom("midgaard:room:temple", "The Temple Square",
 			"A broad plaza of worn flagstones stretches before the great temple. "+
 				"Pilgrims murmur in the shade of its columns.")
-		market := newRoom("market", "Market Square",
+		market := z.newRoom("midgaard:room:market", "Market Square",
 			"Stalls crowd the square and merchants cry their wares over the din of haggling.")
-		temple.exits["north"] = "midgaard:market"
-		market.exits["south"] = "midgaard:temple"
-		market.exits["north"] = "darkwood:grove" // cross-shard exit
-		z.rooms["temple"], z.rooms["market"] = temple, market
-		z.startRoom = "temple"
+		temple.room.exits["north"] = "midgaard:room:market"
+		market.room.exits["south"] = "midgaard:room:temple"
+		market.room.exits["north"] = "darkwood:room:grove" // cross-shard exit
+		z.startRoom = "midgaard:room:temple"
 	}
 	return z
 }

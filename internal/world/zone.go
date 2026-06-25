@@ -32,11 +32,12 @@ const linkDeadGrace = 60 * time.Second
 // sequential and single-threaded.
 type Zone struct {
 	id        string
-	rooms     map[string]*Room
-	players   map[string]*player
-	startRoom string
-	inbox     chan msg     // message queue; the only ingress to zone state
-	log       *slog.Logger // scoped logger: component=zone, zone=<id>
+	rooms     map[ProtoRef]*Entity // room entities, keyed by their ProtoRef (MUDLIB §4)
+	players   map[string]*session  // connection state, keyed by character id
+	startRoom ProtoRef             // ProtoRef of the room a fresh login spawns in
+	rids      ridAllocator         // per-zone RuntimeID source for entities (identity.go)
+	inbox     chan msg             // message queue; the only ingress to zone state
+	log       *slog.Logger         // scoped logger: component=zone, zone=<id>
 
 	// shard, if set, is the world process hosting this zone. It is read (never
 	// mutated through this field) by the zone goroutine to learn its sibling zones for
@@ -64,9 +65,9 @@ type Zone struct {
 // the inbox a single typed channel while letting handle switch on concrete type.
 type msg interface{ zoneMsg() }
 
-// joinMsg adds a pre-built player to the zone directly. Used by tests; the network
-// path uses attachMsg (which creates or re-binds and then joins).
-type joinMsg struct{ p *player }
+// joinMsg adds a pre-built session (carrying its entity) to the zone directly. Used by
+// tests; the network path uses attachMsg (which creates or re-binds and then joins).
+type joinMsg struct{ s *session }
 
 // attachMsg binds a player's gRPC stream (its out channel) to a character. If the
 // character is unknown it creates and joins a new player; if it already exists
@@ -110,15 +111,15 @@ type reapMsg struct {
 // leaveMsg removes a player from the zone immediately.
 type leaveMsg struct{ id string }
 
-// transferInMsg hands an existing player struct from a sibling zone on the SAME shard
-// (an intra-shard cross-zone walk). The destination zone takes ownership: it places
-// the player in room, Stores itself into the player's currentZone pointer so input
-// now routes here, and shows the new room. The SAME out channel and appliedSeq are
+// transferInMsg hands an existing session (and its entity) from a sibling zone on the
+// SAME shard (an intra-shard cross-zone walk). The destination zone takes ownership: it
+// Moves the entity into room, Stores itself into the session's currentZone pointer so
+// input now routes here, and shows the new room. The SAME out channel and appliedSeq are
 // carried, so there is no snapshot, no epoch bump, no directory change — and replayed
 // in-flight input (forwarded by the source) still dedups by appliedSeq.
 type transferInMsg struct {
-	p    *player
-	room string
+	s    *session
+	room ProtoRef
 }
 
 // redirectMsg is posted back by the async handoff coordinator once the destination
@@ -143,7 +144,7 @@ type handoffFailMsg struct {
 // this zone and reply on the channel (nil on success). Posted by the Handoff server.
 type prepareMsg struct {
 	snap  *handoffv1.PlayerSnapshot
-	room  string
+	room  ProtoRef
 	epoch uint64
 	token string
 	reply chan error
@@ -175,8 +176,8 @@ func (pendingExpireMsg) zoneMsg() {}
 func newZone(id string) *Zone {
 	return &Zone{
 		id:         id,
-		rooms:      map[string]*Room{},
-		players:    map[string]*player{},
+		rooms:      map[ProtoRef]*Entity{},
+		players:    map[string]*session{},
 		forwarding: map[string]*Zone{},
 		inbox:      make(chan msg, 256),
 		// Scoped logger so every line this zone emits is tagged with its id; all
@@ -211,8 +212,8 @@ func (z *Zone) Run(ctx context.Context) {
 func (z *Zone) handle(m msg) {
 	switch v := m.(type) {
 	case joinMsg:
-		z.log.Debug("inbox: join", "player", v.p.id)
-		z.join(v.p)
+		z.log.Debug("inbox: join", "player", v.s.character)
+		z.join(v.s)
 	case attachMsg:
 		z.log.Debug("inbox: attach", "player", v.character)
 		z.attach(v.character, v.token, v.out, v.curZone)
@@ -246,8 +247,8 @@ func (z *Zone) handle(m msg) {
 // can run a second time (docs/PROTOCOL.md §5). Otherwise the high-water advances and
 // the line is dispatched.
 func (z *Zone) handleInput(v inputMsg) {
-	p := z.players[v.id]
-	if p == nil {
+	s := z.players[v.id]
+	if s == nil {
 		// The player may have just left via an intra-shard transfer while the separate
 		// reader-loop goroutine was still posting to this (source) zone. Re-post the line
 		// to the destination zone, which dedups by appliedSeq so it is neither lost nor
@@ -263,48 +264,56 @@ func (z *Zone) handleInput(v inputMsg) {
 		z.log.Debug("inbox: input for unknown player", "player", v.id)
 		return
 	}
-	if p.frozen {
+	if s.frozen {
 		// A cross-shard handoff is in progress: this shard no longer acts for the
 		// player. The gate buffers input typed during the redirect and replays it to
 		// the destination shard (PROTOCOL.md §5); applying it here would double-act.
 		z.log.Debug("input dropped: player frozen (handoff in progress)", "player", v.id, "seq", v.seq)
 		return
 	}
-	if v.seq != 0 && v.seq <= p.appliedSeq {
+	if v.seq != 0 && v.seq <= s.appliedSeq {
 		// Replay of an already-applied line: drop it. No dispatch, no output, so the
 		// command's side effects happen exactly once across a re-dial.
-		z.log.Debug("duplicate input dropped", "player", v.id, "seq", v.seq, "applied", p.appliedSeq)
+		z.log.Debug("duplicate input dropped", "player", v.id, "seq", v.seq, "applied", s.appliedSeq)
 		return
 	}
 	if v.seq != 0 {
-		p.appliedSeq = v.seq
+		s.appliedSeq = v.seq
 	}
 	z.log.Debug("inbox: input", "player", v.id, "seq", v.seq, "line", v.line)
-	z.dispatch(p, v.line)
+	z.dispatch(s, v.line)
 }
 
 // join places a newly connected player into the world: it picks a valid room
 // (falling back to the start room), registers the player, announces the arrival to
 // the room, shows the player their surroundings, and primes the prompt.
-func (z *Zone) join(p *player) {
-	if p.room == "" || z.rooms[p.room] == nil {
-		p.room = z.startRoom
+func (z *Zone) join(s *session) {
+	r := z.resolveRoom("") // fresh join always lands in the start room
+	z.players[s.character] = s
+	delete(z.forwarding, s.character) // present here again; no stale forward
+	Move(s.entity, r)
+	z.broadcast(r, s.character, s.entity.Name()+" arrives.")
+	z.lookRoom(s)
+	s.send(promptFrame())
+	z.log.Debug("player joined", "player", s.character, "room", r.proto, "population", len(z.players))
+}
+
+// resolveRoom returns the room entity for the given ProtoRef, falling back to the start
+// room when ref is empty or names no room this zone hosts. This is the single place the
+// old "if z.rooms[room] == nil { room = z.startRoom }" guard lives now that rooms are
+// entities keyed by ProtoRef.
+func (z *Zone) resolveRoom(ref ProtoRef) *Entity {
+	if r := z.rooms[ref]; r != nil {
+		return r
 	}
-	z.players[p.id] = p
-	delete(z.forwarding, p.id) // present here again; no stale forward
-	r := z.rooms[p.room]
-	r.occupants[p.id] = true
-	z.broadcast(r, p.id, p.name+" arrives.")
-	z.lookRoom(p)
-	p.send(promptFrame())
-	z.log.Debug("player joined", "player", p.id, "room", p.room, "population", len(z.players))
+	return z.rooms[z.startRoom]
 }
 
 // leave removes a player from the world: detaches them from their room, announces
 // the departure, and forgets them. Safe to call for an unknown id (no-op).
 func (z *Zone) leave(id string) {
-	p := z.players[id]
-	if p == nil {
+	s := z.players[id]
+	if s == nil {
 		// Clean disconnect for a player who has since transferred to a sibling zone:
 		// forward it to the current owner so the player is removed there, not leaked.
 		if dest := z.forwarding[id]; dest != nil {
@@ -314,12 +323,12 @@ func (z *Zone) leave(id string) {
 		z.log.Debug("leave: unknown player", "player", id)
 		return
 	}
-	if r := z.rooms[p.room]; r != nil {
-		delete(r.occupants, id)
-		z.broadcast(r, id, p.name+" leaves.")
+	if r := s.entity.location; r != nil {
+		z.broadcast(r, id, s.entity.Name()+" leaves.")
+		Move(s.entity, nil)
 	}
 	delete(z.players, id)
-	z.log.Debug("player left", "player", id, "room", p.room, "population", len(z.players))
+	z.log.Debug("player left", "player", id, "population", len(z.players))
 }
 
 // transferIn receives a player handed over from a sibling zone on the same shard (the
@@ -328,66 +337,66 @@ func (z *Zone) leave(id string) {
 // no snapshot, no epoch bump — registers it here, points its currentZone at this zone so
 // the reader loop now routes input to us, announces the arrival, and shows the room.
 func (z *Zone) transferIn(m transferInMsg) {
-	p := m.p
-	room := m.room
-	if z.rooms[room] == nil {
-		room = z.startRoom
-	}
-	p.room = room
-	z.players[p.id] = p
+	s := m.s
+	r := z.resolveRoom(m.room)
+	// The entity now belongs to this zone: re-home it (rid allocator, zone owner) so a
+	// future target reference resolves here, then place it in the destination room.
+	s.entity.zone = z
+	z.players[s.character] = s
 	// Clear any stale forwarding entry from a previous departure from THIS zone: the
 	// player is present here again, so handleInput will route to them directly.
-	delete(z.forwarding, p.id)
+	delete(z.forwarding, s.character)
 	// From now on the player's input belongs to this zone. The source already removed
 	// the player and set up forwarding for any line still in flight to it.
-	if p.currentZone != nil {
-		p.currentZone.Store(z)
+	if s.currentZone != nil {
+		s.currentZone.Store(z)
 	}
-	r := z.rooms[room]
-	r.occupants[p.id] = true
-	z.broadcast(r, p.id, p.name+" arrives.")
-	z.lookRoom(p)
-	p.send(promptFrame())
-	z.log.Debug("intra-shard transfer in", "player", p.id, "room", room,
-		"applied", p.appliedSeq, "population", len(z.players))
+	Move(s.entity, r)
+	z.broadcast(r, s.character, s.entity.Name()+" arrives.")
+	z.lookRoom(s)
+	s.send(promptFrame())
+	z.log.Debug("intra-shard transfer in", "player", s.character, "room", r.proto,
+		"applied", s.appliedSeq, "population", len(z.players))
 }
 
 // attach binds a stream's out channel to a character. A new character is created and
 // joined; an existing one (a re-dial or reconnect within the link-death window) is
-// re-bound to the *same* player, preserving appliedSeq so replayed input dedups
-// correctly. Either way an Attached frame goes out first; player.send stamps it with
+// re-bound to the *same* session, preserving appliedSeq so replayed input dedups
+// correctly. Either way an Attached frame goes out first; session.send stamps it with
 // the resume point (appliedSeq) via ServerFrame.ack_input_seq.
 func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, curZone *atomic.Pointer[Zone]) {
-	p := z.players[character]
+	s := z.players[character]
 	switch {
-	case p != nil && p.pending:
-		// Handoff bind: the gate re-dialed here after a Redirect. Activate the player
+	case s != nil && s.pending:
+		// Handoff bind: the gate re-dialed here after a Redirect. Activate the session
 		// Prepare rehydrated — this is the destination self-commit.
-		if token == "" || token != p.token {
+		if token == "" || token != s.token {
 			z.log.Warn("handoff bind rejected: token mismatch", "player", character)
 			out <- disconnectFrame("handoff token invalid")
 			return
 		}
 		if z.shard != nil {
-			z.shard.dropToken(p.token)
+			z.shard.dropToken(s.token)
 		}
-		p.out = out
-		p.currentZone = curZone
+		s.out = out
+		s.currentZone = curZone
 		if curZone != nil {
 			curZone.Store(z)
 		}
-		p.pending = false
-		p.frozen = false
-		p.attachGen++
-		p.send(attachedFrame(z.id)) // resume ack = appliedSeq carried in the snapshot
-		if r := z.rooms[p.room]; r != nil {
-			r.occupants[p.id] = true // only now does the player become visible in the room
-			z.broadcast(r, p.id, p.name+" arrives.")
+		s.pending = false
+		s.frozen = false
+		s.attachGen++
+		s.send(attachedFrame(z.id)) // resume ack = appliedSeq carried in the snapshot
+		// prepare parked the entity's location at the destination room WITHOUT adding it
+		// to the room contents (pending = invisible). Move now makes it visible.
+		if r := z.resolveRoom(s.entity.location.proto); r != nil {
+			Move(s.entity, r) // only now does the player become visible in the room
+			z.broadcast(r, character, s.entity.Name()+" arrives.")
 		}
-		z.lookRoom(p)
-		p.send(promptFrame())
+		z.lookRoom(s)
+		s.send(promptFrame())
 		z.log.Debug("handoff committed: player activated", "player", character,
-			"room", p.room, "applied", p.appliedSeq, "epoch", p.epoch)
+			"room", s.entity.location.proto, "applied", s.appliedSeq, "epoch", s.epoch)
 
 	case token != "":
 		// A handoff token was presented but no pending player matches it
@@ -397,36 +406,37 @@ func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, cur
 		out <- disconnectFrame("handoff token invalid")
 		return
 
-	case p != nil && p.frozen:
+	case s != nil && s.frozen:
 		// A re-dial to the SOURCE shard mid-handoff: the handoff owns the player.
 		// Re-binding would resume a frozen player and risk a both-own window. Reject.
 		z.log.Warn("attach rejected: character is mid-handoff (frozen)", "player", character)
 		out <- disconnectFrame("character is mid-transfer")
 		return
 
-	case p != nil:
-		// Re-attach (link-dead resume): re-bind the existing player, preserving state.
-		p.out = out
-		p.currentZone = curZone
+	case s != nil:
+		// Re-attach (link-dead resume): re-bind the existing session, preserving state.
+		s.out = out
+		s.currentZone = curZone
 		if curZone != nil {
 			curZone.Store(z)
 		}
-		p.detached = false
-		p.attachGen++
-		p.send(attachedFrame(z.id))
-		z.log.Debug("player re-attached", "player", character, "applied_seq", p.appliedSeq, "gen", p.attachGen)
-		z.lookRoom(p)
-		p.send(promptFrame())
+		s.detached = false
+		s.attachGen++
+		s.send(attachedFrame(z.id))
+		z.log.Debug("player re-attached", "player", character, "applied_seq", s.appliedSeq, "gen", s.attachGen)
+		z.lookRoom(s)
+		s.send(promptFrame())
 
 	default:
 		// Fresh login. epoch starts at 1 (initial ownership); each handoff bumps it.
-		p = &player{id: character, name: character, out: out, epoch: 1, currentZone: curZone}
+		s = &session{character: character, out: out, epoch: 1, currentZone: curZone}
+		z.newPlayerEntity(s, character)
 		if curZone != nil {
 			curZone.Store(z)
 		}
-		p.attachGen++
-		p.send(attachedFrame(z.id))
-		z.join(p) // registers, places, announces arrival, looks, prompts
+		s.attachGen++
+		s.send(attachedFrame(z.id))
+		z.join(s) // registers, places, announces arrival, looks, prompts
 	}
 }
 
@@ -462,36 +472,38 @@ func (z *Zone) prepare(m prepareMsg) {
 			return
 		}
 	}
-	room := m.room
-	if z.rooms[room] == nil {
-		room = z.startRoom
-	}
-	p := &player{
-		id:         character,
-		name:       m.snap.GetName(),
-		room:       room,
+	r := z.resolveRoom(m.room)
+	s := &session{
+		character:  character,
 		appliedSeq: m.snap.GetAppliedSeq(),
 		epoch:      m.epoch,
 		pending:    true,
 		token:      m.token,
 	}
-	z.players[character] = p
+	e := z.newPlayerEntity(s, character)
+	e.short = m.snap.GetName()
+	e.keywords = []string{m.snap.GetName()}
+	// Park the entity AT the destination room (location set) but NOT in its contents —
+	// a pending player is invisible until the gate's re-dial activates it (attach Moves
+	// it into the room then). location is how attach later recovers the destination room.
+	e.location = r
+	z.players[character] = s
 	if z.shard != nil {
 		// Index the token so a Play attach (the gate's re-dial) can route the bind to
 		// THIS zone even on a multi-zone shard.
 		z.shard.indexToken(m.token, z)
 	}
-	gen := p.attachGen
+	gen := s.attachGen
 	time.AfterFunc(pendingTTL, func() { z.post(pendingExpireMsg{id: character, gen: gen}) })
 	z.log.Debug("handoff prepared: pending player rehydrated", "player", character,
-		"room", room, "epoch", m.epoch, "applied", p.appliedSeq)
+		"room", r.proto, "epoch", m.epoch, "applied", s.appliedSeq)
 	m.reply <- nil
 }
 
 // abortPending discards a pending player by handoff token (the source cancelled).
 func (z *Zone) abortPending(token string) {
-	for id, p := range z.players {
-		if p.pending && p.token == token {
+	for id, s := range z.players {
+		if s.pending && s.token == token {
 			z.log.Debug("handoff aborted: discarding pending player", "player", id)
 			delete(z.players, id)
 			if z.shard != nil {
@@ -507,11 +519,11 @@ func (z *Zone) abortPending(token string) {
 // (A future refinement keeps it link-dead instead, since the directory still points
 // here — see PROTOCOL.md §5.)
 func (z *Zone) pendingExpire(id string, gen uint64) {
-	if p := z.players[id]; p != nil && p.pending && p.attachGen == gen {
+	if s := z.players[id]; s != nil && s.pending && s.attachGen == gen {
 		z.log.Debug("pending player expired (gate never bound)", "player", id)
 		delete(z.players, id)
 		if z.shard != nil {
-			z.shard.dropToken(p.token)
+			z.shard.dropToken(s.token)
 		}
 	}
 }
@@ -522,8 +534,8 @@ func (z *Zone) pendingExpire(id string, gen uint64) {
 // schedules a reap after the grace window (cancelled implicitly if it re-attaches and
 // bumps attachGen).
 func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
-	p := z.players[id]
-	if p == nil {
+	s := z.players[id]
+	if s == nil {
 		// The player transferred out of this zone (intra-shard walk) while the separate
 		// reader-loop goroutine still held the old currentZone, and the stream then
 		// dropped. Forward the link-loss to the new owner so IT runs link-death; dropping
@@ -534,23 +546,23 @@ func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
 		}
 		return
 	}
-	if p.out != out {
+	if s.out != out {
 		z.log.Debug("detach from superseded stream ignored", "player", id)
 		return
 	}
-	if p.frozen {
+	if s.frozen {
 		// Mid-handoff: the gate is re-dialing the destination shard. Do NOT remove the
 		// player — the handoff owns its fate (commit -> discard, abort -> thaw).
 		z.log.Debug("detach ignored: player frozen (handoff in progress)", "player", id)
 		return
 	}
-	if p.quitting {
+	if s.quitting {
 		z.log.Debug("clean quit, removing player", "player", id)
 		z.leave(id)
 		return
 	}
-	p.detached = true
-	gen := p.attachGen
+	s.detached = true
+	gen := s.attachGen
 	z.log.Debug("player link-dead", "player", id, "grace", linkDeadGrace)
 	time.AfterFunc(linkDeadGrace, func() { z.post(reapMsg{id: id, gen: gen}) })
 }
@@ -559,7 +571,7 @@ func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
 // generation check ensures a player that has since re-attached (bumping attachGen) is
 // not removed by a stale timer.
 func (z *Zone) reap(id string, gen uint64) {
-	if p := z.players[id]; p != nil && p.detached && p.attachGen == gen {
+	if s := z.players[id]; s != nil && s.detached && s.attachGen == gen {
 		z.log.Debug("reaping link-dead player", "player", id)
 		z.leave(id)
 	}
@@ -569,40 +581,44 @@ func (z *Zone) reap(id string, gen uint64) {
 // by the async handoff coordinator (Shard.beginHandoff) once the directory has
 // recorded the new owner; the player stays frozen until the gate re-attaches there.
 func (z *Zone) redirect(v redirectMsg) {
-	p := z.players[v.id]
-	if p == nil {
+	s := z.players[v.id]
+	if s == nil {
 		return
 	}
-	p.epoch = v.epoch
-	p.send(redirectFrame(v.targetAddr, v.token, v.resumeSeq))
+	s.epoch = v.epoch
+	s.send(redirectFrame(v.targetAddr, v.token, v.resumeSeq))
 	z.log.Debug("redirect sent", "player", v.id, "target", v.targetAddr, "epoch", v.epoch)
 }
 
 // handoffFailed thaws a player whose cross-shard move could not be initiated, so they
 // are not left stuck frozen.
 func (z *Zone) handoffFailed(v handoffFailMsg) {
-	p := z.players[v.id]
-	if p == nil {
+	s := z.players[v.id]
+	if s == nil {
 		return
 	}
-	p.frozen = false
+	s.frozen = false
 	z.log.Debug("handoff failed, thawing player", "player", v.id, "reason", v.reason)
-	p.send(textFrame("The way is barred. (" + v.reason + ")"))
-	p.send(promptFrame())
+	s.send(textFrame("The way is barred. (" + v.reason + ")"))
+	s.send(promptFrame())
 }
 
-// broadcast sends markup to every occupant of r except exceptID (the actor who
-// caused the event). Used for arrival/departure/say lines that others should see.
-func (z *Zone) broadcast(r *Room, exceptID, markup string) {
+// broadcast sends markup to every player-controlled occupant of room r except the actor
+// (exceptID), reached through each occupant entity's PlayerControlled session. Used for
+// arrival/departure/say lines that others should see. Walking r.contents (the uniform
+// containment tree, MUDLIB §4) replaces the old per-room occupant id set.
+func (z *Zone) broadcast(r *Entity, exceptID, markup string) {
 	n := 0
-	for id := range r.occupants {
-		if id == exceptID {
+	for _, occ := range r.contents {
+		pc, ok := Get[*PlayerControlled](occ)
+		if !ok || pc.session == nil {
+			continue // a mob or item: no session to send to
+		}
+		if pc.session.character == exceptID {
 			continue
 		}
-		if o := z.players[id]; o != nil {
-			o.send(textFrame(markup))
-			n++
-		}
+		pc.session.send(textFrame(markup))
+		n++
 	}
-	z.log.Debug("broadcast", "room", r.id, "except", exceptID, "recipients", n)
+	z.log.Debug("broadcast", "room", r.proto, "except", exceptID, "recipients", n)
 }

@@ -11,51 +11,57 @@ import (
 
 // White-box tests for the multiplayer paths the gRPC slice_test doesn't exercise:
 // arrival/departure broadcasts, say-to-others, who, and movement messaging. These
-// drive the zone actor directly via its inbox and read each player's out channel.
+// drive the zone actor directly via its inbox and read each session's out channel.
 
-func newTestPlayer(name string) *player {
-	return &player{id: name, name: name, out: make(chan *playv1.ServerFrame, 64)}
+// newTestPlayerEntity builds a session + its in-world entity in zone z (the post-split
+// successor to the old &player{...}), so white-box tests can join a player directly.
+// The entity is created through the zone (rid/owner wired) and linked to the session via
+// newPlayerEntity; epoch starts at 1 like a fresh login.
+func newTestPlayerEntity(z *Zone, name string) *session {
+	s := &session{character: name, out: make(chan *playv1.ServerFrame, 64), epoch: 1}
+	z.newPlayerEntity(s, name)
+	return s
 }
 
 // waitMarkup waits until an Output frame whose markup contains substr arrives,
 // skipping prompt/attached frames.
-func waitMarkup(t *testing.T, p *player, substr string) {
+func waitMarkup(t *testing.T, s *session, substr string) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case f := <-p.out:
+		case f := <-s.out:
 			if o := f.GetOutput(); o != nil && strings.Contains(o.GetMarkup(), substr) {
 				return
 			}
 		case <-deadline:
-			t.Fatalf("player %s: timed out waiting for %q", p.name, substr)
+			t.Fatalf("player %s: timed out waiting for %q", s.character, substr)
 		}
 	}
 }
 
 // nextOutput returns the markup of the next Output frame.
-func nextOutput(t *testing.T, p *player) string {
+func nextOutput(t *testing.T, s *session) string {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case f := <-p.out:
+		case f := <-s.out:
 			if o := f.GetOutput(); o != nil {
 				return o.GetMarkup()
 			}
 		case <-deadline:
-			t.Fatalf("player %s: timed out waiting for output", p.name)
+			t.Fatalf("player %s: timed out waiting for output", s.character)
 			return ""
 		}
 	}
 }
 
 // drain discards any currently-queued frames so a later assertion only sees new ones.
-func drain(p *player) {
+func drain(s *session) {
 	for {
 		select {
-		case <-p.out:
+		case <-s.out:
 		default:
 			return
 		}
@@ -68,15 +74,15 @@ func TestZoneMultiplayer(t *testing.T) {
 	defer cancel()
 	go z.Run(ctx)
 
-	alice := newTestPlayer("Alice")
-	bob := newTestPlayer("Bob")
+	alice := newTestPlayerEntity(z, "Alice")
+	bob := newTestPlayerEntity(z, "Bob")
 
 	// Alice joins, sees the temple.
-	z.post(joinMsg{p: alice})
+	z.post(joinMsg{s: alice})
 	waitMarkup(t, alice, "The Temple Square")
 
 	// Bob joins: Alice (already present) sees the arrival; Bob's look lists Alice.
-	z.post(joinMsg{p: bob})
+	z.post(joinMsg{s: bob})
 	waitMarkup(t, alice, "Bob arrives.")
 	waitMarkup(t, bob, "Alice is here.")
 

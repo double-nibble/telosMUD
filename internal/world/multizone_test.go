@@ -89,20 +89,21 @@ func TestIntraShardForwarding(t *testing.T) {
 	go src.Run(ctx)
 	go dst.Run(ctx)
 
-	// Place a player in midgaard:market, the room whose north exit crosses into
-	// darkwood:grove. Give it a currentZone pointer like a real connection so transferIn
-	// can repoint it.
+	// Place a player directly in midgaard's market, the room whose north exit crosses
+	// into darkwood's grove. Give it a currentZone pointer like a real connection so
+	// transferIn can repoint it. We use placeTestPlayer rather than joinMsg because join
+	// always lands a fresh player in the start room; this test needs it in market so the
+	// very next "north" triggers the cross-zone transfer.
 	var cur atomic.Pointer[Zone]
 	cur.Store(src)
-	p := &player{
-		id:          "Echo",
-		name:        "Echo",
-		room:        "market",
+	p := &session{
+		character:   "Echo",
 		out:         make(chan *playv1.ServerFrame, 64),
 		epoch:       1,
 		currentZone: &cur,
 	}
-	src.post(joinMsg{p: p})
+	src.newPlayerEntity(p, "Echo")
+	placeTestPlayer(t, src, p, "midgaard:room:market")
 	waitMarkup(t, p, "Market Square")
 
 	// Two inputs posted to the SOURCE zone in order. The first triggers the intra-shard
@@ -118,6 +119,16 @@ func TestIntraShardForwarding(t *testing.T) {
 	if cur.Load() != dst {
 		t.Fatalf("currentZone = %v, want darkwood", cur.Load().id)
 	}
+}
+
+// placeTestPlayer registers a pre-built session in zone z directly at the given room
+// ProtoRef and shows it the room — the white-box equivalent of a fresh join into a
+// specific (non-start) room, which join itself no longer allows. It reuses transferInMsg
+// (which resolves the room, registers the session, Moves its entity in, and looks) so the
+// placement goes through the real zone goroutine and exercises no special test path.
+func placeTestPlayer(t *testing.T, z *Zone, s *session, room ProtoRef) {
+	t.Helper()
+	z.post(transferInMsg{s: s, room: room})
 }
 
 // TestIntraShardWalkStress bounces one player across the same-shard zone boundary many
