@@ -71,6 +71,35 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Second shard: hosts the darkwood zone. The midgaard shard hands players off to
+  # it (and back) across the market<->grove cross-shard exit.
+  world-darkwood:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-world
+    environment:
+      TELOS_SERVICE: telos-world
+      TELOS_ENV: dev
+      TELOS_WORLD_LISTEN: ":9090"
+      TELOS_SHARD_ADDR: world-darkwood:9090
+      TELOS_ZONES: darkwood
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
+      TELOS_REDIS_ADDR: redis:6379
+      TELOS_NATS_URL: nats://nats:4222
+      DEBUG: true
+    expose:
+      - "9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
   gate:
     build:
       context: ..
@@ -81,11 +110,15 @@ services:
       TELOS_SERVICE: telos-gate
       TELOS_ENV: dev
       TELOS_GATE_LISTEN: ":4000"
-      TELOS_WORLD_TARGET: world:9090
+      TELOS_WORLD_TARGET: world:9090 # fallback if the directory is unreachable
+      TELOS_REDIS_ADDR: redis:6379 # directory: resolve the home shard on login
+      TELOS_ZONES: midgaard # players spawn in midgaard
       DEBUG: true
     ports:
       - "4000:4000" # telnet: connect with `telnet localhost 4000`
     depends_on:
       world:
+        condition: service_started
+      world-darkwood:
         condition: service_started
     restart: unless-stopped

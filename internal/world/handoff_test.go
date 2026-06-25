@@ -97,6 +97,81 @@ func TestCrossShardHandoff(t *testing.T) {
 	}
 }
 
+// TestCrossShardHandoffRoundTrip walks a player A->B->A. The return leg exercises the
+// fix for the architect's flagged bug: when B hands back, A still holds the player's
+// stale FROZEN copy from the outbound hop, so A.Prepare must discard it (lower epoch)
+// and rehydrate rather than reject with "already present".
+func TestCrossShardHandoffRoundTrip(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mr.Close)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	dir := directory.NewRedis(rdb, "test")
+
+	ctx := context.Background()
+	mustReg(t, dir.RegisterZone(ctx, "midgaard", "addr-a"))
+	mustReg(t, dir.RegisterZone(ctx, "darkwood", "addr-b"))
+
+	lisA := bufconn.Listen(1 << 20)
+	lisB := bufconn.Listen(1 << 20)
+	lisByAddr := map[string]*bufconn.Listener{"addr-a": lisA, "addr-b": lisB}
+	// One dialer both shards use to reach each other's Handoff service.
+	peers := func(addr string) (handoffv1.HandoffClient, error) {
+		lis := lisByAddr[addr]
+		if lis == nil {
+			return nil, fmt.Errorf("unknown shard %q", addr)
+		}
+		return handoffv1.NewHandoffClient(dialBuf(t, lis)), nil
+	}
+	aPlay := serveShard(t, NewShard("midgaard", "addr-a", dir, peers), lisA)
+	bPlay := serveShard(t, NewShard("darkwood", "addr-b", dir, peers), lisB)
+
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// --- outbound: A -> B ---
+	sA, err := aPlay.Connect(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(t, sA, attach("Strider"))
+	recvAttached(t, sA)
+	send(t, sA, inputSeq(1, "north")) // temple -> market
+	send(t, sA, inputSeq(2, "north")) // market -> darkwood
+	redirB := recvRedirect(t, sA)
+	if redirB.GetTargetShardAddr() != "addr-b" {
+		t.Fatalf("outbound redirect = %q, want addr-b", redirB.GetTargetShardAddr())
+	}
+	sB, err := bPlay.Connect(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(t, sB, attachWithToken("Strider", redirB.GetHandoffToken()))
+	recvAttached(t, sB)
+	recvUntilOutput(t, sB, "Moonlit Grove")
+
+	// --- return: B -> A (A still holds the frozen copy) ---
+	send(t, sB, inputSeq(3, "south")) // grove -> midgaard:market
+	redirA := recvRedirect(t, sB)
+	if redirA.GetTargetShardAddr() != "addr-a" {
+		t.Fatalf("return redirect = %q, want addr-a", redirA.GetTargetShardAddr())
+	}
+	sA2, err := aPlay.Connect(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(t, sA2, attachWithToken("Strider", redirA.GetHandoffToken()))
+	recvAttached(t, sA2)
+	recvUntilOutput(t, sA2, "Market Square") // back home in midgaard
+
+	if place, _ := dir.PlayerPlacement(ctx, "Strider"); place.ShardAddr != "addr-a" || place.Epoch != 3 {
+		t.Fatalf("placement = %+v, want {ShardAddr:addr-a Epoch:3}", place)
+	}
+}
+
 // TestHandoffBindRejectsUnknownToken guards the fix for a state-loss path: an Attach
 // carrying a handoff token but with no matching pending player must be rejected, not
 // silently spawn a fresh character.

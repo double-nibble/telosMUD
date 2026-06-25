@@ -342,14 +342,27 @@ func (z *Zone) prepare(m prepareMsg) {
 	if existing := z.players[character]; existing != nil {
 		switch {
 		case existing.pending && existing.token == m.token:
+			// Idempotent retry of the same Prepare.
 			z.log.Debug("handoff prepare: idempotent retry", "player", character)
 			m.reply <- nil
-		case existing.epoch >= m.epoch:
+			return
+		case m.epoch <= existing.epoch:
 			m.reply <- status.Errorf(codes.FailedPrecondition, "stale epoch %d <= current %d", m.epoch, existing.epoch)
+			return
+		case existing.frozen:
+			// A stale frozen copy left by a prior handoff AWAY from this shard, now
+			// superseded by a newer handoff BACK (m.epoch > existing.epoch). Monotonic
+			// epoch makes the return authoritative: discard the stale copy and rehydrate
+			// fresh below. This is what makes A<->B round trips work; a never-returned
+			// frozen copy is still GC'd later (freeze-timeout / discard signal, deferred).
+			z.log.Debug("discarding stale frozen copy for return handoff",
+				"player", character, "old_epoch", existing.epoch, "new_epoch", m.epoch)
+			delete(z.players, character)
 		default:
+			// A genuinely present (live) player with this id.
 			m.reply <- status.Errorf(codes.AlreadyExists, "character %q already present", character)
+			return
 		}
-		return
 	}
 	room := m.room
 	if z.rooms[room] == nil {
