@@ -60,7 +60,8 @@ func (z *Zone) lookRoom(p *player) {
 	b.WriteString(r.desc)
 	b.WriteByte('\n')
 	if ex := r.sortedExits(); len(ex) > 0 {
-		b.WriteString("Exits: " + strings.Join(ex, ", "))
+		b.WriteString("Exits: ")
+		b.WriteString(strings.Join(ex, ", "))
 	} else {
 		b.WriteString("Exits: none")
 	}
@@ -69,7 +70,9 @@ func (z *Zone) lookRoom(p *player) {
 			continue
 		}
 		if o := z.players[id]; o != nil {
-			b.WriteString("\n" + o.name + " is here.")
+			b.WriteByte('\n')
+			b.WriteString(o.name)
+			b.WriteString(" is here.")
 		}
 	}
 	p.send(textFrame(b.String()))
@@ -189,7 +192,9 @@ func (z *Zone) who(p *player) {
 	var b strings.Builder
 	b.WriteString("Players online:")
 	for _, o := range z.players {
-		b.WriteString("\n  " + o.name)
+		b.WriteByte('\n')
+		b.WriteByte(' ')
+		b.WriteString(o.name)
 	}
 	p.send(textFrame(b.String()))
 }
