@@ -58,6 +58,8 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -65,6 +67,11 @@ import (
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
+
+// maxNameLen caps the login name length. The name becomes the in-world entity
+// name and a targeting keyword, so it must be short enough to render and type. 20
+// runes is generous for a stand-in login (real auth/chargen lands in Phase 13).
+const maxNameLen = 20
 
 // Server accepts telnet connections and bridges them to world shards. It is
 // stateless beyond its live sockets: a listen address, the directory seam (initial
@@ -136,15 +143,28 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 	tc := telnet.New(nc)
 
 	// --- minimal login: read a name (stand-in for real auth) ---
-	_ = tc.Write("\r\nWelcome to TelosMUD.\r\nBy what name shall you be known? ")
-	name, err := tc.ReadLine()
-	if err != nil {
-		log.Debug("connection closed before login", "err", err)
-		return
-	}
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = "Wanderer"
+	// Loop until we get a name that is safe to render and safe to use as a
+	// targeting keyword; an unsafe name re-prompts rather than dropping the
+	// connection. ReadLine already strips control chars and caps length, but the
+	// keyword-grammar rules (no leading '.'/digit, no embedded '.') are gate
+	// policy and enforced here.
+	_ = tc.Write("\r\nWelcome to TelosMUD.\r\n")
+	var name string
+	for {
+		_ = tc.Write("By what name shall you be known? ")
+		line, err := tc.ReadLine()
+		if err != nil {
+			log.Debug("connection closed before login", "err", err)
+			return
+		}
+		candidate := strings.TrimSpace(line)
+		if reason, ok := validateName(candidate); !ok {
+			log.Debug("login name rejected", "reason", reason)
+			_ = tc.Write("\r\nThat name won't do: " + reason + "\r\n")
+			continue
+		}
+		name = candidate
+		break
 	}
 	log.Debug("login name received", "character", name)
 
@@ -528,4 +548,47 @@ func (s *Server) renderFrame(log *slog.Logger, tc *telnet.Conn, f *playv1.Server
 		// Ack only; nothing to show. The piggybacked ack_input_seq is the resume point.
 		log.Debug("frame rendered", "frame", "attached")
 	}
+}
+
+// validateName checks a login name is safe to render and to use as an in-world
+// targeting keyword. It returns (reason, false) for a rejected name (the reason is
+// shown to the player on re-prompt) or ("", true) for an accepted one.
+//
+// This is a deliberately minimal stopgap until Phase 13 real auth/chargen — just
+// enough that a name cannot inject into a terminal or confuse the targeting
+// grammar. The rules:
+//
+//   - non-empty after trimming;
+//   - at most maxNameLen runes (so it renders and types cleanly);
+//   - every rune printable and not a control rune (terminal-injection defense;
+//     ReadLine already strips controls, but a name is too load-bearing to assume
+//     that, and we also reject other non-graphic runes like odd spaces here);
+//   - no leading '.' and no embedded '.', because targeting parses `N.kw` /
+//     `all.kw` — a dotted name would split into a count/selector and a keyword;
+//   - no leading digit, because a leading digit reads as the `N.` count in `N.kw`.
+//
+// Letters, digits-after-the-first, and intra-name punctuation other than '.' are
+// allowed; this is intentionally permissive on charset beyond the grammar hazards.
+func validateName(name string) (string, bool) {
+	if name == "" {
+		return "a name is required", false
+	}
+	if utf8.RuneCountInString(name) > maxNameLen {
+		return "too long", false
+	}
+	if name[0] == '.' {
+		return "it can't start with a dot", false
+	}
+	if r, _ := utf8.DecodeRuneInString(name); unicode.IsDigit(r) {
+		return "it can't start with a digit", false
+	}
+	if strings.ContainsRune(name, '.') {
+		return "it can't contain a dot", false
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) || !unicode.IsPrint(r) {
+			return "it contains an invalid character", false
+		}
+	}
+	return "", true
 }
