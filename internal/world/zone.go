@@ -39,6 +39,12 @@ type Zone struct {
 	inbox     chan msg             // message queue; the only ingress to zone state
 	log       *slog.Logger         // scoped logger: component=zone, zone=<id>
 
+	// protos is the per-SHARD prototype cache (prototype.go), shared READ-ONLY across all
+	// the shard's zone goroutines. The zone reads it via spawn; it is never mutated after
+	// shard construction, so the cross-goroutine sharing needs no lock. A bare test zone
+	// (newZone alone) gets its own private cache so spawn still works standalone.
+	protos *protoCache
+
 	// shard, if set, is the world process hosting this zone. It is read (never
 	// mutated through this field) by the zone goroutine to learn its sibling zones for
 	// an intra-shard move and to populate/clear the shard token index. nil on a bare
@@ -180,6 +186,10 @@ func newZone(id string) *Zone {
 		players:    map[string]*session{},
 		forwarding: map[string]*Zone{},
 		inbox:      make(chan msg, 256),
+		// A private, empty prototype cache by default. A shard-hosted zone has this
+		// replaced with the shared per-shard cache (newShard); a bare test zone keeps its
+		// own so spawn works standalone.
+		protos: newProtoCache(),
 		// Scoped logger so every line this zone emits is tagged with its id; all
 		// the verbose control-flow tracing below goes through z.log at Debug.
 		log: slog.With("component", "zone", "zone", id),

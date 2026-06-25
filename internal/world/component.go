@@ -103,3 +103,89 @@ func Add[T Component](e *Entity, c T) {
 		e.living = v
 	}
 }
+
+// --- Component copy-on-write (MUDLIB §5) -----------------------------------------------
+//
+// A prototype-backed instance starts with the prototype's CANONICAL component pointers in
+// its comps map (and in the e.room/e.living hot fields): the component DATA is shared with
+// the prototype and every sibling instance. Before mutating a component, a caller takes a
+// mutable copy via mutableComponent, which performs copy-on-write the first time: it clones
+// the shared component (deep-copying its reference-typed fields), installs the clone on
+// THIS instance only, and returns it. Subsequent mutations of the same component on the
+// same instance see the already-owned clone and don't re-copy.
+//
+// "Still shared" is detected by pointer identity against the prototype's template
+// component: spawn aliases the exact pointer, and the COW clone replaces it, so identity
+// distinguishes shared-immutable from instance-owned. An entity with no prototype is always
+// already-owned (nothing to protect), so mutableComponent returns its component unchanged.
+
+// cloneComponent returns a deep-enough copy of c that mutating the copy cannot alias the
+// original: every reference-typed field (slice/map) is reallocated. A component type with
+// only value fields is copied by the shallow struct copy alone. New component types with
+// reference-typed fields MUST be handled here, or a COW of that component would alias the
+// prototype — the default panics loudly rather than silently sharing.
+func cloneComponent(c Component) Component {
+	switch v := c.(type) {
+	case *Room:
+		cp := *v // shallow copy of the value fields (sector, flags)
+		cp.exits = make(map[string]ProtoRef, len(v.exits))
+		for k, dst := range v.exits {
+			cp.exits[k] = dst
+		}
+		return &cp
+	case *Living:
+		cp := *v // all value fields; fighting is a live pointer, intentionally instance-set
+		return &cp
+	case *PlayerControlled:
+		cp := *v
+		if v.aliases != nil {
+			cp.aliases = make(map[string]string, len(v.aliases))
+			for k, val := range v.aliases {
+				cp.aliases[k] = val
+			}
+		}
+		return &cp
+	case *Physical:
+		cp := *v
+		return &cp
+	case *Container:
+		cp := *v
+		return &cp
+	case *Wearable:
+		cp := *v
+		return &cp
+	case *Weapon:
+		cp := *v
+		return &cp
+	default:
+		panic("world: cloneComponent missing case for " + reflect.TypeOf(c).String() +
+			" — a COW of this component would alias the prototype")
+	}
+}
+
+// mutableComponent returns the instance's own copy of its component of type T, performing
+// copy-on-write the first time (component.go preamble). The caller mutates the returned
+// pointer freely: the write lands only on this instance, never on the prototype or a
+// sibling. Panics if the entity has no component of type T (mirrors Must — use only where
+// presence is invariant-guaranteed, e.g. mutating a room's exits on a known room entity).
+func mutableComponent[T Component](e *Entity) T {
+	cur := Must[T](e)
+	if e.prototype == nil {
+		return cur // no prototype to protect: already instance-owned
+	}
+	if shared, ok := e.prototype.comps[reflect.TypeFor[T]()]; ok && any(cur) == any(shared) {
+		// Still aliased to the prototype's template component: clone it onto this instance.
+		owned := cloneComponent(cur).(T)
+		Add(e, owned) // replaces the comps entry AND re-promotes the *Room/*Living hot pointer
+		e.zone.log.Debug("cow: component", "rid", e.rid, "proto", e.proto,
+			"kind", reflect.TypeFor[T]().String())
+		return owned
+	}
+	return cur // already instance-owned (COW'd earlier, or never shared)
+}
+
+// mutableRoom is the hot-path COW shortcut for a room entity's Room component (MUDLIB §3
+// escape hatch + §5 COW): it returns an instance-owned *Room whose exits map may be safely
+// mutated, copying-on-write off the prototype the first time. Equivalent to
+// mutableComponent[*Room](e) but named for the common movement/builder call site.
+func mutableRoom(e *Entity) *Room { return mutableComponent[*Room](e) }

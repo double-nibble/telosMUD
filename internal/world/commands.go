@@ -103,7 +103,7 @@ func (z *Zone) lookRoom(s *session) {
 	var b strings.Builder
 	b.WriteString(r.Name())
 	b.WriteByte('\n')
-	b.WriteString(r.long)
+	b.WriteString(r.Long())
 	b.WriteByte('\n')
 	if ex := room.sortedExits(); len(ex) > 0 {
 		b.WriteString("Exits: ")

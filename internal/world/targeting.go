@@ -149,7 +149,7 @@ func (ts TargetSpec) matches(e *Entity) bool {
 	}
 	for _, word := range ts.keywords {
 		hit := false
-		for _, kw := range e.keywords {
+		for _, kw := range e.keywordList() {
 			if len(word) <= len(kw) && strings.EqualFold(kw[:len(word)], word) {
 				hit = true
 				break

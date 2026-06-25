@@ -22,6 +22,7 @@ package world
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"sync"
 
 	"google.golang.org/grpc"
@@ -98,8 +99,13 @@ func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDia
 		peers:      peers,
 		tokenIndex: map[string]*Zone{},
 	}
+	// Build the per-shard prototype cache ONCE here, before any zone goroutine runs
+	// (prototype.go). It is shared read-only across every hosted zone, so the flyweight
+	// pays off across the whole process and the cross-goroutine sharing needs no lock —
+	// it is published immutable. After this loop nothing mutates the cache or a *Prototype.
+	protos := newProtoCache()
 	for _, id := range zoneIDs {
-		z := newDemoZone(id)
+		z := newDemoZone(id, protos)
 		z.shard = s
 		z.handoff = s.beginHandoff
 		s.zones[id] = z
@@ -258,47 +264,101 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 	}()
 }
 
-// newRoom authors one room ENTITY (docs/MUDLIB.md §2, §4): an Entity with a Room
-// component, keyed in the zone by its ProtoRef and carrying its display name (short)
-// and description (long) as entity data, decoupled from the ref (MUDLIB §3). It has no
-// location — its container is the zone — and starts with empty contents. This is the
-// slice-1 inline authoring that slice 3 replaces with prototype spawning; callers wire
-// exits onto the returned Room component and register the entity in z.rooms.
-func (z *Zone) newRoom(ref ProtoRef, name, desc string) *Entity {
-	e := z.newEntity(ref)
-	e.short = name
-	e.long = desc
-	Add(e, &Room{exits: map[string]ProtoRef{}})
+// defineRoom authors one room PROTOTYPE (docs/MUDLIB.md §5) into the shard's cache: an
+// immutable template carrying the room's display name (short), description (long), and a
+// Room component template with an exits map. The exits map is part of the immutable
+// template — it is populated HERE at authoring time and never mutated afterward (an
+// instance that re-routes an exit COWs it via mutableRoom). Returns the prototype so the
+// caller can wire its exits before any instance is spawned.
+func defineRoom(c *protoCache, ref ProtoRef, name, desc string) *Prototype {
+	comps := componentSet{}
+	r := &Room{exits: map[string]ProtoRef{}}
+	comps[reflect.TypeFor[*Room]()] = r
+	return c.define(ref, nil, name, desc, comps)
+}
+
+// spawnRoom instantiates a room prototype into zone z and registers it in z.rooms (MUDLIB
+// §4: a room is an Entity with a Room component and no location, its container the zone).
+// Rooms are singletons — one instance per ref — so they share the prototype's immutable
+// exits/name/desc by reference until something COWs them (nothing does in the demo).
+func (z *Zone) spawnRoom(ref ProtoRef) *Entity {
+	e := z.spawn(ref)
 	z.rooms[ref] = e
 	return e
 }
 
-// newDemoZone builds one of the hardcoded demo zones, authoring its rooms as entities
-// keyed by ProtoRef. midgaard's market has a cross-shard exit north into darkwood;
-// darkwood's grove leads back south. Phase 4's content loader replaces this function
-// body (prototype authoring) without touching callers.
-func newDemoZone(id string) *Zone {
+// newDemoZone builds one of the hardcoded demo zones from PROTOTYPES (docs/MUDLIB.md §5).
+// It authors the zone's room/item/mob prototypes into the shared per-shard cache (passed
+// in by newShard, built once before any zone runs), then spawns instances: one instance
+// per room (singletons), and SEVERAL instances of an item/mob prototype into a room so the
+// flyweight is genuinely exercised — 40 identical kobolds would be 40 thin headers over one
+// template. Phase 4's content loader replaces this authoring body without touching callers.
+//
+// midgaard's market has a cross-shard exit north into darkwood; darkwood's grove leads back
+// south. Exits live on the room PROTOTYPE (defineRoom), wired at authoring time; the spawned
+// singleton room shares that immutable exits map.
+func newDemoZone(id string, protos *protoCache) *Zone {
 	z := newZone(id)
+	z.protos = protos // share the per-shard cache (replaces the private one from newZone)
 	switch id {
 	case "darkwood":
-		grove := z.newRoom("darkwood:room:grove", "A Moonlit Grove",
+		grove := defineRoom(protos, "darkwood:room:grove", "A Moonlit Grove",
 			"Silver birches ring a still clearing; the air hums with quiet magic.")
-		hollow := z.newRoom("darkwood:room:hollow", "A Dark Hollow",
+		hollow := defineRoom(protos, "darkwood:room:hollow", "A Dark Hollow",
 			"The trees crowd close and the moonlight fails. Something rustles, unseen.")
-		grove.room.exits["south"] = "midgaard:room:market" // back across the shard boundary
-		grove.room.exits["north"] = "darkwood:room:hollow"
-		hollow.room.exits["south"] = "darkwood:room:grove"
+		grove.exits()["south"] = "midgaard:room:market" // back across the shard boundary
+		grove.exits()["north"] = "darkwood:room:hollow"
+		hollow.exits()["south"] = "darkwood:room:grove"
+
+		z.spawnRoom("darkwood:room:grove")
+		z.spawnRoom("darkwood:room:hollow")
 		z.startRoom = "darkwood:room:grove"
 	default: // "midgaard"
-		temple := z.newRoom("midgaard:room:temple", "The Temple Square",
+		temple := defineRoom(protos, "midgaard:room:temple", "The Temple Square",
 			"A broad plaza of worn flagstones stretches before the great temple. "+
 				"Pilgrims murmur in the shade of its columns.")
-		market := z.newRoom("midgaard:room:market", "Market Square",
+		market := defineRoom(protos, "midgaard:room:market", "Market Square",
 			"Stalls crowd the square and merchants cry their wares over the din of haggling.")
-		temple.room.exits["north"] = "midgaard:room:market"
-		market.room.exits["south"] = "midgaard:room:temple"
-		market.room.exits["north"] = "darkwood:room:grove" // cross-shard exit
+		temple.exits()["north"] = "midgaard:room:market"
+		market.exits()["south"] = "midgaard:room:temple"
+		market.exits()["north"] = "darkwood:room:grove" // cross-shard exit
+
+		z.spawnRoom("midgaard:room:temple")
+		z.spawnRoom("midgaard:room:market")
 		z.startRoom = "midgaard:room:temple"
+
+		// A spawnable, non-room prototype and a herd of instances over it — the flyweight
+		// proof (MUDLIB §5). Each torch is a thin delta over the one shared template; they
+		// share keywords/short/long and the Physical component by reference until COW'd.
+		// They are placed on the MARKET floor as ground items (not the temple/start room, so
+		// the targeting tests' item counts are unchanged). Slice-4 commands make them
+		// gettable; here they only need to exist and render nothing player-facing new
+		// (lookRoom lists only player occupants, not ground items, this phase).
+		defineTorch(protos)
+		marketEntity := z.rooms["midgaard:room:market"]
+		for i := 0; i < demoTorchCount; i++ {
+			Move(z.spawn("midgaard:obj:torch"), marketEntity)
+		}
 	}
 	return z
+}
+
+// demoTorchCount is how many identical torch instances the demo spawns from the single
+// torch prototype, so the flyweight + COW behaviour is exercised by a real herd rather than
+// hypothetically. Kept small (player-facing output is unchanged: items don't render in the
+// slice-1/2 look until slice-4 commands surface them).
+const demoTorchCount = 5
+
+// defineTorch authors a simple item prototype: a torch with keywords/short/long and a
+// Physical component (mass/material). The immutable template is shared by every spawned
+// instance until one COWs a field. Items become functional (get/drop/wear) in slice 4; here
+// the prototype exists to make the flyweight provable.
+func defineTorch(c *protoCache) *Prototype {
+	comps := componentSet{}
+	comps[reflect.TypeFor[*Physical]()] = &Physical{weight: 2, material: "wood"}
+	return c.define("midgaard:obj:torch",
+		[]string{"torch", "wooden"},
+		"a wooden torch",
+		"A wooden torch lies here, its pitch cold.",
+		comps)
 }
