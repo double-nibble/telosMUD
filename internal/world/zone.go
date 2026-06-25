@@ -292,7 +292,7 @@ func (z *Zone) join(s *session) {
 	z.players[s.character] = s
 	delete(z.forwarding, s.character) // present here again; no stale forward
 	Move(s.entity, r)
-	z.broadcast(r, s.character, s.entity.Name()+" arrives.")
+	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
 	z.lookRoom(s)
 	s.send(promptFrame())
 	z.log.Debug("player joined", "player", s.character, "room", r.proto, "population", len(z.players))
@@ -324,7 +324,7 @@ func (z *Zone) leave(id string) {
 		return
 	}
 	if r := s.entity.location; r != nil {
-		z.broadcast(r, id, s.entity.Name()+" leaves.")
+		z.act("$n leaves.", s.entity, nil, nil, "", "", ToRoom)
 		Move(s.entity, nil)
 	}
 	delete(z.players, id)
@@ -352,7 +352,7 @@ func (z *Zone) transferIn(m transferInMsg) {
 		s.currentZone.Store(z)
 	}
 	Move(s.entity, r)
-	z.broadcast(r, s.character, s.entity.Name()+" arrives.")
+	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
 	z.lookRoom(s)
 	s.send(promptFrame())
 	z.log.Debug("intra-shard transfer in", "player", s.character, "room", r.proto,
@@ -391,7 +391,7 @@ func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, cur
 		// to the room contents (pending = invisible). Move now makes it visible.
 		if r := z.resolveRoom(s.entity.location.proto); r != nil {
 			Move(s.entity, r) // only now does the player become visible in the room
-			z.broadcast(r, character, s.entity.Name()+" arrives.")
+			z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
 		}
 		z.lookRoom(s)
 		s.send(promptFrame())
@@ -603,22 +603,7 @@ func (z *Zone) handoffFailed(v handoffFailMsg) {
 	s.send(promptFrame())
 }
 
-// broadcast sends markup to every player-controlled occupant of room r except the actor
-// (exceptID), reached through each occupant entity's PlayerControlled session. Used for
-// arrival/departure/say lines that others should see. Walking r.contents (the uniform
-// containment tree, MUDLIB §4) replaces the old per-room occupant id set.
-func (z *Zone) broadcast(r *Entity, exceptID, markup string) {
-	n := 0
-	for _, occ := range r.contents {
-		pc, ok := Get[*PlayerControlled](occ)
-		if !ok || pc.session == nil {
-			continue // a mob or item: no session to send to
-		}
-		if pc.session.character == exceptID {
-			continue
-		}
-		pc.session.send(textFrame(markup))
-		n++
-	}
-	z.log.Debug("broadcast", "room", r.proto, "except", exceptID, "recipients", n)
-}
+// Arrival/departure/say lines that others should see now flow through Zone.act
+// (act.go) — one perspective-aware call replaces the old broadcast helper. act walks
+// the same uniform containment tree (room.contents, MUDLIB §4) and reaches each player
+// through its PlayerControlled session sink, so the bystander text is unchanged.

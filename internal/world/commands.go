@@ -2,54 +2,94 @@ package world
 
 import "strings"
 
-// dispatch parses and runs one line of player input. It is called only from the zone
-// goroutine (via handle -> inputMsg), so every verb handler below mutates zone state
-// lock-free. Slice 1 keeps the hardcoded switch from Phase 1; the real parser/registry
-// (alias expansion, abbreviation, command tables) is slice 2 (docs/MUDLIB.md §6). The
-// handlers now operate on the session's in-world Entity (s.entity) and its containment
-// tree rather than the old player.room string.
+// Verb handlers and the base command table (docs/MUDLIB.md §6). The parser/registry and
+// the dispatch loop live in parser.go; this file holds registerCommands (the priority-
+// ordered base table) and the handlers themselves. Each handler runs on the zone
+// goroutine via dispatch, so it mutates zone state lock-free (MUDLIB §4).
 //
-// Every path ends by sending a fresh prompt, except "quit" — which sends a disconnect
-// instead and lets the stream close.
-func (z *Zone) dispatch(s *session, line string) {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		// Blank line: just re-prompt.
-		s.send(promptFrame())
-		return
-	}
+// The handlers preserve every external behavior the slice-1 hardcoded switch produced:
+// the text players see for look/say/who/move/quit is byte-for-byte unchanged. Broadcast
+// lines (say/arrive/leave/depart) now flow through act() perspective messaging (act.go)
+// rather than ad-hoc broadcast strings, but render the SAME text.
 
-	verb, rest := split(line)
-	z.log.Debug("dispatch", "player", s.character, "verb", strings.ToLower(verb), "line", line)
-	switch strings.ToLower(verb) {
-	case "look", "l":
-		z.lookRoom(s)
-	case "say", "'":
-		z.say(s, rest)
-	case "who":
-		z.who(s)
-	case "quit":
-		z.log.Debug("player quit", "player", s.character)
-		// Mark a clean, intentional disconnect so when the stream drops the zone
-		// removes the player immediately instead of waiting out the link-death grace.
-		s.quitting = true
-		s.send(textFrame("Farewell."))
-		s.send(disconnectFrame("quit"))
-		return // no prompt; the stream will close
-	case "north", "south", "east", "west", "up", "down",
-		"n", "s", "e", "w", "u", "d":
-		if z.move(s, canonDir(verb)) {
-			// move released ownership of s/its entity: an intra-shard transfer handed them
-			// to another zone goroutine, or a cross-shard handoff froze the session. This
-			// goroutine must not read or write s/its entity again (the new owner now does)
-			// — and the prompt is the destination's job. Returning here keeps single-writer.
-			return
+// registerCommands returns the base command set in PRIORITY order (MUDLIB §6): index 0 is
+// highest priority, so a typed prefix that collides resolves to the earlier entry. This
+// ordering is the single source of the abbreviation rule — movement and the common verbs
+// come first so "n"->north, "l"->look, never a rarer verb. Built once into baseTable
+// (parser.go); the active-table stack would layer on top in a later phase.
+//
+// Movement verbs are registered with their canonical names and single-letter aliases; the
+// handler routes to z.move (unchanged handoff/transfer logic) and flags ctx.moved when
+// move released ownership, so dispatch honors the early-return invariant.
+func registerCommands() []*Command {
+	mv := func(dir string) func(*Context) error {
+		return func(c *Context) error {
+			if c.z.move(c.s, dir) {
+				c.moved = true // move released ownership: dispatch must not re-prompt
+			}
+			return nil
 		}
-	default:
-		z.log.Debug("unknown verb", "player", s.character, "verb", strings.ToLower(verb))
-		s.send(textFrame("Huh?"))
 	}
-	s.send(promptFrame())
+	return []*Command{
+		// Movement first: highest priority so single letters resolve to directions.
+		{Name: "north", Aliases: []string{"n"}, Run: mv("north")},
+		{Name: "south", Aliases: []string{"s"}, Run: mv("south")},
+		{Name: "east", Aliases: []string{"e"}, Run: mv("east")},
+		{Name: "west", Aliases: []string{"w"}, Run: mv("west")},
+		{Name: "up", Aliases: []string{"u"}, Run: mv("up")},
+		{Name: "down", Aliases: []string{"d"}, Run: mv("down")},
+		// Common verbs next.
+		{Name: "look", Aliases: []string{"l"}, Run: cmdLook},
+		{Name: "say", Aliases: []string{"'"}, Run: cmdSay},
+		{Name: "who", Run: cmdWho},
+		{Name: "quit", Run: cmdQuit},
+	}
+}
+
+// cmdLook shows the actor their current room (MUDLIB §6). Slice 2 keeps look's behavior
+// identical to slice 1: it always describes the room (targeted `look <thing>` is a slice-4
+// concern once items exist). Routes to the existing lookRoom so the output is unchanged.
+func cmdLook(c *Context) error {
+	c.z.lookRoom(c.s)
+	return nil
+}
+
+// cmdSay echoes a message to the actor and broadcasts it to everyone else in the room.
+// The literal say text is passed as the $t arg, so a '%' or '$' inside it is rendered
+// verbatim (no format-string interpretation, act.go).
+func cmdSay(c *Context) error {
+	what := strings.TrimSpace(c.Rest())
+	if what == "" {
+		c.Send("Say what?")
+		return nil
+	}
+	// Two perspectives: the speaker sees "You say", bystanders see "<Name> says". The
+	// say string is data ($t), never a template.
+	c.z.act("You say, '$t'", c.Actor, nil, nil, what, "", ToActor)
+	c.z.act("$n says, '$t'", c.Actor, nil, nil, what, "", ToRoom)
+	return nil
+}
+
+// cmdWho lists every player currently online in the zone (MUDLIB §6). Unchanged output.
+func cmdWho(c *Context) error {
+	c.z.who(c.s)
+	return nil
+}
+
+// cmdQuit marks a clean, intentional disconnect and closes the stream (MUDLIB §6).
+// Behavior preserved from slice 1: it sets quitting, sends "Farewell." + a disconnect,
+// and sends NO prompt. It signals dispatch to skip the prompt by flagging ctx.moved —
+// the same early-return path movement uses — because after a quit the stream closes and
+// the actor must not be re-prompted.
+func cmdQuit(c *Context) error {
+	c.z.log.Debug("player quit", "player", c.s.character)
+	// Mark a clean, intentional disconnect so when the stream drops the zone removes the
+	// player immediately instead of waiting out the link-death grace.
+	c.s.quitting = true
+	c.s.send(textFrame("Farewell."))
+	c.s.send(disconnectFrame("quit"))
+	c.moved = true // suppress the prompt; the stream will close
+	return nil
 }
 
 // lookRoom sends the actor the current room's name, description, exits, and the other
@@ -75,6 +115,9 @@ func (z *Zone) lookRoom(s *session) {
 		if occ == e {
 			continue
 		}
+		// TODO(phase5-visibility): route this presence/name disclosure through canSee/
+		// nameFor once dark/invis flags exist — this is a second path past the canSee
+		// chokepoint (see who()), not just act()/targeting.
 		if Has[*PlayerControlled](occ) {
 			b.WriteByte('\n')
 			b.WriteString(occ.Name())
@@ -82,17 +125,6 @@ func (z *Zone) lookRoom(s *session) {
 		}
 	}
 	s.send(textFrame(b.String()))
-}
-
-// say echoes a message to the actor and broadcasts it to everyone else in the room.
-func (z *Zone) say(s *session, what string) {
-	what = strings.TrimSpace(what)
-	if what == "" {
-		s.send(textFrame("Say what?"))
-		return
-	}
-	s.send(textFrame("You say, '" + what + "'"))
-	z.broadcast(s.entity.location, s.character, s.entity.Name()+" says, '"+what+"'")
 }
 
 // move walks the player through an exit: it validates the direction, detaches the
@@ -105,6 +137,11 @@ func (z *Zone) say(s *session, what string) {
 // s/its entity again: the new owner will, and re-reading here would be a data race /
 // double-prompt. All in-zone outcomes (bad direction, sealed boundary, plain local move)
 // return false so dispatch re-prompts normally.
+//
+// Slice 2 leaves move's handoff/transfer logic and the released-ownership contract
+// untouched; only the departure/arrival broadcast strings now flow through act() (same
+// text). dir is already canonical here (the registry binds each movement command to its
+// canonical direction).
 func (z *Zone) move(s *session, dir string) bool {
 	if dir == "" {
 		s.send(textFrame("Go where?"))
@@ -144,7 +181,7 @@ func (z *Zone) move(s *session, dir string) bool {
 		// The player has departed this room: detach the entity from the room so they
 		// don't linger as a ghost others can see while the handoff is in flight. (The
 		// frozen session/entity itself is GC'd later, once a discard signal lands.)
-		z.broadcast(from, s.character, s.entity.Name()+" departs "+dir+".")
+		z.act("$n departs "+dir+".", s.entity, nil, nil, "", "", ToRoom)
 		Move(s.entity, nil)
 		z.log.Debug("cross-shard move initiated", "player", s.character,
 			"dest_zone", destZone, "dest_room", destRoom, "epoch", s.epoch)
@@ -160,9 +197,9 @@ func (z *Zone) move(s *session, dir string) bool {
 		s.send(textFrame("You can't go that way."))
 		return false
 	}
-	z.broadcast(from, s.character, s.entity.Name()+" leaves "+dir+".")
+	z.act("$n leaves "+dir+".", s.entity, nil, nil, "", "", ToRoom) // announced from `from`
 	Move(s.entity, to)
-	z.broadcast(to, s.character, s.entity.Name()+" arrives.")
+	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom) // announced from `to`
 	z.lookRoom(s)
 	z.log.Debug("player moved", "player", s.character, "dir", dir, "from", from.proto, "to", destRoom)
 	return false
@@ -180,7 +217,7 @@ func (z *Zone) move(s *session, dir string) bool {
 // goroutine touches the session/entity. The brief overlap is bounded by handing them off
 // through the inbox, never by sharing them across two live owners.
 func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string, from *Entity) {
-	z.broadcast(from, s.character, s.entity.Name()+" leaves "+dir+".")
+	z.act("$n leaves "+dir+".", s.entity, nil, nil, "", "", ToRoom)
 	Move(s.entity, nil) // detach from the source room before handing off
 	delete(z.players, s.character)
 	// Forward in-flight input to dest until the reader loop observes the new
@@ -195,39 +232,12 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 func (z *Zone) who(s *session) {
 	var b strings.Builder
 	b.WriteString("Players online:")
+	// TODO(phase5-visibility): this online list discloses presence/name bypassing the
+	// canSee chokepoint; honor anonymity/invis flags here when they land.
 	for _, o := range z.players {
 		b.WriteByte('\n')
 		b.WriteByte(' ')
 		b.WriteString(o.entity.Name())
 	}
 	s.send(textFrame(b.String()))
-}
-
-// split returns the first whitespace-delimited word and the trimmed remainder.
-func split(line string) (verb, rest string) {
-	i := strings.IndexFunc(line, func(r rune) bool { return r == ' ' || r == '\t' })
-	if i < 0 {
-		return line, ""
-	}
-	return line[:i], strings.TrimSpace(line[i+1:])
-}
-
-// canonDir maps a movement verb or its abbreviation to its canonical direction,
-// returning "" for anything unrecognized.
-func canonDir(s string) string {
-	switch strings.ToLower(s) {
-	case "n", "north":
-		return "north"
-	case "s", "south":
-		return "south"
-	case "e", "east":
-		return "east"
-	case "w", "west":
-		return "west"
-	case "u", "up":
-		return "up"
-	case "d", "down":
-		return "down"
-	}
-	return ""
 }
