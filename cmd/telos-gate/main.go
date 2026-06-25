@@ -88,18 +88,24 @@ type loginDirectory struct {
 }
 
 func (d loginDirectory) ShardForCharacter(characterID string) (string, bool) {
-	addr, err := d.redis.ShardForZone(context.Background(), d.homeZone)
-	if err != nil || addr == "" {
-		slog.Debug("login directory fallback",
-			"component", "gate", "character", characterID,
-			"home_zone", d.homeZone, "err", err, "fallback", d.fallback)
-		if d.fallback == "" {
-			return "", false
+	ctx := context.Background()
+	// Two hops: which shard owns the home zone, then where that shard is reachable.
+	shardID, err := d.redis.ShardForZone(ctx, d.homeZone)
+	if err == nil && shardID != "" {
+		if endpoint, eerr := d.redis.EndpointForShard(ctx, shardID); eerr == nil && endpoint != "" {
+			slog.Debug("login directory resolved",
+				"component", "gate", "character", characterID,
+				"home_zone", d.homeZone, "shard_id", shardID, "endpoint", endpoint)
+			return endpoint, true
+		} else {
+			err = eerr
 		}
-		return d.fallback, true
 	}
-	slog.Debug("login directory resolved",
+	slog.Debug("login directory fallback",
 		"component", "gate", "character", characterID,
-		"home_zone", d.homeZone, "addr", addr)
-	return addr, true
+		"home_zone", d.homeZone, "shard_id", shardID, "err", err, "fallback", d.fallback)
+	if d.fallback == "" {
+		return "", false
+	}
+	return d.fallback, true
 }

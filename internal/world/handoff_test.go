@@ -36,8 +36,12 @@ func TestCrossShardHandoff(t *testing.T) {
 	dir := directory.NewRedis(rdb, "test")
 
 	ctx := context.Background()
-	mustReg(t, dir.RegisterZone(ctx, "midgaard", "addr-a"))
-	mustReg(t, dir.RegisterZone(ctx, "darkwood", "addr-b"))
+	// Publish each shard's id -> endpoint, then lease each zone to a shard id. Routing
+	// resolves zone -> shard id -> endpoint, so the peer dialer is still keyed by address.
+	mustReg(t, dir.RegisterShard(ctx, "shard-a", "addr-a", directory.DefaultShardLease))
+	mustReg(t, dir.RegisterShard(ctx, "shard-b", "addr-b", directory.DefaultShardLease))
+	mustReg(t, dir.RegisterZone(ctx, "midgaard", "shard-a"))
+	mustReg(t, dir.RegisterZone(ctx, "darkwood", "shard-b"))
 
 	// Destination shard B runs first so A can reach its Handoff service.
 	lisB := bufconn.Listen(1 << 20)
@@ -92,8 +96,8 @@ func TestCrossShardHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if place.ShardAddr != "addr-b" || place.Epoch != 2 {
-		t.Fatalf("placement = %+v, want {ShardAddr:addr-b Epoch:2}", place)
+	if place.ShardID != "shard-b" || place.Epoch != 2 {
+		t.Fatalf("placement = %+v, want {ShardID:shard-b Epoch:2}", place)
 	}
 }
 
@@ -112,8 +116,12 @@ func TestCrossShardHandoffRoundTrip(t *testing.T) {
 	dir := directory.NewRedis(rdb, "test")
 
 	ctx := context.Background()
-	mustReg(t, dir.RegisterZone(ctx, "midgaard", "addr-a"))
-	mustReg(t, dir.RegisterZone(ctx, "darkwood", "addr-b"))
+	// Publish each shard's id -> endpoint, then lease each zone to a shard id. Routing
+	// resolves zone -> shard id -> endpoint, so the peer dialer is still keyed by address.
+	mustReg(t, dir.RegisterShard(ctx, "shard-a", "addr-a", directory.DefaultShardLease))
+	mustReg(t, dir.RegisterShard(ctx, "shard-b", "addr-b", directory.DefaultShardLease))
+	mustReg(t, dir.RegisterZone(ctx, "midgaard", "shard-a"))
+	mustReg(t, dir.RegisterZone(ctx, "darkwood", "shard-b"))
 
 	lisA := bufconn.Listen(1 << 20)
 	lisB := bufconn.Listen(1 << 20)
@@ -167,8 +175,8 @@ func TestCrossShardHandoffRoundTrip(t *testing.T) {
 	recvAttached(t, sA2)
 	recvUntilOutput(t, sA2, "Market Square") // back home in midgaard
 
-	if place, _ := dir.PlayerPlacement(ctx, "Strider"); place.ShardAddr != "addr-a" || place.Epoch != 3 {
-		t.Fatalf("placement = %+v, want {ShardAddr:addr-a Epoch:3}", place)
+	if place, _ := dir.PlayerPlacement(ctx, "Strider"); place.ShardID != "shard-a" || place.Epoch != 3 {
+		t.Fatalf("placement = %+v, want {ShardID:shard-a Epoch:3}", place)
 	}
 }
 

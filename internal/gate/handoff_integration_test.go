@@ -39,10 +39,17 @@ func TestGateCrossShardHandoff(t *testing.T) {
 	dir := directory.NewRedis(rdb, "test")
 
 	ctx := context.Background()
-	if err := dir.RegisterZone(ctx, "midgaard", "addr-a"); err != nil {
+	// Publish each shard's id -> endpoint, then lease each zone to a shard id. The gate
+	// and the handoff both resolve zone -> shard id -> endpoint before dialing.
+	for _, sh := range []struct{ id, addr string }{{"shard-a", "addr-a"}, {"shard-b", "addr-b"}} {
+		if err := dir.RegisterShard(ctx, sh.id, sh.addr, directory.DefaultShardLease); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := dir.RegisterZone(ctx, "midgaard", "shard-a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.RegisterZone(ctx, "darkwood", "addr-b"); err != nil {
+	if err := dir.RegisterZone(ctx, "darkwood", "shard-b"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -114,8 +121,8 @@ func TestGateCrossShardHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if place.ShardAddr != "addr-b" {
-		t.Fatalf("placement = %+v, want shard addr-b", place)
+	if place.ShardID != "shard-b" {
+		t.Fatalf("placement = %+v, want shard-b", place)
 	}
 
 	// Clean teardown: closing the client end ends the gate's reader loop.
@@ -135,11 +142,16 @@ type homeZoneDir struct {
 }
 
 func (d homeZoneDir) ShardForCharacter(string) (string, bool) {
-	addr, err := d.redis.ShardForZone(context.Background(), d.zone)
-	if err != nil || addr == "" {
+	ctx := context.Background()
+	shardID, err := d.redis.ShardForZone(ctx, d.zone)
+	if err != nil || shardID == "" {
 		return "", false
 	}
-	return addr, true
+	endpoint, err := d.redis.EndpointForShard(ctx, shardID)
+	if err != nil || endpoint == "" {
+		return "", false
+	}
+	return endpoint, true
 }
 
 func serveWorld(t *testing.T, shard *world.Shard, lis *bufconn.Listener) {

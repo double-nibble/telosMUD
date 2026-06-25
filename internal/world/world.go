@@ -198,15 +198,26 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 
 		fail := func(reason string) { src.post(handoffFailMsg{id: character, reason: reason}) }
 
-		addr, err := s.dir.ShardForZone(ctx, destZone)
+		// Resolve the destination in two hops: which SHARD owns the zone, then where that
+		// shard is reachable. The zone exit named only a logical zone ("darkwood"); the
+		// directory turns that into a shard id and the shard id into a dial endpoint, so
+		// the binding survives the owning shard moving hosts.
+		destShardID, err := s.dir.ShardForZone(ctx, destZone)
 		if err != nil {
 			log.Warn("destination zone not in directory", "err", err)
 			fail("destination unreachable")
 			return
 		}
+		addr, err := s.dir.EndpointForShard(ctx, destShardID)
+		if err != nil {
+			log.Warn("owning shard has no live endpoint", "dest_shard", destShardID, "err", err)
+			fail("destination unreachable")
+			return
+		}
+		log.Debug("resolved destination", "dest_shard", destShardID, "endpoint", addr)
 		client, err := s.peers(addr)
 		if err != nil {
-			log.Warn("cannot reach destination shard", "addr", addr, "err", err)
+			log.Warn("cannot reach destination shard", "dest_shard", destShardID, "addr", addr, "err", err)
 			fail("destination unreachable")
 			return
 		}
@@ -226,9 +237,10 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			return
 		}
 
-		// Prepare succeeded: claim ownership in the directory (epoch CAS). On conflict,
-		// roll back the destination's pending entity.
-		if ok, err := s.dir.SetPlayerShard(ctx, character, addr, newEpoch); err != nil || !ok {
+		// Prepare succeeded: claim ownership in the directory (epoch CAS), recording the
+		// destination SHARD ID (not its address). On conflict, roll back the destination's
+		// pending entity.
+		if ok, err := s.dir.SetPlayerShard(ctx, character, destShardID, newEpoch); err != nil || !ok {
 			log.Warn("directory claim failed after prepare", "ok", ok, "err", err)
 			_, _ = client.Abort(ctx, &handoffv1.AbortRequest{HandoffToken: resp.GetHandoffToken(), Reason: "directory conflict"})
 			fail("ownership conflict")

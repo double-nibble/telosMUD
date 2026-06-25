@@ -98,6 +98,101 @@ func TestZoneLeaseExpiry(t *testing.T) {
 	}
 }
 
+func TestShardRegistryAndEndpoint(t *testing.T) {
+	d := newTestRedis(t)
+	ctx := context.Background()
+
+	// Unregistered shard: not found.
+	if _, err := d.EndpointForShard(ctx, "shard-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unregistered shard: want ErrNotFound, got %v", err)
+	}
+	// Register and resolve.
+	if err := d.RegisterShard(ctx, "shard-a", "world-a:9090", DefaultShardLease); err != nil {
+		t.Fatal(err)
+	}
+	if ep, err := d.EndpointForShard(ctx, "shard-a"); err != nil || ep != "world-a:9090" {
+		t.Fatalf("EndpointForShard = %q, %v; want world-a:9090", ep, err)
+	}
+	// Deregister: resolves to not-found again.
+	if err := d.DeregisterShard(ctx, "shard-a", "world-a:9090"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.EndpointForShard(ctx, "shard-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after deregister: want ErrNotFound, got %v", err)
+	}
+}
+
+// TestShardIdConflict covers the two-writer guard: a second process booting with the
+// same shard id but a different endpoint is refused, while the legitimate owner keeps
+// renewing and a same-endpoint restart is allowed.
+func TestShardIdConflict(t *testing.T) {
+	d := newTestRedis(t)
+	ctx := context.Background()
+
+	if err := d.RegisterShard(ctx, "shard-a", "world-a:9090", DefaultShardLease); err != nil {
+		t.Fatal(err)
+	}
+	// A different process claiming the same id is refused.
+	if err := d.RegisterShard(ctx, "shard-a", "world-rogue:9090", DefaultShardLease); !errors.Is(err, ErrShardConflict) {
+		t.Fatalf("duplicate shard id: want ErrShardConflict, got %v", err)
+	}
+	// The legitimate owner still renews (same endpoint).
+	if err := d.RegisterShard(ctx, "shard-a", "world-a:9090", DefaultShardLease); err != nil {
+		t.Fatalf("owner renewal should succeed: %v", err)
+	}
+	// The rogue's late deregister must NOT remove the real owner's registration.
+	if err := d.DeregisterShard(ctx, "shard-a", "world-rogue:9090"); err != nil {
+		t.Fatal(err)
+	}
+	if ep, _ := d.EndpointForShard(ctx, "shard-a"); ep != "world-a:9090" {
+		t.Fatalf("owner registration yanked by rogue deregister: ep=%q", ep)
+	}
+	// Once the registration lapses, the id is reusable by anyone (old holder is gone).
+	if err := d.RegisterShard(ctx, "shard-b", "world-b:9090", 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if err := d.RegisterShard(ctx, "shard-b", "world-b2:9090", DefaultShardLease); err != nil {
+		t.Fatalf("lapsed id should be reusable: %v", err)
+	}
+}
+
+func TestShardRegistrationExpiry(t *testing.T) {
+	d := newTestRedis(t)
+	ctx := context.Background()
+	if err := d.RegisterShard(ctx, "shard-a", "world-a:9090", 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if ep, _ := d.EndpointForShard(ctx, "shard-a"); ep != "world-a:9090" {
+		t.Fatalf("EndpointForShard = %q, want world-a:9090", ep)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if _, err := d.EndpointForShard(ctx, "shard-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after registration lapse: want ErrNotFound, got %v", err)
+	}
+}
+
+// TestZoneToEndpointTwoHop exercises the full routing the world uses: zone -> shard id
+// (lease) -> endpoint (registration).
+func TestZoneToEndpointTwoHop(t *testing.T) {
+	d := newTestRedis(t)
+	ctx := context.Background()
+	if err := d.RegisterShard(ctx, "shard-b", "world-b:9090", DefaultShardLease); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RegisterZone(ctx, "darkwood", "shard-b"); err != nil {
+		t.Fatal(err)
+	}
+	shardID, err := d.ShardForZone(ctx, "darkwood")
+	if err != nil || shardID != "shard-b" {
+		t.Fatalf("ShardForZone = %q, %v; want shard-b", shardID, err)
+	}
+	ep, err := d.EndpointForShard(ctx, shardID)
+	if err != nil || ep != "world-b:9090" {
+		t.Fatalf("EndpointForShard = %q, %v; want world-b:9090", ep, err)
+	}
+}
+
 func TestPlayerPlacementEpochMonotonic(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
@@ -117,7 +212,7 @@ func TestPlayerPlacementEpochMonotonic(t *testing.T) {
 	if err != nil || ok {
 		t.Fatalf("equal epoch should be rejected: ok=%v err=%v", ok, err)
 	}
-	if p, _ := d.PlayerPlacement(ctx, "Bilbo"); p.ShardAddr != "world-a:9090" || p.Epoch != 1 {
+	if p, _ := d.PlayerPlacement(ctx, "Bilbo"); p.ShardID != "world-a:9090" || p.Epoch != 1 {
 		t.Fatalf("placement rolled back by stale write: %+v", p)
 	}
 
@@ -126,7 +221,7 @@ func TestPlayerPlacementEpochMonotonic(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("newer epoch: ok=%v err=%v", ok, err)
 	}
-	if p, _ := d.PlayerPlacement(ctx, "Bilbo"); p.ShardAddr != "world-b:9090" || p.Epoch != 2 {
+	if p, _ := d.PlayerPlacement(ctx, "Bilbo"); p.ShardID != "world-b:9090" || p.Epoch != 2 {
 		t.Fatalf("newer epoch should win: %+v", p)
 	}
 

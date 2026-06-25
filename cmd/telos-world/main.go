@@ -88,29 +88,64 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	}
 	dir := directory.NewRedis(rdb, "telos")
 
-	// Claim an EXCLUSIVE lease on EACH zone. A live, different shard already owning one
-	// is a misconfiguration we refuse to start with — rather than silently both
-	// claiming it and becoming two writers for one zone.
+	// Publish where THIS shard is reachable (shard-id -> endpoint) BEFORE claiming any
+	// zone, so the moment a zone names us as owner, peers can resolve us to a live
+	// address. Then heartbeat it and drop it on shutdown.
+	if err := dir.RegisterShard(ctx, cfg.ShardID, cfg.ShardAddr, directory.DefaultShardLease); err != nil {
+		slog.Error("shard registration failed", "shard_id", cfg.ShardID, "err", err)
+		os.Exit(1)
+	}
+	slog.Info("registered shard", "shard_id", cfg.ShardID, "endpoint", cfg.ShardAddr, "lease", directory.DefaultShardLease)
+	go renewShardRegistration(ctx, dir, cfg.ShardID, cfg.ShardAddr)
+
+	// Claim an EXCLUSIVE lease on EACH zone, owned by this shard's id. A live, different
+	// shard already owning one is a misconfiguration we refuse to start with — rather
+	// than silently both claiming it and becoming two writers for one zone.
 	for _, zoneID := range zones {
-		ok, err := dir.ClaimZone(ctx, zoneID, cfg.ShardAddr, directory.DefaultZoneLease)
+		ok, err := dir.ClaimZone(ctx, zoneID, cfg.ShardID, directory.DefaultZoneLease)
 		if err != nil {
 			slog.Error("zone claim failed", "zone", zoneID, "err", err)
 			os.Exit(1)
 		}
 		if !ok {
 			owner, _ := dir.ShardForZone(ctx, zoneID)
-			slog.Error("zone already claimed by another live shard; refusing to start", "zone", zoneID, "owner", owner)
+			slog.Error("zone already claimed by another live shard; refusing to start", "zone", zoneID, "owner_shard", owner)
 			os.Exit(1)
 		}
-		slog.Info("claimed zone", "zone", zoneID, "shard_addr", cfg.ShardAddr, "shard_id", cfg.ShardID, "lease", directory.DefaultZoneLease)
+		slog.Info("claimed zone", "zone", zoneID, "shard_id", cfg.ShardID, "lease", directory.DefaultZoneLease)
 
 		// Keep each lease alive while we run; release it on shutdown so another shard can
 		// take over immediately instead of waiting out the lease. stop fences us if we
 		// ever lose any lease.
-		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardAddr)
+		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardID)
 	}
 
 	return world.NewMultiShard(zones, home, cfg.ShardAddr, dir, world.GRPCDialer())
+}
+
+// renewShardRegistration heartbeats this shard's id->endpoint registration until ctx is
+// cancelled, then deregisters it so peers stop resolving a dead address immediately.
+// Losing the registration is not fatal (unlike a zone lease): the next tick re-publishes
+// it; it only needs to stay live so zone owners remain dialable.
+func renewShardRegistration(ctx context.Context, dir *directory.Redis, shardID, endpoint string) {
+	t := time.NewTicker(directory.DefaultShardLease / 3)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			rctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = dir.DeregisterShard(rctx, shardID, endpoint)
+			cancel()
+			return
+		case <-t.C:
+			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err := dir.RegisterShard(rctx, shardID, endpoint, directory.DefaultShardLease)
+			cancel()
+			if err != nil {
+				slog.Warn("shard registration renewal error", "shard_id", shardID, "err", err)
+			}
+		}
+	}
 }
 
 // renewZoneLease heartbeats this shard's zone claim until ctx is cancelled, then
@@ -118,19 +153,19 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 // fences this process (stop) — a shard that no longer owns its zone must not keep
 // writing, or we are back to two writers. Each renewal has its own short timeout so a
 // slow Redis can't silently stall the heartbeat past the lease.
-func renewZoneLease(ctx context.Context, stop func(), dir *directory.Redis, zoneID, shardAddr string) {
+func renewZoneLease(ctx context.Context, stop func(), dir *directory.Redis, zoneID, shardID string) {
 	t := time.NewTicker(directory.DefaultZoneLease / 3)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			rctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = dir.ReleaseZone(rctx, zoneID, shardAddr)
+			_ = dir.ReleaseZone(rctx, zoneID, shardID)
 			cancel()
 			return
 		case <-t.C:
 			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			ok, err := dir.ClaimZone(rctx, zoneID, shardAddr, directory.DefaultZoneLease)
+			ok, err := dir.ClaimZone(rctx, zoneID, shardID, directory.DefaultZoneLease)
 			cancel()
 			switch {
 			case err != nil:

@@ -11,12 +11,13 @@ import (
 )
 
 // Locator is the slice of the directory the world needs for cross-shard handoff:
-// resolving which shard hosts a zone, and recording a player's new placement with a
-// monotonic epoch (docs/ARCHITECTURE.md §4, PROTOCOL.md §5). directory.Redis
-// implements it.
+// resolving which shard owns a zone (zone -> shard id), resolving that shard id to a
+// dial endpoint, and recording a player's new placement with a monotonic epoch
+// (docs/ARCHITECTURE.md §4, PROTOCOL.md §5). directory.Redis implements it.
 type Locator interface {
-	ShardForZone(ctx context.Context, zoneID string) (string, error)
-	SetPlayerShard(ctx context.Context, playerID, shardAddr string, epoch uint64) (bool, error)
+	ShardForZone(ctx context.Context, zoneID string) (string, error)      // -> shard id
+	EndpointForShard(ctx context.Context, shardID string) (string, error) // shard id -> dial endpoint
+	SetPlayerShard(ctx context.Context, playerID, shardID string, epoch uint64) (bool, error)
 }
 
 // parseRef splits a qualified exit reference "zone:room" into its parts. An

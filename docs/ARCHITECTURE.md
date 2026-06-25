@@ -112,8 +112,20 @@ logged + metered (lag pulse) for capacity planning.
   directory for manual pinning / rebalancing.
 - **Locality matters.** Adjacent zones are colocated on the same shard so the common case —
   walking room to room — is an in-process channel send, not a network hop.
-- **Directory service** (Redis-backed): authoritative `zone -> shard` and `player -> shard`
-  maps. Gates and shards consult it; it publishes change events on NATS for cache busting.
+- **Directory service** (Redis-backed): authoritative routing, resolved in two hops so a
+  zone's logical owner is decoupled from where that owner runs:
+  `zone -> shard-id` (a leased claim — the cardinal single-writer guard, one shard per zone),
+  `shard-id -> endpoint` (each shard registers and heartbeats its own dial address), and
+  `player -> shard-id`. To route a player into another zone you resolve `zone -> shard-id ->
+  endpoint`, so a zone can be moved between shards by rewriting one lease — no exit, snapshot,
+  or peer list names an address. Gates and shards consult it; it publishes change events on
+  NATS for cache busting.
+  - **Invariant: shard ids are unique per process** (assign them like k8s pod / StatefulSet
+    ordinals). The zone lease treats "same owner = renewal", so two processes sharing a shard
+    id would both pass the claim and become two writers. The directory enforces this
+    defensively — a second process registering a live shard id under a different endpoint is
+    refused at boot (`ErrShardConflict`), before it can claim any zone — but the orchestrator
+    is the real guarantor of uniqueness.
 - **Intra-shard movement:** zone A hands the entity to zone B via a Go channel. Cheap.
 - **Cross-shard movement (handoff):**
   1. Source zone serializes a player snapshot (stats, inventory, affects, position).
