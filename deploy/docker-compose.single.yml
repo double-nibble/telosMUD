@@ -1,0 +1,73 @@
+name: telosmud-single
+
+# Single-server topology: ONE world process hosts BOTH zones (midgaard + darkwood).
+# Contrast with docker-compose.yml, which runs two shards (one zone each) and hands
+# players across the market<->grove boundary via the cross-shard handoff.
+#
+# Here that same boundary is crossed entirely IN-PROCESS — no handoff, no gate
+# re-dial, no directory write — because both zones live on the same shard. The ONLY
+# difference from the two-shard file is this service's TELOS_ZONES (midgaard,darkwood)
+# and the absence of a second world. Placement is config, not code.
+#
+#   docker compose -f deploy/docker-compose.single.yml up --build
+#   telnet localhost 4000   # walk: north (temple->market), north (market->grove)
+#
+# Uses its own project name and a separate redis port so it can run without colliding
+# with `make up`.
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One shard, both zones. A fresh login spawns in the home zone (first in the list,
+  # midgaard); walking north out of the market transfers the player into darkwood's
+  # grove in-process. The directory still leases each zone to this shard.
+  world:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-world
+    environment:
+      TELOS_SERVICE: telos-world
+      TELOS_ENV: dev
+      TELOS_WORLD_LISTEN: ":9090"
+      TELOS_SHARD_ADDR: world:9090
+      TELOS_ZONES: midgaard,darkwood # <-- both zones on one process (home = midgaard)
+      TELOS_REDIS_ADDR: redis:6379
+      DEBUG: true
+    expose:
+      - "9090"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  gate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-gate
+    environment:
+      TELOS_SERVICE: telos-gate
+      TELOS_ENV: dev
+      TELOS_GATE_LISTEN: ":4000"
+      TELOS_WORLD_TARGET: world:9090
+      TELOS_REDIS_ADDR: redis:6379
+      TELOS_ZONES: midgaard # players spawn in midgaard
+      DEBUG: true
+    ports:
+      - "4000:4000" # telnet: connect with `telnet localhost 4000`
+    depends_on:
+      world:
+        condition: service_started
+    restart: unless-stopped
