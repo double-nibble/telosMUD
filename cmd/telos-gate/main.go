@@ -9,10 +9,14 @@
 //     DEBUG env flag (DEBUG=1 lowers the level to Debug; see internal/obs).
 //     From here on every package — gate, telnet, directory — just calls slog
 //     and inherits this logger; none of them take a logger argument.
-//  3. Dial the world (a single lazy gRPC client shared by all connections).
-//  4. Build the gate Server and serve until SIGINT/SIGTERM cancels ctx.
+//  3. Resolve the initial shard via the Redis directory (ShardForZone of a home
+//     zone), with a graceful fallback to the configured WorldTarget when the
+//     directory or world is unreachable.
+//  4. Build the gate Server (it owns a per-address Play client pool, dialed on
+//     demand as players walk to new shards) and serve until SIGINT/SIGTERM.
 //
-// Run with DEBUG=1 to watch the edge narrate every connection end to end.
+// Run with DEBUG=1 to watch the edge narrate every connection end to end,
+// including cross-shard redirects (re-dial target, replay count, buffer prune).
 package main
 
 import (
@@ -22,10 +26,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"github.com/redis/go-redis/v9"
 
-	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/gate"
@@ -46,19 +48,58 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cc, err := grpc.NewClient(cfg.WorldTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		slog.Error("world client failed", "target", cfg.WorldTarget, "err", err)
-		os.Exit(1)
+	// The directory seam: resolve the initial shard from Redis (the zone->shard map
+	// shards register on boot), falling back to the configured WorldTarget so the gate
+	// still serves when Redis or the home zone is absent. Re-dials during a handoff go
+	// by the address the world hands the gate in a Redirect, not through here.
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
+	defer func() { _ = rdb.Close() }()
+	homeZone := "midgaard"
+	if len(cfg.Zones) > 0 {
+		homeZone = cfg.Zones[0]
 	}
-	defer cc.Close()
+	dir := loginDirectory{
+		redis:    directory.NewRedis(rdb, ""),
+		homeZone: homeZone,
+		fallback: cfg.WorldTarget,
+	}
 
-	srv := gate.New(cfg.GateListen, directory.Static{Addr: cfg.WorldTarget}, playv1.NewPlayClient(cc))
-	slog.Info("starting", "env", cfg.Env, "listen", cfg.GateListen, "world", cfg.WorldTarget)
+	srv := gate.New(cfg.GateListen, dir)
+	slog.Info("starting", "env", cfg.Env, "listen", cfg.GateListen,
+		"home_zone", homeZone, "fallback", cfg.WorldTarget)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		slog.Error("gate serve failed", "err", err)
 	}
 	if err := shutdown(context.Background()); err != nil {
 		slog.Error("shutdown error", "err", err)
 	}
+}
+
+// loginDirectory adapts the Redis directory to the gate's directory.Directory seam.
+// On login it resolves the shard hosting the home zone (the demo's spawn zone); if
+// the directory is unreachable or the zone is unregistered it falls back to the
+// configured world target, so a single-shard dev stack still works without Redis.
+// The gate only consults the directory for the FIRST shard — cross-shard moves carry
+// the destination address in the Redirect frame.
+type loginDirectory struct {
+	redis    *directory.Redis
+	homeZone string
+	fallback string
+}
+
+func (d loginDirectory) ShardForCharacter(characterID string) (string, bool) {
+	addr, err := d.redis.ShardForZone(context.Background(), d.homeZone)
+	if err != nil || addr == "" {
+		slog.Debug("login directory fallback",
+			"component", "gate", "character", characterID,
+			"home_zone", d.homeZone, "err", err, "fallback", d.fallback)
+		if d.fallback == "" {
+			return "", false
+		}
+		return d.fallback, true
+	}
+	slog.Debug("login directory resolved",
+		"component", "gate", "character", characterID,
+		"home_zone", d.homeZone, "addr", addr)
+	return addr, true
 }
