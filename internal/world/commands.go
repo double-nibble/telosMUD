@@ -36,7 +36,13 @@ func (z *Zone) dispatch(p *player, line string) {
 		return // no prompt; the stream will close
 	case "north", "south", "east", "west", "up", "down",
 		"n", "s", "e", "w", "u", "d":
-		z.move(p, canonDir(verb))
+		if z.move(p, canonDir(verb)) {
+			// move released ownership of p: an intra-shard transfer handed the struct to
+			// another zone goroutine, or a cross-shard handoff froze it. This goroutine
+			// must not read or write p again (the new owner now does) — and the prompt is
+			// the destination's job. Returning here is what keeps single-writer intact.
+			return
+		}
 	default:
 		z.log.Debug("unknown verb", "player", p.id, "verb", strings.ToLower(verb))
 		p.send(textFrame("Huh?"))
@@ -82,29 +88,45 @@ func (z *Zone) say(p *player, what string) {
 
 // move walks the player through an exit: it validates the direction, detaches the
 // player from the old room (announcing the departure there), reattaches to the
-// destination (announcing the arrival there), and shows the new room. Phase 1 moves
-// are always intra-zone, so this is a plain pair of slice/map ops with no handoff
-// (cross-zone moves arrive in a later phase, docs/MUDLIB.md §4).
-func (z *Zone) move(p *player, dir string) {
+// destination (announcing the arrival there), and shows the new room.
+//
+// It returns true when it RELEASED OWNERSHIP of p — an intra-shard transfer handed the
+// struct to another zone goroutine (transferOut), or a cross-shard handoff froze it for
+// redirect. In both cases the caller (dispatch) must not touch p again: the new owner
+// will, and re-reading p here would be a data race / double-prompt. All in-zone outcomes
+// (bad direction, sealed boundary, plain local move) return false so dispatch re-prompts
+// normally.
+func (z *Zone) move(p *player, dir string) bool {
 	if dir == "" {
 		p.send(textFrame("Go where?"))
-		return
+		return false
 	}
 	from := z.rooms[p.room]
 	ref, ok := from.exits[dir]
 	if !ok {
 		z.log.Debug("move blocked: no exit", "player", p.id, "room", p.room, "dir", dir)
 		p.send(textFrame("You can't go that way."))
-		return
+		return false
 	}
 	destZone, destRoom := parseRef(ref)
+
+	// Intra-shard cross-zone move: the destination is a DIFFERENT zone that THIS shard
+	// also hosts. Transfer the player in-process — no handoff, no snapshot, no epoch
+	// bump, no directory change, no gate re-dial. The player keeps the same out channel
+	// and appliedSeq. transferOut hands the struct to dest, so we release ownership.
+	if destZone != "" && destZone != z.id && z.shard != nil {
+		if dest := z.shard.zones[destZone]; dest != nil {
+			z.transferOut(p, dest, destRoom, dir, from)
+			return true
+		}
+	}
 
 	// Cross-shard (cross-zone) move: hand the player off rather than moving locally.
 	if destZone != "" && destZone != z.id {
 		if z.handoff == nil {
 			// Single-shard zone with no directory: the boundary is sealed.
 			p.send(textFrame("The way is sealed."))
-			return
+			return false
 		}
 		// Combat exclusion would be checked here (PROTOCOL.md §5); no combat in Phase 2.
 		// Freeze first: from now on this shard stops acting for the player. Build the
@@ -116,8 +138,9 @@ func (z *Zone) move(p *player, dir string) {
 		delete(from.occupants, p.id)
 		z.broadcast(from, p.id, p.name+" departs "+dir+".")
 		z.log.Debug("cross-shard move initiated", "player", p.id, "dest_zone", destZone, "dest_room", destRoom, "epoch", p.epoch)
-		z.handoff(buildSnapshot(p), destZone, destRoom, p.epoch)
-		return
+		z.handoff(z, buildSnapshot(p), destZone, destRoom, p.epoch)
+		// p is now frozen/redirecting; the source must stop acting for it (no prompt).
+		return true
 	}
 
 	// Local move within this zone.
@@ -125,7 +148,7 @@ func (z *Zone) move(p *player, dir string) {
 	if !ok {
 		z.log.Debug("move blocked: unknown local room", "player", p.id, "ref", ref)
 		p.send(textFrame("You can't go that way."))
-		return
+		return false
 	}
 	delete(from.occupants, p.id)
 	z.broadcast(from, p.id, p.name+" leaves "+dir+".")
@@ -135,6 +158,30 @@ func (z *Zone) move(p *player, dir string) {
 	z.broadcast(to, p.id, p.name+" arrives.")
 	z.lookRoom(p)
 	z.log.Debug("player moved", "player", p.id, "dir", dir, "from", from.id, "to", destRoom)
+	return false
+}
+
+// transferOut performs the SOURCE side of an intra-shard cross-zone walk. It runs on
+// this (source) zone goroutine: it removes the player from this zone (player map +
+// room occupants, announcing the departure), records a forwarding entry so any input
+// the reader loop still posts here lands at the destination, and hands the player
+// struct to the destination zone via transferInMsg. The destination then owns the
+// player and repoints currentZone; the player keeps the same out channel and
+// appliedSeq, so nothing is lost and forwarded replays dedup by appliedSeq.
+//
+// Single-writer note: once the player is removed here and posted to dest, only dest's
+// goroutine touches the player struct. The brief overlap is bounded by handing the
+// struct off through the inbox, never by sharing it across two live owners.
+func (z *Zone) transferOut(p *player, dest *Zone, destRoom, dir string, from *Room) {
+	delete(from.occupants, p.id)
+	z.broadcast(from, p.id, p.name+" leaves "+dir+".")
+	delete(z.players, p.id)
+	// Forward in-flight input to dest until the reader loop observes the new
+	// currentZone (which dest.transferIn Stores). dest dedups by appliedSeq.
+	z.forwarding[p.id] = dest
+	z.log.Debug("intra-shard transfer out", "player", p.id,
+		"from_zone", z.id, "to_zone", dest.id, "room", destRoom)
+	dest.post(transferInMsg{p: p, room: destRoom})
 }
 
 // who lists every player currently online in the zone.

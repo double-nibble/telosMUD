@@ -2,6 +2,7 @@ package world
 
 import (
 	"log/slog"
+	"sync/atomic"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
@@ -16,6 +17,15 @@ type player struct {
 	name string
 	room string
 	out  chan *playv1.ServerFrame // buffered; drained by the writer goroutine in server.go
+
+	// currentZone is the per-connection routing pointer the Play stream owns
+	// (server.go): it names the zone this player's input should be posted to right
+	// now. The zone that owns the player Stores itself here on attach and on an
+	// intra-shard transfer (transferIn), so the reader loop always posts to the
+	// player's CURRENT zone. nil for test-only players created via joinMsg. Reading or
+	// Storing it is safe from any goroutine; the pointer itself is the only shared
+	// mutable handoff between the source and destination zone goroutines on a move.
+	currentZone *atomic.Pointer[Zone]
 
 	// Redirect/replay substrate (docs/PROTOCOL.md §5).
 	//

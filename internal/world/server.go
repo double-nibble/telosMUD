@@ -2,6 +2,7 @@ package world
 
 import (
 	"log/slog"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -11,19 +12,21 @@ import (
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
 
-// playServer implements the gRPC Play service for one zone. It is the bridge
-// between the network (a player's bidirectional stream) and the zone actor: it
-// never touches zone state, it only posts messages to the zone inbox.
+// playServer implements the gRPC Play service for one shard (which may host several
+// zones). It is the bridge between the network (a player's bidirectional stream) and
+// the zone actors: it never touches zone state, it only posts messages to a zone
+// inbox. Each connection routes its input to the player's CURRENT zone, which can
+// change when the player walks between zones this shard hosts (see currentZone below).
 type playServer struct {
 	playv1.UnimplementedPlayServer
-	zone *Zone
-	log  *slog.Logger // scoped logger: component=play
+	shard *Shard
+	log   *slog.Logger // scoped logger: component=play
 }
 
-func registerPlay(gs *grpc.Server, z *Zone) {
+func registerPlay(gs *grpc.Server, s *Shard) {
 	playv1.RegisterPlayServer(gs, &playServer{
-		zone: z,
-		log:  slog.With("component", "play"),
+		shard: s,
+		log:   slog.With("component", "play"),
 	})
 }
 
@@ -67,7 +70,24 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		// No character id supplied: invent an anonymous one.
 		character = "Wanderer-" + uuid.NewString()[:8]
 	}
+	token := attach.GetHandoffToken()
 	s.log.Debug("attach parsed", "character", character)
+
+	// Decide which hosted zone this connection starts in: a handoff re-dial binds to
+	// whichever zone holds the matching pending player; everything else (fresh login,
+	// link-dead reconnect) routes to the shard's home zone. currentZone is this
+	// connection's routing pointer — the zone Stores itself into it on attach, and the
+	// reader loop Loads it for every input so a later intra-shard move follows the player.
+	zone := s.shard.zones[s.shard.home]
+	if token != "" {
+		if z := s.shard.zoneForToken(token); z != nil {
+			zone = z
+		}
+		// If no zone holds the token, fall through with home zone; the zone's attach
+		// rejects the unknown token rather than spawning a fresh character.
+	}
+	var currentZone atomic.Pointer[Zone]
+	currentZone.Store(zone)
 
 	ctx := stream.Context()
 	// out is this stream's outbound channel; the zone binds it to the character's
@@ -88,13 +108,17 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		}
 	}()
 
-	// Hand the stream to the zone: it creates a new player, re-binds an existing one
-	// (a re-dial within the link-death window), or activates a pending player when the
-	// Attach carries a handoff token (a cross-shard re-dial). Then it sends Attached.
-	s.zone.post(attachMsg{character: character, token: attach.GetHandoffToken(), out: out})
-	s.log.Debug("player stream ready", "character", character, "zone", s.zone.id)
+	// Hand the stream to the chosen zone: it creates a new player, re-binds an existing
+	// one (a re-dial within the link-death window), or activates a pending player when
+	// the Attach carries a handoff token (a cross-shard re-dial). It Stores itself into
+	// currentZone and then sends Attached. We pass &currentZone so the zone — and a
+	// later destination zone after an intra-shard move — can repoint the connection.
+	zone.post(attachMsg{character: character, token: token, out: out, curZone: &currentZone})
+	s.log.Debug("player stream ready", "character", character, "zone", zone.id)
 
-	// Reader loop: translate client frames into zone inbox messages.
+	// Reader loop: translate client frames into zone inbox messages, posting each to
+	// the player's CURRENT zone (which can change as they walk between this shard's
+	// zones). detach/leave likewise go to the current zone.
 	cleanQuit := false
 	for {
 		f, err := stream.Recv()
@@ -106,7 +130,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		case *playv1.ClientFrame_Input:
 			in := pl.Input
 			s.log.Debug("input received", "character", character, "seq", in.GetSeq(), "text", in.GetText())
-			s.zone.post(inputMsg{id: character, seq: in.GetSeq(), line: in.GetText()})
+			currentZone.Load().post(inputMsg{id: character, seq: in.GetSeq(), line: in.GetText()})
 		case *playv1.ClientFrame_Detach:
 			s.log.Debug("detach received (clean)", "character", character)
 			cleanQuit = true
@@ -118,11 +142,11 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 done:
 	if cleanQuit {
 		// Explicit client disconnect: remove now.
-		s.zone.post(leaveMsg{id: character})
+		currentZone.Load().post(leaveMsg{id: character})
 	} else {
 		// Unexpected loss: enter link-death (the zone removes immediately only if the
 		// player was quitting; otherwise it waits out the grace for a re-attach).
-		s.zone.post(detachMsg{id: character, out: out})
+		currentZone.Load().post(detachMsg{id: character, out: out})
 	}
 	s.log.Debug("stream closing", "character", character, "clean", cleanQuit)
 	return nil

@@ -34,29 +34,103 @@ import (
 // tests can dial in-process shards over bufconn.
 type HandoffDialer func(addr string) (handoffv1.HandoffClient, error)
 
-// Shard holds the zone this world process owns, its public address (what the gate
-// and peer shards dial), and the directory used to route cross-shard moves. Phase 2
-// runs one zone per shard; multi-zone shards come later.
+// Shard is one world process. It may host more than one zone: a player can walk
+// between two zones THIS shard owns entirely in-process, with no cross-shard handoff
+// (see Zone.transferIn / Zone.move). zones maps zone id -> zone; home is the zone a
+// fresh login spawns in. addr is the shard's public address (what the gate and peer
+// shards dial) and dir routes moves into zones OTHER shards own.
+//
+// # Cross-goroutine routing primitives (single-writer still holds)
+//
+// Each zone's state is mutated only by its own goroutine. Two deliberately small,
+// concurrency-safe structures connect them:
+//
+//   - the per-connection currentZone (an atomic.Pointer[Zone] owned by the Play
+//     stream, see server.go): which zone a player's input is posted to right now. A
+//     zone Stores itself into it when it takes ownership of the player (attach /
+//     transferIn); the reader loop Loads it for every line.
+//   - tokenIndex (token -> zone): lets the Play attach and Handoff.Prepare route a
+//     handoff bind to whichever hosted zone holds the matching pending player. Guarded
+//     by mu; populated by Prepare, read on bind.
+//
+// No other shared mutable zone state exists. Intra-shard transfer of the player
+// struct itself is still done by message-passing (transferInMsg), so only one zone
+// goroutine ever owns a given player at a time.
 type Shard struct {
-	zone  *Zone
-	addr  string        // this shard's public address ("" in single-shard tests)
-	dir   Locator       // directory for cross-shard routing; nil seals cross-shard exits
-	peers HandoffDialer // dials peer shards' Handoff service
+	zones map[string]*Zone // zone id -> zone; all hosted on this process
+	home  string           // zone a fresh login spawns in
+	addr  string           // this shard's public address ("" in single-shard tests)
+	dir   Locator          // directory for cross-shard routing; nil seals cross-shard exits
+	peers HandoffDialer    // dials peer shards' Handoff service
+
+	mu         sync.Mutex        // guards tokenIndex
+	tokenIndex map[string]*Zone  // handoff token -> hosting zone (populated by Prepare)
 }
 
 // NewDemoShard builds a single-shard midgaard world with no directory wiring — its
 // cross-shard exits are sealed. Used by the single-shard tests and a bare run.
 func NewDemoShard() *Shard {
-	return &Shard{zone: newDemoZone("midgaard")}
+	return newShard([]string{"midgaard"}, "midgaard", "", nil, nil)
 }
 
 // NewShard builds the named demo zone and wires it for cross-shard handoff: addr is
 // this shard's public address, dir routes moves into zones other shards own, and
-// peers dials those shards' Handoff service.
+// peers dials those shards' Handoff service. Single-zone convenience wrapper around
+// NewMultiShard.
 func NewShard(zoneID, addr string, dir Locator, peers HandoffDialer) *Shard {
-	s := &Shard{zone: newDemoZone(zoneID), addr: addr, dir: dir, peers: peers}
-	s.zone.handoff = s.beginHandoff
+	return NewMultiShard([]string{zoneID}, zoneID, addr, dir, peers)
+}
+
+// NewMultiShard builds a shard hosting every zone in zoneIDs (home is the spawn zone
+// for fresh logins) and wires each for cross-shard handoff. A move into a zone this
+// shard hosts is handled in-process (Zone.move); a move into a zone another shard owns
+// goes through beginHandoff as before.
+func NewMultiShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDialer) *Shard {
+	return newShard(zoneIDs, home, addr, dir, peers)
+}
+
+func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDialer) *Shard {
+	s := &Shard{
+		zones:      map[string]*Zone{},
+		home:       home,
+		addr:       addr,
+		dir:        dir,
+		peers:      peers,
+		tokenIndex: map[string]*Zone{},
+	}
+	for _, id := range zoneIDs {
+		z := newDemoZone(id)
+		z.shard = s
+		z.handoff = s.beginHandoff
+		s.zones[id] = z
+	}
+	if s.zones[home] == nil && len(zoneIDs) > 0 {
+		s.home = zoneIDs[0]
+	}
 	return s
+}
+
+// indexToken records that zone z holds a pending player bound by token, so a Play
+// attach or Handoff.Prepare on this shard can route the bind to the right zone.
+func (s *Shard) indexToken(token string, z *Zone) {
+	s.mu.Lock()
+	s.tokenIndex[token] = z
+	s.mu.Unlock()
+}
+
+// zoneForToken returns the zone holding the pending player for token, if any.
+func (s *Shard) zoneForToken(token string) *Zone {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tokenIndex[token]
+}
+
+// dropToken removes a token index entry once its handoff resolves (bound/aborted/
+// expired), so the map does not grow without bound.
+func (s *Shard) dropToken(token string) {
+	s.mu.Lock()
+	delete(s.tokenIndex, token)
+	s.mu.Unlock()
 }
 
 // GRPCDialer dials peer shards over plaintext gRPC, caching one connection per
@@ -78,15 +152,31 @@ func GRPCDialer() HandoffDialer {
 	}
 }
 
-// Zone returns the shard's zone.
-func (s *Shard) Zone() *Zone { return s.zone }
+// Zone returns the shard's home zone. Convenience for single-zone callers/tests.
+func (s *Shard) Zone() *Zone { return s.zones[s.home] }
 
-// Run starts the zone's actor loop and blocks until ctx is cancelled.
-func (s *Shard) Run(ctx context.Context) { s.zone.Run(ctx) }
+// ZoneByID returns the hosted zone with the given id, or nil.
+func (s *Shard) ZoneByID(id string) *Zone { return s.zones[id] }
 
-// Register installs the gRPC Play and Handoff services on the given server.
+// Run starts every hosted zone's actor loop on its own goroutine and blocks until
+// ctx is cancelled. One goroutine per zone preserves single-writer.
+func (s *Shard) Run(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, z := range s.zones {
+		wg.Add(1)
+		go func(z *Zone) {
+			defer wg.Done()
+			z.Run(ctx)
+		}(z)
+	}
+	wg.Wait()
+}
+
+// Register installs the gRPC Play and Handoff services on the given server. The Play
+// service routes a fresh login to the shard's home zone and a handoff bind to whichever
+// hosted zone holds the matching pending player; Handoff routes Prepare by target zone.
 func (s *Shard) Register(gs *grpc.Server) {
-	registerPlay(gs, s.zone)
+	registerPlay(gs, s)
 	registerHandoff(gs, s)
 }
 
@@ -99,14 +189,14 @@ func (s *Shard) Register(gs *grpc.Server) {
 //
 // Step 4 adds the Handoff.Prepare RPC to the destination here, between the directory
 // claim and the redirect; step 5 wires the gate to act on the Redirect.
-func (s *Shard) beginHandoff(snap *handoffv1.PlayerSnapshot, destZone, destRoom string, epoch uint64) {
+func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone, destRoom string, epoch uint64) {
 	go func() {
 		ctx := context.Background()
 		character := snap.GetCharacterId()
 		newEpoch := epoch + 1
 		log := slog.With("component", "handoff", "player", character, "dest_zone", destZone)
 
-		fail := func(reason string) { s.zone.post(handoffFailMsg{id: character, reason: reason}) }
+		fail := func(reason string) { src.post(handoffFailMsg{id: character, reason: reason}) }
 
 		addr, err := s.dir.ShardForZone(ctx, destZone)
 		if err != nil {
@@ -146,7 +236,7 @@ func (s *Shard) beginHandoff(snap *handoffv1.PlayerSnapshot, destZone, destRoom 
 		}
 
 		log.Debug("prepared + ownership claimed; redirecting", "dest_addr", resp.GetTargetShardAddr(), "epoch", newEpoch)
-		s.zone.post(redirectMsg{
+		src.post(redirectMsg{
 			id:         character,
 			targetAddr: resp.GetTargetShardAddr(),
 			token:      resp.GetHandoffToken(),

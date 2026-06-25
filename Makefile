@@ -23,6 +23,9 @@ logs: ## Tail dev dependency logs
 test: ## Run all tests
 	$(GO) test ./...
 
+test-race: ## Run all tests (with race)
+	$(GO) test -race -count=100 ./...
+
 vet: ## go vet
 	$(GO) vet ./...
 

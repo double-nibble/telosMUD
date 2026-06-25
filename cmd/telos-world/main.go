@@ -39,15 +39,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Build the shard. With Redis reachable, register this shard's zone in the
-	// directory and wire cross-shard handoff; otherwise fall back to a single-shard
+	// Build the shard. With Redis reachable, register every zone this shard hosts in
+	// the directory and wire cross-shard handoff; otherwise fall back to a single-shard
 	// world whose cross-shard exits are sealed (so a bare run still works).
-	zoneID := "midgaard"
-	if len(cfg.Zones) > 0 {
-		zoneID = cfg.Zones[0]
+	zones := cfg.Zones
+	if len(zones) == 0 {
+		zones = []string{"midgaard"}
 	}
-	shard := buildShard(ctx, stop, cfg, zoneID)
-	go shard.Run(ctx) // the zone actor loop owns all world state from here on
+	shard := buildShard(ctx, stop, cfg, zones)
+	go shard.Run(ctx) // each zone actor loop owns its world state from here on
 
 	lis, err := net.Listen("tcp", cfg.WorldListen)
 	if err != nil {
@@ -72,41 +72,45 @@ func main() {
 	}
 }
 
-// buildShard wires the world shard. With Redis reachable it registers the shard's
-// zone in the directory and enables cross-shard handoff; otherwise it logs a warning
-// and returns a single-shard world whose cross-shard exits are sealed (so a bare run
-// without backing services still works).
-func buildShard(ctx context.Context, stop func(), cfg config.Config, zoneID string) *world.Shard {
+// buildShard wires the world shard. With Redis reachable it registers EVERY zone this
+// shard hosts in the directory, claims a lease on each, and enables cross-shard
+// handoff; otherwise it logs a warning and returns a single-shard world whose
+// cross-shard exits are sealed (so a bare run without backing services still works).
+// home (the spawn zone for fresh logins) is the first configured zone.
+func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []string) *world.Shard {
+	home := zones[0]
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
 		slog.Warn("redis unavailable; single-shard mode (cross-shard exits sealed)",
 			"addr", cfg.Redis.Addr, "err", err)
-		return world.NewDemoShard()
+		return world.NewMultiShard(zones, home, "", nil, nil)
 	}
 	dir := directory.NewRedis(rdb, "telos")
 
-	// Claim an EXCLUSIVE lease on the zone. A live, different shard already owning it
+	// Claim an EXCLUSIVE lease on EACH zone. A live, different shard already owning one
 	// is a misconfiguration we refuse to start with — rather than silently both
 	// claiming it and becoming two writers for one zone.
-	ok, err := dir.ClaimZone(ctx, zoneID, cfg.ShardAddr, directory.DefaultZoneLease)
-	if err != nil {
-		slog.Error("zone claim failed", "zone", zoneID, "err", err)
-		os.Exit(1)
-	}
-	if !ok {
-		owner, _ := dir.ShardForZone(ctx, zoneID)
-		slog.Error("zone already claimed by another live shard; refusing to start", "zone", zoneID, "owner", owner)
-		os.Exit(1)
-	}
-	slog.Info("claimed zone", "zone", zoneID, "shard_addr", cfg.ShardAddr, "shard_id", cfg.ShardID, "lease", directory.DefaultZoneLease)
+	for _, zoneID := range zones {
+		ok, err := dir.ClaimZone(ctx, zoneID, cfg.ShardAddr, directory.DefaultZoneLease)
+		if err != nil {
+			slog.Error("zone claim failed", "zone", zoneID, "err", err)
+			os.Exit(1)
+		}
+		if !ok {
+			owner, _ := dir.ShardForZone(ctx, zoneID)
+			slog.Error("zone already claimed by another live shard; refusing to start", "zone", zoneID, "owner", owner)
+			os.Exit(1)
+		}
+		slog.Info("claimed zone", "zone", zoneID, "shard_addr", cfg.ShardAddr, "shard_id", cfg.ShardID, "lease", directory.DefaultZoneLease)
 
-	// Keep the lease alive while we run; release it on shutdown so another shard can
-	// take over immediately instead of waiting out the lease. stop fences us if we
-	// ever lose the lease.
-	go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardAddr)
+		// Keep each lease alive while we run; release it on shutdown so another shard can
+		// take over immediately instead of waiting out the lease. stop fences us if we
+		// ever lose any lease.
+		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardAddr)
+	}
 
-	return world.NewShard(zoneID, cfg.ShardAddr, dir, world.GRPCDialer())
+	return world.NewMultiShard(zones, home, cfg.ShardAddr, dir, world.GRPCDialer())
 }
 
 // renewZoneLease heartbeats this shard's zone claim until ctx is cancelled, then

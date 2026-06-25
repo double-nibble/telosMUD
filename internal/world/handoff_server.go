@@ -37,8 +37,8 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 	if snap == nil || snap.GetCharacterId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "missing snapshot")
 	}
-	z := h.shard.zone
-	if req.GetTargetZoneId() != z.id {
+	z := h.shard.zones[req.GetTargetZoneId()]
+	if z == nil {
 		return nil, status.Errorf(codes.NotFound, "zone %q not hosted on this shard", req.GetTargetZoneId())
 	}
 
@@ -79,8 +79,17 @@ func (h *handoffServer) Commit(ctx context.Context, req *handoffv1.CommitRequest
 	return &handoffv1.CommitResponse{}, nil
 }
 
-// Abort discards a pending player whose handoff was cancelled by the source.
+// Abort discards a pending player whose handoff was cancelled by the source. The token
+// index names the zone that prepared it; absent that, broadcast to every hosted zone
+// (the matching one discards, the rest no-op).
 func (h *handoffServer) Abort(ctx context.Context, req *handoffv1.AbortRequest) (*handoffv1.AbortResponse, error) {
-	h.shard.zone.post(abortPendingMsg{token: req.GetHandoffToken()})
+	token := req.GetHandoffToken()
+	if z := h.shard.zoneForToken(token); z != nil {
+		z.post(abortPendingMsg{token: token})
+	} else {
+		for _, z := range h.shard.zones {
+			z.post(abortPendingMsg{token: token})
+		}
+	}
 	return &handoffv1.AbortResponse{}, nil
 }
