@@ -5,6 +5,9 @@ import (
 	"log/slog"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
@@ -55,6 +58,7 @@ type joinMsg struct{ p *player }
 // existing player, preserving appliedSeq so input replay dedups correctly.
 type attachMsg struct {
 	character string
+	token     string // non-empty on a handoff re-dial; binds & activates a pending player
 	out       chan *playv1.ServerFrame
 }
 
@@ -103,14 +107,37 @@ type handoffFailMsg struct {
 	reason string
 }
 
-func (joinMsg) zoneMsg()       {}
-func (attachMsg) zoneMsg()     {}
-func (inputMsg) zoneMsg()      {}
-func (detachMsg) zoneMsg()     {}
-func (reapMsg) zoneMsg()       {}
-func (leaveMsg) zoneMsg()      {}
-func (redirectMsg) zoneMsg()   {}
-func (handoffFailMsg) zoneMsg() {}
+// prepareMsg is the destination side: rehydrate the snapshot as a PENDING player in
+// this zone and reply on the channel (nil on success). Posted by the Handoff server.
+type prepareMsg struct {
+	snap  *handoffv1.PlayerSnapshot
+	room  string
+	epoch uint64
+	token string
+	reply chan error
+}
+
+// abortPendingMsg discards a pending player by handoff token (source cancelled).
+type abortPendingMsg struct{ token string }
+
+// pendingExpireMsg fires if a pending player is never bound by the gate within the
+// TTL; gen guards against expiring one that has since been activated/rebuilt.
+type pendingExpireMsg struct {
+	id  string
+	gen uint64
+}
+
+func (joinMsg) zoneMsg()         {}
+func (attachMsg) zoneMsg()       {}
+func (inputMsg) zoneMsg()        {}
+func (detachMsg) zoneMsg()       {}
+func (reapMsg) zoneMsg()         {}
+func (leaveMsg) zoneMsg()        {}
+func (redirectMsg) zoneMsg()     {}
+func (handoffFailMsg) zoneMsg()  {}
+func (prepareMsg) zoneMsg()      {}
+func (abortPendingMsg) zoneMsg() {}
+func (pendingExpireMsg) zoneMsg() {}
 
 func newZone(id string) *Zone {
 	return &Zone{
@@ -154,7 +181,13 @@ func (z *Zone) handle(m msg) {
 		z.join(v.p)
 	case attachMsg:
 		z.log.Debug("inbox: attach", "player", v.character)
-		z.attach(v.character, v.out)
+		z.attach(v.character, v.token, v.out)
+	case prepareMsg:
+		z.prepare(v)
+	case abortPendingMsg:
+		z.abortPending(v.token)
+	case pendingExpireMsg:
+		z.pendingExpire(v.id, v.gen)
 	case inputMsg:
 		z.handleInput(v)
 	case detachMsg:
@@ -240,27 +273,124 @@ func (z *Zone) leave(id string) {
 // re-bound to the *same* player, preserving appliedSeq so replayed input dedups
 // correctly. Either way an Attached frame goes out first; player.send stamps it with
 // the resume point (appliedSeq) via ServerFrame.ack_input_seq.
-func (z *Zone) attach(character string, out chan *playv1.ServerFrame) {
+func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame) {
 	p := z.players[character]
-	reattach := p != nil
-	if reattach {
+	switch {
+	case p != nil && p.pending:
+		// Handoff bind: the gate re-dialed here after a Redirect. Activate the player
+		// Prepare rehydrated — this is the destination self-commit.
+		if token == "" || token != p.token {
+			z.log.Warn("handoff bind rejected: token mismatch", "player", character)
+			out <- disconnectFrame("handoff token invalid")
+			return
+		}
+		p.out = out
+		p.pending = false
+		p.frozen = false
+		p.attachGen++
+		p.send(attachedFrame(z.id)) // resume ack = appliedSeq carried in the snapshot
+		if r := z.rooms[p.room]; r != nil {
+			r.occupants[p.id] = true // only now does the player become visible in the room
+			z.broadcast(r, p.id, p.name+" arrives.")
+		}
+		z.lookRoom(p)
+		p.send(promptFrame())
+		z.log.Debug("handoff committed: player activated", "player", character,
+			"room", p.room, "applied", p.appliedSeq, "epoch", p.epoch)
+
+	case token != "":
+		// A handoff token was presented but no pending player matches it
+		// (expired/aborted/never-prepared/forged). Reject rather than re-bind something
+		// else or spawn a fresh character — that would silently lose the migrated state.
+		z.log.Warn("handoff bind rejected: no pending player for token", "player", character)
+		out <- disconnectFrame("handoff token invalid")
+		return
+
+	case p != nil && p.frozen:
+		// A re-dial to the SOURCE shard mid-handoff: the handoff owns the player.
+		// Re-binding would resume a frozen player and risk a both-own window. Reject.
+		z.log.Warn("attach rejected: character is mid-handoff (frozen)", "player", character)
+		out <- disconnectFrame("character is mid-transfer")
+		return
+
+	case p != nil:
+		// Re-attach (link-dead resume): re-bind the existing player, preserving state.
 		p.out = out
 		p.detached = false
-	} else {
-		// epoch starts at 1 (initial ownership); each handoff bumps it.
-		p = &player{id: character, name: character, out: out, epoch: 1}
-	}
-	p.attachGen++
-
-	// Attached first: conveys the shard id and (via the ack stamp) the resume point.
-	p.send(attachedFrame(z.id))
-
-	if reattach {
+		p.attachGen++
+		p.send(attachedFrame(z.id))
 		z.log.Debug("player re-attached", "player", character, "applied_seq", p.appliedSeq, "gen", p.attachGen)
-		z.lookRoom(p) // re-show the room to the reconnected client
+		z.lookRoom(p)
 		p.send(promptFrame())
-	} else {
+
+	default:
+		// Fresh login. epoch starts at 1 (initial ownership); each handoff bumps it.
+		p = &player{id: character, name: character, out: out, epoch: 1}
+		p.attachGen++
+		p.send(attachedFrame(z.id))
 		z.join(p) // registers, places, announces arrival, looks, prompts
+	}
+}
+
+// prepare rehydrates a snapshot as a PENDING player in this zone (the destination
+// side of Prepare). It is idempotent on the deterministic token and rejects an epoch
+// at or below one already seen for the character. The pending player is in the zone's
+// player map but not yet in its room's occupant set — invisible until the gate's
+// re-dial activates it.
+func (z *Zone) prepare(m prepareMsg) {
+	character := m.snap.GetCharacterId()
+	if existing := z.players[character]; existing != nil {
+		switch {
+		case existing.pending && existing.token == m.token:
+			z.log.Debug("handoff prepare: idempotent retry", "player", character)
+			m.reply <- nil
+		case existing.epoch >= m.epoch:
+			m.reply <- status.Errorf(codes.FailedPrecondition, "stale epoch %d <= current %d", m.epoch, existing.epoch)
+		default:
+			m.reply <- status.Errorf(codes.AlreadyExists, "character %q already present", character)
+		}
+		return
+	}
+	room := m.room
+	if z.rooms[room] == nil {
+		room = z.startRoom
+	}
+	p := &player{
+		id:         character,
+		name:       m.snap.GetName(),
+		room:       room,
+		appliedSeq: m.snap.GetAppliedSeq(),
+		epoch:      m.epoch,
+		pending:    true,
+		token:      m.token,
+	}
+	z.players[character] = p
+	gen := p.attachGen
+	time.AfterFunc(pendingTTL, func() { z.post(pendingExpireMsg{id: character, gen: gen}) })
+	z.log.Debug("handoff prepared: pending player rehydrated", "player", character,
+		"room", room, "epoch", m.epoch, "applied", p.appliedSeq)
+	m.reply <- nil
+}
+
+// abortPending discards a pending player by handoff token (the source cancelled).
+func (z *Zone) abortPending(token string) {
+	for id, p := range z.players {
+		if p.pending && p.token == token {
+			z.log.Debug("handoff aborted: discarding pending player", "player", id)
+			delete(z.players, id)
+			return
+		}
+	}
+}
+
+// pendingExpire discards a pending player the gate never bound within the TTL. The
+// generation check ignores a stale timer for a player that has since been activated.
+// (A future refinement keeps it link-dead instead, since the directory still points
+// here — see PROTOCOL.md §5.)
+func (z *Zone) pendingExpire(id string, gen uint64) {
+	if p := z.players[id]; p != nil && p.pending && p.attachGen == gen {
+		z.log.Debug("pending player expired (gate never bound)", "player", id)
+		delete(z.players, id)
 	}
 }
 

@@ -89,5 +89,5 @@ func buildShard(ctx context.Context, cfg config.Config, zoneID string) *world.Sh
 		os.Exit(1)
 	}
 	slog.Info("registered zone", "zone", zoneID, "shard_addr", cfg.ShardAddr, "shard_id", cfg.ShardID)
-	return world.NewShard(zoneID, cfg.ShardAddr, dir)
+	return world.NewShard(zoneID, cfg.ShardAddr, dir, world.GRPCDialer())
 }

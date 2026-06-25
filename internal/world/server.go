@@ -88,9 +88,10 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		}
 	}()
 
-	// Hand the stream to the zone: it creates a new player or re-binds an existing one
-	// (a re-dial within the link-death window) and sends Attached + the room.
-	s.zone.post(attachMsg{character: character, out: out})
+	// Hand the stream to the zone: it creates a new player, re-binds an existing one
+	// (a re-dial within the link-death window), or activates a pending player when the
+	// Attach carries a handoff token (a cross-shard re-dial). Then it sends Attached.
+	s.zone.post(attachMsg{character: character, token: attach.GetHandoffToken(), out: out})
 	s.log.Debug("player stream ready", "character", character, "zone", s.zone.id)
 
 	// Reader loop: translate client frames into zone inbox messages.

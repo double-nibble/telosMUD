@@ -47,6 +47,13 @@ type player struct {
 	// routing.
 	frozen bool
 	epoch  uint64
+
+	// Destination side: a PENDING player has been rehydrated by Prepare and is waiting
+	// for the gate to re-dial. It is not yet in its room's occupant set and applies no
+	// input until an Attach carrying the matching token activates it. token is the
+	// handoff token that re-dial must present.
+	pending bool
+	token   string
 }
 
 // send queues a frame for delivery to this player's stream writer, stamping the

@@ -110,6 +110,10 @@ func (z *Zone) move(p *player, dir string) {
 		// Freeze first: from now on this shard stops acting for the player. Build the
 		// snapshot on this (zone) goroutine, then kick off the async handoff.
 		p.frozen = true
+		// The player has departed this room: remove them from the occupant set so they
+		// don't linger as a ghost others can see while the handoff is in flight. (The
+		// frozen player struct itself is GC'd later, once a discard signal lands.)
+		delete(from.occupants, p.id)
 		z.broadcast(from, p.id, p.name+" departs "+dir+".")
 		z.log.Debug("cross-shard move initiated", "player", p.id, "dest_zone", destZone, "dest_room", destRoom, "epoch", p.epoch)
 		z.handoff(buildSnapshot(p), destZone, destRoom, p.epoch)
