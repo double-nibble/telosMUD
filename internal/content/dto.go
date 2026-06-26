@@ -95,13 +95,33 @@ type ContainerDTO struct {
 	KeyRef      string `json:"key_ref" yaml:"key_ref"`
 }
 
-// ResetDTO is one reset-script op (the `body` JSONB of a zone_resets row). v1 understands
-// op:"spawn_item" {proto, room, count}; count<=0 means 1. The full reset interpreter
-// (mobs, max-counts, repop timer) arrives in slice 4.4 — this carries the demo's market
-// floor placements so the byte-identical world boots with them present.
+// ResetDTO is one reset-script op (the `body` JSONB of a zone_resets row). The reset
+// interpreter (world/reset.go) runs the SAME ops at zone boot and on the repop timer.
+//
+// The op kind, proto ref, room ref, max, and optional into-container are all DATA — adding a
+// new placement is a content write, never engine code (docs/PERSISTENCE.md §5).
+//
+//   - op: "spawn_item" or "spawn_mob" — spawn the prototype `proto`. Both spawn the same
+//     flyweight; the kind is advisory (content-lint / future mob-only ops).
+//   - proto: the prototype ref to spawn.
+//   - room: the destination room ref the instances live in.
+//   - count: the number to ensure at BOOT when max is unset (back-compat with the demo seed;
+//     <=0 means 1). When max>0 it is ignored — max is the ceiling for both boot and repop.
+//   - max: the top-up ceiling. On every reset (boot and repop) the interpreter counts the live
+//     instances this op owns and spawns ONLY (max - live), never exceeding max, never leaking.
+//     0 means "use count" (a fixed boot seed with no repop top-up beyond the boot placement).
+//   - into: optional. A container prototype ref already present in `room`; the spawned items
+//     go INTO that container's contents instead of onto the room floor (a chest of loot).
+//   - persistent: this op's objects are world-persistent (housing, persistent rooms). They are
+//     NOT ephemerally re-spawned on repop — they load once from object_instances (the durable
+//     table, docs/PERSISTENCE.md §4) so a flagged object is never duplicated on each timer tick.
+//     The demo flags none; the gate path exists so a future persistent op routes correctly.
 type ResetDTO struct {
-	Op    string `json:"op" yaml:"op"`
-	Proto string `json:"proto" yaml:"proto"`
-	Room  string `json:"room" yaml:"room"`
-	Count int    `json:"count" yaml:"count"`
+	Op         string `json:"op" yaml:"op"`
+	Proto      string `json:"proto" yaml:"proto"`
+	Room       string `json:"room" yaml:"room"`
+	Count      int    `json:"count" yaml:"count"`
+	Max        int    `json:"max,omitempty" yaml:"max,omitempty"`
+	Into       string `json:"into,omitempty" yaml:"into,omitempty"`
+	Persistent bool   `json:"persistent,omitempty" yaml:"persistent,omitempty"`
 }

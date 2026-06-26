@@ -55,41 +55,15 @@ func (z *Zone) buildZone(lc *content.LoadedContent) {
 		z.spawnRoom(ProtoRef(r.Ref))
 	}
 	z.startRoom = ProtoRef(zd.StartRoom)
+	// Boot reset: run the script once to place the starting content. The SAME interpreter
+	// (reset.go) the repop timer uses — boot fills an empty zone, repop tops it back up — so
+	// there is one spawn/Move/counting code path. Then register the timed repop cadence
+	// (reset.go) keyed off reset_secs (a no-op when reset_secs==0: no timed reset).
 	z.runResets(zd.Resets)
+	z.startRepop(zd.Resets, zd.ResetSecs)
 	z.log.Debug("zone built from content", "zone", z.id,
-		"rooms", len(zd.Rooms), "start_room", z.startRoom, "resets", len(zd.Resets))
-}
-
-// runResets executes a zone's reset script at boot. v1 understands op:"spawn_item": it spawns
-// `count` (>=1) ephemeral instances of a prototype into a room's contents — exactly the old
-// newDemoZone Move(z.spawn(ref), marketEntity) loop, now data-driven. Unknown ops and unknown
-// rooms/prototypes are logged and skipped (content-lint is the real gate); the full reset
-// interpreter (mobs, max-counts, repop timer, persistent flag) arrives in slice 4.4.
-func (z *Zone) runResets(resets []content.ResetDTO) {
-	for _, r := range resets {
-		switch r.Op {
-		case "spawn_item", "spawn_mob", "":
-			room := z.rooms[ProtoRef(r.Room)]
-			if room == nil {
-				z.log.Warn("reset skipped: unknown room", "op", r.Op, "room", r.Room, "proto", r.Proto)
-				continue
-			}
-			n := r.Count
-			if n <= 0 {
-				n = 1
-			}
-			for i := 0; i < n; i++ {
-				e := z.spawn(ProtoRef(r.Proto))
-				if e == nil {
-					z.log.Warn("reset skipped: unknown prototype", "op", r.Op, "proto", r.Proto)
-					break
-				}
-				Move(e, room)
-			}
-		default:
-			z.log.Warn("reset op not understood (slice 4.1)", "op", r.Op)
-		}
-	}
+		"rooms", len(zd.Rooms), "start_room", z.startRoom, "resets", len(zd.Resets),
+		"reset_secs", zd.ResetSecs)
 }
 
 // newDemoZone builds the named demo zone from the EMBEDDED demo pack (content.DemoPack),

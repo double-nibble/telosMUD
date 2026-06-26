@@ -94,6 +94,24 @@ type Zone struct {
 	// scheduler can be torn down; nil until persistSave starts the cadence (first registered on
 	// the first persisted login). Zone-owned, only the zone goroutine touches it.
 	savePulse *pulseHandle
+
+	// repopPulse holds the cancel handle for this zone's repop-cadence pulse callback (reset.go).
+	// nil until startRepop registers it at build time (skipped when reset_secs==0 — no timed
+	// reset). The callback re-runs the reset script each stride, ON this goroutine (single-writer).
+	// Zone-owned; only the zone goroutine touches it.
+	repopPulse *pulseHandle
+
+	// persistentDone records the reset ops (by their stable identity) whose persistent objects
+	// have already been loaded, so a persistent-flagged op (docs/PERSISTENCE.md §4) loads its
+	// durable instances from object_instances at MOST ONCE — never re-spawning on each repop tick.
+	// Zone-owned, only the zone goroutine writes it (applyReset). Empty for the demo (it flags none).
+	persistentDone map[string]bool
+
+	// objects, if set, is the durable world-object loader for persistent reset ops (object_instances,
+	// docs/PERSISTENCE.md §4). It is read OFF the zone goroutine (like the saver/login reads) and the
+	// loaded objects are posted back as a loadObjectsMsg. nil today — the demo flags no persistent op
+	// and no store wires it — so the persistent gate degrades to a logged no-op. Set by Shard.adopt.
+	objects ObjectLoader
 }
 
 // msg is anything the zone goroutine processes off its inbox. The interface keeps
@@ -275,6 +293,16 @@ type presence struct {
 	pidSet  bool // its entity has a durable PersistID (the create returned)
 }
 
+// loadObjectsMsg carries durable world-objects (object_instances rows) read OFF the zone goroutine
+// back to the zone, for a persistent-flagged reset op (reset.go, docs/PERSISTENCE.md §4). The zone
+// spawns each object from its proto ref into the target room/container ON its goroutine (single-
+// writer), exactly like loadCharacter rehydrates a player's inventory. Empty/absent today — the
+// demo flags no persistent op — so this path is dormant until a persistent op + a wired loader.
+type loadObjectsMsg struct {
+	target  *Entity            // the room or container the objects belong in (resolved on-goroutine)
+	objects []PersistentObject // the durable instances to rehydrate
+}
+
 func (joinMsg) zoneMsg()          {}
 func (attachMsg) zoneMsg()        {}
 func (inputMsg) zoneMsg()         {}
@@ -294,14 +322,16 @@ func (saveOkMsg) zoneMsg()        {}
 func (drainFlushMsg) zoneMsg()    {}
 func (createdMsg) zoneMsg()       {}
 func (presenceMsg) zoneMsg()      {}
+func (loadObjectsMsg) zoneMsg()   {}
 
 func newZone(id string) *Zone {
 	return &Zone{
-		id:         id,
-		rooms:      map[ProtoRef]*Entity{},
-		players:    map[string]*session{},
-		forwarding: map[string]*Zone{},
-		inbox:      make(chan msg, 256),
+		id:             id,
+		rooms:          map[ProtoRef]*Entity{},
+		players:        map[string]*session{},
+		forwarding:     map[string]*Zone{},
+		persistentDone: map[string]bool{},
+		inbox:          make(chan msg, 256),
 		// A private, empty prototype cache by default. A shard-hosted zone has this
 		// replaced with the shared per-shard cache (newShard); a bare test zone keeps its
 		// own so spawn works standalone.
@@ -408,6 +438,8 @@ func (z *Zone) handle(m msg) {
 		s, present := z.players[v.id]
 		pidSet := present && s.entity != nil && s.entity.pid != nil
 		v.reply <- presence{present: present, pidSet: pidSet}
+	case loadObjectsMsg:
+		z.rehydrateObjects(v)
 	}
 }
 
