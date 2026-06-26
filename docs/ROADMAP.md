@@ -99,6 +99,10 @@ Supra-zone state and cross-zone consequences. ([WORLD-EVENTS.md](WORLD-EVENTS.md
 - `telos-director` tier with leader election; region/world state (single-writer).
 - Scoped event bus: `transient` (NATS core) + `durable` (JetStream, idempotent, ordered).
 - Remote effect commands into zones; the Lua `world.*` / `region:*` / `signal_*` API.
+- **Dynamic zone placement** (the director hosts the zone coordinator): world servers
+  *claim* zones from a pool instead of declaring them, with balancing, standbys, and
+  failover/rebalance. Builds on Phase 4 (crash-failover rehydrates from the durability
+  ladder). Design: [PLACEMENT.md](PLACEMENT.md). Replaces static `TELOS_ZONES`.
 
 **Done when:** a boss death in one zone ripples a region-wide change across zones on different
 shards, and survives a director restart.
