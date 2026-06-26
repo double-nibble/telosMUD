@@ -609,6 +609,17 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// future target reference resolves here, then place it in the destination room.
 	s.entity.zone = z
 	z.players[s.character] = s
+	// Re-arm the per-entity affect/regen tick on THIS zone (Phase 5.2). The source zone
+	// registered the tick capturing the SOURCE pulse; the entity lives here now, so that handle
+	// is stale and would block ensureTick (a.tick != nil) — affects/regen would silently freeze
+	// on the destination. We clear + re-arm here, on our own goroutine. We do NOT clear it from
+	// the source: that callback runs on the source goroutine and must never write this
+	// now-destination-owned entity — it instead self-cancels on its next fire (it sees the player
+	// absent in the source's z.players and returns false without touching the moved entity).
+	if a, ok := Get[*Affected](s.entity); ok {
+		a.tick = nil
+		a.ensureTick(s.entity)
+	}
 	// Clear any stale forwarding entry from a previous departure from THIS zone: the
 	// player is present here again, so handleInput will route to them directly.
 	delete(z.forwarding, s.character)

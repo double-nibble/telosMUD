@@ -25,6 +25,7 @@ type Pack struct {
 	Attributes  []AttributeDTO  `json:"attributes" yaml:"attributes"`
 	Resources   []ResourceDTO   `json:"resources" yaml:"resources"`
 	DamageTypes []DamageTypeDTO `json:"damage_types" yaml:"damage_types"`
+	Affects     []AffectDTO     `json:"affects" yaml:"affects"`
 }
 
 // AttributeDTO is one content-defined attribute (docs/ABILITIES.md §1, docs/PHASE5-PLAN.md §1.1).
@@ -74,6 +75,58 @@ type DamageTypeDTO struct {
 	DisplayName string             `json:"display_name" yaml:"display_name"`
 	Color       string             `json:"color" yaml:"color"`
 	Resist      map[string]float64 `json:"resist" yaml:"resist"`
+}
+
+// AffectDTO is one content-defined status effect (docs/ABILITIES.md §5, docs/PHASE5-PLAN.md §1.4).
+// The Affected runtime (5.2) owns its duration/stacking/tick/expire and feeds its modifiers into
+// attribute derivation (§1.1) and its prevents set into the tag-CC gate (§6).
+//
+//   - stacking is one of refresh|stack|extend|ignore (P5-D3). refresh (default) resets duration;
+//     stack counts up to max_stacks (magnitude scales); extend sums durations; ignore = first wins.
+//   - stack_scope keys an existing instance: "source" (default — one per (ref,source)) or "target"
+//     (one per ref regardless of who applied it).
+//   - body carries duration (pulses), the modifier list, the prevents tags, the tick spec, and the
+//     RESERVED on_apply/on_expire hooks + resist (the op-list hooks land in 5.3).
+type AffectDTO struct {
+	Ref         string        `json:"ref" yaml:"ref"`
+	Name        string        `json:"name" yaml:"name"`
+	Category    string        `json:"category" yaml:"category"`
+	Stacking    string        `json:"stacking" yaml:"stacking"`
+	MaxStacks   int           `json:"max_stacks" yaml:"max_stacks"`
+	StackScope  string        `json:"stack_scope" yaml:"stack_scope"`
+	Dispellable bool          `json:"dispellable" yaml:"dispellable"`
+	Body        AffectBodyDTO `json:"body" yaml:"body"`
+}
+
+// AffectBodyDTO is the JSONB-tail of an affect_defs row: everything that is not a first-class column.
+// Duration is in PULSES (already heartbeat-denominated, so durations are conserved across save/load).
+// Modifiers feed derivation; Prevents feeds the tag-CC set; Tick carries the interval + the RESERVED
+// on_tick op-list (a DoT's deal_damage lands in 5.3). OnApply/OnExpire/Resist are reserved shape.
+type AffectBodyDTO struct {
+	Duration  int                 `json:"duration" yaml:"duration"`
+	Modifiers []AffectModifierDTO `json:"modifiers" yaml:"modifiers"`
+	Prevents  []string            `json:"prevents" yaml:"prevents"`
+	Tick      *AffectTickDTO      `json:"tick" yaml:"tick"`
+	OnApply   any                 `json:"on_apply" yaml:"on_apply"`   // RESERVED op-list (5.3)
+	OnExpire  any                 `json:"on_expire" yaml:"on_expire"` // RESERVED op-list (5.3)
+	Resist    map[string]any      `json:"resist" yaml:"resist"`       // RESERVED resist spec (5.3)
+}
+
+// AffectModifierDTO is one entry of an affect's modifier list: it adds (op:add) or multiplies
+// (op:mul) attribute `attr` by `value` while the affect is active. The Affected runtime sums these
+// across active affects into the entity's single mod source (§1.1).
+type AffectModifierDTO struct {
+	Attr  string  `json:"attr" yaml:"attr"`
+	Op    string  `json:"op" yaml:"op"` // "add" | "mul"
+	Value float64 `json:"value" yaml:"value"`
+}
+
+// AffectTickDTO is an affect's periodic-hook spec: every Interval pulses the runtime fires OnTick.
+// OnTick is a RESERVED op-list this slice (the gated effect-op interpreter is 5.3); the tick
+// MECHANISM (interval counting + the hook point) is live now so a DoT only needs its op-list later.
+type AffectTickDTO struct {
+	Interval int `json:"interval" yaml:"interval"`
+	OnTick   any `json:"on_tick" yaml:"on_tick"` // RESERVED op-list (5.3)
 }
 
 // ZoneDTO is one zone definition plus everything authored inside it: its rooms, the item

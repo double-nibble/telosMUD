@@ -53,6 +53,52 @@ damage_types:
   - {ref: slash, display_name: Slashing, color: white, resist: {slash: 0.9}}
   - {ref: fire,  display_name: Fire,     color: red,   resist: {fire: 1.0}}
 
+# Affects (status effects, docs/ABILITIES.md §5). The engine's Affected runtime (Phase 5.2) owns their
+# duration/stacking/tick/expire and feeds modifiers into derivation + prevents into the tag-CC gate.
+# Durations are in PULSES. on_tick op-lists are RESERVED (5.3 wires the gated deal_damage); the tick
+# MECHANISM (interval counting + the hook point) is live now.
+affects:
+  # weaken: a -2 strength debuff, refresh-stacking (a re-cast resets the timer). Exercises a modifier
+  # feeding derivation and the refresh stacking mode.
+  - ref: weaken
+    name: Weakened
+    category: curse
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 20
+      modifiers:
+        - {attr: strength, op: add, value: -2}
+
+  # root: a movement-blocking CC. prevents the "move" tag (a tagged `walk` would be blocked at the
+  # lifecycle step-3 gate in 5.3); the prevents-set query is testable standalone this slice.
+  - ref: root
+    name: Rooted
+    category: snare
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 12
+      prevents: [move]
+
+  # poison: the §5 example — a DoT. stacks up to 5 (magnitude scales), -2 strength while active, and
+  # ticks every 6 pulses. The on_tick deal_damage op-list completes in 5.3 (RESERVED here); the
+  # modifiers + stacking + tick interval are live now. Exercises the stack stacking mode.
+  - ref: poison
+    name: Poisoned
+    category: poison
+    stacking: stack
+    max_stacks: 5
+    stack_scope: source
+    dispellable: true
+    body:
+      duration: 30
+      modifiers:
+        - {attr: strength, op: add, value: -2}
+      tick:
+        interval: 6
+        on_tick: null   # RESERVED: 5.3 wires ctx.deal_damage(target, {amount: 4*stacks, type: poison})
+
 zones:
   - ref: midgaard
     name: The City of Midgaard

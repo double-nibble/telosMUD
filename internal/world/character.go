@@ -50,8 +50,26 @@ type StateJSON struct {
 	// contentless character) has none; loadCharacter handles that sanely.
 	Attributes map[string]float64 `json:"attributes,omitempty"`
 	// Resources is each pool's CURRENT only (max is the derived attr). loadCharacter installs these
-	// clamped to the live derived max. Reserved subtrees (affects/skills/flags) arrive in 5.2/5.3.
+	// clamped to the live derived max. Reserved subtrees (skills/flags) arrive in 5.3.
 	Resources map[string]ResourceJSON `json:"resources,omitempty"`
+	// Affects are the active status effects (Phase 5.2, docs/PHASE5-PLAN.md §3): each with its
+	// REMAINING duration (in pulses — already heartbeat-denominated so it is conserved across the
+	// save/load seam), magnitude, and stack count. loadCharacter re-attaches each via the runtime
+	// attach path with remaining FROM THE SNAPSHOT — not the def's full duration — so a reload never
+	// resets durations, double-ticks, or re-fires on_apply. The applier (source) is NOT persisted: a
+	// reloaded affect is keyed as self-applied (its mechanical effect is identical). A pre-5.2 save
+	// (no affects array) loads sanely with none. NOT carried on the cross-shard handoff snapshot
+	// (buildSnapshot) — that is the same deferred set as inventory/stats; 5.2 does save/load only.
+	Affects []AffectJSON `json:"affects,omitempty"`
+}
+
+// AffectJSON is the durable form of one active affect: the def ref, the remaining duration in PULSES,
+// the magnitude, and the stack count. The §3 PERSISTENCE shape ([{id, remaining, mag, stacks}]).
+type AffectJSON struct {
+	ID        string  `json:"id"`               // the affect_def ref
+	Remaining int     `json:"remaining"`        // pulses left (authoritative on load; never reset to full)
+	Mag       float64 `json:"mag,omitempty"`    // applied magnitude (1 if absent)
+	Stacks    int     `json:"stacks,omitempty"` // stack count (1 if absent)
 }
 
 // ResourceJSON is the durable form of one resource pool: the current value only (Cur). The max is a
@@ -136,6 +154,7 @@ func dumpCharacter(s *session) CharSnapshot {
 		Equipment:  dumpEquipment(e),
 		Attributes: dumpAttributes(e),
 		Resources:  dumpResources(e),
+		Affects:    dumpAffects(e),
 	}
 	return CharSnapshot{
 		PID:          pid,
@@ -172,6 +191,27 @@ func dumpResources(e *Entity) map[string]ResourceJSON {
 	out := make(map[string]ResourceJSON, len(e.living.resCur))
 	for name := range e.living.resCur {
 		out[name] = ResourceJSON{Cur: resourceCurrent(e, name)}
+	}
+	return out
+}
+
+// dumpAffects renders the entity's active status effects (Phase 5.2, §3): each with its REMAINING
+// pulses, magnitude, and stack count. Empty when the entity carries no Affected component or no live
+// affects. Runs on the zone goroutine; the remaining values are the live (decrementing) ones, so a
+// save mid-affect resumes at the right point. A copy is built so the saver never aliases live state.
+func dumpAffects(e *Entity) []AffectJSON {
+	a, ok := Get[*Affected](e)
+	if !ok || len(a.list) == 0 {
+		return nil
+	}
+	out := make([]AffectJSON, 0, len(a.list))
+	for _, inst := range a.list {
+		out = append(out, AffectJSON{
+			ID:        inst.def.ref,
+			Remaining: inst.remaining,
+			Mag:       inst.magnitude,
+			Stacks:    inst.stacks,
+		})
 	}
 	return out
 }
@@ -273,6 +313,15 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 		}
 		for ref, r := range snap.State.Resources {
 			setResourceCurrent(e, ref, r.Cur) // clamps to the live derived max
+		}
+		// Re-attach active affects (Phase 5.2, §3) via the runtime attach path with remaining FROM THE
+		// SNAPSHOT (reattach=true) — re-registering the per-entity tick and re-seeding the prevents +
+		// modifier contributions WITHOUT resetting duration, double-ticking, or re-firing on_apply. An
+		// unknown ref (content stripped/renamed) is skipped by attach with a debug log, never a crash.
+		for _, af := range snap.State.Affects {
+			applyAffect(e, af.ID, attachOpts{
+				duration: af.Remaining, magnitude: af.Mag, stacks: af.Stacks, reattach: true,
+			})
 		}
 	}
 

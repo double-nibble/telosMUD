@@ -324,6 +324,11 @@ type dmgBody struct {
 	Resist map[string]float64 `json:"resist,omitempty"`
 }
 
+// affectBody is the JSONB-tail shape for an affect_defs row: the whole content.AffectBodyDTO
+// (duration/modifiers/prevents/tick + the reserved on_apply/on_expire/resist hooks). It is the
+// same DTO the embedded YAML carries, so a DB round-trip reproduces the same affect.
+type affectBody = content.AffectBodyDTO
+
 // loadGlobalDefs reads the pack-global attribute/resource/damage-type rows for the enabled packs
 // and appends them onto their content.Pack. They are zone-independent, so they group by pack name
 // (the `pack` helper), not onto any zone. The `default_base` of an attribute and the JSONB `body`
@@ -402,17 +407,18 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 	if err != nil {
 		return fmt.Errorf("store: query damage_type_defs: %w", err)
 	}
-	defer dRows.Close()
 	for dRows.Next() {
 		var d content.DamageTypeDTO
 		var pk string
 		var body []byte
 		if err := dRows.Scan(&d.Ref, &pk, &d.DisplayName, &body); err != nil {
+			dRows.Close()
 			return fmt.Errorf("store: scan damage_type_def: %w", err)
 		}
 		if len(body) > 0 {
 			var b dmgBody
 			if err := json.Unmarshal(body, &b); err != nil {
+				dRows.Close()
 				return fmt.Errorf("store: damage_type_def %s body: %w", d.Ref, err)
 			}
 			d.Color, d.Resist = b.Color, b.Resist
@@ -420,7 +426,40 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		pp := pack(pk)
 		pp.DamageTypes = append(pp.DamageTypes, d)
 	}
-	return dRows.Err()
+	if err := dRows.Err(); err != nil {
+		return err
+	}
+	dRows.Close()
+
+	// Affects (Phase 5.2): the status-effect defs. The first-class columns (stacking/max_stacks/
+	// stack_scope/dispellable/category) plus the JSONB `body` (duration/modifiers/prevents/tick).
+	aRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, name, COALESCE(category, ''), stacking, max_stacks,
+		        COALESCE(stack_scope, ''), dispellable, body
+		   FROM affect_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query affect_defs: %w", err)
+	}
+	defer aRows.Close()
+	for aRows.Next() {
+		var af content.AffectDTO
+		var pk string
+		var body []byte
+		if err := aRows.Scan(&af.Ref, &pk, &af.Name, &af.Category, &af.Stacking,
+			&af.MaxStacks, &af.StackScope, &af.Dispellable, &body); err != nil {
+			return fmt.Errorf("store: scan affect_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b affectBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				return fmt.Errorf("store: affect_def %s body: %w", af.Ref, err)
+			}
+			af.Body = b
+		}
+		pp := pack(pk)
+		pp.Affects = append(pp.Affects, af)
+	}
+	return aRows.Err()
 }
 
 // decodeBaseSpec unmarshals an attribute's default_base JSONB into a content.BaseSpecDTO. A JSON

@@ -180,6 +180,17 @@ func cloneComponent(c Component) Component {
 	case *Weapon:
 		cp := *v // all value fields (dice/type/class/verb)
 		return &cp
+	case *Affected:
+		// The Affected component carries only RUNTIME state (live affect instances, the summed
+		// modifier maps, the prevents set, the per-entity tick handle) — a prototype never authors
+		// affects, so a COW resets every reference-typed field to EMPTY rather than aliasing the
+		// prototype's. The clone re-registers its own mod source on its first attach (registered=false),
+		// and re-arms its own tick — a COW'd instance never inherits the prototype's tick handle (which
+		// would be a stale cross-instance pointer). In practice a prototype-backed mob spawns with no
+		// Affected component at all; this case exists so the COW `default` panic never fires if one is
+		// ever authored, satisfying the component.go invariant.
+		cp := &Affected{byKey: map[affectKey]*affectInstance{}}
+		return cp
 	case *Wearer:
 		// The worn map is reference-typed: a COW must reallocate it so a spawned mob
 		// re-equipping itself never aliases the prototype's worn map (players are

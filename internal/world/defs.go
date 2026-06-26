@@ -101,18 +101,20 @@ func (r *defRegistry[T]) reload(ref string, def T) {
 // defRegistries bundles the per-shard global-definition registries so a zone holds one pointer
 // (mirroring how it holds one *protoCache). Built once at shard construction, shared read-only.
 type defRegistries struct {
-	attr *defRegistry[*attributeDef]
-	res  *defRegistry[*resourceDef]
-	dmg  *defRegistry[*damageTypeDef]
+	attr   *defRegistry[*attributeDef]
+	res    *defRegistry[*resourceDef]
+	dmg    *defRegistry[*damageTypeDef]
+	affect *defRegistry[*affectDef]
 }
 
 // newDefRegistries builds an empty bundle (all three registries empty/published). A bare zone gets
 // its own so attr()/resource reads work standalone and report 0/absent — the bare-engine invariant.
 func newDefRegistries() *defRegistries {
 	return &defRegistries{
-		attr: newDefRegistry[*attributeDef](),
-		res:  newDefRegistry[*resourceDef](),
-		dmg:  newDefRegistry[*damageTypeDef](),
+		attr:   newDefRegistry[*attributeDef](),
+		res:    newDefRegistry[*resourceDef](),
+		dmg:    newDefRegistry[*damageTypeDef](),
+		affect: newDefRegistry[*affectDef](),
 	}
 }
 
@@ -127,6 +129,9 @@ func (z *Zone) resourceDefs() *defRegistry[*resourceDef] {
 }
 func (z *Zone) damageTypeDefs() *defRegistry[*damageTypeDef] {
 	return z.defBundle().dmg
+}
+func (z *Zone) affectDefs() *defRegistry[*affectDef] {
+	return z.defBundle().affect
 }
 
 // defBundle returns the zone's registry bundle, lazily creating an empty private one if a bare zone
@@ -177,4 +182,67 @@ type damageTypeDef struct {
 	displayName string
 	color       string
 	resist      map[string]float64
+}
+
+// affectStacking is the stacking mode of an affect_def (P5-D3, docs/PHASE5-PLAN.md §1.4). It governs
+// what happens when an affect is applied to a target that already has an instance keyed by the same
+// (ref[, source]). The default (zero / unknown) is refresh.
+type affectStacking int
+
+const (
+	stackRefresh affectStacking = iota // reset duration to full (default); buffs like haste
+	stackCount                         // count up to maxStacks, magnitude scales; DoTs like poison
+	stackExtend                        // sum remaining + new duration
+	stackIgnore                        // first wins; the new application is a no-op
+)
+
+// parseStacking maps the content stacking string onto the enum. Unknown/"" => refresh (the §5 default).
+func parseStacking(s string) affectStacking {
+	switch s {
+	case "stack":
+		return stackCount
+	case "extend":
+		return stackExtend
+	case "ignore":
+		return stackIgnore
+	default:
+		return stackRefresh
+	}
+}
+
+// affectModifier is one parsed entry of an affect's modifier list: it adds (add==true) `value` to
+// attribute `attr` or multiplies by it (add==false) while the affect is active. The Affected runtime
+// sums/multiplies these across active affects into the entity's single mod source (attributes.go §1.1).
+type affectModifier struct {
+	attr  string
+	add   bool // true => additive (flatMod); false => multiplicative (mulMod)
+	value float64
+}
+
+// affectDef is the runtime form of an AffectDTO (docs/ABILITIES.md §5): a content-defined status
+// effect. Immutable after build — shared read-only across zone goroutines via the registry, exactly
+// like a *Prototype/*attributeDef. The Affected runtime reads it on attach/tick/expire.
+type affectDef struct {
+	ref         string
+	name        string
+	category    string
+	stacking    affectStacking
+	maxStacks   int  // ceiling for stackCount; >=1
+	scopeTarget bool // stack_scope=="target": one instance per ref (ignore source); else per (ref,source)
+	dispellable bool
+
+	duration int // base duration in PULSES (heartbeat-denominated; conserved across save/load)
+
+	modifiers []affectModifier // additive/multiplicative attribute mods while active
+	prevents  []string         // tags this affect blocks (§6 tag CC); the runtime unions these
+
+	tickInterval int  // fire on_tick every N pulses; 0 => no tick
+	hasTick      bool // whether a tick spec was authored (interval may legitimately be 0-guarded)
+	// onTick is the RESERVED tick op-list (docs/PHASE5-PLAN.md §1.4 / 5.2 scope boundary): the tick
+	// MECHANISM (interval counting + the hook point) is live this slice; the gated op execution lands
+	// in 5.3 when the effect-op interpreter exists. Carried opaque so 5.3 wires it without a reparse.
+	onTick any
+	// onApply/onExpire are the RESERVED apply/expire hooks (5.3). Read-not-run this slice.
+	onApply  any
+	onExpire any
 }

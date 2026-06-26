@@ -64,6 +64,13 @@ func setResourceCurrent(e *Entity, name string, v int) {
 		v = max
 	}
 	e.living.resCur[name] = v
+	// If this drops a regen-able pool below its max, make sure the per-entity tick is running so the
+	// pool refills over time (affect_runtime.go ensureTick). The tick re-resolves the entity by id and
+	// stops when it has neither affects nor a regen need. A no-op when the tick is already registered
+	// or the entity is not on a running zone's pulse path. Zone goroutine only.
+	if e.zone != nil && e.zone.pulses != nil && needsRegen(e) {
+		affectedComponent(e).ensureTick(e)
+	}
 }
 
 // hasResource reports whether resource `name` is content-defined (a def is registered). Used to tell
@@ -73,4 +80,53 @@ func hasResource(e *Entity, name string) bool {
 		return false
 	}
 	return e.zone.resourceDefs().has(name)
+}
+
+// needsRegen reports whether the entity has at least one content-defined resource with a positive
+// regen rate that is not already at its derived max — i.e. whether the per-entity tick has regen work
+// to do. It is the second reason (besides active affects) the tick stays registered (affect_runtime.go
+// ensureTick/maybeStopTick). A contentless/Living-less entity has none. Zone goroutine only.
+func needsRegen(e *Entity) bool {
+	if e == nil || e.living == nil || e.zone == nil {
+		return false
+	}
+	for ref, def := range e.zone.resourceDefs().table() {
+		if def.regen <= 0 {
+			continue
+		}
+		if resourceCurrent(e, ref) < resourceMax(e, ref) {
+			return true
+		}
+	}
+	return false
+}
+
+// runRegen moves each content-defined resource's CURRENT toward its derived max by the resource_def's
+// per-tick regen rate, clamped (never overshooting the max). This is a SELF-effect on the entity's own
+// pool — no PvP concern — so it rides the affect tick this slice (docs/PHASE5-PLAN.md §1.4 / 5.2 scope
+// boundary). Death/on_depleted is Phase 6 — reserved (regen only raises, never crosses 0). A resource
+// already absent (no current stored) reads as full, so regen is a no-op until something spends it.
+// Single-writer: zone goroutine (the pulse).
+func runRegen(e *Entity) {
+	if e == nil || e.living == nil || e.zone == nil {
+		return
+	}
+	for ref, def := range e.zone.resourceDefs().table() {
+		if def.regen <= 0 {
+			continue
+		}
+		max := resourceMax(e, ref)
+		if max <= 0 {
+			continue
+		}
+		cur := resourceCurrent(e, ref)
+		if cur >= max {
+			continue
+		}
+		next := cur + def.regen
+		if next > max {
+			next = max
+		}
+		setResourceCurrent(e, ref, next) // clamps defensively too
+	}
 }

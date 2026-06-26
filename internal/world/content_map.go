@@ -57,6 +57,47 @@ func protoComponents(p content.ProtoDTO) componentSet {
 	return comps
 }
 
+// buildAffectDef maps an AffectDTO onto the runtime affectDef (defs.go). It parses the stacking enum,
+// the modifier list (add|mul), the prevents tags, and the tick spec; the on_tick/on_apply/on_expire
+// op-lists are carried OPAQUE (RESERVED for 5.3's gated effect-op interpreter — this slice builds the
+// tick mechanism, not the op execution). Duration is in pulses. Build-time only (defineGlobals).
+func buildAffectDef(a content.AffectDTO) *affectDef {
+	maxStacks := a.MaxStacks
+	if maxStacks < 1 {
+		maxStacks = 1
+	}
+	mods := make([]affectModifier, 0, len(a.Body.Modifiers))
+	for _, m := range a.Body.Modifiers {
+		// op defaults to "add"; only "mul" is multiplicative. An unknown op is treated as add (the
+		// safe additive identity-friendly default) — content-lint is the real gate.
+		mods = append(mods, affectModifier{attr: m.Attr, add: m.Op != "mul", value: m.Value})
+	}
+	var prevents []string
+	if len(a.Body.Prevents) > 0 {
+		prevents = append(prevents, a.Body.Prevents...)
+	}
+	def := &affectDef{
+		ref:         a.Ref,
+		name:        a.Name,
+		category:    a.Category,
+		stacking:    parseStacking(a.Stacking),
+		maxStacks:   maxStacks,
+		scopeTarget: a.StackScope == "target",
+		dispellable: a.Dispellable,
+		duration:    a.Body.Duration,
+		modifiers:   mods,
+		prevents:    prevents,
+		onApply:     a.Body.OnApply,
+		onExpire:    a.Body.OnExpire,
+	}
+	if t := a.Body.Tick; t != nil {
+		def.hasTick = true
+		def.tickInterval = t.Interval
+		def.onTick = t.OnTick
+	}
+	return def
+}
+
 // wearLocByName resolves a content wear-location NAME to the internal WearLoc slot. The names
 // are the human labels (the inverse of wearLocName), so content authors never see the enum.
 var wearLocByName = map[string]WearLoc{

@@ -78,12 +78,15 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 			ref: dt.Ref, displayName: dt.DisplayName, color: dt.Color, resist: dt.Resist,
 		})
 	}
+	for _, af := range lc.Affects {
+		d.affect.register(af.Ref, buildAffectDef(af))
+	}
 	// Load-time content-lint: reject a derived-attribute graph with a self/mutual reference.
 	for _, err := range lintAttributeCycles(d.attr.table()) {
 		slog.Error("content: attribute derivation cycle (def will resolve to 0)", "err", err)
 	}
 	slog.Debug("global defs registered", "attributes", d.attr.len(),
-		"resources", d.res.len(), "damage_types", d.dmg.len())
+		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len())
 }
 
 // parseAttributeBase turns an AttributeDTO's default_base (a {lit} OR {expr} spec) into a parsed

@@ -43,6 +43,7 @@ CREATE TABLE affect_defs (
   category     TEXT,                         -- dispel/cure targeting
   stacking     TEXT NOT NULL DEFAULT 'refresh',
   max_stacks   INT  NOT NULL DEFAULT 1,
+  stack_scope  TEXT NOT NULL DEFAULT 'source', -- 'source' (per (ref,source)) | 'target' (per ref)
   dispellable  BOOLEAN NOT NULL DEFAULT true,
   body         JSONB NOT NULL DEFAULT '{}'   -- duration, modifiers, prevents[], tick{}, on_apply/expire
 );

@@ -77,6 +77,7 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM attribute_defs WHERE pack=$1`,
 		`DELETE FROM resource_defs WHERE pack=$1`,
 		`DELETE FROM damage_type_defs WHERE pack=$1`,
+		`DELETE FROM affect_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -197,6 +198,30 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			`INSERT INTO damage_type_defs (ref, pack, display_name, body) VALUES ($1,$2,$3,$4)`,
 			d.Ref, pk.Pack, d.DisplayName, body); err != nil {
 			return fmt.Errorf("store: insert damage type %s: %w", d.Ref, err)
+		}
+	}
+	for _, a := range pk.Affects {
+		body, err := json.Marshal(a.Body)
+		if err != nil {
+			return fmt.Errorf("store: marshal affect %s body: %w", a.Ref, err)
+		}
+		scope := a.StackScope
+		if scope == "" {
+			scope = "source"
+		}
+		stacking := a.Stacking
+		if stacking == "" {
+			stacking = "refresh"
+		}
+		maxStacks := a.MaxStacks
+		if maxStacks < 1 {
+			maxStacks = 1
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO affect_defs (ref, pack, name, category, stacking, max_stacks, stack_scope, dispellable, body)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			a.Ref, pk.Pack, a.Name, nullStr(a.Category), stacking, maxStacks, scope, a.Dispellable, body); err != nil {
+			return fmt.Errorf("store: insert affect %s: %w", a.Ref, err)
 		}
 	}
 	return nil

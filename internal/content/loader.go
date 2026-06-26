@@ -38,6 +38,9 @@ type LoadedContent struct {
 	Attributes  []AttributeDTO
 	Resources   []ResourceDTO
 	DamageTypes []DamageTypeDTO
+	// Affects are the pack-global status-effect definitions (Phase 5.2), same last-write-wins
+	// override rule keyed by ref. The world side registers them into the per-shard affectRegistry.
+	Affects []AffectDTO
 }
 
 // Zone returns the loaded zone with the given ref, or nil.
@@ -76,6 +79,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	attrIdx := make(map[string]int)
 	resIdx := make(map[string]int)
 	dmgIdx := make(map[string]int)
+	affIdx := make(map[string]int)
 	for _, p := range packs {
 		for i := range p.Zones {
 			z := p.Zones[i]
@@ -111,6 +115,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 				lc.DamageTypes = append(lc.DamageTypes, d)
 			}
 		}
+		for _, af := range p.Affects {
+			if idx, ok := affIdx[af.Ref]; ok {
+				lc.Affects[idx] = af
+			} else {
+				affIdx[af.Ref] = len(lc.Affects)
+				lc.Affects = append(lc.Affects, af)
+			}
+		}
 	}
 	// Build byRef and the counts from the FINAL zone set (the backing array no longer grows).
 	var rooms, protos, resets int
@@ -125,6 +137,6 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	slog.Debug("content loaded", "packs", enabled, "zones", len(lc.Zones),
 		"rooms", rooms, "prototypes", protos, "resets", resets,
 		"attributes", len(lc.Attributes), "resources", len(lc.Resources),
-		"damage_types", len(lc.DamageTypes))
+		"damage_types", len(lc.DamageTypes), "affects", len(lc.Affects))
 	return lc, nil
 }

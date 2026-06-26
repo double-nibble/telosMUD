@@ -35,9 +35,15 @@ type Locator interface {
 // state (PHASE3-PLAN.md §4); cross-shard inventory is deferred past Phase 3. As of Phase
 // 5.1 a player also carries content-defined attribute bases + resource currents (Living,
 // character.go StateJSON) — those are NOT in this snapshot either, so a wound/resource
-// state resolves from defaults across a cross-shard hop, exactly like inventory. They
-// join the same deferred set: carry them HERE when cross-shard inventory lands. Built on
-// the zone goroutine, so the read of session/entity state is race-free.
+// state resolves from defaults across a cross-shard hop, exactly like inventory. As of 5.2
+// a player ALSO carries active affects (the Affected component, character.go AffectJSON);
+// those round-trip through the SAVE/LOAD (restart) path but, like attributes/resources/
+// inventory, are STILL NOT on this handoff snapshot — the same deferred set. Because affect
+// durations only decrement on the OWNING zone's pulse (the resolve-by-id/skip-frozen tick),
+// a frozen in-flight entity does not tick, so durations are conserved up to the seam; the
+// destination simply resolves from defaults until the handoff carry lands. Carry attributes/
+// resources/affects HERE together when cross-shard inventory lands. Built on the zone
+// goroutine, so the read of session/entity state is race-free.
 func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 	// DEFERRED (PHASE3-PLAN.md §4): as of slice 4 a player entity CAN carry items
 	// (s.entity.contents) and wear them (the *Wearer slot map, components.go). A future
