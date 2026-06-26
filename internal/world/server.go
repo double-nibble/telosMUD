@@ -1,8 +1,10 @@
 package world
 
 import (
+	"context"
 	"log/slog"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -89,6 +91,28 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	var currentZone atomic.Pointer[Zone]
 	currentZone.Store(zone)
 
+	// Resume the player's ownership epoch from the directory BEFORE handing the stream to
+	// the zone. Only for a fresh/link-dead login (token == ""), never a handoff re-dial
+	// (that carries its own epoch through the pending session). The directory's placement
+	// persists across logout/crash/restart, so without this a relog after a prior cross-
+	// shard move would restart at epoch 1 and its next move's CAS would be rejected as stale
+	// ("ownership conflict"). This read runs on THIS stream goroutine — never the zone
+	// goroutine — so directory I/O can't block the actor loop. Errors degrade to not-found
+	// (epoch 0 -> the zone seeds 1), so a directory hiccup can only cost a fresh-character
+	// epoch, never a crash. A read-only lookup never writes/lowers the directory epoch, so
+	// there is no both-own risk.
+	var resumeEpoch uint64
+	if token == "" && s.shard.dir != nil {
+		ectx, ecancel := context.WithTimeout(stream.Context(), 2*time.Second)
+		if ep, found, err := s.shard.dir.PlayerEpoch(ectx, character); err != nil {
+			s.log.Debug("epoch resume read failed; treating as fresh", "character", character, "err", err)
+		} else if found {
+			resumeEpoch = ep
+			s.log.Debug("epoch resumed from directory", "character", character, "epoch", ep)
+		}
+		ecancel()
+	}
+
 	ctx := stream.Context()
 	// out is this stream's outbound channel; the zone binds it to the character's
 	// player. The writer goroutine below is the ONLY caller of stream.Send.
@@ -113,7 +137,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// the Attach carries a handoff token (a cross-shard re-dial). It Stores itself into
 	// currentZone and then sends Attached. We pass &currentZone so the zone — and a
 	// later destination zone after an intra-shard move — can repoint the connection.
-	zone.post(attachMsg{character: character, token: token, out: out, curZone: &currentZone})
+	zone.post(attachMsg{character: character, token: token, out: out, curZone: &currentZone, resumeEpoch: resumeEpoch})
 	s.log.Debug("player stream ready", "character", character, "zone", zone.id)
 
 	// Reader loop: translate client frames into zone inbox messages, posting each to

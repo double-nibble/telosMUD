@@ -17,6 +17,13 @@ type Locator interface {
 	ShardForZone(ctx context.Context, zoneID string) (string, error)      // -> shard id
 	EndpointForShard(ctx context.Context, shardID string) (string, error) // shard id -> dial endpoint
 	SetPlayerShard(ctx context.Context, playerID, shardID string, epoch uint64) (bool, error)
+	// PlayerEpoch reads the player's last-recorded ownership epoch from the directory so a
+	// fresh login can RESUME it (instead of restarting at 1). The directory's placement
+	// persists across logout/crash/restart, so the next cross-shard move must compute
+	// stored+1 to satisfy the placement CAS — otherwise a relog after any handoff hits an
+	// "ownership conflict". found=false (not an error) when the player has no placement yet
+	// (a brand-new character). Read OFF the zone goroutine (server.go), never on it.
+	PlayerEpoch(ctx context.Context, playerID string) (epoch uint64, found bool, err error)
 }
 
 // buildSnapshot serializes a player's authoritative in-memory state for transfer to

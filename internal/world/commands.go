@@ -1,6 +1,9 @@
 package world
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // Verb handlers and the base command table (docs/MUDLIB.md §6). The parser/registry and
 // the dispatch loop live in parser.go; this file holds registerCommands (the priority-
@@ -189,10 +192,17 @@ func (z *Zone) move(s *session, dir string) bool {
 		// be initiated — otherwise the entity's location stays nil and the next room action
 		// null-derefs.
 		s.frozenFrom = from
+		s.redirected = false // not yet redirected; the freeze reaper reads this discriminator
 		z.act("$n departs "+dir+".", s.entity, nil, nil, "", "", ToRoom)
 		Move(s.entity, nil)
 		z.log.Debug("cross-shard move initiated", "player", s.character,
 			"dest_zone", destZone, "dest_room", destRoom, "epoch", s.epoch)
+		// Backstop the freeze: if neither the redirect (success) nor handoffFailed (RPC
+		// timeout) has resolved this session within freezeTTL, freezeExpire either reaps the
+		// orphan (redirected) or thaws it in place. The gen guard ignores a stale timer for a
+		// session that has since rebound. AfterFunc only POSTS to the inbox — single-writer holds.
+		gen := s.attachGen
+		time.AfterFunc(freezeTTL, func() { z.post(freezeExpireMsg{id: s.character, gen: gen}) })
 		z.handoff(z, buildSnapshot(s), destZone, string(destRoom), s.epoch)
 		// s is now frozen/redirecting; the source must stop acting for it (no prompt).
 		return true

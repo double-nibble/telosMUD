@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync/atomic"
@@ -95,6 +96,12 @@ type attachMsg struct {
 	// input to this zone (and, after an intra-shard move, to the destination zone). nil
 	// for test-only attaches that don't drive a real stream.
 	curZone *atomic.Pointer[Zone]
+	// resumeEpoch is the player's last-recorded ownership epoch, read from the directory
+	// OFF the zone goroutine (server.go) before this attach was posted. Only the fresh-login
+	// (default) branch of attach consults it, seeding s.epoch = max(1, resumeEpoch) so the
+	// next cross-shard move computes resumeEpoch+1 — which the placement CAS accepts. 0 on a
+	// brand-new character or a token re-dial (which carries its own epoch).
+	resumeEpoch uint64
 }
 
 // inputMsg carries one line of player input. seq is the gate's session-scoped input
@@ -173,6 +180,15 @@ type pendingExpireMsg struct {
 	gen uint64
 }
 
+// freezeExpireMsg fires if a frozen (source-side, in-flight handoff) player is still
+// frozen after freezeTTL — the backstop for a handoff that neither thawed (RPC timeout)
+// nor was reclaimed. gen (the session's attachGen at freeze time) guards against acting
+// on a session that has since rebound/rebuilt. See Zone.freezeExpire for thaw-vs-reap.
+type freezeExpireMsg struct {
+	id  string
+	gen uint64
+}
+
 func (joinMsg) zoneMsg()         {}
 func (attachMsg) zoneMsg()       {}
 func (inputMsg) zoneMsg()        {}
@@ -185,6 +201,7 @@ func (handoffFailMsg) zoneMsg()  {}
 func (prepareMsg) zoneMsg()      {}
 func (abortPendingMsg) zoneMsg() {}
 func (pendingExpireMsg) zoneMsg() {}
+func (freezeExpireMsg) zoneMsg()  {}
 
 func newZone(id string) *Zone {
 	return &Zone{
@@ -239,14 +256,28 @@ func (z *Zone) Run(ctx context.Context) {
 
 // handle dispatches one inbox message to the matching handler. Runs only on the
 // zone goroutine (called from Run), so all handlers below are lock-free.
+//
+// It is wrapped in a recover() that is the process-survival net: an unrecovered panic
+// in ANY handler (attach/prepare/redirect/handoffFailed/detach/reap/...) would otherwise
+// propagate out of Zone.Run and crash the WHOLE world process — every zone, every player.
+// On a panic we log the offending message type + stack and CONTINUE the loop. This layers
+// with dispatchSafe (the COMMAND path's nicer per-player message); this outer net catches
+// everything else. The underlying bug should still be fixed — the source nil-derefs below
+// (attach pending-bind, prepare unknown-room) are guarded so this net is rarely tripped.
 func (z *Zone) handle(m msg) {
+	defer func() {
+		if r := recover(); r != nil {
+			z.log.Error("zone handler panicked; zone survived",
+				"msg_type", fmt.Sprintf("%T", m), "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
 	switch v := m.(type) {
 	case joinMsg:
 		z.log.Debug("inbox: join", "player", v.s.character)
 		z.join(v.s)
 	case attachMsg:
 		z.log.Debug("inbox: attach", "player", v.character)
-		z.attach(v.character, v.token, v.out, v.curZone)
+		z.attach(v.character, v.token, v.out, v.curZone, v.resumeEpoch)
 	case transferInMsg:
 		z.transferIn(v)
 	case prepareMsg:
@@ -255,6 +286,8 @@ func (z *Zone) handle(m msg) {
 		z.abortPending(v.token)
 	case pendingExpireMsg:
 		z.pendingExpire(v.id, v.gen)
+	case freezeExpireMsg:
+		z.freezeExpire(v.id, v.gen)
 	case inputMsg:
 		z.handleInput(v)
 	case detachMsg:
@@ -411,7 +444,7 @@ func (z *Zone) transferIn(m transferInMsg) {
 // re-bound to the *same* session, preserving appliedSeq so replayed input dedups
 // correctly. Either way an Attached frame goes out first; session.send stamps it with
 // the resume point (appliedSeq) via ServerFrame.ack_input_seq.
-func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, curZone *atomic.Pointer[Zone]) {
+func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, curZone *atomic.Pointer[Zone], resumeEpoch uint64) {
 	s := z.players[character]
 	switch {
 	case s != nil && s.pending:
@@ -435,15 +468,21 @@ func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, cur
 		s.attachGen++
 		s.send(attachedFrame(z.id)) // resume ack = appliedSeq carried in the snapshot
 		// prepare parked the entity's location at the destination room WITHOUT adding it
-		// to the room contents (pending = invisible). Move now makes it visible.
-		if r := z.resolveRoom(s.entity.location.proto); r != nil {
+		// to the room contents (pending = invisible). Move now makes it visible. Guard the
+		// location read: prepare now rejects an unplaceable room, but a defensive fallback
+		// to the start room (resolveRoom("")) keeps this branch from ever null-deref'ing.
+		r := z.resolveRoom("") // start-room fallback
+		if s.entity.location != nil {
+			r = z.resolveRoom(s.entity.location.proto)
+		}
+		if r != nil {
 			Move(s.entity, r) // only now does the player become visible in the room
 			z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
 		}
 		z.lookRoom(s)
 		s.send(promptFrame())
 		z.log.Debug("handoff committed: player activated", "player", character,
-			"room", s.entity.location.proto, "applied", s.appliedSeq, "epoch", s.epoch)
+			"room", roomRef(s.entity.location), "applied", s.appliedSeq, "epoch", s.epoch)
 
 	case token != "":
 		// A handoff token was presented but no pending player matches it
@@ -475,9 +514,18 @@ func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, cur
 		s.send(promptFrame())
 
 	default:
-		// Fresh login. epoch starts at 1 (initial ownership); each handoff bumps it.
-		s = &session{character: character, out: out, epoch: 1, currentZone: curZone}
+		// Fresh login. Seed the epoch from the directory's persisted placement (read off the
+		// zone goroutine in server.go, threaded in as resumeEpoch) so it stays globally
+		// monotonic per player: a relog after any prior cross-shard move resumes at the stored
+		// epoch, and the NEXT move computes stored+1 — which the placement CAS accepts. Seed to
+		// EXACTLY the stored value (not +1); brand-new characters (resumeEpoch 0) start at 1.
+		epoch := resumeEpoch
+		if epoch < 1 {
+			epoch = 1
+		}
+		s = &session{character: character, out: out, epoch: epoch, currentZone: curZone}
 		z.newPlayerEntity(s, character)
+		z.log.Debug("fresh login epoch seeded", "player", character, "epoch", epoch, "resume", resumeEpoch)
 		if curZone != nil {
 			curZone.Store(z)
 		}
@@ -520,6 +568,15 @@ func (z *Zone) prepare(m prepareMsg) {
 		}
 	}
 	r := z.resolveRoom(m.room)
+	if r == nil {
+		// This zone can't place the player anywhere — the target room is unknown AND the
+		// start room hasn't spawned (e.g. a just-restarted destination mid-boot). Reject
+		// cleanly rather than parking a pending entity with a nil location (a landmine that
+		// later null-derefs on bind). The source thaws via handoffFailed.
+		z.log.Warn("handoff prepare rejected: no placeable room", "player", character, "room", m.room)
+		m.reply <- status.Errorf(codes.FailedPrecondition, "zone %q cannot place room %q", z.id, m.room)
+		return
+	}
 	s := &session{
 		character:  character,
 		appliedSeq: m.snap.GetAppliedSeq(),
@@ -573,6 +630,53 @@ func (z *Zone) pendingExpire(id string, gen uint64) {
 			z.shard.dropToken(s.token)
 		}
 	}
+}
+
+// freezeTTL bounds how long a source-side frozen player (an in-flight cross-shard handoff)
+// may linger before the backstop reaper fires. It MUST be >= pendingTTL and longer than
+// handoffRPCTimeout so the normal resolutions win first: the RPC timeout thaws a failed
+// handoff (handoffFailMsg) and a successful one redirects, both well before this. This only
+// catches the leftover: a frozen copy that never got cleaned up (e.g. a dead gate never
+// re-dialed after a successful redirect, or a path that froze but neither posted result).
+// It is a package var (not a const) so a test can shrink it to exercise the reaper quickly.
+var freezeTTL = pendingTTL
+
+// freezeExpire is the backstop for a frozen source-side player still frozen after freezeTTL.
+// The gen check ignores a stale timer for a session that has since rebound/rebuilt (a return
+// handoff, a re-attach). It then discriminates on s.redirected:
+//
+//   - redirected: the handoff SUCCEEDED — the directory points at the destination, so this
+//     source copy is an ORPHAN. Remove it (and drop its token) so the character can reconnect
+//     to the source without hitting the frozen "mid-transfer" reject. Thawing it would be a
+//     both-own bug (two shards acting for one player), so we never thaw a redirected copy.
+//   - not redirected: the handoff never completed — the directory never moved, so reclaiming
+//     the source IS correct. THAW IN PLACE: restore via frozenFrom (like handoffFailed) and
+//     tell the player the way is barred (timeout). The placement CAS stays the arbiter: we
+//     only reclaim when the directory never recorded the move.
+func (z *Zone) freezeExpire(id string, gen uint64) {
+	s := z.players[id]
+	if s == nil || !s.frozen || s.attachGen != gen {
+		return // already resolved (thawed/redirected-and-reaped) or rebound
+	}
+	if s.redirected {
+		// Successful handoff's orphaned source copy: remove it so reconnect to the source works.
+		z.log.Debug("freeze timeout: reaping orphaned redirected source copy", "player", id)
+		delete(z.players, id)
+		if z.shard != nil && s.token != "" {
+			z.shard.dropToken(s.token)
+		}
+		return
+	}
+	// Handoff never completed: thaw in place and restore to the room they tried to leave.
+	z.log.Debug("freeze timeout: thawing un-redirected player in place", "player", id)
+	s.frozen = false
+	if s.frozenFrom != nil {
+		Move(s.entity, s.frozenFrom)
+		z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
+		s.frozenFrom = nil
+	}
+	s.send(textFrame("The way is barred. (handoff timed out)"))
+	s.send(promptFrame())
 }
 
 // detach handles a player's stream dropping. out identifies which stream, so a stale
@@ -635,6 +739,9 @@ func (z *Zone) redirect(v redirectMsg) {
 	s.frozenFrom = nil // committed to leaving: the failure-restore is no longer needed
 	s.epoch = v.epoch
 	s.send(redirectFrame(v.targetAddr, v.token, v.resumeSeq))
+	// Mark the handoff as SUCCEEDED (directory now points at the destination). The freeze-
+	// timeout reaper reads this: a redirected frozen copy is an orphan to remove, not thaw.
+	s.redirected = true
 	z.log.Debug("redirect sent", "player", v.id, "target", v.targetAddr, "epoch", v.epoch)
 }
 

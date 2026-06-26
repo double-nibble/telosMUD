@@ -24,12 +24,22 @@ import (
 	"log/slog"
 	"reflect"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 )
+
+// handoffRPCTimeout bounds the whole source-side handoff conversation (ShardForZone/
+// EndpointForShard/Prepare/SetPlayerShard). Without a deadline a Prepare to a restarting
+// or draining destination hangs forever and the coordinator posts NEITHER redirectMsg NOR
+// handoffFailMsg — leaving the player permanently frozen and locked out of reconnect. On
+// the deadline the fail(...) path posts handoffFailMsg and the source thaws + restores the
+// player to the room they tried to leave. It is a package var (not a const) so a test can
+// shrink it to exercise the timeout->thaw path quickly.
+var handoffRPCTimeout = 5 * time.Second
 
 // HandoffDialer resolves a Handoff client for a peer shard's address. Injected so
 // tests can dial in-process shards over bufconn.
@@ -197,7 +207,11 @@ func (s *Shard) Register(gs *grpc.Server) {
 // claim and the redirect; step 5 wires the gate to act on the Redirect.
 func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone, destRoom string, epoch uint64) {
 	go func() {
-		ctx := context.Background()
+		// Bound the whole conversation: a hung Prepare to a restarting/draining destination
+		// must not strand the frozen player forever. On deadline the fail(...) path below
+		// thaws + restores them. Runs off the zone goroutine, so blocking here is safe.
+		ctx, cancel := context.WithTimeout(context.Background(), handoffRPCTimeout)
+		defer cancel()
 		character := snap.GetCharacterId()
 		newEpoch := epoch + 1
 		log := slog.With("component", "handoff", "player", character, "dest_zone", destZone)
@@ -248,7 +262,12 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 		// pending entity.
 		if ok, err := s.dir.SetPlayerShard(ctx, character, destShardID, newEpoch); err != nil || !ok {
 			log.Warn("directory claim failed after prepare", "ok", ok, "err", err)
-			_, _ = client.Abort(ctx, &handoffv1.AbortRequest{HandoffToken: resp.GetHandoffToken(), Reason: "directory conflict"})
+			// The rollback Abort needs a FRESH context: ctx may already be at/past its
+			// deadline (e.g. SetPlayerShard was what timed out), which would cancel the
+			// Abort before it could discard the destination's pending entity.
+			abortCtx, ac := context.WithTimeout(context.Background(), 2*time.Second)
+			_, _ = client.Abort(abortCtx, &handoffv1.AbortRequest{HandoffToken: resp.GetHandoffToken(), Reason: "directory conflict"})
+			ac()
 			fail("ownership conflict")
 			return
 		}

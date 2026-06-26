@@ -75,6 +75,14 @@ type session struct {
 	// (redirect) and after a failed-handoff restore. nil except during an in-flight handoff.
 	frozenFrom *Entity
 
+	// redirected marks that the source has SENT the Redirect frame for an in-flight handoff
+	// (set in Zone.redirect, after the frame goes out). It is the discriminator the freeze-
+	// timeout reaper uses: a frozen session that was redirected had its handoff SUCCEED (the
+	// directory points at the destination), so its lingering source copy is an orphan to be
+	// REMOVED; a frozen session that was NOT redirected never completed, so on timeout it is
+	// THAWED IN PLACE and restored to frozenFrom. Only meaningful while frozen.
+	redirected bool
+
 	// Destination side: a PENDING session has been rehydrated by Prepare and is waiting
 	// for the gate to re-dial. Its entity is not yet in a room's contents and it applies
 	// no input until an Attach carrying the matching token activates it. token is the

@@ -281,6 +281,22 @@ func (r *Redis) PlayerPlacement(ctx context.Context, playerID string) (Placement
 	return Placement{ShardID: shardID, Epoch: epoch}, nil
 }
 
+// PlayerEpoch returns the player's last-recorded ownership epoch, or found=false (with a
+// nil error) when the player has no placement yet. A thin wrapper over PlayerPlacement so
+// the world can RESUME the epoch on a fresh login without importing Placement: the epoch is
+// globally monotonic per player via the directory, so the next handoff's CAS (which writes
+// stored+1) is accepted instead of rejected as stale.
+func (r *Redis) PlayerEpoch(ctx context.Context, playerID string) (uint64, bool, error) {
+	place, err := r.PlayerPlacement(ctx, playerID)
+	if errors.Is(err, ErrNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return place.Epoch, true, nil
+}
+
 // ClearPlayer removes a player's placement (on clean logout).
 func (r *Redis) ClearPlayer(ctx context.Context, playerID string) error {
 	return r.rdb.Del(ctx, r.playerKey(playerID)).Err()
