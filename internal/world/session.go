@@ -69,6 +69,12 @@ type session struct {
 	frozen bool
 	epoch  uint64
 
+	// frozenFrom is the room entity the player tried to leave when the cross-shard handoff
+	// was initiated. move() detaches the entity from its room while the handoff is in flight;
+	// if the handoff FAILS, handoffFailed re-attaches the entity here. Cleared on success
+	// (redirect) and after a failed-handoff restore. nil except during an in-flight handoff.
+	frozenFrom *Entity
+
 	// Destination side: a PENDING session has been rehydrated by Prepare and is waiting
 	// for the gate to re-dial. Its entity is not yet in a room's contents and it applies
 	// no input until an Attach carrying the matching token activates it. token is the

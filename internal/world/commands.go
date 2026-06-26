@@ -185,6 +185,10 @@ func (z *Zone) move(s *session, dir string) bool {
 		// The player has departed this room: detach the entity from the room so they
 		// don't linger as a ghost others can see while the handoff is in flight. (The
 		// frozen session/entity itself is GC'd later, once a discard signal lands.)
+		// Remember the room so handoffFailed can put the entity BACK if the handoff can't
+		// be initiated — otherwise the entity's location stays nil and the next room action
+		// null-derefs.
+		s.frozenFrom = from
 		z.act("$n departs "+dir+".", s.entity, nil, nil, "", "", ToRoom)
 		Move(s.entity, nil)
 		z.log.Debug("cross-shard move initiated", "player", s.character,

@@ -278,3 +278,52 @@ func recvUntilOutput(t *testing.T, s playv1.Play_ConnectClient, substr string) {
 		}
 	}
 }
+
+// TestCrossShardHandoffFailureRestoresPlayer covers the bug where a cross-zone move into a
+// zone NO shard hosts left the player's entity detached from its room (location==nil), so the
+// next room action null-dereferenced and crashed the zone. The handoff must fail gracefully
+// ("The way is barred"), thaw the player, and RESTORE them to the room they tried to leave —
+// after which look and a normal move must work.
+func TestCrossShardHandoffFailureRestoresPlayer(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mr.Close)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	dir := directory.NewRedis(rdb, "test")
+
+	ctx := context.Background()
+	// Only midgaard is hosted; darkwood is registered NOWHERE, so the market->grove
+	// cross-shard exit resolves to no shard and the handoff cannot be initiated.
+	mustReg(t, dir.RegisterShard(ctx, "shard-a", "addr-a", directory.DefaultShardLease))
+	mustReg(t, dir.RegisterZone(ctx, "midgaard", "shard-a"))
+
+	lis := bufconn.Listen(1 << 20)
+	// The peer dialer must never be reached — resolution fails before any dial.
+	peers := func(addr string) (handoffv1.HandoffClient, error) {
+		return nil, fmt.Errorf("unexpected dial to %q", addr)
+	}
+	play := serveShard(t, NewShard("midgaard", "addr-a", dir, peers), lis)
+
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := play.Connect(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(t, s, attach("Lost"))
+	recvAttached(t, s)
+	send(t, s, inputSeq(1, "north")) // temple -> market
+	expectMarkup(t, s, "Market Square")
+	send(t, s, inputSeq(2, "north")) // market -> darkwood:grove, but darkwood is unhosted
+	recvUntilOutput(t, s, "The way is barred")
+
+	// Before the fix the entity's location was nil here; look would null-deref and crash the
+	// zone. After the fix the player is back in the market and these work normally.
+	send(t, s, inputSeq(3, "look"))
+	recvUntilOutput(t, s, "Market Square")
+	send(t, s, inputSeq(4, "south")) // market -> temple, a normal move still works
+	recvUntilOutput(t, s, "The Temple Square")
+}

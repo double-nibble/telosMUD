@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"log/slog"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
@@ -310,7 +311,24 @@ func (z *Zone) handleInput(v inputMsg) {
 		s.appliedSeq = v.seq
 	}
 	z.log.Debug("inbox: input", "player", v.id, "seq", v.seq, "line", v.line)
-	z.dispatch(s, v.line)
+	z.dispatchSafe(s, v.line)
+}
+
+// dispatchSafe runs one command with panic recovery. A bug in a handler must NEVER crash the
+// zone goroutine: an unrecovered panic there is fatal to the whole world process and every
+// player on every zone it hosts (a single malformed command would be a DoS). On a panic we
+// log the stack, tell the offending player their command failed, and the zone keeps serving
+// everyone else. This is the safety net; the underlying bug should still be fixed.
+func (z *Zone) dispatchSafe(s *session, line string) {
+	defer func() {
+		if r := recover(); r != nil {
+			z.log.Error("command handler panicked; zone survived",
+				"player", s.character, "line", line, "panic", r, "stack", string(debug.Stack()))
+			s.send(textFrame("Something went wrong with that command."))
+			s.send(promptFrame())
+		}
+	}()
+	z.dispatch(s, line)
 }
 
 // join places a newly connected player into the world: it picks a valid room
@@ -614,6 +632,7 @@ func (z *Zone) redirect(v redirectMsg) {
 	if s == nil {
 		return
 	}
+	s.frozenFrom = nil // committed to leaving: the failure-restore is no longer needed
 	s.epoch = v.epoch
 	s.send(redirectFrame(v.targetAddr, v.token, v.resumeSeq))
 	z.log.Debug("redirect sent", "player", v.id, "target", v.targetAddr, "epoch", v.epoch)
@@ -627,6 +646,14 @@ func (z *Zone) handoffFailed(v handoffFailMsg) {
 		return
 	}
 	s.frozen = false
+	// Restore the entity to the room it tried to leave: move() detached it (location=nil)
+	// for the in-flight handoff. Without this re-attach the location stays nil and the next
+	// look/move null-derefs (commands.go lookRoom/move read s.entity.location).
+	if s.frozenFrom != nil {
+		Move(s.entity, s.frozenFrom)
+		z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
+		s.frozenFrom = nil
+	}
 	z.log.Debug("handoff failed, thawing player", "player", v.id, "reason", v.reason)
 	s.send(textFrame("The way is barred. (" + v.reason + ")"))
 	s.send(promptFrame())

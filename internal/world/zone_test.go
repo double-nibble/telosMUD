@@ -23,6 +23,23 @@ func newTestPlayerEntity(z *Zone, name string) *session {
 	return s
 }
 
+// TestDispatchSafeRecoversHandlerPanic proves a panicking command handler cannot crash the
+// zone goroutine — which, unrecovered, would be fatal to the whole world process and every
+// player on it. A session whose entity never joined a room (location==nil) makes "look"
+// null-deref; dispatchSafe must recover, keep running, and send the player an error.
+func TestDispatchSafeRecoversHandlerPanic(t *testing.T) {
+	z := newZone("test")
+	s := newTestPlayerEntity(z, "Boom") // entity created but never joined -> location is nil
+
+	z.dispatchSafe(s, "look") // would panic in lookRoom; must be recovered, not propagate
+
+	select {
+	case <-s.out: // received the generic-error / prompt frame: the zone survived the panic
+	default:
+		t.Fatal("dispatchSafe recovered the panic but produced no output to the player")
+	}
+}
+
 // waitMarkup waits until an Output frame whose markup contains substr arrives,
 // skipping prompt/attached frames.
 func waitMarkup(t *testing.T, s *session, substr string) {
