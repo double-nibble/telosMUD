@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
+	"github.com/double-nibble/telosmud/internal/content"
 )
 
 // handoffRPCTimeout bounds the whole source-side handoff conversation (ShardForZone/
@@ -100,15 +101,13 @@ func NewMultiShard(zoneIDs []string, home, addr string, dir Locator, peers Hando
 	return newShard(zoneIDs, home, addr, dir, peers)
 }
 
+// newShard builds a shard whose zones are the EMBEDDED demo pack (test/bare-run path). Each
+// zone is constructed via newDemoZone, which loads packs/demo.yaml into the shared cache and
+// builds the named zone — so the demo world has no Postgres dependency and the Phase 1-3
+// tests construct it exactly as before. Production uses NewShardFromContent instead, so the
+// demo pack is never compiled into the engine's production boot path.
 func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDialer) *Shard {
-	s := &Shard{
-		zones:      map[string]*Zone{},
-		home:       home,
-		addr:       addr,
-		dir:        dir,
-		peers:      peers,
-		tokenIndex: map[string]*Zone{},
-	}
+	s := newBareShard(home, addr, dir, peers)
 	// Build the per-shard prototype cache ONCE here, before any zone goroutine runs
 	// (prototype.go). It is shared read-only across every hosted zone, so the flyweight
 	// pays off across the whole process and the cross-goroutine sharing needs no lock —
@@ -116,14 +115,56 @@ func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDia
 	protos := newProtoCache()
 	for _, id := range zoneIDs {
 		z := newDemoZone(id, protos)
-		z.shard = s
-		z.handoff = s.beginHandoff
-		s.zones[id] = z
+		s.adopt(id, z)
 	}
 	if s.zones[home] == nil && len(zoneIDs) > 0 {
 		s.home = zoneIDs[0]
 	}
 	return s
+}
+
+// NewShardFromContent is the PRODUCTION constructor (cmd/telos-world buildShard). It fills
+// the shared per-shard prototype cache from already-loaded content (Postgres or the embedded
+// pack, chosen by the binary), then builds every hosted zone from that content via buildZone.
+// With empty content (no DB / no enabled packs) every zone boots EMPTY — the bare-engine
+// invariant — and a login is rejected cleanly rather than panicking (Zone.join guards).
+//
+// Unlike newShard it does NOT call newDemoZone, so no demo content is linked into the
+// production path; the demo lives only in the YAML/DB.
+func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr string, dir Locator, peers HandoffDialer) *Shard {
+	s := newBareShard(home, addr, dir, peers)
+	protos := newProtoCache()
+	defineContent(protos, lc) // fill the cache once from all loaded zones, before any zone runs
+	for _, id := range zoneIDs {
+		z := newZone(id)
+		z.protos = protos
+		z.buildZone(lc) // spawn room singletons + run resets (empty if the zone wasn't loaded)
+		s.adopt(id, z)
+	}
+	if s.zones[home] == nil && len(zoneIDs) > 0 {
+		s.home = zoneIDs[0]
+	}
+	return s
+}
+
+// newBareShard allocates the Shard struct with its routing maps; callers then build and
+// adopt the hosted zones.
+func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
+	return &Shard{
+		zones:      map[string]*Zone{},
+		home:       home,
+		addr:       addr,
+		dir:        dir,
+		peers:      peers,
+		tokenIndex: map[string]*Zone{},
+	}
+}
+
+// adopt registers a built zone on the shard and wires its cross-shard handoff hook.
+func (s *Shard) adopt(id string, z *Zone) {
+	z.shard = s
+	z.handoff = s.beginHandoff
+	s.zones[id] = z
 }
 
 // indexToken records that zone z holds a pending player bound by token, so a Play
@@ -306,127 +347,17 @@ func (z *Zone) spawnRoom(ref ProtoRef) *Entity {
 	return e
 }
 
-// newDemoZone builds one of the hardcoded demo zones from PROTOTYPES (docs/MUDLIB.md §5).
-// It authors the zone's room/item/mob prototypes into the shared per-shard cache (passed
-// in by newShard, built once before any zone runs), then spawns instances: one instance
-// per room (singletons), and SEVERAL instances of an item/mob prototype into a room so the
-// flyweight is genuinely exercised — 40 identical kobolds would be 40 thin headers over one
-// template. Phase 4's content loader replaces this authoring body without touching callers.
-//
-// midgaard's market has a cross-shard exit north into darkwood; darkwood's grove leads back
-// south. Exits live on the room PROTOTYPE (defineRoom), wired at authoring time; the spawned
-// singleton room shares that immutable exits map.
-func newDemoZone(id string, protos *protoCache) *Zone {
-	z := newZone(id)
-	z.protos = protos // share the per-shard cache (replaces the private one from newZone)
-	switch id {
-	case "darkwood":
-		grove := defineRoom(protos, "darkwood:room:grove", "A Moonlit Grove",
-			"Silver birches ring a still clearing; the air hums with quiet magic.")
-		hollow := defineRoom(protos, "darkwood:room:hollow", "A Dark Hollow",
-			"The trees crowd close and the moonlight fails. Something rustles, unseen.")
-		grove.exits()["south"] = "midgaard:room:market" // back across the shard boundary
-		grove.exits()["north"] = "darkwood:room:hollow"
-		hollow.exits()["south"] = "darkwood:room:grove"
-
-		z.spawnRoom("darkwood:room:grove")
-		z.spawnRoom("darkwood:room:hollow")
-		z.startRoom = "darkwood:room:grove"
-	default: // "midgaard"
-		temple := defineRoom(protos, "midgaard:room:temple", "The Temple Square",
-			"A broad plaza of worn flagstones stretches before the great temple. "+
-				"Pilgrims murmur in the shade of its columns.")
-		market := defineRoom(protos, "midgaard:room:market", "Market Square",
-			"Stalls crowd the square and merchants cry their wares over the din of haggling.")
-		temple.exits()["north"] = "midgaard:room:market"
-		market.exits()["south"] = "midgaard:room:temple"
-		market.exits()["north"] = "darkwood:room:grove" // cross-shard exit
-
-		z.spawnRoom("midgaard:room:temple")
-		z.spawnRoom("midgaard:room:market")
-		z.startRoom = "midgaard:room:temple"
-
-		// A spawnable, non-room prototype and a herd of instances over it — the flyweight
-		// proof (MUDLIB §5). Each torch is a thin delta over the one shared template; they
-		// share keywords/short/long and the Physical component by reference until COW'd.
-		// They are placed on the MARKET floor as ground items (not the temple/start room, so
-		// the targeting tests' item counts are unchanged). Slice-4 commands make them
-		// gettable; lookRoom still lists only player occupants, so the player-facing room
-		// text is unchanged.
-		defineTorch(protos)
-		marketEntity := z.rooms["midgaard:room:market"]
-		for i := 0; i < demoTorchCount; i++ {
-			Move(z.spawn("midgaard:obj:torch"), marketEntity)
-		}
-
-		// Slice-4 content: a wearable, a weapon, and a CONTAINER prototype, with instances on
-		// the market floor. The container (a chest) is the COW-arming object (Finding 6): its
-		// Container component is shared with the prototype, so open/close must COW. Authored
-		// here so a real run has gettable/wearable/wieldable items and an openable chest;
-		// none of them render in lookRoom, so the demo's room text stays byte-for-byte.
-		defineHelmet(protos)
-		defineSword(protos)
-		defineChest(protos)
-		Move(z.spawn("midgaard:obj:helmet"), marketEntity)
-		Move(z.spawn("midgaard:obj:sword"), marketEntity)
-		Move(z.spawn("midgaard:obj:chest"), marketEntity)
-	}
-	return z
-}
-
-// demoTorchCount is how many identical torch instances the demo spawns from the single
-// torch prototype, so the flyweight + COW behaviour is exercised by a real herd rather than
-// hypothetically. Kept small (player-facing output is unchanged: items don't render in the
-// slice-1/2 look until slice-4 commands surface them).
-const demoTorchCount = 5
-
-// defineTorch authors a simple item prototype: a torch with keywords/short/long and a
-// Physical component (mass/material). The immutable template is shared by every spawned
-// instance until one COWs a field. Items become functional (get/drop/wear) in slice 4; here
-// the prototype exists to make the flyweight provable.
-func defineTorch(c *protoCache) *Prototype {
-	comps := componentSet{}
-	comps[reflect.TypeFor[*Physical]()] = &Physical{weight: 2, material: "wood"}
-	return c.define("midgaard:obj:torch",
-		[]string{"torch", "wooden"},
-		"a wooden torch",
-		"A wooden torch lies here, its pitch cold.",
-		comps)
-}
-
-// defineHelmet authors a wearable item prototype (a helmet that fits the head slot). Its
-// Wearable advertises WearLocHead; wear consults that to pick the slot. Slice-4 content.
-func defineHelmet(c *protoCache) *Prototype {
-	comps := componentSet{}
-	comps[reflect.TypeFor[*Physical]()] = &Physical{weight: 3, material: "iron"}
-	comps[reflect.TypeFor[*Wearable]()] = wearableFor(WearLocHead)
-	return c.define("midgaard:obj:helmet",
-		[]string{"helmet", "iron"},
-		"an iron helmet",
-		"An iron helmet rests here.",
-		comps)
-}
-
-// defineSword authors a weapon prototype: Wearable in the wield slot, plus a Weapon carrying
-// the damage shape (data only this phase; combat is Phase 6). wield records it in the wield
-// slot; the Weapon dice are inert until combat resolves rounds off the pulse scheduler.
-func defineSword(c *protoCache) *Prototype {
-	comps := componentSet{}
-	comps[reflect.TypeFor[*Physical]()] = &Physical{weight: 5, material: "steel"}
-	comps[reflect.TypeFor[*Wearable]()] = wearableFor(WearLocWield)
-	comps[reflect.TypeFor[*Weapon]()] = &Weapon{
-		diceNum: 2, diceSize: 6, damageType: "slash", class: "sword", attackVerb: "slash",
-	}
-	return c.define("midgaard:obj:sword",
-		[]string{"sword", "steel", "long"},
-		"a steel longsword",
-		"A steel longsword lies here.",
-		comps)
-}
+// newDemoZone has moved to build.go: the hand-authored body is GONE (Phase 4.1). It is now a
+// thin wrapper that loads the EMBEDDED demo content pack into the shared per-shard cache and
+// builds the named zone via the content loader, producing byte-identical prototypes. The
+// authoring helpers below (defineRoom/spawnRoom/defineChest) remain as general prototype-
+// construction utilities the prototype/container tests use directly.
 
 // defineChest authors the CONTAINER prototype — the COW-arming object (Finding 6). It starts
 // CLOSED; open/close flip Container.closed, which is shared with this prototype, so the verbs
 // must COW via mutableComponent (cmdOpen/cmdClose). capacity caps how many items it holds.
+// Retained as a test authoring helper (container_test's concurrent-COW race builds a bare
+// cache from it); the demo world itself is authored in the demo pack (packs/demo.yaml).
 func defineChest(c *protoCache) *Prototype {
 	comps := componentSet{}
 	comps[reflect.TypeFor[*Physical]()] = &Physical{weight: 40, material: "oak"}

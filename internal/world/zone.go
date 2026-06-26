@@ -369,6 +369,19 @@ func (z *Zone) dispatchSafe(s *session, line string) {
 // the room, shows the player their surroundings, and primes the prompt.
 func (z *Zone) join(s *session) {
 	r := z.resolveRoom("") // fresh join always lands in the start room
+	if r == nil {
+		// Empty-world boot (bare-engine invariant, docs/PHASE4-PLAN.md §7.5): the zone hosts
+		// no rooms (no content loaded / no start room), so there is nowhere to place the
+		// player. Reject the login cleanly rather than registering a roomless player and then
+		// null-deref'ing in lookRoom/act. The player is NOT added to z.players, so no later
+		// command finds a placeless session.
+		z.log.Warn("login rejected: zone has no rooms (empty world)", "player", s.character, "zone", z.id)
+		s.send(textFrame("This world has no rooms yet. There is nowhere to enter."))
+		// Close the stream (like transferIn's empty-dest rejection) rather than leave a
+		// registered-nowhere session the player can type into a void — no prompt.
+		s.send(disconnectFrame("world has no content"))
+		return
+	}
 	z.players[s.character] = s
 	delete(z.forwarding, s.character) // present here again; no stale forward
 	Move(s.entity, r)
@@ -419,6 +432,18 @@ func (z *Zone) leave(id string) {
 func (z *Zone) transferIn(m transferInMsg) {
 	s := m.s
 	r := z.resolveRoom(m.room)
+	if r == nil {
+		// The destination zone hosts no rooms (empty-world boot): it cannot place the
+		// transferred player. Disconnect cleanly rather than null-deref'ing in lookRoom. The
+		// player keeps no presence here; the source already released it, so the session is
+		// dropped (a real placement controller would re-route, Phase 10).
+		z.log.Warn("intra-shard transfer rejected: destination has no rooms", "player", s.character, "zone", z.id)
+		if s.currentZone != nil {
+			s.currentZone.Store(z)
+		}
+		s.send(disconnectFrame("destination has no rooms"))
+		return
+	}
 	// The entity now belongs to this zone: re-home it (rid allocator, zone owner) so a
 	// future target reference resolves here, then place it in the destination room.
 	s.entity.zone = z

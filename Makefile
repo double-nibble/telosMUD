@@ -2,7 +2,7 @@ GO ?= go
 COMPOSE ?= docker compose -f deploy/docker-compose.yml
 
 .DEFAULT_GOAL := help
-.PHONY: help up deps down logs test vet lint build tidy proto
+.PHONY: help up deps down logs test vet lint build tidy proto migrate migrate-status seed
 
 help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | \
@@ -40,3 +40,12 @@ tidy: ## go mod tidy
 
 proto: ## Generate protobuf/gRPC code (requires buf)
 	@command -v buf >/dev/null 2>&1 && buf generate || echo "buf not installed; see https://buf.build/docs/installation"
+
+migrate: ## Apply DB migrations (embedded goose; uses TELOS_POSTGRES_DSN)
+	$(GO) run ./cmd/telos-migrate up
+
+migrate-status: ## Show DB migration status
+	$(GO) run ./cmd/telos-migrate status
+
+seed: ## Import the demo content pack into Postgres (pack='demo')
+	$(GO) run ./cmd/telos-seed

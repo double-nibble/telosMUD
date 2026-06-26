@@ -1,0 +1,84 @@
+# The `demo` content pack — the midgaard + darkwood world, transcribed VERBATIM from the
+# old internal/world/world.go newDemoZone()/defineTorch()/defineHelmet()/defineSword()/
+# defineChest() Go authoring. This file is the source of truth for the demo world the unit
+# tests load (embedded via internal/content/demo.go) and for `make seed` (imported into the
+# Postgres `pack='demo'` rows for the live stack).
+#
+# HARD CONSTRAINT (Phase 4.1): the rendered demo world must stay byte-identical — room
+# names, long descriptions, exit display order, item keywords/short/long, and the market
+# floor item placements must match the old Go authoring exactly. The parity test
+# (content_parity_test.go) diffs the prototypes this pack produces against newDemoZone's
+# output before that authoring was deleted; keep it green when editing this file.
+#
+# Both demo zones (midgaard + darkwood) ship together so the cross-zone exit
+# market --north--> darkwood:room:grove satisfies the exits.to_room FK when seeded.
+
+pack: demo
+
+zones:
+  - ref: midgaard
+    name: The City of Midgaard
+    start_room: midgaard:room:temple
+    rooms:
+      - ref: midgaard:room:temple
+        name: The Temple Square
+        long: >-
+          A broad plaza of worn flagstones stretches before the great temple. Pilgrims
+          murmur in the shade of its columns.
+        exits:
+          north: midgaard:room:market
+      - ref: midgaard:room:market
+        name: Market Square
+        long: Stalls crowd the square and merchants cry their wares over the din of haggling.
+        exits:
+          south: midgaard:room:temple
+          north: darkwood:room:grove   # cross-zone exit
+    item_prototypes:
+      - ref: midgaard:obj:torch
+        keywords: [torch, wooden]
+        short: a wooden torch
+        long: A wooden torch lies here, its pitch cold.
+        physical: {weight: 2, material: wood}
+      - ref: midgaard:obj:helmet
+        keywords: [helmet, iron]
+        short: an iron helmet
+        long: An iron helmet rests here.
+        physical: {weight: 3, material: iron}
+        wearable: {locations: [head]}
+      - ref: midgaard:obj:sword
+        keywords: [sword, steel, long]
+        short: a steel longsword
+        long: A steel longsword lies here.
+        physical: {weight: 5, material: steel}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 2, dice_size: 6, damage_type: slash, class: sword, attack_verb: slash}
+      - ref: midgaard:obj:chest
+        keywords: [chest, oak, wooden]
+        short: a wooden chest
+        long: A heavy wooden chest sits here.
+        physical: {weight: 40, material: oak}
+        container: {capacity: 10, closed: true}
+    # Reset placements: instances spawned onto the market floor at zone boot, exactly as the
+    # old newDemoZone Move(z.spawn(...), marketEntity) calls did. None render in lookRoom, so
+    # the demo's room text is unchanged; count==5 torches exercises the flyweight herd.
+    resets:
+      - {op: spawn_item, proto: midgaard:obj:torch,  room: midgaard:room:market, count: 5}
+      - {op: spawn_item, proto: midgaard:obj:helmet, room: midgaard:room:market}
+      - {op: spawn_item, proto: midgaard:obj:sword,  room: midgaard:room:market}
+      - {op: spawn_item, proto: midgaard:obj:chest,  room: midgaard:room:market}
+
+  - ref: darkwood
+    name: The Darkwood
+    start_room: darkwood:room:grove
+    rooms:
+      - ref: darkwood:room:grove
+        name: A Moonlit Grove
+        long: Silver birches ring a still clearing; the air hums with quiet magic.
+        exits:
+          south: midgaard:room:market   # back across the shard boundary
+          north: darkwood:room:hollow
+      - ref: darkwood:room:hollow
+        name: A Dark Hollow
+        long: The trees crowd close and the moonlight fails. Something rustles, unseen.
+        exits:
+          south: darkwood:room:grove

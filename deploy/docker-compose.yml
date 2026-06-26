@@ -44,6 +44,36 @@ services:
       timeout: 3s
       retries: 10
 
+  # One-shot: apply the embedded goose migrations (the schema), then exit. Runs before any
+  # world boots so the shards never race migrations (the migration is advisory-locked too).
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-migrate
+    environment:
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # One-shot: import the demo content pack (pack='demo') into the definition rows, then exit.
+  # Content is DATA, not a migration (decision D4), so it runs after migrate, before worlds.
+  seed:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-seed
+    environment:
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   world:
     build:
       context: ..
@@ -70,6 +100,8 @@ services:
         condition: service_healthy
       nats:
         condition: service_healthy
+      seed:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # Second shard: hosts the darkwood zone. The midgaard shard hands players off to
@@ -100,6 +132,8 @@ services:
         condition: service_healthy
       nats:
         condition: service_healthy
+      seed:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   gate:

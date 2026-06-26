@@ -19,11 +19,18 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
+	"github.com/double-nibble/telosmud/db"
 	"github.com/double-nibble/telosmud/internal/config"
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
+	"github.com/double-nibble/telosmud/internal/store"
 	"github.com/double-nibble/telosmud/internal/world"
 )
+
+// enabledPacks is the content packs a world shard loads. v1 ships only the demo pack;
+// strip-the-stdlib / per-deploy pack selection (a config field) is a later concern.
+var enabledPacks = []string{content.DemoPack}
 
 func main() {
 	cfg, err := config.Load(config.PathFromEnv())
@@ -79,12 +86,20 @@ func main() {
 // home (the spawn zone for fresh logins) is the first configured zone.
 func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []string) *world.Shard {
 	home := zones[0]
+
+	// Load content BEFORE building any zone (docs/PHASE4-PLAN.md §3). This is synchronous boot
+	// I/O on the construction goroutine — never on a zone goroutine — so blocking is fine. If
+	// Postgres is unreachable the shard boots EMPTY (the bare-engine invariant), exactly as it
+	// degrades to single-shard when Redis is down. The demo world lives only in the DB/YAML, so
+	// nothing demo is compiled into this path.
+	lc := loadContent(ctx, cfg)
+
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
 		slog.Warn("redis unavailable; single-shard mode (cross-shard exits sealed)",
 			"addr", cfg.Redis.Addr, "err", err)
-		return world.NewMultiShard(zones, home, "", nil, nil)
+		return world.NewShardFromContent(lc, zones, home, "", nil, nil)
 	}
 	dir := directory.NewRedis(rdb, "telos")
 
@@ -120,7 +135,41 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardID)
 	}
 
-	return world.NewMultiShard(zones, home, cfg.ShardAddr, dir, world.GRPCDialer())
+	return world.NewShardFromContent(lc, zones, home, cfg.ShardAddr, dir, world.GRPCDialer())
+}
+
+// loadContent reads the enabled packs from Postgres, optionally running migrations first
+// (opt-in via TELOS_DB_AUTOMIGRATE, advisory-locked so multi-shard boots serialize). If the
+// database is unreachable it logs a warning and returns EMPTY content — the engine boots with
+// zero rooms (bare-engine invariant), and a login is rejected cleanly rather than panicking.
+// Postgres is the production source; the embedded YAML pack is the unit-test/dev source.
+func loadContent(ctx context.Context, cfg config.Config) *content.LoadedContent {
+	if db.AutoMigrateEnabled() {
+		if err := db.Migrate(ctx, cfg.Postgres.DSN); err != nil {
+			slog.Warn("auto-migrate failed; continuing (boot may be empty)", "err", err)
+		} else {
+			slog.Info("auto-migrate applied", "guard", db.AutoMigrateEnv)
+		}
+	}
+	pool, err := store.Open(ctx, cfg.Postgres.DSN)
+	if err != nil {
+		slog.Warn("postgres unavailable; booting empty world (bare-engine)", "err", err)
+		empty, _ := content.Load(ctx, nil, nil)
+		return empty
+	}
+	defer pool.Close()
+	lc, err := content.Load(ctx, pool, enabledPacks)
+	if err != nil {
+		slog.Warn("content load failed; booting empty world", "err", err)
+		empty, _ := content.Load(ctx, nil, nil)
+		return empty
+	}
+	if lc.Empty() {
+		slog.Warn("no content loaded (packs absent in DB?); booting empty world", "packs", enabledPacks)
+	} else {
+		slog.Info("content loaded from postgres", "packs", enabledPacks, "zones", len(lc.Zones))
+	}
+	return lc
 }
 
 // renewShardRegistration heartbeats this shard's id->endpoint registration until ctx is

@@ -16,6 +16,18 @@ name: telosmud-single
 # with `make up`.
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-telos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-telos}
+      POSTGRES_DB: ${POSTGRES_DB:-telosmud}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telos} -d ${POSTGRES_DB:-telosmud}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -26,6 +38,35 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # One-shot: apply migrations, then import the demo content pack, then exit. The world
+  # below loads pack='demo' from Postgres (both zones live in the same DB, so the cross-zone
+  # market->grove exit FK holds).
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-migrate
+    environment:
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-seed
+    environment:
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
 
   # One shard, both zones. A fresh login spawns in the home zone (first in the list,
   # midgaard); walking north out of the market transfers the player into darkwood's
@@ -42,6 +83,7 @@ services:
       TELOS_WORLD_LISTEN: ":9090"
       TELOS_SHARD_ADDR: world:9090
       TELOS_ZONES: midgaard,darkwood # <-- both zones on one process (home = midgaard)
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
       TELOS_REDIS_ADDR: redis:6379
       DEBUG: true
     expose:
@@ -49,6 +91,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      seed:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   gate:
