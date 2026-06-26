@@ -84,10 +84,10 @@ type PlayerControlled struct {
 
 func (*PlayerControlled) componentKind() Kind { return KindPlayerControlled }
 
-// --- Stubs below: shape only, not built or read this phase. ---
-
-// Physical grants mass/size/material/condition (MUDLIB §3). Stub: items become real in
-// slice 4.
+// Physical grants mass/size/material/condition (MUDLIB §3). Functional in slice 4: items
+// carry weight so a Container can enforce a weight limit and a wearer can weigh its load
+// (the latter is shape only this phase). The fields are value types, so a COW of Physical
+// is the shallow struct copy in cloneComponent.
 type Physical struct {
 	weight   int
 	size     int
@@ -97,27 +97,118 @@ type Physical struct {
 func (*Physical) componentKind() Kind { return KindPhysical }
 
 // Container grants "holds other entities" beyond the universal contents tree: capacity,
-// weight limit, and open/closed/locked state (MUDLIB §3). Stub: functional in slice 4.
+// weight limit, and open/closed/locked state (MUDLIB §3). Functional in slice 4: get/put
+// respect closed and capacity; open/close flip `closed`, which — because Container is a
+// prototype-shared component on a spawned instance — MUST go through mutableComponent so
+// the write lands on the instance, never the shared prototype (the slice-3 COW path,
+// Finding 6). capacity 0 means "unbounded" (no limit authored). All fields are value
+// types, so cloneComponent copies a Container with the shallow struct copy.
 type Container struct {
-	capacity    int
-	weightLimit int
-	closed      bool
-	locked      bool
-	keyRef      ProtoRef
+	capacity    int      // max item count this container holds; 0 == unbounded
+	weightLimit int      // shape only this phase (no aggregate-weight enforcement yet)
+	closed      bool     // an item cannot be taken from / put into a closed container
+	locked      bool     // shape only this phase (no key/lock command yet)
+	keyRef      ProtoRef // shape only: the key prototype that unlocks it
 }
 
 func (*Container) componentKind() Kind { return KindContainer }
 
-// Wearable grants wear locations (worn/wield/hold) (MUDLIB §3). Stub: functional in
-// slice 4 (wear/wield/remove).
+// hasRoom reports whether the container can accept one more item, given how many it
+// currently holds (n). A capacity of 0 is unbounded (no authored limit).
+func (c *Container) hasRoom(n int) bool { return c.capacity == 0 || n < c.capacity }
+
+// Wear locations (MUDLIB §3). A Wearable advertises which of these slots it can occupy;
+// a slot maps a worn item to a body location on the wearer. Held/wielded are slots too
+// (the hands), which is why wield/hold share the worn-slot machinery. The set is the
+// classic Diku core; content extends it later. Each is a distinct slot index (NOT a
+// bitmask position) used as the Wearer map key and the Wearable.locations bit shift.
+type WearLoc int
+
+const (
+	WearLocNone   WearLoc = iota // sentinel: not wearable anywhere
+	WearLocHead                  // a helmet
+	WearLocBody                  // armor on the torso
+	WearLocHands                 // gloves
+	WearLocFeet                  // boots
+	WearLocWield                 // primary weapon hand
+	WearLocHold                  // off-hand held item (light, shield-substitute, focus)
+	wearLocCount                 // table size; keep last
+)
+
+// wearLocName is the human label for a slot, used in the equipment list and act() lines
+// ("You wear $p on your head.").
+var wearLocName = map[WearLoc]string{
+	WearLocHead:  "head",
+	WearLocBody:  "body",
+	WearLocHands: "hands",
+	WearLocFeet:  "feet",
+	WearLocWield: "wielded",
+	WearLocHold:  "held",
+}
+
+// Wearable grants wear locations: the set of slots this item can occupy (MUDLIB §3).
+// locations is a bitmask of (1 << WearLoc) bits. Functional in slice 4: wear/wield/hold
+// consult it to pick a legal slot; remove returns the item to inventory.
 type Wearable struct {
-	locations uint64 // bitmask of valid wear slots
+	locations uint64 // bitmask of valid wear slots: bit (1<<loc) set == may occupy loc
 }
 
 func (*Wearable) componentKind() Kind { return KindWearable }
 
-// Weapon grants damage dice, damage type, class, and attack verb (MUDLIB §3). Stub:
-// data only; combat resolution is Phase 6.
+// canWear reports whether this item may occupy slot loc.
+func (w *Wearable) canWear(loc WearLoc) bool { return w.locations&(1<<loc) != 0 }
+
+// slots returns the wearable's legal slots in WearLoc order, so a generic `wear` (no
+// explicit slot) can pick the first free legal one.
+func (w *Wearable) slots() []WearLoc {
+	var out []WearLoc
+	for loc := WearLocHead; loc < wearLocCount; loc++ {
+		if w.canWear(loc) {
+			out = append(out, loc)
+		}
+	}
+	return out
+}
+
+// wearableFor builds a Wearable advertising exactly the given slots (authoring helper).
+func wearableFor(locs ...WearLoc) *Wearable {
+	var bits uint64
+	for _, l := range locs {
+		bits |= 1 << l
+	}
+	return &Wearable{locations: bits}
+}
+
+// Wearer holds the equipment state for a living entity: which item occupies each worn
+// slot (MUDLIB §3 — the wearer side of Wearable). It lives on the WEARER, not the item,
+// so it is plain instance state: a player entity has prototype==nil, so mutating its
+// Wearer map is never a prototype-shared write and needs no COW. (A spawned mob that
+// wears gear would COW its Wearer like any other component — handled by cloneComponent.)
+//
+// A worn item stays in the wearer's contents (inventory) — equipped is a STATE over a
+// carried item, exactly as Diku models it — so it is reachable both as inventory and via
+// the Wearer slot map. Targeting's ScopeEquipment reads worn; ScopeInventory reads the
+// rest. remove just clears the slot, leaving the item carried.
+type Wearer struct {
+	worn map[WearLoc]*Entity
+}
+
+func (*Wearer) componentKind() Kind { return KindWearable } // shares the wearable kind tag
+
+// slotOf returns the slot an item currently occupies on this wearer, or WearLocNone.
+func (w *Wearer) slotOf(item *Entity) WearLoc {
+	for loc, e := range w.worn {
+		if e == item {
+			return loc
+		}
+	}
+	return WearLocNone
+}
+
+// Weapon grants damage dice, damage type, class, and attack verb (MUDLIB §3). Data only
+// this phase: wield records the weapon in the WearLocWield slot; combat resolution
+// (rolling the dice, applying damageType) is Phase 6. The pulse scheduler (pulse.go) is
+// the substrate those rounds will hang off.
 type Weapon struct {
 	diceNum, diceSize int
 	damageType        string

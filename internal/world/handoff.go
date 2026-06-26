@@ -28,6 +28,14 @@ type Locator interface {
 // state (PHASE3-PLAN.md §4); cross-shard inventory is deferred past Phase 3. Built on
 // the zone goroutine, so the read of session/entity state is race-free.
 func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
+	// DEFERRED (PHASE3-PLAN.md §4): as of slice 4 a player entity CAN carry items
+	// (s.entity.contents) and wear them (the *Wearer slot map, components.go). A future
+	// cross-shard handoff that supports a player carrying inventory would walk
+	// s.entity.contents + the Wearer slots HERE and have prepare rehydrate them — which needs
+	// the common.v1.Item shape to reference a ProtoRef plus the instance's COW delta (so a
+	// unique/enchanted item survives the hop). That is a proto change scoped OUT of Phase 3
+	// (the ROADMAP milestone is single-zone); no Phase-3 test transfers a player with items,
+	// so the snapshot stays minimal — identity + the applied-input high-water mark only.
 	return &handoffv1.PlayerSnapshot{
 		CharacterId: s.character,
 		Name:        s.entity.Name(),

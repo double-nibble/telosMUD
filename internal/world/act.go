@@ -50,20 +50,29 @@ const (
 // referents ($p / $N), either may be nil; t1/t2 are literal text args ($t / $T), used for
 // player-supplied strings like a say message. to selects the recipient set.
 //
+// This is the common 4-referent form; act2 adds the second object ($P, e.g. the container
+// in "get $p from $P"). Both funnel through render.
+//
 // The actor's room (actor.location) defines the broadcast set for ToRoom variants. Each
 // recipient gets the template rendered from ITS perspective: $n becomes "You" for the
 // actor, "Someone" for an observer who can't see the actor, the name otherwise.
 func (z *Zone) act(tmpl string, actor, obj, vict *Entity, t1, t2 string, to ActTo) {
+	z.act2(tmpl, actor, obj, nil, vict, t1, t2, to)
+}
+
+// act2 is act with an explicit second object referent obj2 ($P) — used by the container
+// verbs ("You get $p from $P.", "You put $p in $P."). Everything else is identical to act.
+func (z *Zone) act2(tmpl string, actor, obj, obj2, vict *Entity, t1, t2 string, to ActTo) {
 	room := actor.location
 	switch to {
 	case ToActor:
 		if pc, ok := sessionOf(actor); ok {
-			pc.send(textFrame(z.render(tmpl, actor, actor, obj, vict, t1, t2)))
+			pc.send(textFrame(z.render(tmpl, actor, actor, obj, obj2, vict, t1, t2)))
 		}
 	case ToVictim:
 		if vict != nil {
 			if pc, ok := sessionOf(vict); ok {
-				pc.send(textFrame(z.render(tmpl, vict, actor, obj, vict, t1, t2)))
+				pc.send(textFrame(z.render(tmpl, vict, actor, obj, obj2, vict, t1, t2)))
 			}
 		}
 	case ToRoom, ToRoomExceptActor:
@@ -82,7 +91,7 @@ func (z *Zone) act(tmpl string, actor, obj, vict *Entity, t1, t2 string, to ActT
 			if !ok {
 				continue // a mob or item: no session sink (AI/Lua hooks are a later phase)
 			}
-			pc.send(textFrame(z.render(tmpl, occ, actor, obj, vict, t1, t2)))
+			pc.send(textFrame(z.render(tmpl, occ, actor, obj, obj2, vict, t1, t2)))
 			n++
 		}
 		z.log.Debug("act", "room", roomRef(room), "tmpl", tmpl, "recipients", n)
@@ -94,7 +103,7 @@ func (z *Zone) act(tmpl string, actor, obj, vict *Entity, t1, t2 string, to ActT
 // referents; t1/t2 are literal text args. The scan is single-pass and treats every
 // non-token byte — including any '$' or '%' inside a substituted name or text arg —
 // literally; substituted values are NEVER re-scanned for tokens.
-func (z *Zone) render(tmpl string, viewer, actor, obj, vict *Entity, t1, t2 string) string {
+func (z *Zone) render(tmpl string, viewer, actor, obj, obj2, vict *Entity, t1, t2 string) string {
 	var b strings.Builder
 	b.Grow(len(tmpl) + 16)
 	for i := 0; i < len(tmpl); i++ {
@@ -112,9 +121,9 @@ func (z *Zone) render(tmpl string, viewer, actor, obj, vict *Entity, t1, t2 stri
 		case 'p':
 			b.WriteString(z.nameFor(viewer, obj, false))
 		case 'P':
-			// Second object referent: not used this slice; render its name if present,
-			// else nothing (keeps the token from leaking a bare "$P").
-			b.WriteString(z.nameFor(viewer, nil, false))
+			// Second object referent ($P), e.g. the container in "get $p from $P". Renders
+			// its name (or nothing if the caller passed none) with the same can't-see guard.
+			b.WriteString(z.nameFor(viewer, obj2, false))
 		case 't':
 			b.WriteString(t1) // literal text arg: copied verbatim, never re-scanned
 		case 'T':

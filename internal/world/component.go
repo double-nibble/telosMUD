@@ -149,13 +149,24 @@ func cloneComponent(c Component) Component {
 		cp := *v
 		return &cp
 	case *Container:
-		cp := *v
+		cp := *v // all value fields (capacity/closed/locked/keyRef)
 		return &cp
 	case *Wearable:
-		cp := *v
+		cp := *v // single value field (locations bitmask)
 		return &cp
 	case *Weapon:
+		cp := *v // all value fields (dice/type/class/verb)
+		return &cp
+	case *Wearer:
+		// The worn map is reference-typed: a COW must reallocate it so a spawned mob
+		// re-equipping itself never aliases the prototype's worn map (players are
+		// prototype==nil and never reach this path). The mapped *Entity values are live
+		// instance objects, copied by pointer.
 		cp := *v
+		cp.worn = make(map[WearLoc]*Entity, len(v.worn))
+		for loc, e := range v.worn {
+			cp.worn[loc] = e
+		}
 		return &cp
 	default:
 		panic("world: cloneComponent missing case for " + reflect.TypeOf(c).String() +

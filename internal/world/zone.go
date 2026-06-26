@@ -65,6 +65,12 @@ type Zone struct {
 	// posts results back to the source zone as redirectMsg / handoffFailMsg. nil on a
 	// single-shard zone, where cross-shard exits are sealed.
 	handoff func(src *Zone, snap *handoffv1.PlayerSnapshot, destZone, destRoom string, epoch uint64)
+
+	// pulses is the per-zone heartbeat scheduler (pulse.go). Its callbacks fire ON THIS
+	// zone goroutine, driven by the ticker case in Run's select, so they have full
+	// single-writer access to zone state — combat rounds (Phase 6) and affect ticks
+	// (Phase 5) hang off it. Plain zone-owned data; only this goroutine touches it.
+	pulses *pulseScheduler
 }
 
 // msg is anything the zone goroutine processes off its inbox. The interface keeps
@@ -190,6 +196,9 @@ func newZone(id string) *Zone {
 		// replaced with the shared per-shard cache (newShard); a bare test zone keeps its
 		// own so spawn works standalone.
 		protos: newProtoCache(),
+		// Per-zone heartbeat scheduler (pulse.go). Empty until something registers a
+		// callback; the ticker in Run is a cheap no-op until then.
+		pulses: newPulseScheduler(),
 		// Scoped logger so every line this zone emits is tagged with its id; all
 		// the verbose control-flow tracing below goes through z.log at Debug.
 		log: slog.With("component", "zone", "zone", id),
@@ -206,6 +215,14 @@ func (z *Zone) post(m msg) { z.inbox <- m }
 // ever races it.
 func (z *Zone) Run(ctx context.Context) {
 	z.log.Debug("zone loop start", "rooms", len(z.rooms), "start_room", z.startRoom)
+	// The heartbeat: one ticker owned by the loop goroutine. On each tick the loop calls
+	// pulses.tick INLINE — so every periodic/delayed callback runs on THIS goroutine with
+	// the same single-writer access a command handler has (pulse.go). The ticker only fires
+	// a select wakeup; it never touches entity state itself, and with no registered
+	// callbacks tick is a no-op, so adding it cannot perturb the deterministic tests (they
+	// register none) — it just costs one cheap wakeup per pulseInterval on an idle zone.
+	ticker := time.NewTicker(pulseInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -213,6 +230,8 @@ func (z *Zone) Run(ctx context.Context) {
 			return
 		case m := <-z.inbox:
 			z.handle(m)
+		case <-ticker.C:
+			z.pulses.tick()
 		}
 	}
 }

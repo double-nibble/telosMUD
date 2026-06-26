@@ -30,7 +30,7 @@ func registerCommands() []*Command {
 			return nil
 		}
 	}
-	return []*Command{
+	base := []*Command{
 		// Movement first: highest priority so single letters resolve to directions.
 		{Name: "north", Aliases: []string{"n"}, Run: mv("north")},
 		{Name: "south", Aliases: []string{"s"}, Run: mv("south")},
@@ -44,6 +44,10 @@ func registerCommands() []*Command {
 		{Name: "who", Run: cmdWho},
 		{Name: "quit", Run: cmdQuit},
 	}
+	// Container/inventory/equipment verbs last: lower priority than movement/look/say so
+	// abbreviation precedence (the "n->north not nuke" rule) is unchanged. They live in
+	// container.go (the Phase-3 milestone).
+	return append(base, containerCommands()...)
 }
 
 // cmdLook shows the actor their current room (MUDLIB §6). Slice 2 keeps look's behavior

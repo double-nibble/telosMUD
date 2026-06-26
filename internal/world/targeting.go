@@ -187,31 +187,9 @@ func (z *Zone) Resolve(actor *Entity, spec TargetSpec, scopes ...Scope) []*Entit
 		}
 	}
 
-	switch {
-	case spec.all:
-		z.log.Debug("targeting: all", "actor", actor.short, "keywords", spec.keywords, "matches", len(hits))
-		return hits
-	case spec.index > 0:
-		// N.keyword: the Nth (1-based) match. Out of range yields nothing (no panic).
-		if spec.index <= len(hits) {
-			z.log.Debug("targeting: nth", "actor", actor.short, "n", spec.index, "keywords", spec.keywords)
-			return hits[spec.index-1 : spec.index]
-		}
-		z.log.Debug("targeting: nth out of range", "actor", actor.short, "n", spec.index, "have", len(hits))
-		return nil
-	case spec.index < 0:
-		// Defensive: a negative selector (shouldn't occur — atoiBounded rejects '-') is
-		// treated as no match rather than indexing oddly.
-		return nil
-	default:
-		// Unqualified keyword: the first visible match.
-		if len(hits) > 0 {
-			z.log.Debug("targeting: first", "actor", actor.short, "keywords", spec.keywords)
-			return hits[:1]
-		}
-		z.log.Debug("targeting: no match", "actor", actor.short, "keywords", spec.keywords)
-		return nil
-	}
+	z.log.Debug("targeting: resolve", "actor", actor.short, "keywords", spec.keywords,
+		"all", spec.all, "index", spec.index, "candidates", len(hits))
+	return selectMatches(spec, hits)
 }
 
 // scopeCandidates concatenates the entity lists for the requested scopes in order, so a
@@ -238,11 +216,81 @@ func (z *Zone) scopeCandidates(actor *Entity, scopes ...Scope) []*Entity {
 					out = append(out, e)
 				}
 			}
-		case ScopeEquipment, ScopeContainer:
-			// Functional in slice 4; no worn items or opened containers exist yet.
+		case ScopeEquipment:
+			// Worn/wielded items: the actor's Wearer slot map (components.go). A worn item
+			// also remains in the actor's contents (equipped is a state over a carried item),
+			// so ScopeEquipment and ScopeInventory can both surface it — commands choose the
+			// scope set that matches their semantics (remove searches equipment; get-from-
+			// floor never does).
+			if wr, ok := Get[*Wearer](actor); ok {
+				for _, loc := range wornOrder {
+					if e := wr.worn[loc]; e != nil {
+						out = append(out, e)
+					}
+				}
+			}
+		case ScopeContainer:
+			// A bare ScopeContainer has no container to search — `get x from y` resolves the
+			// container explicitly and searches its contents via containerContents (below),
+			// not through this scope. Left empty so the scope constant stays meaningful for
+			// callers that pass an explicit container.
 		}
 	}
 	return out
+}
+
+// wornOrder is the deterministic slot order ScopeEquipment surfaces worn items in, so
+// `remove 2.ring`-style selection and the equipment list agree on ordering.
+var wornOrder = func() []WearLoc {
+	out := make([]WearLoc, 0, wearLocCount)
+	for loc := WearLocHead; loc < wearLocCount; loc++ {
+		out = append(out, loc)
+	}
+	return out
+}()
+
+// resolveInContainer searches an opened container's contents for spec, applying the same
+// visibility filter and Diku selection as Resolve (MUDLIB §7). It is the explicit-container
+// path `get <item> from <container>` / `put <item> in <container>` use: the command resolves
+// the container first, then calls this against its contents. A closed container yields
+// nothing (the caller checks closed separately to message "It is closed."). Runs on the
+// zone goroutine over zone-owned data.
+func (z *Zone) resolveInContainer(actor, container *Entity, spec TargetSpec) []*Entity {
+	if spec.empty() {
+		return nil
+	}
+	var hits []*Entity
+	for _, e := range container.contents {
+		if !z.canSee(actor, e) {
+			continue
+		}
+		if spec.matches(e) {
+			hits = append(hits, e)
+		}
+	}
+	return selectMatches(spec, hits)
+}
+
+// selectMatches applies the Diku Nth/all/first selection to an already-filtered candidate
+// list (MUDLIB §7). Factored out of Resolve so the container path shares the exact selection
+// semantics rather than re-deriving them.
+func selectMatches(spec TargetSpec, hits []*Entity) []*Entity {
+	switch {
+	case spec.all:
+		return hits
+	case spec.index > 0:
+		if spec.index <= len(hits) {
+			return hits[spec.index-1 : spec.index]
+		}
+		return nil
+	case spec.index < 0:
+		return nil
+	default:
+		if len(hits) > 0 {
+			return hits[:1]
+		}
+		return nil
+	}
 }
 
 // roomContents returns the contents of room, or nil when room is nil (a detached actor,

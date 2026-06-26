@@ -332,13 +332,25 @@ func newDemoZone(id string, protos *protoCache) *Zone {
 		// share keywords/short/long and the Physical component by reference until COW'd.
 		// They are placed on the MARKET floor as ground items (not the temple/start room, so
 		// the targeting tests' item counts are unchanged). Slice-4 commands make them
-		// gettable; here they only need to exist and render nothing player-facing new
-		// (lookRoom lists only player occupants, not ground items, this phase).
+		// gettable; lookRoom still lists only player occupants, so the player-facing room
+		// text is unchanged.
 		defineTorch(protos)
 		marketEntity := z.rooms["midgaard:room:market"]
 		for i := 0; i < demoTorchCount; i++ {
 			Move(z.spawn("midgaard:obj:torch"), marketEntity)
 		}
+
+		// Slice-4 content: a wearable, a weapon, and a CONTAINER prototype, with instances on
+		// the market floor. The container (a chest) is the COW-arming object (Finding 6): its
+		// Container component is shared with the prototype, so open/close must COW. Authored
+		// here so a real run has gettable/wearable/wieldable items and an openable chest;
+		// none of them render in lookRoom, so the demo's room text stays byte-for-byte.
+		defineHelmet(protos)
+		defineSword(protos)
+		defineChest(protos)
+		Move(z.spawn("midgaard:obj:helmet"), marketEntity)
+		Move(z.spawn("midgaard:obj:sword"), marketEntity)
+		Move(z.spawn("midgaard:obj:chest"), marketEntity)
 	}
 	return z
 }
@@ -360,5 +372,49 @@ func defineTorch(c *protoCache) *Prototype {
 		[]string{"torch", "wooden"},
 		"a wooden torch",
 		"A wooden torch lies here, its pitch cold.",
+		comps)
+}
+
+// defineHelmet authors a wearable item prototype (a helmet that fits the head slot). Its
+// Wearable advertises WearLocHead; wear consults that to pick the slot. Slice-4 content.
+func defineHelmet(c *protoCache) *Prototype {
+	comps := componentSet{}
+	comps[reflect.TypeFor[*Physical]()] = &Physical{weight: 3, material: "iron"}
+	comps[reflect.TypeFor[*Wearable]()] = wearableFor(WearLocHead)
+	return c.define("midgaard:obj:helmet",
+		[]string{"helmet", "iron"},
+		"an iron helmet",
+		"An iron helmet rests here.",
+		comps)
+}
+
+// defineSword authors a weapon prototype: Wearable in the wield slot, plus a Weapon carrying
+// the damage shape (data only this phase; combat is Phase 6). wield records it in the wield
+// slot; the Weapon dice are inert until combat resolves rounds off the pulse scheduler.
+func defineSword(c *protoCache) *Prototype {
+	comps := componentSet{}
+	comps[reflect.TypeFor[*Physical]()] = &Physical{weight: 5, material: "steel"}
+	comps[reflect.TypeFor[*Wearable]()] = wearableFor(WearLocWield)
+	comps[reflect.TypeFor[*Weapon]()] = &Weapon{
+		diceNum: 2, diceSize: 6, damageType: "slash", class: "sword", attackVerb: "slash",
+	}
+	return c.define("midgaard:obj:sword",
+		[]string{"sword", "steel", "long"},
+		"a steel longsword",
+		"A steel longsword lies here.",
+		comps)
+}
+
+// defineChest authors the CONTAINER prototype — the COW-arming object (Finding 6). It starts
+// CLOSED; open/close flip Container.closed, which is shared with this prototype, so the verbs
+// must COW via mutableComponent (cmdOpen/cmdClose). capacity caps how many items it holds.
+func defineChest(c *protoCache) *Prototype {
+	comps := componentSet{}
+	comps[reflect.TypeFor[*Physical]()] = &Physical{weight: 40, material: "oak"}
+	comps[reflect.TypeFor[*Container]()] = &Container{capacity: 10, closed: true}
+	return c.define("midgaard:obj:chest",
+		[]string{"chest", "oak", "wooden"},
+		"a wooden chest",
+		"A heavy wooden chest sits here.",
 		comps)
 }
