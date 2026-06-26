@@ -2,6 +2,7 @@ package world
 
 import (
 	"log/slog"
+	"strings"
 
 	"github.com/double-nibble/telosmud/internal/content"
 )
@@ -81,12 +82,38 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, af := range lc.Affects {
 		d.affect.register(af.Ref, buildAffectDef(af))
 	}
+	// Abilities (Phase 5.3): parse each ability's on_resolve op-list into the runtime def and register
+	// it. A command-invocation ability also binds its verb words into the per-shard ability command
+	// table (abilityCmds), which dispatch consults after the built-in baseTable. A malformed op-list is
+	// logged loudly and the def registers with whatever ops parsed (content-lint is the real gate).
+	for _, ab := range lc.Abilities {
+		def, err := buildAbilityDef(ab)
+		if err != nil {
+			slog.Error("content: ability on_resolve parse failed; registering with parsed ops only",
+				"ability", ab.Ref, "err", err)
+		}
+		lintAbilityOps(ab.Ref, def.ops)
+		d.ability.register(ab.Ref, def)
+		if def.invocation == "command" {
+			for _, w := range def.words {
+				lw := strings.ToLower(strings.TrimSpace(w))
+				if lw == "" {
+					continue
+				}
+				if d.abilityCmds == nil {
+					d.abilityCmds = map[string]*abilityDef{}
+				}
+				d.abilityCmds[lw] = def
+			}
+		}
+	}
 	// Load-time content-lint: reject a derived-attribute graph with a self/mutual reference.
 	for _, err := range lintAttributeCycles(d.attr.table()) {
 		slog.Error("content: attribute derivation cycle (def will resolve to 0)", "err", err)
 	}
 	slog.Debug("global defs registered", "attributes", d.attr.len(),
-		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len())
+		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len(),
+		"abilities", d.ability.len(), "ability_commands", len(d.abilityCmds))
 }
 
 // parseAttributeBase turns an AttributeDTO's default_base (a {lit} OR {expr} spec) into a parsed

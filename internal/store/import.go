@@ -100,7 +100,11 @@ func insertZone(ctx context.Context, tx pgx.Tx, pack string, z content.ZoneDTO) 
 // content read path reads it back via body->>'long').
 func insertRooms(ctx context.Context, tx pgx.Tx, pack string, z content.ZoneDTO) error {
 	for _, r := range z.Rooms {
-		body, _ := json.Marshal(map[string]string{"long": r.Long})
+		rb := map[string]any{"long": r.Long}
+		if len(r.Flags) > 0 {
+			rb["flags"] = r.Flags
+		}
+		body, _ := json.Marshal(rb)
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO rooms (ref, pack, zone_ref, name, sector, body) VALUES ($1,$2,$3,$4,$5,$6)`,
 			r.Ref, pack, z.Ref, r.Name, nullStr(r.Sector), body); err != nil {
@@ -222,6 +226,42 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 			a.Ref, pk.Pack, a.Name, nullStr(a.Category), stacking, maxStacks, scope, a.Dispellable, body); err != nil {
 			return fmt.Errorf("store: insert affect %s: %w", a.Ref, err)
+		}
+	}
+	// Abilities (Phase 5.3): targeting/requires/costs/on_resolve are their own JSONB columns; the
+	// command verbs ride the `messages` JSONB under "words" (the 00003 schema has no words column),
+	// alongside the act() emit templates. The loader (loadGlobalDefs) reads this split back verbatim.
+	for _, ab := range pk.Abilities {
+		targeting, _ := json.Marshal(ab.Targeting)
+		requires, _ := json.Marshal(ab.Requires)
+		costs, _ := json.Marshal(ab.Costs)
+		onResolve, err := json.Marshal(ab.OnResolve)
+		if err != nil {
+			return fmt.Errorf("store: marshal ability %s on_resolve: %w", ab.Ref, err)
+		}
+		messages, _ := json.Marshal(abilityMessages{
+			AbilityMessagesDTO: ab.Messages, Words: ab.Words,
+		})
+		tags := ab.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		inv := ab.Invocation
+		if inv == "" {
+			inv = "command"
+		}
+		var lua any
+		if ab.OnResolveLua != "" {
+			lua = ab.OnResolveLua
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ability_defs
+			   (ref, pack, name, invocation, targeting, tags, requires, costs,
+			    cast_time, lag, cooldown, on_resolve, on_resolve_lua, messages)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			ab.Ref, pk.Pack, ab.Name, inv, targeting, tags, requires, costs,
+			ab.CastTime, ab.Lag, ab.Cooldown, onResolve, lua, messages); err != nil {
+			return fmt.Errorf("store: insert ability %s: %w", ab.Ref, err)
 		}
 	}
 	return nil

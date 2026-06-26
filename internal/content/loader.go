@@ -41,6 +41,10 @@ type LoadedContent struct {
 	// Affects are the pack-global status-effect definitions (Phase 5.2), same last-write-wins
 	// override rule keyed by ref. The world side registers them into the per-shard affectRegistry.
 	Affects []AffectDTO
+	// Abilities are the pack-global ability definitions (Phase 5.3), same last-write-wins override
+	// rule keyed by ref. The world side registers them into the per-shard abilityRegistry and
+	// registers each command-invocation ability into the per-shard command table.
+	Abilities []AbilityDTO
 }
 
 // Zone returns the loaded zone with the given ref, or nil.
@@ -80,6 +84,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	resIdx := make(map[string]int)
 	dmgIdx := make(map[string]int)
 	affIdx := make(map[string]int)
+	abilIdx := make(map[string]int)
 	for _, p := range packs {
 		for i := range p.Zones {
 			z := p.Zones[i]
@@ -123,6 +128,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 				lc.Affects = append(lc.Affects, af)
 			}
 		}
+		for _, ab := range p.Abilities {
+			if idx, ok := abilIdx[ab.Ref]; ok {
+				lc.Abilities[idx] = ab
+			} else {
+				abilIdx[ab.Ref] = len(lc.Abilities)
+				lc.Abilities = append(lc.Abilities, ab)
+			}
+		}
 	}
 	// Build byRef and the counts from the FINAL zone set (the backing array no longer grows).
 	var rooms, protos, resets int
@@ -137,6 +150,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	slog.Debug("content loaded", "packs", enabled, "zones", len(lc.Zones),
 		"rooms", rooms, "prototypes", protos, "resets", resets,
 		"attributes", len(lc.Attributes), "resources", len(lc.Resources),
-		"damage_types", len(lc.DamageTypes), "affects", len(lc.Affects))
+		"damage_types", len(lc.DamageTypes), "affects", len(lc.Affects),
+		"abilities", len(lc.Abilities))
 	return lc, nil
 }

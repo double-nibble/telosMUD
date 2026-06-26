@@ -154,6 +154,12 @@ func cloneComponent(c Component) Component {
 				cp.resCur[k] = val
 			}
 		}
+		if v.flags != nil {
+			cp.flags = make(map[string]bool, len(v.flags))
+			for k, val := range v.flags {
+				cp.flags[k] = val
+			}
+		}
 		cp.attrs = attrCache{dirty: true} // fresh, empty, dirty: recompute lazily on this instance
 		// modSrcs are runtime-registered (affects/gear); the clone starts with NONE so it never
 		// aliases the prototype's slice — a COW'd instance re-registers its own sources (5.2).

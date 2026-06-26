@@ -32,8 +32,8 @@ func TestAbbreviationResolves(t *testing.T) {
 		{"sa", "say"},
 		{"say", "say"},
 		{"who", "who"},
-		{"wh", "who"},   // "wh" prefixes only "who" -> who
-		{"q", "quit"},   // "q" prefixes only "quit"
+		{"wh", "who"}, // "wh" prefixes only "who" -> who
+		{"q", "quit"}, // "q" prefixes only "quit"
 		{"qu", "quit"},
 		{"frobnicate", ""}, // unknown
 		{"", ""},           // empty

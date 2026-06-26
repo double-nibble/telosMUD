@@ -23,9 +23,13 @@ type Room struct {
 	// sector classifies the terrain/environment (city, forest, water…) for movement
 	// cost and look flavour. Stub: unused in slice 1.
 	sector string
-	// flags carries room flags (safe/dark/indoor…). Stub: the visibility filter and
-	// safe-room checks consult it once content supplies flags.
+	// flags carries the legacy bitmask room flags (dark/indoor…). Stub: the visibility filter
+	// consults it once content supplies bit flags.
 	flags uint64
+	// namedFlags is the open-set room flag store (flags.go): builder-authored named booleans like
+	// "safe"/"arena" that the PvP gate (pvp.go) and other content rules read. Populated from the
+	// room DTO at authoring (content_map.go); immutable at runtime this phase. nil => no flags set.
+	namedFlags map[string]bool
 }
 
 func (*Room) componentKind() Kind { return KindRoom }
@@ -66,6 +70,10 @@ type Living struct {
 	// resCur holds each resource pool's CURRENT (max is the derived attr). nil until the first
 	// setResourceCurrent. Persisted (current only); resourceCurrent clamps it to the live derived max.
 	resCur map[string]int
+	// flags is the entity's open-set named-flag store (flags.go): per-entity booleans like the "pvp"
+	// consent flag the PvP gate reads. nil until the first setFlag. Persisted in the StateJSON `flags`
+	// subtree. Instance state, zone-goroutine-owned; a COW'd instance starts with no flags.
+	flags map[string]bool
 	// attrs is the memoized derivation cache + dirty bit (attributes.go). Recomputed lazily after any
 	// base/mod change. NOT persisted (it is a pure function of bases + mods + defs) and NOT shared —
 	// each instance owns its own; cloneComponent gives a COW'd instance a fresh (empty) cache.

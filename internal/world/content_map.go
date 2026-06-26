@@ -1,6 +1,7 @@
 package world
 
 import (
+	"log/slog"
 	"reflect"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -27,6 +28,12 @@ func roomComponents(r content.RoomDTO) componentSet {
 		exits[dir] = ProtoRef(to)
 	}
 	room := &Room{exits: exits, sector: r.Sector}
+	if len(r.Flags) > 0 {
+		room.namedFlags = make(map[string]bool, len(r.Flags))
+		for _, f := range r.Flags {
+			room.namedFlags[f] = true
+		}
+	}
 	return componentSet{reflect.TypeFor[*Room](): room}
 }
 
@@ -94,6 +101,15 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		def.hasTick = true
 		def.tickInterval = t.Interval
 		def.onTick = t.OnTick
+		// Phase 5.3: parse the on_tick op-list into the typed effectOp tree the gated interpreter runs
+		// each tick (a DoT's deal_damage). A malformed list logs + carries whatever parsed (content-lint
+		// is the real gate); a nil list (a timer-only tick) parses to nil.
+		ops, err := parseOpList(t.OnTick)
+		if err != nil {
+			slog.Error("content: affect on_tick parse failed; tick will fire no effect",
+				"affect", a.Ref, "err", err)
+		}
+		def.tickOps = ops
 	}
 	return def
 }

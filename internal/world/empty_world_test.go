@@ -38,6 +38,13 @@ func TestEmptyShardBootsAndRejectsLoginCleanly(t *testing.T) {
 	if n := z.damageTypeDefs().len(); n != 0 {
 		t.Fatalf("empty shard should have 0 damage-type defs, got %d", n)
 	}
+	// Phase 5.3: no content => zero ability defs and no ability commands. "fireball" is unavailable.
+	if n := z.abilityDefs().len(); n != 0 {
+		t.Fatalf("empty shard should have 0 ability defs, got %d", n)
+	}
+	if z.abilityForVerb("fireball") != nil {
+		t.Fatal("empty shard should expose no ability commands (fireball unavailable)")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

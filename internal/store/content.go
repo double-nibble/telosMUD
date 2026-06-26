@@ -129,15 +129,22 @@ func (p *Pool) LoadDefinition(ctx context.Context, kind, ref, pack string) (cont
 // Definition. The exits are a small second query keyed by the room ref.
 func (p *Pool) loadRoomDefinition(ctx context.Context, ref, pack string) (content.Definition, error) {
 	var r content.RoomDTO
+	var flags []byte
 	err := p.pool.QueryRow(ctx,
-		`SELECT ref, name, COALESCE(sector, ''), COALESCE(body->>'long', '')
+		`SELECT ref, name, COALESCE(sector, ''), COALESCE(body->>'long', ''),
+		        COALESCE(body->'flags', '[]'::jsonb)
 		   FROM rooms WHERE ref = $1 AND pack = $2`, ref, pack).
-		Scan(&r.Ref, &r.Name, &r.Sector, &r.Long)
+		Scan(&r.Ref, &r.Name, &r.Sector, &r.Long, &flags)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return content.Definition{Kind: content.KindRoom, Ref: ref, Found: false}, nil
 	}
 	if err != nil {
 		return content.Definition{}, fmt.Errorf("store: load room definition %s: %w", ref, err)
+	}
+	if len(flags) > 0 {
+		if err := json.Unmarshal(flags, &r.Flags); err != nil {
+			return content.Definition{}, fmt.Errorf("store: room %s flags: %w", ref, err)
+		}
 	}
 	r.Exits = map[string]string{}
 	exRows, err := p.pool.Query(ctx, `SELECT dir, to_room FROM exits WHERE from_room = $1`, ref)
@@ -185,7 +192,8 @@ func (p *Pool) loadProtoDefinition(ctx context.Context, table, kind, ref, pack s
 func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string]*content.ZoneDTO) error {
 	rooms := map[string]*content.RoomDTO{}
 	rows, err := p.pool.Query(ctx,
-		`SELECT ref, zone_ref, name, COALESCE(sector, ''), COALESCE(body->>'long', '')
+		`SELECT ref, zone_ref, name, COALESCE(sector, ''), COALESCE(body->>'long', ''),
+		        COALESCE(body->'flags', '[]'::jsonb)
 		   FROM rooms WHERE pack = ANY($1) ORDER BY zone_ref, ref`, enabled)
 	if err != nil {
 		return fmt.Errorf("store: query rooms: %w", err)
@@ -193,9 +201,16 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 	for rows.Next() {
 		var r content.RoomDTO
 		var zoneRef string
-		if err := rows.Scan(&r.Ref, &zoneRef, &r.Name, &r.Sector, &r.Long); err != nil {
+		var flags []byte
+		if err := rows.Scan(&r.Ref, &zoneRef, &r.Name, &r.Sector, &r.Long, &flags); err != nil {
 			rows.Close()
 			return fmt.Errorf("store: scan room: %w", err)
+		}
+		if len(flags) > 0 {
+			if err := json.Unmarshal(flags, &r.Flags); err != nil {
+				rows.Close()
+				return fmt.Errorf("store: room %s flags: %w", r.Ref, err)
+			}
 		}
 		r.Exits = map[string]string{}
 		z := zones[zoneRef]
@@ -459,7 +474,76 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		pp := pack(pk)
 		pp.Affects = append(pp.Affects, af)
 	}
-	return aRows.Err()
+	if err := aRows.Err(); err != nil {
+		return err
+	}
+	aRows.Close()
+
+	// Abilities (Phase 5.3): the skill/spell definitions. The lifecycle metadata (invocation/
+	// cast_time/lag/cooldown) + tags are first-class columns; targeting/requires/costs/on_resolve/
+	// messages are JSONB (the same DTO sub-shapes the embedded YAML carries). The 00003 schema has no
+	// first-class `words` column, so the command-invocation verbs ride the `messages` JSONB under
+	// "words" (abilityMessages) — the production seed writes them there; the embedded YAML carries
+	// them as a first-class field.
+	abRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, name, invocation, tags, targeting, requires, costs,
+		        cast_time, lag, cooldown, COALESCE(on_resolve, 'null'::jsonb),
+		        COALESCE(on_resolve_lua, ''), COALESCE(messages, '{}'::jsonb)
+		   FROM ability_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query ability_defs: %w", err)
+	}
+	defer abRows.Close()
+	for abRows.Next() {
+		var ab content.AbilityDTO
+		var pk string
+		var targeting, requires, costs, onResolve, messages []byte
+		if err := abRows.Scan(&ab.Ref, &pk, &ab.Name, &ab.Invocation, &ab.Tags,
+			&targeting, &requires, &costs, &ab.CastTime, &ab.Lag, &ab.Cooldown,
+			&onResolve, &ab.OnResolveLua, &messages); err != nil {
+			return fmt.Errorf("store: scan ability_def: %w", err)
+		}
+		if err := json.Unmarshal(targeting, &ab.Targeting); err != nil {
+			return fmt.Errorf("store: ability_def %s targeting: %w", ab.Ref, err)
+		}
+		if len(requires) > 0 {
+			if err := json.Unmarshal(requires, &ab.Requires); err != nil {
+				return fmt.Errorf("store: ability_def %s requires: %w", ab.Ref, err)
+			}
+		}
+		if len(costs) > 0 {
+			if err := json.Unmarshal(costs, &ab.Costs); err != nil {
+				return fmt.Errorf("store: ability_def %s costs: %w", ab.Ref, err)
+			}
+		}
+		var mb abilityMessages
+		if len(messages) > 0 {
+			if err := json.Unmarshal(messages, &mb); err != nil {
+				return fmt.Errorf("store: ability_def %s messages: %w", ab.Ref, err)
+			}
+		}
+		ab.Messages = mb.AbilityMessagesDTO
+		ab.Words = mb.Words
+		// on_resolve is a raw op-list (or null); carry it as the decoded generic form the world-side
+		// op-list parser consumes, exactly like the affect tick op-list.
+		if len(onResolve) > 0 {
+			if err := json.Unmarshal(onResolve, &ab.OnResolve); err != nil {
+				return fmt.Errorf("store: ability_def %s on_resolve: %w", ab.Ref, err)
+			}
+		}
+		pp := pack(pk)
+		pp.Abilities = append(pp.Abilities, ab)
+	}
+	return abRows.Err()
+}
+
+// abilityMessages is the JSONB-tail shape for the ability_defs `messages` column. The 00003 schema
+// has no first-class `words` column, so the command-invocation verbs ride here under "words" (the
+// production seed writes them; the embedded YAML carries them as a first-class field). Everything
+// else is the act() emit templates.
+type abilityMessages struct {
+	content.AbilityMessagesDTO
+	Words []string `json:"words,omitempty"`
 }
 
 // decodeBaseSpec unmarshals an attribute's default_base JSONB into a content.BaseSpecDTO. A JSON

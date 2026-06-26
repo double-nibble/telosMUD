@@ -116,11 +116,11 @@ func (t *commandTable) resolve(verb string) (*Command, bool) {
 // a handler calls (Send to the actor, Act for perspective messaging, Target/Targets for
 // Diku resolution). Constructed per dispatched line and never escapes the zone goroutine.
 type Context struct {
-	z      *Zone
-	s      *session // the actor's connection (output sink); never nil for a dispatched line
-	Actor  *Entity  // the actor's in-world entity (s.entity)
-	arg    string   // the verb's argument tail, trimmed ("hi" in `say hi`)
-	moved  bool     // set by movement handlers when they released ownership (see dispatch)
+	z     *Zone
+	s     *session // the actor's connection (output sink); never nil for a dispatched line
+	Actor *Entity  // the actor's in-world entity (s.entity)
+	arg   string   // the verb's argument tail, trimmed ("hi" in `say hi`)
+	moved bool     // set by movement handlers when they released ownership (see dispatch)
 }
 
 // Rest returns the full argument string after the verb (trimmed). For `say hello there`
@@ -183,6 +183,16 @@ func (z *Zone) dispatch(s *session, line string) {
 	lower := strings.ToLower(verb)
 	cmd, ok := baseTable.resolve(lower)
 	if !ok {
+		// Not a built-in verb: try a content-defined ability command (Phase 5.3). The ability table is
+		// consulted AFTER the baseTable so a content ability never shadows a core verb. A match enters
+		// the ability lifecycle (ability.go); the verb's tail is the target argument. No prompt is sent
+		// by the lifecycle, so we prompt here on return (it never releases ownership).
+		if def := z.abilityForVerb(lower); def != nil {
+			z.log.Debug("dispatch: ability command", "player", s.character, "verb", lower, "ability", def.ref)
+			z.castAbility(s, def, rest, nil)
+			s.send(promptFrame())
+			return
+		}
 		z.log.Debug("unknown verb", "player", s.character, "verb", lower)
 		s.send(textFrame("Huh?"))
 		s.send(promptFrame())

@@ -44,7 +44,7 @@ func TestIntraShardMultiZoneWalk(t *testing.T) {
 	// the move and a follow-up command back-to-back: the follow-up may reach the source
 	// (midgaard) zone before the reader loop observes the new currentZone, exercising the
 	// forwarding path. Either way it must run on the destination.
-	send(t, s, inputSeq(2, "north"))      // market -> darkwood:grove (intra-shard transfer)
+	send(t, s, inputSeq(2, "north"))       // market -> darkwood:grove (intra-shard transfer)
 	send(t, s, inputSeq(3, "say arrived")) // typed immediately after the move
 
 	// The arrival look proves we landed in darkwood with NO Redirect frame in between
@@ -112,7 +112,7 @@ func TestIntraShardForwarding(t *testing.T) {
 	src.post(inputMsg{id: "Echo", seq: 1, line: "north"})
 	src.post(inputMsg{id: "Echo", seq: 2, line: "say forwarded"})
 
-	waitMarkup(t, p, "Moonlit Grove")     // landed in darkwood via in-process transfer
+	waitMarkup(t, p, "Moonlit Grove")        // landed in darkwood via in-process transfer
 	waitMarkup(t, p, "You say, 'forwarded'") // the forwarded line ran on the destination
 
 	// currentZone now points at the destination zone.

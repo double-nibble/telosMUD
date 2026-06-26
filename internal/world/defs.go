@@ -101,20 +101,30 @@ func (r *defRegistry[T]) reload(ref string, def T) {
 // defRegistries bundles the per-shard global-definition registries so a zone holds one pointer
 // (mirroring how it holds one *protoCache). Built once at shard construction, shared read-only.
 type defRegistries struct {
-	attr   *defRegistry[*attributeDef]
-	res    *defRegistry[*resourceDef]
-	dmg    *defRegistry[*damageTypeDef]
-	affect *defRegistry[*affectDef]
+	attr    *defRegistry[*attributeDef]
+	res     *defRegistry[*resourceDef]
+	dmg     *defRegistry[*damageTypeDef]
+	affect  *defRegistry[*affectDef]
+	ability *defRegistry[*abilityDef]
+
+	// abilityCmds is the per-shard ability COMMAND table (defs.go is per-shard data): the verb
+	// words a command-invocation ability registers (defineGlobals), each mapping to the abilityDef
+	// the lifecycle enters. dispatch consults it AFTER the built-in baseTable so a content ability
+	// never shadows a core verb. Built once at construction (single goroutine), then read-only — same
+	// publish-once-then-read discipline as the registries, so no lock is needed for the read path.
+	abilityCmds map[string]*abilityDef
 }
 
 // newDefRegistries builds an empty bundle (all three registries empty/published). A bare zone gets
 // its own so attr()/resource reads work standalone and report 0/absent — the bare-engine invariant.
 func newDefRegistries() *defRegistries {
 	return &defRegistries{
-		attr:   newDefRegistry[*attributeDef](),
-		res:    newDefRegistry[*resourceDef](),
-		dmg:    newDefRegistry[*damageTypeDef](),
-		affect: newDefRegistry[*affectDef](),
+		attr:        newDefRegistry[*attributeDef](),
+		res:         newDefRegistry[*resourceDef](),
+		dmg:         newDefRegistry[*damageTypeDef](),
+		affect:      newDefRegistry[*affectDef](),
+		ability:     newDefRegistry[*abilityDef](),
+		abilityCmds: map[string]*abilityDef{},
 	}
 }
 
@@ -132,6 +142,20 @@ func (z *Zone) damageTypeDefs() *defRegistry[*damageTypeDef] {
 }
 func (z *Zone) affectDefs() *defRegistry[*affectDef] {
 	return z.defBundle().affect
+}
+func (z *Zone) abilityDefs() *defRegistry[*abilityDef] {
+	return z.defBundle().ability
+}
+
+// abilityForVerb returns the command-invocation ability bound to verb `v` (lower-cased), or nil.
+// dispatch consults it after the built-in command table. Read-only (the table is published once at
+// construction), safe from any zone goroutine.
+func (z *Zone) abilityForVerb(v string) *abilityDef {
+	b := z.defBundle()
+	if b.abilityCmds == nil {
+		return nil
+	}
+	return b.abilityCmds[v]
 }
 
 // defBundle returns the zone's registry bundle, lazily creating an empty private one if a bare zone
@@ -238,11 +262,150 @@ type affectDef struct {
 
 	tickInterval int  // fire on_tick every N pulses; 0 => no tick
 	hasTick      bool // whether a tick spec was authored (interval may legitimately be 0-guarded)
-	// onTick is the RESERVED tick op-list (docs/PHASE5-PLAN.md §1.4 / 5.2 scope boundary): the tick
-	// MECHANISM (interval counting + the hook point) is live this slice; the gated op execution lands
-	// in 5.3 when the effect-op interpreter exists. Carried opaque so 5.3 wires it without a reparse.
-	onTick any
-	// onApply/onExpire are the RESERVED apply/expire hooks (5.3). Read-not-run this slice.
+	// onTick is the raw on_tick op-list (carried opaque from the DTO). tickOps is the PARSED form the
+	// gated effect-op interpreter runs each tick (a DoT's deal_damage). Phase 5.3 completes this: the
+	// tick MECHANISM was live in 5.2; the op execution lands here. A nil/empty tickOps => a timer-only
+	// tick (the interval still counts, but fires no effect).
+	onTick  any
+	tickOps []effectOp
+	// onApply/onExpire are the RESERVED apply/expire hooks (Phase 7 Lua). Read-not-run.
 	onApply  any
 	onExpire any
+}
+
+// detrimentalCategories is the set of affect categories the engine treats as harmful BY CATEGORY,
+// regardless of the affect's modifiers. A content category-name is just data, but these well-known
+// names denote affliction kinds (a debuff/affliction/curse/poison/disease) so the derived-harm gate
+// (affectIsDetrimental) errs toward gating even when an author labeled the apply_affect helpful. It is
+// an OR input, not the whole story — the stat/prevents derivation below catches the unlabeled cases.
+var detrimentalCategories = map[string]bool{
+	"debuff":     true,
+	"affliction": true,
+	"curse":      true,
+	"poison":     true,
+	"disease":    true,
+}
+
+// affectIsDetrimental DERIVES whether an affect_def is harmful to its target FROM THE DEF ITSELF —
+// never from a content-supplied "harmful"/disposition label (which a mislabeled or malicious pack can
+// lie about, §7/D2). The derived-harm gate (opApplyAffect) ORs this with the explicit label so an
+// author can still force-gate, but can never UN-gate a genuinely-detrimental affect by labeling it
+// helpful/neutral/unlabeled. An affect counts as detrimental when ANY of:
+//
+//   - a modifier REDUCES a stat: an additive modifier with value<0 (e.g. -2 strength), or a
+//     multiplicative modifier with value<1 (e.g. ×0.5 speed);
+//   - the def declares ANY prevents tags (a CC affect — root/silence/etc. is harm by construction);
+//   - the def's category is in detrimentalCategories (a well-known affliction kind).
+//
+// A genuinely-beneficial affect (only stat-raising modifiers, no prevents, a non-affliction category)
+// returns false and stays UNGATED — a buff on an ally still lands. Pure read of the immutable def.
+func affectIsDetrimental(def *affectDef) bool {
+	if def == nil {
+		return false
+	}
+	for _, m := range def.modifiers {
+		if m.add && m.value < 0 {
+			return true // a flat stat reduction
+		}
+		if !m.add && m.value < 1 {
+			return true // a multiplicative stat reduction (×<1)
+		}
+	}
+	if len(def.prevents) > 0 {
+		return true // any CC tag is harm by construction
+	}
+	if detrimentalCategories[def.category] {
+		return true
+	}
+	return false
+}
+
+// abilityDisposition is the harmful/helpful/neutral intent of an ability or op (docs/ABILITIES.md
+// §7). It is what drives the PvP gate: ONLY dispHarmful routes through pvp_allowed. The op-level
+// guard (guardHarmful) also keys off disposition so a debuff apply_affect is gated while a buff is not.
+type abilityDisposition int
+
+const (
+	dispNeutral abilityDisposition = iota
+	dispHelpful
+	dispHarmful
+)
+
+// parseDisposition maps the content string onto the enum. Unknown/"" => neutral (ungated). A neutral
+// or helpful ability never routes through the PvP gate; only "harmful" does.
+func parseDisposition(s string) abilityDisposition {
+	switch s {
+	case "harmful":
+		return dispHarmful
+	case "helpful":
+		return dispHelpful
+	default:
+		return dispNeutral
+	}
+}
+
+// targetMode is an ability's targeting mode (docs/ABILITIES.md §2): which entity(ies) the resolver
+// selects. self/none need no argument; enemy/ally select a living in the room by the typed keyword.
+type targetMode int
+
+const (
+	tmNone targetMode = iota
+	tmSelf
+	tmEnemy
+	tmAlly
+)
+
+func parseTargetMode(s string) targetMode {
+	switch s {
+	case "self":
+		return tmSelf
+	case "enemy":
+		return tmEnemy
+	case "ally":
+		return tmAlly
+	default:
+		return tmNone
+	}
+}
+
+// resourceCost is one resource an ability spends (reserved on cast, paid on commit, refunded on
+// interrupt). The runtime form of a content.ResourceCostDTO.
+type resourceCost struct {
+	resource string
+	amount   int
+}
+
+// abilityDef is the runtime form of an AbilityDTO (docs/ABILITIES.md §2): a content-defined ability
+// the engine's fixed lifecycle (ability.go) runs. Immutable after build — shared read-only across
+// zone goroutines via the registry, exactly like a *Prototype/*affectDef. The lifecycle reads its
+// targeting/requires/costs/timing and its on_resolve op-list; the engine knows the KIND, this is the
+// whole skill.
+type abilityDef struct {
+	ref        string
+	name       string
+	invocation string // "command" | "proc" | "passive" — this phase wires "command"; proc/passive reserve hooks
+	words      []string
+
+	mode        targetMode
+	disposition abilityDisposition
+
+	tags         []string           // §6 CC tags this ability carries (an affect's prevents[] blocks them)
+	notPrevented []string           // requires.not_prevented: extra tags the actor must not be prevented from
+	reqAttr      map[string]float64 // requires.attr: per-attribute minimum thresholds
+
+	costs []resourceCost
+
+	castTime int // pulses of interruptible cast lockout; 0 => straight to commit
+	lag      int // WAIT_STATE pulses imposed on commit (reserved-coarse: logged this phase)
+	cooldown int // per-ability cooldown in pulses, armed on commit (transient this slice)
+
+	// ops is the PARSED on_resolve op-list (effect_op.go). Each op is a registered handler; the
+	// interpreter walks them in step 8. nil => the ability resolves with no effect (just messages).
+	ops []effectOp
+
+	// onResolveLua is RESERVED (Phase 7): read at load, NEVER executed this phase.
+	onResolveLua string
+
+	msgActor string // step-9 "You ..." emit template
+	msgRoom  string // step-9 "$n ..." bystander emit template
 }

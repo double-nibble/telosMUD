@@ -292,14 +292,40 @@ func fireOnAffectExpire(e *Entity, inst *affectInstance) {
 	e.zone.log.Debug("affect on_expire hook (reserved; 5.3)", "ref", inst.def.ref, "rid", e.rid)
 }
 
+// fireOnTick runs an affect's on_tick op-list through the GATED effect-op interpreter (Phase 5.3
+// completes the 5.2-reserved hook). This is the DoT path: a poison's tick is just
+// [deal_damage <type> <amt>], and its damage routes through the SAME shared mitigation pipeline +
+// guardHarmful that a cast's deal_damage does — so a DoT on a protected player is gated exactly like a
+// direct spell (the can't-bypass property covers the tick path). The effect's source/actor is the
+// affect's SOURCE (who applied it — inst.source), NOT the victim, so the gate evaluates "may the
+// applier still harm this target?" and per-source stacking inside any apply_affect keys correctly. The
+// magnitude is the stack count (a poison's 4*stacks). A self/ambient affect (source nil) ticks with the
+// victim as the source — a self-inflicted DoT is never gated against itself.
 func fireOnTick(e *Entity, inst *affectInstance, pulse uint64) {
-	if inst.def.onTick == nil {
+	if len(inst.def.tickOps) == 0 {
+		return
+	}
+	src := inst.source
+	if src == nil {
+		src = e // self/ambient: the victim is the source (self-harm is never gated)
+	} else if src.location == nil || src.living == nil {
+		// FAIL-CLOSED: the affect's source has detached (reaped / handed off / mid-transfer). We must
+		// NOT evaluate the PvP gate against a stale source pointer (it could read a wrong room flag or
+		// race the owning goroutine). A harmful tick with no live, attributable source is a no-op this
+		// pulse — the affect keeps counting down and will expire on its own. Explicit, not incidental.
+		e.zone.log.Debug("affect on_tick: source detached, no-op harmful tick",
+			"ref", inst.def.ref, "rid", e.rid)
 		return
 	}
 	if e.zone.log.Enabled(nil, slog.LevelDebug) {
-		e.zone.log.Debug("affect on_tick hook (reserved; 5.3)", "ref", inst.def.ref,
+		e.zone.log.Debug("affect on_tick", "ref", inst.def.ref,
 			"rid", e.rid, "stacks", inst.stacks, "pulse", pulse)
 	}
+	c := &effectCtx{
+		z: e.zone, actor: src, source: src, target: e,
+		mag: float64(maxInt(inst.stacks, 1)), disp: dispHarmful,
+	}
+	runOps(c, inst.def.tickOps)
 }
 
 func maxInt(a, b int) int {

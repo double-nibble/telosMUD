@@ -97,7 +97,37 @@ affects:
         - {attr: strength, op: add, value: -2}
       tick:
         interval: 6
-        on_tick: null   # RESERVED: 5.3 wires ctx.deal_damage(target, {amount: 4*stacks, type: poison})
+        # The DoT (Phase 5.3): a poison tick is just deal_damage, routed through the SAME gated
+        # mitigation pipeline a cast uses. amount 4; the magnitude (stacks) scales it (effectCtx.mag),
+        # so a 3-stack poison ticks 12. The damage type is "poison" (neutral — no resist matrix entry).
+        on_tick:
+          - {op: deal_damage, type: poison, amount: 4}
+
+# Abilities (skills/spells, docs/ABILITIES.md §2). The engine provides the lifecycle + the effect-op
+# vocabulary; THIS data is the whole skill — the engine has never heard of "fireball". Adding one is a
+# content write, zero engine changes.
+abilities:
+  # fireball: THE Phase 5.3 milestone. A command-invocation spell, targets an enemy, costs 30 mana,
+  # casts instantly (cast_time 0 -> straight to commit), then resolves [deal_damage fire, apply_affect
+  # poison]. Its harmful disposition gates it vs a non-consenting player at BOTH choke points
+  # (lifecycle step 4 + the in-op guard). 8d6 fire damage flows through the shared mitigation pipeline.
+  - ref: fireball
+    name: Fireball
+    invocation: command
+    words: [fireball]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic, fire]
+    costs:
+      - {resource: mana, amount: 30}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You hurl a roaring fireball at $N!"
+      room: "$n hurls a roaring fireball at $N!"
+    on_resolve:
+      - {op: deal_damage, type: fire, dice: "8d6"}
+      - {op: apply_affect, affect: poison, harmful: true}
 
 zones:
   - ref: midgaard

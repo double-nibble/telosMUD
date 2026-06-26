@@ -26,6 +26,7 @@ type Pack struct {
 	Resources   []ResourceDTO   `json:"resources" yaml:"resources"`
 	DamageTypes []DamageTypeDTO `json:"damage_types" yaml:"damage_types"`
 	Affects     []AffectDTO     `json:"affects" yaml:"affects"`
+	Abilities   []AbilityDTO    `json:"abilities" yaml:"abilities"`
 }
 
 // AttributeDTO is one content-defined attribute (docs/ABILITIES.md §1, docs/PHASE5-PLAN.md §1.1).
@@ -126,7 +127,69 @@ type AffectModifierDTO struct {
 // MECHANISM (interval counting + the hook point) is live now so a DoT only needs its op-list later.
 type AffectTickDTO struct {
 	Interval int `json:"interval" yaml:"interval"`
-	OnTick   any `json:"on_tick" yaml:"on_tick"` // RESERVED op-list (5.3)
+	OnTick   any `json:"on_tick" yaml:"on_tick"` // op-list (Phase 5.3 — a DoT's deal_damage)
+}
+
+// AbilityDTO is one content-defined ability (docs/ABILITIES.md §2, docs/PHASE5-PLAN.md §1.6): a
+// skill/spell/mob-special/item-proc that COMPOSES the engine's effect-op vocabulary. The engine
+// provides the lifecycle; this data is the whole skill. The engine has never heard of "fireball".
+//
+//   - invocation is 'command' (becomes a verb once granted), 'proc' (fires on an event), or
+//     'passive' (always-on). Phase 5.3 wires 'command'; proc/passive RESERVE the hooks (events 6/7).
+//   - targeting drives the resolver AND the PvP gate: mode/scope/range + disposition
+//     (helpful/harmful/neutral). A harmful disposition vs a non-consenting player is gated (§7).
+//   - tags are the §6 CC tags ("cast","verbal","fire"); an affect's prevents[] blocks them (step 3).
+//   - requires/costs gate the cast (known-skill, attr thresholds, not_prevented tag; resource costs).
+//   - cast_time/lag/cooldown are timing (pulses). cast_time 0 (fireball) skips straight to commit.
+//   - on_resolve is the declarative op-list (this phase). on_resolve_lua is RESERVED (read-not-run,
+//     Phase 7). messages carries the actor/room emit templates (step 9).
+type AbilityDTO struct {
+	Ref          string             `json:"ref" yaml:"ref"`
+	Name         string             `json:"name" yaml:"name"`
+	Invocation   string             `json:"invocation" yaml:"invocation"` // 'command' | 'proc' | 'passive'
+	Words        []string           `json:"words" yaml:"words"`           // command verbs that invoke it (invocation=command)
+	Targeting    TargetingDTO       `json:"targeting" yaml:"targeting"`
+	Tags         []string           `json:"tags" yaml:"tags"`
+	Requires     RequiresDTO        `json:"requires" yaml:"requires"`
+	Costs        []ResourceCostDTO  `json:"costs" yaml:"costs"`
+	CastTime     int                `json:"cast_time" yaml:"cast_time"`
+	Lag          int                `json:"lag" yaml:"lag"`
+	Cooldown     int                `json:"cooldown" yaml:"cooldown"`
+	OnResolve    any                `json:"on_resolve" yaml:"on_resolve"`         // declarative op-list (Phase 5.3)
+	OnResolveLua string             `json:"on_resolve_lua" yaml:"on_resolve_lua"` // RESERVED, read-not-run (Phase 7)
+	Messages     AbilityMessagesDTO `json:"messages" yaml:"messages"`
+}
+
+// TargetingDTO is an ability's target spec (docs/ABILITIES.md §2). mode is self/ally/enemy/area/
+// room/object/direction/none; scope (room/...) is reserved-coarse this phase; disposition
+// (helpful/harmful/neutral) drives the PvP gate (§7) — only 'harmful' routes through pvp_allowed.
+type TargetingDTO struct {
+	Mode        string `json:"mode" yaml:"mode"`
+	Scope       string `json:"scope" yaml:"scope"`
+	Range       int    `json:"range" yaml:"range"`
+	Disposition string `json:"disposition" yaml:"disposition"` // 'helpful' | 'harmful' | 'neutral'
+}
+
+// RequiresDTO is an ability's declarative gate set (docs/ABILITIES.md §2, step 3). NotPrevented is
+// the tag-CC check (does any active affect prevent this tag?) on TOP of the ability's own tags;
+// Attr is a per-attribute minimum threshold. Known-skill/wielding/zone-flag gates are reserved shape.
+type RequiresDTO struct {
+	NotPrevented []string           `json:"not_prevented" yaml:"not_prevented"`
+	Attr         map[string]float64 `json:"attr" yaml:"attr"`
+}
+
+// ResourceCostDTO is one resource an ability spends (docs/ABILITIES.md §2). Reserved on cast,
+// paid on commit, refunded on interrupt. The fireball milestone is {resource: mana, amount: 30}.
+type ResourceCostDTO struct {
+	Resource string `json:"resource" yaml:"resource"`
+	Amount   int    `json:"amount" yaml:"amount"`
+}
+
+// AbilityMessagesDTO carries the step-9 emit templates (act perspective strings). Actor is the
+// "You ..." line; Room is the "$n ..." bystander line. Either may be empty (no message).
+type AbilityMessagesDTO struct {
+	Actor string `json:"actor" yaml:"actor"`
+	Room  string `json:"room" yaml:"room"`
 }
 
 // ZoneDTO is one zone definition plus everything authored inside it: its rooms, the item
@@ -152,6 +215,10 @@ type RoomDTO struct {
 	Long   string            `json:"long" yaml:"long"`
 	Sector string            `json:"sector" yaml:"sector"`
 	Exits  map[string]string `json:"exits" yaml:"exits"`
+	// Flags are open-set named room booleans (docs/ABILITIES.md §1): "safe" (no PvP harm lands here),
+	// "arena" (PvP forced on), etc. The PvP gate (world/pvp.go) reads them; the engine never invents a
+	// flag name. Empty for an unflagged room. Mapped onto Room.namedFlags (world/content_map.go).
+	Flags []string `json:"flags" yaml:"flags"`
 }
 
 // ProtoDTO is one item or mob prototype: targeting keywords, the inline short and the

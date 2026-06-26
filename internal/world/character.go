@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"encoding/json"
+	"sort"
 )
 
 // character.go is the persistence DTO boundary (docs/PHASE4-PLAN.md D5) and the CharacterStore
@@ -61,6 +62,10 @@ type StateJSON struct {
 	// (no affects array) loads sanely with none. NOT carried on the cross-shard handoff snapshot
 	// (buildSnapshot) — that is the same deferred set as inventory/stats; 5.2 does save/load only.
 	Affects []AffectJSON `json:"affects,omitempty"`
+	// Flags is the entity's open-set named-flag set (Phase 5.3, flags.go): per-entity booleans like the
+	// "pvp" consent flag the PvP gate reads. Stored as the set of SET flag names. loadCharacter
+	// re-installs each. A pre-5.3 save (no flags) loads with none (the safe default — no PvP consent).
+	Flags []string `json:"flags,omitempty"`
 }
 
 // AffectJSON is the durable form of one active affect: the def ref, the remaining duration in PULSES,
@@ -155,6 +160,7 @@ func dumpCharacter(s *session) CharSnapshot {
 		Attributes: dumpAttributes(e),
 		Resources:  dumpResources(e),
 		Affects:    dumpAffects(e),
+		Flags:      dumpFlags(e),
 	}
 	return CharSnapshot{
 		PID:          pid,
@@ -213,6 +219,21 @@ func dumpAffects(e *Entity) []AffectJSON {
 			Stacks:    inst.stacks,
 		})
 	}
+	return out
+}
+
+// dumpFlags renders the entity's SET named flags (Living.flags) as a stable sorted slice so the
+// on-disk form is deterministic. Empty when the entity carries no flags. Runs on the zone goroutine;
+// reads zone-owned state into a fresh slice so the saver never aliases live entity state.
+func dumpFlags(e *Entity) []string {
+	if e.living == nil || len(e.living.flags) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(e.living.flags))
+	for name := range e.living.flags {
+		out = append(out, name)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -322,6 +343,10 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 			applyAffect(e, af.ID, attachOpts{
 				duration: af.Remaining, magnitude: af.Mag, stacks: af.Stacks, reattach: true,
 			})
+		}
+		// Re-install the entity's named flags (Phase 5.3, flags.go) — e.g. a player's "pvp" consent.
+		for _, name := range snap.State.Flags {
+			setFlag(e, name, true)
 		}
 	}
 
