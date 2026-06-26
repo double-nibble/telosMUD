@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
 // playServer implements the gRPC Play service for one shard (which may host several
@@ -67,9 +68,16 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		return status.Error(codes.InvalidArgument, "first frame must be Attach")
 	}
 
-	character := attach.GetCharacterId()
+	// Defense-in-depth at the world's gRPC boundary (mirrors the CleanLine call in the
+	// reader loop): the gate validates the login name, but a compromised/buggy gate or a
+	// direct-shard client could send a control-laden or over-long character id. It seeds
+	// the player's display name AND targeting keyword (newPlayerEntity), so an
+	// un-sanitized id is a terminal-injection vector into other players' clients (who,
+	// "$n arrives", says). Sanitize BEFORE the empty-check so an all-control id that
+	// cleans to empty falls through to the anonymous fallback rather than rendering blank.
+	character := textsan.CleanName(attach.GetCharacterId(), maxPlayerNameRunes)
 	if character == "" {
-		// No character id supplied: invent an anonymous one.
+		// No (usable) character id supplied: invent an anonymous one.
 		character = "Wanderer-" + uuid.NewString()[:8]
 	}
 	token := attach.GetHandoffToken()
@@ -153,8 +161,15 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		switch pl := f.Payload.(type) {
 		case *playv1.ClientFrame_Input:
 			in := pl.Input
-			s.log.Debug("input received", "character", character, "seq", in.GetSeq(), "text", in.GetText())
-			currentZone.Load().post(inputMsg{id: character, seq: in.GetSeq(), line: in.GetText()})
+			// Defense-in-depth: the edge (telnet codec) already caps+sanitizes every
+			// line, but the world is a separate trust domain reachable over gRPC — a
+			// compromised/buggy gate or a direct-shard client could deliver an unbounded
+			// or control-laden line. Re-cap and re-strip control runes here, at the
+			// world's own ingress, before it reaches a zone inbox and fans out to other
+			// players' terminals. CleanLine is a no-op for legitimate, already-clean input.
+			line := textsan.CleanLine(in.GetText())
+			s.log.Debug("input received", "character", character, "seq", in.GetSeq(), "text", line)
+			currentZone.Load().post(inputMsg{id: character, seq: in.GetSeq(), line: line})
 		case *playv1.ClientFrame_Detach:
 			s.log.Debug("detach received (clean)", "character", character)
 			cleanQuit = true

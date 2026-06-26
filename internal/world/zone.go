@@ -13,7 +13,15 @@ import (
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/textsan"
 )
+
+// maxPlayerNameRunes caps an externally-sourced player name at the world's gRPC
+// boundary — both a Play-attach character id (server.go) and a rehydrated handoff
+// snapshot's display name (prepare, below). It mirrors the gate's maxNameLen
+// (internal/gate): the edge minted the name under that limit, so a longer one is
+// malformed and only a bypassed/forged producer can exceed it.
+const maxPlayerNameRunes = 20
 
 // linkDeadGrace is how long a player's in-zone presence survives after its stream
 // drops unexpectedly (no clean quit). A re-dial (handoff, docs/PROTOCOL.md §5) or a
@@ -610,8 +618,16 @@ func (z *Zone) prepare(m prepareMsg) {
 		token:      m.token,
 	}
 	e := z.newPlayerEntity(s, character)
-	e.short = m.snap.GetName()
-	e.keywords = []string{m.snap.GetName()}
+	// Defense-in-depth: the snapshot's Name is externally-sourced and the cross-shard
+	// handoff is currently UNAUTHENTICATED (docs/PROTOCOL.md §5) — a forged/tampered
+	// snapshot could carry a control-laden Name that would land here as a passively
+	// rendered display name + targeting keyword, re-opening terminal injection through
+	// a non-edge door. Sanitize it (strip control/non-graphic runes, cap length) the
+	// same way the gate's validateName guards a login name. A legitimate name minted by
+	// the edge passes through unchanged.
+	name := textsan.CleanName(m.snap.GetName(), maxPlayerNameRunes)
+	e.short = name
+	e.keywords = []string{name}
 	// Park the entity AT the destination room (location set) but NOT in its contents —
 	// a pending player is invisible until the gate's re-dial activates it (attach Moves
 	// it into the room then). location is how attach later recovers the destination room.
