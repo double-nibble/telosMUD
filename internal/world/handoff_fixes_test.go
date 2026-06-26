@@ -50,7 +50,7 @@ func TestEpochResumeOnRelogin(t *testing.T) {
 	aPlay := serveShard(t, NewShard("midgaard", "addr-a", dir, peers), lisA)
 	bPlay := serveShard(t, NewShard("darkwood", "addr-b", dir, peers), lisB)
 
-	// Shrink the freeze TTL so A's redirected source orphan is reaped (FIX 2B) promptly,
+	// Shrink the freeze TTL so A's handed-off source orphan is reaped (FIX 2B) promptly,
 	// freeing the character to re-login to A without hitting the frozen "mid-transfer"
 	// reject. Without this the orphan would block the relogin for the full default TTL.
 	oldFreeze := freezeTTL
@@ -89,7 +89,7 @@ func TestEpochResumeOnRelogin(t *testing.T) {
 	}
 
 	// --- fresh re-login to A (NEW stream, same character) ---
-	// Retry until A's redirected orphan has been reaped (freezeTTL above): a relogin while
+	// Retry until A's handed-off orphan has been reaped (freezeTTL above): a relogin while
 	// the orphan is still frozen is rejected with a Disconnect ("mid-transfer"). Once reaped,
 	// the attach succeeds and seeds the epoch resumed from the directory (2).
 	var sA2 playv1.Play_ConnectClient
@@ -196,10 +196,10 @@ func TestHandoffRPCTimeoutThawsPlayer(t *testing.T) {
 	recvUntilOutput(t, s, "The Temple Square")
 }
 
-// TestFreezeExpireThawsUnredirected (FIX 2B) drives freezeExpire directly (like the pulse
-// tests drive tick) for determinism: a frozen, NOT-redirected session whose freeze elapsed
+// TestFreezeExpireThawsUnhandedOff (FIX 2B) drives freezeExpire directly (like the pulse
+// tests drive tick) for determinism: a frozen, NOT-handed-off session whose freeze elapsed
 // is thawed in place and restored to frozenFrom.
-func TestFreezeExpireThawsUnredirected(t *testing.T) {
+func TestFreezeExpireThawsUnhandedOff(t *testing.T) {
 	z := newDemoZone("midgaard", newProtoCache())
 
 	market := z.rooms["midgaard:room:market"]
@@ -208,30 +208,30 @@ func TestFreezeExpireThawsUnredirected(t *testing.T) {
 	z.newPlayerEntity(s, "Ghost")
 	z.players["Ghost"] = s
 
-	// Simulate a frozen, un-redirected source copy: detached from its room, frozenFrom set.
+	// Simulate a frozen, un-handed-off source copy: detached from its room, frozenFrom set.
 	Move(s.entity, nil)
 	s.frozen = true
-	s.redirected = false
+	s.handedOff = false
 	s.frozenFrom = market
 	gen := s.attachGen
 
 	z.freezeExpire("Ghost", gen)
 
 	if s.frozen {
-		t.Fatal("freezeExpire(!redirected) should have thawed the session")
+		t.Fatal("freezeExpire(!handedOff) should have thawed the session")
 	}
 	if s.entity.location != market {
 		t.Fatalf("player not restored to frozenFrom: location=%v", s.entity.location)
 	}
 	if z.players["Ghost"] == nil {
-		t.Fatal("an un-redirected thaw must keep the player present")
+		t.Fatal("an un-handed-off thaw must keep the player present")
 	}
 }
 
-// TestFreezeExpireReapsRedirected (FIX 2B) covers the other discriminator: a redirected
+// TestFreezeExpireReapsHandedOff (FIX 2B) covers the other discriminator: a handed-off
 // frozen orphan is REMOVED so a subsequent attach for that character succeeds (rather than
 // hitting the frozen "mid-transfer" reject).
-func TestFreezeExpireReapsRedirected(t *testing.T) {
+func TestFreezeExpireReapsHandedOff(t *testing.T) {
 	z := newDemoZone("midgaard", newProtoCache())
 
 	out := make(chan *playv1.ServerFrame, 16)
@@ -240,13 +240,13 @@ func TestFreezeExpireReapsRedirected(t *testing.T) {
 	z.players["Mover"] = s
 	Move(s.entity, nil)
 	s.frozen = true
-	s.redirected = true // handoff succeeded; the directory points elsewhere
+	s.handedOff = true // handoff committed; the directory points elsewhere
 	gen := s.attachGen
 
 	z.freezeExpire("Mover", gen)
 
 	if z.players["Mover"] != nil {
-		t.Fatal("a redirected frozen orphan must be removed from z.players")
+		t.Fatal("a handed-off frozen orphan must be removed from z.players")
 	}
 
 	// A fresh attach for the same character now succeeds (no frozen reject): it lands in the
@@ -261,6 +261,54 @@ func TestFreezeExpireReapsRedirected(t *testing.T) {
 	if ns.frozen || ns.pending {
 		t.Fatalf("re-attached session should be live: frozen=%v pending=%v", ns.frozen, ns.pending)
 	}
+}
+
+// TestFreezeExpireReapsAtCommitBeforeRedirect (FIX 2B, both-own window) pins the discriminator
+// to the directory CAS-commit point rather than to Redirect-frame send. It replays the inbox
+// order the coordinator now produces: the handedOffMsg commit-marker (markHandedOff) is processed
+// FIRST, and a freezeExpire that fires in the old gap — after the CAS commit but BEFORE the
+// redirectMsg — must REAP the orphan, not thaw it. Under the previous code (flag set only in
+// Zone.redirect) this same ordering would have thawed a player whose handoff already succeeded =
+// both-own. The redirect is delivered afterward to confirm it still no-ops cleanly on the reaped
+// session. No dependence on freezeTTL: the marker is what makes the choice correct.
+func TestFreezeExpireReapsAtCommitBeforeRedirect(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+
+	market := z.rooms["midgaard:room:market"]
+	out := make(chan *playv1.ServerFrame, 16)
+	s := &session{character: "Racer", out: out, epoch: 2}
+	z.newPlayerEntity(s, "Racer")
+	z.players["Racer"] = s
+
+	// Frozen source copy mid-handoff, NOT yet redirected and (crucially) frozenFrom still set —
+	// exactly the state in which the old discriminator (redirected) would read false.
+	Move(s.entity, nil)
+	s.frozen = true
+	s.handedOff = false
+	s.frozenFrom = market
+	gen := s.attachGen
+
+	// CAS commits: the commit-marker is processed (enqueued ahead of redirectMsg).
+	z.markHandedOff("Racer")
+	if !s.handedOff {
+		t.Fatal("markHandedOff must set the success discriminator at CAS-commit time")
+	}
+	if s.frozenFrom != nil {
+		t.Fatal("markHandedOff must clear frozenFrom so a later thaw cannot both-own restore")
+	}
+
+	// freezeExpire fires in the old gap — after the commit but BEFORE the Redirect frame.
+	z.freezeExpire("Racer", gen)
+
+	if z.players["Racer"] != nil {
+		t.Fatal("a handed-off copy reaped at commit time must be removed, not thawed (both-own)")
+	}
+	if s.entity.location == market {
+		t.Fatal("a handed-off copy must NOT be restored to frozenFrom (that would be both-own)")
+	}
+
+	// The trailing redirectMsg lands on the now-reaped session: a clean no-op.
+	z.redirect(redirectMsg{id: "Racer", targetAddr: "addr-b", token: "tok", epoch: 3})
 }
 
 // TestFreezeExpireGenGuard (FIX 2B) confirms a stale timer (wrong gen) is a no-op, so a

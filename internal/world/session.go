@@ -75,13 +75,17 @@ type session struct {
 	// (redirect) and after a failed-handoff restore. nil except during an in-flight handoff.
 	frozenFrom *Entity
 
-	// redirected marks that the source has SENT the Redirect frame for an in-flight handoff
-	// (set in Zone.redirect, after the frame goes out). It is the discriminator the freeze-
-	// timeout reaper uses: a frozen session that was redirected had its handoff SUCCEED (the
-	// directory points at the destination), so its lingering source copy is an orphan to be
-	// REMOVED; a frozen session that was NOT redirected never completed, so on timeout it is
-	// THAWED IN PLACE and restored to frozenFrom. Only meaningful while frozen.
-	redirected bool
+	// handedOff marks that the directory's ownership CAS has COMMITTED for an in-flight
+	// handoff — the moment the destination shard becomes the truth (set on the zone goroutine
+	// by Zone.markHandedOff, posted by the coordinator the instant SetPlayerShard succeeds,
+	// BEFORE the redirectMsg). It is the discriminator the freeze-timeout reaper uses: a frozen
+	// session that was handed off had its handoff SUCCEED (the directory points at the
+	// destination), so its lingering source copy is an orphan to be REMOVED — thawing it would
+	// be a both-own bug; a frozen session that was NOT handed off never committed, so on timeout
+	// it is THAWED IN PLACE and restored to frozenFrom. Tying the flag to the CAS commit (not the
+	// later Redirect frame) is what makes the reaper's choice independent of freeze-TTL timing.
+	// Only meaningful while frozen.
+	handedOff bool
 
 	// Destination side: a PENDING session has been rehydrated by Prepare and is waiting
 	// for the gate to re-dial. Its entity is not yet in a room's contents and it applies

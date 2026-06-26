@@ -161,6 +161,15 @@ type redirectMsg struct {
 	epoch      uint64
 }
 
+// handedOffMsg is the commit-marker posted back the instant the directory ownership CAS
+// (SetPlayerShard) succeeds, BEFORE redirectMsg. It flips the freeze-reaper's success
+// discriminator (session.handedOff) at the exact point the both-own truth flips — the CAS
+// commit — rather than one step later at Redirect-frame send. Enqueued ahead of redirectMsg,
+// so a freezeExpire firing in the old gap (after the CAS commit, before the frame) now
+// observes handedOff=true and reaps the orphan instead of thawing a player whose handoff
+// already succeeded. See Zone.markHandedOff and Shard.beginHandoff.
+type handedOffMsg struct{ id string }
+
 // handoffFailMsg is posted back if the handoff could not be initiated, so the zone
 // thaws the otherwise-stuck frozen player.
 type handoffFailMsg struct {
@@ -205,6 +214,7 @@ func (reapMsg) zoneMsg()         {}
 func (leaveMsg) zoneMsg()        {}
 func (transferInMsg) zoneMsg()   {}
 func (redirectMsg) zoneMsg()     {}
+func (handedOffMsg) zoneMsg()    {}
 func (handoffFailMsg) zoneMsg()  {}
 func (prepareMsg) zoneMsg()      {}
 func (abortPendingMsg) zoneMsg() {}
@@ -305,6 +315,8 @@ func (z *Zone) handle(m msg) {
 		z.reap(v.id, v.gen)
 	case redirectMsg:
 		z.redirect(v)
+	case handedOffMsg:
+		z.markHandedOff(v.id)
 	case handoffFailMsg:
 		z.handoffFailed(v)
 	case leaveMsg:
@@ -684,24 +696,26 @@ var freezeTTL = pendingTTL
 
 // freezeExpire is the backstop for a frozen source-side player still frozen after freezeTTL.
 // The gen check ignores a stale timer for a session that has since rebound/rebuilt (a return
-// handoff, a re-attach). It then discriminates on s.redirected:
+// handoff, a re-attach). It then discriminates on s.handedOff:
 //
-//   - redirected: the handoff SUCCEEDED — the directory points at the destination, so this
+//   - handedOff: the handoff SUCCEEDED — the directory's ownership CAS committed, so this
 //     source copy is an ORPHAN. Remove it (and drop its token) so the character can reconnect
 //     to the source without hitting the frozen "mid-transfer" reject. Thawing it would be a
-//     both-own bug (two shards acting for one player), so we never thaw a redirected copy.
-//   - not redirected: the handoff never completed — the directory never moved, so reclaiming
+//     both-own bug (two shards acting for one player), so we never thaw a handed-off copy.
+//   - not handedOff: the handoff never committed — the directory never moved, so reclaiming
 //     the source IS correct. THAW IN PLACE: restore via frozenFrom (like handoffFailed) and
 //     tell the player the way is barred (timeout). The placement CAS stays the arbiter: we
-//     only reclaim when the directory never recorded the move.
+//     only reclaim when the directory never recorded the move. Because the commit-marker
+//     (handedOffMsg) sets handedOff at CAS-commit time and is enqueued ahead of redirectMsg,
+//     this discriminator is correct regardless of where the freeze timer fires.
 func (z *Zone) freezeExpire(id string, gen uint64) {
 	s := z.players[id]
 	if s == nil || !s.frozen || s.attachGen != gen {
-		return // already resolved (thawed/redirected-and-reaped) or rebound
+		return // already resolved (thawed/handed-off-and-reaped) or rebound
 	}
-	if s.redirected {
+	if s.handedOff {
 		// Successful handoff's orphaned source copy: remove it so reconnect to the source works.
-		z.log.Debug("freeze timeout: reaping orphaned redirected source copy", "player", id)
+		z.log.Debug("freeze timeout: reaping orphaned handed-off source copy", "player", id)
 		delete(z.players, id)
 		if z.shard != nil && s.token != "" {
 			z.shard.dropToken(s.token)
@@ -709,7 +723,7 @@ func (z *Zone) freezeExpire(id string, gen uint64) {
 		return
 	}
 	// Handoff never completed: thaw in place and restore to the room they tried to leave.
-	z.log.Debug("freeze timeout: thawing un-redirected player in place", "player", id)
+	z.log.Debug("freeze timeout: thawing un-handed-off player in place", "player", id)
 	s.frozen = false
 	if s.frozenFrom != nil {
 		Move(s.entity, s.frozenFrom)
@@ -769,20 +783,45 @@ func (z *Zone) reap(id string, gen uint64) {
 	}
 }
 
+// markHandedOff flips the freeze-reaper's success discriminator at the directory CAS-commit
+// point. Posted by the async handoff coordinator (Shard.beginHandoff) as handedOffMsg the
+// instant SetPlayerShard succeeds, BEFORE redirectMsg — so it lands ahead of the Redirect in
+// this zone's inbox. The both-own truth flips at the CAS commit; setting the flag here (not
+// in redirect, one message later) means a freezeExpire firing in the old gap reaps the orphan
+// instead of thawing a player whose handoff already succeeded. Clearing frozenFrom here makes
+// the failure-restore (handoffFailed/thaw) a no-op from this point on — defense in depth
+// against a both-own restore. Idempotent and single-writer: only POSTed to the inbox.
+//
+// Tolerated residual: the freeze timer runs on a separate goroutine and cannot observe the
+// CAS return, so in a microsecond-scale sliver it may enqueue a freezeExpireMsg AHEAD of this
+// marker (timer fires between SetPlayerShard returning ok and beginHandoff posting us). That
+// freezeExpire thaws in place, and this marker then runs on an already-thawed session. The
+// result is a transient, NON-authoritative source copy (the directory CAS already points at
+// the destination); it self-heals when the player's gate re-dials on the trailing Redirect
+// and the stale source stream goes link-dead and reaps. No dual ownership — the directory is
+// the sole arbiter — and this sliver is bounded by goroutine scheduling, not by freezeTTL.
+func (z *Zone) markHandedOff(id string) {
+	s := z.players[id]
+	if s == nil {
+		return
+	}
+	s.handedOff = true
+	s.frozenFrom = nil // committed to leaving: the failure-restore is no longer valid
+	z.log.Debug("handoff committed (directory CAS done)", "player", id)
+}
+
 // redirect tells a frozen player's client to re-dial the destination shard. Posted
 // by the async handoff coordinator (Shard.beginHandoff) once the directory has
-// recorded the new owner; the player stays frozen until the gate re-attaches there.
+// recorded the new owner (always after the handedOffMsg commit-marker); the player stays
+// frozen until the gate re-attaches there. The success discriminator is already set by
+// markHandedOff — redirect only carries the epoch forward and sends the Redirect frame.
 func (z *Zone) redirect(v redirectMsg) {
 	s := z.players[v.id]
 	if s == nil {
 		return
 	}
-	s.frozenFrom = nil // committed to leaving: the failure-restore is no longer needed
 	s.epoch = v.epoch
 	s.send(redirectFrame(v.targetAddr, v.token, v.resumeSeq))
-	// Mark the handoff as SUCCEEDED (directory now points at the destination). The freeze-
-	// timeout reaper reads this: a redirected frozen copy is an orphan to remove, not thaw.
-	s.redirected = true
 	z.log.Debug("redirect sent", "player", v.id, "target", v.targetAddr, "epoch", v.epoch)
 }
 

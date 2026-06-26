@@ -313,6 +313,14 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			return
 		}
 
+		// Commit-marker FIRST: the directory CAS just committed, so the both-own truth has
+		// flipped. Post handedOffMsg ahead of redirectMsg (and ahead of the log line below) so
+		// the freeze-reaper's success discriminator is set at the CAS-commit point, not one
+		// message later at Redirect-frame send. This closes the narrow both-own window where a
+		// freezeExpire firing in the gap would thaw a player whose handoff already succeeded —
+		// correctness no longer depends on freezeTTL >> handoffRPCTimeout.
+		src.post(handedOffMsg{id: character})
+
 		log.Debug("prepared + ownership claimed; redirecting", "dest_addr", resp.GetTargetShardAddr(), "epoch", newEpoch)
 		src.post(redirectMsg{
 			id:         character,
