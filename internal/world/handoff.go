@@ -32,7 +32,11 @@ type Locator interface {
 // freeze-point to the gate's replay-point, PROTOCOL.md §5) — now sourced from the
 // session and its entity instead of the old player struct. Inventory/equipment/affects
 // (proto fields 6–11) stay unset until later slices make those components carry real
-// state (PHASE3-PLAN.md §4); cross-shard inventory is deferred past Phase 3. Built on
+// state (PHASE3-PLAN.md §4); cross-shard inventory is deferred past Phase 3. As of Phase
+// 5.1 a player also carries content-defined attribute bases + resource currents (Living,
+// character.go StateJSON) — those are NOT in this snapshot either, so a wound/resource
+// state resolves from defaults across a cross-shard hop, exactly like inventory. They
+// join the same deferred set: carry them HERE when cross-shard inventory lands. Built on
 // the zone goroutine, so the read of session/entity state is race-free.
 func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 	// DEFERRED (PHASE3-PLAN.md §4): as of slice 4 a player entity CAN carry items

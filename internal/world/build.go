@@ -1,6 +1,8 @@
 package world
 
 import (
+	"log/slog"
+
 	"github.com/double-nibble/telosmud/internal/content"
 )
 
@@ -38,6 +40,63 @@ func defineContent(c *protoCache, lc *content.LoadedContent) {
 			c.define(ProtoRef(p.Ref), p.Keywords, p.Short, p.Long, protoComponents(p))
 		}
 	}
+}
+
+// defineGlobals registers every PACK-GLOBAL definition (attributes/resources/damage-types) from lc
+// into the shard's registry bundle (defs.go). Build-time only: called from the shard constructors
+// while the bundle is still private to the construction goroutine, so the copy-then-swap registers
+// are uncontended and leave the bundle PUBLISHED for the lock-free runtime read path. It parses each
+// attribute's base formula (the prefix-AST, formula.go) once here, then runs the load-time cycle
+// lint over the assembled attribute graph. A nil lc (bare-engine boot) registers nothing — zero
+// attrs/resources/damage-types, the engine still boots and a stat read returns 0.
+func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
+	if lc == nil {
+		return
+	}
+	for _, a := range lc.Attributes {
+		base, err := parseAttributeBase(a)
+		if err != nil {
+			// A malformed formula is a content error: log loudly and register the def WITHOUT a base
+			// (resolves to 0) rather than aborting the whole boot. Content-lint is the real gate.
+			slog.Error("content: attribute base parse failed; registering with zero base",
+				"attr", a.Ref, "err", err)
+			base = nil
+		}
+		d.attr.register(a.Ref, &attributeDef{
+			ref: a.Ref, displayName: a.DisplayName, valueKind: a.ValueKind,
+			base: base, min: a.Min, max: a.Max,
+		})
+	}
+	for _, r := range lc.Resources {
+		d.res.register(r.Ref, &resourceDef{
+			ref: r.Ref, displayName: r.DisplayName, maxAttr: r.MaxAttr,
+			vital: r.Vital, regen: r.Regen, depletedThreshold: r.DepletedThreshold,
+		})
+	}
+	for _, dt := range lc.DamageTypes {
+		d.dmg.register(dt.Ref, &damageTypeDef{
+			ref: dt.Ref, displayName: dt.DisplayName, color: dt.Color, resist: dt.Resist,
+		})
+	}
+	// Load-time content-lint: reject a derived-attribute graph with a self/mutual reference.
+	for _, err := range lintAttributeCycles(d.attr.table()) {
+		slog.Error("content: attribute derivation cycle (def will resolve to 0)", "err", err)
+	}
+	slog.Debug("global defs registered", "attributes", d.attr.len(),
+		"resources", d.res.len(), "damage_types", d.dmg.len())
+}
+
+// parseAttributeBase turns an AttributeDTO's default_base (a {lit} OR {expr} spec) into a parsed
+// formula tree (formula.go). A literal becomes a litNode; an expr is parsed from the prefix-AST. A
+// zero spec (neither set) yields nil (base 0).
+func parseAttributeBase(a content.AttributeDTO) (formulaNode, error) {
+	if a.DefaultBase.Lit != nil {
+		return litNode{v: *a.DefaultBase.Lit}, nil
+	}
+	if a.DefaultBase.Expr != nil {
+		return parseFormula(a.DefaultBase.Expr)
+	}
+	return nil, nil
 }
 
 // buildZone constructs zone z (id == zoneRef) from its loaded definition: it spawns each room
@@ -86,6 +145,11 @@ func newDemoZone(id string, protos *protoCache) *Zone {
 		panic("world: load embedded demo pack: " + err.Error())
 	}
 	defineContent(protos, lc)
+	// Register the demo pack's pack-global defs (attributes/resources/damage-types) into THIS
+	// zone's private bundle, so a test zone built via newDemoZone resolves the demo's
+	// strength/max_hp/hp standalone. The shard path (newShard) shares one bundle across zones;
+	// here each demo zone gets its own equivalent registration (same immutable defs).
+	defineGlobals(z.defs, lc)
 	z.buildZone(lc)
 	return z
 }

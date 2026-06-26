@@ -15,10 +15,65 @@
 package content
 
 // Pack is the top-level shape of a content pack file (one pack = one YAML document, or the
-// rows of one `pack` column value). A pack ships one or more whole zones.
+// rows of one `pack` column value). A pack ships one or more whole zones AND the pack-GLOBAL,
+// zone-independent definition kinds (attributes/resources/damage-types — and, in 5.2/5.3,
+// affects/abilities). The globals are NOT under any ZoneDTO: a `strength` attribute or a `fire`
+// damage type is owned by the pack, not by Midgaard (docs/PHASE5-PLAN.md §2.2).
 type Pack struct {
-	Pack  string    `json:"pack" yaml:"pack"`
-	Zones []ZoneDTO `json:"zones" yaml:"zones"`
+	Pack        string          `json:"pack" yaml:"pack"`
+	Zones       []ZoneDTO       `json:"zones" yaml:"zones"`
+	Attributes  []AttributeDTO  `json:"attributes" yaml:"attributes"`
+	Resources   []ResourceDTO   `json:"resources" yaml:"resources"`
+	DamageTypes []DamageTypeDTO `json:"damage_types" yaml:"damage_types"`
+}
+
+// AttributeDTO is one content-defined attribute (docs/ABILITIES.md §1, docs/PHASE5-PLAN.md §1.1).
+// value_kind is 'int'|'float'|'derived'; a 'derived' attribute's base is a formula AST. default_base
+// is the base: a literal {"lit": n} OR a formula {"expr": <ast>} where the AST is a nested prefix
+// array — ["+", ["*", ["attr","con"], 10], ["*", ["attr","level"], 5]] = con*10 + level*5. Allowed
+// heads: + - * / min max clamp, ["attr",name], ["lit",n]. min/max clamp the resolved value.
+type AttributeDTO struct {
+	Ref         string      `json:"ref" yaml:"ref"`
+	DisplayName string      `json:"display_name" yaml:"display_name"`
+	ValueKind   string      `json:"value_kind" yaml:"value_kind"`
+	DefaultBase BaseSpecDTO `json:"default_base" yaml:"default_base"`
+	Min         *float64    `json:"min" yaml:"min"`
+	Max         *float64    `json:"max" yaml:"max"`
+}
+
+// BaseSpecDTO is an attribute's base: EXACTLY one of Lit (a literal value) or Expr (a formula AST).
+// The AST is carried as the generic nested-array form (heads + - * / min max clamp / attr / lit).
+// A zero BaseSpecDTO (neither set) resolves to 0 — a sane default for a contentless attribute.
+type BaseSpecDTO struct {
+	Lit  *float64       `json:"lit" yaml:"lit"`
+	Expr FormulaNodeDTO `json:"expr" yaml:"expr"`
+}
+
+// FormulaNodeDTO is the prefix-AST expression form, decoded generically (it is a nested array or a
+// scalar in YAML/JSON). The world-side mapper (content_map.go) parses it into a typed evaluable
+// node; keeping it `any` here keeps the DTO free of the evaluator type. nil == no formula.
+type FormulaNodeDTO = any
+
+// ResourceDTO is one content-defined resource pool (docs/ABILITIES.md §1, §1.2). max_attr names the
+// DERIVED attribute that caps the pool (so gear/affects that raise max_hp flow through derivation);
+// the engine holds `current`. vital + on_depleted is how "hp at 0 = death" is content (5.2/combat).
+type ResourceDTO struct {
+	Ref               string `json:"ref" yaml:"ref"`
+	DisplayName       string `json:"display_name" yaml:"display_name"`
+	MaxAttr           string `json:"max_attr" yaml:"max_attr"`
+	Vital             bool   `json:"vital" yaml:"vital"`
+	Regen             int    `json:"regen" yaml:"regen"`                           // per-tick flat regen (reserved; ticks ride 5.2)
+	DepletedThreshold int    `json:"depleted_threshold" yaml:"depleted_threshold"` // reserved (vital depletion, 5.2)
+}
+
+// DamageTypeDTO is one content-defined damage type with its resist/vuln/immune matrix (§1). The
+// matrix maps an OTHER damage-type/category ref to a multiplier (1.0 = neutral, <1 resist, >1
+// vuln, 0 = immune). The shared mitigation pipeline (5.3) reads it; slice 5.1 just loads it.
+type DamageTypeDTO struct {
+	Ref         string             `json:"ref" yaml:"ref"`
+	DisplayName string             `json:"display_name" yaml:"display_name"`
+	Color       string             `json:"color" yaml:"color"`
+	Resist      map[string]float64 `json:"resist" yaml:"resist"`
 }
 
 // ZoneDTO is one zone definition plus everything authored inside it: its rooms, the item

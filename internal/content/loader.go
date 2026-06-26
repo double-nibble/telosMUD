@@ -30,6 +30,14 @@ type LoadedContent struct {
 	Zones []ZoneDTO
 	// byRef indexes Zones by ref for O(1) lookup.
 	byRef map[string]*ZoneDTO
+
+	// Attributes/Resources/DamageTypes are the PACK-GLOBAL definition kinds (Phase 5.1): they
+	// are zone-independent, accumulated across every loaded pack in load order. A later pack
+	// shipping the same ref overrides the earlier one (last write wins), mirroring the zone
+	// override rule. The world side registers them into per-shard registries (build.go).
+	Attributes  []AttributeDTO
+	Resources   []ResourceDTO
+	DamageTypes []DamageTypeDTO
 }
 
 // Zone returns the loaded zone with the given ref, or nil.
@@ -64,6 +72,10 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	// Track positions by index, NOT by pointer — appending to lc.Zones reallocates the backing
 	// array, so any &lc.Zones[i] taken here would dangle.
 	idxByRef := make(map[string]int)
+	// Pack-global defs accumulate with the same last-write-wins override rule, keyed by ref.
+	attrIdx := make(map[string]int)
+	resIdx := make(map[string]int)
+	dmgIdx := make(map[string]int)
 	for _, p := range packs {
 		for i := range p.Zones {
 			z := p.Zones[i]
@@ -73,6 +85,30 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				idxByRef[z.Ref] = len(lc.Zones)
 				lc.Zones = append(lc.Zones, z)
+			}
+		}
+		for _, a := range p.Attributes {
+			if idx, ok := attrIdx[a.Ref]; ok {
+				lc.Attributes[idx] = a
+			} else {
+				attrIdx[a.Ref] = len(lc.Attributes)
+				lc.Attributes = append(lc.Attributes, a)
+			}
+		}
+		for _, r := range p.Resources {
+			if idx, ok := resIdx[r.Ref]; ok {
+				lc.Resources[idx] = r
+			} else {
+				resIdx[r.Ref] = len(lc.Resources)
+				lc.Resources = append(lc.Resources, r)
+			}
+		}
+		for _, d := range p.DamageTypes {
+			if idx, ok := dmgIdx[d.Ref]; ok {
+				lc.DamageTypes[idx] = d
+			} else {
+				dmgIdx[d.Ref] = len(lc.DamageTypes)
+				lc.DamageTypes = append(lc.DamageTypes, d)
 			}
 		}
 	}
@@ -87,6 +123,8 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 		resets += len(z.Resets)
 	}
 	slog.Debug("content loaded", "packs", enabled, "zones", len(lc.Zones),
-		"rooms", rooms, "prototypes", protos, "resets", resets)
+		"rooms", rooms, "prototypes", protos, "resets", resets,
+		"attributes", len(lc.Attributes), "resources", len(lc.Resources),
+		"damage_types", len(lc.DamageTypes))
 	return lc, nil
 }

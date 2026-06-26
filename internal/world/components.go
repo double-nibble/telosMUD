@@ -45,16 +45,36 @@ func (r *Room) sortedExits() []string {
 	return out
 }
 
-// Living grants "is alive and can act": vitals, position, stats, and a fighting
-// target. Held as a direct pointer on Entity (the hot component movement/combat touch
-// every tick, MUDLIB §3). Slice 1 adds it to player entities to mark them living but
-// reads none of its fields yet; vitals/stats derivation is Phase 5, combat Phase 6, so
-// the fields below are the documented shape, all stubs.
+// Living grants "is alive and can act": stats, vitals, position, and a fighting target. Held as a
+// direct pointer on Entity (the hot component movement/combat touch every tick, MUDLIB §3).
+//
+// Phase 5.1 makes it REAL: the old stub hp/maxHP/mp/mv int fields are GONE; vitals are now
+// content-defined RESOURCES (resCur holds each pool's current; max is a derived attribute) and stats
+// are content-defined ATTRIBUTES (attrBase holds per-entity base overrides; the resolved value comes
+// from the modifier stack, attributes.go). All reads route through accessors (attr()/resourceCurrent/
+// the Living methods below) so the Phase 1-4 call sites that never touched the int fields stay green,
+// and an entity with NO content defs behaves sanely (every accessor reports 0/full).
+//
+// The two maps and the cache are INSTANCE state, mutated only by the owning zone goroutine. For a
+// player (prototype==nil) they hold its bases/currents directly; a future prototype-backed mob would
+// inherit bases from its prototype and COW these maps on first write (cloneComponent handles them).
 type Living struct {
-	// hp/mp/mv and their maxima — current vitals. Stub until Phase 5 stat derivation.
-	hp, maxHP int
-	mp, maxMP int
-	mv, maxMV int
+	// attrBase holds this entity's per-attribute BASE OVERRIDES (race/class/level/point-buy); a
+	// present override replaces the attribute_def's default base in derivation (attributes.go). nil
+	// until the first setAttrBase. Persisted (base overrides only — derived values are recomputed).
+	attrBase map[string]float64
+	// resCur holds each resource pool's CURRENT (max is the derived attr). nil until the first
+	// setResourceCurrent. Persisted (current only); resourceCurrent clamps it to the live derived max.
+	resCur map[string]int
+	// attrs is the memoized derivation cache + dirty bit (attributes.go). Recomputed lazily after any
+	// base/mod change. NOT persisted (it is a pure function of bases + mods + defs) and NOT shared —
+	// each instance owns its own; cloneComponent gives a COW'd instance a fresh (empty) cache.
+	attrs attrCache
+	// modSrcs are this entity's modifier sources feeding derivation (gear + affects). The 5.2
+	// Affected runtime registers its view here (addModSource); empty until then, so derivation is
+	// base-only. Instance state, recomputed at runtime — NOT persisted (affects re-attach in 5.2 and
+	// re-register their source). A COW'd instance starts with NO sources (it re-registers its own).
+	modSrcs []modSource
 
 	// position is standing/resting/sleeping/fighting… gating which commands run
 	// (MUDLIB §6). Stub: defaults to the zero value until the Position enum lands.
@@ -125,14 +145,14 @@ func (c *Container) hasRoom(n int) bool { return c.capacity == 0 || n < c.capaci
 type WearLoc int
 
 const (
-	WearLocNone   WearLoc = iota // sentinel: not wearable anywhere
-	WearLocHead                  // a helmet
-	WearLocBody                  // armor on the torso
-	WearLocHands                 // gloves
-	WearLocFeet                  // boots
-	WearLocWield                 // primary weapon hand
-	WearLocHold                  // off-hand held item (light, shield-substitute, focus)
-	wearLocCount                 // table size; keep last
+	WearLocNone  WearLoc = iota // sentinel: not wearable anywhere
+	WearLocHead                 // a helmet
+	WearLocBody                 // armor on the torso
+	WearLocHands                // gloves
+	WearLocFeet                 // boots
+	WearLocWield                // primary weapon hand
+	WearLocHold                 // off-hand held item (light, shield-substitute, focus)
+	wearLocCount                // table size; keep last
 )
 
 // wearLocName is the human label for a slot, used in the equipment list and act() lines

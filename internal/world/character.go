@@ -42,6 +42,23 @@ type StateJSON struct {
 	AppliedSeq uint64              `json:"applied_seq"`
 	Inventory  []ItemJSON          `json:"inventory,omitempty"`
 	Equipment  map[string]ItemJSON `json:"equipment,omitempty"` // wear-slot name -> worn item
+
+	// Attributes is the per-entity attribute BASE OVERRIDES only (Phase 5.1, docs/PHASE5-PLAN.md
+	// §3): race/class/level/point-buy bases keyed by attribute ref. DERIVED values are NEVER stored
+	// — they are recomputed from bases + mods + defs on load — so a content rebalance (changing a
+	// max_hp formula) takes effect on every character without a data migration. A pre-5.1 save (or a
+	// contentless character) has none; loadCharacter handles that sanely.
+	Attributes map[string]float64 `json:"attributes,omitempty"`
+	// Resources is each pool's CURRENT only (max is the derived attr). loadCharacter installs these
+	// clamped to the live derived max. Reserved subtrees (affects/skills/flags) arrive in 5.2/5.3.
+	Resources map[string]ResourceJSON `json:"resources,omitempty"`
+}
+
+// ResourceJSON is the durable form of one resource pool: the current value only (Cur). The max is a
+// derived attribute, recomputed on load, never stored — so gear/affect changes to the cap are always
+// reflected. Mirrors the §3 PERSISTENCE shape ({hp:{cur:N}}).
+type ResourceJSON struct {
+	Cur int `json:"cur"`
 }
 
 // ItemJSON is the flyweight item form (docs/PERSISTENCE.md §4, common.v1.Item): a prototype ref
@@ -117,6 +134,8 @@ func dumpCharacter(s *session) CharSnapshot {
 		AppliedSeq: s.appliedSeq,
 		Inventory:  dumpInventory(e),
 		Equipment:  dumpEquipment(e),
+		Attributes: dumpAttributes(e),
+		Resources:  dumpResources(e),
 	}
 	return CharSnapshot{
 		PID:          pid,
@@ -126,6 +145,35 @@ func dumpCharacter(s *session) CharSnapshot {
 		StateVersion: s.stateVersion,
 		State:        st,
 	}
+}
+
+// dumpAttributes renders the entity's per-attribute BASE OVERRIDES (Living.attrBase) — bases only,
+// never the derived/resolved values (those recompute on load, §3). Empty when the entity carries no
+// overrides (a contentless or freshly-spawned character). Runs on the zone goroutine; reads
+// zone-owned state, copied into a fresh map so the saver never aliases live entity state.
+func dumpAttributes(e *Entity) map[string]float64 {
+	if e.living == nil || len(e.living.attrBase) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(e.living.attrBase))
+	for k, v := range e.living.attrBase {
+		out[k] = v
+	}
+	return out
+}
+
+// dumpResources renders each resource pool's CURRENT only (max is the derived attr, recomputed on
+// load). It uses the CLAMPED live current (resourceCurrent) so a pool whose max gear/affects lowered
+// is never saved over-cap. Empty when the entity holds no resource currents.
+func dumpResources(e *Entity) map[string]ResourceJSON {
+	if e.living == nil || len(e.living.resCur) == 0 {
+		return nil
+	}
+	out := make(map[string]ResourceJSON, len(e.living.resCur))
+	for name := range e.living.resCur {
+		out[name] = ResourceJSON{Cur: resourceCurrent(e, name)}
+	}
+	return out
 }
 
 // dumpInventory walks the player's carried items (e.contents) and renders each as an ItemJSON —
@@ -213,6 +261,20 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 	}
 	s.stateVersion = snap.StateVersion
 	s.appliedSeq = snap.State.AppliedSeq
+
+	// Rehydrate content-defined stats (Phase 5.1, §3). Install attribute BASE OVERRIDES FIRST so the
+	// derivation has them before any resource max is computed; setAttrBase dirties the cache. Then
+	// set each resource CURRENT clamped to its derived max (setResourceCurrent). DERIVED attribute
+	// values are recomputed lazily on the next attr() — never loaded — so a contentless / pre-5.1
+	// save (no attributes/resources subtrees) just installs nothing and the entity reads 0/full.
+	if e.living != nil {
+		for ref, base := range snap.State.Attributes {
+			setAttrBase(e, ref, base)
+		}
+		for ref, r := range snap.State.Resources {
+			setResourceCurrent(e, ref, r.Cur) // clamps to the live derived max
+		}
+	}
 
 	// Rehydrate carried items into the player's contents (inventory).
 	for _, it := range snap.State.Inventory {

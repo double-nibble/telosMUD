@@ -52,6 +52,10 @@ func (p *Pool) ImportPack(ctx context.Context, pk content.Pack) error {
 			return err
 		}
 	}
+	// Pack-GLOBAL defs (Phase 5.1): zone-independent rows, inserted after the zone tree (no FK to it).
+	if err := insertGlobalDefs(ctx, tx, pk); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("store: commit import: %w", err)
 	}
@@ -69,6 +73,10 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM mob_prototypes WHERE pack=$1`,
 		`DELETE FROM rooms WHERE pack=$1`,
 		`DELETE FROM zones WHERE pack=$1`,
+		// Pack-global defs (Phase 5.1): no FK into the zone tree, so order-independent.
+		`DELETE FROM attribute_defs WHERE pack=$1`,
+		`DELETE FROM resource_defs WHERE pack=$1`,
+		`DELETE FROM damage_type_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -151,6 +159,44 @@ func insertProtos(ctx context.Context, tx pgx.Tx, table, pack, zoneRef string, p
 			 VALUES ($1,$2,$3,$4,$5,$6,$7)`, table),
 			d.Ref, pack, zoneRef, d.Short, d.Long, kw, body); err != nil {
 			return fmt.Errorf("store: insert %s %s: %w", table, d.Ref, err)
+		}
+	}
+	return nil
+}
+
+// insertGlobalDefs writes a pack's zone-independent attribute/resource/damage-type rows (Phase 5.1).
+// The relational columns stay first-class; min/max (attributes), regen/depleted_threshold
+// (resources), color/resist (damage types) ride the JSONB `body` — the same split the loaders read.
+// default_base is the {lit}|{expr} spec marshalled straight into its own JSONB column.
+func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
+	for _, a := range pk.Attributes {
+		base, err := json.Marshal(a.DefaultBase)
+		if err != nil {
+			return fmt.Errorf("store: marshal attribute %s base: %w", a.Ref, err)
+		}
+		body, _ := json.Marshal(attrBody{Min: a.Min, Max: a.Max})
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO attribute_defs (ref, pack, display_name, value_kind, default_base, body)
+			 VALUES ($1,$2,$3,$4,$5,$6)`,
+			a.Ref, pk.Pack, a.DisplayName, a.ValueKind, base, body); err != nil {
+			return fmt.Errorf("store: insert attribute %s: %w", a.Ref, err)
+		}
+	}
+	for _, r := range pk.Resources {
+		body, _ := json.Marshal(resourceBody{Regen: r.Regen, DepletedThreshold: r.DepletedThreshold})
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO resource_defs (ref, pack, display_name, max_attr, vital, body)
+			 VALUES ($1,$2,$3,$4,$5,$6)`,
+			r.Ref, pk.Pack, r.DisplayName, nullStr(r.MaxAttr), r.Vital, body); err != nil {
+			return fmt.Errorf("store: insert resource %s: %w", r.Ref, err)
+		}
+	}
+	for _, d := range pk.DamageTypes {
+		body, _ := json.Marshal(dmgBody{Color: d.Color, Resist: d.Resist})
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO damage_type_defs (ref, pack, display_name, body) VALUES ($1,$2,$3,$4)`,
+			d.Ref, pk.Pack, d.DisplayName, body); err != nil {
+			return fmt.Errorf("store: insert damage type %s: %w", d.Ref, err)
 		}
 	}
 	return nil

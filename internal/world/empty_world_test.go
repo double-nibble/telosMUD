@@ -27,6 +27,17 @@ func TestEmptyShardBootsAndRejectsLoginCleanly(t *testing.T) {
 	if len(z.rooms) != 0 || z.startRoom != "" {
 		t.Fatalf("empty zone should have no rooms/start room: rooms=%d start=%q", len(z.rooms), z.startRoom)
 	}
+	// Bare-engine invariant (Phase 5.1): no content => zero attribute/resource/damage-type defs.
+	// Combat ops are simply unavailable; a stat read on any entity returns 0 (no panic).
+	if n := z.attrDefs().len(); n != 0 {
+		t.Fatalf("empty shard should have 0 attribute defs, got %d", n)
+	}
+	if n := z.resourceDefs().len(); n != 0 {
+		t.Fatalf("empty shard should have 0 resource defs, got %d", n)
+	}
+	if n := z.damageTypeDefs().len(); n != 0 {
+		t.Fatalf("empty shard should have 0 damage-type defs, got %d", n)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

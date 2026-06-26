@@ -55,6 +55,13 @@ type Zone struct {
 	// (newZone alone) gets its own private cache so spawn still works standalone.
 	protos *protoCache
 
+	// defs is the per-SHARD bundle of pack-global definition registries (attributes/resources/
+	// damage-types — defs.go), shared READ-ONLY across all the shard's zone goroutines exactly
+	// like protos: each is an atomic-swap table read lock-free from any zone goroutine. A bare
+	// test zone (newZone alone) gets its own empty bundle so attr()/resource reads work
+	// standalone (returning 0 — no content defined). Set to the shared bundle by a shard.
+	defs *defRegistries
+
 	// shard, if set, is the world process hosting this zone. It is read (never
 	// mutated through this field) by the zone goroutine to learn its sibling zones for
 	// an intra-shard move and to populate/clear the shard token index. nil on a bare
@@ -336,6 +343,10 @@ func newZone(id string) *Zone {
 		// replaced with the shared per-shard cache (newShard); a bare test zone keeps its
 		// own so spawn works standalone.
 		protos: newProtoCache(),
+		// A private, empty definition-registry bundle by default (defs.go). A shard-hosted zone
+		// has this replaced with the shared per-shard bundle; a bare test zone keeps its own so
+		// attr()/resource reads work standalone (reporting 0/absent — no content defined).
+		defs: newDefRegistries(),
 		// Per-zone heartbeat scheduler (pulse.go). Empty until something registers a
 		// callback; the ticker in Run is a cheap no-op until then.
 		pulses: newPulseScheduler(),

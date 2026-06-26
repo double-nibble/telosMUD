@@ -134,7 +134,30 @@ func cloneComponent(c Component) Component {
 		}
 		return &cp
 	case *Living:
-		cp := *v // all value fields; fighting is a live pointer, intentionally instance-set
+		// Living gained reference-typed instance state in Phase 5.1 (attrBase/resCur maps + the
+		// derivation cache). A COW MUST reallocate the maps or a spawned mob mutating its bases/
+		// currents would alias the prototype's (players are prototype==nil and never reach this
+		// path, but a future prototype-backed mob does). The attrs cache is a pure function of
+		// bases+mods+defs, so the clone starts with an EMPTY (dirty) cache — it recomputes lazily.
+		// fighting is a live pointer, intentionally instance-set (copied by pointer here, like
+		// before). position is a value field copied by the shallow struct copy.
+		cp := *v
+		if v.attrBase != nil {
+			cp.attrBase = make(map[string]float64, len(v.attrBase))
+			for k, val := range v.attrBase {
+				cp.attrBase[k] = val
+			}
+		}
+		if v.resCur != nil {
+			cp.resCur = make(map[string]int, len(v.resCur))
+			for k, val := range v.resCur {
+				cp.resCur[k] = val
+			}
+		}
+		cp.attrs = attrCache{dirty: true} // fresh, empty, dirty: recompute lazily on this instance
+		// modSrcs are runtime-registered (affects/gear); the clone starts with NONE so it never
+		// aliases the prototype's slice — a COW'd instance re-registers its own sources (5.2).
+		cp.modSrcs = nil
 		return &cp
 	case *PlayerControlled:
 		cp := *v

@@ -15,6 +15,44 @@
 
 pack: demo
 
+# Pack-GLOBAL definitions (Phase 5.1, docs/ABILITIES.md §1): attributes/resources/damage-types are
+# zone-independent — they belong to the pack, not to Midgaard. The engine knows the KIND; these rows
+# give the instances. Stripping the pack (bare-engine boot) leaves zero of these and the server still
+# runs — a stat read just returns 0.
+attributes:
+  # Primary stats: literal-base attributes (point-buy/level bases override these per character).
+  - {ref: strength,     display_name: Strength,     value_kind: int, default_base: {lit: 10}}
+  - {ref: intellect,    display_name: Intellect,    value_kind: int, default_base: {lit: 10}}
+  - {ref: constitution, display_name: Constitution, value_kind: int, default_base: {lit: 10}}
+  - {ref: level,        display_name: Level,         value_kind: int, default_base: {lit: 1}, min: 1}
+  # Derived attributes: base is a prefix-AST formula evaluated against OTHER attrs (recursive).
+  #   max_hp   = constitution*10 + level*5
+  #   max_mana = intellect*8 + level*3
+  - ref: max_hp
+    display_name: Maximum Health
+    value_kind: derived
+    default_base:
+      expr: ["+", ["*", ["attr", constitution], 10], ["*", ["attr", level], 5]]
+    min: 1
+  - ref: max_mana
+    display_name: Maximum Mana
+    value_kind: derived
+    default_base:
+      expr: ["+", ["*", ["attr", intellect], 8], ["*", ["attr", level], 3]]
+    min: 0
+
+resources:
+  # hp is VITAL: at 0 = death (the on_depleted hook is content, wired in 5.2/combat). Its max is the
+  # derived max_hp attribute, so anything that raises constitution/level/max_hp raises the cap.
+  - {ref: hp,   display_name: Health, max_attr: max_hp,   vital: true, regen: 1}
+  - {ref: mana, display_name: Mana,   max_attr: max_mana, vital: false, regen: 1}
+
+damage_types:
+  # A small resist matrix: slash resists slash a little (armor-ish), fire is neutral. The shared
+  # mitigation pipeline (5.3) reads these; 5.1 only loads them. Multiplier <1 resist, >1 vuln, 0 immune.
+  - {ref: slash, display_name: Slashing, color: white, resist: {slash: 0.9}}
+  - {ref: fire,  display_name: Fire,     color: red,   resist: {fire: 1.0}}
+
 zones:
   - ref: midgaard
     name: The City of Midgaard

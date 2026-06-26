@@ -91,6 +91,10 @@ func (p *Pool) LoadPacks(ctx context.Context, enabled []string) ([]content.Pack,
 	if err := p.loadResets(ctx, enabled, zonesByRef); err != nil {
 		return nil, err
 	}
+	// Pack-GLOBAL defs (Phase 5.1): zone-independent, grouped onto their pack (not a zone).
+	if err := p.loadGlobalDefs(ctx, enabled, pack); err != nil {
+		return nil, err
+	}
 
 	out := make([]content.Pack, 0, len(byPack))
 	for _, name := range enabled {
@@ -300,4 +304,131 @@ func (p *Pool) loadResets(ctx context.Context, enabled []string, zones map[strin
 		}
 	}
 	return rows.Err()
+}
+
+// attrBody / resourceBody / dmgBody are the JSONB-tail shapes for the pack-global def rows. They
+// mirror the non-relational fields of the content DTOs so a DB round-trip reproduces the same def
+// the embedded YAML would. The relational columns (ref/display_name/value_kind/...) stay first-class.
+type attrBody struct {
+	Min *float64 `json:"min,omitempty"`
+	Max *float64 `json:"max,omitempty"`
+}
+
+type resourceBody struct {
+	Regen             int `json:"regen,omitempty"`
+	DepletedThreshold int `json:"depleted_threshold,omitempty"`
+}
+
+type dmgBody struct {
+	Color  string             `json:"color,omitempty"`
+	Resist map[string]float64 `json:"resist,omitempty"`
+}
+
+// loadGlobalDefs reads the pack-global attribute/resource/damage-type rows for the enabled packs
+// and appends them onto their content.Pack. They are zone-independent, so they group by pack name
+// (the `pack` helper), not onto any zone. The `default_base` of an attribute and the JSONB `body`
+// of every kind round-trip through the same DTO the embedded loader produces.
+func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(string) *content.Pack) error {
+	// Attributes.
+	rows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, display_name, value_kind, COALESCE(default_base, 'null'::jsonb), body
+		   FROM attribute_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query attribute_defs: %w", err)
+	}
+	for rows.Next() {
+		var a content.AttributeDTO
+		var pk string
+		var base, body []byte
+		if err := rows.Scan(&a.Ref, &pk, &a.DisplayName, &a.ValueKind, &base, &body); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: scan attribute_def: %w", err)
+		}
+		if err := decodeBaseSpec(base, &a.DefaultBase); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: attribute_def %s base: %w", a.Ref, err)
+		}
+		if len(body) > 0 {
+			var b attrBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				rows.Close()
+				return fmt.Errorf("store: attribute_def %s body: %w", a.Ref, err)
+			}
+			a.Min, a.Max = b.Min, b.Max
+		}
+		pp := pack(pk)
+		pp.Attributes = append(pp.Attributes, a)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+
+	// Resources.
+	rRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, display_name, COALESCE(max_attr, ''), vital, body
+		   FROM resource_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query resource_defs: %w", err)
+	}
+	for rRows.Next() {
+		var r content.ResourceDTO
+		var pk string
+		var body []byte
+		if err := rRows.Scan(&r.Ref, &pk, &r.DisplayName, &r.MaxAttr, &r.Vital, &body); err != nil {
+			rRows.Close()
+			return fmt.Errorf("store: scan resource_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b resourceBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				rRows.Close()
+				return fmt.Errorf("store: resource_def %s body: %w", r.Ref, err)
+			}
+			r.Regen, r.DepletedThreshold = b.Regen, b.DepletedThreshold
+		}
+		pp := pack(pk)
+		pp.Resources = append(pp.Resources, r)
+	}
+	if err := rRows.Err(); err != nil {
+		return err
+	}
+	rRows.Close()
+
+	// Damage types.
+	dRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, display_name, body
+		   FROM damage_type_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query damage_type_defs: %w", err)
+	}
+	defer dRows.Close()
+	for dRows.Next() {
+		var d content.DamageTypeDTO
+		var pk string
+		var body []byte
+		if err := dRows.Scan(&d.Ref, &pk, &d.DisplayName, &body); err != nil {
+			return fmt.Errorf("store: scan damage_type_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b dmgBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				return fmt.Errorf("store: damage_type_def %s body: %w", d.Ref, err)
+			}
+			d.Color, d.Resist = b.Color, b.Resist
+		}
+		pp := pack(pk)
+		pp.DamageTypes = append(pp.DamageTypes, d)
+	}
+	return dRows.Err()
+}
+
+// decodeBaseSpec unmarshals an attribute's default_base JSONB into a content.BaseSpecDTO. A JSON
+// `null` (no base) leaves it zero. The column is the {"lit":n} | {"expr":<ast>} object the embedded
+// YAML carries, so the same DTO drives both sources.
+func decodeBaseSpec(raw []byte, out *content.BaseSpecDTO) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return json.Unmarshal(raw, out)
 }

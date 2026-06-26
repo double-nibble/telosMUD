@@ -92,6 +92,12 @@ type Shard struct {
 	// constructor to set after building the cache.
 	protos *protoCache
 
+	// defs is the per-shard bundle of pack-global definition registries (attributes/resources/
+	// damage-types — defs.go), shared read-only by every hosted zone exactly like protos. Built
+	// once at construction, then only read; the 4.3-style hot-reload swap (a later slice) would
+	// reload an entry into this one shared bundle. Set by the constructors after registration.
+	defs *defRegistries
+
 	// reloader, if non-nil, is the content hot-reload applier (reload.go): it subscribes to the
 	// content bus and atomically swaps a rebuilt *Prototype into protos on an invalidation. nil
 	// when no bus/source is configured — hot reload disabled, a busless shard is byte-identical
@@ -134,6 +140,12 @@ func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDia
 	// it is published immutable. After this loop nothing mutates the cache or a *Prototype.
 	protos := newProtoCache()
 	s.protos = protos
+	// Register the demo pack's pack-global defs ONCE into the shared shard bundle, before any zone
+	// runs (defineGlobals), so every hosted zone reads the SAME atomic-swap registries — the same
+	// shared-read-only-after-publish discipline as protos. adopt points each zone at this bundle.
+	if lc, err := content.LoadDemoPack(); err == nil {
+		defineGlobals(s.defs, lc)
+	}
 	for _, id := range zoneIDs {
 		z := newDemoZone(id, protos)
 		s.adopt(id, z)
@@ -157,6 +169,7 @@ func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr
 	protos := newProtoCache()
 	s.protos = protos
 	defineContent(protos, lc) // fill the cache once from all loaded zones, before any zone runs
+	defineGlobals(s.defs, lc) // register pack-global attribute/resource/damage-type defs (5.1)
 	for _, id := range zoneIDs {
 		z := newZone(id)
 		z.protos = protos
@@ -181,6 +194,9 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		peers:      peers,
 		tokenIndex: map[string]*Zone{},
 		saver:      newSaver(nil, nil), // disabled until WithPersistence configures it
+		// Empty global-definition bundle (defs.go); the constructor registers content into it
+		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
+		defs: newDefRegistries(),
 	}
 }
 
@@ -219,6 +235,12 @@ func (s *Shard) adopt(id string, z *Zone) {
 	z.shard = s
 	z.handoff = s.beginHandoff
 	z.saver = s.saver
+	// Share the ONE per-shard global-definition bundle with every hosted zone (defs.go), replacing
+	// the private bundle newZone/newDemoZone gave it. Every zone goroutine then reads the same
+	// atomic-swap registries lock-free, exactly as it shares the one protoCache.
+	if s.defs != nil {
+		z.defs = s.defs
+	}
 	s.zones[id] = z
 }
 
