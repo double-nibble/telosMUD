@@ -3,7 +3,10 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/double-nibble/telosmud/internal/content"
 )
@@ -14,6 +17,12 @@ import (
 // container); the `body` of a zone_reset carries the ResetDTO. Stable relational columns
 // (ref/name/short/long/keywords/exits) stay first-class so FK integrity and indexed lookups
 // work, with the open-ended remainder in JSONB (docs/PERSISTENCE.md §1).
+
+// Compile-time assertions that *Pool serves both the bulk and single-ref content reads.
+var (
+	_ content.Source           = (*Pool)(nil)
+	_ content.DefinitionSource = (*Pool)(nil)
+)
 
 // protoBody is the JSONB tail shape for an item/mob prototype row: the optional component
 // templates. It mirrors the component fields of content.ProtoDTO so a round-trip through the
@@ -90,6 +99,83 @@ func (p *Pool) LoadPacks(ctx context.Context, enabled []string) ([]content.Pack,
 		}
 	}
 	return out, nil
+}
+
+// LoadDefinition implements content.DefinitionSource: the SINGLE-ROW re-read behind hot reload
+// (docs/PHASE4-PLAN.md §5). It fetches exactly the (kind, ref) row within pack with an indexed PK
+// lookup and assembles the same neutral DTO the bulk loader produces, so the world's mapper
+// rebuilds a byte-identical prototype. Found=false (no error) means the row was deleted/renamed —
+// the caller drops the prototype. pgx.ErrNoRows is the not-found signal, not an error.
+func (p *Pool) LoadDefinition(ctx context.Context, kind, ref, pack string) (content.Definition, error) {
+	switch kind {
+	case content.KindRoom:
+		return p.loadRoomDefinition(ctx, ref, pack)
+	case content.KindItem:
+		return p.loadProtoDefinition(ctx, "item_prototypes", kind, ref, pack)
+	case content.KindMob:
+		return p.loadProtoDefinition(ctx, "mob_prototypes", kind, ref, pack)
+	default:
+		// Unknown/unsupported kind (e.g. zone): nothing to reload as a prototype. Report
+		// not-found so the caller no-ops rather than erroring.
+		return content.Definition{Kind: kind, Ref: ref, Found: false}, nil
+	}
+}
+
+// loadRoomDefinition fetches one room row plus its exits and returns it as a RoomDTO-bearing
+// Definition. The exits are a small second query keyed by the room ref.
+func (p *Pool) loadRoomDefinition(ctx context.Context, ref, pack string) (content.Definition, error) {
+	var r content.RoomDTO
+	err := p.pool.QueryRow(ctx,
+		`SELECT ref, name, COALESCE(sector, ''), COALESCE(body->>'long', '')
+		   FROM rooms WHERE ref = $1 AND pack = $2`, ref, pack).
+		Scan(&r.Ref, &r.Name, &r.Sector, &r.Long)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return content.Definition{Kind: content.KindRoom, Ref: ref, Found: false}, nil
+	}
+	if err != nil {
+		return content.Definition{}, fmt.Errorf("store: load room definition %s: %w", ref, err)
+	}
+	r.Exits = map[string]string{}
+	exRows, err := p.pool.Query(ctx, `SELECT dir, to_room FROM exits WHERE from_room = $1`, ref)
+	if err != nil {
+		return content.Definition{}, fmt.Errorf("store: load room exits %s: %w", ref, err)
+	}
+	defer exRows.Close()
+	for exRows.Next() {
+		var dir, to string
+		if err := exRows.Scan(&dir, &to); err != nil {
+			return content.Definition{}, fmt.Errorf("store: scan exit %s: %w", ref, err)
+		}
+		r.Exits[dir] = to
+	}
+	if err := exRows.Err(); err != nil {
+		return content.Definition{}, err
+	}
+	return content.Definition{Kind: content.KindRoom, Ref: ref, Found: true, Room: r}, nil
+}
+
+// loadProtoDefinition fetches one item/mob prototype row and decodes its component body, returning
+// a ProtoDTO-bearing Definition. table selects items vs mobs; kind is echoed into the result.
+func (p *Pool) loadProtoDefinition(ctx context.Context, table, kind, ref, pack string) (content.Definition, error) {
+	var d content.ProtoDTO
+	var body []byte
+	err := p.pool.QueryRow(ctx, fmt.Sprintf(
+		`SELECT ref, short, long, keywords, body FROM %s WHERE ref = $1 AND pack = $2`, table),
+		ref, pack).Scan(&d.Ref, &d.Short, &d.Long, &d.Keywords, &body)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return content.Definition{Kind: kind, Ref: ref, Found: false}, nil
+	}
+	if err != nil {
+		return content.Definition{}, fmt.Errorf("store: load %s definition %s: %w", table, ref, err)
+	}
+	if len(body) > 0 {
+		var b protoBody
+		if err := json.Unmarshal(body, &b); err != nil {
+			return content.Definition{}, fmt.Errorf("store: %s %s body: %w", table, ref, err)
+		}
+		d.Physical, d.Wearable, d.Weapon, d.Container = b.Physical, b.Wearable, b.Weapon, b.Container
+	}
+	return content.Definition{Kind: kind, Ref: ref, Found: true, Proto: d}, nil
 }
 
 func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string]*content.ZoneDTO) error {

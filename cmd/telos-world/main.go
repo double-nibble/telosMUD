@@ -23,6 +23,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/checkpoint"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/contentbus"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
 	"github.com/double-nibble/telosmud/internal/store"
@@ -101,11 +102,23 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// nothing demo is compiled into this path.
 	lc := loadContent(ctx, cfg)
 
-	// Open the durable character store (Postgres) for the persistence ladder (slice 4.2). It is
-	// OPTIONAL: if Postgres is unreachable the store stays nil and characters are EPHEMERAL
-	// (today's behavior) — the bare-engine boot degrades, never crashes. Separate from the content
-	// pool above (which is closed after the boot load); this one lives for the shard's lifetime.
-	charStore := openCharStore(ctx, cfg)
+	// Open the long-lived Postgres pool (slice 4.2 character ladder + slice 4.3 hot-reload re-read).
+	// It is OPTIONAL: if Postgres is unreachable it stays nil and characters are EPHEMERAL and hot
+	// reload is DISABLED (today's behavior) — the bare-engine boot degrades, never crashes. Separate
+	// from the content-load pool above (which is closed after the boot load); this one lives for the
+	// shard's lifetime. The same *store.Pool serves both world.CharacterStore and
+	// content.DefinitionSource, so the hot-reload single-ref re-read reuses it.
+	livePool := openLivePool(ctx, cfg)
+	var charStore world.CharacterStore
+	var defSource content.DefinitionSource
+	if livePool != nil {
+		charStore = livePool
+		defSource = livePool
+	}
+
+	// Optional content bus for hot reload (slice 4.3). NATS unreachable => hot reload DISABLED
+	// (boot-load still works); never fatal, exactly like Redis/Postgres being down.
+	bus := openContentBus(cfg)
 
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -115,7 +128,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		// Redis down: no checkpoint tier, but the Postgres tier (if up) still gives save-on-logout
 		// durability — a character survives a restart, just with a wider crash window.
 		return world.NewShardFromContent(lc, zones, home, "", nil, nil).
-			WithPersistence(charStore, nil)
+			WithPersistence(charStore, nil).
+			WithHotReload(defSource, bus, enabledPacks)
 	}
 	dir := directory.NewRedis(rdb, "telos")
 	ckpt := checkpoint.NewRedis(rdb, "telos") // ~10s Redis checkpoint tier of the ladder
@@ -153,24 +167,39 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	}
 
 	return world.NewShardFromContent(lc, zones, home, cfg.ShardAddr, dir, world.GRPCDialer()).
-		WithPersistence(charStore, ckpt)
+		WithPersistence(charStore, ckpt).
+		WithHotReload(defSource, bus, enabledPacks)
 }
 
-// openCharStore opens the durable character store (Postgres) for the persistence ladder. It is
-// OPTIONAL and never fatal: an unreachable database returns a nil store, so characters stay
-// ephemeral (the bare-engine degradation) rather than the world failing to boot. The pool lives
-// for the shard's lifetime (the async saver and the login read use it), so — unlike the content
-// load pool — it is not closed here. A nil *store.Pool implements world.CharacterStore as a nil
-// interface only if returned as the interface's nil; to keep the storeless path truly nil we
-// return the world.CharacterStore interface and pass it straight through to WithPersistence.
-func openCharStore(ctx context.Context, cfg config.Config) world.CharacterStore {
+// openLivePool opens the long-lived Postgres pool the shard keeps for its lifetime: it backs both
+// the durable character store (the async saver + login read) and the hot-reload single-ref re-read
+// (content.DefinitionSource). It is OPTIONAL and never fatal: an unreachable database returns nil,
+// so characters stay ephemeral AND hot reload is disabled (the bare-engine degradation) rather than
+// the world failing to boot. Returns the concrete *store.Pool (nil on failure) so the caller can
+// keep the CharacterStore and DefinitionSource interfaces truly nil when there is no pool — a typed
+// nil in an interface would be non-nil and defeat the disabled-fallback guards.
+func openLivePool(ctx context.Context, cfg config.Config) *store.Pool {
 	pool, err := store.Open(ctx, cfg.Postgres.DSN)
 	if err != nil {
-		slog.Warn("postgres unavailable for character store; characters are ephemeral", "err", err)
+		slog.Warn("postgres unavailable; characters ephemeral and hot reload disabled", "err", err)
 		return nil
 	}
-	slog.Info("character store ready (durable characters)")
+	slog.Info("postgres ready (durable characters + hot reload)")
 	return pool
+}
+
+// openContentBus connects the content hot-reload bus (NATS). OPTIONAL and never fatal: an
+// unreachable broker returns a nil Bus, so hot reload is simply disabled (boot-load still works).
+// Returns the contentbus.Bus interface so the disabled path is a true nil interface (a typed nil
+// *NATSBus would be non-nil and slip past WithHotReload's nil guard).
+func openContentBus(cfg config.Config) contentbus.Bus {
+	bus, err := contentbus.Connect(cfg.NATS.URL)
+	if err != nil {
+		slog.Warn("nats unavailable; content hot reload disabled", "url", cfg.NATS.URL, "err", err)
+		return nil
+	}
+	slog.Info("content bus ready (hot reload enabled)", "url", cfg.NATS.URL)
+	return bus
 }
 
 // loadContent reads the enabled packs from Postgres, optionally running migrations first

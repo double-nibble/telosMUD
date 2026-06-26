@@ -11,6 +11,7 @@ import (
 
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/contentbus"
 	"github.com/double-nibble/telosmud/internal/store"
 )
 
@@ -45,4 +46,21 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("seeded content pack", "pack", pack.Pack, "zones", len(pack.Zones))
+
+	// Hot-reload trigger (docs/PHASE4-PLAN.md §5): publish an invalidation for every ref in the
+	// re-imported pack so any RUNNING shard reloads it without a restart. OPTIONAL and non-fatal:
+	// if NATS is unreachable the seed still succeeded (the rows are written) — running shards just
+	// won't hot-reload until their next boot. Mirrors the rest of the optional-dependency posture.
+	bus, err := contentbus.Connect(cfg.NATS.URL)
+	if err != nil {
+		slog.Warn("content bus unreachable; rows seeded but running shards not hot-reloaded", "err", err)
+		return
+	}
+	defer bus.Close()
+	n, err := contentbus.PublishPack(ctx, bus, pack)
+	if err != nil {
+		slog.Warn("publishing content invalidations failed (partial)", "published", n, "err", err)
+		return
+	}
+	slog.Info("published content invalidations", "count", n)
 }

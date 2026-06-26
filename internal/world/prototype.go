@@ -1,6 +1,10 @@
 package world
 
-import "reflect"
+import (
+	"reflect"
+	"sync"
+	"sync/atomic"
+)
 
 // Prototypes & instancing — flyweight + copy-on-write (docs/MUDLIB.md §5, §8 D1).
 //
@@ -30,6 +34,31 @@ import "reflect"
 // no lock: it is publication-then-immutable. Any code path that mutated a value reachable
 // from a *Prototype would be a cross-zone data race; the COW helpers below exist precisely
 // so no such path exists.
+//
+// # Hot reload and the atomic table swap (docs/PHASE4-PLAN.md §5)
+//
+// Slice 4.3 makes the cache reloadable AT RUNTIME: an operator edits a definition row and
+// publishes an invalidation, and every shard rebuilds JUST that *Prototype and swaps it in,
+// so the NEXT spawn uses the new data. The hot path (spawn -> get) reads the cache locklessly
+// on EVERY zone goroutine, so a runtime swap of a shared map would be a cross-goroutine data
+// race. The fix is NOT to mutate the shared map in place; it is to publish a NEW immutable map.
+//
+// Mechanism (chosen of the two in §5): a single per-shard atomic.Pointer to the map TABLE
+// (protoCache.live). spawn/get do one atomic Load — lock-free, one indirection, the hot path
+// stays cheap. A reload (or a build-time define) builds a NEW table = a copy of the current
+// one with the one entry replaced, then atomically Stores it. Readers either see the whole old
+// table or the whole new one, never a half-written map. The OLD *Prototype stays alive as long
+// as any live instance still aliases it (Go GC), so a reload NEVER touches in-flight COW deltas
+// — live instances keep the prototype they spawned from; only later spawns see the edit.
+//
+// Why the whole-table swap (§5 option 1) and not a per-zone reload message (§5 option 2): the
+// cache is per-SHARD, shared by every hosted zone, so "apply the swap on each zone goroutine"
+// would still have N zone goroutines mutating ONE shared map — the very race we are removing —
+// unless each zone owned a private copy, which would defeat the per-shard flyweight. A shared
+// structure read across goroutines wants a shared-atomic swap: it is the simplest CORRECT fit,
+// keeps spawn lock-free, and confines the only writer to whoever calls reload (serialized by
+// the shard's single reload applier). The map copy is O(#refs) and a reload is rare, so the
+// per-reload allocation is negligible against keeping every spawn lock-free.
 
 // Prototype is an immutable template (MUDLIB §5). After build() returns it, nothing
 // mutates it or anything reachable from it; many instances on many zone goroutines read
@@ -43,37 +72,110 @@ type Prototype struct {
 	comps    componentSet // component template: canonical pointers shared until COW
 }
 
+// newPrototype is the single *Prototype constructor (the build entry point both define and the
+// hot-reload swap use, so a reloaded prototype is built identically to a booted one). It
+// normalizes a nil component set to empty and takes ownership of the immutable template fields.
+func newPrototype(ref ProtoRef, keywords []string, short, long string, comps componentSet) *Prototype {
+	if comps == nil {
+		comps = componentSet{}
+	}
+	return &Prototype{ref: ref, keywords: keywords, short: short, long: long, comps: comps}
+}
+
 // protoCache is the per-shard prototype registry (MUDLIB §5: "cached per shard"). It maps
 // ProtoRef -> *Prototype and is shared READ-ONLY across the shard's zone goroutines. It is
 // populated entirely during shard construction (newShard, before Run), then only read — so
 // it needs no lock. It is NOT per-zone: a shard's zones share one cache, which is what makes
 // the flyweight pay off across the whole process.
 type protoCache struct {
-	protos map[ProtoRef]*Prototype
+	// live is the published table of prototypes, swapped atomically. Every read (get/spawn,
+	// from any zone goroutine) Loads it; every write (define at build time, reload at runtime)
+	// Stores a fresh copy with the one changed entry. Holding a pointer to the map (not the map
+	// directly) is what makes the swap a single atomic operation. NEVER index a Loaded table for
+	// WRITE — that would mutate a table other goroutines are reading.
+	live atomic.Pointer[protoTable]
+
+	// writeMu serializes the WRITE path only (define/reload's read-copy-store), so two writers
+	// can't both copy the same base table and clobber each other's update (the atomic Store is
+	// last-writer-wins on a stale copy otherwise). Readers never take it — get/spawn are a pure
+	// atomic.Load. Today there is a single runtime writer (the reload applier), but enforcing it
+	// here structurally rather than by wiring keeps a future second writer (a resync goroutine,
+	// a second subscription) from silently losing an update.
+	writeMu sync.Mutex
 }
 
-// newProtoCache builds an empty cache. Authoring (define) happens immediately after, on
-// the construction goroutine, before any zone Run starts.
+// protoTable is the immutable snapshot the atomic pointer publishes: a ref->prototype map that,
+// once Stored into protoCache.live, is never mutated again. A define/reload builds a new one.
+type protoTable map[ProtoRef]*Prototype
+
+// newProtoCache builds an empty cache with an empty published table. Authoring (define) happens
+// immediately after, on the construction goroutine, before any zone Run starts.
 func newProtoCache() *protoCache {
-	return &protoCache{protos: map[ProtoRef]*Prototype{}}
+	c := &protoCache{}
+	c.live.Store(&protoTable{})
+	return c
 }
 
-// define registers a prototype under its ref. Build-time only: called from newShard while
-// the cache is still private to the construction goroutine, never after a zone is running.
-// It takes ownership of keywords/short/long/comps as the canonical immutable template — the
-// caller must not retain and mutate them afterward (they become shared-immutable).
+// table returns the currently published table (always non-nil after newProtoCache).
+func (c *protoCache) table() protoTable { return *c.live.Load() }
+
+// swap publishes next as the new live table by an atomic Store. The caller must have built next
+// as a FRESH map (never the Loaded table mutated in place), so a reader holding the old table is
+// undisturbed. Build-time define and runtime reload share this one publish point.
+func (c *protoCache) swap(next protoTable) { c.live.Store(&next) }
+
+// define registers a prototype under its ref. Build-time path: called from newShard while the
+// cache is still private to the construction goroutine (single-threaded), so the copy-then-swap
+// here is uncontended, and it leaves the cache already PUBLISHED (the atomic table holds it) so
+// the runtime read path (get) is identical whether a ref was defined at boot or hot-reloaded. It
+// takes ownership of keywords/short/long/comps as the canonical immutable template — the caller
+// must not retain and mutate them afterward (they become shared-immutable).
 func (c *protoCache) define(ref ProtoRef, keywords []string, short, long string, comps componentSet) *Prototype {
-	if comps == nil {
-		comps = componentSet{}
+	p := newPrototype(ref, keywords, short, long, comps)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	cur := c.table()
+	next := make(protoTable, len(cur)+1)
+	for k, v := range cur {
+		next[k] = v
 	}
-	p := &Prototype{ref: ref, keywords: keywords, short: short, long: long, comps: comps}
-	c.protos[ref] = p
+	next[ref] = p
+	c.swap(next)
 	return p
 }
 
-// get returns the prototype for ref, or nil. Read-only; safe from any zone goroutine
-// because the cache is immutable after construction.
-func (c *protoCache) get(ref ProtoRef) *Prototype { return c.protos[ref] }
+// reload atomically replaces (or, with p==nil, removes) the prototype for ref AT RUNTIME — the
+// hot-reload swap (§5). It builds a FRESH table copy with the one entry changed and Stores it, so
+// every concurrent spawn on every zone goroutine sees either the whole old table or the whole new
+// one; the swap is never observed half-applied. The OLD *Prototype is left untouched and stays
+// alive while any live instance aliases it (Go GC) — so a reload corrupts no in-flight COW delta;
+// instances spawned BEFORE the reload keep the old prototype, spawns AFTER use the new one. A nil
+// p (the ref's row was deleted) removes the entry: subsequent spawns of that ref return nil and
+// are logged, exactly like an unknown ref, rather than serving a stale prototype.
+//
+// Concurrency: reload is the only runtime writer of the table and is serialized by the shard's
+// single reload applier (the contentbus subscriber goroutine), so two reloads never race each
+// other's copy; spawn never writes the table, so a reader never races a writer either.
+func (c *protoCache) reload(ref ProtoRef, p *Prototype) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	cur := c.table()
+	next := make(protoTable, len(cur))
+	for k, v := range cur {
+		if k == ref {
+			continue // dropped (then re-added below if p != nil)
+		}
+		next[k] = v
+	}
+	if p != nil {
+		next[ref] = p
+	}
+	c.swap(next)
+}
+
+// get returns the prototype for ref, or nil. Read-only and safe from any zone goroutine: it
+// Loads the published table atomically, so it never races a concurrent reload's table swap.
+func (c *protoCache) get(ref ProtoRef) *Prototype { return c.table()[ref] }
 
 // exits returns the Room template's exits map for AUTHORING-TIME wiring only (newDemoZone
 // populates it before any instance is spawned or any zone runs). After construction this

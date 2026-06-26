@@ -31,6 +31,7 @@ import (
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/contentbus"
 )
 
 // handoffRPCTimeout bounds the whole source-side handoff conversation (ShardForZone/
@@ -84,6 +85,18 @@ type Shard struct {
 	// DISABLED (a no-op) unless a store/checkpointer was configured — so a storeless shard
 	// keeps the pre-4.2 ephemeral behavior with zero extra goroutines or work.
 	saver *saver
+
+	// protos is the per-shard prototype cache shared read-only by every hosted zone. It is held
+	// here too (not only on each zone) so the hot-reload applier can swap entries into the one
+	// shared cache (reload.go). nil only on a zero-value shard; newBareShard leaves it for the
+	// constructor to set after building the cache.
+	protos *protoCache
+
+	// reloader, if non-nil, is the content hot-reload applier (reload.go): it subscribes to the
+	// content bus and atomically swaps a rebuilt *Prototype into protos on an invalidation. nil
+	// when no bus/source is configured — hot reload disabled, a busless shard is byte-identical
+	// to a pre-4.3 shard. Set by WithHotReload, torn down at Run end.
+	reloader *reloader
 }
 
 // NewDemoShard builds a single-shard midgaard world with no directory wiring — its
@@ -120,6 +133,7 @@ func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDia
 	// pays off across the whole process and the cross-goroutine sharing needs no lock —
 	// it is published immutable. After this loop nothing mutates the cache or a *Prototype.
 	protos := newProtoCache()
+	s.protos = protos
 	for _, id := range zoneIDs {
 		z := newDemoZone(id, protos)
 		s.adopt(id, z)
@@ -141,6 +155,7 @@ func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDia
 func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr string, dir Locator, peers HandoffDialer) *Shard {
 	s := newBareShard(home, addr, dir, peers)
 	protos := newProtoCache()
+	s.protos = protos
 	defineContent(protos, lc) // fill the cache once from all loaded zones, before any zone runs
 	for _, id := range zoneIDs {
 		z := newZone(id)
@@ -182,6 +197,19 @@ func (s *Shard) WithPersistence(store CharacterStore, ckpt Checkpointer) *Shard 
 	for _, z := range s.zones {
 		z.saver = s.saver
 	}
+	return s
+}
+
+// WithHotReload enables content hot reload (docs/PHASE4-PLAN.md §5): it subscribes the shard to
+// the content bus so an invalidation re-reads and swaps the one affected prototype into the shared
+// cache (reload.go). src is the single-ref re-read source (the Postgres store in prod, the embedded
+// or in-memory source in tests); bus is the invalidation transport; enabledPacks scopes which
+// edits this shard acts on. It is OPTIONAL: a nil bus or nil src leaves hot reload DISABLED and the
+// shard byte-identical to a pre-4.3 shard. MUST be called before Run (the subscription is torn down
+// at Run end). Returns the shard for chaining. The production constructor wires it; tests inject an
+// in-memory bus + source the same way.
+func (s *Shard) WithHotReload(src content.DefinitionSource, bus contentbus.Bus, enabledPacks []string) *Shard {
+	s.reloader = newReloader(src, s.protos, bus, enabledPacks)
 	return s
 }
 
@@ -248,6 +276,11 @@ func (s *Shard) ZoneByID(id string) *Zone { return s.zones[id] }
 // goroutine. A disabled saver's run returns immediately (no goroutine cost for a storeless boot).
 func (s *Shard) Run(ctx context.Context) {
 	go s.saver.run(ctx) // off-zone-goroutine character writer (no-op if disabled)
+	// Hot reload runs on the bus's own subscription goroutine (no shard goroutine of its own);
+	// just tear the subscription down when the shard stops so a restart doesn't double-subscribe.
+	if s.reloader != nil {
+		defer s.reloader.stop()
+	}
 	var wg sync.WaitGroup
 	for _, z := range s.zones {
 		wg.Add(1)

@@ -216,10 +216,36 @@ Two layers keep "one writer" honest:
 
 - Shards bulk-load `definitions` into memory at boot (filtered by enabled `pack`s).
 - On content change (OLC edit or deploy), the writer publishes an invalidation keyed by
-  `(kind, ref)` on **NATS**; shards reload just the affected rows (Lua included — ties to the
-  per-zone VM hot-reload in ARCHITECTURE.md §3).
+  `(kind, ref, pack)` on **NATS** (`content.invalidate`); shards reload just the affected rows
+  (Lua included — ties to the per-zone VM hot-reload in ARCHITECTURE.md §3).
 - Because game-design changes are JSONB/Lua, they need **no schema migration** — the whole
   point of the pillar showing up in ops.
+
+**Implementation (slice 4.3, `internal/contentbus` + `internal/world/reload.go`):**
+
+- The bus is behind an interface (`contentbus.Bus`) with a NATS impl and an in-memory `MemBus`
+  for tests, mirroring the `CharacterStore`/`MemStore` split — the reload path is unit-testable
+  with no live broker. It is **optional, never fatal**: NATS unreachable ⇒ hot reload disabled,
+  boot-load still works, a busless shard is byte-identical to before.
+- On an invalidation a shard re-reads exactly `(kind, ref)` (`content.DefinitionSource.
+  LoadDefinition`, a single-row pgx query / embedded scan), rebuilds the one `*Prototype` via the
+  same DTO→component mapper the boot loader uses, and swaps it into the per-shard cache.
+- **Concurrency — the per-shard prototype cache is swapped, not mutated.** The cache
+  (`protoCache`) holds an `atomic.Pointer` to its map table; `spawn`/`get` read it locklessly on
+  every zone goroutine (one atomic `Load`), and a reload publishes a **new** table (a copy with
+  the one entry replaced) via a single atomic `Store`. Readers see the whole old or whole new
+  table, never a half-applied map. The old `*Prototype` stays alive while any live instance
+  aliases it (Go GC). This is `PHASE4-PLAN.md` §5 option 1 (whole-table swap), chosen over option
+  2 (per-zone reload message) because the cache is **per-shard, shared by every zone** — applying
+  a swap "on each zone goroutine" would still have N goroutines mutating one shared map. The only
+  runtime writer is the bus subscription goroutine (serial per subscription).
+- **Live instances are NOT retroactively changed** by a reload: an instance spawned before the
+  edit keeps the prototype it spawned from; only later spawns see the new data. This is the
+  documented MUD semantics (an existing mob keeps its stats; the next repop uses the edit), not a
+  bug — it also avoids corrupting in-flight COW deltas. A deleted definition removes the cache
+  entry (later spawns return nil/unknown) rather than serving a stale prototype.
+- **Trigger:** `make seed` (the re-import) publishes an invalidation for every ref in the pack
+  after the write commits (`contentbus.PublishPack`); a future OLC save publishes the same.
 
 ## 9. Migrations
 
