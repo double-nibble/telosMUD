@@ -47,7 +47,12 @@ func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 		CharacterId: s.character,
 		Name:        s.entity.Name(),
 		AppliedSeq:  s.appliedSeq,
-		Flags:       map[string]string{},
+		// Carry the optimistic-concurrency version through the handoff so a later save on the
+		// destination CASes from the right base and a handoff + a save stay monotonic (slice 4.2,
+		// docs/PERSISTENCE.md §7). The destination seeds its session.stateVersion from this on
+		// Prepare, exactly as it seeds appliedSeq.
+		StateVersion: s.stateVersion,
+		Flags:        map[string]string{},
 	}
 }
 

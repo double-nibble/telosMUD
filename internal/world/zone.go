@@ -81,6 +81,19 @@ type Zone struct {
 	// single-writer access to zone state — combat rounds (Phase 6) and affect ticks
 	// (Phase 5) hang off it. Plain zone-owned data; only this goroutine touches it.
 	pulses *pulseScheduler
+
+	// saver is the shard's async character writer (saver.go), shared read-only by every
+	// hosted zone. The zone produces a CharSnapshot on its own goroutine (dumpCharacter) and
+	// hands it to the saver over a buffered channel; the saver does the blocking Redis/Postgres
+	// I/O OFF this goroutine and posts the result back as saveConflictMsg/saveOkMsg. nil (or a
+	// disabled saver) means ephemeral characters — no durable state, exactly today's behavior.
+	// Set by Shard.adopt; never mutated by the zone goroutine.
+	saver *saver
+
+	// savePulse holds the cancel handle for this zone's save-cadence pulse callback so the
+	// scheduler can be torn down; nil until persistSave starts the cadence (first registered on
+	// the first persisted login). Zone-owned, only the zone goroutine touches it.
+	savePulse *pulseHandle
 }
 
 // msg is anything the zone goroutine processes off its inbox. The interface keeps
@@ -110,6 +123,16 @@ type attachMsg struct {
 	// next cross-shard move computes resumeEpoch+1 — which the placement CAS accepts. 0 on a
 	// brand-new character or a token re-dial (which carries its own epoch).
 	resumeEpoch uint64
+
+	// loaded is the character's durable snapshot, read OFF the zone goroutine (server.go) before
+	// this attach was posted — sibling to resumeEpoch, the freshest of {Postgres row, Redis
+	// checkpoint}. Only the fresh-login branch consults it: a present snapshot rehydrates the
+	// entity (PersistID, room, inventory/equipment) via loadCharacter; a nil snapshot for a
+	// known store means a brand-new name (attach mints a row), and a nil store means ephemeral
+	// (today's blank-entity login). Never set on a token re-dial or a link-dead re-attach (those
+	// already hold a live session). loadedOK distinguishes "no snapshot found" from "no store".
+	loaded   CharSnapshot
+	loadedOK bool // a durable snapshot was found for this name (rehydrate); else create-or-ephemeral
 }
 
 // inputMsg carries one line of player input. seq is the gate's session-scoped input
@@ -206,20 +229,71 @@ type freezeExpireMsg struct {
 	gen uint64
 }
 
-func (joinMsg) zoneMsg()         {}
-func (attachMsg) zoneMsg()       {}
-func (inputMsg) zoneMsg()        {}
-func (detachMsg) zoneMsg()       {}
-func (reapMsg) zoneMsg()         {}
-func (leaveMsg) zoneMsg()        {}
-func (transferInMsg) zoneMsg()   {}
-func (redirectMsg) zoneMsg()     {}
-func (handedOffMsg) zoneMsg()    {}
-func (handoffFailMsg) zoneMsg()  {}
-func (prepareMsg) zoneMsg()      {}
-func (abortPendingMsg) zoneMsg() {}
+// saveConflictMsg is posted BACK to the zone by the async saver (saver.go) when a Postgres
+// state_version CAS finds zero rows — a stale writer (a zombie/duplicated owner saved first).
+// The zone reconciles ON its own goroutine: re-load the current durable version and re-dump at
+// it, so the next save's CAS matches. Reconciliation is single-writer (only the zone touches the
+// session) — the saver never mutates entity state off-goroutine (docs/PHASE4-PLAN.md §4).
+type saveConflictMsg struct{ id string }
+
+// saveOkMsg carries a successful Postgres flush's bumped state_version back to the zone, so the
+// session's stateVersion advances in lockstep with the row (every save CASes on the prior value).
+// Posted by the saver; applied on the zone goroutine.
+type saveOkMsg struct {
+	id         string
+	newVersion uint64
+}
+
+// drainFlushMsg requests an immediate durable flush of every persisted player in this zone — the
+// shard-drain flush point (Shard.Drain, a rolling-redeploy hook). The dump runs on the zone
+// goroutine; the write is the saver's job. Phase 4 builds it; Phase 10 wires the trigger.
+type drainFlushMsg struct{}
+
+// createdMsg carries a freshly-minted PersistID back to the zone after a brand-new character's
+// row was INSERTed off the zone goroutine (createCharacter). The zone adopts the UUID onto the
+// live entity here — PersistID becomes REAL — so subsequent cadence saves can CAS the row.
+type createdMsg struct {
+	id  string
+	pid PersistID
+}
+
+// presenceMsg is a synchronous query answered ON the zone goroutine: it reports whether a player
+// is currently registered and whether its entity has a durable PersistID yet (the brand-new-
+// character create is async, so the PID lands a beat after login). Because z.players is
+// zone-owned, an external caller must never read it directly; this routes the read through the
+// inbox so it stays single-writer. It is the race-free probe the persistence tests (and a future
+// ops/health endpoint) use to observe login/logout/create without touching zone state. reply is
+// buffered by the caller so the handler never blocks.
+type presenceMsg struct {
+	id    string
+	reply chan presence
+}
+
+// presence is the answer to a presenceMsg.
+type presence struct {
+	present bool // the player is registered in this zone
+	pidSet  bool // its entity has a durable PersistID (the create returned)
+}
+
+func (joinMsg) zoneMsg()          {}
+func (attachMsg) zoneMsg()        {}
+func (inputMsg) zoneMsg()         {}
+func (detachMsg) zoneMsg()        {}
+func (reapMsg) zoneMsg()          {}
+func (leaveMsg) zoneMsg()         {}
+func (transferInMsg) zoneMsg()    {}
+func (redirectMsg) zoneMsg()      {}
+func (handedOffMsg) zoneMsg()     {}
+func (handoffFailMsg) zoneMsg()   {}
+func (prepareMsg) zoneMsg()       {}
+func (abortPendingMsg) zoneMsg()  {}
 func (pendingExpireMsg) zoneMsg() {}
 func (freezeExpireMsg) zoneMsg()  {}
+func (saveConflictMsg) zoneMsg()  {}
+func (saveOkMsg) zoneMsg()        {}
+func (drainFlushMsg) zoneMsg()    {}
+func (createdMsg) zoneMsg()       {}
+func (presenceMsg) zoneMsg()      {}
 
 func newZone(id string) *Zone {
 	return &Zone{
@@ -292,10 +366,10 @@ func (z *Zone) handle(m msg) {
 	switch v := m.(type) {
 	case joinMsg:
 		z.log.Debug("inbox: join", "player", v.s.character)
-		z.join(v.s)
+		z.join(v.s, "") // test/direct join: always the start room
 	case attachMsg:
 		z.log.Debug("inbox: attach", "player", v.character)
-		z.attach(v.character, v.token, v.out, v.curZone, v.resumeEpoch)
+		z.attach(v)
 	case transferInMsg:
 		z.transferIn(v)
 	case prepareMsg:
@@ -322,6 +396,18 @@ func (z *Zone) handle(m msg) {
 	case leaveMsg:
 		z.log.Debug("inbox: leave", "player", v.id)
 		z.leave(v.id)
+	case saveConflictMsg:
+		z.saveConflict(v.id)
+	case saveOkMsg:
+		z.saveOk(v.id, v.newVersion)
+	case drainFlushMsg:
+		z.saveAll(saveFlush)
+	case createdMsg:
+		z.characterCreated(v.id, v.pid)
+	case presenceMsg:
+		s, present := z.players[v.id]
+		pidSet := present && s.entity != nil && s.entity.pid != nil
+		v.reply <- presence{present: present, pidSet: pidSet}
 	}
 }
 
@@ -384,11 +470,12 @@ func (z *Zone) dispatchSafe(s *session, line string) {
 	z.dispatch(s, line)
 }
 
-// join places a newly connected player into the world: it picks a valid room
-// (falling back to the start room), registers the player, announces the arrival to
-// the room, shows the player their surroundings, and primes the prompt.
-func (z *Zone) join(s *session) {
-	r := z.resolveRoom("") // fresh join always lands in the start room
+// join places a newly connected player into the world at room (a fresh login uses the start room
+// — room=="" — and a rehydrated login uses its SAVED room ref; resolveRoom falls back to the
+// start room for an unknown ref): it registers the player, announces the arrival to the room,
+// shows the player their surroundings, and primes the prompt.
+func (z *Zone) join(s *session, room ProtoRef) {
+	r := z.resolveRoom(room) // empty room => start-room fallback (resolveRoom)
 	if r == nil {
 		// Empty-world boot (bare-engine invariant, docs/PHASE4-PLAN.md §7.5): the zone hosts
 		// no rooms (no content loaded / no start room), so there is nowhere to place the
@@ -436,6 +523,17 @@ func (z *Zone) leave(id string) {
 		z.log.Debug("leave: unknown player", "player", id)
 		return
 	}
+	// Immediate durable flush on a clean leave/quit (docs/PERSISTENCE.md §6: logout is a flush
+	// point). Dump BEFORE detaching from the room so room_ref reflects where they logged out;
+	// the dump is on this goroutine (race-free) and the write is the saver's job (off-goroutine),
+	// so removal does not wait on I/O. A storeless/ephemeral player is a no-op.
+	if z.saver != nil && z.saver.enabled() && s.entity != nil && s.entity.pid == nil {
+		// Brand-new character that quit before its async create returned a PersistID: the flush
+		// is skipped (no id to CAS on), so this session's actions are not persisted. Narrow
+		// (the create round-trip window) but a real silent-loss path — log it so it's observable.
+		z.log.Info("character logged out before its durable id was assigned; session not persisted", "player", id)
+	}
+	z.enqueueSave(id, s, saveFlush)
 	if r := s.entity.location; r != nil {
 		z.act("$n leaves.", s.entity, nil, nil, "", "", ToRoom)
 		Move(s.entity, nil)
@@ -489,7 +587,8 @@ func (z *Zone) transferIn(m transferInMsg) {
 // re-bound to the *same* session, preserving appliedSeq so replayed input dedups
 // correctly. Either way an Attached frame goes out first; session.send stamps it with
 // the resume point (appliedSeq) via ServerFrame.ack_input_seq.
-func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, curZone *atomic.Pointer[Zone], resumeEpoch uint64) {
+func (z *Zone) attach(m attachMsg) {
+	character, token, out, curZone, resumeEpoch := m.character, m.token, m.out, m.curZone, m.resumeEpoch
 	s := z.players[character]
 	switch {
 	case s != nil && s.pending:
@@ -576,8 +675,68 @@ func (z *Zone) attach(character, token string, out chan *playv1.ServerFrame, cur
 		}
 		s.attachGen++
 		s.send(attachedFrame(z.id))
-		z.join(s) // registers, places, announces arrival, looks, prompts
+		// Persistence (docs/PHASE4-PLAN.md §4): rehydrate from the snapshot read off-goroutine,
+		// or create a brand-new durable row, or (no store) stay ephemeral exactly as before.
+		room := z.loginRoom(s, m)
+		z.join(s, room) // registers, places, announces arrival, looks, prompts
+		z.startSaveCadence()
 	}
+}
+
+// loginRoom applies the persistence read path for a fresh login and returns the room ref the
+// player should land in (empty => start room). It runs on the zone goroutine, so every entity
+// mutation (loadCharacter, the create) is single-writer; the blocking I/O already happened
+// off-goroutine (the load in server.go) or is the saver's job (the create's row insert is the one
+// exception — see below). Three cases:
+//
+//   - a durable snapshot was loaded (m.loadedOK): rehydrate the entity (PersistID, version,
+//     inventory/equipment) and land them in their SAVED room. This is also the crash-rehydrate-
+//     by-name primitive (docs/PLACEMENT.md §6): the snapshot may have been written by a shard
+//     this one never saw — load is keyed by name, so any shard can resume it.
+//   - a store is configured but no row exists: a brand-new name — mint the row (PersistID) so the
+//     next save can CAS it. The insert is a quick off-goroutine call posted back as the PID; the
+//     character starts blank in the start room meanwhile.
+//   - no store (ephemeral): return "" and stay blank, exactly today's behavior.
+func (z *Zone) loginRoom(s *session, m attachMsg) ProtoRef {
+	if m.loadedOK {
+		loadCharacter(z, s, m.loaded)
+		if m.loaded.RoomRef != "" {
+			return ProtoRef(m.loaded.RoomRef)
+		}
+		return ""
+	}
+	if z.saver != nil && z.saver.store != nil {
+		// Brand-new character: create the durable row off the zone goroutine and adopt the minted
+		// PersistID when it returns (createDone). The blocking INSERT must not run here; spawn it
+		// like beginHandoff. Until it returns the character is ephemeral-in-memory; the first
+		// cadence flush after the PID arrives makes it durable. The start room is the create's
+		// recorded location.
+		z.createCharacter(s)
+	}
+	return ""
+}
+
+// createCharacter inserts a brand-new durable row for the session off the zone goroutine and
+// posts the minted PersistID back as a createdMsg. The session is already live in the start room;
+// the PID arriving later just makes future saves durable. Errors are logged (non-fatal): the
+// character simply stays ephemeral until a later login retries the create. zoneRef/roomRef are
+// captured now (the start room) so the row records the spawn location.
+func (z *Zone) createCharacter(s *session) {
+	store := z.saver.store
+	name := s.character
+	zoneRef := z.id
+	roomRef := string(z.startRoom)
+	z.log.Debug("creating new durable character", "player", name, "zone", zoneRef, "room", roomRef)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), saveIOTimeout)
+		defer cancel()
+		pid, err := store.CreateCharacter(ctx, name, zoneRef, roomRef)
+		if err != nil {
+			z.log.Debug("character create failed (staying ephemeral)", "player", name, "err", err)
+			return
+		}
+		z.post(createdMsg{id: name, pid: pid})
+	}()
 }
 
 // prepare rehydrates a snapshot as a PENDING player in this zone (the destination
@@ -623,11 +782,12 @@ func (z *Zone) prepare(m prepareMsg) {
 		return
 	}
 	s := &session{
-		character:  character,
-		appliedSeq: m.snap.GetAppliedSeq(),
-		epoch:      m.epoch,
-		pending:    true,
-		token:      m.token,
+		character:    character,
+		appliedSeq:   m.snap.GetAppliedSeq(),
+		stateVersion: m.snap.GetStateVersion(), // carry the CAS base across the handoff (§7)
+		epoch:        m.epoch,
+		pending:      true,
+		token:        m.token,
 	}
 	e := z.newPlayerEntity(s, character)
 	// Defense-in-depth: the snapshot's Name is externally-sourced and the cross-shard
@@ -844,6 +1004,137 @@ func (z *Zone) handoffFailed(v handoffFailMsg) {
 	z.log.Debug("handoff failed, thawing player", "player", v.id, "reason", v.reason)
 	s.send(textFrame("The way is barred. (" + v.reason + ")"))
 	s.send(promptFrame())
+}
+
+// --- Durability ladder: cadence + reconcile (docs/PHASE4-PLAN.md §4) -------------------
+
+// saveCheckpointPulses / saveFlushPulses set the two write cadences in pulse units (pulse.go's
+// quarter-second heartbeat): a cheap Redis checkpoint every ~10s and a Postgres flush every ~60s.
+// They are package vars (not consts) so a test can shrink them to exercise the ladder quickly.
+var (
+	saveCheckpointPulses uint64 = 40  // ~10s at 250ms/pulse
+	saveFlushPulses      uint64 = 240 // ~60s
+)
+
+// startSaveCadence registers the per-zone save-cadence pulse callback the FIRST time a persisted
+// player joins (idempotent: a no-op once savePulse is set). The callback fires ON the zone
+// goroutine (pulse.go), so it has single-writer access: it dumps every persisted player and hands
+// the snapshot to the async saver (which does the off-goroutine I/O). It emits a Redis checkpoint
+// every saveCheckpointPulses and a Postgres flush every saveFlushPulses. With no saver configured
+// (ephemeral) it is never registered, so a storeless zone pays nothing.
+func (z *Zone) startSaveCadence() {
+	if z.savePulse != nil || z.saver == nil || !z.saver.enabled() {
+		return
+	}
+	z.savePulse = z.pulses.every(saveCheckpointPulses, func(pulse uint64) bool {
+		reason := saveCheckpoint
+		// A flush tick is a superset of a checkpoint tick: when the pulse aligns with the
+		// (longer) flush stride, write both tiers. saveCheckpointPulses divides the pulse counter
+		// the callback fires on, so test the flush stride against it.
+		if pulse%saveFlushPulses < saveCheckpointPulses {
+			reason = saveFlush
+		}
+		z.saveAll(reason)
+		return true // keep ticking while the zone runs
+	})
+	z.log.Debug("save cadence started", "checkpoint_pulses", saveCheckpointPulses, "flush_pulses", saveFlushPulses)
+}
+
+// saveAll dumps every live, persisted, non-frozen player and enqueues a save at the given tier.
+// Runs on the zone goroutine (the pulse callback). A pending/frozen player (mid-handoff) is
+// skipped: its durable record belongs to the other shard until the handoff resolves, so saving it
+// here would race the cross-shard owner's epoch/state_version.
+func (z *Zone) saveAll(reason saveReason) {
+	for id, s := range z.players {
+		if s.pending || s.frozen || s.entity == nil || s.entity.pid == nil {
+			continue
+		}
+		z.enqueueSave(id, s, reason)
+	}
+}
+
+// enqueueSave dumps one session (on the zone goroutine) and hands the snapshot to the async saver.
+// The dump is race-free (zone-owned reads only); the saver does the blocking write off-goroutine.
+// A character with no PersistID (storeless/ephemeral, or not yet created) is skipped.
+func (z *Zone) enqueueSave(id string, s *session, reason saveReason) {
+	if z.saver == nil || !z.saver.enabled() || s.entity == nil || s.entity.pid == nil {
+		return
+	}
+	z.saver.enqueue(saveRequest{snap: dumpCharacter(s), zone: z, id: id, reason: reason})
+}
+
+// saveOk advances the session's state_version to the value the Postgres CAS bumped it to, so the
+// next save CASes on the current row version. Posted back by the saver after a successful flush;
+// applied on the zone goroutine. A higher stored version is never lowered (a concurrent flush or
+// reconcile may already have advanced it).
+func (z *Zone) saveOk(id string, newVersion uint64) {
+	s := z.players[id]
+	if s == nil {
+		return
+	}
+	if newVersion > s.stateVersion {
+		s.stateVersion = newVersion
+		z.log.Debug("save ok: state_version advanced", "player", id, "state_version", newVersion)
+	}
+}
+
+// saveConflict reconciles a state_version CAS loss (a zombie/duplicated owner saved first). It
+// re-reads the current durable version off the zone goroutine — via the saver's store — and on
+// return re-dumps at it, so the next save's CAS matches. The re-read is the ONLY blocking call,
+// so it is done in a spawned goroutine (mirroring beginHandoff) that posts the refreshed version
+// back as a saveOkMsg; the zone goroutine itself never blocks. If the store/character is gone we
+// simply log — the next cadence flush will re-CAS from whatever version the session then holds.
+//
+// Crash-failover note (docs/PLACEMENT.md §6): a conflict is exactly the fence that protects a
+// genuinely-rehydrated player on a NEW shard from a zombie original — the original's save fails
+// the CAS here. Reconciling by RE-READING (never force-writing) means this shard yields to the
+// higher version rather than clobbering a legitimate newer owner.
+func (z *Zone) saveConflict(id string) {
+	s := z.players[id]
+	if s == nil || z.saver == nil || z.saver.store == nil || s.entity == nil || s.entity.pid == nil {
+		z.log.Debug("save conflict: no session/store to reconcile", "player", id)
+		return
+	}
+	name := s.character
+	store := z.saver.store
+	z.log.Debug("save conflict: reconciling (re-reading current version)", "player", id)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), saveIOTimeout)
+		defer cancel()
+		snap, found, err := store.LoadCharacter(ctx, name)
+		if err != nil || !found {
+			z.log.Debug("save conflict reconcile read failed", "player", name, "found", found, "err", err)
+			return
+		}
+		// Adopt the current durable version so the next save CASes on it. saveOk only raises the
+		// session's version (never lowers), so this is the safe minimal reconcile.
+		z.post(saveOkMsg{id: name, newVersion: snap.StateVersion})
+	}()
+}
+
+// characterCreated adopts a freshly-minted PersistID onto the live player entity after the
+// brand-new-character INSERT returned (createCharacter posted createdMsg). PersistID becomes REAL
+// here (identity.go). Idempotent: a second create (a race between two logins of a new name — the
+// CITEXT UNIQUE makes only one INSERT win) is guarded by checking pid==nil. The player may have
+// logged out before the insert returned; then there is no session and we drop the PID (the row
+// exists and the next login will LOAD it).
+func (z *Zone) characterCreated(id string, pid PersistID) {
+	s := z.players[id]
+	if s == nil || s.entity == nil {
+		z.log.Debug("character created but session gone; row will load next login", "player", id)
+		return
+	}
+	if s.entity.pid != nil {
+		return // already has one (a prior create/load won the race)
+	}
+	p := pid
+	s.entity.pid = &p
+	z.log.Debug("new character durable id assigned", "player", id, "pid", pid)
+	// Flush whatever the player did during the async-create round-trip: every save was skipped
+	// while pid==nil (enqueueSave's guard), so persist current state now rather than waiting for
+	// the next cadence tick — closes the new-character first-actions loss window for a player who
+	// is still connected when the create returns.
+	z.enqueueSave(id, s, saveFlush)
 }
 
 // Arrival/departure/say lines that others should see now flow through Zone.act

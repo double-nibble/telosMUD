@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/double-nibble/telosmud/db"
+	"github.com/double-nibble/telosmud/internal/checkpoint"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/directory"
@@ -67,6 +68,12 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down")
+		// Shutdown durability rests on the per-player save-on-Detach flush (a clean client
+		// disconnect runs leave -> flush while everything is still live). The Shard.Drain hook —
+		// a bulk flush of every live player — is built (PERSISTENCE.md §6) but its TRIGGER is
+		// Phase 10: a true graceful drain must flush BEFORE ctx cancels the zone+saver goroutines,
+		// which the placement controller will coordinate. Calling it here post-cancel would be
+		// best-effort only, so we leave the trigger to Phase 10 and rely on per-session flushes.
 		gs.GracefulStop()
 	}()
 
@@ -94,14 +101,24 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// nothing demo is compiled into this path.
 	lc := loadContent(ctx, cfg)
 
+	// Open the durable character store (Postgres) for the persistence ladder (slice 4.2). It is
+	// OPTIONAL: if Postgres is unreachable the store stays nil and characters are EPHEMERAL
+	// (today's behavior) — the bare-engine boot degrades, never crashes. Separate from the content
+	// pool above (which is closed after the boot load); this one lives for the shard's lifetime.
+	charStore := openCharStore(ctx, cfg)
+
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
 		slog.Warn("redis unavailable; single-shard mode (cross-shard exits sealed)",
 			"addr", cfg.Redis.Addr, "err", err)
-		return world.NewShardFromContent(lc, zones, home, "", nil, nil)
+		// Redis down: no checkpoint tier, but the Postgres tier (if up) still gives save-on-logout
+		// durability — a character survives a restart, just with a wider crash window.
+		return world.NewShardFromContent(lc, zones, home, "", nil, nil).
+			WithPersistence(charStore, nil)
 	}
 	dir := directory.NewRedis(rdb, "telos")
+	ckpt := checkpoint.NewRedis(rdb, "telos") // ~10s Redis checkpoint tier of the ladder
 
 	// Publish where THIS shard is reachable (shard-id -> endpoint) BEFORE claiming any
 	// zone, so the moment a zone names us as owner, peers can resolve us to a live
@@ -135,7 +152,25 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardID)
 	}
 
-	return world.NewShardFromContent(lc, zones, home, cfg.ShardAddr, dir, world.GRPCDialer())
+	return world.NewShardFromContent(lc, zones, home, cfg.ShardAddr, dir, world.GRPCDialer()).
+		WithPersistence(charStore, ckpt)
+}
+
+// openCharStore opens the durable character store (Postgres) for the persistence ladder. It is
+// OPTIONAL and never fatal: an unreachable database returns a nil store, so characters stay
+// ephemeral (the bare-engine degradation) rather than the world failing to boot. The pool lives
+// for the shard's lifetime (the async saver and the login read use it), so — unlike the content
+// load pool — it is not closed here. A nil *store.Pool implements world.CharacterStore as a nil
+// interface only if returned as the interface's nil; to keep the storeless path truly nil we
+// return the world.CharacterStore interface and pass it straight through to WithPersistence.
+func openCharStore(ctx context.Context, cfg config.Config) world.CharacterStore {
+	pool, err := store.Open(ctx, cfg.Postgres.DSN)
+	if err != nil {
+		slog.Warn("postgres unavailable for character store; characters are ephemeral", "err", err)
+		return nil
+	}
+	slog.Info("character store ready (durable characters)")
+	return pool
 }
 
 // loadContent reads the enabled packs from Postgres, optionally running migrations first

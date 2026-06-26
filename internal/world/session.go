@@ -49,6 +49,16 @@ type session struct {
 	// the world has consumed.
 	appliedSeq uint64
 
+	// stateVersion is the optimistic-concurrency guard for this character's durable record
+	// (docs/PERSISTENCE.md §7). It mirrors characters.state_version: a save CASes on it
+	// (UPDATE ... WHERE state_version=$old) and the saver posts the bumped value back via
+	// saveConflictMsg/the success path so subsequent saves stay monotonic. A stale (zombie)
+	// owner saving with a lower version fails the CAS and is rejected — the §7 backstop behind
+	// the directory epoch. 0 for a brand-new or storeless (ephemeral) character. Zone-owned:
+	// only the zone goroutine reads/writes it (dumpCharacter reads it on-goroutine; the saver
+	// posts the bumped value back as an inbox message, never mutating it off-goroutine).
+	stateVersion uint64
+
 	// detached/attachGen support re-attach (the gate re-dialing after a Redirect, or a
 	// link-death + reconnect). On stream loss the session is NOT removed; it is marked
 	// detached and reaped after a grace period unless a new stream re-binds. attachGen is

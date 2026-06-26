@@ -121,6 +121,21 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		ecancel()
 	}
 
+	// Load the character's durable snapshot, sibling to the epoch read above and on the SAME
+	// stream goroutine — never the zone goroutine — so the (blocking) Postgres/Redis reads can't
+	// stall the actor loop (docs/PHASE4-PLAN.md §4). Only for a fresh/link-dead login (token=="");
+	// a handoff re-dial carries its state in the pending session. loadCharacterSnapshot picks the
+	// FRESHER of {Postgres row, Redis checkpoint} by state_version (the crash-rehydrate freshness
+	// check). loadedOK distinguishes a found row (rehydrate) from a brand-new name (create). A
+	// disabled store yields loadedOK=false with no I/O, so a storeless boot is unchanged.
+	var loaded CharSnapshot
+	var loadedOK bool
+	if token == "" {
+		lctx, lcancel := context.WithTimeout(stream.Context(), 2*time.Second)
+		loaded, loadedOK = s.shard.loadCharacterSnapshot(lctx, character)
+		lcancel()
+	}
+
 	ctx := stream.Context()
 	// out is this stream's outbound channel; the zone binds it to the character's
 	// player. The writer goroutine below is the ONLY caller of stream.Send.
@@ -145,7 +160,15 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// the Attach carries a handoff token (a cross-shard re-dial). It Stores itself into
 	// currentZone and then sends Attached. We pass &currentZone so the zone — and a
 	// later destination zone after an intra-shard move — can repoint the connection.
-	zone.post(attachMsg{character: character, token: token, out: out, curZone: &currentZone, resumeEpoch: resumeEpoch})
+	zone.post(attachMsg{
+		character:   character,
+		token:       token,
+		out:         out,
+		curZone:     &currentZone,
+		resumeEpoch: resumeEpoch,
+		loaded:      loaded,
+		loadedOK:    loadedOK,
+	})
 	s.log.Debug("player stream ready", "character", character, "zone", zone.id)
 
 	// Reader loop: translate client frames into zone inbox messages, posting each to

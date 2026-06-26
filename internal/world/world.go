@@ -75,8 +75,15 @@ type Shard struct {
 	dir   Locator          // directory for cross-shard routing; nil seals cross-shard exits
 	peers HandoffDialer    // dials peer shards' Handoff service
 
-	mu         sync.Mutex        // guards tokenIndex
-	tokenIndex map[string]*Zone  // handoff token -> hosting zone (populated by Prepare)
+	mu         sync.Mutex       // guards tokenIndex
+	tokenIndex map[string]*Zone // handoff token -> hosting zone (populated by Prepare)
+
+	// saver is the shard's async character writer (saver.go): one per shard, shared by every
+	// hosted zone, drained by a single background goroutine started in Run. It does all the
+	// off-zone-goroutine character I/O (Redis checkpoint + Postgres CAS). Always non-nil but
+	// DISABLED (a no-op) unless a store/checkpointer was configured — so a storeless shard
+	// keeps the pre-4.2 ephemeral behavior with zero extra goroutines or work.
+	saver *saver
 }
 
 // NewDemoShard builds a single-shard midgaard world with no directory wiring — its
@@ -148,7 +155,8 @@ func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr
 }
 
 // newBareShard allocates the Shard struct with its routing maps; callers then build and
-// adopt the hosted zones.
+// adopt the hosted zones. The saver starts DISABLED (nil store + checkpointer); WithPersistence
+// swaps in a configured one before any zone is adopted.
 func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 	return &Shard{
 		zones:      map[string]*Zone{},
@@ -157,13 +165,32 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		dir:        dir,
 		peers:      peers,
 		tokenIndex: map[string]*Zone{},
+		saver:      newSaver(nil, nil), // disabled until WithPersistence configures it
 	}
 }
 
-// adopt registers a built zone on the shard and wires its cross-shard handoff hook.
+// WithPersistence configures the shard's durable character ladder: the Postgres-backed store and
+// the optional Redis checkpointer. Either may be nil (a nil store = no durable record, a nil
+// checkpointer = no Redis tier; both nil = ephemeral, today's behavior). It MUST be called before
+// the shard's zones run (it is wired into the saver every zone shares via adopt). Returns the
+// shard for chaining. The production constructor (cmd/telos-world buildShard) calls this; tests
+// inject an in-memory store the same way.
+func (s *Shard) WithPersistence(store CharacterStore, ckpt Checkpointer) *Shard {
+	s.saver = newSaver(store, ckpt)
+	// Re-point every already-adopted zone at the new saver (adopt copies the pointer). Callers
+	// normally call this before adopting any zone, but re-pointing keeps the wiring order-free.
+	for _, z := range s.zones {
+		z.saver = s.saver
+	}
+	return s
+}
+
+// adopt registers a built zone on the shard and wires its cross-shard handoff hook + the shared
+// async saver.
 func (s *Shard) adopt(id string, z *Zone) {
 	z.shard = s
 	z.handoff = s.beginHandoff
+	z.saver = s.saver
 	s.zones[id] = z
 }
 
@@ -215,9 +242,12 @@ func (s *Shard) Zone() *Zone { return s.zones[s.home] }
 // ZoneByID returns the hosted zone with the given id, or nil.
 func (s *Shard) ZoneByID(id string) *Zone { return s.zones[id] }
 
-// Run starts every hosted zone's actor loop on its own goroutine and blocks until
-// ctx is cancelled. One goroutine per zone preserves single-writer.
+// Run starts every hosted zone's actor loop on its own goroutine and the shard's single async
+// saver drainer, then blocks until ctx is cancelled. One goroutine per zone preserves
+// single-writer; the saver drainer is the ONE place character I/O runs, never on a zone
+// goroutine. A disabled saver's run returns immediately (no goroutine cost for a storeless boot).
 func (s *Shard) Run(ctx context.Context) {
+	go s.saver.run(ctx) // off-zone-goroutine character writer (no-op if disabled)
 	var wg sync.WaitGroup
 	for _, z := range s.zones {
 		wg.Add(1)
@@ -227,6 +257,21 @@ func (s *Shard) Run(ctx context.Context) {
 		}(z)
 	}
 	wg.Wait()
+}
+
+// Drain enqueues an immediate durable flush of every live, persisted player on every hosted zone
+// — the shard-drain flush point (docs/PERSISTENCE.md §6, rolling redeploy). It posts a leaveMsg-
+// free flush request to each zone goroutine (so the dump stays single-writer) and returns at once;
+// the saver writes the snapshots off-goroutine. Phase 4 BUILDS this hook; the placement controller
+// that TRIGGERS a drain (graceful handoff of every player before shutdown) is Phase 10. A no-op on
+// a disabled (ephemeral) saver.
+func (s *Shard) Drain() {
+	if s.saver == nil || !s.saver.enabled() {
+		return
+	}
+	for _, z := range s.zones {
+		z.post(drainFlushMsg{})
+	}
 }
 
 // Register installs the gRPC Play and Handoff services on the given server. The Play

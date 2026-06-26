@@ -253,7 +253,7 @@ func TestFreezeExpireReapsHandedOff(t *testing.T) {
 	// start room. Drive attach directly with a fresh out channel.
 	var cz atomic.Pointer[Zone]
 	out2 := make(chan *playv1.ServerFrame, 16)
-	z.attach("Mover", "", out2, &cz, 0)
+	z.attach(attachMsg{character: "Mover", out: out2, curZone: &cz})
 	ns := z.players["Mover"]
 	if ns == nil {
 		t.Fatal("attach after reap should create a fresh live session")

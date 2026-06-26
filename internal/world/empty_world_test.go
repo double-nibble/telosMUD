@@ -51,7 +51,7 @@ func TestEmptyZoneJoinDoesNotRegisterPlayer(t *testing.T) {
 	s := &session{character: "Nobody", out: out, epoch: 1}
 	z.newPlayerEntity(s, "Nobody")
 
-	z.join(s) // must not panic
+	z.join(s, "") // must not panic
 
 	if z.players["Nobody"] != nil {
 		t.Fatal("empty-world join must not register a placeless player")
