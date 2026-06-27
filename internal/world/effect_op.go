@@ -78,12 +78,18 @@ type effectOp struct {
 
 	// Common argument fields (a flat bag — different ops read different fields, exactly like the
 	// reset op's Op/Proto/Room/Max). Decoded from the op map at parse time.
-	resource  string  // resource ref (heal/restore/modify_resource)
-	affect    string  // affect ref (apply_affect/remove_affect)
-	dmgType   string  // damage type ref (deal_damage)
-	amount    float64 // a flat amount (heal/damage/modify_resource delta)
-	diceNum   int     // dice count (deal_damage <N>d<S>)
-	diceSize  int     // dice size
+	resource string  // resource ref (heal/restore/modify_resource)
+	affect   string  // affect ref (apply_affect/remove_affect)
+	dmgType  string  // damage type ref (deal_damage)
+	amount   float64 // a flat amount (heal/damage/modify_resource delta)
+	diceNum  int     // dice count (deal_damage <N>d<S>)
+	diceSize int     // dice size
+	// bonus and diceCount are the [G-A] FORMULA-damage extension: a scoped formula over $actor/$target/
+	// $source attributes added to deal_damage's raw amount (a weapon's `+ $actor.damroll + str_bonus`),
+	// and an optional scoped formula for the DICE COUNT (a level-scaled rider like `ceil(level/2)d6`).
+	// nil => not used (the flat amount + literal NdS path). Evaluated via the check scoping (check.go).
+	bonus     formulaNode
+	diceCount formulaNode
 	duration  int     // affect duration override (apply_affect)
 	magnitude float64 // affect magnitude override (apply_affect)
 	prob      float64 // probability (chance)

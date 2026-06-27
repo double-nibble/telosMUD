@@ -42,8 +42,20 @@ func opDealDamage(c *effectCtx, op *effectOp) error {
 		return fmt.Errorf("deal_damage: no target")
 	}
 	raw := op.amount
-	if op.diceNum > 0 && op.diceSize > 0 {
-		raw += float64(rollDice(c, op.diceNum, op.diceSize))
+	// Dice: a content-formula dice COUNT ([G-A], a level-scaled rider) overrides the literal diceNum;
+	// rollDice defensively caps the count at maxDice so a runaway formula can't spin the zone goroutine.
+	num := op.diceNum
+	if op.diceCount != nil {
+		num = int(evalCheckFormula(c, op.diceCount, c.actor))
+	}
+	if num > 0 && op.diceSize > 0 {
+		raw += float64(rollDice(c, num, op.diceSize))
+	}
+	// [G-A] scoped attribute bonus: `+ $actor.damroll + str_bonus` etc., over the actor/target/source
+	// attributes (default scope = the actor dealing the damage). This is what lets a sword add STR, a
+	// crit scale, and a combo-finisher read combo_points — all as CONTENT, not Lua.
+	if op.bonus != nil {
+		raw += evalCheckFormula(c, op.bonus, c.actor)
 	}
 	if c.mag > 0 {
 		raw *= c.mag

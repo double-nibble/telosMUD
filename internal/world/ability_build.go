@@ -161,6 +161,25 @@ func parseOp(v any) (effectOp, error) {
 		op.diceNum = int(mapFloat(m, "dice_num"))
 		op.diceSize = int(mapFloat(m, "dice_size"))
 	}
+	// [G-A] formula-damage: a scoped attribute `bonus` formula added to deal_damage's amount, and an
+	// optional `dice_count` formula (a level-scaled dice count, paired with dice_size). Both parse via
+	// the same prefix-AST evaluator as check formulas; nil when absent (the flat amount + literal dice
+	// path is unchanged). `bonus` here is the OP's top-level bonus (a check's own bonus lives under its
+	// nested `check` object, so there is no collision).
+	if b, present := m["bonus"]; present {
+		node, err := parseFormula(b)
+		if err != nil {
+			return effectOp{}, fmt.Errorf("bonus: %w", err)
+		}
+		op.bonus = node
+	}
+	if dc, present := m["dice_count"]; present {
+		node, err := parseFormula(dc)
+		if err != nil {
+			return effectOp{}, fmt.Errorf("dice_count: %w", err)
+		}
+		op.diceCount = node
+	}
 	// Nested branches for flow ops.
 	if t, present := m["then"]; present {
 		sub, err := parseOpList(t)
