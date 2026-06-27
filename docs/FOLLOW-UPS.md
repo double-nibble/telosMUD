@@ -49,11 +49,35 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
   `mag = victim max-hp` is builder-influenceable; `death.go:194` the corpse is an
   UNOWNED free-for-all (no loot ownership). Both are intentional minimal-slice
   behavior to revisit with the progression/loot ruleset. · *progression/security*
+- **Retire the redundant resume-seq wire fields (`Play` protocol)** —
+  `api/proto/telosmud/play/v1/play.proto:34` (`Attach.input_seq`) and `:143`
+  (`Redirect.resume_input_seq`). Both carry a resume point that the *receiving* side
+  already derives authoritatively and ignores on the wire: the world ignores
+  `Attach.input_seq` (it dedups by its own `appliedSeq`, seeded from the handoff
+  snapshot), and the gate ignores `Redirect.resume_input_seq` (it replays from the
+  destination's `ServerFrame.ack_input_seq` on the `Attached` frame — see
+  `internal/gate/gate.go` `runStream`/`doReplay`). The Go-side dead `resumeSeq` param is
+  already gone (§3); what remains is the *protocol-level* cleanup.
+
+  **Deferred deliberately — this touches the gate↔world contract** (`play.proto`,
+  PROTOCOL.md §1, the handoff path) and is a coordinated wire change, not a local edit.
+  Options when next touched: (a) **delete both fields** and lean entirely on the
+  receiver-authoritative `ack_input_seq` (simplest; the cleaner end state), or (b) **keep
+  them but reclassify as diagnostics-only** in the proto comments (a cheap sanity/observability
+  signal — source's *claimed* resume point vs. what the destination actually acked).
+  Recommend (a) unless we find a use for the cross-check. Do this in an end-of-roadmap
+  protocol sweep or whenever `play.proto` is next revised. · *edge/distsys*
 
 ## 3. Possible latent bugs (also surfaced as chips)
 
-- **`gate.go:256` `resumeSeq` accepted but never read** — possible session-resume /
-  reconnect frame-replay not plumbed. Investigate + plumb or drop. · *gate* · chip `task_44fcce5f`
+- ~~**`gate.go:256` `resumeSeq` accepted but never read** — possible session-resume /
+  reconnect frame-replay not plumbed. Investigate + plumb or drop.~~ · *gate* · chip
+  `task_44fcce5f` — **RESOLVED:** investigated; resume IS wired end to end, just not via
+  this param. The destination shard is authoritative — it reports its applied high-water
+  mark on the `Attached` frame's `ack_input_seq`, which drives `doReplay`. The redirect's
+  `resume_input_seq` was a redundant source-side estimate. Dropped the dead `runStream`
+  param + its nolint (kept `redirectTarget.resumeSeq` for the diagnostic log). The
+  remaining *wire-level* redundancy is now tracked in §2 below.
 - **`combat_test.go:448` empty `if z.move(...)`** — a combat test that may not assert
   the move outcome it intends. Make it assert. · *combat* · chip `task_0db5e6e9`
 

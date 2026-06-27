@@ -202,9 +202,12 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 	}()
 
 	// Outer re-dial loop. Each iteration binds the session to one shard (initial
-	// Attach has no token; a re-dial carries the redirect's token + resume seq) and
-	// runs the bridge until that stream ends. A bridge that ends in a Redirect hands
-	// back the next target; otherwise we tear the connection down.
+	// Attach has no token; a re-dial carries the redirect's handoff token) and runs the
+	// bridge until that stream ends. A bridge that ends in a Redirect hands back the
+	// next target; otherwise we tear the connection down. The resume point is NOT
+	// threaded from the redirect: the destination shard is authoritative and reports how
+	// far it has applied on its Attached frame (ack_input_seq), which drives replay (see
+	// runStream / doReplay).
 	conn := &connState{
 		log:   log,
 		tc:    tc,
@@ -214,14 +217,15 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 		lines: lines,
 	}
 	var token string
-	var resumeSeq uint64
 	for {
-		next, ok := s.runStream(ctx, conn, addr, token, resumeSeq)
+		next, ok := s.runStream(ctx, conn, addr, token)
 		if !ok {
 			return // bridge ended without a redirect: socket/world closed.
 		}
+		// next.resumeSeq is the SOURCE's claimed resume point — logged for diagnostics
+		// only; the actual replay keys off the DESTINATION's ack (runStream / doReplay).
 		log.Debug("redirect received", "target", next.addr, "resume_seq", next.resumeSeq)
-		addr, token, resumeSeq = next.addr, next.token, next.resumeSeq
+		addr, token = next.addr, next.token
 	}
 }
 
@@ -239,7 +243,9 @@ type connState struct {
 }
 
 // redirectTarget is what a finished bridge reports when the world asked the gate to
-// migrate: where to dial, the token to present, and the seq to resume replay from.
+// migrate: where to dial and the token to present. resumeSeq is the SOURCE shard's
+// claimed resume point, carried for diagnostics only — the actual replay keys off the
+// DESTINATION's ack_input_seq on its first (Attached) frame (see runStream / doReplay).
 type redirectTarget struct {
 	addr      string
 	token     string
@@ -247,13 +253,19 @@ type redirectTarget struct {
 }
 
 // runStream binds the session to the shard at addr and runs the bridge over a single
-// Play stream. token/resumeSeq are empty/zero on the first attach and carry the
-// redirect's handoff token + resume point on a re-dial.
+// Play stream. token is empty on the first attach and carries the redirect's handoff
+// token on a re-dial.
+//
+// The resume point is deliberately NOT a parameter: on a re-dial the destination shard
+// is authoritative about how much input it has applied and reports it on its first
+// (Attached) frame as ServerFrame.ack_input_seq, which the writer feeds to doReplay. The
+// redirect's resume_input_seq (a source-side estimate) is therefore carried for
+// diagnostics only, never to drive replay.
 //
 // It returns (target, true) when the stream ended in a Redirect — the caller re-dials
 // target. It returns (_, false) when the bridge ended for any other reason (socket
 // EOF, world disconnect, dial/attach failure): the caller tears the connection down.
-func (s *Server) runStream(ctx context.Context, c *connState, addr, token string, resumeSeq uint64) (redirectTarget, bool) { //nolint:revive // TODO(gate-engineer): resumeSeq param is accepted but unused — confirm resume is wired or drop it
+func (s *Server) runStream(ctx context.Context, c *connState, addr, token string) (redirectTarget, bool) {
 	log := c.log.With("addr", addr)
 
 	cli, err := s.pool.client(addr)
