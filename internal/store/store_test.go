@@ -24,6 +24,19 @@ func normalizeContent(zones []content.ZoneDTO) []content.ZoneDTO {
 		z := &out[zi]
 		z.Rooms = append([]content.RoomDTO(nil), z.Rooms...)
 		sort.Slice(z.Rooms, func(i, j int) bool { return z.Rooms[i].Ref < z.Rooms[j].Ref })
+		for ri := range z.Rooms {
+			// Canonicalize an unflagged room's Flags to nil. The two loaders represent
+			// "no flags" DIFFERENTLY but EQUIVALENTLY: the YAML loader leaves Flags nil,
+			// while the DB loader COALESCEs a missing flags key to '[]'::jsonb and
+			// unmarshals it into a non-nil []string{}. reflect.DeepEqual treats nil and
+			// []string{} as unequal, so without this the parity check fails on a Go
+			// nil-vs-empty distinction that is not a content difference. Collapsing both
+			// to nil keeps the guard catching REAL content drift (a flag that exists in
+			// one path and not the other) while ignoring the empty-slice representation.
+			if len(z.Rooms[ri].Flags) == 0 {
+				z.Rooms[ri].Flags = nil
+			}
+		}
 		z.Items = append([]content.ProtoDTO(nil), z.Items...)
 		sort.Slice(z.Items, func(i, j int) bool { return z.Items[i].Ref < z.Items[j].Ref })
 		z.Mobs = append([]content.ProtoDTO(nil), z.Mobs...)

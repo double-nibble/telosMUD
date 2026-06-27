@@ -20,6 +20,8 @@ jobs:
           go-version: "1.25"
           cache: true
       - run: go vet ./...
+      # gofmt is not enforced by `go vet`; a dirty file slipped in unnoticed before this check.
+      - run: test -z "$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
       - run: go build ./...
       - run: go test ./... -race
 
@@ -32,3 +34,50 @@ jobs:
           lint: true
           format: true
           push: false
+
+  # Gated Postgres integration tests (internal/store/*_test.go). The hermetic `go`
+  # job above SKIPs these (they t.Skip unless TELOS_TEST_DSN is set), so they were
+  # the layer that let the seed/deletePack idempotency bug ship. This job stands up
+  # a real Postgres and exports TELOS_TEST_DSN so they actually RUN, including
+  # TestImportPackIdempotent (the seed-regression: import the demo pack twice).
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: telos
+          POSTGRES_PASSWORD: telos
+          POSTGRES_DB: telosmud
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U telos -d telosmud"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TELOS_TEST_DSN: postgres://telos:telos@localhost:5432/telosmud?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.71.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: buf generate
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      # The test migrates the schema itself (db.Migrate) before each gated test.
+      - run: go test -count=1 ./internal/store/... -run 'TestStorePackRoundTrip|TestImportPackIdempotent|TestCharacterCRUD' -v
+
+  # Whole-stack smoke: the cheapest catch for the seed-class bug. Brings the docker
+  # compose stack up TWICE against the same Postgres volume (the populated-volume
+  # re-seed that originally collided), asserts every service is healthy, the seed
+  # one-shot exits 0, and a telnet client can connect and `look`.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make smoke-twice

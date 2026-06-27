@@ -23,9 +23,9 @@ type session struct {
 	id string
 
 	mu      sync.Mutex
-	nextSeq uint64        // seq to assign to the NEXT line (1-based)
-	buf     []bufferedIn  // un-acked input, ascending by seq
-	frozen  bool          // true while a redirect is in flight: live input queues, is not "live"
+	nextSeq uint64       // seq to assign to the NEXT line (1-based)
+	buf     []bufferedIn // un-acked input, ascending by seq
+	frozen  bool         // true while a redirect is in flight: live input queues, is not "live"
 }
 
 // bufferedIn is one un-acked input line held for possible replay.
