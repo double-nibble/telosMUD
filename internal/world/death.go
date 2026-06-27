@@ -273,10 +273,11 @@ func addThreat(victim, attacker *Entity, amount float64) {
 	if victim == nil || victim.living == nil || attacker == nil || amount <= 0 {
 		return
 	}
-	if victim.living.threat == nil {
-		victim.living.threat = map[*Entity]float64{}
+	l := mutableLiving(victim) // COW: fork a proto-aliased mob's Living before mutating its threat table (else threat keys leak to the proto + siblings)
+	if l.threat == nil {
+		l.threat = map[*Entity]float64{}
 	}
-	victim.living.threat[attacker] += amount
+	l.threat[attacker] += amount
 }
 
 // scrubThreat removes `dead` from EVERY other combatant's threat table in its room, AND clears the
@@ -293,7 +294,11 @@ func (z *Zone) scrubThreat(dead *Entity) {
 			}
 		}
 	}
-	if dead.living != nil {
+	// Clear the dead entity's own table only if it actually has one. A proto-aliased mob that never
+	// accrued threat aliases the prototype's (nil) threat map; skipping the write avoids forking its
+	// Living just to set nil->nil (and avoids a write-through to the shared proto). A mob that DID accrue
+	// threat already COW'd its Living in addThreat, so this clears the instance-owned table.
+	if dead.living != nil && dead.living.threat != nil {
 		dead.living.threat = nil
 	}
 }
@@ -353,7 +358,7 @@ func (z *Zone) retargetMob(mob *Entity) {
 		z.stopFight(mob)
 		return
 	}
-	mob.living.fighting = next
+	mutableLiving(mob).fighting = next // COW: fork a proto-aliased mob's Living before re-pointing its fighting target
 	setPosition(mob, posFighting)
 }
 

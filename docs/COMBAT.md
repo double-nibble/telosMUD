@@ -35,7 +35,11 @@ For each swing `attacker -> defender`:
    - **Parry** (requires a wielded weapon; skill)
    - **Block** (requires a shield; skill)
    Each is an independent gated chance; success ⇒ swing ends (avoided), emits its own message.
-4. **Damage roll** — weapon dice + `damroll` + STR/skill/enchant bonuses; crit check.
+4. **Damage roll** — weapon dice + `damroll` + STR/skill/enchant bonuses; crit check. With no
+   wielded weapon and no natural-weapon component the swing uses an **unarmed fallback**: the
+   content `unarmed_dice_num`/`unarmed_dice_size` attributes (a monk/brass-knuckles affect raises
+   them through the normal mod-stack), with a small engine default (1d3) when a pack defines
+   neither — so a bare-handed creature always does real damage (never a bonus-only ~0 swing).
 5. **Soak / mitigation** — armor reduces by **damage type** (slash / pierce / bludgeon /
    magic / ...) as a blend of flat reduction and % resist; then resist / vuln / immune
    multipliers from affects and race.
@@ -47,6 +51,18 @@ For each swing `attacker -> defender`:
 The ordering matters: **to-hit first (did it land), then active avoidances (was it negated),
 then soak (how much got through).** This produces a readable combat log and distinct GMCP
 events per stage.
+
+**Regen pauses in combat.** Passive resource regen (hp/mana ticking toward max) is suspended
+for a *fighting* entity by default — the classic "no rest mid-fight" rule — so a mob's hp regen
+cannot claw back a player's per-round damage and stall the fight. A resource opts back in with
+`regen_in_combat: true` (a troll's regeneration, WoW energy/focus, a per-round ki/mana pool meant
+to tick through a fight). The per-entity regen tick stays alive, so regen resumes the instant combat
+ends. The INVARIANT that makes this safe: passive `regen` is *ambient* recovery only — anything that
+should change a resource *because of* combat (a rage/combo/energy builder) is an event-driven op
+(`OnHit`/`OnTurn` → `modify_resource`), not `regen`, so the combat pause never touches it. Footgun:
+`regen_in_combat` is a property of the resource DEF, so don't model one creature's regeneration by
+flipping the shared `hp` def's flag (that makes EVERY creature regen in combat) — use a separate
+Regeneration affect/ability or a distinct fast-heal resource.
 
 ## 4. Stats that feed it
 

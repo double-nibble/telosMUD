@@ -241,3 +241,22 @@ func mutableComponent[T Component](e *Entity) T {
 // mutated, copying-on-write off the prototype the first time. Equivalent to
 // mutableComponent[*Room](e) but named for the common movement/builder call site.
 func mutableRoom(e *Entity) *Room { return mutableComponent[*Room](e) }
+
+// mutableLiving is the COW choke-point for the Living component — the SINGLE helper EVERY
+// Living mutator must call before writing any Living field (position, resCur, flags, attrBase,
+// fighting, cooldowns, threat, modSrcs, …). A prototype-backed mob spawns aliasing its
+// prototype's *Living, so writing `e.living.X` directly would corrupt the shared template and
+// every sibling/repop (the COW write-through bug). Routing through mutableComponent forks the
+// instance's own *Living the FIRST time it is mutated (and re-promotes the e.living hot pointer),
+// so the write lands on this instance only; a player (prototype==nil) and an already-COW'd mob
+// fall through unchanged (a cheap pointer-identity check).
+//
+// Returns the instance-owned *Living, OR nil for an entity with no Living (every mutator already
+// no-ops a Living-less entity, so the callers stay `if e.living == nil { return }` then write the
+// returned pointer). Single-writer: zone goroutine.
+func mutableLiving(e *Entity) *Living {
+	if e == nil || e.living == nil {
+		return nil
+	}
+	return mutableComponent[*Living](e)
+}

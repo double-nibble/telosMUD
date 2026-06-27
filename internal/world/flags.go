@@ -24,19 +24,20 @@ func hasFlag(e *Entity, name string) bool {
 // setFlag sets (on=true) or clears (on=false) a named flag on entity e. The "pvp" consent flag is set
 // this way (a consent command / chargen, later). Single-writer: zone goroutine. A no-op without Living.
 func setFlag(e *Entity, name string, on bool) {
-	if e == nil || e.living == nil {
+	l := mutableLiving(e) // COW: fork a proto-aliased mob's Living before mutating its flags map (else a tag leaks to the proto + siblings)
+	if l == nil {
 		return
 	}
 	if !on {
-		if e.living.flags != nil {
-			delete(e.living.flags, name)
+		if l.flags != nil {
+			delete(l.flags, name)
 		}
 		return
 	}
-	if e.living.flags == nil {
-		e.living.flags = map[string]bool{}
+	if l.flags == nil {
+		l.flags = map[string]bool{}
 	}
-	e.living.flags[name] = true
+	l.flags[name] = true
 }
 
 // roomFlag reports whether a ROOM entity carries the named room flag. The room's flags live on its

@@ -339,6 +339,7 @@ type attrBody struct {
 
 type resourceBody struct {
 	Regen             int            `json:"regen,omitempty"`
+	RegenInCombat     bool           `json:"regen_in_combat,omitempty"` // keep regenerating while fighting (default false)
 	DepletedThreshold int            `json:"depleted_threshold,omitempty"`
 	OnEvent           map[string]any `json:"on_event,omitempty"`    // [G3] event subscriptions (6.2)
 	OnDepleted        []any          `json:"on_depleted,omitempty"` // [G-D] death hook (6.3b)
@@ -434,6 +435,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				return fmt.Errorf("store: resource_def %s body: %w", r.Ref, err)
 			}
 			r.Regen, r.DepletedThreshold = b.Regen, b.DepletedThreshold
+			r.RegenInCombat = b.RegenInCombat
 			r.OnEvent, r.OnDepleted = b.OnEvent, b.OnDepleted
 			r.PerRound = b.PerRound
 		}

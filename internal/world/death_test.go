@@ -190,6 +190,78 @@ func TestKillGoblinThroughDemoPipelineDropsLootableCorpse(t *testing.T) {
 	}
 }
 
+// TestFreshUnarmedPlayerKillsHollowGoblin is the STARTER-COMBAT acceptance gate: a FRESH player (demo
+// default stats, NO equipped weapon, NO stat boosts) must be able to punch the hollow goblin to death in
+// a reasonable number of rounds without dying. This is the realistic melee the e2e death sequence drives
+// (`kill goblin`). It guards the three starter-combat fixes together: (1) the unarmed swing now does real
+// damage (unarmed_dice_* content + the engine fallback), (2) the goblin is retuned to a low-hp starter,
+// (3) the engine pauses the goblin's hp regen mid-fight so it no longer claws back the player's damage.
+// Before these, a bare-handed `kill goblin` ran for minutes and never resolved.
+func TestFreshUnarmedPlayerKillsHollowGoblin(t *testing.T) {
+	z := newDemoZone("darkwood", newProtoCache())
+	z.testCombatRng = rand.New(rand.NewSource(7))
+
+	hollow := z.rooms["darkwood:room:hollow"]
+	s := &session{character: "Hero", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(s, "Hero") // a FRESH player: demo defaults (str 10), no weapon, no boosts
+	Move(s.entity, hollow)
+	z.players["Hero"] = s
+
+	// Sanity: the player is genuinely unarmed (no wielded weapon, no natural Weapon component) and at
+	// default strength — so this proves the UNARMED fallback, not a buffed swing.
+	if wieldedWeapon(s.entity) != nil {
+		t.Fatal("fresh player is not unarmed (test would not exercise the unarmed swing)")
+	}
+	if got := attr(s.entity, "strength"); got != 10 {
+		t.Fatalf("fresh player strength = %v, want the demo default 10", got)
+	}
+
+	var goblin *Entity
+	for _, e := range hollow.contents {
+		if e.proto == "darkwood:mob:goblin" {
+			goblin = e
+		}
+	}
+	if goblin == nil {
+		t.Fatal("the reset did not spawn the hollow goblin")
+	}
+	startHP := resourceCurrent(goblin, "hp")
+	t.Logf("hollow goblin starting hp = %d", startHP)
+
+	ctx := &Context{z: z, s: s, Actor: s.entity, arg: "goblin"}
+	if err := cmdKill(ctx); err != nil {
+		t.Fatalf("cmdKill: %v", err)
+	}
+
+	// Run rounds until the goblin dies. The bound is the "reasonable number of rounds" contract: a fresh
+	// unarmed player should fell the starter goblin well within it (measured median ~6 rounds, worst-case
+	// ~13 over 60 seeds; 20 leaves headroom against an unlucky to-hit streak without going flaky). If the
+	// fight does not resolve here the starter tuning regressed — regen clawback, over-tuned hp, or ~0
+	// unarmed damage all manifest as a fight that never ends.
+	const maxRounds = 20
+	rounds := 0
+	died := false
+	for ; rounds < maxRounds && !died; rounds++ {
+		for i := uint64(0); i < PULSE_VIOLENCE; i++ {
+			z.pulses.tick()
+		}
+		for _, e := range hollow.contents {
+			if _, ok := Get[*Container](e); ok {
+				died = true
+			}
+		}
+	}
+	if !died {
+		t.Fatalf("fresh unarmed player did NOT kill the hollow goblin within %d rounds "+
+			"(goblin start hp %d) — starter combat is unplayable", maxRounds, startHP)
+	}
+	// The player survived (it is no longer fighting because its target died, and it is not dead itself).
+	if !canAct(s.entity) {
+		t.Fatal("the player died winning the fight — the starter goblin is too dangerous")
+	}
+	t.Logf("fresh unarmed player killed the hollow goblin in %d round(s)", rounds)
+}
+
 // TestLookCorpseShowsContents proves `look corpse` reveals the loot before looting.
 func TestLookCorpseShowsContents(t *testing.T) {
 	z, s := combatZone(t)

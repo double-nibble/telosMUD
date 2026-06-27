@@ -115,10 +115,13 @@ func TestRepopReplacesTakenItem(t *testing.T) {
 // proving reset_secs -> pulse wiring tops up on a tick — deterministically, by ticking the
 // scheduler directly rather than waiting on a real timer.
 func TestRepopPulseTick(t *testing.T) {
+	// The demo midgaard zone now authors reset_secs (so the world repops), which means build() ALREADY
+	// registered its repop callback at the demo cadence — startRepop is idempotent, so the zone drives
+	// its OWN cadence (a second startRepop is a no-op). This test proves the reset_secs -> pulse wiring
+	// by depleting the floor and ticking the demo zone's REAL stride, asserting the repop tops it back up.
 	z := NewDemoShard().Zone()
-	op := torchReset(5)
-	// Register a repop cadence of 1 second (stride = pulsesPerSecond ticks).
-	z.startRepop([]content.ResetDTO{op}, 1)
+	const demoResetSecs = 90 // matches packs/demo.yaml midgaard reset_secs
+	stride := uint64(demoResetSecs) * pulsesPerSecond
 
 	// Deplete the floor.
 	market := z.rooms["midgaard:room:market"]
@@ -131,9 +134,9 @@ func TestRepopPulseTick(t *testing.T) {
 		t.Fatalf("after clearing: %d torches, want 0", got)
 	}
 
-	// Tick the scheduler stride times to fire the repop callback once (single-writer: the
+	// Tick the scheduler one full stride to fire the repop callback once (single-writer: the
 	// callback runs inline in tick, exactly as Zone.Run would call it).
-	for i := uint64(0); i < pulsesPerSecond; i++ {
+	for i := uint64(0); i < stride; i++ {
 		z.pulses.tick()
 	}
 	if got := marketTorches(z); got != 5 {

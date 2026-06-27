@@ -35,10 +35,11 @@ func position(e *Entity) Position {
 // setPosition writes the entity's Position. Single-writer: zone goroutine. A no-op on a Living-less
 // entity (an item has no position).
 func setPosition(e *Entity, p Position) {
-	if e == nil || e.living == nil {
+	l := mutableLiving(e) // COW: fork a proto-aliased mob's Living before writing (else death corrupts the proto)
+	if l == nil {
 		return
 	}
-	e.living.position = int(p)
+	l.position = int(p)
 }
 
 // canAct reports whether the entity's position allows it to INITIATE an action (attack, cast). Dead/

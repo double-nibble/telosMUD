@@ -216,6 +216,7 @@ type resourceDef struct {
 	maxAttr           string // derived-attr ref capping the pool; "" => no cap (unbounded)
 	vital             bool   // depletion drives death (on_depleted) — wired in 5.2/combat
 	regen             int    // per-tick flat regen (reserved; regen ticks ride 5.2)
+	regenInCombat     bool   // keep regenerating while the owner is fighting (default false: pause in combat)
 	depletedThreshold int    // reserved (vital depletion threshold)
 	// perRound marks a per-round REACTION budget ([G9], combat.go topUpReactions): a resource topped up to
 	// its derived max at the start of EVERY combat round, so a reactor gets a bounded number of reactions

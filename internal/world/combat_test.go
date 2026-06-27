@@ -141,6 +141,43 @@ func TestSwingHitFormulaDamageWithSoak(t *testing.T) {
 	}
 }
 
+// TestBuildSwingDamageOpUnarmed proves the UNARMED fallback (the starter-combat key fix). With no
+// wielded weapon and no natural Weapon component, buildSwingDamageOp must produce REAL dice — never the
+// bonus-only (~0) swing that left a fresh player unable to punch anything to death. Three cases:
+//   - engine default: content defines no unarmed_dice_* -> the engine substitutes its 1d3 fallback.
+//   - content override: unarmed_dice_num/size attributes drive the dice (the demo's 1d6 punch).
+//   - weapon precedence: a wielded weapon still wins over the unarmed fallback.
+func TestBuildSwingDamageOpUnarmed(t *testing.T) {
+	z, s := combatZone(t) // combatZone registers NO unarmed_dice_* attrs -> they resolve to 0
+
+	// 1) Engine default fallback: no content unarmed dice -> 1d3 (defaultUnarmedDiceNum/Size).
+	op := buildSwingDamageOp(s.entity)
+	if op.diceNum != defaultUnarmedDiceNum || op.diceSize != defaultUnarmedDiceSize {
+		t.Fatalf("unarmed default dice = %dd%d, want %dd%d (engine fallback)",
+			op.diceNum, op.diceSize, defaultUnarmedDiceNum, defaultUnarmedDiceSize)
+	}
+	if op.diceNum < 1 || op.diceSize < 1 {
+		t.Fatal("unarmed swing produced no dice (the ~0 bonus-only regression)")
+	}
+
+	// 2) Content override: register unarmed_dice_* attrs (the demo's 1d6 punch) -> they drive the dice.
+	z.defs.attr.register("unarmed_dice_num", &attributeDef{ref: "unarmed_dice_num", base: litNode{v: 1}})
+	z.defs.attr.register("unarmed_dice_size", &attributeDef{ref: "unarmed_dice_size", base: litNode{v: 6}})
+	setAttrBase(s.entity, "unarmed_dice_num", 1) // dirty the cache so the new defs resolve
+	op = buildSwingDamageOp(s.entity)
+	if op.diceNum != 1 || op.diceSize != 6 {
+		t.Fatalf("content-overridden unarmed dice = %dd%d, want 1d6", op.diceNum, op.diceSize)
+	}
+
+	// 3) Weapon precedence: a wielded weapon overrides the unarmed fallback entirely.
+	equipWeapon(s.entity, &Weapon{diceNum: 2, diceSize: 8, damageType: "slash"})
+	op = buildSwingDamageOp(s.entity)
+	if op.diceNum != 2 || op.diceSize != 8 || op.dmgType != "slash" {
+		t.Fatalf("wielded weapon dice = %dd%d %q, want 2d8 slash (weapon wins over unarmed)",
+			op.diceNum, op.diceSize, op.dmgType)
+	}
+}
+
 // TestSwingMiss proves a to-hit "miss" band ends the swing with no damage + a miss message.
 func TestSwingMiss(t *testing.T) {
 	z, s := combatZone(t)

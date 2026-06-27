@@ -90,6 +90,13 @@ type ResourceDTO struct {
 	Vital             bool   `json:"vital" yaml:"vital"`
 	Regen             int    `json:"regen" yaml:"regen"`                           // per-tick flat regen (reserved; ticks ride 5.2)
 	DepletedThreshold int    `json:"depleted_threshold" yaml:"depleted_threshold"` // reserved (vital depletion, 5.2)
+	// RegenInCombat lets a resource keep regenerating while its owner is FIGHTING. Default false: the
+	// engine PAUSES passive regen for an entity in combat (the classic Diku "no rest mid-fight" rule), so
+	// a mob's hp regen does not claw back a fresh player's swings round after round. A pack that wants
+	// regen-during-combat (a troll's regeneration, a mana pool that ticks in a fight) sets this true. The
+	// engine names no resource — this is the per-resource flag content authors choose; the mechanism
+	// (pause-while-fighting) is the engine default.
+	RegenInCombat bool `json:"regen_in_combat" yaml:"regen_in_combat"`
 	// PerRound marks a per-round REACTION budget ([G9], Phase 6.4b): the resource is topped up to its max
 	// at the start of every combat round, so a reactor (e.g. a mob with an OnLeaveRoom opportunity attack)
 	// gets a bounded number of reactions/round and a spent reaction does not refill until the next round.

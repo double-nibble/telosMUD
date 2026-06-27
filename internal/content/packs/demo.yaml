@@ -49,6 +49,13 @@ attributes:
   - {ref: damroll,   display_name: Damage Roll, value_kind: int, default_base: {lit: 0}}
   - {ref: attacks,   display_name: Attacks per Round, value_kind: int, default_base: {lit: 1}, min: 1}
   - {ref: crit_mult, display_name: Critical Multiplier, value_kind: float, default_base: {lit: 2}}
+  # unarmed_dice_num / unarmed_dice_size: the dice an entity's BARE-HANDED swing rolls when it wields no
+  # weapon and carries no natural Weapon component (buildSwingDamageOp). A fresh, unarmed player would
+  # otherwise deal bonus-only damage (~0 at STR 10); these give it a real 1d6 punch. CONTENT-OVERRIDABLE
+  # via the normal mod-stack — a monk class / brass-knuckles affect raises them, NO engine predicate. The
+  # engine substitutes a tiny default (1d3) only when a pack defines neither, so a bare pack still hits.
+  - {ref: unarmed_dice_num,  display_name: Unarmed Dice Count, value_kind: int, default_base: {lit: 1}, min: 1}
+  - {ref: unarmed_dice_size, display_name: Unarmed Dice Size,  value_kind: int, default_base: {lit: 6}, min: 1}
   # strength_bonus = (strength - 10) / 2  (5e-ish ability mod; the [G-A] damage bonus reads it). floor
   # via the int value_kind truncation in the formula evaluator's consumers; the swing adds it to damage.
   - ref: strength_bonus
@@ -321,6 +328,10 @@ zones:
   - ref: midgaard
     name: The City of Midgaard
     start_room: midgaard:room:temple
+    # Repop cadence (seconds): the zone's reset script re-runs on this stride (reset.go startRepop), so a
+    # picked-up longsword / spent torches respawn. 90s is a sane starter pace — long enough not to dupe
+    # under a player's feet, short enough that the world recovers between visits.
+    reset_secs: 90
     rooms:
       - ref: midgaard:room:temple
         name: The Temple Square
@@ -372,6 +383,9 @@ zones:
   - ref: darkwood
     name: The Darkwood
     start_room: darkwood:room:grove
+    # Repop cadence (seconds): a killed goblin / goblin-chief and their loot respawn on this stride so the
+    # zone stays playable after a kill (reset.go startRepop re-runs the reset script). 90s starter pace.
+    reset_secs: 90
     rooms:
       - ref: darkwood:room:grove
         name: A Moonlit Grove
@@ -414,19 +428,23 @@ zones:
         living:
           combat_profile: melee
           attributes:
-            # A modest fighter: 14 STR (str_bonus +2), tough enough to survive a few rounds, low evasion
-            # so a player reliably connects, a little dodge, a little slash soak (hide), 1 attack/round.
-            strength: 14
-            constitution: 8        # max_hp = 8*10 + 1*5 = 85
+            # A STARTER mob (the hollow goblin): tuned so a FRESH, unarmed player kills it in ~4-8 rounds
+            # without dying. Low hp (constitution 1 => max_hp 15), no soak, low evasion/dodge so a bare-
+            # handed 1d4 punch reliably connects. The goblin still hits back (str 12, 1d6 natural weapon)
+            # so the death path is exercised, but it is not the over-tuned slog the lair chief is. With the
+            # engine's no-regen-in-combat default (resource regen_in_combat false), its hp no longer claws
+            # back the player's per-round damage mid-fight.
+            strength: 12           # str_bonus +1 on its bite-back
+            constitution: 1        # max_hp = 1*10 + 1*5 = 15
             level: 1
             accuracy: 2
-            damroll: 1
+            damroll: 0
             attacks: 1
-            evasion: 8             # a d20 attack hits on margin>=0 most of the time
-            dodge: 10             # ~10% dodge chance on the 1d100 roll-under
+            evasion: 6             # low -> a fresh player's d20 attack lands almost every round
+            dodge: 5              # ~5% dodge on the 1d100 roll-under (a rare whiff, not a slog)
             parry: 0              # no parry skill -> roll-under-0 auto-fails ([G-C], gear-gated by 0)
             block: 0              # no shield -> block auto-fails
-            soak_slash: 1         # 1 flat slash soak (its hide)
+            soak_slash: 0         # a STARTER mob: no soak (the longsword/knife bite full damage)
       # An AGGRESSIVE goblin (Phase 6.3b): `aggressive: 1` is a CONTENT number the engine reads to make
       # the mob initiate combat on a player entering its room (death.go aggroOnEntry) — no engine flag.
       - ref: darkwood:mob:goblin-chief

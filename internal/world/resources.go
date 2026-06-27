@@ -50,11 +50,12 @@ func resourceCurrent(e *Entity, name string) int {
 // is the floor truth; resourceCurrent re-clamps on read against the live max for the lower-max
 // case). Single-writer: zone goroutine. A no-op on an entity with no Living.
 func setResourceCurrent(e *Entity, name string, v int) {
-	if e == nil || e.living == nil {
+	l := mutableLiving(e) // COW: fork a proto-aliased mob's Living before mutating its resCur map (else combat damage writes the proto's hp)
+	if l == nil {
 		return
 	}
-	if e.living.resCur == nil {
-		e.living.resCur = map[string]int{}
+	if l.resCur == nil {
+		l.resCur = map[string]int{}
 	}
 	maxV := resourceMax(e, name)
 	if v < 0 {
@@ -63,7 +64,7 @@ func setResourceCurrent(e *Entity, name string, v int) {
 	if maxV > 0 && v > maxV {
 		v = maxV
 	}
-	e.living.resCur[name] = v
+	l.resCur[name] = v
 	// If this drops a regen-able pool below its max, make sure the per-entity tick is running so the
 	// pool refills over time (affect_runtime.go ensureTick). The tick re-resolves the entity by id and
 	// stops when it has neither affects nor a regen need. A no-op when the tick is already registered
@@ -111,8 +112,17 @@ func runRegen(e *Entity) {
 	if e == nil || e.living == nil || e.zone == nil {
 		return
 	}
+	fighting := position(e) == posFighting
 	for ref, def := range e.zone.resourceDefs().table() {
 		if def.regen <= 0 {
+			continue
+		}
+		// Pause passive regen for a FIGHTING entity unless the resource opts into regen-in-combat. This is
+		// the engine "no rest mid-fight" default (content flag `regen_in_combat`): without it a mob's hp
+		// regen claws back a fresh player's per-round damage and the fight never ends. A troll's regen (or
+		// a mana pool meant to tick in a fight) sets regen_in_combat: true to keep ticking. The per-entity
+		// tick itself stays alive (needsRegen is not combat-gated), so regen resumes the instant combat ends.
+		if fighting && !def.regenInCombat {
 			continue
 		}
 		maxV := resourceMax(e, ref)

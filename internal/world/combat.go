@@ -93,12 +93,12 @@ func (z *Zone) startFight(attacker, target *Entity) bool {
 	if position(target) == posDead {
 		return false
 	}
-	attacker.living.fighting = target
+	mutableLiving(attacker).fighting = target // COW: forking a proto-aliased mob's Living before setting its fighting target (else the proto retains a stale pointer)
 	setPosition(attacker, posFighting)
 	// Retaliation: an unengaged target turns and fights its attacker (classic auto-retaliate). A target
 	// already fighting someone else keeps its current target (threat/assist is 6.3b).
 	if target.living.fighting == nil {
-		target.living.fighting = attacker
+		mutableLiving(target).fighting = attacker // COW: same, for the retaliating target
 		setPosition(target, posFighting)
 	}
 	z.ensureCombatRound()
@@ -113,7 +113,7 @@ func (z *Zone) stopFight(e *Entity) {
 	if e == nil || e.living == nil {
 		return
 	}
-	e.living.fighting = nil
+	mutableLiving(e).fighting = nil // COW: forking a proto-aliased mob's Living before clearing its fighting target (else the proto keeps a stale pointer)
 	if position(e) == posFighting {
 		setPosition(e, posStanding)
 	}
@@ -491,14 +491,18 @@ func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit boo
 // buildSwingDamageOp builds the deal_damage op for an attacker's swing from its WEAPON profile + the
 // content damage bonus formula. It reads the attacker's wielded weapon (Weapon component) for the dice
 // + damage type, and attaches the [G-A] scoped bonus formula the attacker's combat profile carries
-// (weapon damroll + str). With no wielded weapon it falls back to the entity's intrinsic unarmed
-// attack (a content `unarmed_*` attribute path) — for a mob that IS its weapon, the content carries the
-// dice on the prototype's Weapon component anyway (a mob is spawned wielding its natural weapon, or the
-// prototype carries a Weapon directly). The bonus formula is read from the attacker's combat profile.
+// (weapon damroll + str). With no wielded weapon it falls back to the entity's intrinsic UNARMED attack
+// (unarmedSwingDice) — for a mob that IS its weapon, the content carries the dice on the prototype's
+// Weapon component anyway (a mob is spawned wielding its natural weapon, or the prototype carries a
+// Weapon directly). The bonus formula is read from the attacker's combat profile.
 func buildSwingDamageOp(attacker *Entity) *effectOp {
 	op := &effectOp{kind: "deal_damage"}
 	if w := wieldedWeapon(attacker); w != nil {
 		op.diceNum, op.diceSize, op.dmgType = w.diceNum, w.diceSize, w.damageType
+	} else {
+		// Unarmed: no wielded weapon and no natural Weapon component. A bare swing must still do
+		// MEANINGFUL damage — a content-overridable fallback so a fresh, unarmed player can punch.
+		op.diceNum, op.diceSize, op.dmgType = unarmedSwingDice(attacker)
 	}
 	// The damage BONUS is a content formula ([G-A]) the attacker's combat profile carries — `$actor.str +
 	// $actor.damroll` etc. It is parsed once at content build and stored as op.bonus so opDealDamage adds
@@ -507,6 +511,32 @@ func buildSwingDamageOp(attacker *Entity) *effectOp {
 		op.bonus = prof.damageBonus
 	}
 	return op
+}
+
+// defaultUnarmedDiceNum / defaultUnarmedDiceSize are the ENGINE fallback for a bare-handed swing when
+// content defines no `unarmed_dice_*` attributes — a small 1d3 punch. The engine guarantees an unarmed
+// creature does SOMETHING (so a bare pack with no weapons is still playable); a pack tunes the real
+// numbers via the content attributes. Engine = mechanism (the fallback + the seam); content = flavor.
+const (
+	defaultUnarmedDiceNum  = 1
+	defaultUnarmedDiceSize = 3
+)
+
+// unarmedSwingDice resolves the dice + damage type for an attacker's bare-handed swing. The dice are
+// CONTENT-OVERRIDABLE attributes (`unarmed_dice_num`/`unarmed_dice_size`): a pack (or a monk class /
+// brass-knuckles affect) raises them through the normal attribute mod-stack, with NO engine predicate.
+// When content defines neither (value 0), the engine substitutes its small default so a bare-engine
+// pack still lands real damage — the unarmed creature is never reduced to bonus-only (~0) again. The
+// damage TYPE is left "" (untyped — no by-type resist/soak applies): a pack that wants a TYPED natural
+// attack (so its soak/resist matrix engages) authors a Weapon component on the prototype, the existing
+// natural-weapon path. Zone-goroutine read.
+func unarmedSwingDice(attacker *Entity) (num, size int, dmgType string) {
+	num = int(attr(attacker, "unarmed_dice_num"))
+	size = int(attr(attacker, "unarmed_dice_size"))
+	if num <= 0 || size <= 0 {
+		num, size = defaultUnarmedDiceNum, defaultUnarmedDiceSize
+	}
+	return num, size, ""
 }
 
 // combatProfileFor resolves an entity's combat profile by its combatRef through the per-shard combat-

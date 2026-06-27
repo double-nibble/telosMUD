@@ -189,6 +189,43 @@ func TestResourceRegenTick(t *testing.T) {
 	}
 }
 
+// TestResourceRegenPausesInCombat: the engine "no rest mid-fight" default — a resource with the default
+// regen_in_combat=false does NOT regenerate while its owner is posFighting, then resumes the instant the
+// fight ends. This is the mechanism that stops a mob's hp regen from clawing back a player's per-round
+// damage (the starter-combat slog). The affectTestZone hp def declares no regen_in_combat, so the
+// pause-in-combat default applies.
+func TestResourceRegenPausesInCombat(t *testing.T) {
+	z, e := affectTestZone(t)
+	e.SetHP(90) // max_hp 100, regen 5; wounded so the tick is registered
+
+	setPosition(e, posFighting) // in combat -> regen paused (default regen_in_combat=false)
+	z.pulses.tick()
+	if got := e.HP(); got != 90 {
+		t.Fatalf("hp regenerated mid-fight: HP = %d, want 90 (paused in combat)", got)
+	}
+
+	setPosition(e, posStanding) // fight over -> regen resumes on the next tick
+	z.pulses.tick()
+	if got := e.HP(); got != 95 {
+		t.Fatalf("hp did not resume regen after combat: HP = %d, want 95", got)
+	}
+}
+
+// TestResourceRegenInCombatOptIn: a resource that sets regen_in_combat=true KEEPS regenerating while its
+// owner is fighting (a troll's regeneration). This guards the content opt-out of the pause default.
+func TestResourceRegenInCombatOptIn(t *testing.T) {
+	z, e := affectTestZone(t)
+	// Override the hp def to regen-in-combat (a troll-style pool that ticks through a fight).
+	z.defs.res.register("hp", &resourceDef{ref: "hp", maxAttr: "max_hp", vital: true, regen: 5, regenInCombat: true})
+	e.SetHP(90)
+
+	setPosition(e, posFighting)
+	z.pulses.tick()
+	if got := e.HP(); got != 95 {
+		t.Fatalf("regen_in_combat pool did not tick in a fight: HP = %d, want 95", got)
+	}
+}
+
 // TestPoisonTickHookFires: an affect with tick.interval fires its (reserved) on_tick hook at the
 // interval — proven by the sinceTick counter resetting AND the affect still decrementing/expiring.
 func TestPoisonTickHookFires(t *testing.T) {

@@ -246,8 +246,14 @@ func TestStorePackRoundTrip(t *testing.T) {
 	goblin := findMob(dbZones, "darkwood:mob:goblin")
 	require.NotNil(t, goblin, "round-trip: darkwood goblin mob missing from DB-loaded content")
 	require.NotNil(t, goblin.Living, "round-trip: goblin Living block was DROPPED on the DB path (mob stat sheet lost)")
-	assert.Equal(t, "melee", goblin.Living.CombatProfile, "round-trip: goblin combat_profile")
-	assert.Equal(t, float64(14), goblin.Living.Attributes["strength"], "round-trip: goblin strength (Living attributes lost)")
+	yamlGoblin := findMob(normalizeContent(fromYAML.Zones), "darkwood:mob:goblin")
+	require.NotNil(t, yamlGoblin, "round-trip: darkwood goblin missing from YAML content (test precondition)")
+	require.NotNil(t, yamlGoblin.Living, "round-trip: goblin Living missing in YAML (test precondition)")
+	// Assert DB-vs-YAML PARITY, not a magic balance value: the pin names a Living-block drop directly
+	// in the failure message while surviving goblin stat retunes (it broke when strength 14 -> 12).
+	assert.Equal(t, yamlGoblin.Living.CombatProfile, goblin.Living.CombatProfile, "round-trip: goblin combat_profile")
+	assert.Equal(t, yamlGoblin.Living.Attributes["strength"], goblin.Living.Attributes["strength"],
+		"round-trip: goblin strength (Living attributes lost on the DB path)")
 }
 
 // TestImportPackIdempotent pins the seed/import idempotency contract (the deletePack regression). A

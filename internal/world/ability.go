@@ -345,14 +345,15 @@ func (z *Zone) payCosts(actor *Entity, def *abilityDef) {
 // re-resolves the player by id and clears only the live entity's map (never a stale cross-zone entity).
 func (z *Zone) armCooldown(s *session, def *abilityDef) {
 	actor := s.entity
-	if actor.living == nil {
+	l := mutableLiving(actor) // COW: fork a proto-aliased actor's Living before mutating its cooldown map (players are prototype==nil; a mob with abilities must not write the proto)
+	if l == nil {
 		return
 	}
-	if actor.living.cooldowns == nil {
-		actor.living.cooldowns = map[string]uint64{}
+	if l.cooldowns == nil {
+		l.cooldowns = map[string]uint64{}
 	}
 	elapsesAt := z.pulses.pulse + uint64(def.cooldown) //nolint:gosec // TODO(world-engineer): cooldown is a small non-negative pulse count; add a bound
-	actor.living.cooldowns[def.ref] = elapsesAt
+	l.cooldowns[def.ref] = elapsesAt
 	id := s.character
 	ref := def.ref
 	z.pulses.after(uint64(def.cooldown), func(pulse uint64) bool { //nolint:gosec // TODO(world-engineer): cooldown is a small non-negative pulse count; add a bound
@@ -383,14 +384,15 @@ func (z *Zone) armCooldown(s *session, def *abilityDef) {
 // no-op (already elapsed). Single-writer: zone goroutine.
 func (z *Zone) rearmCooldown(s *session, ref string, remaining int) {
 	actor := s.entity
-	if actor.living == nil || remaining <= 0 {
+	if actor == nil || actor.living == nil || remaining <= 0 {
 		return
 	}
-	if actor.living.cooldowns == nil {
-		actor.living.cooldowns = map[string]uint64{}
+	l := mutableLiving(actor) // COW: fork a proto-aliased actor's Living before mutating its cooldown map (rehydrate twin of armCooldown)
+	if l.cooldowns == nil {
+		l.cooldowns = map[string]uint64{}
 	}
 	elapsesAt := z.pulses.pulse + uint64(remaining)
-	actor.living.cooldowns[ref] = elapsesAt
+	l.cooldowns[ref] = elapsesAt
 	id := s.character
 	z.pulses.after(uint64(remaining), func(pulse uint64) bool {
 		live, ok := z.players[id]

@@ -72,9 +72,10 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, r := range lc.Resources {
 		rd := &resourceDef{
 			ref: r.Ref, displayName: r.DisplayName, maxAttr: r.MaxAttr,
-			vital: r.Vital, regen: r.Regen, depletedThreshold: r.DepletedThreshold,
-			perRound: r.PerRound,
-			onEvent:  parseEventMap(r.OnEvent, "resource "+r.Ref),
+			vital: r.Vital, regen: r.Regen, regenInCombat: r.RegenInCombat,
+			depletedThreshold: r.DepletedThreshold,
+			perRound:          r.PerRound,
+			onEvent:           parseEventMap(r.OnEvent, "resource "+r.Ref),
 		}
 		// on_depleted ([G-D]): the death-hook op-list, parsed like any op-list. A malformed list logs
 		// loudly and registers with whatever parsed (content-lint discipline); nil/absent => engine default

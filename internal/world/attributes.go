@@ -54,10 +54,11 @@ type attrCache struct {
 // a modifier source changes (setAttrBase, gear change, affect apply/expire in 5.2). Cheap: it just
 // flips the flag; the recompute is lazy on the next attr(). A no-op on an entity with no Living.
 func markAttrsDirty(e *Entity) {
-	if e == nil || e.living == nil {
+	l := mutableLiving(e) // COW: fork a proto-aliased mob's Living before touching its attrs cache (else the proto's cache dirties/recomputes)
+	if l == nil {
 		return
 	}
-	e.living.attrs.dirty = true
+	l.attrs.dirty = true
 }
 
 // attr resolves attribute `name` on entity e through the full modifier stack, memoized. It is the
@@ -67,7 +68,14 @@ func attr(e *Entity, name string) float64 {
 	if e == nil || e.living == nil {
 		return 0
 	}
-	l := e.living
+	// The derivation cache (attrs) is INSTANCE state that must never be written through to a shared
+	// prototype: a proto-aliased mob writing l.attrs.values[name] would store into the prototype's
+	// Living (and every sibling's, since they alias the same pointer). COW the Living before the cache
+	// write so the memo lands on this instance only. The fork happens on the FIRST attr() of a spawned
+	// mob (cheap pointer-identity check thereafter); the clone starts with a fresh empty/dirty cache, so
+	// it recomputes its own values — never serving a sibling's memo. A player (prototype==nil) and an
+	// already-COW'd mob fall through unchanged.
+	l := mutableLiving(e)
 	if l.attrs.dirty || l.attrs.values == nil {
 		// Flush the whole cache on the first read after a dirty: clear it and recompute lazily.
 		l.attrs.values = map[string]float64{}
@@ -149,13 +157,14 @@ func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, erro
 // holds race/class/level/point-buy bases; for a player, prototype==nil so it lives here directly).
 // It dirties the cache so the next attr() recomputes. Single-writer: zone goroutine.
 func setAttrBase(e *Entity, name string, base float64) {
-	if e.living == nil {
+	l := mutableLiving(e) // COW: fork a proto-aliased mob's Living before mutating its attrBase map (else a base override leaks to the proto)
+	if l == nil {
 		return
 	}
-	if e.living.attrBase == nil {
-		e.living.attrBase = map[string]float64{}
+	if l.attrBase == nil {
+		l.attrBase = map[string]float64{}
 	}
-	e.living.attrBase[name] = base
+	l.attrBase[name] = base
 	markAttrsDirty(e)
 }
 
@@ -176,10 +185,11 @@ func (e *Entity) modSources() []modSource {
 // contribution lands on the next attr(). This is the seam the 5.2 Affected runtime (and a gear
 // hook) feeds: register the source once, then dirty on every change. Single-writer: zone goroutine.
 func addModSource(e *Entity, src modSource) {
-	if e.living == nil {
+	l := mutableLiving(e) // COW: fork a proto-aliased mob's Living before appending a mod source (else a gear/affect source leaks to the proto + siblings)
+	if l == nil {
 		return
 	}
-	e.living.modSrcs = append(e.living.modSrcs, src)
+	l.modSrcs = append(l.modSrcs, src)
 	markAttrsDirty(e)
 }
 
