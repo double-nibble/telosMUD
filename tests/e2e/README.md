@@ -37,33 +37,32 @@ regression catch for the **lookRoom render gap** (commit 98b69a6): mobs / ground
 items / corpses were silently skipped in `look` even though targeting resolved them.
 This assertion FAILS if that fix is reverted.
 
-**Precondition — a live goblin.** The demo zones set no `reset_secs`, so a killed mob
-does NOT repop until its shard restarts (which re-runs the boot reset). CI runs against
-a fresh `make up` stack, so the goblin is always present. Against a long-lived dev stack
-where someone already killed it, `docker compose -f deploy/docker-compose.yml restart
-world-darkwood` respawns it.
+The **death-sequence phase runs by default**: the fresh player melees the goblin with
+plain `kill goblin` (no weapon, no special verb), polls for `is DEAD!`, then asserts the
+corpse renders (`the corpse of a small goblin lies here.`), the loot is visible
+(`look corpse` lists `a rusty knife`), and the knife is recoverable
+(`get knife from corpse`). Starter combat is tuned so a fresh unarmed player reliably
+wins: unarmed swings deal real damage (content `unarmed_dice` 1d6) and passive regen
+pauses in combat, so the goblin (15 hp, no soak) dies in ~6 rounds (median; 3-13 over
+60 seeds, zero player deaths). Measured live (5 pristine kills): 4-10 rounds in
+~10-25s, ~2.5-3s/round (PULSE_VIOLENCE 10 x 250ms + handler overhead); the full e2e
+ran 6/6 green at 11-24s wall-clock. The death poll caps generously at 90s.
 
-The **death-sequence phase** (kill the goblin -> assert the corpse renders
-`the corpse of a small goblin lies here.` -> recover its rusty knife from the corpse)
-is written and ready, but **gated on the `TELOS_E2E_KILL` env var**:
-
-> **Why the death phase is gated.** Empirically (verified against the live stack), a
-> fresh player cannot reliably kill the hollow goblin in a CI-reasonable time.
-> Bare-handed (strength 10 -> str_bonus 0, damroll 0) the player deals ~no damage and
-> the goblin never dies. Even after grabbing + wielding the committed Market Square
-> steel longsword (2d6 slash), the kill ran **2.5+ minutes with ~35 landed blows** and
-> the goblin (85 hp + slash-resist + soak + hp regen) was still alive, while it landed
-> 35 hits + 5 crits on the player — a real player-death risk on a long fight. Melee is
-> too slow and too variable to gate CI on. The throwaway `nuke` one-shot spell is **not
-> committed**, so it is deliberately not used here.
->
-> To enable the death phase, set `TELOS_E2E_KILL` to a **deterministic** one-shot kill
-> command (e.g. a committed test-only spell/op). The test then issues it, polls for
-> `is DEAD!`, and runs the corpse-render + loot assertions.
+`TELOS_E2E_KILL` is an OPTIONAL override — set it to a faster one-shot kill verb for
+local speed. The committed/CI path runs the real melee kill with no special env.
 
 ```
-TELOS_E2E_KILL='<one-shot kill command>' make test-e2e
+make test-e2e                              # default: real melee kill
+TELOS_E2E_KILL='<one-shot verb>' make test-e2e   # optional: fast override
 ```
+
+**Precondition — a live goblin.** The demo zones set `reset_secs: 90`, so a killed
+goblin repops within ~90s. CI runs against a fresh `make up` stack (goblin always
+present). A fast-repeated LOCAL run can race the not-yet-repopped goblin, so space
+reruns by the repop stride (~90s) or `docker compose -f deploy/docker-compose.yml
+restart world-darkwood` to force a clean repop between runs. The render assertion (above)
+IS the live-goblin precondition: it fails fast with a clear message if the goblin has not
+repopped, rather than entering combat against a corpse.
 
 ## Harness
 

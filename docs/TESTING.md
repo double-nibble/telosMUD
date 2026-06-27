@@ -111,14 +111,17 @@ stay deterministic against variable gate/handoff latency.
 
 `combat_death_test.go` is the tier's exemplar: it walks a fresh character temple ->
 market -> grove (a **cross-shard handoff**, midgaard shard-a -> darkwood shard-b) ->
-hollow and asserts the goblin's long-line renders in `look` — the committed regression
-catch for the lookRoom render gap (commit 98b69a6, "mobs/corpses not rendering in
-`look`"). The **death-sequence** phase (kill -> corpse renders -> loot recoverable) is
-present and ready but **gated on `TELOS_E2E_KILL`**: a fresh player cannot reliably kill
-the hollow goblin in a CI-reasonable time (bare-handed deals ~no damage; even with the
-committed Market Square longsword the goblin's 85 hp + slash-resist/soak/regen outlasts
-2.5+ minutes of swings), so the death phase runs only when `TELOS_E2E_KILL` is set to a
-**deterministic** one-shot kill command. See `tests/e2e/README.md`.
+hollow, asserts the goblin's long-line renders in `look` (the committed regression catch
+for the lookRoom render gap, commit 98b69a6, "mobs/corpses not rendering in `look`"),
+then runs the full **death sequence** BY DEFAULT: a fresh unarmed player melees the
+goblin with plain `kill goblin`, polls for `is DEAD!`, and asserts the corpse renders +
+the rusty knife is lootable. Starter combat is tuned for this (unarmed 1d6, regen pauses
+in combat, the goblin is 15 hp/no-soak), so the kill takes ~6 rounds median (~3-13;
+~3s/round) with zero player deaths; the death poll caps generously at 90s.
+`TELOS_E2E_KILL` is an OPTIONAL override (a faster one-shot kill verb). The demo zones
+set `reset_secs: 90`, so the killed goblin repops within ~90s — CI's fresh stack always
+has a live goblin; space fast LOCAL reruns by the repop stride (or restart
+world-darkwood). See `tests/e2e/README.md`.
 
 ## Smoke test
 
