@@ -148,7 +148,7 @@ demo** (both zones seeded together); revisit when packs are split.
 ```sql
 CREATE EXTENSION IF NOT EXISTS citext;
 
-CREATE TABLE accounts (                            -- minimal stub; full account model is Phase 13
+CREATE TABLE accounts (                            -- minimal stub; full account model is Phase 14
   id         UUID PRIMARY KEY,
   status     TEXT NOT NULL DEFAULT 'active',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -156,7 +156,7 @@ CREATE TABLE accounts (                            -- minimal stub; full account
 
 CREATE TABLE characters (
   id            UUID PRIMARY KEY,                  -- the PersistID, now REAL (MUDLIB §1)
-  account_id    UUID REFERENCES accounts(id),      -- nullable until Phase 13 auth
+  account_id    UUID REFERENCES accounts(id),      -- nullable until Phase 14 auth
   name          CITEXT UNIQUE NOT NULL,            -- engine-universal: one name, one char
   zone_ref      TEXT,                              -- where to rehydrate
   room_ref      TEXT,
@@ -376,7 +376,8 @@ cadence touched in 4.2).
 - **GMCP** — Phase 9.
 - **The placement controller / director / drain** — Phase 10. Phase 4 only builds the
   *load-from-checkpoint primitive* the crash path needs; it wires no trigger.
-- **OAuth / real accounts / chargen** — Phase 13 (`accounts` is a nullable-FK stub).
+- **OAuth / real accounts** — Phase 14; **chargen / progression** — Phase 11 (`accounts` is a
+  nullable-FK stub).
 - **Cross-shard inventory in the snapshot** — already deferred (handoff.go); Phase 4's
   `state.inventory`/`equipment` round-trip is for *save/load*, not handoff transfer.
 

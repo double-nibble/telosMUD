@@ -236,5 +236,5 @@ visibility filter beyond a trivial stub (dark/invis need flags that arrive with 
 - **Comms over NATS, GMCP, orchestration, loot, economy** — Phases 8+. Socials/channels
   (MUDLIB §6) are *not* implemented; the parser leaves the post-command-table hook but
   no social/channel data.
-- **Backpressure / flow control** — Phase 14. `session.send` keeps its non-blocking
+- **Backpressure / flow control** — Phase 15. `session.send` keeps its non-blocking
   drop-on-full behavior.
