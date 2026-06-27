@@ -13,6 +13,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"reflect"
 	"sort"
 	"testing"
@@ -53,6 +54,125 @@ func normalizeContent(zones []content.ZoneDTO) []content.ZoneDTO {
 	return out
 }
 
+// canonicalizeDefs canonicalizes a pack-GLOBAL def slice so the YAML-loaded and Postgres-loaded
+// forms compare with reflect.DeepEqual regardless of representation differences the two load paths
+// introduce. It is the order-insensitive, representation-insensitive analog of normalizeContent for
+// the SIX global def kinds (attributes/resources/damage-types/affects/abilities/combat-profiles).
+//
+// Why a JSON round-trip rather than per-field guards: these DTOs carry many `any`/formula/op-list
+// fields (FormulaNodeDTO, OnResolve, ToHit, Avoidance, the OnEvent maps) plus typed numeric fields,
+// and the two loaders disagree on representation in two systematic ways the persistence-engineer
+// documented:
+//
+//   - int vs float64: the YAML loader yields Go ints for some numeric fields, while a value that
+//     round-trips through the DB's JSONB body comes back float64. Marshaling BOTH sides to JSON and
+//     unmarshaling into `any` makes every number a float64 uniformly, so the distinction vanishes.
+//   - nil vs empty: the DB path COALESCEs a missing slice/map to '[]'/'{}'::jsonb and unmarshals a
+//     non-nil empty container, while the YAML path leaves it nil — and reflect.DeepEqual treats nil
+//     and []T{} (or map{}) as unequal (the same trap normalizeContent handles for room Flags). The
+//     recursive strip below drops null, empty arrays, and empty objects so the two normalize alike.
+//
+// The result is a []map[string]any sorted by ref. A DeepEqual over it auto-catches ANY future
+// top-level field drop on the store import/load path — the systemic blind spot (three regressions:
+// ability_defs, mob Living, affect Scope, resource PerRound) the zones-only round-trip never saw.
+//
+// One residual bound (persistence review, NOT a serialization gap): because the strip folds zero/empty
+// on both sides, the catch only fires for a field the DEMO PACK populates with a non-zero value. A
+// persisted field that is empty across all demo content would drop invisibly — close that by giving the
+// demo pack a non-trivial value for it, not by changing this helper. The three historical regressions
+// are all covered (the demo pack carries a non-zero value for each).
+func canonicalizeDefs(t *testing.T, defs any) []map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(defs)
+	require.NoError(t, err, "canonicalizeDefs: marshal")
+	var out []map[string]any
+	require.NoError(t, json.Unmarshal(raw, &out), "canonicalizeDefs: unmarshal")
+	for i := range out {
+		applyImportDefaults(out[i])
+		if v := stripEmpty(out[i]); v != nil {
+			out[i] = v.(map[string]any)
+		} else {
+			out[i] = map[string]any{}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return refOf(out[i]) < refOf(out[j]) })
+	return out
+}
+
+// applyImportDefaults collapses the DEFAULT-injection difference between the two load paths so the
+// deep-compare measures content equivalence, not raw-zero-vs-defaulted representation. The store's
+// ImportPack (internal/store/import.go) rewrites a handful of empty/zero DTO fields to their canonical
+// default before the row is written (an empty stack_scope -> "source", invocation -> "command",
+// max_stacks < 1 -> 1, scope -> "entity", a nil tags -> []), so the DB path reads those values back
+// EXPLICIT while the embedded-YAML DTO keeps the author's zero value. Both map to identical runtime
+// behavior (the world mapper applies the same defaults on either path), so this is a representation
+// difference BELOW the content contract — exactly the kind normalizeContent already folds for room
+// Flags. We apply the SAME defaults to BOTH sides here; mirror import.go if a default is added there.
+//
+// This is deliberately NARROW: it touches only the named default-injected fields. Any OTHER top-level
+// field the DB path drops or mangles still surfaces in the deep-compare — that is the whole point.
+func applyImportDefaults(m map[string]any) {
+	defaultStr := func(key, def string) {
+		if s, _ := m[key].(string); s == "" {
+			if _, present := m[key]; present {
+				m[key] = def
+			}
+		}
+	}
+	// Affect defaults (import.go affect loop).
+	defaultStr("stack_scope", "source")
+	defaultStr("stacking", "refresh")
+	defaultStr("scope", "entity")
+	if v, present := m["max_stacks"]; present {
+		if n, ok := v.(float64); ok && n < 1 {
+			m["max_stacks"] = float64(1)
+		}
+	}
+	// Ability defaults (import.go ability loop).
+	defaultStr("invocation", "command")
+}
+
+// refOf returns the "ref" field of a canonicalized def map (empty if absent — every def has one).
+func refOf(m map[string]any) string {
+	if r, ok := m["ref"].(string); ok {
+		return r
+	}
+	return ""
+}
+
+// stripEmpty recursively returns nil for any null, empty array, or empty object so that the
+// nil-vs-empty-container differences between the two load paths normalize identically. A map drops
+// keys whose values strip to nil; a non-empty container is returned with its surviving children.
+// Scalars pass through unchanged (numbers are already float64 post-JSON, so int↔float64 is moot).
+func stripEmpty(v any) any {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			if s := stripEmpty(val); s != nil {
+				out[k] = s
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(x))
+		for _, val := range x {
+			out = append(out, stripEmpty(val))
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return x
+	}
+}
+
 // TestStorePackRoundTrip is the 4.1 carry-forward: import the embedded demo pack into Postgres,
 // LoadPacks it back, and assert the assembled LoadedContent equals what the embedded loader
 // produces directly — the DB path and the YAML path agree (the parity guard, exercised through
@@ -82,34 +202,52 @@ func TestStorePackRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip mismatch:\n DB  = %+v\n YAML= %+v", dbZones, yamlZones)
 	}
 
-	// Pin the combat-mob Living round-trip (Phase 6.3a): the darkwood goblin's Living block (its
-	// stat sheet + `melee` profile ref) must survive the mob_prototypes.body JSONB trip. Before the
-	// protoBody.Living fix this came back nil from the DB path; this names the regression directly.
+	// Pack-level scalar (persistence review): DefaultCombat rides pack_meta.default_combat — it is
+	// NEITHER zone content nor one of the six def slices, so neither DeepEqual reaches it. A drop on its
+	// store import/load path is the same top-level-field-drop class this test closes, so pin it directly.
+	assert.Equal(t, fromYAML.DefaultCombat, fromDB.DefaultCombat, "round-trip: pack default_combat scalar")
+
+	// Deep-compare every pack-GLOBAL def kind, the same way the zone DeepEqual above covers zone
+	// content. THIS is the systemic catch: a global def is NOT zone content, so the zones-only
+	// round-trip never saw a top-level field silently dropped on the store import/load path — the
+	// exact gap class behind THREE regressions (mob Living, affect Scope, resource PerRound), each
+	// previously patched with a one-off per-field guard. A whole-struct DeepEqual over the canonical
+	// form auto-catches ANY field drop, present or future, with no per-field maintenance. Table-driven
+	// over all six slices so a failure names the def kind that diverged.
+	defCases := []struct {
+		name string
+		db   any // the DB-loaded def slice
+		yaml any // the embedded-YAML def slice
+	}{
+		{"attributes", fromDB.Attributes, fromYAML.Attributes},
+		{"resources", fromDB.Resources, fromYAML.Resources},
+		{"damage_types", fromDB.DamageTypes, fromYAML.DamageTypes},
+		{"affects", fromDB.Affects, fromYAML.Affects},
+		{"abilities", fromDB.Abilities, fromYAML.Abilities},
+		{"combat_profiles", fromDB.CombatProfiles, fromYAML.CombatProfiles},
+	}
+	for _, tc := range defCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbDefs := canonicalizeDefs(t, tc.db)
+			yamlDefs := canonicalizeDefs(t, tc.yaml)
+			// require.Equal renders a readable per-field diff; it subsumes the old hand-written guards
+			// (mob Living lives on a mob proto, but resource PerRound / affect Scope are pure global
+			// defs caught HERE). Any top-level field the DB path drops shows as a missing/zeroed key.
+			require.Equalf(t, yamlDefs, dbDefs,
+				"global def round-trip mismatch for %s: the DB import/load path diverged from the embedded "+
+					"YAML — a top-level field was dropped or mis-serialized on the store path", tc.name)
+		})
+	}
+
+	// One named regression pin retained for the failure MESSAGE: mob Living rides a mob PROTOTYPE
+	// (zone content), not a global def, so the six-slice deep-compare above does NOT cover it — the
+	// zone DeepEqual does, but only opaquely ("round-trip mismatch"). This names the Phase 6.3a
+	// protoBody.Living drop directly: before the fix the goblin's stat sheet came back nil from the DB.
 	goblin := findMob(dbZones, "darkwood:mob:goblin")
 	require.NotNil(t, goblin, "round-trip: darkwood goblin mob missing from DB-loaded content")
 	require.NotNil(t, goblin.Living, "round-trip: goblin Living block was DROPPED on the DB path (mob stat sheet lost)")
 	assert.Equal(t, "melee", goblin.Living.CombatProfile, "round-trip: goblin combat_profile")
 	assert.Equal(t, float64(14), goblin.Living.Attributes["strength"], "round-trip: goblin strength (Living attributes lost)")
-
-	// Pin the room-scoped affect round-trip (Phase 6.4a, [G13]): the `web` affect's top-level Scope
-	// ("room") must survive the DB path. It is a pack-GLOBAL def (not zone content), so the zone
-	// DeepEqual above does NOT cover it — the gap class that hid the mob-Living and ability_defs
-	// drops. Before the affect_defs.scope column it loaded as "" => roomScoped false.
-	yamlWeb := findAffect(fromYAML.Affects, "web")
-	require.NotNil(t, yamlWeb, "round-trip: 'web' affect missing from embedded YAML content (test precondition)")
-	require.Equal(t, "room", yamlWeb.Scope, "round-trip: embedded 'web' affect scope (test precondition)")
-	dbWeb := findAffect(fromDB.Affects, "web")
-	require.NotNil(t, dbWeb, "round-trip: 'web' affect missing from DB-loaded content")
-	assert.Equalf(t, "room", dbWeb.Scope, "round-trip: 'web' affect scope was DROPPED on the DB path "+
-		"(room-scoped affect would attach to one entity instead of the room)")
-
-	// Pin the per-round reaction-budget flag round-trip (Phase 6.4b, [G9]): the `reactions`
-	// resource's top-level PerRound must survive the DB path (it rides the resource body JSONB).
-	// Same global-def gap class — without it the reaction budget never refreshes.
-	dbReactions := findResource(fromDB.Resources, "reactions")
-	require.NotNil(t, dbReactions, "round-trip: 'reactions' resource missing from DB-loaded content")
-	assert.True(t, dbReactions.PerRound, "round-trip: 'reactions' resource per_round was DROPPED on the DB "+
-		"path (the reaction budget would never refresh, breaking opportunity attacks)")
 }
 
 // TestImportPackIdempotent pins the seed/import idempotency contract (the deletePack regression). A
@@ -193,16 +331,6 @@ func combatProfileRefs(lc *content.LoadedContent) []string {
 		out = append(out, cp.Ref)
 	}
 	return out
-}
-
-// findResource returns the pack-global ResourceDTO with the given ref, or nil.
-func findResource(resources []content.ResourceDTO, ref string) *content.ResourceDTO {
-	for i := range resources {
-		if resources[i].Ref == ref {
-			return &resources[i]
-		}
-	}
-	return nil
 }
 
 // findAffect returns the pack-global AffectDTO with the given ref, or nil.
