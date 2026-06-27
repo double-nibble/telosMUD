@@ -39,9 +39,20 @@ type effectCtx struct {
 	actor  *Entity // the entity resolving the ability (the caster); the gate's "attacker" side
 	source *Entity // who the effect is attributed to (actor for a cast; the affect's source for a DoT)
 	target *Entity // the primary target (single-target ops); may equal actor for self ops
-	mag    float64 // magnitude scale (an affect's stacks*magnitude; 1 for a plain cast)
-	disp   abilityDisposition
-	rng    *rand.Rand // deterministic-injectable; nil => the package default
+	other  *Entity // event-handler counterpart (the victim for OnHit, the foe for a contested check);
+	//                bound by an op's `target: other` selector (runOps). nil outside an event handler.
+	mag  float64 // magnitude scale (an affect's stacks*magnitude; 1 for a plain cast; event mag)
+	disp abilityDisposition
+	rng  *rand.Rand // deterministic-injectable; nil => the package default
+	// depth is how many EVENT-fires deep this resolution is (event.go re-entrancy guard). A command/
+	// cast/tick ctx is depth 0; fireEvent runs handlers at depth+1 and refuses past maxEventDepth.
+	depth int
+	// eventBudget is the SHARED remaining count of handler executions for the whole event cascade
+	// rooted at one action (event.go WIDTH guard). nil outside a cascade; the first fireEvent allocates
+	// it and every nested fireEvent threads the SAME pointer, so TOTAL work (depth × fan-out) is
+	// bounded — not just recursion depth. A wide subscription set that the depth cap alone wouldn't stop
+	// (N handlers each firing M events) can't starve the single-writer zone goroutine.
+	eventBudget *int
 }
 
 // rollChance returns true with probability p (clamped to [0,1]). Uses the ctx rng when present so a
@@ -79,6 +90,7 @@ type effectOp struct {
 	text      string  // a message template (act/send)
 	to        string  // act recipient set: "actor" | "room" | "victim"
 	harmful   bool    // explicit per-op harmful flag (debuff apply_affect, drain); else inherits ctx.disp
+	tgt       string  // per-op target selector for event handlers: "" (ctx.target) | "self" | "other"
 
 	// then/els are the nested branches for the flow ops (if/chance). Parsed recursively.
 	then []effectOp
@@ -130,6 +142,18 @@ func runOps(c *effectCtx, ops []effectOp) {
 			c.z.log.Warn("effect op not understood", "op", op.kind, "actor", c.actor.short)
 			continue
 		}
+		// Per-op target selection (event handlers bind self/other): "self" -> the subject, "other" ->
+		// the counterpart. Empty leaves ctx.target untouched, so a normal ability op is unaffected. The
+		// swap is restored after the op so sibling ops in the list see the original target.
+		prev := c.target
+		switch op.tgt {
+		case "self":
+			c.target = c.actor
+		case "other":
+			if c.other != nil {
+				c.target = c.other
+			}
+		}
 		if c.z.log.Enabled(nil, slog.LevelDebug) {
 			c.z.log.Debug("effect op", "op", op.kind, "actor", c.actor.short,
 				"target", targetShort(c.target), "disp", int(c.disp))
@@ -137,6 +161,7 @@ func runOps(c *effectCtx, ops []effectOp) {
 		if err := h(c, op); err != nil {
 			c.z.log.Debug("effect op error (skipped)", "op", op.kind, "err", err)
 		}
+		c.target = prev
 	}
 }
 
@@ -154,6 +179,19 @@ func guardHarmful(c *effectCtx, target *Entity) bool {
 	if target == nil {
 		return false
 	}
+	// FAIL-CLOSED on a DETACHED actor or target (reaped / handed off / mid-transfer). The PvP policy
+	// reads room flags off both entities' locations (pvp.go inSafeRoom/inArenaRoom), so evaluating it
+	// against a stale pointer could read a wrong room or race the owning goroutine — the fireOnTick
+	// lesson, here made structural so it covers EVERY harmful op (event handlers, future Lua, direct
+	// invokes), not just the affect tick. A harm op with no live, in-room actor+target is a clean no-op.
+	if c.actor == nil || c.actor.living == nil || c.actor.location == nil ||
+		target.living == nil || target.location == nil {
+		if c.z != nil {
+			c.z.log.Debug("guardHarmful: actor or target detached, harm denied",
+				"actor", targetShort(c.actor), "target", targetShort(target))
+		}
+		return false
+	}
 	// PvP only: against a non-player (a mob) the gate is a no-op (always allowed).
 	if !isPlayer(target) {
 		return true
@@ -168,6 +206,24 @@ func guardHarmful(c *effectCtx, target *Entity) bool {
 		}
 	}
 	return ok
+}
+
+// guardCrossPlayerWrite is the ONE shared predicate for ops that WRITE another entity's state where
+// harm is NOT structurally derivable from a damage/affect def — modify_resource (any sign: a content
+// pool's polarity is unknown), dispel, remove_affect (stripping/altering a player's buffs). A
+// self-write, an ally/mob write, or a write the gate permits proceeds; writing ANOTHER player routes
+// the single guardHarmful. Returns true to proceed, false to cleanly no-op. Funnelling all three (and
+// any future such op, incl. a Lua-exposed one) through here means none can forget the !=actor self-
+// exception or the isPlayer test (the security-auditor's can't-forget property for the non-damage
+// cross-player writes — the damage/debuff paths already funnel dealDamage/applyDebuff).
+func guardCrossPlayerWrite(c *effectCtx, target *Entity) bool {
+	if target == nil {
+		return false
+	}
+	if target == c.actor || !isPlayer(target) {
+		return true // self-write or a mob/ally write — not a cross-player harm vector
+	}
+	return guardHarmful(c, target)
 }
 
 // dealDamage is the SHARED MITIGATION PIPELINE (docs/PHASE5-PLAN.md §1.6): the ONE function a spell's

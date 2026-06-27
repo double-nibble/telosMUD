@@ -271,14 +271,14 @@ func emitCheck(c *effectCtx, spec *checkSpec, res checkResult) {
 	}
 }
 
-// fireCheckEvent is the RESERVED OnCheck hook ([G2e]). The in-zone event bus (slice 6.2) makes it a
-// real content-subscribable dispatch (a bardic-inspiration reroll, a lucky-halfling); this slice it
-// logs only — exactly as ability.go step-10 reserves OnHit/OnAbilityResolved. Keeping the fire point
-// here now means 6.2 wires the bus without touching the classifier.
+// fireCheckEvent fires the OnCheck in-zone event ([G2e]/[G3]) for content to react to a resolved check
+// (a rage build on a successful save, a proc on a skill use). The subject is the checker (c.actor); the
+// counterpart (c.target — the save's caster, the contested foe) rides as the event `other` so a handler
+// can `target: other`. Synchronous, single-writer, depth-guarded (event.go). Slice 6.2 made this a real
+// dispatch (was reserved-log in 6.1).
 func fireCheckEvent(c *effectCtx, res checkResult) {
 	if c.z == nil {
 		return
 	}
-	c.z.log.Debug("event OnCheck (reserved)", "actor", targetShort(c.actor),
-		"band", res.bandLabel, "total", res.total, "dc", res.dc)
+	c.z.fireEvent(c, evOnCheck, c.actor, c.target, 1)
 }

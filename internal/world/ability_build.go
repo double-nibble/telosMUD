@@ -62,7 +62,44 @@ func buildAbilityDef(a content.AbilityDTO) (*abilityDef, error) {
 		return def, fmt.Errorf("ability %s on_resolve: %w", a.Ref, err)
 	}
 	def.ops = ops
+	def.onEvent = parseEventMap(a.OnEvent, "ability "+a.Ref)
 	return def, nil
+}
+
+// parseEventMap parses a content `on_event` map ({"OnHit": [ops...], "OnKill": [ops...]}) into the
+// runtime subscription table ([G3], event.go). Keys are validated against the closed engine event set
+// (an unknown kind is dropped + lint-logged — content can't invent events). A bad op-list logs and
+// carries whatever parsed. nil/empty in => nil out (no subscriptions). Build-time only; `owner` names
+// the def for diagnostics.
+func parseEventMap(v any, owner string) map[eventKind][]effectOp {
+	if v == nil {
+		return nil
+	}
+	m, ok := asMap(v)
+	if !ok {
+		slog.Error("content: on_event must be a map of event->ops", "def", owner)
+		return nil
+	}
+	var out map[eventKind][]effectOp
+	for key, raw := range m {
+		kind := eventKind(key)
+		if !knownEventKinds[kind] {
+			slog.Error("content: on_event references unknown engine event (dropped)", "def", owner, "event", key)
+			continue
+		}
+		ops, err := parseOpList(raw)
+		if err != nil {
+			slog.Error("content: on_event op-list parse failed", "def", owner, "event", key, "err", err)
+		}
+		if len(ops) == 0 {
+			continue
+		}
+		if out == nil {
+			out = map[eventKind][]effectOp{}
+		}
+		out[kind] = ops
+	}
+	return out
 }
 
 // parseOpList parses a generic decoded op-list (any -> []effectOp). nil/empty parses to nil (no ops).
@@ -108,6 +145,7 @@ func parseOp(v any) (effectOp, error) {
 	op.text = firstStr(m, "text", "template", "message")
 	op.to = mapStr(m, "to")
 	op.harmful = mapBool(m, "harmful")
+	op.tgt = mapStr(m, "target") // event-handler target selector: "self" | "other" (else ctx.target)
 	// `if` reads its condition affect under has_affect (falls back to affect/id above).
 	if has := firstStr(m, "has_affect"); has != "" {
 		op.affect = has
@@ -422,5 +460,16 @@ func lintAbilityOps(ref string, ops []effectOp) int {
 		}
 	}
 	walk(ops)
+	return unknown
+}
+
+// lintEventMap runs the op-vocabulary lint over each on_event handler op-list ([G3]) so an unknown op
+// inside a resource/affect/ability subscription is caught at LOAD (like ability on_resolve), not just
+// warn-skipped at runtime. `owner` names the def. Returns the count of unknown ops.
+func lintEventMap(owner string, onEvent map[eventKind][]effectOp) int {
+	unknown := 0
+	for kind, ops := range onEvent {
+		unknown += lintAbilityOps(owner+" on_event["+string(kind)+"]", ops)
+	}
 	return unknown
 }

@@ -100,7 +100,7 @@ func opModifyResource(c *effectCtx, op *effectOp) error {
 	}
 	// Any resource write on another PLAYER (any sign) is gated: the engine can't know a content pool's
 	// polarity, so a positive delta to a "corruption" pool is treated as potential harm.
-	if c.target != c.actor && isPlayer(c.target) && !guardHarmful(c, c.target) {
+	if !guardCrossPlayerWrite(c, c.target) {
 		return nil // clean no-op on a gated block
 	}
 	delta := int(op.amount)
@@ -150,7 +150,7 @@ func opRemoveAffect(c *effectCtx, op *effectOp) error {
 		return fmt.Errorf("remove_affect: no affect ref")
 	}
 	// Stripping an affect off another PLAYER is harm: gate it through the single funnel.
-	if c.target != c.actor && isPlayer(c.target) && !guardHarmful(c, c.target) {
+	if !guardCrossPlayerWrite(c, c.target) {
 		return nil // clean no-op on a gated block
 	}
 	a, ok := Get[*Affected](c.target)
@@ -177,7 +177,7 @@ func opDispel(c *effectCtx, op *effectOp) error {
 		return fmt.Errorf("dispel: no living target")
 	}
 	// Dispelling another PLAYER's affects is harm (you can strip their buffs): gate it.
-	if c.target != c.actor && isPlayer(c.target) && !guardHarmful(c, c.target) {
+	if !guardCrossPlayerWrite(c, c.target) {
 		return nil // clean no-op on a gated block
 	}
 	a, ok := Get[*Affected](c.target)

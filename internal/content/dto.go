@@ -66,6 +66,9 @@ type ResourceDTO struct {
 	Vital             bool   `json:"vital" yaml:"vital"`
 	Regen             int    `json:"regen" yaml:"regen"`                           // per-tick flat regen (reserved; ticks ride 5.2)
 	DepletedThreshold int    `json:"depleted_threshold" yaml:"depleted_threshold"` // reserved (vital depletion, 5.2)
+	// OnEvent subscribes op-lists to in-zone engine events ([G3]) for an entity that HAS this resource
+	// (a rage pool that builds on OnHit). Map of event-name -> op-list. Phase 6.2.
+	OnEvent map[string]any `json:"on_event" yaml:"on_event"`
 }
 
 // DamageTypeDTO is one content-defined damage type with its resist/vuln/immune matrix (§1). The
@@ -111,6 +114,9 @@ type AffectBodyDTO struct {
 	OnApply   any                 `json:"on_apply" yaml:"on_apply"`   // RESERVED op-list (5.3)
 	OnExpire  any                 `json:"on_expire" yaml:"on_expire"` // RESERVED op-list (5.3)
 	Resist    map[string]any      `json:"resist" yaml:"resist"`       // RESERVED resist spec (5.3)
+	// OnEvent subscribes op-lists to in-zone engine events ([G3]) while this affect is active (a proc
+	// buff). Map of event-name -> op-list. Phase 6.2.
+	OnEvent map[string]any `json:"on_event" yaml:"on_event"`
 }
 
 // AffectModifierDTO is one entry of an affect's modifier list: it adds (op:add) or multiplies
@@ -158,6 +164,9 @@ type AbilityDTO struct {
 	OnResolve    any                `json:"on_resolve" yaml:"on_resolve"`         // declarative op-list (Phase 5.3)
 	OnResolveLua string             `json:"on_resolve_lua" yaml:"on_resolve_lua"` // RESERVED, read-not-run (Phase 7)
 	Messages     AbilityMessagesDTO `json:"messages" yaml:"messages"`
+	// OnEvent subscribes op-lists to in-zone engine events ([G3]) for a known/granted ability. Map of
+	// event-name -> op-list. Phase 6.2 (per-entity ability subscriptions await the Skilled component).
+	OnEvent map[string]any `json:"on_event" yaml:"on_event"`
 }
 
 // TargetingDTO is an ability's target spec (docs/ABILITIES.md §2). mode is self/ally/enemy/area/

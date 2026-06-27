@@ -144,6 +144,19 @@ This single mechanism delivers [G3] **and** unblocks the WoW resource zoo (rage/
 are `on_event → modify_resource`), conditional regen [G4] (`on_event OnEnterCombat/OnLeaveCombat`),
 the rest event [G5], and the declarative reactions [G9].
 
+**Built in 6.2 + carried from its reviews:** the dispatch is gather-at-fire-time (no cached map, no
+invalidation surface); subscriptions come from the resources an entity HAS + its active affects
+(ability/item subscriptions await the Skilled/equipment components). Two guards bound the cascade — a
+**depth** cap (re-entrancy) AND a shared **width** budget (`maxEventHandlers`, total handler runs per
+root action) so a wide non-recursive fan-out can't starve the heartbeat. The harm gate is structural:
+`guardHarmful` fails **closed** on a detached actor/target (the `fireOnTick` lesson, now covering every
+fire point), and the three non-damage cross-player writes funnel one `guardCrossPlayerWrite`.
+*Deferred (non-blocking):* the per-entity subscription **index** (the plan's "built at load/affect-
+apply time" optimization — recompute-at-fire is correct and cheap at current scale; revisit if 6.3's
+per-swing fire points profile hot); and a **Phase-7 threat-model note** — a Lua handler receives a live
+`other` pointer with attr/has-affect read access, so the sandbox must decide whether Lua may read a
+counterpart's hidden state or must see a capability-narrowed view.
+
 ### 1.3 The combat round (COMBAT.md, on the substrate)
 
 - **Round driver:** `PULSE_VIOLENCE` = a fixed multiple of the base zone pulse (≈2.4s/round,

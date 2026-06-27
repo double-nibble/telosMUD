@@ -69,10 +69,13 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		})
 	}
 	for _, r := range lc.Resources {
-		d.res.register(r.Ref, &resourceDef{
+		rd := &resourceDef{
 			ref: r.Ref, displayName: r.DisplayName, maxAttr: r.MaxAttr,
 			vital: r.Vital, regen: r.Regen, depletedThreshold: r.DepletedThreshold,
-		})
+			onEvent: parseEventMap(r.OnEvent, "resource "+r.Ref),
+		}
+		lintEventMap("resource "+r.Ref, rd.onEvent)
+		d.res.register(r.Ref, rd)
 	}
 	for _, dt := range lc.DamageTypes {
 		d.dmg.register(dt.Ref, &damageTypeDef{
@@ -80,7 +83,9 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		})
 	}
 	for _, af := range lc.Affects {
-		d.affect.register(af.Ref, buildAffectDef(af))
+		ad := buildAffectDef(af)
+		lintEventMap("affect "+af.Ref, ad.onEvent)
+		d.affect.register(af.Ref, ad)
 	}
 	// Abilities (Phase 5.3): parse each ability's on_resolve op-list into the runtime def and register
 	// it. A command-invocation ability also binds its verb words into the per-shard ability command
@@ -93,6 +98,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 				"ability", ab.Ref, "err", err)
 		}
 		lintAbilityOps(ab.Ref, def.ops)
+		lintEventMap("ability "+ab.Ref, def.onEvent)
 		d.ability.register(ab.Ref, def)
 		if def.invocation == "command" {
 			for _, w := range def.words {

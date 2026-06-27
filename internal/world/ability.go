@@ -225,10 +225,11 @@ func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, rng *r
 	}
 	// GMCP vitals/affliction/cooldown deltas are RESERVED (Phase 9): the emit point is here.
 
-	// --- Step 10: events (RESERVED Phase 6/7) ------------------------------------------------
-	// OnAbilityResolved / OnHit / OnApplyAffect for procs/passives to react. Fire-no-op + log; the
-	// event bus + proc dispatch land in Phase 6/7 without a lifecycle change.
-	z.log.Debug("ability lifecycle: events (reserved)", "ability", def.ref, "actor", actor.short)
+	// --- Step 10: events (the in-zone event bus, [G3]) ---------------------------------------
+	// Fire OnAbilityResolved so content (a resource that builds on ability use, a proc affect) reacts.
+	// Synchronous, single-writer, depth-guarded (event.go). The target rides as the event `other`.
+	// OnHit fires from the combat swing pipeline (6.3); OnApplyAffect from the affect runtime (later).
+	z.fireEvent(c, evOnAbilityResolved, actor, target, 1)
 }
 
 // resolveAbilityTarget resolves the ability's target per its mode (step 2). self/none target the actor

@@ -197,6 +197,10 @@ type resourceDef struct {
 	vital             bool   // depletion drives death (on_depleted) — wired in 5.2/combat
 	regen             int    // per-tick flat regen (reserved; regen ticks ride 5.2)
 	depletedThreshold int    // reserved (vital depletion threshold)
+	// onEvent subscribes content op-lists to in-zone engine events ([G3], event.go). An entity that
+	// HAS this resource (a positive max or a stored current) reacts to the keyed event — e.g. a `rage`
+	// pool with onEvent[OnHit] = modify_resource rage +N is the canonical builder. nil => no handlers.
+	onEvent map[eventKind][]effectOp
 }
 
 // damageTypeDef is the runtime form of a DamageTypeDTO: a named damage type with a resist/vuln/
@@ -271,6 +275,10 @@ type affectDef struct {
 	// onApply/onExpire are the RESERVED apply/expire hooks (Phase 7 Lua). Read-not-run.
 	onApply  any
 	onExpire any
+	// onEvent subscribes content op-lists to in-zone engine events ([G3], event.go) while the affect is
+	// active on an entity — a proc affect (e.g. a "bloodlust" buff whose onEvent[OnKill] heals). The
+	// runtime gathers these from the entity's ACTIVE affects at fire time. nil => no handlers.
+	onEvent map[eventKind][]effectOp
 }
 
 // detrimentalCategories is the set of affect categories the engine treats as harmful BY CATEGORY,
@@ -405,6 +413,11 @@ type abilityDef struct {
 
 	// onResolveLua is RESERVED (Phase 7): read at load, NEVER executed this phase.
 	onResolveLua string
+
+	// onEvent subscribes content op-lists to in-zone engine events ([G3], event.go) for a known/granted
+	// ability. Per-entity ability subscriptions await the Skilled component (a later slice); the field +
+	// parse exist now so an ability pack can author them. nil => no handlers.
+	onEvent map[eventKind][]effectOp
 
 	msgActor string // step-9 "You ..." emit template
 	msgRoom  string // step-9 "$n ..." bystander emit template

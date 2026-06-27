@@ -96,6 +96,7 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		prevents:    prevents,
 		onApply:     a.Body.OnApply,
 		onExpire:    a.Body.OnExpire,
+		onEvent:     parseEventMap(a.Body.OnEvent, "affect "+a.Ref),
 	}
 	if t := a.Body.Tick; t != nil {
 		def.hasTick = true
