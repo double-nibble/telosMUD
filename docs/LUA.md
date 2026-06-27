@@ -5,7 +5,10 @@ composes the engine's [effect-op vocabulary](ABILITIES.md) through a **curated, 
 API** — never raw Go internals. Lua runs *inside* the owning zone's goroutine, so scripts see
 a consistent, single-threaded world.
 
-Runtime: `gopher-lua`. Status: **proposal** — three choices flagged in §10.
+Runtime: `gopher-lua` (a minimal in-tree fork — `third_party/gopher-lua`, see its `FORK.md`).
+Status: design baseline; **[PHASE7-PLAN.md](PHASE7-PLAN.md) is the implementation source of
+truth** (it orders this into slices, resolves the three open forks §10 flagged, and supersedes
+§5's mechanism claims — see the §5 note below).
 
 ---
 
@@ -103,23 +106,52 @@ This buys three things:
 
 ## 5. The sandbox
 
-The VM is built with a **restricted global table**:
+> **Superseded by [PHASE7-PLAN.md](PHASE7-PLAN.md) (§1.1, §2 threat rows T3/T4/T13/T14,
+> §2.1 the allowlist).** The original draft of this section cited `SetMaxStackSize` and
+> "instruction budget via the LState context" — **both are wrong for gopher-lua v1.1.1**
+> (verified against the real runtime): `SetMaxStackSize` does not exist, and the `LState`
+> context bounds wall-clock **between** ops only, never instruction count and never inside a
+> Go builtin. This section is corrected to match what slice 7.1 actually builds; the plan is
+> the source of truth for the mechanism and defaults.
 
-- **Removed:** `os`, `io`, `debug`, `package`/`require`, `dofile`, `loadfile`, `load`/
-  `loadstring`, raw `collectgarbage`, and anything FFI-like. No filesystem, network, process,
-  or code-loading reach.
-- **Kept:** `string`, `table`, `math` (with `math.random` rebound to the engine RNG, §9),
-  `pairs`/`ipairs`/`select`/`type`/`tostring`/`tonumber`/`pcall`/`error`/`assert`; `print`
-  redirected to `mud.log`.
-- **CPU quota:** every script invocation runs under an **instruction budget + wall-clock
-  deadline** (via the LState context). Exceeding it aborts *that call* (caught by the engine's
-  pcall), logs it, and counts against the script's error budget (§6). A runaway loop can't
-  stall the zone.
-- **Stack/recursion** capped (`SetMaxStackSize`); deep recursion errors out rather than
-  blowing the goroutine stack.
-- **Memory:** gopher-lua has no hard per-VM cap natively, so we bound it indirectly —
-  instruction budget, table-size guards on script-writable state, and per-zone VM memory
-  metrics with alerting. Noted as a known limitation, not a silent gap.
+The VM is built (per zone, at zone build) with a **restricted global table assembled from an
+allowlist** — the kept base functions are registered **individually**, *not* via
+`lua.OpenBase`/`NewState`-then-delete (deletion is defeatable by `_G`/`_ENV` aliasing;
+allowlisting makes an unsafe capability *absent*, not *hidden*):
+
+- **Dropped (never registered):** `load`/`loadstring`/`dofile`/`loadfile`/`require`/`module`/
+  `package`, `getmetatable`/`setmetatable`/`rawget`/`rawset`/`rawequal`/`rawlen`/`next`/`_G`/
+  `setfenv`/`getfenv`/`newproxy`/`collectgarbage`, `os`/`io`/`debug`, `coroutine`/`channel`,
+  `string.dump`. No filesystem, network, process, code-loading, metatable, or FFI reach
+  (PHASE7-PLAN.md §2.1).
+- **Kept:** `string`, `table`, `math` (with `math.random` rebound to the per-zone engine RNG
+  and `math.randomseed` a no-op, §9); `assert`/`error`/`pcall`/`xpcall`/`select`/`type`/
+  `tostring`/`tonumber`/`pairs`/`ipairs`/`unpack`; `print` redirected to `mud.log`. The
+  amplifier builtins (`string.rep`/`format`/`gsub`/`find`/`match`, `table.concat`) are kept
+  only as **size-capped wrappers**, never the raw stdlib versions (T13 — a single-op alloc
+  bomb like `string.rep("A", 2e9)` allocates GB in one instruction that neither the count nor
+  the clock can stop).
+- **CPU quota — three layers** (P7-D6): **(1)** a **vendored gopher-lua fork** adds a
+  deterministic per-call **instruction-count abort** in `mainLoopWithContext`
+  (`third_party/gopher-lua`, see its `FORK.md`) — v1.1.1 has no `SetHook`/`MaskCount`/
+  debug-hook, so the count cannot come from a hook; **(2)** the `LState` **context deadline**
+  (`SetContext` + `context.WithTimeout`) bounds wall-clock between ops; **(3)** the capped
+  amplifier builtins above catch the single-op bomb the other two miss. All three abort *that
+  call only*, are caught by the engine's `pcall`, and count against the error budget (§6).
+  Default: **100k instructions, 5ms wall-clock** per entry-point call, tunable.
+- **Stack/recursion** capped by the **build-time** `lua.Options{CallStackSize, RegistrySize/
+  RegistryMaxSize}` (T4 — *not* `SetMaxStackSize`, which does not exist); deep recursion
+  errors out as a catchable Lua error rather than overflowing the host goroutine stack.
+- **Shared-metatable poison (T14):** the string metatable (`L.G.builtinMts[LTString]`, what
+  method syntax `("x"):rep()` dispatches through) is a **private, engine-owned table holding
+  the capped wrappers, never exposed as a script-reachable global** — so a script doing
+  `string.rep = evil` cannot change `("x"):rep()` for a sibling. A `__newindex` guard alone is
+  insufficient (Lua 5.1 `__newindex` skips existing-key overwrites; method syntax bypasses
+  `_ENV`); the table must be unreachable, not merely guarded.
+- **Memory:** gopher-lua has no hard per-VM cap natively, so we bound it indirectly — the
+  instruction budget (multi-op growth), the capped builtins (single-op bombs), table-size
+  guards on script-writable state, and per-zone VM memory metrics with alerting. Noted as a
+  known limitation, not a silent gap.
 
 ## 6. Error isolation & circuit breaker
 

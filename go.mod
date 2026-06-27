@@ -10,10 +10,17 @@ require (
 	github.com/pressly/goose/v3 v3.27.1
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/stretchr/testify v1.11.1
+	github.com/yuin/gopher-lua v1.1.1
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+// TELOSMUD FORK (docs/PHASE7-PLAN.md P7-D6, third_party/gopher-lua/FORK.md): the Lua
+// runtime is a minimal in-tree fork of gopher-lua v1.1.1 adding a per-call VM
+// instruction-count abort (mainLoopWithContext) — upstream has no SetHook/MaskCount.
+// The module path is unchanged so imports stay `github.com/yuin/gopher-lua`.
+replace github.com/yuin/gopher-lua => ./third_party/gopher-lua
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -29,7 +36,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.15.0 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
-	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.50.0 // indirect

@@ -131,6 +131,15 @@ type Zone struct {
 	// loaded objects are posted back as a loadObjectsMsg. nil today — the demo flags no persistent op
 	// and no store wires it — so the persistent gate degrades to a logged no-op. Set by Shard.adopt.
 	objects ObjectLoader
+
+	// lua is this zone's Lua runtime (luart.go, Phase 7): one *lua.LState plus the restricted-
+	// globals sandbox, constructed at zone build and called ONLY from this goroutine (the
+	// single-writer invariant — gopher-lua is not goroutine-safe). It is torn down when Run
+	// returns. A zone with NO scripted content compiles/runs no scripts: the VM exists but does
+	// nothing (the bare-engine invariant — Phase-6 empty-boot behavior is byte-identical). Only
+	// the zone goroutine touches it. Slice 7.1 builds the VM + sandbox skeleton; handles, effect
+	// ops, and entry points hang off it in 7.2+.
+	lua *luaRuntime
 }
 
 // msg is anything the zone goroutine processes off its inbox. The interface keeps
@@ -371,7 +380,7 @@ func (presenceMsg) zoneMsg()      {}
 func (loadObjectsMsg) zoneMsg()   {}
 
 func newZone(id string) *Zone {
-	return &Zone{
+	z := &Zone{
 		id:             id,
 		rooms:          map[ProtoRef]*Entity{},
 		players:        map[string]*session{},
@@ -393,6 +402,13 @@ func newZone(id string) *Zone {
 		// the verbose control-flow tracing below goes through z.log at Debug.
 		log: slog.With("component", "zone", "zone", id),
 	}
+	// The per-zone Lua runtime (luart.go): the VM + the restricted-globals sandbox, built at
+	// zone construction so it is live before Run starts, and torn down when Run returns. Built
+	// for EVERY zone (including bare/empty ones) — it is inert until scripted content runs
+	// through it, so the bare-engine invariant holds. Seeded deterministically from the zone id
+	// so script RNG is reproducible (T9).
+	z.lua = newLuaRuntime(id, z.log)
+	return z
 }
 
 // post enqueues a message for the zone goroutine. Safe to call from any goroutine —
@@ -413,6 +429,10 @@ func (z *Zone) Run(ctx context.Context) {
 	// register none) — it just costs one cheap wakeup per pulseInterval on an idle zone.
 	ticker := time.NewTicker(pulseInterval)
 	defer ticker.Stop()
+	// Tear the Lua VM down when the loop exits — on THIS goroutine, the only one that ever
+	// touched it (gopher-lua is not goroutine-safe). After this no script can run; the zone is
+	// stopping anyway.
+	defer z.lua.close()
 	for {
 		select {
 		case <-ctx.Done():
