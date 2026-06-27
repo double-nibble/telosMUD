@@ -48,3 +48,70 @@ If a proposed engine change would make that *false*, it's the wrong change.
 
 This pillar is referenced by [ABILITIES.md](ABILITIES.md), [COMBAT.md](COMBAT.md), and
 [MUDLIB.md](MUDLIB.md); when those docs say "content-defined," this is why.
+
+## Pillar: every action and event is hookable
+
+**If the engine does something, content can hook it.** Every meaningful action the
+engine takes and every state transition it makes emits a *named event* content can
+subscribe to — and the consequential ones offer a *before-checkpoint* content can
+alter or veto. The engine performs the action; **content decides what it means and
+what else happens.** Where Pillar 1 says content defines the nouns and the numbers,
+this pillar says content defines the **consequences and reactions** — together they
+let a builder compose *any* system out of generic primitives plus hooks into
+everything those primitives do.
+
+The engine fires the event; content supplies the reaction:
+
+| The engine performs the action...        | ...content hooks the consequence                          |
+|------------------------------------------|-----------------------------------------------------------|
+| a swing lands                            | `OnHit` → lifesteal, rage build, on-hit poison            |
+| an entity takes damage                   | `OnDamageTaken` → thorns, a "bloodied below 50%" trigger  |
+| an entity's vital empties                | `on_depleted` → death, *or* a death-ward that cancels it  |
+| an actor enters a room                   | `OnEnter` → aggro, traps, a greeter, zone ambiance        |
+| an actor leaves a room                   | `OnLeaveRoom` → opportunity attacks, a farewell           |
+| an ability is about to commit            | `BeforeCastCommit` → counterspell, an interrupt, a surcharge |
+| an affect attaches / ticks / expires     | `OnApplyAffect` / `OnAffectTick` / `OnAffectExpire`       |
+| a character logs in / rests / levels     | `OnLogin` / `OnRest` / `OnLevelUp`                        |
+
+**Two kinds of hook.** *Observe-and-react* (after): the action already happened, the
+hook adds consequences — most hooks, and they can't rewrite the past. *Checkpoint*
+(before): the action is pending, the hook runs first and the engine reads the
+resulting state to decide whether/how to proceed — the **death checkpoint is the
+reference implementation** (the `on_depleted` hook revives the victim → the engine
+re-reads the vital → death cancels; see [COMBAT.md](COMBAT.md)). Counterspell,
+parry windows, and interrupts
+all ride this same observe-then-recheck shape; the engine never hardcodes the
+outcome, it exposes the seam and reads what content did.
+
+### The litmus test
+> A builder can add a **sailing** system — ships, docks, tides — entirely in content:
+> subscribe to room-enter to board a vessel, fire their *own* `OnShipDock` event that
+> their quests hook, and add a checkpoint that refuses disembarking mid-voyage —
+> **without recompiling the server.**
+
+If the engine can't express that — because some action emits no event, or because
+builders can't define and fire their own events — the bus is incomplete.
+
+## Corollaries (hookability)
+
+5. **Comprehensive, not curated-to-taste.** The engine's job is to emit an event at
+   *every* action and transition, not to guess which ones builders will want. A
+   missing hook is an *engine bug*, not a content limitation. (The current
+   `eventKind` taxonomy in [WORLD-EVENTS.md](WORLD-EVENTS.md) is partial — several
+   kinds are reserved-but-unlit; filling it out is ongoing engine work.)
+6. **Builders define their own events.** A system the engine never imagined needs
+   builder-named events content *fires* and *subscribes to* — the bus must not be
+   limited to the engine's enumerated kinds. *(Open: today's closed `eventKinds`
+   validation map needs a content-namespaced custom-event lane — Phase 7.)*
+7. **Hooks are bounded and gated.** Universal hookability is universal attack
+   surface, so every hook runs under the shared depth/width budget (a recursive hook
+   *terminates*, never overflows — the 6.5 death-seam lesson) and any harmful op
+   inside re-funnels the PvP/hostility gate. Phase 7 Lua hooks additionally run in
+   the sandbox (instruction budget, curated API). Power, without a foot-gun.
+8. **Hooks are the glue between systems.** Loot, crafting, progression, and quests
+   get no bespoke engine wiring — they are content subscribing to the same events
+   combat, movement, and abilities already emit. Events are the integration layer.
+
+Realized by the in-zone event bus ([internal/world/event.go](../internal/world/event.go),
+[WORLD-EVENTS.md](WORLD-EVENTS.md)) and the ability/affect `on_event` hooks; Phase 7
+(Lua) makes the hook *bodies* arbitrary content.
