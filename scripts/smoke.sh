@@ -13,6 +13,11 @@
 #      up, no container crash-loops.
 #   3. A telnet client can CONNECT, log in, and `look` — the player-facing path is
 #      live end to end (gate -> world -> directory).
+#   4. The CROSS-SHARD handoff reconnect works end to end: a fresh character walks
+#      midgaard (shard-a) -> darkwood (shard-b) across the real cross-shard exit, quits,
+#      and RECONNECTS into the exact quit room with NO "mid-transfer" rejection — the
+#      regression guard for the live 2-shard reconnect bug (aa64b06), at the layer
+#      (real Redis directory + two real shards + the gate's routing) where it surfaced.
 #
 # By default it runs the stack ONCE. Pass --twice (or SMOKE_TWICE=1) to run the
 # whole bring-up TWICE against the SAME persisted Postgres volume — that is the
@@ -112,26 +117,52 @@ assert_seed_ok() {
   log "seed exited 0 (content imported / re-imported cleanly)"
 }
 
-# telnet_session drives one scripted player session against the gate and prints
-# everything the gate sent. It feeds login + look + quit on stdin with pauses so each
-# prompt lands before the next line. It prefers `nc` (a single bidirectional pipe);
-# if nc is absent it falls back to a bash /dev/tcp coproc.
-telnet_session() {
-  # The scripted player: pause, send a name, look, quit. `quit` makes the gate close
-  # the socket, so nc returns on its own; -w 15 bounds an idle session as a backstop.
+# scripted_session drives one scripted player session against the gate and prints
+# everything the gate sent. It is the reusable telnet driver: pass the per-line
+# inter-command pause (seconds) as $1, then each subsequent argument is one line to
+# send (the trailing \r\n is added). A login name is just the first line; `look`,
+# directions, `quit`, etc. follow. The pause lets each gate prompt/render land before
+# the next line — generous enough to cover the cross-shard handoff (the market->grove
+# move re-dials shard-b before the activation `look` returns).
+#
+# It prefers `nc` (a single bidirectional pipe); if nc is absent it falls back to a
+# bash /dev/tcp coproc. Every session is bounded: `quit` makes the gate close the
+# socket (nc returns on its own), and `nc -w` caps an idle session as a backstop so a
+# wedged stack can never hang CI.
+scripted_session() {
+  local pause="$1"; shift
+  local idle=$(( pause * (${#} + 4) + 10 ))   # generous idle cap: scales with line count
   if command -v nc >/dev/null 2>&1; then
-    { sleep 1; printf 'Smoketest\r\n'; sleep 2; printf 'look\r\n'; sleep 2; printf 'quit\r\n'; sleep 1; } \
-      | nc -w 15 "${GATE_HOST}" "${GATE_PORT}"
+    _feed_lines "$pause" "$@" | nc -w "$idle" "${GATE_HOST}" "${GATE_PORT}"
   else
     exec {gate}<>"/dev/tcp/${GATE_HOST}/${GATE_PORT}" || return 1
     cat <&${gate} &
     local reader=$!
-    { sleep 1; printf 'Smoketest\r\n'; sleep 2; printf 'look\r\n'; sleep 2; printf 'quit\r\n'; sleep 1; } >&${gate}
+    _feed_lines "$pause" "$@" >&${gate}
     exec {gate}>&-
     sleep 1
     kill "$reader" 2>/dev/null || true
     wait "$reader" 2>/dev/null || true
   fi
+}
+
+# _feed_lines emits one input line at a time on stdout, each preceded by `pause`
+# seconds so the gate has time to render the prior response. A leading pause lets the
+# "By what name" prompt arrive before the name is sent.
+_feed_lines() {
+  local pause="$1"; shift
+  sleep "$pause"
+  local line
+  for line in "$@"; do
+    printf '%s\r\n' "$line"
+    sleep "$pause"
+  done
+}
+
+# telnet_session is the original single-look session (login -> look -> quit), kept as a
+# thin wrapper over scripted_session so the look smoke below reads the same as before.
+telnet_session() {
+  scripted_session 2 'Smoketest' 'look' 'quit'
 }
 
 # assert_telnet_look connects to the gate, logs in, and asserts a 'look' renders a
@@ -156,6 +187,81 @@ assert_telnet_look() {
   done
 }
 
+# assert_cross_shard_reconnect is the END-TO-END regression guard for the cross-shard
+# handoff reconnect bug (fixed in aa64b06). It reproduces, against the REAL 2-shard
+# docker stack, the exact journey a user hit on `make up`:
+#
+#   Session 1: log in a FRESH character -> walk the cross-shard route
+#       temple --n--> market --n--> grove (CROSS-SHARD: shard-a/midgaard handoff to
+#       shard-b/darkwood) --n--> hollow -> quit.
+#   Session 2: reconnect the SAME character.
+#
+# The regression: pre-fix, the handoff snapshot dropped the PersistID and the relog
+# routed to the stale home shard, so the frozen source orphan rejected the reconnect
+# with "character is mid-transfer" and the player could not log back in. This asserts
+# the reconnect SUCCEEDS, renders the exact quit room ("A Dark Hollow" on shard-b), and
+# that "mid-transfer" NEVER appears. The in-process bufconn+miniredis guard
+# (TestCrossShardHandoffPersistsAndReconnects) only approximates this; THIS exercises
+# real Redis directory placement + two real world shards + the gate's real routing —
+# the layer at which the bug actually surfaced.
+#
+# Each character name is unique per invocation so a re-run (or the --twice second pass)
+# never collides with a row already persisted in the volume.
+assert_cross_shard_reconnect() {
+  # Name must satisfy the gate's validateName: <=20 runes, no leading digit, no dot.
+  # Keep it short and unique-per-invocation so a re-run / the --twice second pass never
+  # collides with a row already in the volume. PID%10000 + run keeps us well under 20.
+  local tag="$(( $$ % 10000 ))r${run:-1}"
+  local char="Strav${tag}"
+  local deadline=$(( $(date +%s) + 90 )) out1="" out2=""
+  # PAUSE per command: generous, because the cross-shard move re-dials shard-b and the
+  # activation `look` must land before the next `north`. Bounded by scripted_session's
+  # idle cap, never open-ended.
+  local pause=3
+  while :; do
+    # --- Session 1: fresh char walks across the shard boundary, then quits.
+    out1="$(scripted_session "$pause" "$char" 'north' 'north' 'north' 'quit' 2>/dev/null || true)"
+    # Did the cross-shard walk land us in darkwood's hollow? (Proves the handoff worked
+    # and we're live on shard-b.) If not yet — likely shards not all registered — retry.
+    if ! printf '%s' "$out1" | grep -qi 'Dark Hollow'; then
+      if (( $(date +%s) >= deadline )); then
+        printf '%s' "$out1" | grep -qi 'By what name' \
+          || fail "cross-shard walk: gate never presented the login prompt; got: $(printf '%s' "$out1" | head -c 400)"
+        fail "cross-shard walk never reached 'A Dark Hollow' (handoff to shard-b failed?); got: $(printf '%s' "$out1" | head -c 600)"
+      fi
+      sleep 3
+      continue
+    fi
+
+    # The quit flush + directory CAS are async; give the destination a beat to persist
+    # the new location before reconnecting. Bounded, not open-ended.
+    sleep 3
+
+    # --- Session 2: reconnect the SAME character. Must NOT be mid-transfer; must land
+    # back in the exact quit room (hollow, on shard-b) — the heart of the regression.
+    out2="$(scripted_session "$pause" "$char" 'look' 'quit' 2>/dev/null || true)"
+
+    if printf '%s' "$out2" | grep -qi 'mid-transfer'; then
+      fail "RECONNECT REJECTED 'mid-transfer' (cross-shard reconnect regression!); session2 output: $(printf '%s' "$out2" | head -c 600)"
+    fi
+    if printf '%s' "$out2" | grep -qi 'Dark Hollow'; then
+      log "cross-shard reconnect OK: $char walked midgaard->darkwood, quit in hollow, reconnected into hollow (no mid-transfer)"
+      return 0
+    fi
+
+    # Reconnect produced neither mid-transfer nor the expected room. If we still have
+    # budget it may be a slow flush/registration; retry the whole journey with a fresh
+    # name. Otherwise fail loudly with both captures.
+    if (( $(date +%s) >= deadline )); then
+      fail "reconnect did not render 'A Dark Hollow' (and was not 'mid-transfer'); session2 output: $(printf '%s' "$out2" | head -c 600)"
+    fi
+    # Fresh short name for the retry (still <=20 runes, no leading digit): suffix with
+    # seconds-mod so a half-completed prior attempt's row never interferes.
+    char="Strav${tag}t$(( $(date +%s) % 100000 ))"
+    sleep 3
+  done
+}
+
 for run in $(seq 1 "$RUNS"); do
   if (( RUNS > 1 )); then log "RUN $run of $RUNS (same Postgres volume; run 2 exercises the re-seed)"; fi
   log "make up (build + start full stack)"
@@ -163,6 +269,7 @@ for run in $(seq 1 "$RUNS"); do
   wait_healthy
   assert_seed_ok
   assert_telnet_look
+  assert_cross_shard_reconnect
   if (( run < RUNS )); then
     # Stop the long-running services but KEEP the volume so run 2 re-seeds a populated DB.
     log "stopping services (keeping the Postgres volume for the re-seed run)"
