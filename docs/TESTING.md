@@ -69,6 +69,7 @@ idempotency tests moved to `tests/integration/`.
 | `make test` (`go test ./...`) | The **hermetic** default suite: all unit tests + co-located/integration tests that **skip** without a DSN. Never needs docker or a database. Must stay fast. |
 | `make test-race` | `go test -race -count=100 ./...`. |
 | `make test-integration` | The **gated** Postgres integration tier (`./tests/integration/... ./internal/store/...`). Sets `TELOS_TEST_DSN` for you; needs `make deps` up. |
+| `make test-e2e` | The **gated** black-box e2e tier (`./tests/e2e/...`, built with `-tags e2e`). Drives a real telnet client against a live gate (`TELOS_E2E_ADDR`, default `localhost:4000`); **skips** if the gate is down. Needs `make up`. |
 | `make smoke` | Full docker stack up once; assert healthy + seed exits 0 + a player can `look`. |
 | `make smoke-twice` | Smoke, but bring the stack up TWICE on the same volume — the re-seed/idempotency catch. |
 | `make lint` | `golangci-lint run` (the standard; run locally before every commit). |
@@ -87,6 +88,37 @@ first and `t.Skip`s when the env var is unset.
 - This gate is the layer that was MISSING when the `deletePack`/seed-idempotency bug
   shipped: it only reproduced against **real Postgres** on the **second** import.
   `tests/integration/store_pack_test.go::TestImportPackIdempotent` is its regression.
+
+The **e2e tier** is gated **twice** so `go test ./...` never runs it even on a dev
+box whose `make up` stack is up:
+
+1. The **`e2e` build tag** excludes the e2e files from the default build entirely —
+   the package has no test files without `-tags e2e`, so `make test` / `go test ./...`
+   never compiles or runs them. `make test-e2e` (and CI's `e2e` job) build `-tags e2e`.
+2. Once built, `helpers.E2EAddr(t)` **skips** when the gate (`TELOS_E2E_ADDR`, default
+   `localhost:4000`) is not reachable — so `make test-e2e` with the stack down is a
+   clean SKIP, never a failure.
+
+## E2E tier
+
+`tests/e2e/` is the **black-box acceptance** tier: a real telnet client connects to
+the live gate, logs in a fresh character, drives commands, and asserts the
+player-visible output — exactly what a human at a telnet prompt would see. The shared
+harness is `tests/helpers/telnet.go` (`Dial` + poll-for-substring `Expect`/`ExpectFrom`/
+`ExpectAny`, with telnet IAC stripped) and `tests/helpers/e2e.go` (the `E2EAddr` skip
+gate). Assertions **poll with a deadline** — never `time.Sleep`-and-hope — so the tests
+stay deterministic against variable gate/handoff latency.
+
+`combat_death_test.go` is the tier's exemplar: it walks a fresh character temple ->
+market -> grove (a **cross-shard handoff**, midgaard shard-a -> darkwood shard-b) ->
+hollow and asserts the goblin's long-line renders in `look` — the committed regression
+catch for the lookRoom render gap (commit 98b69a6, "mobs/corpses not rendering in
+`look`"). The **death-sequence** phase (kill -> corpse renders -> loot recoverable) is
+present and ready but **gated on `TELOS_E2E_KILL`**: a fresh player cannot reliably kill
+the hollow goblin in a CI-reasonable time (bare-handed deals ~no damage; even with the
+committed Market Square longsword the goblin's 85 hp + slash-resist/soak/regen outlasts
+2.5+ minutes of swings), so the death phase runs only when `TELOS_E2E_KILL` is set to a
+**deterministic** one-shot kill command. See `tests/e2e/README.md`.
 
 ## Smoke test
 

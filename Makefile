@@ -7,8 +7,13 @@ COMPOSE ?= docker compose -f deploy/docker-compose.yml
 # it for you.
 TELOS_TEST_DSN ?= postgres://telos:telos@localhost:5432/telosmud?sslmode=disable
 
+# Gate address for the e2e tier (tests/e2e). The dev `make up` stack exposes the gate
+# here; override TELOS_E2E_ADDR for a non-default host/port (e.g. a CI compose network).
+# The e2e tests SKIP cleanly when this gate is not reachable.
+TELOS_E2E_ADDR ?= localhost:4000
+
 .DEFAULT_GOAL := help
-.PHONY: help up deps down logs test test-race test-integration smoke smoke-twice vet lint build tidy proto migrate migrate-status seed
+.PHONY: help up deps down logs test test-race test-integration test-e2e smoke smoke-twice vet lint build tidy proto migrate migrate-status seed
 
 help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | \
@@ -35,6 +40,10 @@ test-race: ## Run all tests (with race)
 test-integration: ## Run the GATED Postgres integration tests (needs `make deps` up)
 	@echo "Running gated integration tests against $(TELOS_TEST_DSN)"
 	TELOS_TEST_DSN="$(TELOS_TEST_DSN)" $(GO) test -count=1 ./tests/integration/... ./internal/store/... -v
+
+test-e2e: ## Run the GATED e2e tier against a live gate (needs `make up`; SKIPs if the gate is down)
+	@echo "Running e2e tier against gate $(TELOS_E2E_ADDR)"
+	TELOS_E2E_ADDR="$(TELOS_E2E_ADDR)" $(GO) test -tags e2e -count=1 ./tests/e2e/... -v
 
 smoke: ## Bring up the full docker stack and assert it is healthy + seed exits 0 + a player can look
 	./tests/smoke/smoke.sh

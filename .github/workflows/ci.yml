@@ -105,3 +105,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make smoke-twice
+
+  # Black-box e2e (tests/e2e, built with -tags e2e): bring the FULL stack up, then drive
+  # a real telnet client through the cross-shard journey and assert the player-visible
+  # output. This is the committed CI catch for the lookRoom render regression (commit
+  # 98b69a6 — a mob silently skipped in `look`). Generated *.pb.go is gitignored, so the
+  # compose build needs the proto; `make up` builds the images (which run buf inside).
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.71.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: buf generate
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      # Bring the full stack up (postgres, redis, nats, migrate, seed, both world shards,
+      # gate). Reuse the smoke harness's readiness wait so the gate + both shards are
+      # registered before the e2e dials — then run the e2e tier and always tear down.
+      - name: bring up the stack and wait for the gate
+        run: SMOKE_KEEP=1 ./tests/smoke/smoke.sh
+      - name: run the e2e tier
+        run: make test-e2e
+      - name: tear down the stack
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v
