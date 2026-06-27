@@ -41,6 +41,55 @@ func (a *ridAllocator) alloc() RuntimeID {
 	return RuntimeID(a.next.Add(1))
 }
 
+// entityByRID resolves a RuntimeID to the live *Entity in THIS zone, or nil if no entity in
+// this zone carries that rid. It is the re-resolution primitive a Lua handle calls on EVERY
+// method (luahandle.go, docs/PHASE7-PLAN.md §1.2 / T7): a handle never holds an *Entity, only
+// a (rid, zone) pair, and re-resolves through here so a dead/departed/cross-zone rid becomes a
+// safe nil — no dangling pointer, no cross-zone reach.
+//
+// It walks the zone's containment tree: the room entities themselves (a room handle resolves
+// here too — rooms get rids via spawn) and, recursively, each room's contents (occupants,
+// ground items, and items nested inside containers). A zone holds few rooms at modest
+// populations, so this O(entities-in-zone) walk is fine for script method calls (not a
+// combat-hot path); if a future slice needs it hot, a maintained rid->entity index can sit
+// behind this same accessor without touching callers. Single-writer: zone goroutine only.
+func (z *Zone) entityByRID(rid RuntimeID) *Entity {
+	if z == nil || rid == 0 {
+		return nil
+	}
+	for _, room := range z.rooms {
+		if room == nil {
+			continue
+		}
+		if room.rid == rid {
+			return room
+		}
+		if e := findInContents(room, rid); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// findInContents recursively searches container's contents subtree for rid (containers nest:
+// an item in a corpse in a room). Returns the matching entity or nil.
+func findInContents(container *Entity, rid RuntimeID) *Entity {
+	for _, c := range container.contents {
+		if c == nil {
+			continue
+		}
+		if c.rid == rid {
+			return c
+		}
+		if len(c.contents) > 0 {
+			if e := findInContents(c, rid); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
 // parseRef splits a room ProtoRef into the zone it belongs to and the ProtoRef that
 // keys it in that zone's room map. The canonical form is "zone:kind:name" (e.g.
 // "midgaard:room:temple"); the zone is the leading segment and the room key is the

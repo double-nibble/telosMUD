@@ -140,6 +140,16 @@ type Zone struct {
 	// the zone goroutine touches it. Slice 7.1 builds the VM + sandbox skeleton; handles, effect
 	// ops, and entry points hang off it in 7.2+.
 	lua *luaRuntime
+
+	// gen is the zone's generation counter — the forward-looking guard a Lua handle captures
+	// at creation (luahandle.go, §1.2) so a handle minted before a hot-reload swap can be
+	// recognized as stale. In slice 7.2 it is captured into every handle and re-checked on
+	// every method (handleResolve), but it is NEVER bumped yet — the cross-zone/no-dangling
+	// guarantee in 7.2 rests on the zone-pointer match + RID-not-found-in-this-zone walk. The
+	// BUMP POINT (on the hot-reload chunk swap) is deferred to slice 7.7, where wiring it makes
+	// stale-gen handles no-op without any handle-layer change. Zone-owned; only the zone
+	// goroutine touches it.
+	gen uint64
 }
 
 // msg is anything the zone goroutine processes off its inbox. The interface keeps

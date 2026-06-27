@@ -134,6 +134,46 @@ func preventsAny(e *Entity, tags []string) (string, bool) {
 	return "", false
 }
 
+// hasAffect reports whether entity e currently carries an active affect with ref `ref` (any
+// applier/source). A read-only query the Lua handle layer (h:has_affect) calls; O(active
+// affects), which is small. A nil/absent Affected component has none. Single-writer: zone
+// goroutine.
+func hasAffect(e *Entity, ref string) bool {
+	a, ok := Get[*Affected](e)
+	if !ok {
+		return false
+	}
+	for _, inst := range a.list {
+		if inst.def != nil && inst.def.ref == ref {
+			return true
+		}
+	}
+	return false
+}
+
+// affectMagnitude returns the applied magnitude of the active affect `ref` on e, or 0 if e
+// carries no such affect. When multiple instances of the same ref are active (different
+// appliers under source-scoped stacking), it returns the LARGEST magnitude — the "how strong
+// is this effect on me" question a script asks. Read-only; the Lua handle layer
+// (h:affect_magnitude) calls it. Single-writer: zone goroutine.
+func affectMagnitude(e *Entity, ref string) float64 {
+	a, ok := Get[*Affected](e)
+	if !ok {
+		return 0
+	}
+	best := 0.0
+	found := false
+	for _, inst := range a.list {
+		if inst.def != nil && inst.def.ref == ref {
+			if !found || inst.magnitude > best {
+				best = inst.magnitude
+				found = true
+			}
+		}
+	}
+	return best
+}
+
 // affectedComponent returns the entity's Affected component, lazily creating + adding it on first
 // use. The created component is registered as the entity's single affect mod source (addModSource)
 // the first time, satisfying the single-source invariant. Single-writer: zone goroutine.

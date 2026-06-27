@@ -217,6 +217,12 @@ func (rt *luaRuntime) installSandbox() {
 	// is reached directly as globals.
 	rt.setGlobals(env)
 
+	// Register the entity-handle userdata type (luahandle.go, slice 7.2): its method table +
+	// the pointer-safe __tostring (T15). The metatable lives in the registry, not the globals,
+	// so it survives the setGlobals swap and is never script-reachable as a global. Read-only
+	// handles — no effect ops / harm surface this slice.
+	rt.installHandleType()
+
 	// Arm the default per-call budgets (T3/T4). The per-call re-arm chokepoint is slice 7.5;
 	// arming once here makes the abort path live and testable now.
 	L.SetInstructionBudget(luaInstrBudget)

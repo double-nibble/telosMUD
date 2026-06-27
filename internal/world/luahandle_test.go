@@ -1,0 +1,264 @@
+package world
+
+import (
+	"testing"
+
+	lua "github.com/yuin/gopher-lua"
+)
+
+// luahandle_test.go — slice 7.2 gates (docs/PHASE7-PLAN.md §1.2, threat rows T7 + T15). These
+// prove the handle layer is a VALIDATED reference, never a Go pointer: a dead/departed/
+// cross-zone handle no-ops (never panics, never derefs a foreign *Entity), tostring leaks no
+// pointer, and the read methods read real engine state. Security-auditor reviews T15 + the
+// re-validation path.
+
+// handleTestZone builds a bare zone with one room, a "self" living entity placed in it, the
+// attribute/resource/affect defs the methods read, and a flag. Returns the zone, the runtime,
+// and the self entity. Mirrors the affect/attribute test setup.
+func handleTestZone(t *testing.T) (*Zone, *luaRuntime, *Entity) {
+	t.Helper()
+	z := newZone("handle-zone")
+
+	z.defs.attr.register("strength", &attributeDef{ref: "strength", base: litNode{v: 14}})
+	z.defs.attr.register("level", &attributeDef{ref: "level", base: litNode{v: 7}})
+	z.defs.attr.register("max_hp", &attributeDef{ref: "max_hp", base: litNode{v: 100}})
+	z.defs.res.register("hp", &resourceDef{ref: "hp", maxAttr: "max_hp", vital: true})
+	z.defs.affect.register("blessed", &affectDef{
+		ref: "blessed", name: "Blessed", stacking: stackRefresh, maxStacks: 1, duration: 20,
+		modifiers: []affectModifier{{attr: "strength", add: true, value: 2}},
+	})
+
+	// A room entity, registered in the zone (so a room handle resolves and self:room() works).
+	room := z.newEntity("handle:room:hall")
+	Add(room, &Room{exits: map[string]ProtoRef{}})
+	room.short = "The Hall"
+	z.rooms["handle:room:hall"] = room
+
+	// The scripted entity ("self"), living, placed in the room.
+	self := z.newEntity("handle:mob:guard")
+	Add(self, &Living{})
+	self.short = "a stern guard"
+	Move(self, room)
+	setFlag(self, "aggressive", true)
+	setResourceCurrent(self, "hp", 73)
+	applyAffect(self, "blessed", attachOpts{magnitude: 3})
+
+	return z, z.lua, self
+}
+
+// runSelf runs src with `self` bound to e and fails on error.
+func runSelf(t *testing.T, rt *luaRuntime, e *Entity, src string) {
+	t.Helper()
+	if err := rt.runChunkWithSelf(t.Name(), src, e); err != nil {
+		t.Fatalf("script errored: %v\nsrc: %s", err, src)
+	}
+}
+
+// --- read methods against a real entity ---------------------------------------------------
+
+func TestHandleReadMethods(t *testing.T) {
+	_, rt, self := handleTestZone(t)
+	checks := []string{
+		`assert(self:id() ~= nil and self:id() > 0, "id")`,
+		`assert(self:name() == "a stern guard", "name: "..tostring(self:name()))`,
+		`assert(self:short() == "a stern guard", "short")`,
+		// blessed is +2 strength scaled by the applied magnitude (3): 14 + 2*3 = 20.
+		`assert(self:attr("strength") == 20, "strength 14+2*3 blessed: "..tostring(self:attr("strength")))`,
+		`assert(self:attr("nonesuch") == 0, "unknown attr reads 0")`,
+		`assert(self:resource("hp") == 73, "hp: "..tostring(self:resource("hp")))`,
+		`assert(self:resource("nonesuch") == 0, "unknown resource reads 0")`,
+		`assert(self:level() == 7, "level attr: "..tostring(self:level()))`,
+		`assert(self:has_affect("blessed") == true, "has blessed")`,
+		`assert(self:has_affect("cursed") == false, "no cursed")`,
+		`assert(self:affect_magnitude("blessed") == 3, "blessed mag: "..tostring(self:affect_magnitude("blessed")))`,
+		`assert(self:affect_magnitude("cursed") == 0, "absent mag 0")`,
+		`assert(self:has_flag("aggressive") == true, "aggressive flag")`,
+		`assert(self:has_flag("sleeping") == false, "no sleeping flag")`,
+		`assert(self:room() ~= nil, "room handle")`,
+		`assert(self:room():name() == "The Hall", "room name: "..tostring(self:room():name()))`,
+		`assert(self:room():id() ~= self:id(), "room is a distinct entity")`,
+	}
+	for _, c := range checks {
+		runSelf(t, rt, self, c)
+	}
+}
+
+// --- T15: __tostring leaks no Go pointer ---------------------------------------------------
+
+// TestHandleTostringNoPointer asserts tostring(self) is the safe "<entity #rid>" form and
+// NEVER contains a Go pointer (0x...). The default gopher-lua tostring(userdata) leaks the
+// pointer — an ASLR defeat — so every handle's metatable MUST define __tostring.
+func TestHandleTostringNoPointer(t *testing.T) {
+	_, rt, self := handleTestZone(t)
+	runSelf(t, rt, self, `
+		local s = tostring(self)
+		assert(s:match("^<entity #%d+>$") ~= nil, "tostring form wrong: "..s)
+		assert(s:find("0x") == nil, "tostring leaked a pointer: "..s)
+		assert(s:find("userdata") == nil, "tostring leaked the userdata tag: "..s)
+	`)
+	// The rid in the string matches self:id().
+	runSelf(t, rt, self, `assert(tostring(self) == ("<entity #"..tostring(self:id())..">"), "rid mismatch")`)
+}
+
+// TestHandleTypeHasTostring asserts the registered handle type's metatable defines __tostring
+// (no handle type may be exposed without one — T15). A Go-side check on the metatable.
+func TestHandleTypeHasTostring(t *testing.T) {
+	_, rt, _ := handleTestZone(t)
+	mt := rt.L.GetTypeMetatable(luaHandleTypeName)
+	tbl, ok := mt.(*lua.LTable)
+	if !ok {
+		t.Fatal("handle type metatable is not a table")
+	}
+	if tbl.RawGetString("__tostring") == lua.LNil {
+		t.Fatal("handle metatable lacks __tostring (T15)")
+	}
+}
+
+// --- T7: no-dangling — dead/departed/removed entity no-ops --------------------------------
+
+// TestHandleDepartedNoOps asserts a handle for an entity that has LEFT the zone (Move to nil,
+// the despawn/handoff path) no-ops: its methods return nil/false, never panic, and the script
+// observes a safe absence.
+func TestHandleDepartedNoOps(t *testing.T) {
+	_, rt, self := handleTestZone(t)
+	// First, prove the handle works while resolved.
+	runSelf(t, rt, self, `assert(self:name() ~= nil)`)
+	// Remove the entity from the zone's containment tree (it can no longer be found by rid).
+	Move(self, nil)
+	// The SAME self handle must now no-op cleanly.
+	runSelf(t, rt, self, `
+		assert(self:name() == nil, "departed name should be nil")
+		assert(self:attr("strength") == nil, "departed attr should be nil")
+		assert(self:resource("hp") == nil, "departed resource should be nil")
+		assert(self:has_affect("blessed") == false, "departed has_affect should be false")
+		assert(self:affect_magnitude("blessed") == 0, "departed magnitude should be 0")
+		assert(self:has_flag("aggressive") == false, "departed has_flag should be false")
+		assert(self:room() == nil, "departed room should be nil")
+		assert(self:level() == nil, "departed level should be nil")
+		-- id() still works (it is the handle's own identity, not a live read) and tostring is safe.
+		assert(self:id() ~= nil, "id survives")
+		assert(tostring(self):find("0x") == nil, "tostring still safe on a departed handle")
+	`)
+}
+
+// TestHandleStaleAfterReresolve asserts that a handle captured in one call and re-used in a
+// LATER call (after the entity departed between calls) does not act and does not panic — the
+// "*Entity never lives across calls" guarantee. We bind self, depart it, then re-invoke.
+func TestHandleStaleAfterReuse(t *testing.T) {
+	_, rt, self := handleTestZone(t)
+	// Capture works in call 1.
+	runSelf(t, rt, self, `assert(self:name() ~= nil)`)
+	// Between calls the entity is reaped.
+	Move(self, nil)
+	// Call 2 with the same handle: safe no-op, zone survives, next script still runs.
+	runSelf(t, rt, self, `assert(self:name() == nil)`)
+	runSelf(t, rt, self, `assert(1 + 1 == 2)`)
+}
+
+// --- T7: cross-zone — a foreign-zone handle is invalid here -------------------------------
+
+// TestHandleCrossZoneInvalid asserts resolution is ZONE-SCOPED (T7): a handle whose payload
+// names a zone resolves its rid ONLY within that zone's containment walk. An rid that exists in
+// zone A but not in zone B, carried by a handle pointing at zone B, does NOT resolve — the
+// method no-ops. No method ever dereferences a foreign-zone *Entity, because resolveHandle only
+// ever walks h.zone and a handle is minted with the entity's OWN zone pointer.
+func TestHandleCrossZoneInvalid(t *testing.T) {
+	zoneA, _, selfA := handleTestZone(t)
+	zoneB := newZone("zone-b")
+	rtB := zoneB.lua
+
+	// Forge the cross-zone hazard directly: a handle whose payload carries zone B's pointer +
+	// gen but A's self rid (an rid that is NOT registered in B's containment tree). This is the
+	// exact shape the guarantee must defeat — a smuggled rid used against the wrong zone.
+	ud := rtB.L.NewUserData()
+	ud.Value = &luaHandle{rid: selfA.rid, zone: zoneB, zoneGen: zoneB.gen}
+	rtB.L.SetMetatable(ud, rtB.L.GetTypeMetatable(luaHandleTypeName))
+	rtB.L.SetGlobal("smuggled", ud)
+	defer rtB.L.SetGlobal("smuggled", lua.LNil)
+
+	// B's walk does not contain A's rid, so every method no-ops — never reaching A's entity.
+	if err := rtB.runChunk(t.Name(), `
+		assert(smuggled:name() == nil, "cross-zone rid resolved (name)")
+		assert(smuggled:attr("strength") == nil, "cross-zone rid resolved (attr)")
+		assert(smuggled:room() == nil, "cross-zone rid resolved (room)")
+		assert(tostring(smuggled):find("0x") == nil, "tostring leaked a pointer")
+	`); err != nil {
+		t.Fatalf("cross-zone isolation failed: %v", err)
+	}
+
+	// And a proper B-minted handle for a B entity resolves B's entity — B's runtime works
+	// normally for B's own world; only the foreign rid is rejected.
+	bRoom := zoneB.newEntity("b:room:cell")
+	Add(bRoom, &Room{exits: map[string]ProtoRef{}})
+	zoneB.rooms["b:room:cell"] = bRoom
+	bSelf := zoneB.newEntity("b:mob:clone")
+	Add(bSelf, &Living{})
+	bSelf.short = "the B clone"
+	Move(bSelf, bRoom)
+	runSelf(t, rtB, bSelf, `assert(self:name() == "the B clone", "B handle should resolve B entity, got "..tostring(self:name()))`)
+
+	_ = zoneA
+}
+
+// --- -race: no method holds an *Entity across the call ------------------------------------
+
+// TestHandleNoEntityAcrossCall exercises many resolve/read cycles under the race detector
+// (run with -race) to catch any path that stashes an *Entity in a Lua value or touches one
+// outside the single Go method call. The handle layer never stores an *Entity, so there is
+// nothing to race; this asserts that property holds under repeated cross-call reuse.
+func TestHandleNoEntityAcrossCall(t *testing.T) {
+	_, rt, self := handleTestZone(t)
+	for i := 0; i < 200; i++ {
+		runSelf(t, rt, self, `
+			local _ = self:name()
+			local _ = self:attr("strength")
+			local r = self:room()
+			if r then local _ = r:name() end
+		`)
+	}
+}
+
+// --- runChunkWithSelf hygiene -------------------------------------------------------------
+
+// TestSelfClearedBetweenCalls asserts `self` does not leak from one runChunkWithSelf call into
+// an unrelated later plain runChunk call.
+func TestSelfClearedBetweenCalls(t *testing.T) {
+	_, rt, self := handleTestZone(t)
+	runSelf(t, rt, self, `assert(self ~= nil)`)
+	if err := rt.runChunk(t.Name(), `assert(self == nil, "self leaked into a later call")`); err != nil {
+		t.Fatalf("self not cleared: %v", err)
+	}
+}
+
+// TestHandleNilEntity asserts a handle for a nil entity is lua nil (the no-result convention),
+// and binding a nil self yields nil in-script (no panic).
+func TestHandleNilEntity(t *testing.T) {
+	_, rt, _ := handleTestZone(t)
+	if got := rt.newHandle(nil); got != lua.LNil {
+		t.Fatalf("newHandle(nil) = %v, want LNil", got)
+	}
+	if err := rt.runChunkWithSelf(t.Name(), `assert(self == nil)`, nil); err != nil {
+		t.Fatalf("nil-self script errored: %v", err)
+	}
+}
+
+// TestHandleTostringStandalone is a focused T15 check independent of the zone fixture: a fresh
+// runtime, a handle, tostring contains no pointer.
+func TestHandleTostringStandalone(t *testing.T) {
+	z := newZone("solo")
+	rt := z.lua
+	e := z.newEntity("solo:mob:x")
+	Add(e, &Living{})
+	r := z.newEntity("solo:room:x")
+	Add(r, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["solo:room:x"] = r
+	Move(e, r)
+	rt.L.SetGlobal("h", rt.newHandle(e))
+	defer rt.L.SetGlobal("h", lua.LNil)
+	if err := rt.runChunk(t.Name(), `
+		local s = tostring(h)
+		assert(s:find("0x") == nil and s:find("userdata") == nil, "pointer/tag leak: "..s)
+	`); err != nil {
+		t.Fatal(err)
+	}
+}
