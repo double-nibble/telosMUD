@@ -181,6 +181,56 @@ counterpart's hidden state or must see a capability-narrowed view.
   roll reservation (Phase 11/12). A single primary `Fighting` target; `assist`/threat list (damage +
   heal weighted) chooses mob targets; aggressive mobs initiate on entry.
 
+#### 1.3.1 Acceptance-validated design inputs (rpg-systems-designer, before 6.3)
+
+The §16 full-spectrum acceptance confirmed **DikuMUD/ROM, 5e attack-vs-AC, and the text-WoW hit/crit
+table all express as PURE CONTENT** on this pipeline (no engine flavor-hardcoding; 5e degenerates
+cleanly with no avoidance defs; WoW's single-roll combined table is just the to-hit check with a
+richer band list). It surfaced **one genuine new mechanism** plus three pipeline-SHAPE constraints
+6.3 must honor (cheap now, expensive to retrofit):
+
+- **[G-A] Damage as a FORMULA over attributes — the one new mechanism (highest priority, blocks all
+  three models).** `opDealDamage` takes a flat `amount` + literal `NdS` today. ROM `weapon + damroll
+  + str_bonus`, 5e crit-doubled dice + level-scaled riders (sneak attack `ceil(level/2)d6`), and WoW
+  combo-point finishers ALL need the damage amount/dice-count to read `$actor`/`$target`/`$source`
+  attributes. Extend the damage op to accept a **scoped formula** (reusing the 6.1 formula evaluator +
+  check scoping) for the bonus and for a dice-count formula; the result still flows through
+  `dealDamage → guardHarmful → mitigate` (no security change). *Without it a sword that adds STR falls
+  to Lua — a pillar regression for the most basic case.* **Owned by abilities-engineer; landed FIRST
+  as a standalone primitive (it's reusable by any ability), then the swing pipeline consumes it.**
+- **[G-F] The avoidance ladder is OPTIONAL (0+ content-declared checks); the to-hit `check` may be the
+  SOLE classifier.** ROM authors dodge/parry/block; 5e authors none (straight to soak); WoW authors
+  none and puts the whole hit/dodge/parry/block/crit table in the to-hit check's bands. The pipeline
+  must NOT hardcode "always run dodge then parry then block" — it runs the to-hit check, then
+  zero-or-more content-declared avoidance checks. (Avoidance gating — parry needs a weapon, block a
+  shield — is content via gear zeroing the `parry`/`block` attribute → roll-under-0 auto-fails; no new
+  predicate. [G-C])
+- **[G-G] The round driver defaults to SIMULTANEOUS (no initiative).** Per-pulse iteration over
+  `Fighting` entities is a stable/arbitrary order by default (ROM/WoW); 5e initiative is an OPTIONAL
+  content `check` at `OnEnterCombat` that writes an order attribute the driver sorts by. Do not bake
+  in "roll 1d20+dex" or "no order" — make the iteration order a content-overridable sort key.
+- **[G-H] Expose the per-swing INDEX to the swing ctx** (a `$swing.index` scoped ref) so the to-hit
+  `bonus` formula can vary by swing — PF iterative attacks (−5/−10/−15) are unauthorable without it.
+  Cheap while the round loop is being written; 5e/ROM/WoW don't need it.
+
+Already in 6.3 scope, confirmed no shape problem: **[G-B]** wire `soak()` to read `soak_<type>`
+attributes (5e = the no-op case, defines none); **[G-D]** `on_depleted` → death → corpse → `OnKill`
+(carry `subject`=killer, `other`=victim). Content-expressible via built conventions: **[G-E]** a
+once-per-round rider (sneak attack "once per turn") gates on a per-round resource readable from an
+`OnHit` handler — confirm the convention reaches `on_event` handlers. Crit covers all idioms
+(nat-face `faceEq` / %-chance `max` band / margin) — the crit consequence (double dice / ×mult)
+routes through [G-A].
+
+**Slicing (the plan's split, with the acceptance inputs folded in):**
+- **6.3a — round driver + swing pipeline + formula damage.** [G-A] formula damage (first, standalone);
+  `PULSE_VIOLENCE` + `Fighting` (simultaneous default [G-G]); the swing pipeline (to-hit check →
+  optional avoidance ladder [G-F] → formula damage + crit bands → soak [G-B] → apply → `OnHit`/
+  `OnDamageTaken`); cooldown completion [G8] + GCD; swing index [G-H]; a ROM-style combat content
+  pack. **Done when:** you fight a mob through the full pipeline (miss/dodge/parry/block/soak) with a
+  STR-bonus weapon, all from content.
+- **6.3b — death & threat.** [G-D] `on_depleted` → death → corpse (gear+coins) → `OnKill`; threat list,
+  `assist`/`flee`/`consider`. **Done when:** the mob dies, drops a lootable corpse, and threat/assist work.
+
 ### 1.4 Formula context scoping & new heads (P6-D1/§G1)
 
 `formula.go` gains: arithmetic heads `floor`/`ceil`/`round`/`mod` and a conditional head
