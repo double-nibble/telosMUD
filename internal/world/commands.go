@@ -155,15 +155,27 @@ func (z *Zone) lookRoom(s *session) {
 	} else {
 		b.WriteString("Exits: none")
 	}
+	// Room contents: render EVERY visible occupant — other players ("X is here"), mobs, ground items,
+	// and corpses (a mob/item/corpse's `long` IS its room/ground presence line). Previously only
+	// PlayerControlled entities rendered, so mobs and dropped items/corpses were invisible to `look`
+	// even though they were really in the room (targeting/`kill` still resolved them) — a render gap.
 	for _, occ := range r.contents {
 		if occ == e {
 			continue
 		}
-		// TODO(phase5-visibility): route this presence/name disclosure through canSee/
-		// nameFor once dark/invis flags exist — this is a second path past the canSee
-		// chokepoint (see who()), not just act()/targeting.
-		if Has[*PlayerControlled](occ) {
-			b.WriteByte('\n')
+		// TODO(phase5-visibility): route this presence/name disclosure through canSee/nameFor once
+		// dark/invis flags exist — rendering all contents here is a second path past the canSee
+		// chokepoint (see who()), consistent with the existing player-presence disclosure.
+		b.WriteByte('\n')
+		switch {
+		case Has[*PlayerControlled](occ):
+			b.WriteString(occ.Name())
+			b.WriteString(" is here.")
+		case occ.Long() != "":
+			// A mob, a ground item, or a corpse — its long line is its room/ground presence.
+			b.WriteString(occ.Long())
+		default:
+			// No long line authored: fall back to the short name.
 			b.WriteString(occ.Name())
 			b.WriteString(" is here.")
 		}
