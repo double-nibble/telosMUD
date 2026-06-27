@@ -61,9 +61,41 @@ func buildAbilityDef(a content.AbilityDTO) (*abilityDef, error) {
 	if err != nil {
 		return def, fmt.Errorf("ability %s on_resolve: %w", a.Ref, err)
 	}
+	// [G12] AoE: an ability declaring targeting.area stamps it onto each TOP-LEVEL on_resolve op that
+	// did not set its own `area` — so authoring `targeting.area: room` makes the whole on_resolve list
+	// area-scoped (each op loops per target) without repeating `area:` on every op. A per-op `area`
+	// wins. Only top-level ops are stamped: a nested band/then op runs inside the looped per-target ctx
+	// (already bound to one target), so it must NOT re-loop. normalizeArea validates the value.
+	area := normalizeArea(a.Targeting.Area)
+	if area != "" {
+		for i := range ops {
+			if ops[i].area == "" {
+				ops[i].area = area
+			}
+		}
+	}
+	def.area = area
 	def.ops = ops
 	def.onEvent = parseEventMap(a.OnEvent, "ability "+a.Ref)
 	return def, nil
+}
+
+// normalizeArea validates an AoE area selector ([G12]). "room"/"room_and_adjacent" pass through; the
+// single-target synonyms ("", "self", "target") collapse to "" (the degenerate 1-target path); an
+// unknown value is dropped to "" with a lint warning (content-lint discipline — the engine names no
+// area shape it doesn't implement). Build-time only.
+func normalizeArea(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "room":
+		return "room"
+	case "room_and_adjacent":
+		return "room_and_adjacent"
+	case "", "self", "target":
+		return ""
+	default:
+		slog.Error("content: unknown targeting.area (treated as single-target)", "area", s)
+		return ""
+	}
 }
 
 // parseEventMap parses a content `on_event` map ({"OnHit": [ops...], "OnKill": [ops...]}) into the
@@ -146,6 +178,7 @@ func parseOp(v any) (effectOp, error) {
 	op.to = mapStr(m, "to")
 	op.harmful = mapBool(m, "harmful")
 	op.tgt = mapStr(m, "target") // event-handler target selector: "self" | "other" (else ctx.target)
+	op.area = mapStr(m, "area")  // [G12] per-op AoE selector: "room" | "room_and_adjacent" (else single)
 	// `if` reads its condition affect under has_affect (falls back to affect/id above).
 	if has := firstStr(m, "has_affect"); has != "" {
 		op.affect = has

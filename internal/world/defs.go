@@ -277,6 +277,12 @@ type affectDef struct {
 	maxStacks   int  // ceiling for stackCount; >=1
 	scopeTarget bool // stack_scope=="target": one instance per ref (ignore source); else per (ref,source)
 	dispellable bool
+	// roomScoped marks a ROOM-scoped affect ([G13], docs/PHASE6-PLAN.md §1.3): instead of attaching to a
+	// living entity, it attaches to the ROOM entity, ticks over the room's living OCCUPANTS each interval
+	// (applying its on_tick / its modifier-or-CC to them), and lands on ENTRANTS on arrival. A web,
+	// darkness, silence-field, or consecrate is a room affect. Default false (the Phase-5 per-entity
+	// shape). The Affected runtime hosts both; roomScoped routes the tick over occupants (affect_room.go).
+	roomScoped bool
 
 	duration int // base duration in PULSES (heartbeat-denominated; conserved across save/load)
 
@@ -415,6 +421,11 @@ type abilityDef struct {
 
 	mode        targetMode
 	disposition abilityDisposition
+	// area is the AoE shape ([G12]): "" (single-target), "room", or "room_and_adjacent". It is also
+	// stamped onto each top-level on_resolve op (ability_build.go) so the interpreter loops per target;
+	// kept on the def for inspection/lint and so the lifecycle can relax single-target resolution for an
+	// area ability (an area ability needs no explicit keyword target).
+	area string
 
 	tags         []string           // §6 CC tags this ability carries (an affect's prevents[] blocks them)
 	notPrevented []string           // requires.not_prevented: extra tags the actor must not be prevented from

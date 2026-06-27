@@ -270,6 +270,10 @@ func (z *Zone) move(s *session, dir string) bool {
 	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom) // announced from `to`
 	z.lookRoom(s)
 	z.log.Debug("player moved", "player", s.character, "dir", dir, "from", from.proto, "to", destRoom)
+	// [G13] room-scoped affects: a creature entering a web/darkness/silence-field room gets it on
+	// arrival (the field lands on entrants, not just on those present at cast). Single-writer: the
+	// entrant + room are both this zone's (a local move), so this never reaches a cross-zone entity.
+	applyRoomAffectsTo(s.entity)
 	// Aggro (6.3b): an aggressive mob in the destination room initiates combat on the entrant — a content
 	// `aggressive` attribute, not an engine flag (death.go). Done after the arrival look so the player
 	// sees the room, then the attack. A local move only; cross-zone arrivals (transferIn) are a later hook.

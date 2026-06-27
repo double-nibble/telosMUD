@@ -474,11 +474,12 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 	}
 	dRows.Close()
 
-	// Affects (Phase 5.2): the status-effect defs. The first-class columns (stacking/max_stacks/
-	// stack_scope/dispellable/category) plus the JSONB `body` (duration/modifiers/prevents/tick).
+	// Affects (Phase 5.2 + 6.4a): the status-effect defs. The first-class columns (stacking/max_stacks/
+	// stack_scope/dispellable/category/scope) plus the JSONB `body` (duration/modifiers/prevents/tick).
+	// scope ([G13]) is "entity"|"room"; the world mapper reads it as roomScoped (Scope=="room").
 	aRows, err := p.pool.Query(ctx,
 		`SELECT ref, pack, name, COALESCE(category, ''), stacking, max_stacks,
-		        COALESCE(stack_scope, ''), dispellable, body
+		        COALESCE(stack_scope, ''), dispellable, COALESCE(scope, ''), body
 		   FROM affect_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
 	if err != nil {
 		return fmt.Errorf("store: query affect_defs: %w", err)
@@ -489,7 +490,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		var pk string
 		var body []byte
 		if err := aRows.Scan(&af.Ref, &pk, &af.Name, &af.Category, &af.Stacking,
-			&af.MaxStacks, &af.StackScope, &af.Dispellable, &body); err != nil {
+			&af.MaxStacks, &af.StackScope, &af.Dispellable, &af.Scope, &body); err != nil {
 			return fmt.Errorf("store: scan affect_def: %w", err)
 		}
 		if len(body) > 0 {

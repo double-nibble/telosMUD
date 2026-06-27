@@ -231,10 +231,17 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if maxStacks < 1 {
 			maxStacks = 1
 		}
+		// Scope ([G13], Phase 6.4a): "entity" (default) | "room". A first-class column like stack_scope;
+		// an empty DTO value (a pre-6.4a / entity-scoped affect) normalizes to "entity" so the stored row
+		// is explicit and the loader's roomScoped mapping (Scope=="room") stays correct.
+		affectScope := a.Scope
+		if affectScope == "" {
+			affectScope = "entity"
+		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO affect_defs (ref, pack, name, category, stacking, max_stacks, stack_scope, dispellable, body)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-			a.Ref, pk.Pack, a.Name, nullStr(a.Category), stacking, maxStacks, scope, a.Dispellable, body); err != nil {
+			`INSERT INTO affect_defs (ref, pack, name, category, stacking, max_stacks, stack_scope, dispellable, scope, body)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			a.Ref, pk.Pack, a.Name, nullStr(a.Category), stacking, maxStacks, scope, a.Dispellable, affectScope, body); err != nil {
 			return fmt.Errorf("store: insert affect %s: %w", a.Ref, err)
 		}
 	}

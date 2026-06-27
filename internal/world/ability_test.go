@@ -781,6 +781,11 @@ func TestFireballFromDemoPack(t *testing.T) {
 	mob := makeMobTarget(z, caster.entity, "training dummy")
 	mob.setKeywords([]string{"dummy"})
 	setResourceCurrent(mob, "hp", 100)
+	// fireball is now an AoE save-for-half ([G12]): a FAILED save deals full damage + the burn rider, a
+	// made save halves it and skips the burn. Pin the mob to ALWAYS FAIL (a very negative dex_save) so
+	// this milestone proof still exercises the full-damage + poison-rider path deterministically — the
+	// AoE/save mechanics get their own per-target coverage in aoe_test.go.
+	setAttrBase(mob, "dex_save", -100)
 
 	z.dispatch(caster, "fireball dummy")
 
@@ -791,6 +796,6 @@ func TestFireballFromDemoPack(t *testing.T) {
 		t.Fatal("demo fireball must deal fire damage")
 	}
 	if a, ok := Get[*Affected](mob); !ok || len(a.list) == 0 {
-		t.Fatal("demo fireball must apply poison")
+		t.Fatal("demo fireball must apply poison on a failed save")
 	}
 }

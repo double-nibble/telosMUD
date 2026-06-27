@@ -302,6 +302,73 @@ func roomContents(room *Entity) []*Entity {
 	return room.contents
 }
 
+// areaTargets resolves the set of living entities an area-scoped op ([G12], docs/PHASE6-PLAN.md §1.3)
+// applies to, given the effect ctx (the actor's room is the origin) and an area selector:
+//
+//	"room"               -> every living target in the actor's room, MINUS the actor itself if the
+//	                        effect is harmful (don't fireball yourself — disposition decides friend/foe,
+//	                        matching the PvP/disposition model; the per-target guardHarmful is the real
+//	                        gate, this is just the obvious self-exclusion).
+//	"room_and_adjacent"  -> the actor's room plus every room ONE EXIT away that THIS zone owns. A
+//	                        SAME-ZONE-ONLY containment: an exit whose destination is in another zone (or
+//	                        another shard) is EXCLUDED — we never dereference a cross-zone *Entity (the
+//	                        5.2/6.3a single-writer rule). A cross-zone AoE consequence is a reserved
+//	                        Phase-10 director concern, a no-op here.
+//
+// THE CONTAINMENT IS STRUCTURAL (the #1 distsys review point): the ONLY rooms this enumerates are the
+// actor's own room and rooms found via z.rooms[destRoom] — the zone's OWN room map. parseRef gives the
+// exit's destination zone; if it is non-empty and != z.id, the exit is skipped BEFORE any room/entity
+// is touched. There is no path here that loads, messages, or dereferences a room another zone owns.
+// Single-writer: zone goroutine, reading only this zone's containment.
+func areaTargets(c *effectCtx, area string) []*Entity {
+	if c == nil || c.actor == nil {
+		return nil
+	}
+	origin := c.actor.location
+	if origin == nil {
+		return nil
+	}
+	harmful := c.disp == dispHarmful
+	var out []*Entity
+	collect := func(room *Entity) {
+		for _, e := range roomContents(room) {
+			if e.living == nil {
+				continue
+			}
+			// Self-exclusion for a harmful AoE: don't catch the caster in their own fireball. A
+			// helpful/neutral area op (a room heal/buff) INCLUDES the actor.
+			if e == c.actor && harmful {
+				continue
+			}
+			out = append(out, e)
+		}
+	}
+	collect(origin)
+	if area == "room_and_adjacent" {
+		z := c.z
+		if z != nil && origin.room != nil {
+			for _, dir := range origin.room.sortedExits() {
+				ref := origin.room.exits[dir]
+				destZone, destRoom := parseRef(ref)
+				// SAME-ZONE CONTAINMENT: a cross-zone (or cross-shard) exit is excluded ENTIRELY. We
+				// never look the room up anywhere but THIS zone's own map, so a destination this zone
+				// does not own is simply absent — no cross-goroutine *Entity is ever reached.
+				if destZone != "" && destZone != z.id {
+					if z.log != nil {
+						z.log.Debug("areaTargets: cross-zone exit excluded (same-zone containment)",
+							"dir", dir, "dest_zone", destZone, "this_zone", z.id)
+					}
+					continue
+				}
+				if adj := z.rooms[destRoom]; adj != nil && adj != origin {
+					collect(adj)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // canSee is the visibility filter (MUDLIB §7): an actor may only target what it can
 // perceive. Slice 1 left room/entity flags as stubs (no dark/invis/hidden data yet), so
 // this is the honest trivial filter: everything in scope is visible. It is the single

@@ -74,6 +74,15 @@ attributes:
   # combat on a player entering its room (death.go aggroOnEntry). Default 0 (passive); a mob's Living
   # block overrides it to 1. The engine never names "aggressive"; it reads whatever this attribute is.
   - {ref: aggressive, display_name: Aggressive, value_kind: int, default_base: {lit: 0}}
+  # Saving-throw attributes ([G2]/[G12]): a target's DEX save bonus and a caster's spell save DC. These
+  # are what a per-target `check` save (a fireball's save-for-half) reads — `$target.dex_save` vs
+  # `$source.spell_dc`. The engine names neither; the check spec authored on the spell reads them.
+  - ref: dex_save
+    display_name: Dexterity Save
+    value_kind: int
+    default_base:
+      expr: ["floor", ["/", ["-", ["attr", strength], 10], 2]]   # demo: reuse the STR-derived mod shape
+  - {ref: spell_dc, display_name: Spell Save DC, value_kind: int, default_base: {lit: 13}}
 
 resources:
   # hp is VITAL: at 0 = death. The on_depleted op-list is the [G-D] death hook (Phase 6.3b): the engine
@@ -123,6 +132,25 @@ affects:
       duration: 12
       prevents: [move]
 
+  # web: a ROOM-SCOPED affect ([G13]). It attaches to the ROOM (not a creature), ticks over the room's
+  # occupants, and lands on anyone who walks IN — rooting (prevents the `move` tag, the same tag-CC a
+  # cast root uses) and slowing (-1 dodge) everyone caught in it. scope: room is the only new field; the
+  # Affected runtime hosts it. duration 12 pulses; tick interval 2 re-leases the snare on occupants. A
+  # web is transient (re-applied by content, never snapshotted).
+  - ref: web
+    name: Webbed
+    category: snare
+    scope: room
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 12
+      modifiers:
+        - {attr: dodge, op: add, value: -1}
+      prevents: [move]
+      tick:
+        interval: 2
+
   # poison: the §5 example — a DoT. stacks up to 5 (magnitude scales), -2 strength while active, and
   # ticks every 6 pulses. The on_tick deal_damage op-list completes in 5.3 (RESERVED here); the
   # modifiers + stacking + tick interval are live now. Exercises the stack stacking mode.
@@ -157,7 +185,12 @@ abilities:
     name: Fireball
     invocation: command
     words: [fireball]
-    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    # [G12] AoE: targeting.area room makes fireball hit EVERY valid living target in the caster's room
+    # (the caster is excluded — harmful self-exclusion). The engine loops the on_resolve PER TARGET, and
+    # each target funnels guardHarmful INDEPENDENTLY (a consenting foe burns, a non-consenting player in
+    # the room is unharmed). mode: enemy keeps the classic `fireball goblin` working, but with an area
+    # the keyword is optional — a bare `fireball` blankets the room.
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful, area: room}
     tags: [cast, verbal, somatic, fire]
     costs:
       - {resource: mana, amount: 30}
@@ -165,11 +198,51 @@ abilities:
     lag: 12
     cooldown: 0
     messages:
-      actor: "You hurl a roaring fireball at $N!"
-      room: "$n hurls a roaring fireball at $N!"
+      actor: "You hurl a roaring fireball into the room!"
+      room: "$n hurls a roaring fireball into the room!"
+    # The whole on_resolve is ONE area-scoped `check` op: per target, roll a DEX save vs the caster's
+    # spell DC; the save HALVES the damage (the half/full bands). Each target rolls its OWN save and its
+    # damage gates on its OWN consent — the Phase-6 milestone "a fireball's save halves its damage across
+    # everyone in the room", entirely from content. apply_affect (burn) on a failed save adds the rider.
     on_resolve:
-      - {op: deal_damage, type: fire, dice: "8d6"}
-      - {op: apply_affect, affect: poison, harmful: true}
+      - op: check
+        check:
+          label: "Dexterity save"
+          dice: "1d20"
+          bonus: ["attr", "$target.dex_save"]
+          vs: ["attr", "$source.spell_dc"]
+          bands:
+            # made the save (total >= DC, margin >= 0): HALF damage, no burn.
+            - margin_min: 0
+              label: save
+              ops:
+                - {op: deal_damage, type: fire, dice: "4d6"}
+            # failed the save: FULL damage + a lingering burn (poison-as-fire DoT rider).
+            - label: fail
+              ops:
+                - {op: deal_damage, type: fire, dice: "8d6"}
+                - {op: apply_affect, affect: poison, harmful: true}
+
+  # web: a command spell that conjures the `web` ROOM-scoped affect ([G13]) in the caster's room. mode
+  # none (no creature target — the field IS the target); the apply_affect op detects the room-scoped def
+  # and attaches it to the room (occupants + entrants get rooted). disposition harmful so the per-occupant
+  # landing funnels the gate. No engine knowledge of "web" — the room affect + this ability are content.
+  - ref: cast_web
+    name: Web
+    invocation: command
+    words: [web]
+    targeting: {mode: none, scope: room, range: 0, disposition: harmful}
+    tags: [cast, somatic]
+    costs:
+      - {resource: mana, amount: 15}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You fling a tangle of sticky webs across the room!"
+      room: "$n flings a tangle of sticky webs across the room!"
+    on_resolve:
+      - {op: apply_affect, affect: web}
 
 # Combat profiles (Phase 6.3a, docs/COMBAT.md §3) — the ROM-style to-hit / avoidance / damage SHAPE as
 # pure content. The engine runs the pipeline; THIS data is the whole ruleset. `default_combat` names the

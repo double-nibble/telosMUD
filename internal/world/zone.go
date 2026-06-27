@@ -690,6 +690,10 @@ func (z *Zone) transferIn(m transferInMsg) {
 	Move(s.entity, r)
 	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
 	z.lookRoom(s)
+	// [G13] room-scoped affects land on an entrant arriving via an intra-shard transfer too — the
+	// destination room is THIS zone's, the entity is now ours (single-writer), so this is safe here.
+	applyRoomAffectsTo(s.entity)
+	z.aggroOnEntry(s.entity, r) // arrival-hook parity (distsys SC2): an aggressive mob engages a transferred-in player too
 	s.send(promptFrame())
 	z.log.Debug("intra-shard transfer in", "player", s.character, "room", r.proto,
 		"applied", s.appliedSeq, "population", len(z.players))
@@ -753,6 +757,12 @@ func (z *Zone) attach(m attachMsg) {
 		if r != nil {
 			Move(s.entity, r) // only now does the player become visible in the room
 			z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
+			// Arrival-hook parity (distsys 6.4a SC1/SC2): a player arriving via a CROSS-SHARD handoff
+			// must land in active room affects (a web/darkness field snares them on arrival, not only on
+			// the next room tick) and trigger an aggressive mob — same as the local-move and intra-shard
+			// paths. The destination room is THIS zone's and the entity is now ours (single-writer), safe.
+			applyRoomAffectsTo(s.entity)
+			z.aggroOnEntry(s.entity, r)
 		}
 		z.lookRoom(s)
 		s.send(promptFrame())

@@ -102,6 +102,14 @@ type effectOp struct {
 	to        string  // act recipient set: "actor" | "room" | "victim"
 	harmful   bool    // explicit per-op harmful flag (debuff apply_affect, drain); else inherits ctx.disp
 	tgt       string  // per-op target selector for event handlers: "" (ctx.target) | "self" | "other"
+	// area is the per-op AoE target-set selector ([G12], docs/PHASE6-PLAN.md §1.3). "" => single-target
+	// (the degenerate 1-target case — ctx.target, unchanged). "room" / "room_and_adjacent" make runOps
+	// LOOP this one op over every valid living target in the area, binding c.target to each so the op
+	// (deal_damage / a per-target check save / apply_affect) runs — and funnels guardHarmful — once PER
+	// target. An ability sets it from its targeting.area onto each top-level op at build time (so an op
+	// authored area-scoped runs area-scoped; a nested band/then op without it stays single-target within
+	// the looped per-target ctx). Same-zone-contained (areaTargets never dereferences a cross-zone room).
+	area string
 
 	// then/els are the nested branches for the flow ops (if/chance). Parsed recursively.
 	then []effectOp
@@ -153,6 +161,14 @@ func runOps(c *effectCtx, ops []effectOp) {
 			c.z.log.Warn("effect op not understood", "op", op.kind, "actor", c.actor.short)
 			continue
 		}
+		// AoE ([G12]): an area-scoped op LOOPS over the area's valid living targets, running the SAME op
+		// once per target with c.target bound to each. This is the whole [G12] mechanism — the per-op
+		// handler (and the guardHarmful it funnels) is UNCHANGED, just invoked N times, gated N times. A
+		// non-area op (op.area == "") is the degenerate 1-target case below.
+		if op.area != "" {
+			runOpArea(c, op, h)
+			continue
+		}
 		// Per-op target selection (event handlers bind self/other): "self" -> the subject, "other" ->
 		// the counterpart. Empty leaves ctx.target untouched, so a normal ability op is unaffected. The
 		// swap is restored after the op so sibling ops in the list see the original target.
@@ -174,6 +190,29 @@ func runOps(c *effectCtx, ops []effectOp) {
 		}
 		c.target = prev
 	}
+}
+
+// runOpArea runs ONE area-scoped op once per valid living target in the op's area ([G12]). It resolves
+// the target set (areaTargets — same-zone-contained), then binds c.target to each and invokes the op
+// handler. EACH invocation funnels the op's own gate (a harmful op's dealDamage/applyDebuff ->
+// guardHarmful) INDEPENDENTLY, so an AoE is N gate checks, never one: a consenting foe is harmed, a
+// non-consenting player in the same room is a clean no-op — per target. A per-target `check` save rolls
+// once per target (resolveCheck reads the bound c.target). c.target is restored after the loop so a
+// sibling op in the list (area or not) sees the original target. Single-writer: zone goroutine.
+func runOpArea(c *effectCtx, op *effectOp, h effectOpHandler) {
+	targets := areaTargets(c, op.area)
+	prev := c.target
+	for _, t := range targets {
+		c.target = t
+		if c.z.log.Enabled(nil, slog.LevelDebug) {
+			c.z.log.Debug("effect op (area)", "op", op.kind, "area", op.area,
+				"actor", c.actor.short, "target", targetShort(t), "disp", int(c.disp))
+		}
+		if err := h(c, op); err != nil {
+			c.z.log.Debug("effect op error (skipped)", "op", op.kind, "err", err)
+		}
+	}
+	c.target = prev
 }
 
 // --- The shared mitigation pipeline + the PvP guard (the security boundary) -------------------

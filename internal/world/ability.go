@@ -245,6 +245,13 @@ func (z *Zone) resolveAbilityTarget(actor *Entity, def *abilityDef, arg string) 
 		// Resolve a living target in the room by the typed keyword (the classic `cast fireball goblin`).
 		hits := z.Resolve(actor, parseTargetSpec(arg), ScopeRoomLiving)
 		if len(hits) == 0 {
+			// [G12] AoE: an area ability (targeting.area room/room_and_adjacent) needs NO explicit
+			// keyword target — its op-list loops over the area set (runOpArea binds each target), so a
+			// bare `fireball` with no argument resolves with a nil primary target and still hits the
+			// room. A SINGLE-target ability with no match is a clean failure (the unchanged path).
+			if def.area != "" {
+				return nil, true
+			}
 			// No explicit target: fall back to the actor's current fighting target (Phase 6) — none
 			// this phase, so a missing target is a clean failure.
 			return nil, false

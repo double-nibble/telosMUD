@@ -122,14 +122,20 @@ type DamageTypeDTO struct {
 //   - body carries duration (pulses), the modifier list, the prevents tags, the tick spec, and the
 //     RESERVED on_apply/on_expire hooks + resist (the op-list hooks land in 5.3).
 type AffectDTO struct {
-	Ref         string        `json:"ref" yaml:"ref"`
-	Name        string        `json:"name" yaml:"name"`
-	Category    string        `json:"category" yaml:"category"`
-	Stacking    string        `json:"stacking" yaml:"stacking"`
-	MaxStacks   int           `json:"max_stacks" yaml:"max_stacks"`
-	StackScope  string        `json:"stack_scope" yaml:"stack_scope"`
-	Dispellable bool          `json:"dispellable" yaml:"dispellable"`
-	Body        AffectBodyDTO `json:"body" yaml:"body"`
+	Ref         string `json:"ref" yaml:"ref"`
+	Name        string `json:"name" yaml:"name"`
+	Category    string `json:"category" yaml:"category"`
+	Stacking    string `json:"stacking" yaml:"stacking"`
+	MaxStacks   int    `json:"max_stacks" yaml:"max_stacks"`
+	StackScope  string `json:"stack_scope" yaml:"stack_scope"`
+	Dispellable bool   `json:"dispellable" yaml:"dispellable"`
+	// Scope is the affect's attachment target ([G13], docs/PHASE6-PLAN.md §1.3): "entity" (default —
+	// attaches to a living entity, the Phase-5 shape) or "room" (attaches to the ROOM entity, ticks over
+	// the room's occupants, and lands on entrants). A room-scoped affect (web/darkness/silence-field/
+	// consecrate) is how an area condition persists in a place rather than on a creature. Transient: a
+	// room affect is re-applied by content/reset, not snapshotted (matches combat's transient model).
+	Scope string        `json:"scope" yaml:"scope"`
+	Body  AffectBodyDTO `json:"body" yaml:"body"`
 }
 
 // AffectBodyDTO is the JSONB-tail of an affect_defs row: everything that is not a first-class column.
@@ -207,6 +213,12 @@ type TargetingDTO struct {
 	Scope       string `json:"scope" yaml:"scope"`
 	Range       int    `json:"range" yaml:"range"`
 	Disposition string `json:"disposition" yaml:"disposition"` // 'helpful' | 'harmful' | 'neutral'
+	// Area is the AoE shape ([G12], docs/PHASE6-PLAN.md §1.3): "" / "self" / "target" = single-target
+	// (the degenerate case, unchanged); "room" = every valid living target in the actor's room;
+	// "room_and_adjacent" = that room plus rooms one exit away (SAME-ZONE only — a cross-zone exit is
+	// excluded). It is stamped onto each top-level on_resolve op so the effect-op interpreter LOOPS the
+	// op per target, gating each independently. A per-op `area` field overrides it for that one op.
+	Area string `json:"area" yaml:"area"`
 }
 
 // RequiresDTO is an ability's declarative gate set (docs/ABILITIES.md §2, step 3). NotPrevented is

@@ -465,11 +465,11 @@ func TestNoFightingPointerCrossesZoneOnTransfer(t *testing.T) {
 		t.Fatal("startFight precondition failed")
 	}
 
-	var bRoom ProtoRef
-	for ref := range B.rooms {
-		bRoom = ref
-		break
-	}
+	// Transfer into B's START room (deterministic, and NOT the aggressive goblin-chief's lair): this
+	// isolates what the test pins — that the transfer SCRUBS the crossed fighting pointer. (Picking a
+	// random B room via map iteration is flaky now: an aggressive mob in the destination legitimately
+	// re-engages the arrival via aggroOnEntry, which is correct behavior, not a crossed pointer.)
+	bRoom := B.startRoom
 	A.transferOut(s, B, bRoom, "north", s.entity.location)
 	B.handle(<-B.inbox)
 

@@ -131,11 +131,24 @@ func opModifyResource(c *effectCtx, op *effectOp) error {
 // another player stays ungated (a buff on an ally). The source is the EFFECT source (the caster, or a
 // DoT's applier), so per-source stacking keys correctly.
 func opApplyAffect(c *effectCtx, op *effectOp) error {
-	if c.target == nil {
-		return fmt.Errorf("apply_affect: no target")
-	}
 	if op.affect == "" {
 		return fmt.Errorf("apply_affect: no affect ref")
+	}
+	// [G13] room-scoped affect: a room affect (web/darkness/...) attaches to the actor's ROOM entity,
+	// not to a creature, and lands on the room's occupants + entrants. The interpreter detects the
+	// room-scoped def and routes to applyRoomAffect (the per-occupant harm funnel lives inside it), so
+	// a single `apply_affect: web` op authors a room field — no separate op kind. The applier is the
+	// effect source (the caster), keying the field per-applier.
+	if def := c.z.affectDefs().get(op.affect); def != nil && def.roomScoped {
+		room := c.actor.location
+		if room == nil {
+			return fmt.Errorf("apply_affect (room): actor has no room")
+		}
+		applyRoomAffect(room, op.affect, c.source)
+		return nil
+	}
+	if c.target == nil {
+		return fmt.Errorf("apply_affect: no target")
 	}
 	opts := attachOpts{source: c.source, duration: op.duration, magnitude: op.magnitude}
 	def := c.target.zone.affectDefs().get(op.affect)

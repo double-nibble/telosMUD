@@ -127,6 +127,39 @@ func TestStorePackRoundTrip(t *testing.T) {
 	if goblin.Living.Attributes["strength"] != 14 {
 		t.Fatalf("round-trip: goblin strength = %v, want 14 (Living attributes lost)", goblin.Living.Attributes["strength"])
 	}
+
+	// Explicitly pin the room-scoped affect round-trip (Phase 6.4a, [G13]): the `web` affect's top-level
+	// Scope ("room") must survive the DB path. It is a pack-GLOBAL def (not zone content), so the zone
+	// DeepEqual above does NOT cover it — exactly the class of gap that hid the mob-Living and (earlier)
+	// the ability_defs drops. AffectDTO.Scope is a first-class field mapped to runtime affectDef.roomScoped
+	// (content_map.go: Scope=="room"); before the affect_defs.scope column it loaded as "" => roomScoped
+	// false, so `web` would attach to one entity instead of the room. We assert the DB-loaded value equals
+	// the embedded-YAML value AND is "room" — a re-break drops it back to "" and this fails directly.
+	yamlWeb := findAffect(fromYAML.Affects, "web")
+	dbWeb := findAffect(fromDB.Affects, "web")
+	if yamlWeb == nil {
+		t.Fatal("round-trip: 'web' affect missing from embedded YAML content (test precondition)")
+	}
+	if yamlWeb.Scope != "room" {
+		t.Fatalf("round-trip: embedded 'web' affect scope = %q, want 'room' (test precondition)", yamlWeb.Scope)
+	}
+	if dbWeb == nil {
+		t.Fatal("round-trip: 'web' affect missing from DB-loaded content")
+	}
+	if dbWeb.Scope != "room" {
+		t.Fatalf("round-trip: 'web' affect scope was DROPPED on the DB path: got %q, want 'room' "+
+			"(room-scoped affect would attach to one entity instead of the room)", dbWeb.Scope)
+	}
+}
+
+// findAffect returns the pack-global AffectDTO with the given ref, or nil.
+func findAffect(affects []content.AffectDTO, ref string) *content.AffectDTO {
+	for i := range affects {
+		if affects[i].Ref == ref {
+			return &affects[i]
+		}
+	}
+	return nil
 }
 
 // findMob returns the mob ProtoDTO with the given ref across all zones, or nil.
@@ -206,6 +239,15 @@ func TestImportPackIdempotent(t *testing.T) {
 	}
 	if lc.DefaultCombat != "melee" {
 		t.Fatalf("after re-import: default_combat = %q, want 'melee'", lc.DefaultCombat)
+	}
+
+	// Room-scoped affect (Phase 6.4a, [G13]): the `web` affect's scope must survive the re-import too —
+	// the affect_defs.scope column is overwritten (not collided) by the strip-and-replace, so a second
+	// import keeps scope='room' rather than reverting to the 'entity' default.
+	if web := findAffect(lc.Affects, "web"); web == nil {
+		t.Fatal("after re-import: 'web' affect missing")
+	} else if web.Scope != "room" {
+		t.Fatalf("after re-import: 'web' affect scope = %q, want 'room'", web.Scope)
 	}
 }
 
