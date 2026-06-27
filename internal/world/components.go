@@ -25,7 +25,7 @@ type Room struct {
 	sector string
 	// flags carries the legacy bitmask room flags (dark/indoor…). Stub: the visibility filter
 	// consults it once content supplies bit flags.
-	flags uint64
+	flags uint64 //nolint:unused // TODO(world-engineer): legacy bitmask room-flags stub; keep until content supplies bit flags
 	// namedFlags is the open-set room flag store (flags.go): builder-authored named booleans like
 	// "safe"/"arena" that the PvP gate (pvp.go) and other content rules read. Populated from the
 	// room DTO at authoring (content_map.go); immutable at runtime this phase. nil => no flags set.
@@ -127,7 +127,7 @@ type PlayerControlled struct {
 
 	// account, aliases, promptCfg, gmcpSupports — per MUDLIB §3. Stubs until the
 	// account model and GMCP negotiation arrive (Phase 8+).
-	account string
+	account string //nolint:unused // TODO(world-engineer): account-model stub (MUDLIB §3); keep until Phase 8+
 	aliases map[string]string
 }
 
@@ -166,13 +166,14 @@ func (*Container) componentKind() Kind { return KindContainer }
 // currently holds (n). A capacity of 0 is unbounded (no authored limit).
 func (c *Container) hasRoom(n int) bool { return c.capacity == 0 || n < c.capacity }
 
-// Wear locations (MUDLIB §3). A Wearable advertises which of these slots it can occupy;
-// a slot maps a worn item to a body location on the wearer. Held/wielded are slots too
-// (the hands), which is why wield/hold share the worn-slot machinery. The set is the
-// classic Diku core; content extends it later. Each is a distinct slot index (NOT a
-// bitmask position) used as the Wearer map key and the Wearable.locations bit shift.
+// WearLoc is a wear-location slot (MUDLIB §3). A Wearable advertises which of these slots it
+// can occupy; a slot maps a worn item to a body location on the wearer. Held/wielded are slots
+// too (the hands), which is why wield/hold share the worn-slot machinery. The set is the classic
+// Diku core; content extends it later. Each is a distinct slot index (NOT a bitmask position)
+// used as the Wearer map key and the Wearable.locations bit shift.
 type WearLoc int
 
+// WearLoc values: the worn-equipment slots. WearLocNone is the not-wearable sentinel.
 const (
 	WearLocNone  WearLoc = iota // sentinel: not wearable anywhere
 	WearLocHead                 // a helmet

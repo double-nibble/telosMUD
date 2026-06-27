@@ -46,7 +46,7 @@ func Migrate(ctx context.Context, dsn string) error {
 	if err != nil {
 		return fmt.Errorf("db: open for migrate: %w", err)
 	}
-	defer sqldb.Close()
+	defer func() { _ = sqldb.Close() }()
 	return MigrateDB(ctx, sqldb)
 }
 

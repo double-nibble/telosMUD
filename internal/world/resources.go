@@ -30,14 +30,14 @@ func resourceCurrent(e *Entity, name string) int {
 	if e == nil || e.living == nil {
 		return 0
 	}
-	max := resourceMax(e, name)
+	maxV := resourceMax(e, name)
 	cur, ok := e.living.resCur[name]
 	if !ok {
 		// No explicit current yet: full when a max is known, else 0 (contentless).
-		return max
+		return maxV
 	}
-	if max > 0 && cur > max {
-		return max
+	if maxV > 0 && cur > maxV {
+		return maxV
 	}
 	if cur < 0 {
 		return 0
@@ -56,12 +56,12 @@ func setResourceCurrent(e *Entity, name string, v int) {
 	if e.living.resCur == nil {
 		e.living.resCur = map[string]int{}
 	}
-	max := resourceMax(e, name)
+	maxV := resourceMax(e, name)
 	if v < 0 {
 		v = 0
 	}
-	if max > 0 && v > max {
-		v = max
+	if maxV > 0 && v > maxV {
+		v = maxV
 	}
 	e.living.resCur[name] = v
 	// If this drops a regen-able pool below its max, make sure the per-entity tick is running so the
@@ -115,17 +115,17 @@ func runRegen(e *Entity) {
 		if def.regen <= 0 {
 			continue
 		}
-		max := resourceMax(e, ref)
-		if max <= 0 {
+		maxV := resourceMax(e, ref)
+		if maxV <= 0 {
 			continue
 		}
 		cur := resourceCurrent(e, ref)
-		if cur >= max {
+		if cur >= maxV {
 			continue
 		}
 		next := cur + def.regen
-		if next > max {
-			next = max
+		if next > maxV {
+			next = maxV
 		}
 		setResourceCurrent(e, ref, next) // clamps defensively too
 	}

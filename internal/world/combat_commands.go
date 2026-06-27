@@ -205,7 +205,7 @@ func cmdConsider(c *Context) error {
 // is the target. Returns the act() template.
 func considerVerdict(actor, target *Entity) string {
 	pa, pt := combatPower(actor), combatPower(target)
-	verdict := "$N looks like a fair fight."
+	var verdict string
 	switch {
 	case pt <= pa*0.5:
 		verdict = "You could kill $N with one hand tied behind your back."

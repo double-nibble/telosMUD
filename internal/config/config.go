@@ -30,14 +30,17 @@ type Config struct {
 	Zones     []string `yaml:"zones"`      // zone ids this shard hosts
 }
 
+// PostgresConfig configures the Postgres connection (the content/character store).
 type PostgresConfig struct {
 	DSN string `yaml:"dsn"`
 }
 
+// RedisConfig configures the Redis connection (the directory).
 type RedisConfig struct {
 	Addr string `yaml:"addr"`
 }
 
+// NATSConfig configures the NATS connection (the comms/events bus).
 type NATSConfig struct {
 	URL string `yaml:"url"`
 }
@@ -49,7 +52,7 @@ func Default() Config {
 		Service:  "telos",
 		Env:      "dev",
 		LogLevel: "info",
-		Postgres: PostgresConfig{DSN: "postgres://telos:telos@localhost:5432/telosmud?sslmode=disable"},
+		Postgres: PostgresConfig{DSN: "postgres://telos:telos@localhost:5432/telosmud?sslmode=disable"}, //nolint:gosec // local-dev default DSN; prod creds come from env
 		Redis:    RedisConfig{Addr: "localhost:6379"},
 		NATS:     NATSConfig{URL: "nats://localhost:4222"},
 
@@ -71,7 +74,7 @@ func PathFromEnv() string { return os.Getenv("TELOS_CONFIG") }
 func Load(path string) (Config, error) {
 	cfg := Default()
 	if path != "" {
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) //nolint:gosec // TODO(config-owner): config path is operator-supplied; validate/confine it
 		switch {
 		case err == nil:
 			if err := yaml.Unmarshal(data, &cfg); err != nil {

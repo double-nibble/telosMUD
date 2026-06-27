@@ -115,14 +115,14 @@ func (d loginDirectory) ShardForCharacter(characterID string) (string, bool) {
 	// Two hops: which shard owns the home zone, then where that shard is reachable.
 	shardID, err := d.redis.ShardForZone(ctx, d.homeZone)
 	if err == nil && shardID != "" {
-		if endpoint, eerr := d.redis.EndpointForShard(ctx, shardID); eerr == nil && endpoint != "" {
+		endpoint, eerr := d.redis.EndpointForShard(ctx, shardID)
+		if eerr == nil && endpoint != "" {
 			slog.Debug("login directory resolved",
 				"component", "gate", "character", characterID,
 				"home_zone", d.homeZone, "shard_id", shardID, "endpoint", endpoint)
 			return endpoint, true
-		} else {
-			err = eerr
 		}
+		err = eerr
 	}
 	slog.Debug("login directory fallback",
 		"component", "gate", "character", characterID,

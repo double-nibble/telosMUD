@@ -207,10 +207,14 @@ func TestEventWidthBudget(t *testing.T) {
 		{kind: "modify_resource", resource: "tally", amount: 1},
 		{kind: "check", check: &checkSpec{dice: d1(t), bands: []checkBand{{label: "x"}}}},
 	}
-	z.defs.res.register("rageA", &resourceDef{ref: "rageA", maxAttr: "max_rage",
-		onEvent: map[eventKind][]effectOp{evOnCheck: handler}})
-	z.defs.res.register("rageB", &resourceDef{ref: "rageB", maxAttr: "max_rage",
-		onEvent: map[eventKind][]effectOp{evOnCheck: handler}})
+	z.defs.res.register("rageA", &resourceDef{
+		ref: "rageA", maxAttr: "max_rage",
+		onEvent: map[eventKind][]effectOp{evOnCheck: handler},
+	})
+	z.defs.res.register("rageB", &resourceDef{
+		ref: "rageB", maxAttr: "max_rage",
+		onEvent: map[eventKind][]effectOp{evOnCheck: handler},
+	})
 	setResourceCurrent(caster.entity, "tally", 0)
 	mob := makeMobTarget(z, caster.entity, "goblin")
 

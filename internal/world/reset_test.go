@@ -25,8 +25,8 @@ func marketTorches(z *Zone) int {
 
 // torchReset is a max-bearing reset op the repop tests drive directly (the demo's own op uses
 // count, not max; a max op is what a timed repop tops up to).
-func torchReset(max int) content.ResetDTO {
-	return content.ResetDTO{Op: "spawn_item", Proto: "midgaard:obj:torch", Room: "midgaard:room:market", Max: max}
+func torchReset(maxN int) content.ResetDTO {
+	return content.ResetDTO{Op: "spawn_item", Proto: "midgaard:obj:torch", Room: "midgaard:room:market", Max: maxN}
 }
 
 // TestRepopTopsUpToMax removes some instances and re-runs the reset, asserting the count returns

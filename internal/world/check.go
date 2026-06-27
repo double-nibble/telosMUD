@@ -299,7 +299,7 @@ func emitCheck(c *effectCtx, spec *checkSpec, res checkResult) {
 // counterpart (c.target — the save's caster, the contested foe) rides as the event `other` so a handler
 // can `target: other`. Synchronous, single-writer, depth-guarded (event.go). Slice 6.2 made this a real
 // dispatch (was reserved-log in 6.1).
-func fireCheckEvent(c *effectCtx, res checkResult) {
+func fireCheckEvent(c *effectCtx, _ checkResult) {
 	if c.z == nil {
 		return
 	}

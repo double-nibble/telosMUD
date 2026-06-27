@@ -44,7 +44,7 @@ import (
 // fight in a zone resolves on this stride, hung off the zone's own heartbeat (no global lockstep). A
 // content ruleset that wants faster/slower rounds tunes this multiple (a future per-pack override is a
 // reserved seam; the constant is the engine default).
-const PULSE_VIOLENCE uint64 = 10
+const PULSE_VIOLENCE uint64 = 10 //nolint:revive // TODO(world-engineer): ALL_CAPS is a deliberate Diku homage; decide rename vs keep (touches combat.go + tests + docs)
 
 // maxSwingsPerRound caps the swings one entity resolves per round, so a runaway `attacks` attribute (a
 // content bug or a haste stack gone wrong) can never spin the single-writer zone goroutine. Far past any
@@ -200,7 +200,7 @@ func (z *Zone) topUpReactions(e *Entity) {
 		if !def.perRound {
 			continue
 		}
-		if max := resourceMax(e, ref); max > 0 {
+		if max := resourceMax(e, ref); max > 0 { //nolint:revive // TODO(world-engineer): rename `max` local (shadows builtin) in the per-round refresh hot path
 			setResourceCurrent(e, ref, max)
 		}
 	}
@@ -342,7 +342,7 @@ func (z *Zone) gatherCombatants() []*Entity {
 // re-read per swing so a swing that ends the fight (the reserved death path) stops the rest of the
 // round. `budget` is the round-shared event budget (runCombatRound) every swing's OnHit/OnDamageTaken
 // threads. Single-writer: zone goroutine.
-func (z *Zone) resolveSwings(attacker *Entity, pulse uint64, budget *int) {
+func (z *Zone) resolveSwings(attacker *Entity, _ uint64, budget *int) {
 	n := int(attr(attacker, "attacks"))
 	if n < 1 {
 		n = 1 // every combatant gets at least one swing (a contentless attacker still swings once)
@@ -406,8 +406,10 @@ func (z *Zone) resolveSwing(attacker, target *Entity, swingIndex int, rng *rand.
 	// profile/ladder skips this entirely. Each avoidance check resolves with the DEFENDER as $actor and
 	// the ATTACKER as $target (so it reads `$actor.dodge` etc.); we build a defender-scoped ctx. -------
 	if dprof := defenderProfile(target); dprof != nil {
-		dc := &effectCtx{z: z, actor: target, source: target, target: attacker,
-			mag: 1, disp: dispNeutral, rng: rng, swingIndex: swingIndex, eventBudget: budget}
+		dc := &effectCtx{
+			z: z, actor: target, source: target, target: attacker,
+			mag: 1, disp: dispNeutral, rng: rng, swingIndex: swingIndex, eventBudget: budget,
+		}
 		for _, av := range dprof.avoidance {
 			res := resolveCheck(dc, av)
 			if res.band != nil {

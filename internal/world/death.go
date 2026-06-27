@@ -118,8 +118,10 @@ func (z *Zone) runDeathHook(dc *effectCtx, ops []effectOp, victim *Entity) {
 // bounded by the SAME round budget as the swing that triggered it (no fresh 256). disp neutral — a
 // harmful op inside re-decides its own disposition and re-gates.
 func (z *Zone) deathCtx(victim, killer *Entity, parent *effectCtx) *effectCtx {
-	c := &effectCtx{z: z, actor: victim, source: victim, target: victim, other: killer,
-		mag: 1, disp: dispNeutral}
+	c := &effectCtx{
+		z: z, actor: victim, source: victim, target: victim, other: killer,
+		mag: 1, disp: dispNeutral,
+	}
 	if parent != nil {
 		c.rng, c.depth, c.eventBudget = parent.rng, parent.depth, parent.eventBudget
 	}

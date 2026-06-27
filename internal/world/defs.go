@@ -86,6 +86,8 @@ func (r *defRegistry[T]) register(ref string, def T) {
 // and Stores it, so every concurrent reader sees the whole old or whole new table, never a partial.
 // This slice never CALLS reload (no invalidation is published yet); it exists so a later slice
 // drops in hot reload without touching the read path. (Kept for symmetry with protoCache.reload.)
+//
+//nolint:unused // TODO(world-engineer): hot-reload hook not yet called (no invalidation published); keep (Phase-N placeholder)
 func (r *defRegistry[T]) reload(ref string, def T) {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
@@ -142,15 +144,19 @@ func newDefRegistries() *defRegistries {
 func (z *Zone) attrDefs() *defRegistry[*attributeDef] {
 	return z.defBundle().attr
 }
+
 func (z *Zone) resourceDefs() *defRegistry[*resourceDef] {
 	return z.defBundle().res
 }
+
 func (z *Zone) damageTypeDefs() *defRegistry[*damageTypeDef] {
 	return z.defBundle().dmg
 }
+
 func (z *Zone) affectDefs() *defRegistry[*affectDef] {
 	return z.defBundle().affect
 }
+
 func (z *Zone) abilityDefs() *defRegistry[*abilityDef] {
 	return z.defBundle().ability
 }

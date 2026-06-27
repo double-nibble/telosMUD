@@ -107,20 +107,20 @@ func (z *Zone) applyReset(r *content.ResetDTO) {
 
 	// The ceiling: max if set, else the boot `count` (>=1). max wins so a repop tops up to a
 	// stable number regardless of the boot seed; count alone (max==0) is a fixed boot placement.
-	max := r.Max
-	if max <= 0 {
-		max = r.Count
-		if max <= 0 {
-			max = 1
+	ceiling := r.Max
+	if ceiling <= 0 {
+		ceiling = r.Count
+		if ceiling <= 0 {
+			ceiling = 1
 		}
 	}
 
 	// Top-up: count the live instances this op owns in the target, spawn only the difference.
 	live := countProto(target, ProtoRef(r.Proto))
-	need := max - live
+	need := ceiling - live
 	if need <= 0 {
 		z.log.Debug("repop no-op (at or above max)", "op", r.Op, "proto", r.Proto,
-			"room", r.Room, "into", r.Into, "live", live, "max", max)
+			"room", r.Room, "into", r.Into, "live", live, "max", ceiling)
 		return
 	}
 	spawned := 0
@@ -134,7 +134,7 @@ func (z *Zone) applyReset(r *content.ResetDTO) {
 		spawned++
 	}
 	z.log.Debug("repop", "zone", z.id, "op", r.Op, "proto", r.Proto, "room", r.Room,
-		"into", r.Into, "live", live, "max", max, "spawned", spawned, "skipped", need-spawned)
+		"into", r.Into, "live", live, "max", ceiling, "spawned", spawned, "skipped", need-spawned)
 }
 
 // countProto returns how many live instances of proto sit directly in target's contents. This is

@@ -83,7 +83,7 @@ func applyRoomAffect(room *Entity, ref string, source *Entity) *affectInstance {
 // attachRoomInstance installs (or refreshes, per the def's stacking) a room affect instance on the room
 // entity's Affected component. It mirrors applyAffect's stacking logic but WITHOUT the Living guard (a
 // room is not Living) and without firing the entity on_apply hook. Single-writer: zone goroutine.
-func attachRoomInstance(room *Entity, a *Affected, def *affectDef, source *Entity) *affectInstance {
+func attachRoomInstance(_ *Entity, a *Affected, def *affectDef, source *Entity) *affectInstance {
 	key := keyFor(def, source)
 	dur := def.duration
 	if existing := a.byKey[key]; existing != nil {
@@ -219,7 +219,7 @@ func roomTickFor(room *Entity) pulseFunc {
 // modifier and runs any on_tick over the CURRENT occupants; it decrements remaining and EXPIRES (clearing
 // the field from occupants) at 0. Snapshots the instance slice so an expiry mid-loop is safe. Single-
 // writer: zone goroutine.
-func roomTickOnce(room *Entity, a *Affected, pulse uint64) {
+func roomTickOnce(room *Entity, a *Affected, _ uint64) {
 	snapshot := make([]*affectInstance, len(a.list))
 	copy(snapshot, a.list)
 	for _, inst := range snapshot {

@@ -126,8 +126,10 @@ func TestSwingHitFormulaDamageWithSoak(t *testing.T) {
 	mob := combatMob(z, s.entity, "dummy", "", 100) // defender: no profile (no avoidance), soak 3
 	z.defs.attr.register("soak_slash", &attributeDef{ref: "soak_slash", base: litNode{v: 3}})
 
-	c := &effectCtx{z: z, actor: s.entity, source: s.entity, target: mob, mag: 1, disp: dispHarmful,
-		rng: rand.New(rand.NewSource(1))}
+	c := &effectCtx{
+		z: z, actor: s.entity, source: s.entity, target: mob, mag: 1, disp: dispHarmful,
+		rng: rand.New(rand.NewSource(1)),
+	}
 	z.resolveSwing(s.entity, mob, 0, c.rng, newBudget())
 
 	// 6 (weapon) + 2 (str_bonus) + 1 (damroll) = 9 raw; soak_slash 3 -> 6 applied. hp 100 -> 94.
@@ -244,10 +246,12 @@ func TestOnHitFiresContentHandler(t *testing.T) {
 	z, s := combatZone(t)
 	// A rage resource the player HAS (max>0), with an OnHit handler that adds 5 rage.
 	z.defs.attr.register("max_rage", &attributeDef{ref: "max_rage", base: litNode{v: 100}})
-	z.defs.res.register("rage", &resourceDef{ref: "rage", maxAttr: "max_rage",
+	z.defs.res.register("rage", &resourceDef{
+		ref: "rage", maxAttr: "max_rage",
 		onEvent: map[eventKind][]effectOp{
 			evOnHit: {{kind: "modify_resource", resource: "rage", amount: 5, tgt: "self"}},
-		}})
+		},
+	})
 	z.defs.combat.register("attacker", autoHitProfile(nil))
 	s.entity.living.combatRef = "attacker"
 	setResourceCurrent(s.entity, "rage", 0)
@@ -441,7 +445,7 @@ func TestCannotMoveWhileFighting(t *testing.T) {
 	}
 	// flee, then the move is allowed.
 	z.stopFight(s.entity)
-	if z.move(s, "north") {
+	if z.move(s, "north") { //nolint:revive,staticcheck // TODO(combat-engineer): empty branch — possibly a silently-non-asserting test; confirm z.move's return was meant to be asserted
 		// a local move returns false (no ownership release); it should SUCCEED (return false) and relocate.
 	}
 	if s.entity.location == z.rooms[z.startRoom] {
@@ -531,9 +535,7 @@ func TestGatherCombatantsDeterministicOrder(t *testing.T) {
 	}
 	// The player IDs must appear in sorted order (Ann, Bob, Hero, Mike, Zed).
 	var players []string
-	for _, id := range first {
-		players = append(players, id)
-	}
+	players = append(players, first...)
 	want := []string{"Ann", "Bob", "Hero", "Mike", "Zed"}
 	if strings.Join(players, ",") != strings.Join(want, ",") {
 		t.Fatalf("player gather order = %v, want %v (sorted by id)", players, want)

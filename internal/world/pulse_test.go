@@ -42,7 +42,7 @@ func TestPulseFiresOnZoneGoroutine(t *testing.T) {
 		// Reading z.players here is only safe because this runs on the zone goroutine.
 		_ = len(z.players)
 		firedFromZone.Store(true)
-		fired <- int(pulse)
+		fired <- int(pulse) //nolint:gosec // TODO(world-engineer): test-only bounded pulse-count conversion
 		return false
 	})
 
@@ -66,7 +66,7 @@ func TestPulseFiresOnZoneGoroutine(t *testing.T) {
 func TestPulsePeriodicAndCancel(t *testing.T) {
 	z := newZone("test")
 	var count atomic.Int64
-	h := z.pulses.every(1, func(pulse uint64) bool {
+	h := z.pulses.every(1, func(_ uint64) bool {
 		count.Add(1)
 		return true
 	})

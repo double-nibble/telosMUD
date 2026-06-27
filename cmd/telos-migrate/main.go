@@ -36,7 +36,7 @@ func main() {
 		slog.Error("open db failed", "err", err)
 		os.Exit(1)
 	}
-	defer sqldb.Close()
+	defer func() { _ = sqldb.Close() }()
 
 	switch cmd {
 	case "up":

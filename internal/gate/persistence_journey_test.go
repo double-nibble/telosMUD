@@ -172,6 +172,8 @@ func TestQuitFlushReliableAfterMove(t *testing.T) {
 // echoAbsent returns true if want does NOT appear in the terminal's output within d. It is
 // the deliberate inverse of terminal.expect — asserting the ABSENCE of an echo, with a
 // bounded wait so the test stays fast and deterministic (no open-ended sleep).
+//
+//nolint:unused // TODO(test-engineer): absence-of-echo assertion scaffolding for journey tests not yet written; keep (Phase-N harness)
 func echoAbsent(term *terminal, want string, d time.Duration) bool {
 	deadline := time.After(d)
 	for {

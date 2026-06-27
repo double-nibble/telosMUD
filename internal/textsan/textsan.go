@@ -53,28 +53,28 @@ func CleanName(s string, maxRunes int) string {
 // capBytes truncates s to at most max bytes, backing off to the nearest rune
 // boundary so a multibyte rune is never split. A string already within the limit is
 // returned unchanged.
-func capBytes(s string, max int) string {
-	if len(s) <= max {
+func capBytes(s string, limit int) string {
+	if len(s) <= limit {
 		return s
 	}
-	for max > 0 && !utf8.RuneStart(s[max]) {
-		max--
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
 	}
-	return s[:max]
+	return s[:limit]
 }
 
 // capRunes truncates s to at most max runes. A string already within the limit is
 // returned unchanged.
-func capRunes(s string, max int) string {
-	if max <= 0 {
+func capRunes(s string, limit int) string {
+	if limit <= 0 {
 		return ""
 	}
-	if utf8.RuneCountInString(s) <= max {
+	if utf8.RuneCountInString(s) <= limit {
 		return s
 	}
 	n := 0
 	for i := range s {
-		if n == max {
+		if n == limit {
 			return s[:i]
 		}
 		n++

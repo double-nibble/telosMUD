@@ -28,7 +28,7 @@ func TestMissingFileIsNotError(t *testing.T) {
 func TestYAMLOverride(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "c.yaml")
 	body := "service: telos-world\nlog_level: debug\nredis:\n  addr: r:6379\n"
-	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil { //nolint:gosec // TODO(config-owner): test-only fixture file perms
 		t.Fatal(err)
 	}
 	cfg, err := Load(p)

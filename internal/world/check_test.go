@@ -31,8 +31,10 @@ func fmtRollDice(roll int) string { return fmt.Sprintf("%dd1", roll) }
 
 // checkCtx builds a deterministic ctx with distinct actor/source/target bindings.
 func checkCtx(z *Zone, actor, source, target *Entity) *effectCtx {
-	return &effectCtx{z: z, actor: actor, source: source, target: target, mag: 1,
-		rng: rand.New(rand.NewSource(1))}
+	return &effectCtx{
+		z: z, actor: actor, source: source, target: target, mag: 1,
+		rng: rand.New(rand.NewSource(1)),
+	}
 }
 
 func d1(t *testing.T) diceSpec {
@@ -50,8 +52,10 @@ func bn(v float64) formulaNode { return litNode{v: v} }
 
 // litEval resolves a literal band-edge formula in a matches() test (no entity scope needed).
 func litEval(n formulaNode) float64 {
-	v, _ := n.eval(&formulaResolver{visited: map[string]bool{},
-		resolve: func(string, map[string]bool) (float64, error) { return 0, nil }})
+	v, _ := n.eval(&formulaResolver{
+		visited: map[string]bool{},
+		resolve: func(string, map[string]bool) (float64, error) { return 0, nil },
+	})
 	return v
 }
 
@@ -364,8 +368,10 @@ func TestCheckBranchStillGated(t *testing.T) {
 			{label: "failure"},
 		},
 	}}
-	c := &effectCtx{z: z, actor: caster.entity, source: caster.entity, target: victim.entity,
-		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
+	c := &effectCtx{
+		z: z, actor: caster.entity, source: caster.entity, target: victim.entity,
+		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1)),
+	}
 	if err := opCheck(c, op); err != nil {
 		t.Fatalf("opCheck: %v", err)
 	}
@@ -393,8 +399,10 @@ func TestCheckVisibility(t *testing.T) {
 	}
 
 	// hide -> no roll line.
-	hide := &checkSpec{label: "Climb", dice: d1(t), bonus: litNode{v: 14}, vs: checkVs{dc: litNode{v: 15}},
-		visibility: visHide, bands: []checkBand{{marginMin: bn(0), label: "success"}, {label: "failure"}}}
+	hide := &checkSpec{
+		label: "Climb", dice: d1(t), bonus: litNode{v: 14}, vs: checkVs{dc: litNode{v: 15}},
+		visibility: visHide, bands: []checkBand{{marginMin: bn(0), label: "success"}, {label: "failure"}},
+	}
 	resolveCheck(c, hide)
 	if out := drainOutputs(caster); len(out) != 0 {
 		t.Fatalf("visHide: want no output, got %v", out)

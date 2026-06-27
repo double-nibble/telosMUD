@@ -42,8 +42,10 @@ func hasAffectRef(e *Entity, ref string) bool {
 // attribution) and `target` as the victim — exactly the path a spell's deal_damage op takes, with NO
 // swing pipeline involved. Returns the applied amount.
 func dealRaw(z *Zone, attacker, target *Entity, raw float64, dmgType string) int {
-	c := &effectCtx{z: z, actor: attacker, source: attacker, target: target,
-		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
+	c := &effectCtx{
+		z: z, actor: attacker, source: attacker, target: target,
+		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1)),
+	}
 	return dealDamage(c, target, raw, dmgType)
 }
 
@@ -202,11 +204,13 @@ func TestDeathWardCancelsDeath(t *testing.T) {
 	})
 	// hp's on_depleted is the death-ward: set hp to 1 (modify_resource +1 from the clamped-0 floor) and
 	// apply rooted. The re-check sees hp > 0 and CANCELS the death — pure content, no engine "cancel".
-	z.defs.res.register("hp", &resourceDef{ref: "hp", maxAttr: "max_hp", vital: true,
+	z.defs.res.register("hp", &resourceDef{
+		ref: "hp", maxAttr: "max_hp", vital: true,
 		onDepleted: []effectOp{
 			{kind: "modify_resource", resource: "hp", amount: 1, tgt: "self"},
 			{kind: "apply_affect", affect: "rooted", tgt: "self"},
-		}})
+		},
+	})
 
 	mob := combatMob(z, s.entity, "wardling", "", 3)
 	room := mob.location
@@ -252,7 +256,8 @@ func TestRecursiveOnDepletedTerminates(t *testing.T) {
 	// hp's on_depleted re-deals 50 lethal damage to SELF — the runaway the auditor reproduced. Each level
 	// empties the (already-0, re-revived-to-0?) pool and would call back into onVitalDepleted forever
 	// without the depth cap. The hook never raises the vital, so the victim stays depleted -> dies.
-	z.defs.res.register("hp", &resourceDef{ref: "hp", maxAttr: "max_hp", vital: true,
+	z.defs.res.register("hp", &resourceDef{
+		ref: "hp", maxAttr: "max_hp", vital: true,
 		onDepleted: []effectOp{{kind: "deal_damage", dmgType: "slash", amount: 50, tgt: "self"}},
 	})
 	mob := combatMob(z, s.entity, "doomling", "", 10)
@@ -278,7 +283,8 @@ func TestPingPongOnDepletedTerminates(t *testing.T) {
 	z, s := combatZone(t)
 	// Both entities share the one hp def whose on_depleted deals lethal damage to `other` (the killer).
 	// A dying -> hits its killer B -> B dies -> hits its killer A -> ... bounded at maxEventDepth.
-	z.defs.res.register("hp", &resourceDef{ref: "hp", maxAttr: "max_hp", vital: true,
+	z.defs.res.register("hp", &resourceDef{
+		ref: "hp", maxAttr: "max_hp", vital: true,
 		onDepleted: []effectOp{{kind: "deal_damage", dmgType: "slash", amount: 50, tgt: "other"}},
 	})
 	a := combatMob(z, s.entity, "alpha", "", 10)
@@ -286,8 +292,10 @@ func TestPingPongOnDepletedTerminates(t *testing.T) {
 
 	// B kills A; A's on_depleted retaliates at `other` (= B), kicking off the ping-pong. The call must
 	// return (terminate) rather than overflow the stack.
-	c := &effectCtx{z: z, actor: b, source: b, target: a, mag: 1, disp: dispHarmful,
-		rng: rand.New(rand.NewSource(1))}
+	c := &effectCtx{
+		z: z, actor: b, source: b, target: a, mag: 1, disp: dispHarmful,
+		rng: rand.New(rand.NewSource(1)),
+	}
 	dealDamage(c, a, 50, "slash")
 
 	// Both ended dead (the hooks only damage; neither revives). The point of the test is that we GET HERE.

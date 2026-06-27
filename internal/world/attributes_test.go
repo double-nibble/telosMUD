@@ -20,6 +20,7 @@ func (m fixedMods) flatMod(ref string) float64 {
 	}
 	return m.flat[ref]
 }
+
 func (m fixedMods) mulMod(ref string) float64 {
 	if m.mul == nil {
 		return 1
@@ -124,9 +125,11 @@ func TestDerivedOfDerived(t *testing.T) {
 	// con=12, level=3, max_hp = con*10 + level*5 = 135.
 	con := &attributeDef{ref: "constitution", base: litNode{v: 12}}
 	lvl := &attributeDef{ref: "level", base: litNode{v: 3}}
-	maxHP := &attributeDef{ref: "max_hp", valueKind: "derived", base: mustParse(t, []any{"+",
+	maxHP := &attributeDef{ref: "max_hp", valueKind: "derived", base: mustParse(t, []any{
+		"+",
 		[]any{"*", []any{"attr", "constitution"}, 10.0},
-		[]any{"*", []any{"attr", "level"}, 5.0}})}
+		[]any{"*", []any{"attr", "level"}, 5.0},
+	})}
 	_, e := testEntityWithDefs(t, []*attributeDef{con, lvl, maxHP}, nil)
 
 	if got := attr(e, "max_hp"); got != 135 {
@@ -141,8 +144,10 @@ func TestDerivedOfDerived(t *testing.T) {
 
 func TestResourceClampedToDerivedMax(t *testing.T) {
 	con := &attributeDef{ref: "constitution", base: litNode{v: 10}}
-	maxHP := &attributeDef{ref: "max_hp", valueKind: "derived",
-		base: mustParse(t, []any{"*", []any{"attr", "constitution"}, 10.0})} // 100
+	maxHP := &attributeDef{
+		ref: "max_hp", valueKind: "derived",
+		base: mustParse(t, []any{"*", []any{"attr", "constitution"}, 10.0}),
+	} // 100
 	hp := &resourceDef{ref: "hp", maxAttr: "max_hp", vital: true}
 	_, e := testEntityWithDefs(t, []*attributeDef{con, maxHP}, []*resourceDef{hp})
 

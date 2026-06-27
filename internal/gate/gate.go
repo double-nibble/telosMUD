@@ -135,7 +135,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // backstop: when handle returns, the socket closes, which unblocks any in-flight
 // writer goroutine's Recv.
 func (s *Server) handle(ctx context.Context, nc net.Conn) {
-	defer nc.Close()
+	defer func() { _ = nc.Close() }()
 	remote := nc.RemoteAddr().String()
 	log := s.log.With("remote", remote)
 	log.Debug("connection accepted")
@@ -253,7 +253,7 @@ type redirectTarget struct {
 // It returns (target, true) when the stream ended in a Redirect — the caller re-dials
 // target. It returns (_, false) when the bridge ended for any other reason (socket
 // EOF, world disconnect, dial/attach failure): the caller tears the connection down.
-func (s *Server) runStream(ctx context.Context, c *connState, addr, token string, resumeSeq uint64) (redirectTarget, bool) {
+func (s *Server) runStream(ctx context.Context, c *connState, addr, token string, resumeSeq uint64) (redirectTarget, bool) { //nolint:revive // TODO(gate-engineer): resumeSeq param is accepted but unused — confirm resume is wired or drop it
 	log := c.log.With("addr", addr)
 
 	cli, err := s.pool.client(addr)

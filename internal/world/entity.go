@@ -163,6 +163,8 @@ func (e *Entity) removeContent(child *Entity) {
 // not use it yet — the real Diku targeting grammar (2.sword, all.coin) is slice 2 — but
 // it is the containment-side hook the resolver will build on, and keeping it here keeps
 // the contents tree the single place containment is queried.
+//
+//nolint:unused // TODO(world-engineer): containment-query hook the resolver will build on; keep (Phase-N placeholder)
 func (e *Entity) contentsByKeyword(word string) []*Entity {
 	var out []*Entity
 	for _, c := range e.contents {

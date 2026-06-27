@@ -95,8 +95,10 @@ func makePlayerTargetInRoom(z *Zone, actor *Entity, name string) *session {
 
 // seededCtx builds a deterministic effectCtx for direct op-handler tests.
 func seededCtx(z *Zone, actor, target *Entity, disp abilityDisposition) *effectCtx {
-	return &effectCtx{z: z, actor: actor, source: actor, target: target, mag: 1, disp: disp,
-		rng: rand.New(rand.NewSource(1))}
+	return &effectCtx{
+		z: z, actor: actor, source: actor, target: target, mag: 1, disp: disp,
+		rng: rand.New(rand.NewSource(1)),
+	}
 }
 
 // --- Effect-op handler tests -------------------------------------------------------------------
@@ -178,7 +180,8 @@ func TestOpIfBranchesOnHasAffect(t *testing.T) {
 	mob := makeMobTarget(z, caster.entity, "goblin")
 	setResourceCurrent(mob, "hp", 100)
 	c := seededCtx(z, caster.entity, mob, dispHarmful)
-	ifOp := &effectOp{kind: "if", affect: "poison",
+	ifOp := &effectOp{
+		kind: "if", affect: "poison",
 		then: []effectOp{{kind: "deal_damage", dmgType: "fire", amount: 50}},
 		els:  []effectOp{{kind: "deal_damage", dmgType: "fire", amount: 5}},
 	}

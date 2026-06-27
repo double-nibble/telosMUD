@@ -324,6 +324,8 @@ func (term *terminal) close(t *testing.T) {
 // with msg otherwise. The deterministic alternative to time.Sleep for an out-of-band
 // condition (a directory placement appearing, a shard count settling) that isn't
 // observable on the player's socket.
+//
+//nolint:unused // TODO(test-engineer): wait-for-condition scaffolding for journey tests not yet written; keep (Phase-N harness)
 func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
 	t.Helper()
 	deadline := time.After(timeout)

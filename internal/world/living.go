@@ -37,12 +37,24 @@ func (e *Entity) ResourceMax(ref string) int { return resourceMax(e, ref) }
 // HP / MaxHP / Mana / MaxMana are the conventional-vital accessors the engine and combat (Phase 6)
 // use. Each is a thin lookup of the corresponding stdlib resource by its conventional ref, so a
 // world whose content omits that resource reports 0 — never a panic, never a stale stub field.
-func (e *Entity) HP() int      { return resourceCurrent(e, resHP) }
-func (e *Entity) MaxHP() int   { return resourceMax(e, resHP) }
-func (e *Entity) Mana() int    { return resourceCurrent(e, resMana) }
+
+// HP returns the entity's current hit points (0 when the world has no HP resource).
+func (e *Entity) HP() int { return resourceCurrent(e, resHP) }
+
+// MaxHP returns the entity's derived maximum hit points (0 when the world has no HP resource).
+func (e *Entity) MaxHP() int { return resourceMax(e, resHP) }
+
+// Mana returns the entity's current mana (0 when the world has no mana resource).
+func (e *Entity) Mana() int { return resourceCurrent(e, resMana) }
+
+// MaxMana returns the entity's derived maximum mana (0 when the world has no mana resource).
 func (e *Entity) MaxMana() int { return resourceMax(e, resMana) }
 
 // SetHP / SetMana set a conventional vital's current, clamped to [0, derived max] (resources.go).
 // Single-writer: zone goroutine. A no-op when the entity has no Living.
-func (e *Entity) SetHP(v int)   { setResourceCurrent(e, resHP, v) }
+
+// SetHP sets the entity's current hit points, clamped to [0, MaxHP].
+func (e *Entity) SetHP(v int) { setResourceCurrent(e, resHP, v) }
+
+// SetMana sets the entity's current mana, clamped to [0, MaxMana].
 func (e *Entity) SetMana(v int) { setResourceCurrent(e, resMana, v) }

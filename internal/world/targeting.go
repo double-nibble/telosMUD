@@ -27,6 +27,7 @@ import "strings"
 // bare `sword` resolves room-floor-then-inventory (or whatever order the verb declares).
 type Scope int
 
+// Scope values: where a keyword-resolve search looks for its target.
 const (
 	ScopeInventory  Scope = iota // the actor's own contents (inventory)
 	ScopeEquipment               // worn/wielded items (functional in slice 4)
@@ -375,6 +376,6 @@ func areaTargets(c *effectCtx, area string) []*Entity {
 // chokepoint the resolver consults, so when content supplies dark/invis/hidden flags
 // (Phase 5+) the rule lands here and every command inherits it — and, critically, the
 // can't-see leak surface (see act.go) is gated by the SAME predicate.
-func (z *Zone) canSee(actor, target *Entity) bool {
+func (z *Zone) canSee(_, _ *Entity) bool {
 	return true
 }

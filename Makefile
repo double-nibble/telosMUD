@@ -1,9 +1,10 @@
 GO ?= go
 COMPOSE ?= docker compose -f deploy/docker-compose.yml
 
-# DSN for the gated Postgres integration tests (internal/store/*_test.go). It is the
-# same address `make deps` exposes; export TELOS_TEST_DSN to make the gated tests RUN
-# instead of t.Skip. test-integration sets it for you.
+# DSN for the gated Postgres integration tests (tests/integration + the co-located
+# internal/store/*_test.go). It is the same address `make deps` exposes; export
+# TELOS_TEST_DSN to make the gated tests RUN instead of t.Skip. test-integration sets
+# it for you.
 TELOS_TEST_DSN ?= postgres://telos:telos@localhost:5432/telosmud?sslmode=disable
 
 .DEFAULT_GOAL := help
@@ -33,19 +34,20 @@ test-race: ## Run all tests (with race)
 
 test-integration: ## Run the GATED Postgres integration tests (needs `make deps` up)
 	@echo "Running gated integration tests against $(TELOS_TEST_DSN)"
-	TELOS_TEST_DSN="$(TELOS_TEST_DSN)" $(GO) test -count=1 ./internal/store/... -run 'TestStorePackRoundTrip|TestImportPackIdempotent|TestCharacterCRUD' -v
+	TELOS_TEST_DSN="$(TELOS_TEST_DSN)" $(GO) test -count=1 ./tests/integration/... ./internal/store/... -v
 
 smoke: ## Bring up the full docker stack and assert it is healthy + seed exits 0 + a player can look
-	./scripts/smoke.sh
+	./tests/smoke/smoke.sh
 
 smoke-twice: ## Smoke, but bring the stack up TWICE on the same volume (the re-seed/idempotency catch)
-	./scripts/smoke.sh --twice
+	./tests/smoke/smoke.sh --twice
 
 vet: ## go vet
 	$(GO) vet ./...
 
-lint: ## golangci-lint (skips if not installed)
-	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run || echo "golangci-lint not installed; skipping"
+lint: ## golangci-lint run (the project standard; install: https://golangci-lint.run/welcome/install)
+	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not installed — see https://golangci-lint.run/welcome/install"; exit 1; }
+	golangci-lint run
 
 build: ## Build all binaries into ./bin
 	$(GO) build -o bin/ ./cmd/...

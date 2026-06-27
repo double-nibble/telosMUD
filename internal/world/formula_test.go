@@ -42,9 +42,11 @@ func TestFormulaArithmetic(t *testing.T) {
 		{"clamp-hi", []any{"clamp", 99.0, 0.0, 10.0}, 10},
 		{"clamp-mid", []any{"clamp", 5.0, 0.0, 10.0}, 5},
 		// con*10 + level*5 with con=10, level=2 = 110
-		{"nested", []any{"+",
+		{"nested", []any{
+			"+",
 			[]any{"*", []any{"attr", "con"}, 10.0},
-			[]any{"*", []any{"attr", "level"}, 5.0}}, 110},
+			[]any{"*", []any{"attr", "level"}, 5.0},
+		}, 110},
 	}
 	attrs := map[string]float64{"con": 10, "level": 2}
 	for _, c := range cases {
@@ -134,9 +136,11 @@ func TestLintAttributeCyclesDetects(t *testing.T) {
 	acyclic := map[string]*attributeDef{
 		"con":   {ref: "con", base: litNode{v: 10}},
 		"level": {ref: "level", base: litNode{v: 1}},
-		"max_hp": mk("max_hp", []any{"+",
+		"max_hp": mk("max_hp", []any{
+			"+",
 			[]any{"*", []any{"attr", "con"}, 10.0},
-			[]any{"*", []any{"attr", "level"}, 5.0}}),
+			[]any{"*", []any{"attr", "level"}, 5.0},
+		}),
 	}
 	if errs := lintAttributeCycles(acyclic); len(errs) != 0 {
 		t.Fatalf("acyclic graph flagged: %v", errs)

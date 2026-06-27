@@ -1,0 +1,75 @@
+# golangci-lint configuration (schema v2 — golangci-lint >= 2.x).
+#
+# A sensible, not-overly-strict default set for a mature Go codebase. Project rule:
+# run `golangci-lint run` locally before committing (CI runs it too). See docs/TESTING.md.
+#
+# We use `default: none` + an explicit enable list so the set is predictable and every
+# enabled linter is a deliberate, documented choice rather than whatever the tool's
+# "standard"/"all" preset happens to include this release.
+version: "2"
+
+run:
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    # errcheck    — unchecked error returns. The class that lets a real failure pass
+    #               silently (the spirit of the seed-bug: a swallowed error is invisible).
+    - errcheck
+    # govet       — go vet's suspicious-construct passes (printf, copylocks, etc).
+    - govet
+    # ineffassign — assignments to a variable that are never read.
+    - ineffassign
+    # staticcheck — the staticcheck correctness + simplification rule set.
+    - staticcheck
+    # unused      — unused constants, vars, funcs, and types.
+    - unused
+    # misspell    — commonly-misspelled English words in comments/strings. High signal.
+    - misspell
+    # unconvert   — redundant type conversions (safe, mechanical cleanups).
+    - unconvert
+    # gosec       — security-focused static analysis (weak rng in a security context,
+    #               unhandled errors in sensitive spots, file-perm bits, etc).
+    - gosec
+    # revive      — fast, configurable golint successor: a broad style + correctness
+    #               net (exported-doc, naming, early-return, unreachable code, ...).
+    - revive
+  exclusions:
+    generated: lax
+    rules:
+      # Test files legitimately ignore errors in cleanup/teardown; keep errcheck loud
+      # in production code without flagging _, _ = cleanup() patterns in tests.
+      - path: _test\.go
+        linters:
+          - errcheck
+      # gosec in test files: G404 (weak RNG) is the deliberate determinism standard —
+      # tests seed math/rand for reproducibility, which is correct, not a security
+      # weakness. G104 (unhandled errors) is teardown/scaffolding noise, same rationale
+      # as the errcheck test exclude above. Production gosec stays fully enforced (the
+      # handful of production G404/G101 sites carry explicit, reasoned //nolint instead).
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "(G404|G104)"
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  # gofmt is the baseline; gofumpt is the stricter superset. `golangci-lint fmt`
+  # applies these; `run` reports files that need formatting.
+  enable:
+    - gofmt
+    - gofumpt
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

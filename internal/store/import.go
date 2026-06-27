@@ -10,7 +10,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/content"
 )
 
-// import.go is the content WRITE path used by `make seed` (cmd/telos-seed): it loads a parsed
+// ImportPack is the content WRITE path used by `make seed` (cmd/telos-seed): it loads a parsed
 // content.Pack (from the same embedded YAML the tests use) into the definition rows. It is the
 // "import (file->rows)" half of decision D4; export (rows->file) is a later concern. Seeding
 // is idempotent per pack: it DELETEs the pack's existing rows then re-inserts, so re-running
@@ -197,8 +197,10 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 	}
 	for _, r := range pk.Resources {
-		body, _ := json.Marshal(resourceBody{Regen: r.Regen, DepletedThreshold: r.DepletedThreshold,
-			OnEvent: r.OnEvent, OnDepleted: r.OnDepleted, PerRound: r.PerRound})
+		body, _ := json.Marshal(resourceBody{
+			Regen: r.Regen, DepletedThreshold: r.DepletedThreshold,
+			OnEvent: r.OnEvent, OnDepleted: r.OnDepleted, PerRound: r.PerRound,
+		})
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO resource_defs (ref, pack, display_name, max_attr, vital, body)
 			 VALUES ($1,$2,$3,$4,$5,$6)`,

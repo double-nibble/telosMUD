@@ -6,7 +6,7 @@ import (
 )
 
 func TestCleanLine(t *testing.T) {
-	nel := "a" + "" + "b" // U+0085 NEL is a C1 control rune
+	nel := "a" + "" + "b" //nolint:staticcheck // intentional U+0085 NEL control-rune fixture for the sanitizer
 	bad := "ab\xffcd"      // 0xff is invalid UTF-8
 	tests := []struct {
 		name string
@@ -57,8 +57,8 @@ func TestCleanLineCapNeverSplitsRune(t *testing.T) {
 }
 
 func TestCleanName(t *testing.T) {
-	const max = 20
-	zwsp := "Wal" + "​" + "ker" // U+200B zero-width space (category Cf) is non-printable
+	const maxLen = 20
+	zwsp := "Wal" + "​" + "ker" //nolint:staticcheck // intentional U+200B zero-width-space fixture for the sanitizer
 	tests := []struct {
 		name string
 		in   string
@@ -68,12 +68,12 @@ func TestCleanName(t *testing.T) {
 		{"strips control runes", "Wa\x1blker\x07", "Walker"},
 		{"strips non-printable", zwsp, "Walker"},
 		{"keeps accented letters", "Élodie", "Élodie"},
-		{"caps length", strings.Repeat("x", 50), strings.Repeat("x", max)},
+		{"caps length", strings.Repeat("x", 50), strings.Repeat("x", maxLen)},
 		{"empty", "", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := CleanName(tt.in, max); got != tt.want {
+			if got := CleanName(tt.in, maxLen); got != tt.want {
 				t.Fatalf("CleanName(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})

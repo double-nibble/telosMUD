@@ -247,9 +247,9 @@ func (c *Conn) refuse(cmd, opt byte) {
 	)
 	switch cmd {
 	case doo:
-		c.writeRaw([]byte{iac, wont, opt})
+		c.writeRaw([]byte{iac, wont, opt}) //nolint:errcheck,gosec // TODO(edge-engineer): mid-protocol write; decide whether a failed telnet-negotiation write should drop the session
 	case will:
-		c.writeRaw([]byte{iac, dont, opt})
+		c.writeRaw([]byte{iac, dont, opt}) //nolint:errcheck,gosec // TODO(edge-engineer): mid-protocol write; decide whether a failed telnet-negotiation write should drop the session
 	}
 }
 

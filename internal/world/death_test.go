@@ -223,10 +223,12 @@ func TestOnKillFiresWithKillerAsSubject(t *testing.T) {
 	z, s := combatZone(t)
 	// An "honor" resource the killer HAS, with an OnKill handler that adds 7.
 	z.defs.attr.register("max_honor", &attributeDef{ref: "max_honor", base: litNode{v: 100}})
-	z.defs.res.register("honor", &resourceDef{ref: "honor", maxAttr: "max_honor",
+	z.defs.res.register("honor", &resourceDef{
+		ref: "honor", maxAttr: "max_honor",
 		onEvent: map[eventKind][]effectOp{
 			evOnKill: {{kind: "modify_resource", resource: "honor", amount: 7, tgt: "self"}},
-		}})
+		},
+	})
 	z.defs.combat.register("killer", killShotProfile(100))
 	s.entity.living.combatRef = "killer"
 	setResourceCurrent(s.entity, "honor", 0)
@@ -246,8 +248,10 @@ func TestOnKillFiresWithKillerAsSubject(t *testing.T) {
 func TestOnDepletedHookRunsBeforeDeath(t *testing.T) {
 	z, s := combatZone(t)
 	// hp's on_depleted heals the victim to 50 — a content "second wind" that prevents death.
-	z.defs.res.register("hp", &resourceDef{ref: "hp", maxAttr: "max_hp", vital: true,
-		onDepleted: []effectOp{{kind: "modify_resource", resource: "hp", amount: 50, tgt: "self"}}})
+	z.defs.res.register("hp", &resourceDef{
+		ref: "hp", maxAttr: "max_hp", vital: true,
+		onDepleted: []effectOp{{kind: "modify_resource", resource: "hp", amount: 50, tgt: "self"}},
+	})
 	z.defs.combat.register("killer", killShotProfile(100))
 	s.entity.living.combatRef = "killer"
 	equipWeapon(s.entity, &Weapon{diceNum: 6, diceSize: 1, damageType: "slash"})

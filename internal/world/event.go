@@ -1,6 +1,7 @@
 package world
 
 import (
+	"context"
 	"log/slog"
 	"math/rand"
 	"sort"
@@ -188,7 +189,7 @@ func (z *Zone) fireEvent(parent *effectCtx, kind eventKind, subject, other *Enti
 			return
 		}
 		*budget--
-		if z.log.Enabled(nil, slog.LevelDebug) {
+		if z.log.Enabled(context.Background(), slog.LevelDebug) {
 			z.log.Debug("event fire", "event", string(kind), "subject", subject.short,
 				"origin", h.origin, "depth", depth+1)
 		}

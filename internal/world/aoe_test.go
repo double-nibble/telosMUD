@@ -93,8 +93,10 @@ func TestAoEPerTargetGate(t *testing.T) {
 	// Force EVERYONE to FAIL the save (full 8) so the per-target GATE — not the save — decides who is
 	// hurt: a high spell DC + zero dex_save means total(1d20+0) < 13 unless a nat-high; seed so both
 	// roll low. Simpler: pin the outcome with a deterministic rng that yields low d20 faces.
-	c := &effectCtx{z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
-		rng: rand.New(rand.NewSource(7))}
+	c := &effectCtx{
+		z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
+		rng: rand.New(rand.NewSource(7)),
+	}
 	runOps(c, def.ops)
 
 	// The mob took damage (8 on a failed save, or 4 on a save — either way < 100); the player took NONE.
@@ -108,8 +110,10 @@ func TestAoEPerTargetGate(t *testing.T) {
 	// With PvP consent on both sides, the SAME AoE now harms the player too (the gate opens per target).
 	setFlag(caster.entity, flagPvP, true)
 	setFlag(bystander.entity, flagPvP, true)
-	c2 := &effectCtx{z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
-		rng: rand.New(rand.NewSource(7))}
+	c2 := &effectCtx{
+		z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
+		rng: rand.New(rand.NewSource(7)),
+	}
 	runOps(c2, def.ops)
 	if got := resourceCurrent(bystander.entity, "hp"); got >= 100 {
 		t.Fatalf("consented AoE must harm the player: hp %d, want < 100", got)
@@ -129,8 +133,10 @@ func TestAoESaveHalvesPerTarget(t *testing.T) {
 	setAttrBase(failer, "dex_save", -100) // total = 1d20 - 100 < 13 always => fail band (8 dmg)
 
 	def := fireballAreaDef()
-	c := &effectCtx{z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
-		rng: rand.New(rand.NewSource(1))}
+	c := &effectCtx{
+		z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
+		rng: rand.New(rand.NewSource(1)),
+	}
 	runOps(c, def.ops)
 
 	if got := resourceCurrent(saver, "hp"); got != 96 {
@@ -150,8 +156,10 @@ func TestAoEExcludesCaster(t *testing.T) {
 	_ = aoeMob(z, room, "goblin", 100)
 
 	def := fireballAreaDef()
-	c := &effectCtx{z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
-		rng: rand.New(rand.NewSource(3))}
+	c := &effectCtx{
+		z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
+		rng: rand.New(rand.NewSource(3)),
+	}
 	runOps(c, def.ops)
 	if got := resourceCurrent(caster.entity, "hp"); got != 100 {
 		t.Fatalf("a harmful room AoE must exclude the caster: hp %d, want 100", got)
@@ -195,8 +203,10 @@ func TestAoERoomAndAdjacentSameZoneContainment(t *testing.T) {
 	def.area = "room_and_adjacent"
 	def.ops[0].area = "room_and_adjacent"
 
-	c := &effectCtx{z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
-		rng: rand.New(rand.NewSource(1))}
+	c := &effectCtx{
+		z: z, actor: caster.entity, source: caster.entity, mag: 1, disp: dispHarmful,
+		rng: rand.New(rand.NewSource(1)),
+	}
 	runOps(c, def.ops)
 
 	if got := resourceCurrent(near, "hp"); got != 92 {

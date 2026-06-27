@@ -142,7 +142,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		os.Exit(1)
 	}
 	slog.Info("registered shard", "shard_id", cfg.ShardID, "endpoint", cfg.ShardAddr, "lease", directory.DefaultShardLease)
-	go renewShardRegistration(ctx, dir, cfg.ShardID, cfg.ShardAddr)
+	go renewShardRegistration(ctx, dir, cfg.ShardID, cfg.ShardAddr) //nolint:gosec // TODO(distributed-systems): confirm ctx is the right lifetime for the renewal goroutine
 
 	// Claim an EXCLUSIVE lease on EACH zone, owned by this shard's id. A live, different
 	// shard already owning one is a misconfiguration we refuse to start with — rather
@@ -163,7 +163,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		// Keep each lease alive while we run; release it on shutdown so another shard can
 		// take over immediately instead of waiting out the lease. stop fences us if we
 		// ever lose any lease.
-		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardID)
+		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardID) //nolint:gosec // TODO(distributed-systems): confirm ctx is the right lifetime for the lease goroutine
 	}
 
 	return world.NewShardFromContent(lc, zones, home, cfg.ShardAddr, dir, world.GRPCDialer()).

@@ -29,7 +29,7 @@ func slicePtr(s []string) uintptr {
 	if len(s) == 0 {
 		return 0
 	}
-	return uintptr(unsafe.Pointer(&s[0]))
+	return uintptr(unsafe.Pointer(&s[0])) //nolint:gosec // TODO(world-engineer): test-only unsafe pointer-identity helper
 }
 
 func TestSpawnSharesImmutableFields(t *testing.T) {

@@ -75,14 +75,14 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 
 // Commit is an idempotent no-op: the destination self-commits when the gate's stream
 // binds the pending player (see Zone.attach). Kept for the explicit-lifecycle path.
-func (h *handoffServer) Commit(ctx context.Context, req *handoffv1.CommitRequest) (*handoffv1.CommitResponse, error) {
+func (h *handoffServer) Commit(_ context.Context, _ *handoffv1.CommitRequest) (*handoffv1.CommitResponse, error) {
 	return &handoffv1.CommitResponse{}, nil
 }
 
 // Abort discards a pending player whose handoff was cancelled by the source. The token
 // index names the zone that prepared it; absent that, broadcast to every hosted zone
 // (the matching one discards, the rest no-op).
-func (h *handoffServer) Abort(ctx context.Context, req *handoffv1.AbortRequest) (*handoffv1.AbortResponse, error) {
+func (h *handoffServer) Abort(_ context.Context, req *handoffv1.AbortRequest) (*handoffv1.AbortResponse, error) {
 	token := req.GetHandoffToken()
 	if z := h.shard.zoneForToken(token); z != nil {
 		z.post(abortPendingMsg{token: token})

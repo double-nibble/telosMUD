@@ -8,7 +8,10 @@ package world
 // from the pulse scheduler). No DB I/O. The cardinal concurrency piece is the tick's resolve-by-id/
 // skip-frozen contract (pulse.go pulseFunc doc comment) — see affectTickFor.
 
-import "log/slog"
+import (
+	"context"
+	"log/slog"
+)
 
 // attachOpts carries the optional knobs an apply_affect op supplies. Zero values mean "use the def's
 // defaults" (duration from the def, magnitude 1, the def's stacking). reattach=true is the persistence
@@ -180,6 +183,8 @@ func (a *Affected) ensureTick(e *Entity) {
 
 // maybeStopTick cancels the per-entity tick when the entity no longer has affects OR a regen need.
 // Called at the end of a tick. Zone goroutine only.
+//
+//nolint:unused // TODO(world-engineer): tick-stop helper not yet wired into the tick path; keep (Phase-N placeholder)
 func (a *Affected) maybeStopTick(e *Entity) {
 	if a.tick == nil {
 		return
@@ -234,10 +239,7 @@ func affectTickFor(z *Zone, id string, fallback *Entity) pulseFunc {
 			// No affects component (e.g. tick kept alive purely for regen, then the component was
 			// never created): just regen and decide whether to keep going.
 			runRegen(e)
-			if !needsRegen(e) {
-				return false
-			}
-			return true
+			return needsRegen(e)
 		}
 		a.tickOnce(e, pulse)
 		// Decide whether to keep the tick alive (affects remain or regen still needed).
@@ -317,7 +319,7 @@ func fireOnTick(e *Entity, inst *affectInstance, pulse uint64) {
 			"ref", inst.def.ref, "rid", e.rid)
 		return
 	}
-	if e.zone.log.Enabled(nil, slog.LevelDebug) {
+	if e.zone.log.Enabled(context.Background(), slog.LevelDebug) {
 		e.zone.log.Debug("affect on_tick", "ref", inst.def.ref,
 			"rid", e.rid, "stacks", inst.stacks, "pulse", pulse)
 	}

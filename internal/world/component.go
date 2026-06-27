@@ -20,6 +20,7 @@ import "reflect"
 // human/serialization-facing label.
 type Kind int
 
+// Kind values: the entity-kind tags an Entity carries. KindInvalid is the zero value.
 const (
 	KindInvalid Kind = iota
 	KindPhysical

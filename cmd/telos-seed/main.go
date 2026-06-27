@@ -56,7 +56,7 @@ func main() {
 		slog.Warn("content bus unreachable; rows seeded but running shards not hot-reloaded", "err", err)
 		return
 	}
-	defer bus.Close()
+	defer func() { _ = bus.Close() }()
 	n, err := contentbus.PublishPack(ctx, bus, pack)
 	if err != nil {
 		slog.Warn("publishing content invalidations failed (partial)", "published", n, "err", err)

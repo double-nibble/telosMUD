@@ -23,8 +23,10 @@ func damageZone(t *testing.T) (*Zone, *session, *Entity) {
 }
 
 func dmgCtx(z *Zone, actor, target *Entity) *effectCtx {
-	return &effectCtx{z: z, actor: actor, source: actor, target: target, mag: 1,
-		rng: rand.New(rand.NewSource(1))}
+	return &effectCtx{
+		z: z, actor: actor, source: actor, target: target, mag: 1,
+		rng: rand.New(rand.NewSource(1)),
+	}
 }
 
 // TestDealDamageScopedBonus: a weapon's "+ $actor.damroll + $actor.str_bonus" adds the ATTACKER's
@@ -34,9 +36,12 @@ func TestDealDamageScopedBonus(t *testing.T) {
 	setAttrBase(caster.entity, "str_bonus", 4)
 	setAttrBase(caster.entity, "damroll", 2)
 
-	op := &effectOp{kind: "deal_damage", dmgType: "fire", amount: 0,
+	op := &effectOp{
+		kind: "deal_damage", dmgType: "fire", amount: 0,
 		bonus: opNode{op: "+", args: []formulaNode{
-			attrNode{ref: "$actor.damroll"}, attrNode{ref: "$actor.str_bonus"}}}}
+			attrNode{ref: "$actor.damroll"}, attrNode{ref: "$actor.str_bonus"},
+		}},
+	}
 	c := dmgCtx(z, caster.entity, mob)
 	if err := opDealDamage(c, op); err != nil {
 		t.Fatalf("opDealDamage: %v", err)
@@ -53,9 +58,12 @@ func TestDealDamageDiceCountFormula(t *testing.T) {
 	z, caster, mob := damageZone(t)
 	setAttrBase(caster.entity, "level", 5) // ceil(5/2) = 3
 
-	op := &effectOp{kind: "deal_damage", dmgType: "fire", diceSize: 1,
+	op := &effectOp{
+		kind: "deal_damage", dmgType: "fire", diceSize: 1,
 		diceCount: opNode{op: "ceil", args: []formulaNode{
-			opNode{op: "/", args: []formulaNode{attrNode{ref: "$actor.level"}, litNode{v: 2}}}}}}
+			opNode{op: "/", args: []formulaNode{attrNode{ref: "$actor.level"}, litNode{v: 2}}},
+		}},
+	}
 	c := dmgCtx(z, caster.entity, mob)
 	if err := opDealDamage(c, op); err != nil {
 		t.Fatalf("opDealDamage: %v", err)

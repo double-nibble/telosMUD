@@ -44,8 +44,10 @@ func reactionZone(t *testing.T) (*Zone, *session, *Entity) {
 				kind: "if", ifResource: "reactions", ifResourceMin: 1,
 				then: []effectOp{
 					{kind: "modify_resource", resource: "reactions", amount: -1},
-					{kind: "deal_damage", tgt: "other", dmgType: "slash", diceNum: 1, diceSize: 1,
-						bonus: attrNode{ref: "$actor.strength_bonus"}},
+					{
+						kind: "deal_damage", tgt: "other", dmgType: "slash", diceNum: 1, diceSize: 1,
+						bonus: attrNode{ref: "$actor.strength_bonus"},
+					},
 				},
 			}},
 		},

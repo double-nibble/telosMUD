@@ -31,7 +31,7 @@ func randIntn(n int) int {
 	if n <= 0 {
 		return 0
 	}
-	return rand.Intn(n)
+	return rand.Intn(n) //nolint:gosec // seeded for gameplay determinism, not security
 }
 
 // opDealDamage: deal_damage(target, {amount|<N>d<S>, type}). Routes through the SHARED mitigation

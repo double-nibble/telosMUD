@@ -1,6 +1,7 @@
 package world
 
 import (
+	"context"
 	"log/slog"
 	"math/rand"
 )
@@ -77,7 +78,7 @@ func (c *effectCtx) rollChance(p float64) bool {
 	if c.rng != nil {
 		return c.rng.Float64() < p
 	}
-	return rand.Float64() < p
+	return rand.Float64() < p //nolint:gosec // seeded for gameplay determinism, not security
 }
 
 // effectOp is one parsed op of an op-list: its kind plus the decoded argument bag, plus the nested
@@ -204,7 +205,7 @@ func runOps(c *effectCtx, ops []effectOp) {
 				c.target = c.other
 			}
 		}
-		if c.z.log.Enabled(nil, slog.LevelDebug) {
+		if c.z.log.Enabled(context.Background(), slog.LevelDebug) {
 			c.z.log.Debug("effect op", "op", op.kind, "actor", c.actor.short,
 				"target", targetShort(c.target), "disp", int(c.disp))
 		}
@@ -227,7 +228,7 @@ func runOpArea(c *effectCtx, op *effectOp, h effectOpHandler) {
 	prev := c.target
 	for _, t := range targets {
 		c.target = t
-		if c.z.log.Enabled(nil, slog.LevelDebug) {
+		if c.z.log.Enabled(context.Background(), slog.LevelDebug) {
 			c.z.log.Debug("effect op (area)", "op", op.kind, "area", op.area,
 				"actor", c.actor.short, "target", targetShort(t), "disp", int(c.disp))
 		}

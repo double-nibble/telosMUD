@@ -55,7 +55,7 @@ func (p *Pool) LoadCharacter(ctx context.Context, name string) (world.CharSnapsh
 		Name:         name,
 		ZoneRef:      derefStr(zoneRef),
 		RoomRef:      derefStr(roomRef),
-		StateVersion: uint64(stateVersion),
+		StateVersion: uint64(stateVersion), //nolint:gosec // TODO(persistence-engineer): bounded state_version counter; add explicit non-negative guard
 	}
 	if len(stateJSON) > 0 {
 		if err := json.Unmarshal(stateJSON, &snap.State); err != nil {
@@ -111,7 +111,7 @@ func (p *Pool) SaveCharacter(ctx context.Context, snap world.CharSnapshot) (uint
 		        last_saved_at = now()
 		  WHERE id = $4 AND state_version = $5
 		 RETURNING state_version`,
-		stateJSON, nullStr(snap.ZoneRef), nullStr(snap.RoomRef), id, int64(snap.StateVersion)).
+		stateJSON, nullStr(snap.ZoneRef), nullStr(snap.RoomRef), id, int64(snap.StateVersion)). //nolint:gosec // TODO(persistence-engineer): bounded state_version counter; add explicit non-negative guard
 		Scan(&newVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// CAS lost: the stored state_version moved past snap.StateVersion (or the row is gone).
@@ -120,7 +120,7 @@ func (p *Pool) SaveCharacter(ctx context.Context, snap world.CharSnapshot) (uint
 	if err != nil {
 		return 0, false, fmt.Errorf("store: save character %q: %w", snap.Name, err)
 	}
-	return uint64(newVersion), true, nil
+	return uint64(newVersion), true, nil //nolint:gosec // TODO(persistence-engineer): bounded state_version counter; add explicit non-negative guard
 }
 
 // derefStr returns the pointed-to string, or "" for a SQL NULL.

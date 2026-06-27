@@ -306,7 +306,7 @@ func (z *Zone) move(s *session, dir string) bool {
 // Single-writer note: once the session is removed here and posted to dest, only dest's
 // goroutine touches the session/entity. The brief overlap is bounded by handing them off
 // through the inbox, never by sharing them across two live owners.
-func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string, from *Entity) {
+func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string, _ *Entity) {
 	// Combat exclusion is ENFORCED in move() (refuses while posFighting), so a fighting player never
 	// reaches here. disengage anyway, BEFORE detaching from the room: no `fighting` pointer or
 	// posFighting may cross to dest's goroutine (the transferred entity would otherwise carry a SOURCE-
