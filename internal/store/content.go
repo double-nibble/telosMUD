@@ -32,6 +32,12 @@ type protoBody struct {
 	Wearable  *content.WearableDTO  `json:"wearable,omitempty"`
 	Weapon    *content.WeaponDTO    `json:"weapon,omitempty"`
 	Container *content.ContainerDTO `json:"container,omitempty"`
+	// Living is the mob-statting block (Phase 6.3a): the per-entity attribute base overrides + the
+	// combat_profile ref. It rides the SAME mob_prototypes.body JSONB as the other component
+	// templates (the schema's "living/mob/AI components" tail). Without it a DB round-trip dropped
+	// the goblin's stat sheet (Living went nil), so the swing pipeline had no mob numbers — the gap
+	// TestStorePackRoundTrip caught. nil for every inert item (omitempty keeps their body unchanged).
+	Living *content.LivingDTO `json:"living,omitempty"`
 }
 
 // LoadPacks implements content.Source: it reads every loaded definition for the enabled packs
@@ -185,6 +191,7 @@ func (p *Pool) loadProtoDefinition(ctx context.Context, table, kind, ref, pack s
 			return content.Definition{}, fmt.Errorf("store: %s %s body: %w", table, ref, err)
 		}
 		d.Physical, d.Wearable, d.Weapon, d.Container = b.Physical, b.Wearable, b.Weapon, b.Container
+		d.Living = b.Living
 	}
 	return content.Definition{Kind: kind, Ref: ref, Found: true, Proto: d}, nil
 }
@@ -278,6 +285,7 @@ func (p *Pool) loadPrototypes(ctx context.Context, enabled []string, zones map[s
 					return fmt.Errorf("store: %s %s body: %w", table, d.Ref, err)
 				}
 				d.Physical, d.Wearable, d.Weapon, d.Container = b.Physical, b.Wearable, b.Weapon, b.Container
+				d.Living = b.Living
 			}
 			z := zones[zoneRef]
 			if z == nil {
@@ -343,6 +351,23 @@ type dmgBody struct {
 // (duration/modifiers/prevents/tick + the reserved on_apply/on_expire/resist hooks). It is the
 // same DTO the embedded YAML carries, so a DB round-trip reproduces the same affect.
 type affectBody = content.AffectBodyDTO
+
+// combatProfileBody is the JSONB-tail shape for a combat_profile_defs row (Phase 6.3a): the to-hit
+// check, the ordered avoidance ladder, and the damage-bonus formula. ref+pack are first-class; the
+// SHAPE of every check/formula is content, carried generically (the world mapper parses it), so the
+// whole body mirrors content.CombatProfileDTO minus its Ref (which is the relational PK column).
+type combatProfileBody struct {
+	ToHit       any                    `json:"to_hit,omitempty"`
+	Avoidance   []any                  `json:"avoidance,omitempty"`
+	DamageBonus content.FormulaNodeDTO `json:"damage_bonus,omitempty"`
+}
+
+// packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
+// just default_combat — the combat profile a player fights with when its prototype names none). One
+// row per pack; a future pack-level scalar is a content write here, not a migration.
+type packMetaBody struct {
+	DefaultCombat string `json:"default_combat,omitempty"`
+}
 
 // loadGlobalDefs reads the pack-global attribute/resource/damage-type rows for the enabled packs
 // and appends them onto their content.Pack. They are zone-independent, so they group by pack name
@@ -534,7 +559,65 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		pp := pack(pk)
 		pp.Abilities = append(pp.Abilities, ab)
 	}
-	return abRows.Err()
+	if err := abRows.Err(); err != nil {
+		return err
+	}
+	abRows.Close()
+
+	// Combat profiles (Phase 6.3a): ref+pack first-class, the to-hit/avoidance/damage SHAPE in the
+	// JSONB body. Decoded into the same CombatProfileDTO the embedded YAML carries.
+	cpRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM combat_profile_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query combat_profile_defs: %w", err)
+	}
+	for cpRows.Next() {
+		var cp content.CombatProfileDTO
+		var pk string
+		var body []byte
+		if err := cpRows.Scan(&cp.Ref, &pk, &body); err != nil {
+			cpRows.Close()
+			return fmt.Errorf("store: scan combat_profile_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b combatProfileBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				cpRows.Close()
+				return fmt.Errorf("store: combat_profile_def %s body: %w", cp.Ref, err)
+			}
+			cp.ToHit, cp.Avoidance, cp.DamageBonus = b.ToHit, b.Avoidance, b.DamageBonus
+		}
+		pp := pack(pk)
+		pp.CombatProfiles = append(pp.CombatProfiles, cp)
+	}
+	if err := cpRows.Err(); err != nil {
+		return err
+	}
+	cpRows.Close()
+
+	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
+	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).
+	mRows, err := p.pool.Query(ctx,
+		`SELECT pack, body FROM pack_meta WHERE pack = ANY($1)`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query pack_meta: %w", err)
+	}
+	defer mRows.Close()
+	for mRows.Next() {
+		var pk string
+		var body []byte
+		if err := mRows.Scan(&pk, &body); err != nil {
+			return fmt.Errorf("store: scan pack_meta: %w", err)
+		}
+		if len(body) > 0 {
+			var b packMetaBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				return fmt.Errorf("store: pack_meta %s body: %w", pk, err)
+			}
+			pack(pk).DefaultCombat = b.DefaultCombat
+		}
+	}
+	return mRows.Err()
 }
 
 // abilityMessages is the JSONB-tail shape for the ability_defs `messages` column. The 00003 schema

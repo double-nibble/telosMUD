@@ -47,10 +47,11 @@ func registerCommands() []*Command {
 		{Name: "who", Run: cmdWho},
 		{Name: "quit", Run: cmdQuit},
 	}
-	// Container/inventory/equipment verbs last: lower priority than movement/look/say so
-	// abbreviation precedence (the "n->north not nuke" rule) is unchanged. They live in
-	// container.go (the Phase-3 milestone).
-	return append(base, containerCommands()...)
+	// Container/inventory/equipment verbs, then combat verbs (kill/flee), last: lower priority than
+	// movement/look/say so abbreviation precedence (the "n->north not nuke" rule) is unchanged. They
+	// live in container.go (Phase 3) and combat_commands.go (Phase 6.3a).
+	base = append(base, containerCommands()...)
+	return append(base, combatCommands()...)
 }
 
 // cmdLook shows the actor their current room (MUDLIB §6). Slice 2 keeps look's behavior
@@ -154,6 +155,15 @@ func (z *Zone) move(s *session, dir string) bool {
 		s.send(textFrame("Go where?"))
 		return false
 	}
+	// Combat exclusion (docs/COMBAT.md invariant; PROTOCOL.md §5): you cannot walk while fighting. This
+	// is the ENFORCED gate the combat round driver depends on — it is why no `fighting` pointer or
+	// posFighting can ever cross a zone boundary (a cross-zone walk is impossible mid-fight), so the
+	// driver never gathers a stale cross-zone entity. `flee` is the sanctioned way out (it stopFights,
+	// then a later move is allowed). Applies to EVERY branch below (local / intra-shard / cross-shard).
+	if position(s.entity) == posFighting {
+		s.send(textFrame("You can't leave while fighting! Flee first."))
+		return false
+	}
 	from := s.entity.location // the current room entity
 	ref, ok := from.room.exits[dir]
 	if !ok {
@@ -181,7 +191,11 @@ func (z *Zone) move(s *session, dir string) bool {
 			s.send(textFrame("The way is sealed."))
 			return false
 		}
-		// Combat exclusion would be checked here (PROTOCOL.md §5); no combat in Phase 2.
+		// Combat exclusion is ENFORCED above (move refuses while posFighting), so a fighting player can
+		// never reach here. disengage anyway, as belt-and-suspenders, BEFORE detaching from the room: it
+		// guarantees no `fighting` pointer / posFighting crosses the shard boundary in the snapshot, and
+		// drops any opponent's link to the departing player while the room scan can still find them.
+		z.disengage(s.entity)
 		// Freeze first: from now on this shard stops acting for the player. Build the
 		// snapshot on this (zone) goroutine, then kick off the async handoff.
 		s.frozen = true
@@ -235,6 +249,12 @@ func (z *Zone) move(s *session, dir string) bool {
 // goroutine touches the session/entity. The brief overlap is bounded by handing them off
 // through the inbox, never by sharing them across two live owners.
 func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string, from *Entity) {
+	// Combat exclusion is ENFORCED in move() (refuses while posFighting), so a fighting player never
+	// reaches here. disengage anyway, BEFORE detaching from the room: no `fighting` pointer or
+	// posFighting may cross to dest's goroutine (the transferred entity would otherwise carry a SOURCE-
+	// owned *Entity that dest's round driver would deref), and an opponent left behind must not stay
+	// posFighting at a now-departed target. The room scan still finds opponents here (pre-detach).
+	z.disengage(s.entity)
 	z.act("$n leaves "+dir+".", s.entity, nil, nil, "", "", ToRoom)
 	Move(s.entity, nil) // detach from the source room before handing off
 	delete(z.players, s.character)

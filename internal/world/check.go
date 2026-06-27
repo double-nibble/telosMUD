@@ -188,6 +188,11 @@ func evalCheckFormula(c *effectCtx, node formulaNode, def *Entity) float64 {
 	r := &formulaResolver{
 		visited: map[string]bool{},
 		resolve: func(ref string, _ map[string]bool) (float64, error) {
+			// $swing.* is a CTX scalar, not an entity attribute ([G-H]) — intercept it before the attr
+			// lookup so a to-hit/damage bonus can read the per-swing index (PF iterative -5/-10).
+			if v, ok := resolveSwingRef(c, ref); ok {
+				return v, nil
+			}
 			ent, bare := resolveCheckScope(c, ref, def)
 			return attr(ent, bare), nil
 		},
@@ -222,6 +227,24 @@ func resolveCheckScope(c *effectCtx, ref string, def *Entity) (*Entity, string) 
 		return c.source, name
 	default:
 		return def, name
+	}
+}
+
+// resolveSwingRef resolves a `$swing.<field>` ctx-scalar ref ([G-H]) to its value. The only field this
+// slice exposes is `index` — the 0-based swing index within the current combat round (combat.go sets
+// effectCtx.swingIndex per swing) — so PF iterative attacks (`-5*$swing.index`) are authorable. Returns
+// (value, true) when `ref` is a recognized `$swing.` ref; (0, false) otherwise (the caller falls back
+// to the attr/entity-scope resolver). An unknown `$swing.` field yields (0, true) — a clean 0, not an
+// attr miss — so a typo doesn't silently read an entity attribute.
+func resolveSwingRef(c *effectCtx, ref string) (float64, bool) {
+	if !strings.HasPrefix(ref, "$swing.") {
+		return 0, false
+	}
+	switch ref[len("$swing."):] {
+	case "index":
+		return float64(c.swingIndex), true
+	default:
+		return 0, true
 	}
 }
 

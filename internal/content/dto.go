@@ -27,6 +27,30 @@ type Pack struct {
 	DamageTypes []DamageTypeDTO `json:"damage_types" yaml:"damage_types"`
 	Affects     []AffectDTO     `json:"affects" yaml:"affects"`
 	Abilities   []AbilityDTO    `json:"abilities" yaml:"abilities"`
+
+	// CombatProfiles are the pack-GLOBAL combat profiles (docs/COMBAT.md §3, Phase 6.3a): a named
+	// bundle of the to-hit check, the ordered avoidance ladder, and the damage bonus formula an entity
+	// uses when it fights. They are pack globals (zone-independent, like attributes) referenced by a
+	// mob prototype's `combat_profile` or by the pack's DefaultCombat (the player default). The whole
+	// to-hit/avoidance/damage SHAPE is content here — the engine only runs the pipeline (P6-D6).
+	CombatProfiles []CombatProfileDTO `json:"combat_profiles" yaml:"combat_profiles"`
+	// DefaultCombat names the combat profile a PLAYER entity uses when its own prototype declares none
+	// — the pack's "this is how an unarmed/unspecced character fights" default. Empty => players have
+	// no combat profile (a `kill` then auto-hits with weapon-only damage — the degenerate bare case).
+	DefaultCombat string `json:"default_combat" yaml:"default_combat"`
+}
+
+// CombatProfileDTO is one named combat profile (Phase 6.3a). to_hit is the attacker's to-hit CHECK
+// (a CheckDTO body — dice/bonus/vs/bands, same shape an ability's `check` op uses). avoidance is the
+// DEFENDER's ordered avoidance ladder: zero-or-more named checks run in order, the first success
+// negates the swing ([G-F] — an empty ladder is the 5e/WoW "straight to soak" case). damage_bonus is
+// the [G-A] scoped damage formula (`$actor.str_bonus + $actor.damroll`) added to weapon dice. EVERY
+// numeric here is content — the engine names none of it.
+type CombatProfileDTO struct {
+	Ref         string         `json:"ref" yaml:"ref"`
+	ToHit       any            `json:"to_hit" yaml:"to_hit"`             // a check body (parseCheckSpec)
+	Avoidance   []any          `json:"avoidance" yaml:"avoidance"`       // ordered avoidance check bodies
+	DamageBonus FormulaNodeDTO `json:"damage_bonus" yaml:"damage_bonus"` // [G-A] scoped damage bonus formula
 }
 
 // AttributeDTO is one content-defined attribute (docs/ABILITIES.md §1, docs/PHASE5-PLAN.md §1.1).
@@ -245,6 +269,22 @@ type ProtoDTO struct {
 	Wearable  *WearableDTO  `json:"wearable" yaml:"wearable"`
 	Weapon    *WeaponDTO    `json:"weapon" yaml:"weapon"`
 	Container *ContainerDTO `json:"container" yaml:"container"`
+
+	// Living, when present, makes this prototype a LIVING entity (a mob): it carries the per-entity
+	// attribute BASE overrides (the mob's str/con/accuracy/evasion/...) and the combat profile ref the
+	// swing pipeline uses (Phase 6.3a). A nil Living means an inert item (no stats, no combat) — every
+	// existing demo item is unchanged.
+	Living *LivingDTO `json:"living" yaml:"living"`
+}
+
+// LivingDTO is the mob-statting block on a prototype (Phase 6.3a). Attributes is the per-entity
+// attribute base overrides (the same shape a character's saved bases take) — a goblin's strength/
+// constitution/accuracy/evasion/attacks/soak_slash/... live here, so the mob's combat numbers are
+// pure content (P6-D6). CombatProfile names the pack-global CombatProfileDTO this mob fights with (its
+// to-hit/avoidance/damage). A mob with no CombatProfile fights with the to-hit auto-hit default.
+type LivingDTO struct {
+	Attributes    map[string]float64 `json:"attributes" yaml:"attributes"`
+	CombatProfile string             `json:"combat_profile" yaml:"combat_profile"`
 }
 
 // PhysicalDTO mirrors the world.Physical component template (mass/size/material).

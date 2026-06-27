@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
@@ -101,6 +102,17 @@ type Zone struct {
 	// scheduler can be torn down; nil until persistSave starts the cadence (first registered on
 	// the first persisted login). Zone-owned, only the zone goroutine touches it.
 	savePulse *pulseHandle
+
+	// combatPulse holds the cancel handle for this zone's combat round driver (combat.go). nil until
+	// the first startFight arms it (ensureCombatRound); the driver self-cancels and nils it when no
+	// Fighting entities remain. ONE per zone drives ALL fights (the centralized [G-G] iteration order).
+	// Zone-owned; only the zone goroutine touches it.
+	combatPulse *pulseHandle
+
+	// testCombatRng is a SEEDED rng a test installs so a whole combat round (to-hit/avoidance/damage)
+	// is deterministic; nil in production (the swing pipeline then uses the package default randIntn).
+	// Zone-owned, set only on a bare test zone before driving rounds. Never set on a live zone.
+	testCombatRng *rand.Rand
 
 	// repopPulse holds the cancel handle for this zone's repop-cadence pulse callback (reset.go).
 	// nil until startRepop registers it at build time (skipped when reset_secs==0 — no timed
@@ -629,6 +641,17 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// future target reference resolves here, then place it in the destination room.
 	s.entity.zone = z
 	z.players[s.character] = s
+	// Belt-and-suspenders combat clear: transferOut already disengaged the mover (and move() refuses
+	// to walk while fighting), so this is normally a no-op. But it GUARANTEES the destination never
+	// inherits a SOURCE-zone `fighting` *Entity or a posFighting state — combat is TRANSIENT and never
+	// crosses a zone (P6-D8); the destination re-engages via a fresh `kill`. (No opponent-link to drop:
+	// any opponent was in the SOURCE room, not reachable from here.)
+	if s.entity.living != nil {
+		s.entity.living.fighting = nil
+		if position(s.entity) == posFighting {
+			setPosition(s.entity, posStanding)
+		}
+	}
 	// Re-arm the per-entity affect/regen tick on THIS zone (Phase 5.2). The source zone
 	// registered the tick capturing the SOURCE pulse; the entity lives here now, so that handle
 	// is stale and would block ensureTick (a.tick != nil) — affects/regen would silently freeze
@@ -959,6 +982,11 @@ func (z *Zone) freezeExpire(id string, gen uint64) {
 	// Handoff never completed: thaw in place and restore to the room they tried to leave.
 	z.log.Debug("freeze timeout: thawing un-handed-off player in place", "player", id)
 	s.frozen = false
+	// The cross-shard freeze path disengaged the player before freezing, so they thaw NOT fighting and
+	// no driver re-arm is needed. stopFight defensively in case a future path freezes a fighting player:
+	// a thawed player left posFighting with no live target would soft-lock (the driver self-cancelled
+	// when they froze and nothing re-arms it). This guarantees a clean standing state on thaw.
+	z.stopFight(s.entity)
 	if s.frozenFrom != nil {
 		Move(s.entity, s.frozenFrom)
 		z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
@@ -1077,9 +1105,12 @@ func (z *Zone) handoffFailed(v handoffFailMsg) {
 		return
 	}
 	s.frozen = false
-	// Restore the entity to the room it tried to leave: move() detached it (location=nil)
-	// for the in-flight handoff. Without this re-attach the location stays nil and the next
-	// look/move null-derefs (commands.go lookRoom/move read s.entity.location).
+	// Disengaged before freeze (the cross-shard path), so this is normally a no-op; stopFight defends
+	// against a future fighting-player freeze leaving the thawed player soft-locked posFighting with the
+	// driver retired (distsys S1). Restore the entity to the room it tried to leave: move() detached it
+	// (location=nil) for the in-flight handoff. Without this re-attach the location stays nil and the
+	// next look/move null-derefs (commands.go lookRoom/move read s.entity.location).
+	z.stopFight(s.entity)
 	if s.frozenFrom != nil {
 		Move(s.entity, s.frozenFrom)
 		z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)

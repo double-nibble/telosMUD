@@ -53,6 +53,11 @@ type effectCtx struct {
 	// bounded — not just recursion depth. A wide subscription set that the depth cap alone wouldn't stop
 	// (N handlers each firing M events) can't starve the single-writer zone goroutine.
 	eventBudget *int
+	// swingIndex is the 0-based index of the current melee swing within a combat round ([G-H], combat.go).
+	// The swing pipeline sets it per swing so a to-hit/damage formula can read `$swing.index` (resolved
+	// in resolveCheckScope) — PF iterative attacks (-5/-10/-15 by swing) are authorable without it. It is
+	// 0 outside the swing loop (a spell's deal_damage / a check unrelated to a swing reads $swing.index 0).
+	swingIndex int
 }
 
 // rollChance returns true with probability p (clamped to [0,1]). Uses the ctx rng when present so a
@@ -291,10 +296,23 @@ func mitigate(target *Entity, raw float64, dmgType string) int {
 	return int(v)
 }
 
-// soak is the flat damage reduction a target's armor contributes (Phase 6 attaches the real armor
-// component here). 0 this phase: the seam exists so deal_damage's pipeline is the single place both a
-// spell and a weapon subtract armor, and Phase 6 fills it without touching any op.
-func soak(target *Entity, dmgType string) float64 { return 0 }
+// soak is the FLAT damage reduction a target's armor contributes, by damage TYPE ([G-B], docs/COMBAT.md
+// §3 step-5). It reads a CONTENT-DERIVED attribute named `soak_<dmgType>` (e.g. `soak_slash`) — armor
+// pieces feed it through the modSource mod-stack (a plate body adds +3 soak_slash), so a sword swing and
+// a spell's deal_damage subtract the same by-type armor through this ONE seam. A ruleset that defines no
+// such attribute (5e: armor is AC, not flat reduction) reads 0 here — the no-op case the gap analysis
+// confirmed degenerates cleanly. Negative soak (a vulnerability armor) is clamped to 0: soak only ever
+// REDUCES; an amplifier belongs in the resist/vuln matrix (mitigate), not here. Zone-goroutine read.
+func soak(target *Entity, dmgType string) float64 {
+	if target == nil || target.living == nil || dmgType == "" {
+		return 0
+	}
+	v := attr(target, "soak_"+dmgType)
+	if v < 0 {
+		return 0
+	}
+	return v
+}
 
 // applyDebuff is the shared HARMFUL apply_affect path: a debuff (a harmful-disposition affect) on a
 // target routes through guardHarmful before attaching, exactly like dealDamage. A helpful/neutral
@@ -309,18 +327,23 @@ func applyDebuff(c *effectCtx, target *Entity, affectRef string, opts attachOpts
 	return true
 }
 
-// vitalResource returns the ref of the target's first content-defined VITAL resource (hp in the
-// demo), or "" if none. The shared mitigation pipeline subtracts damage from it. Reads the registry.
+// vitalResource returns the ref of the target's content-defined VITAL resource (hp in the demo), or ""
+// if none. The shared mitigation pipeline subtracts damage from it. The pick is DETERMINISTIC — the
+// lowest ref by sort order among the vital resources — so a pack that (against the convention) defines
+// more than one vital still resolves the same pool every time, not whichever Go's randomized map
+// iteration yields first. Content convention is ONE vital; lintVitalResources warns at load on >1.
+// Reads the registry (lock-free atomic.Load).
 func vitalResource(e *Entity) string {
 	if e == nil || e.zone == nil {
 		return ""
 	}
+	chosen := ""
 	for ref, def := range e.zone.resourceDefs().table() {
-		if def.vital {
-			return ref
+		if def.vital && (chosen == "" || ref < chosen) {
+			chosen = ref
 		}
 	}
-	return ""
+	return chosen
 }
 
 // isPlayer reports whether e is a player-controlled entity (the gate's "is this a PvP target?"

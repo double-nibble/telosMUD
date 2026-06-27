@@ -45,6 +45,14 @@ type LoadedContent struct {
 	// rule keyed by ref. The world side registers them into the per-shard abilityRegistry and
 	// registers each command-invocation ability into the per-shard command table.
 	Abilities []AbilityDTO
+	// CombatProfiles are the pack-global combat profiles (Phase 6.3a), same last-write-wins override
+	// rule keyed by ref. The world side parses each into a runtime combatProfile (to-hit/avoidance/
+	// damage) and registers them into the per-shard combat-profile registry.
+	CombatProfiles []CombatProfileDTO
+	// DefaultCombat names the combat profile a player entity fights with when its own prototype
+	// declares none (the pack's player default). The LAST non-empty pack value wins. Empty => players
+	// have no combat profile (the degenerate auto-hit case).
+	DefaultCombat string
 }
 
 // Zone returns the loaded zone with the given ref, or nil.
@@ -85,7 +93,11 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	dmgIdx := make(map[string]int)
 	affIdx := make(map[string]int)
 	abilIdx := make(map[string]int)
+	cpIdx := make(map[string]int)
 	for _, p := range packs {
+		if p.DefaultCombat != "" {
+			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
+		}
 		for i := range p.Zones {
 			z := p.Zones[i]
 			if idx, ok := idxByRef[z.Ref]; ok {
@@ -134,6 +146,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				abilIdx[ab.Ref] = len(lc.Abilities)
 				lc.Abilities = append(lc.Abilities, ab)
+			}
+		}
+		for _, cp := range p.CombatProfiles {
+			if idx, ok := cpIdx[cp.Ref]; ok {
+				lc.CombatProfiles[idx] = cp
+			} else {
+				cpIdx[cp.Ref] = len(lc.CombatProfiles)
+				lc.CombatProfiles = append(lc.CombatProfiles, cp)
 			}
 		}
 	}

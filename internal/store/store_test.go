@@ -109,6 +109,36 @@ func TestStorePackRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(dbZones, yamlZones) {
 		t.Fatalf("round-trip mismatch:\n DB  = %+v\n YAML= %+v", dbZones, yamlZones)
 	}
+
+	// Explicitly pin the combat-mob Living round-trip (Phase 6.3a): the darkwood goblin's Living block
+	// (its stat sheet + `melee` profile ref) must survive the mob_prototypes.body JSONB trip. Before
+	// the protoBody.Living fix this came back nil from the DB path and the DeepEqual above failed; this
+	// guard names the regression directly so a re-break reports "goblin Living dropped", not a diff dump.
+	goblin := findMob(dbZones, "darkwood:mob:goblin")
+	if goblin == nil {
+		t.Fatal("round-trip: darkwood goblin mob missing from DB-loaded content")
+	}
+	if goblin.Living == nil {
+		t.Fatal("round-trip: goblin Living block was DROPPED on the DB path (mob stat sheet lost)")
+	}
+	if goblin.Living.CombatProfile != "melee" {
+		t.Fatalf("round-trip: goblin combat_profile = %q, want 'melee'", goblin.Living.CombatProfile)
+	}
+	if goblin.Living.Attributes["strength"] != 14 {
+		t.Fatalf("round-trip: goblin strength = %v, want 14 (Living attributes lost)", goblin.Living.Attributes["strength"])
+	}
+}
+
+// findMob returns the mob ProtoDTO with the given ref across all zones, or nil.
+func findMob(zones []content.ZoneDTO, ref string) *content.ProtoDTO {
+	for zi := range zones {
+		for mi := range zones[zi].Mobs {
+			if zones[zi].Mobs[mi].Ref == ref {
+				return &zones[zi].Mobs[mi]
+			}
+		}
+	}
+	return nil
 }
 
 // TestImportPackIdempotent pins the seed/import idempotency contract (the deletePack regression). A
@@ -159,6 +189,23 @@ func TestImportPackIdempotent(t *testing.T) {
 	if len(lc.Attributes) == 0 || len(lc.Resources) == 0 || len(lc.Affects) == 0 {
 		t.Fatalf("after re-import: global defs missing (attrs=%d resources=%d affects=%d)",
 			len(lc.Attributes), len(lc.Resources), len(lc.Affects))
+	}
+
+	// Combat content (Phase 6.3a) must survive the re-import exactly like the abilities above: the
+	// `melee` profile present exactly once (deletePack strips combat_profile_defs so a second import
+	// strips-and-replaces, never collides on the duplicate ref), and the pack's default_combat scalar
+	// (pack_meta) intact. This is the combat-content extension of the deletePack idempotency contract.
+	melees := 0
+	for _, cp := range lc.CombatProfiles {
+		if cp.Ref == "melee" {
+			melees++
+		}
+	}
+	if melees != 1 {
+		t.Fatalf("after re-import: found %d 'melee' combat profiles, want exactly 1", melees)
+	}
+	if lc.DefaultCombat != "melee" {
+		t.Fatalf("after re-import: default_combat = %q, want 'melee'", lc.DefaultCombat)
 	}
 }
 

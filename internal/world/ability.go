@@ -261,6 +261,13 @@ func (z *Zone) resolveAbilityTarget(actor *Entity, def *abilityDef, arg string) 
 // on a block it sends the actor a message and returns false. Single-writer: zone goroutine.
 func (z *Zone) checkRequires(s *session, def *abilityDef) bool {
 	actor := s.entity
+	// Cooldown ([G8], Phase 6.3a): refuse an ability still cooling down. This is the step-3 gate the
+	// armed cooldown map (armCooldown) backs — today's fires-and-logs became a real gate.
+	if def.cooldown > 0 && z.onCooldown(actor, def.ref) {
+		z.log.Debug("ability lifecycle: blocked at step 3 (cooldown)", "ability", def.ref, "actor", actor.short)
+		s.send(textFrame("That isn't ready yet."))
+		return false
+	}
 	// Tag-CC (§6): the ability's own tags PLUS its requires.not_prevented tags must not be prevented.
 	checkTags := def.tags
 	if len(def.notPrevented) > 0 {
@@ -306,17 +313,80 @@ func (z *Zone) payCosts(actor *Entity, def *abilityDef) {
 	}
 }
 
-// armCooldown registers the ability's cooldown lockout on the pulse scheduler (step 7). Transient this
-// slice (not persisted — the slice scope). A real per-ability cooldown map + a "still cooling down"
-// step-3 check is a later refinement; this fires-and-logs so the timing seam is on the pulse spine and
-// the resolve-by-id contract is honored (the callback re-resolves nothing it mutates — it only logs).
+// armCooldown registers the ability's cooldown lockout ([G8], Phase 6.3a). It records the ELAPSES-AT
+// pulse in the actor's per-entity cooldown map (Living.cooldowns) so lifecycle step-3 (checkRequires)
+// can refuse the ability while it cools, AND it schedules a pulse callback to CLEAR the entry when the
+// cooldown elapses. The map is the source of truth (a logout mid-cooldown serializes the REMAINING from
+// it, P6-D8); the callback is the cleanup so a stale entry never lingers. Resolve-by-id: the callback
+// re-resolves the player by id and clears only the live entity's map (never a stale cross-zone entity).
 func (z *Zone) armCooldown(s *session, def *abilityDef) {
+	actor := s.entity
+	if actor.living == nil {
+		return
+	}
+	if actor.living.cooldowns == nil {
+		actor.living.cooldowns = map[string]uint64{}
+	}
+	elapsesAt := z.pulses.pulse + uint64(def.cooldown)
+	actor.living.cooldowns[def.ref] = elapsesAt
 	id := s.character
+	ref := def.ref
 	z.pulses.after(uint64(def.cooldown), func(pulse uint64) bool {
-		z.log.Debug("ability cooldown elapsed", "ability", def.ref, "id", id)
+		// Resolve-by-id: clear the entry only on the live player. Absent/frozen => the entity left;
+		// do not touch it (the destination owns the map after a handoff). A re-armed cooldown (a
+		// fresh use during this one) overwrote elapsesAt with a LATER pulse — only clear if this
+		// callback's deadline is still the current one, so a re-arm isn't prematurely cleared.
+		live, ok := z.players[id]
+		if !ok || live == nil || live.entity == nil || live.entity.living == nil || live.frozen {
+			return false
+		}
+		if at, present := live.entity.living.cooldowns[ref]; present && at <= pulse {
+			delete(live.entity.living.cooldowns, ref)
+			z.log.Debug("ability cooldown elapsed", "ability", ref, "id", id)
+		}
 		return false
 	})
 	if z.log.Enabled(nil, slog.LevelDebug) {
-		z.log.Debug("ability cooldown armed", "ability", def.ref, "pulses", def.cooldown, "id", id)
+		z.log.Debug("ability cooldown armed", "ability", def.ref, "pulses", def.cooldown,
+			"id", id, "elapses_at", elapsesAt)
 	}
+}
+
+// rearmCooldown re-installs a persisted cooldown ([G8] / P6-D8) from its REMAINING pulses on load. It
+// is the armCooldown twin for the rehydrate path: it has only a ref + remaining (no def), so it sets
+// the elapses-at from NOW + remaining and schedules the same clear callback. Runs on the DESTINATION
+// zone goroutine (the entity is live here), so the timer write is single-writer. A remaining <= 0 is a
+// no-op (already elapsed). Single-writer: zone goroutine.
+func (z *Zone) rearmCooldown(s *session, ref string, remaining int) {
+	actor := s.entity
+	if actor.living == nil || remaining <= 0 {
+		return
+	}
+	if actor.living.cooldowns == nil {
+		actor.living.cooldowns = map[string]uint64{}
+	}
+	elapsesAt := z.pulses.pulse + uint64(remaining)
+	actor.living.cooldowns[ref] = elapsesAt
+	id := s.character
+	z.pulses.after(uint64(remaining), func(pulse uint64) bool {
+		live, ok := z.players[id]
+		if !ok || live == nil || live.entity == nil || live.entity.living == nil || live.frozen {
+			return false
+		}
+		if at, present := live.entity.living.cooldowns[ref]; present && at <= pulse {
+			delete(live.entity.living.cooldowns, ref)
+		}
+		return false
+	})
+}
+
+// onCooldown reports whether ability `ref` is still cooling down on entity e ([G8] step-3 gate). True
+// when the actor's cooldown map holds an elapses-at pulse strictly AFTER the current zone pulse. A
+// missing entry (never used, or already elapsed-and-cleared) is false. Zone-goroutine read.
+func (z *Zone) onCooldown(e *Entity, ref string) bool {
+	if e == nil || e.living == nil || e.living.cooldowns == nil {
+		return false
+	}
+	at, ok := e.living.cooldowns[ref]
+	return ok && at > z.pulses.pulse
 }

@@ -61,6 +61,12 @@ func protoComponents(p content.ProtoDTO) componentSet {
 			closed: d.Closed, locked: d.Locked, keyRef: ProtoRef(d.KeyRef),
 		}
 	}
+	// A prototype with a Living block is a MOB (Phase 6.3a): give it a *Living template carrying its
+	// stat sheet + combat-profile ref. Spawn promotes this to the instance's hot e.living pointer; a
+	// first stat/resource write COWs it (mutableComponent), so two goblins never alias each other's hp.
+	if l := protoLiving(p.Living); l != nil {
+		comps[reflect.TypeFor[*Living]()] = l
+	}
 	return comps
 }
 
@@ -113,6 +119,62 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		def.tickOps = ops
 	}
 	return def
+}
+
+// protoLiving builds the *Living component template for a mob prototype from its LivingDTO (Phase
+// 6.3a): the per-entity attribute BASE overrides (the mob's str/con/accuracy/...) and the combat
+// profile REF the swing pipeline resolves. A nil DTO returns nil (an inert item — no Living). The
+// attrBase map is the mob's stat sheet; combatRef names the pack-global profile (resolved at fight
+// time, not here, so build order is irrelevant). position defaults to posStanding (the zero value).
+func protoLiving(d *content.LivingDTO) *Living {
+	if d == nil {
+		return nil
+	}
+	l := &Living{combatRef: d.CombatProfile}
+	if len(d.Attributes) > 0 {
+		l.attrBase = make(map[string]float64, len(d.Attributes))
+		for k, v := range d.Attributes {
+			l.attrBase[k] = v
+		}
+	}
+	return l
+}
+
+// buildCombatProfile parses a CombatProfileDTO into the runtime combatProfile (combat.go): the to-hit
+// check spec, the ordered avoidance ladder (each a check spec), and the [G-A] damage bonus formula.
+// Build-time only (defineGlobals). A malformed sub-spec logs loudly and is dropped from the profile
+// (content-lint is the real gate) rather than aborting boot. Returns the profile (never nil — an
+// all-malformed profile is an empty one that auto-hits).
+func buildCombatProfile(d content.CombatProfileDTO) *combatProfile {
+	p := &combatProfile{}
+	if d.ToHit != nil {
+		spec, err := parseCheckSpec(d.ToHit)
+		if err != nil {
+			slog.Error("content: combat profile to_hit parse failed; profile auto-hits",
+				"profile", d.Ref, "err", err)
+		} else {
+			p.toHit = spec
+		}
+	}
+	for i, av := range d.Avoidance {
+		spec, err := parseCheckSpec(av)
+		if err != nil {
+			slog.Error("content: combat profile avoidance check parse failed; dropped",
+				"profile", d.Ref, "index", i, "err", err)
+			continue
+		}
+		p.avoidance = append(p.avoidance, spec)
+	}
+	if d.DamageBonus != nil {
+		node, err := parseFormula(d.DamageBonus)
+		if err != nil {
+			slog.Error("content: combat profile damage_bonus parse failed; ignored",
+				"profile", d.Ref, "err", err)
+		} else {
+			p.damageBonus = node
+		}
+	}
+	return p
 }
 
 // wearLocByName resolves a content wear-location NAME to the internal WearLoc slot. The names

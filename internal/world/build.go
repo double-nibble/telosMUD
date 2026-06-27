@@ -2,6 +2,7 @@ package world
 
 import (
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -113,13 +114,42 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 			}
 		}
 	}
+	// Combat profiles (Phase 6.3a): parse each into its to-hit/avoidance/damage runtime form and
+	// register it. A mob/player references one by ref (Living.combatRef); the swing pipeline resolves it.
+	for _, cp := range lc.CombatProfiles {
+		d.combat.register(cp.Ref, buildCombatProfile(cp))
+	}
+	d.defaultCombat = lc.DefaultCombat
 	// Load-time content-lint: reject a derived-attribute graph with a self/mutual reference.
 	for _, err := range lintAttributeCycles(d.attr.table()) {
 		slog.Error("content: attribute derivation cycle (def will resolve to 0)", "err", err)
 	}
+	// Load-time content-lint: combat + death assume ONE vital resource per pack (vitalResource picks
+	// deterministically by sorted ref, but >1 vital is a content modelling error — only the lowest-ref
+	// one ever takes damage / drives death). Warn loudly so an author sees it at load, not in a fight.
+	lintVitalResources(d.res.table())
 	slog.Debug("global defs registered", "attributes", d.attr.len(),
 		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len(),
 		"abilities", d.ability.len(), "ability_commands", len(d.abilityCmds))
+}
+
+// lintVitalResources warns if a pack registers more than one VITAL resource. The combat/death machinery
+// (vitalResource, the swing's apply stage, the 6.3b on_depleted path) models ONE vital pool (hp); a
+// second is a content error — vitalResource deterministically picks the lowest ref, so only it ever
+// takes damage and the others silently never deplete. Build-time only; logs at WARN with the offending
+// refs (sorted) so an author sees it at load. Does not abort boot (content-lint discipline).
+func lintVitalResources(table map[string]*resourceDef) {
+	var vitals []string
+	for ref, def := range table {
+		if def != nil && def.vital {
+			vitals = append(vitals, ref)
+		}
+	}
+	if len(vitals) > 1 {
+		sort.Strings(vitals)
+		slog.Warn("content: more than one VITAL resource defined; only the lowest ref takes damage / drives death",
+			"vitals", vitals, "used", vitals[0])
+	}
 }
 
 // parseAttributeBase turns an AttributeDTO's default_base (a {lit} OR {expr} spec) into a parsed

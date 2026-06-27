@@ -85,11 +85,26 @@ type Living struct {
 	modSrcs []modSource
 
 	// position is standing/resting/sleeping/fighting… gating which commands run
-	// (MUDLIB §6). Stub: defaults to the zero value until the Position enum lands.
+	// (MUDLIB §6, position.go). Stored as an int (the Position enum's underlying type) so the COW
+	// shallow-copy and the persisted shape are unchanged; position()/setPosition give it names.
 	position int
-	// fighting is the current combat target (a live entity), nil when not fighting.
-	// Stub: set by combat in Phase 6.
+	// fighting is the current combat target (a live entity), nil when not fighting. Set by startFight
+	// (combat.go) and cleared by stopFight; the per-zone round driver swings every posFighting entity
+	// at its `fighting` target each PULSE_VIOLENCE. Transient — never persisted (combat drops on a
+	// crash/handoff, P6-D8); a captured *Entity here is re-validated each round (same-room/alive gates).
 	fighting *Entity
+	// combatRef names the pack-global combat profile this entity fights with (combat.go): its to-hit
+	// check, avoidance ladder, and damage bonus. Resolved by ref through the per-shard combat-profile
+	// registry (combatProfileFor) — the ref, not a resolved pointer, is stored so prototype build order
+	// (defineContent vs defineGlobals) never matters and a hot-reloaded profile is picked up. "" => no
+	// combat profile (the bare-engine case: a `kill` auto-hits, weapon-only damage). A mob carries its
+	// prototype's ref; a player carries the pack DefaultCombat ref (set at entity creation).
+	combatRef string
+	// cooldowns maps an ability ref to the pulse number its cooldown ELAPSES on ([G8], combat.go). The
+	// ability lifecycle step-3 gate refuses an ability still cooling down. Transient instance state
+	// (zone-goroutine-owned); serialized as REMAINING pulses into StateJSON.Cooldowns (P6-D8). nil until
+	// the first armed cooldown.
+	cooldowns map[string]uint64
 }
 
 func (*Living) componentKind() Kind { return KindLiving }

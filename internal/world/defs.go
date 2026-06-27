@@ -106,6 +106,13 @@ type defRegistries struct {
 	dmg     *defRegistry[*damageTypeDef]
 	affect  *defRegistry[*affectDef]
 	ability *defRegistry[*abilityDef]
+	combat  *defRegistry[*combatProfile]
+
+	// defaultCombat is the pack's player-default combat profile ref (Phase 6.3a): the profile a player
+	// entity fights with when its own (none — players aren't prototyped) declares none. newPlayerEntity
+	// stamps it onto the player's Living.combatRef so a player `kill` runs the same content pipeline as a
+	// mob. Empty => players have no profile (auto-hit). Set once at construction, then read-only.
+	defaultCombat string
 
 	// abilityCmds is the per-shard ability COMMAND table (defs.go is per-shard data): the verb
 	// words a command-invocation ability registers (defineGlobals), each mapping to the abilityDef
@@ -124,6 +131,7 @@ func newDefRegistries() *defRegistries {
 		dmg:         newDefRegistry[*damageTypeDef](),
 		affect:      newDefRegistry[*affectDef](),
 		ability:     newDefRegistry[*abilityDef](),
+		combat:      newDefRegistry[*combatProfile](),
 		abilityCmds: map[string]*abilityDef{},
 	}
 }
@@ -145,6 +153,12 @@ func (z *Zone) affectDefs() *defRegistry[*affectDef] {
 }
 func (z *Zone) abilityDefs() *defRegistry[*abilityDef] {
 	return z.defBundle().ability
+}
+
+// combatProfiles is the zone-goroutine read accessor for the global combat-profile registry (combat.go,
+// Phase 6.3a). Lock-free atomic.Load; a bare zone falls back to its own empty bundle (no profiles).
+func (z *Zone) combatProfiles() *defRegistry[*combatProfile] {
+	return z.defBundle().combat
 }
 
 // abilityForVerb returns the command-invocation ability bound to verb `v` (lower-cased), or nil.

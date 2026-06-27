@@ -79,6 +79,13 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM damage_type_defs WHERE pack=$1`,
 		`DELETE FROM affect_defs WHERE pack=$1`,
 		`DELETE FROM ability_defs WHERE pack=$1`,
+		// Combat content (Phase 6.3a): the profiles and the pack's default_combat scalar. MUST be
+		// stripped on a re-seed so a second `make seed`/`make up` strips-and-replaces rather than
+		// colliding on a duplicate ref (the ability_defs idempotency regression — covered by
+		// TestImportPackIdempotent). No FK into the zone tree, so order-independent. (The mob `living`
+		// block rides mob_prototypes.body and is cleared with the mob_prototypes delete above.)
+		`DELETE FROM combat_profile_defs WHERE pack=$1`,
+		`DELETE FROM pack_meta WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -152,6 +159,7 @@ func insertProtos(ctx context.Context, tx pgx.Tx, table, pack, zoneRef string, p
 	for _, d := range protos {
 		body, err := json.Marshal(protoBody{
 			Physical: d.Physical, Wearable: d.Wearable, Weapon: d.Weapon, Container: d.Container,
+			Living: d.Living, // mob stat sheet + combat_profile ref (Phase 6.3a) rides the body JSONB
 		})
 		if err != nil {
 			return fmt.Errorf("store: marshal %s %s body: %w", table, d.Ref, err)
@@ -263,6 +271,35 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			ab.Ref, pk.Pack, ab.Name, inv, targeting, tags, requires, costs,
 			ab.CastTime, ab.Lag, ab.Cooldown, onResolve, lua, messages); err != nil {
 			return fmt.Errorf("store: insert ability %s: %w", ab.Ref, err)
+		}
+	}
+	// Combat profiles (Phase 6.3a): the whole to-hit/avoidance/damage SHAPE is content, so it all
+	// rides the JSONB body (combatProfileBody). ref+pack is the per-kind PK. The loader reads it back
+	// into the same CombatProfileDTO the embedded YAML produces.
+	for _, cp := range pk.CombatProfiles {
+		body, err := json.Marshal(combatProfileBody{
+			ToHit: cp.ToHit, Avoidance: cp.Avoidance, DamageBonus: cp.DamageBonus,
+		})
+		if err != nil {
+			return fmt.Errorf("store: marshal combat profile %s body: %w", cp.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO combat_profile_defs (ref, pack, body) VALUES ($1,$2,$3)`,
+			cp.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert combat profile %s: %w", cp.Ref, err)
+		}
+	}
+	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so
+	// a pack that names no player default leaves no row (the loader then leaves DefaultCombat empty).
+	if pk.DefaultCombat != "" {
+		body, err := json.Marshal(packMetaBody{DefaultCombat: pk.DefaultCombat})
+		if err != nil {
+			return fmt.Errorf("store: marshal pack_meta %s: %w", pk.Pack, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO pack_meta (pack, body) VALUES ($1,$2)`,
+			pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert pack_meta %s: %w", pk.Pack, err)
 		}
 	}
 	return nil

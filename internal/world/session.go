@@ -116,7 +116,11 @@ func (z *Zone) newPlayerEntity(s *session, character string) *Entity {
 	e := z.newEntity(ProtoRef(character))
 	e.short = character
 	e.keywords = []string{character}
-	Add(e, &Living{})
+	// A player fights with the pack's DEFAULT combat profile (Phase 6.3a) — set its combatRef so a
+	// `kill` runs the same content to-hit/avoidance/damage pipeline a mob does. Empty when no pack (the
+	// bare-engine case) => no profile => auto-hit. Players aren't prototyped, so this is the seam content
+	// configures the player's baseline combat through (gear/affects then modify the derived attributes).
+	Add(e, &Living{combatRef: z.defBundle().defaultCombat})
 	Add(e, &PlayerControlled{session: s})
 	s.entity = e
 	return e

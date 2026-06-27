@@ -41,6 +41,36 @@ attributes:
       expr: ["+", ["*", ["attr", intellect], 8], ["*", ["attr", level], 3]]
     min: 0
 
+  # --- Combat attributes (Phase 6.3a, docs/COMBAT.md §4) — the ROM-style conventional set. The ENGINE
+  # names none of these; the swing pipeline runs whatever check/formula the combat profile authored,
+  # and these are the attributes those formulas read. A pack with none = no combat (the bare case).
+  # Offense:
+  - {ref: accuracy,  display_name: Accuracy,  value_kind: int, default_base: {lit: 0}}
+  - {ref: damroll,   display_name: Damage Roll, value_kind: int, default_base: {lit: 0}}
+  - {ref: attacks,   display_name: Attacks per Round, value_kind: int, default_base: {lit: 1}, min: 1}
+  - {ref: crit_mult, display_name: Critical Multiplier, value_kind: float, default_base: {lit: 2}}
+  # strength_bonus = (strength - 10) / 2  (5e-ish ability mod; the [G-A] damage bonus reads it). floor
+  # via the int value_kind truncation in the formula evaluator's consumers; the swing adds it to damage.
+  - ref: strength_bonus
+    display_name: Strength Bonus
+    value_kind: int
+    default_base:
+      expr: ["floor", ["/", ["-", ["attr", strength], 10], 2]]
+  # Defense:
+  - {ref: evasion, display_name: Evasion, value_kind: int, default_base: {lit: 10}}
+  - {ref: dodge,   display_name: Dodge,   value_kind: int, default_base: {lit: 0}}
+  # parry/block GATE on gear (a wielded weapon / a held shield) via deriving to 0 when ungeared ([G-C]);
+  # this demo leaves them as flat content bases (a sword-wielding mob authors a positive parry directly).
+  - {ref: parry, display_name: Parry, value_kind: int, default_base: {lit: 0}}
+  - {ref: block, display_name: Block, value_kind: int, default_base: {lit: 0}}
+  # soak_slash: flat slash-damage reduction ([G-B]). The swing's mitigate() subtracts soak_<type>; armor
+  # would feed this through the mod-stack. A flat base here models a tough hide / worn plate.
+  - {ref: soak_slash, display_name: Slash Soak, value_kind: int, default_base: {lit: 0}}
+  # combat_order: the [G-G] iteration-order key the round driver sorts by (default 0 => simultaneous,
+  # the gather order is preserved). An OnEnterCombat initiative check would write this; the demo leaves
+  # it at 0 (no initiative) — the simultaneous default the acceptance gate validated.
+  - {ref: combat_order, display_name: Combat Order, value_kind: int, default_base: {lit: 0}}
+
 resources:
   # hp is VITAL: at 0 = death (the on_depleted hook is content, wired in 5.2/combat). Its max is the
   # derived max_hp attribute, so anything that raises constitution/level/max_hp raises the cap.
@@ -129,6 +159,51 @@ abilities:
       - {op: deal_damage, type: fire, dice: "8d6"}
       - {op: apply_affect, affect: poison, harmful: true}
 
+# Combat profiles (Phase 6.3a, docs/COMBAT.md §3) — the ROM-style to-hit / avoidance / damage SHAPE as
+# pure content. The engine runs the pipeline; THIS data is the whole ruleset. `default_combat` names the
+# profile a player fights with; a mob names its own via its `living.combat_profile`.
+default_combat: melee
+
+combat_profiles:
+  - ref: melee
+    # TO-HIT: a d20 attack roll + accuracy vs the target's evasion. Bands (top-down, first match wins):
+    #   nat-20 -> crit (faceEq, independent of total) ; nat-1 -> miss ; margin>=0 -> hit ; else miss.
+    # The engine reads only the band LABEL (crit/miss/hit) — the SHAPE is fully content.
+    to_hit:
+      label: Attack
+      dice: "1d20"
+      bonus: ["attr", "$actor.accuracy"]
+      vs: ["attr", "$target.evasion"]
+      bands:
+        - {face_eq: 20, label: crit}
+        - {face_eq: 1, label: miss}
+        - {margin_min: 0, label: hit}
+        - {label: miss}
+    # AVOIDANCE LADDER ([G-F]): an ordered list of roll-under-skill checks; the FIRST success negates the
+    # swing. A roll-under uses `max: <skill>` (total <= skill => success). A ladder of dodge then parry
+    # then block; a defender whose parry/block derive to 0 auto-fails that rung (roll-under-0 is
+    # impossible on 1d100) — gear-gating with NO engine predicate ([G-C]). Each band's LABEL is the verb
+    # the combat message reads (dodge/parry/block).
+    avoidance:
+      - label: Dodge
+        dice: "1d100"
+        bands:
+          - {max: ["attr", "$actor.dodge"], label: dodge}
+          - {label: fail}
+      - label: Parry
+        dice: "1d100"
+        bands:
+          - {max: ["attr", "$actor.parry"], label: parry}
+          - {label: fail}
+      - label: Block
+        dice: "1d100"
+        bands:
+          - {max: ["attr", "$actor.block"], label: block}
+          - {label: fail}
+    # DAMAGE BONUS ([G-A]): weapon dice (from the wielded Weapon) + strength_bonus + damroll, scoped to
+    # the attacker ($actor). This is what makes a STR-heavy fighter hit harder — as CONTENT, no Lua.
+    damage_bonus: ["+", ["attr", "$actor.strength_bonus"], ["attr", "$actor.damroll"]]
+
 zones:
   - ref: midgaard
     name: The City of Midgaard
@@ -196,3 +271,30 @@ zones:
         long: The trees crowd close and the moonlight fails. Something rustles, unseen.
         exits:
           south: darkwood:room:grove
+    # A combat mob (Phase 6.3a): the goblin carries a Living block (its stat sheet + the `melee` combat
+    # profile) and a Weapon (its rusty knife = its natural attack dice). `kill goblin` runs the full
+    # swing pipeline against it. NOTHING engine-side names "goblin" — it is data, like every item.
+    mob_prototypes:
+      - ref: darkwood:mob:goblin
+        keywords: [goblin, small]
+        short: a small goblin
+        long: A wiry goblin bares its teeth, clutching a rusty knife.
+        weapon: {dice_num: 1, dice_size: 6, damage_type: slash, class: knife, attack_verb: stab}
+        living:
+          combat_profile: melee
+          attributes:
+            # A modest fighter: 14 STR (str_bonus +2), tough enough to survive a few rounds, low evasion
+            # so a player reliably connects, a little dodge, a little slash soak (hide), 1 attack/round.
+            strength: 14
+            constitution: 8        # max_hp = 8*10 + 1*5 = 85
+            level: 1
+            accuracy: 2
+            damroll: 1
+            attacks: 1
+            evasion: 8             # a d20 attack hits on margin>=0 most of the time
+            dodge: 10             # ~10% dodge chance on the 1d100 roll-under
+            parry: 0              # no parry skill -> roll-under-0 auto-fails ([G-C], gear-gated by 0)
+            block: 0              # no shield -> block auto-fails
+            soak_slash: 1         # 1 flat slash soak (its hide)
+    resets:
+      - {op: spawn_mob, proto: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}

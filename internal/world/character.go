@@ -66,6 +66,13 @@ type StateJSON struct {
 	// "pvp" consent flag the PvP gate reads. Stored as the set of SET flag names. loadCharacter
 	// re-installs each. A pre-5.3 save (no flags) loads with none (the safe default — no PvP consent).
 	Flags []string `json:"flags,omitempty"`
+	// Cooldowns is each armed ability cooldown's REMAINING pulses at dump time ([G8] / P6-D8, Phase
+	// 6.3a), keyed by ability ref. loadCharacter re-arms each via pulse.after(remaining) on the
+	// DESTINATION zone goroutine (never a cross-goroutine timer write — the Phase 5.2 lesson). A logout
+	// mid-cooldown does NOT refresh it (remaining is conserved, like affect durations). Transient combat
+	// state (Fighting/target/threat) is NOT persisted — combat drops cleanly on a crash/handoff. A
+	// pre-6.3 save (no cooldowns) loads with none.
+	Cooldowns map[string]int `json:"cooldowns,omitempty"`
 }
 
 // AffectJSON is the durable form of one active affect: the def ref, the remaining duration in PULSES,
@@ -161,6 +168,7 @@ func dumpCharacter(s *session) CharSnapshot {
 		Resources:  dumpResources(e),
 		Affects:    dumpAffects(e),
 		Flags:      dumpFlags(e),
+		Cooldowns:  dumpCooldowns(e),
 	}
 	return CharSnapshot{
 		PID:          pid,
@@ -218,6 +226,30 @@ func dumpAffects(e *Entity) []AffectJSON {
 			Mag:       inst.magnitude,
 			Stacks:    inst.stacks,
 		})
+	}
+	return out
+}
+
+// dumpCooldowns renders each armed ability cooldown as its REMAINING pulses ([G8] / P6-D8): the stored
+// elapses-at pulse minus the current zone pulse, clamped non-negative. Remaining (not the absolute
+// pulse) is the durable form so it is conserved across the save/load seam exactly like an affect's
+// remaining duration — a reload re-arms from remaining, never refreshing to the full cooldown. An
+// already-elapsed entry (remaining 0) is dropped. Empty when the entity holds no live cooldowns. Runs
+// on the zone goroutine; reads zone-owned state into a fresh map so the saver never aliases live state.
+func dumpCooldowns(e *Entity) map[string]int {
+	if e == nil || e.living == nil || len(e.living.cooldowns) == 0 || e.zone == nil {
+		return nil
+	}
+	now := e.zone.pulses.pulse
+	var out map[string]int
+	for ref, at := range e.living.cooldowns {
+		if at <= now {
+			continue // already elapsed (the clear callback just hasn't run yet)
+		}
+		if out == nil {
+			out = map[string]int{}
+		}
+		out[ref] = int(at - now)
 	}
 	return out
 }
@@ -355,6 +387,16 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 		// Re-install the entity's named flags (Phase 5.3, flags.go) — e.g. a player's "pvp" consent.
 		for _, name := range snap.State.Flags {
 			setFlag(e, name, true)
+		}
+		// Re-arm ability cooldowns ([G8] / P6-D8, Phase 6.3a) from their REMAINING pulses — on THIS
+		// (destination) zone goroutine, so the re-armed clear callback is registered on the zone that
+		// owns the entity (never a cross-goroutine timer write, the Phase 5.2 lesson). A logout mid-
+		// cooldown resumes at the saved remaining; an elapsed (<=0) entry is skipped.
+		for ref, remaining := range snap.State.Cooldowns {
+			if remaining <= 0 {
+				continue
+			}
+			z.rearmCooldown(s, ref, remaining)
 		}
 	}
 
