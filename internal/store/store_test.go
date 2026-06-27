@@ -98,6 +98,57 @@ func TestStorePackRoundTrip(t *testing.T) {
 	}
 }
 
+// TestImportPackIdempotent pins the seed/import idempotency contract (the deletePack regression). A
+// pack re-import is meant to STRIP the pack's prior rows in one transaction, then re-insert — so
+// running `make seed` / `make up` twice against a populated database replaces content rather than
+// colliding. The bug: deletePack cleared attribute/resource/damage_type/affect defs but OMITTED
+// ability_defs, so the SECOND import failed on "duplicate key value violates unique constraint
+// ability_defs_pkey" (e.g. fireball). It survived several slices because it only reproduced against
+// REAL Postgres on a RE-import — exactly the gap a single-import or in-memory test cannot see. This
+// test imports the demo pack twice and asserts the second succeeds with content intact.
+func TestImportPackIdempotent(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	data, err := content.DemoPackBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, err := content.ParsePack(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := p.ImportPack(ctx, pk); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	// THE REGRESSION: the second import must strip-and-replace, not collide on a duplicate key. Before
+	// the deletePack fix this returned the ability_defs_pkey violation.
+	if err := p.ImportPack(ctx, pk); err != nil {
+		t.Fatalf("second import must be idempotent (strip-and-replace), got: %v", err)
+	}
+
+	// Content intact after the re-import: every global def kind loads back, and the ability that
+	// triggered the original bug is present exactly once (the table deletePack must clear).
+	lc, err := content.Load(ctx, p, []string{content.DemoPack})
+	if err != nil {
+		t.Fatalf("load after re-import: %v", err)
+	}
+	fireballs := 0
+	for _, ab := range lc.Abilities {
+		if ab.Ref == "fireball" {
+			fireballs++
+		}
+	}
+	if fireballs != 1 {
+		t.Fatalf("after re-import: found %d 'fireball' abilities, want exactly 1", fireballs)
+	}
+	if len(lc.Attributes) == 0 || len(lc.Resources) == 0 || len(lc.Affects) == 0 {
+		t.Fatalf("after re-import: global defs missing (attrs=%d resources=%d affects=%d)",
+			len(lc.Attributes), len(lc.Resources), len(lc.Affects))
+	}
+}
+
 // TestCharacterCRUD exercises the pgx CharacterStore against a real database: create mints a
 // PersistID and a version-0 row; load returns it; the state_version CAS bumps on a matching save
 // and REJECTS a stale one; and the round-tripped state JSONB (inventory) survives the trip.
