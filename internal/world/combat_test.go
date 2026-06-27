@@ -443,11 +443,11 @@ func TestCannotMoveWhileFighting(t *testing.T) {
 	if !contains(out, "can't leave while fighting") {
 		t.Fatalf("expected the combat-exclusion message, got %v", out)
 	}
-	// flee, then the move is allowed.
+	// flee, then the move is allowed. A local move never releases ownership, so move()'s bool stays
+	// false whether it succeeds or is refused; the relocation itself is the only observable outcome, so
+	// assert on s.entity.location rather than the return.
 	z.stopFight(s.entity)
-	if z.move(s, "north") { //nolint:revive,staticcheck // TODO(combat-engineer): empty branch — possibly a silently-non-asserting test; confirm z.move's return was meant to be asserted
-		// a local move returns false (no ownership release); it should SUCCEED (return false) and relocate.
-	}
+	z.move(s, "north")
 	if s.entity.location == z.rooms[z.startRoom] {
 		t.Fatal("after flee the move should have succeeded")
 	}
