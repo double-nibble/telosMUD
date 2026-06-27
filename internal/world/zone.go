@@ -269,6 +269,18 @@ type saveOkMsg struct {
 	newVersion uint64
 }
 
+// saveReconcileMsg carries the freshly RE-READ durable version back to the zone after a live
+// player's CAS loss (Zone.saveConflict's spawned re-read). The handler adopts the version (like
+// saveOk) AND re-dumps the player's current in-memory state, re-enqueuing the flush — so a conflict
+// re-WRITES current state at the new version instead of silently dropping the data it was carrying.
+// Distinct from saveOkMsg precisely because it re-enqueues a save; saveOk must not (it is also
+// posted by the saver's own final-flush success, where re-enqueuing would loop). Applied on the
+// zone goroutine, so the re-dump stays single-writer.
+type saveReconcileMsg struct {
+	id         string
+	newVersion uint64
+}
+
 // drainFlushMsg requests an immediate durable flush of every persisted player in this zone — the
 // shard-drain flush point (Shard.Drain, a rolling-redeploy hook). The dump runs on the zone
 // goroutine; the write is the saver's job. Phase 4 builds it; Phase 10 wires the trigger.
@@ -326,6 +338,7 @@ func (pendingExpireMsg) zoneMsg() {}
 func (freezeExpireMsg) zoneMsg()  {}
 func (saveConflictMsg) zoneMsg()  {}
 func (saveOkMsg) zoneMsg()        {}
+func (saveReconcileMsg) zoneMsg() {}
 func (drainFlushMsg) zoneMsg()    {}
 func (createdMsg) zoneMsg()       {}
 func (presenceMsg) zoneMsg()      {}
@@ -441,6 +454,8 @@ func (z *Zone) handle(m msg) {
 		z.saveConflict(v.id)
 	case saveOkMsg:
 		z.saveOk(v.id, v.newVersion)
+	case saveReconcileMsg:
+		z.saveReconcile(v.id, v.newVersion)
 	case drainFlushMsg:
 		z.saveAll(saveFlush)
 	case createdMsg:
@@ -576,7 +591,12 @@ func (z *Zone) leave(id string) {
 		// (the create round-trip window) but a real silent-loss path — log it so it's observable.
 		z.log.Info("character logged out before its durable id was assigned; session not persisted", "player", id)
 	}
-	z.enqueueSave(id, s, saveFlush)
+	// saveFinal (not saveFlush): the session is removed below in this same handler, so a CAS miss
+	// must NOT bounce a conflict back (there would be no session to re-dump). The saver instead
+	// re-reads, rebases this authoritative logout snapshot, and retries the CAS itself — so a
+	// cadence flush winning the race can never strand the durable record at the pre-move room
+	// (docs/PERSISTENCE.md §6, the TestQuitFlushReliableAfterMove regression).
+	z.enqueueSave(id, s, saveFinal)
 	if r := s.entity.location; r != nil {
 		z.act("$n leaves.", s.entity, nil, nil, "", "", ToRoom)
 		Move(s.entity, nil)
@@ -983,6 +1003,16 @@ func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
 	}
 	s.detached = true
 	gen := s.attachGen
+	// Flush durably NOW, before the 60s link-death grace — do NOT defer the player's current state to
+	// the reap. A move is not itself a flush point (only cadence/logout/drain are), so without this a
+	// player who walked and then dropped unexpectedly would not have their new room persisted until the
+	// reap leave() 60s later — lost entirely if the shard crashes in that window. It also closes the
+	// quit/detach ORDERING race: a fast quit whose detach is processed before `quitting` is observed
+	// takes THIS path, and the immediate flush records the logout state regardless. The dump is on this
+	// goroutine (race-free), the write is the saver's job (off-goroutine), and the entity is NOT removed
+	// from the room here (reap/resume still decides its fate), so a re-attach within the grace resumes
+	// normally — this only adds a durability checkpoint, it does not change the grace/resume semantics.
+	z.enqueueSave(id, s, saveFlush)
 	z.log.Debug("player link-dead", "player", id, "grace", linkDeadGrace)
 	time.AfterFunc(linkDeadGrace, func() { z.post(reapMsg{id: id, gen: gen}) })
 }
@@ -1132,17 +1162,46 @@ func (z *Zone) saveOk(id string, newVersion uint64) {
 	}
 }
 
-// saveConflict reconciles a state_version CAS loss (a zombie/duplicated owner saved first). It
-// re-reads the current durable version off the zone goroutine — via the saver's store — and on
-// return re-dumps at it, so the next save's CAS matches. The re-read is the ONLY blocking call,
-// so it is done in a spawned goroutine (mirroring beginHandoff) that posts the refreshed version
-// back as a saveOkMsg; the zone goroutine itself never blocks. If the store/character is gone we
-// simply log — the next cadence flush will re-CAS from whatever version the session then holds.
+// saveReconcile finishes a live player's CAS-loss reconcile (Zone.saveConflict's spawned re-read
+// posts saveReconcileMsg here). It adopts the freshly re-read version AND re-dumps the player's
+// CURRENT in-memory state at it, re-enqueuing the flush — so the data the losing flush carried is
+// re-WRITTEN rather than dropped. Runs on the zone goroutine, so the re-dump is single-writer. If
+// the player has since left (the reconcile read raced a logout), there is nothing to re-dump: the
+// logout's own saveFinal flush already carried the authoritative final state, so we simply return.
+func (z *Zone) saveReconcile(id string, newVersion uint64) {
+	s := z.players[id]
+	if s == nil {
+		z.log.Debug("save reconcile: player gone; logout flush carried final state", "player", id)
+		return
+	}
+	if newVersion > s.stateVersion {
+		s.stateVersion = newVersion
+	}
+	z.log.Debug("save reconcile: re-dumping current state at fresh version", "player", id, "state_version", s.stateVersion)
+	// Re-enqueue a cadence-tier flush (saveFlush, not saveFinal): the player is still present, so a
+	// subsequent CAS miss should reconcile through this same live-session path again.
+	z.enqueueSave(id, s, saveFlush)
+}
+
+// saveConflict reconciles a still-LIVE player's state_version CAS loss (a concurrent flush — its own
+// cadence racing a checkpoint/drain, or a zombie/duplicated owner — saved first). It re-reads the
+// current durable version off the zone goroutine — via the saver's store — and on return ADOPTS it
+// AND re-dumps the player's CURRENT in-memory state, re-enqueuing the flush at the fresh version so
+// the conflict re-WRITES rather than silently dropping the data it was carrying. The re-read is the
+// ONLY blocking call, so it runs in a spawned goroutine (mirroring beginHandoff) that posts the
+// refreshed version back as saveOkMsg; the zone goroutine then re-dumps + re-enqueues on its own
+// goroutine (the saveOk handler), keeping the dump single-writer. If the store/character is gone we
+// simply log — the next cadence flush re-CASes from whatever version the session then holds.
+//
+// This path is for a player STILL PRESENT in the zone. The logout/leave flush takes saveFinal
+// instead (saver.go), which the saver reconciles itself — there is no live session here to re-dump
+// once the player has been removed.
 //
 // Crash-failover note (docs/PLACEMENT.md §6): a conflict is exactly the fence that protects a
 // genuinely-rehydrated player on a NEW shard from a zombie original — the original's save fails
 // the CAS here. Reconciling by RE-READING (never force-writing) means this shard yields to the
-// higher version rather than clobbering a legitimate newer owner.
+// higher version before re-dumping, rather than blindly clobbering a legitimate newer owner: the
+// re-dump still goes through a fresh CAS, so a truly-superseded shard simply loses again next time.
 func (z *Zone) saveConflict(id string) {
 	s := z.players[id]
 	if s == nil || z.saver == nil || z.saver.store == nil || s.entity == nil || s.entity.pid == nil {
@@ -1160,9 +1219,10 @@ func (z *Zone) saveConflict(id string) {
 			z.log.Debug("save conflict reconcile read failed", "player", name, "found", found, "err", err)
 			return
 		}
-		// Adopt the current durable version so the next save CASes on it. saveOk only raises the
-		// session's version (never lowers), so this is the safe minimal reconcile.
-		z.post(saveOkMsg{id: name, newVersion: snap.StateVersion})
+		// Adopt the current durable version AND re-dump current state at it. saveOk raises the
+		// session's version (never lowers) then re-enqueues a flush, so the data this conflict was
+		// carrying is re-written at the fresh version rather than lost.
+		z.post(saveReconcileMsg{id: name, newVersion: snap.StateVersion})
 	}()
 }
 

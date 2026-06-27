@@ -63,30 +63,21 @@ func TestReconnectLandsInSavedRoom(t *testing.T) {
 	term.close(t)
 }
 
-// TestReconnectInputSeqMuteBug DOCUMENTS a real bug this stabilization pass surfaced and
-// pins the CURRENT (wrong) behavior so a fix is observable as this test changing.
+// TestReconnectResetsInputSeqFence pins the FIX for the reconnect-mute bug this stabilization
+// pass surfaced.
 //
-// THE BUG: the world dedups input by a per-character high-water mark (appliedSeq): an
-// input whose seq <= appliedSeq is dropped as a replay (zone.go, the handoff/link-death
-// exactly-once mechanism). On a flush the world persists appliedSeq into the durable
-// snapshot, and on LOGIN loadCharacter restores it (character.go). But the GATE mints a
-// FRESH session on every new connection, whose input seq restarts at 1 (session.go
-// newSession). So when a persisted player whose saved appliedSeq is N reconnects, the
-// gate's first new line is seq 1 <= N, and the world DROPS the returning player's first N
-// inputs as duplicates. The player is rehydrated into the right room but is silently MUTE
-// for their first N commands.
+// THE BUG (now fixed): the world dedups input by a high-water mark (appliedSeq): an input whose
+// seq <= appliedSeq is dropped as a replay (zone.go — the handoff/link-death exactly-once
+// mechanism). loadCharacter used to RESTORE appliedSeq from the durable snapshot on a fresh login.
+// But appliedSeq is SESSION-scoped: the gate mints a fresh session whose input seq restarts at 1.
+// So a persisted player whose saved appliedSeq was N reconnected MUTE — the world dropped their
+// first N inputs (seq 1..N) as phantom replays.
 //
-// CONTRACT QUESTION (for the edge-engineer / persistence-engineer): appliedSeq is a
-// SESSION-scoped exactly-once fence (handoff replay, link-death re-attach), not a durable
-// property of the character. A fresh login is a NEW session with a fresh seq space, so the
-// load path should almost certainly RESET appliedSeq to 0 on a non-resume attach (or the
-// gate should carry its seq counter across reconnects). Until that contract is decided +
-// fixed, this test documents the live behavior. When the fix lands, this test's `say` WILL
-// echo and it fails with the explanatory message below — change it to assert the echo.
-//
-// We pre-seed a durable record with appliedSeq = 5 so the precondition is deterministic
-// (no dependency on a prior session's flush).
-func TestReconnectInputSeqMuteBug(t *testing.T) {
+// THE FIX (character.go): a fresh-login / crash-rehydrate is a new session, so loadCharacter resets
+// the fence to 0; the handoff/resume paths (same session) preserve it separately. This test seeds a
+// durable record with appliedSeq = 5 and asserts the returning player's FIRST input is applied (it
+// echoes) — i.e. the stale durable fence does not mute them.
+func TestReconnectResetsInputSeqFence(t *testing.T) {
 	const addr = "addr-a"
 	store := world.NewMemStore()
 	if _, err := store.CreateCharacter(context.Background(), "Mutebug", "midgaard", "midgaard:room:market"); err != nil {
@@ -112,46 +103,33 @@ func TestReconnectInputSeqMuteBug(t *testing.T) {
 	term.login(t, "Mutebug")
 	term.expect(t, "Market Square") // rehydrated into the saved room
 
-	// The fresh gate session's first line is seq 1, which is <= the restored appliedSeq
-	// (5), so the world DROPS it: `say` produces no echo.
+	// The fresh gate session's first line is seq 1. With the fence reset to 0 on login, it is
+	// APPLIED (not dropped against the stale saved appliedSeq of 5): the returning player is not mute.
 	term.send(t, "say echo-check")
-	if !echoAbsent(term, "You say, 'echo-check'", 1*time.Second) {
-		t.Fatal("returning player's first input ECHOED — the appliedSeq mute bug appears FIXED; " +
-			"update TestReconnectInputSeqMuteBug to assert the echo and remove the bug note")
-	}
-	t.Log("documented bug present: returning player's first input (seq 1 <= saved appliedSeq 5) was dropped (mute)")
+	term.expect(t, "You say, 'echo-check'")
 
 	term.close(t)
 }
 
-// TestQuitFlushLostOnDetachRace DOCUMENTS and pins a second, separate persistence race
-// this pass surfaced: a player's logout (quit) flush is INTERMITTENTLY lost, leaving the
-// durable record at its pre-move location.
+// TestQuitFlushReliableAfterMove pins the FIX for a persistence race this pass surfaced: a
+// player's logout flush was INTERMITTENTLY lost, leaving the durable record at its pre-move
+// location.
 //
-// THE RACE: a move does not flush durably (only cadence/logout/drain do), so a player who
-// walks then quits relies entirely on the LOGOUT flush to record their new room. On quit
-// the world sets quitting=true and sends a Disconnect; the gate closes the socket; the
-// world's stream-reader then posts detachMsg, and the detach handler — IF it sees
-// quitting=true — runs leave() which enqueues the durable flush. But detachMsg (from the
-// socket EOF) and the quit input (which sets quitting) arrive on different goroutines.
-// When the EOF-driven detach is processed before quitting is set, detach takes the
-// 60-SECOND link-death grace path instead of the immediate leave+flush — so the moved
-// room is not persisted until a reap 60s later (well past any reconnect), appearing as a
-// lost logout. Reproduces ~1-in-5 here.
+// THE RACE (now fixed): a move is not itself a flush point (only cadence/logout/drain are), so a
+// player who walks then quits relies on the LOGOUT flush to record their new room. On quit the
+// world sets quitting=true; the gate closes the socket; the world's stream-reader posts detachMsg.
+// detach() flushes only IF it sees quitting=true — else it took the 60s link-death grace path with
+// NO flush, deferring (effectively losing) the moved room. The detach vs quit-input ordering raced,
+// so ~1-in-5 the moved room was not persisted promptly.
 //
-// CONTRACT QUESTION (for the persistence-engineer / edge-engineer): a clean quit must
-// flush the player's final state RELIABLY. Either the quit must be acknowledged as a
-// clean teardown BEFORE the socket closes (so detach always sees quitting), or detach's
-// link-death path must itself flush before scheduling the grace reap (so no logout is
-// ever deferred 60s / lost on a fast disconnect).
+// THE FIX (zone.go detach): the link-death branch now enqueues a durable flush BEFORE scheduling the
+// grace reap — so the player's current state is persisted immediately on ANY unexpected drop,
+// regardless of whether `quitting` was observed first. This closes the race (the flush is reliable)
+// and also hardens against a shard crash during the grace window losing a walked-to room.
 //
-// This test is written to NOT be flaky in CI: it asserts the milestone reconnect READS
-// the saved room (covered deterministically by TestReconnectLandsInSavedRoom), and treats
-// the quit-flush WRITE as best-effort — it runs the quit journey and, if the flush did
-// land, asserts it landed CORRECTLY (room=market), but t.Skips (with a clear note) on the
-// runs where the race deferred it. It exists to keep the race VISIBLE and documented, and
-// will tighten to a hard assertion once the flush is made reliable.
-func TestQuitFlushLostOnDetachRace(t *testing.T) {
+// The test walks the player to a new room, quits, and asserts the durable record reliably reflects
+// the moved room within a tight window (a hard assertion now — no skip).
+func TestQuitFlushReliableAfterMove(t *testing.T) {
 	const addr = "addr-a"
 	store := world.NewMemStore()
 	if _, err := store.CreateCharacter(context.Background(), "Quitter", "midgaard", "midgaard:room:temple"); err != nil {
@@ -172,29 +150,23 @@ func TestQuitFlushLostOnDetachRace(t *testing.T) {
 	term.expect(t, "Farewell.")
 	term.close(t)
 
-	// Give the (possibly-deferred) flush a generous window. If it lands, it MUST record the
-	// moved room — a flush that persisted the WRONG room would be a real corruption and
-	// fails hard. If it never lands in-window, the detach-race deferred it: document + skip.
-	// A flush that is NOT deferred by the race lands in milliseconds; this window only
-	// needs to clear that fast path. We deliberately do NOT wait out the 60s link-death
-	// grace (that would make the test slow under -count); a deferred flush simply skips.
-	landed := false
-	deadline := time.Now().Add(1 * time.Second)
-	for time.Now().Before(deadline) {
+	// The flush must reliably land on the moved room (market) — promptly, well within the 60s grace.
+	// Poll a tight window; the async saver writes in milliseconds on either teardown path now.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
 		snap, ok, _ := store.LoadCharacter(t.Context(), "Quitter")
-		if ok && snap.RoomRef != "midgaard:room:temple" {
-			if snap.RoomRef != "midgaard:room:market" {
-				t.Fatalf("logout flush recorded the WRONG room: %q, want market", snap.RoomRef)
-			}
-			landed = true
-			break
+		if ok && snap.RoomRef == "midgaard:room:market" {
+			return // flushed the moved room, as required
+		}
+		if ok && snap.RoomRef != "midgaard:room:temple" && snap.RoomRef != "midgaard:room:market" {
+			t.Fatalf("logout flush recorded the WRONG room: %q, want market", snap.RoomRef)
+		}
+		if time.Now().After(deadline) {
+			snap, _, _ := store.LoadCharacter(t.Context(), "Quitter")
+			t.Fatalf("logout flush did not record the moved room within deadline: durable room=%q, want market", snap.RoomRef)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !landed {
-		t.Skip("logout flush did not land in-window: the detach-race deferred it to the 60s link-death reap (documented bug TestQuitFlushLostOnDetachRace)")
-	}
-	t.Log("logout flush landed correctly (room=market) this run")
 }
 
 // echoAbsent returns true if want does NOT appear in the terminal's output within d. It is

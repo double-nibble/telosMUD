@@ -321,7 +321,15 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 		e.pid = &pid // PersistID becomes REAL here (identity.go)
 	}
 	s.stateVersion = snap.StateVersion
-	s.appliedSeq = snap.State.AppliedSeq
+	// appliedSeq is the SESSION-scoped input-dedup fence (the high-water mark over THIS gate
+	// session's input seq numbers), NOT a durable property of the character. A fresh login — and a
+	// crash-rehydrate-by-name — is a NEW gate session whose input seq restarts at 1, so the fence MUST
+	// start at 0. Restoring the saved value here would drop the returning player's first N inputs as
+	// phantom replays (a silent mute until their seq climbs past the stale mark). The handoff and
+	// link-dead RESUME paths keep the SAME session and preserve appliedSeq separately (zone.go attach /
+	// world.go redirect resumeSeq) — only this fresh-login rehydrate resets it. The durable AppliedSeq
+	// is still persisted (dumpCharacter) for diagnostics + the in-flight handoff snapshot shape.
+	s.appliedSeq = 0
 
 	// Rehydrate content-defined stats (Phase 5.1, §3). Install attribute BASE OVERRIDES FIRST so the
 	// derivation has them before any resource max is computed; setAttrBase dirties the cache. Then

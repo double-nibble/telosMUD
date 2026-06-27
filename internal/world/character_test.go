@@ -221,16 +221,24 @@ func TestSaveConflictPostsReconcile(t *testing.T) {
 	waitEntityPID(t, z, "Cy")
 	drainChan(out)
 
-	// Simulate a zombie writer advancing the durable row far ahead of this session's version.
-	snap, _, _ := mem.LoadCharacter(context.Background(), "Cy")
-	for i := 0; i < 3; i++ {
-		v, ok, _ := mem.SaveCharacter(context.Background(), snap)
-		if !ok {
-			t.Fatalf("setup advance save lost CAS at version %d", snap.StateVersion)
+	// Simulate a zombie writer advancing the durable row ahead of this session's version. RE-READ the
+	// current version and retry on each CAS miss: the session's own background machinery (the
+	// post-create flush, the cadence saver) writes "Cy" concurrently, so a setup that assumed a fixed
+	// starting version would intermittently lose its first CAS — a flaky setup under -race/-count. We
+	// drive the row to a comfortable margin (>=4) above the session's version (0-2) so the session is
+	// reliably STALE for the reconcile assertion below.
+	var advanced uint64
+	setupDeadline := time.Now().Add(3 * time.Second)
+	for advanced < 4 {
+		if cur, found, _ := mem.LoadCharacter(context.Background(), "Cy"); found {
+			if v, ok, _ := mem.SaveCharacter(context.Background(), cur); ok {
+				advanced = v
+			}
 		}
-		snap.StateVersion = v
+		if time.Now().After(setupDeadline) {
+			t.Fatalf("setup could not advance the durable row to version >=4 (reached %d)", advanced)
+		}
 	}
-	advanced := snap.StateVersion
 
 	// Force this session to flush at its (now stale) version 0: the CAS loses, the saver posts
 	// saveConflictMsg, and the zone reconciles by re-reading -> the session's version catches up to
@@ -248,6 +256,103 @@ func TestSaveConflictPostsReconcile(t *testing.T) {
 			t.Fatalf("reconcile after save conflict never let a later flush advance the row past %d", advanced)
 		case <-time.After(20 * time.Millisecond):
 		}
+	}
+}
+
+// TestLogoutFlushSurvivesCASConflict proves the durability-ladder fix for a logout flush that
+// LOSES its state_version CAS to a concurrent (cadence) flush. Because the session is REMOVED in the
+// same leave() that enqueued the flush, a CAS miss cannot be bounced back to a live session to
+// re-dump (Zone.saveConflict would find no session). The logout flush is therefore enqueued as
+// saveFinal, and the saver itself re-reads the current version, rebases this authoritative snapshot,
+// and retries the CAS — so the durable record ends on the player's LOGOUT room, never stranded at a
+// pre-move room a racing cadence write happened to win with.
+//
+// We force the conflict deterministically: log in, walk to the market, then advance the durable row
+// OUT FROM UNDER the session (a stand-in for a cadence flush that won the CAS first at the old
+// version), and only then quit. The first logout CAS (at the session's stale version) loses; the
+// saver's saveFinal retry must still land market.
+func TestLogoutFlushSurvivesCASConflict(t *testing.T) {
+	shard, z, mem := persistShard(t)
+
+	out := login(t, shard, z, "Quincy")
+	waitRow(t, mem, "Quincy")
+	waitEntityPID(t, z, "Quincy")
+	drainChan(out)
+	sendInput(z, "Quincy", "north") // temple -> market
+	waitFrame(t, out, "Market")
+
+	// A concurrent writer (think: a cadence flush) advances the durable row past the session's
+	// version, so the logout flush's CAS at the session's version is guaranteed to MISS. We do NOT
+	// change the room here — the point is that the LOGOUT snapshot (market) must still win after the
+	// saver re-reads and rebases, not be lost to whatever room the row currently holds (temple).
+	// Re-read + retry on a CAS miss: the session's own background saver writes "Quincy" concurrently,
+	// so a fixed-version save would intermittently lose this setup CAS (a flaky setup under -race/-count).
+	setupDeadline := time.Now().Add(3 * time.Second)
+	for {
+		if cur, found, _ := mem.LoadCharacter(context.Background(), "Quincy"); found {
+			if _, ok, _ := mem.SaveCharacter(context.Background(), cur); ok {
+				break
+			}
+		}
+		if time.Now().After(setupDeadline) {
+			t.Fatal("setup: could not advance the durable row ahead of the session")
+		}
+	}
+
+	// Quit: leave() enqueues a saveFinal. Its first CAS loses (stale version); the saver re-reads,
+	// rebases onto the advanced version, and retries — landing the logout room (market).
+	quit(t, z, "Quincy")
+	got := waitRowWhere(t, mem, "Quincy", func(s CharSnapshot) bool {
+		return s.RoomRef == "midgaard:room:market"
+	})
+	if got.RoomRef != "midgaard:room:market" {
+		t.Fatalf("logout flush lost its CAS and was dropped: durable room = %q, want market", got.RoomRef)
+	}
+}
+
+// TestFinalFlushYieldsToReattachedSession proves the MUST-FIX from the durability review: a logout
+// flush that loses its CAS must NOT force-overwrite a NEWER legitimate write made by a session that
+// RE-ATTACHED within the link-death grace while the reconcile loop was running. finalizeFlush probes
+// z.players (the single-writer authority): a present live session means its current state wins, so
+// the stale logout snapshot is routed through the live reconcile path (saveConflictMsg -> re-dump
+// current) instead of being force-written — it must never revert the live session's room.
+//
+// We drive finalizeFlush directly with a STALE logout snapshot (old room, old version) while a LIVE
+// session for the same name is present in the zone at a NEWER room, and assert the durable row ends
+// on the LIVE room — never reverted to the stale snapshot's room.
+func TestFinalFlushYieldsToReattachedSession(t *testing.T) {
+	shard, z, mem := persistShard(t)
+
+	// A live session: logs in, walks to the market. This stands in for the player who RE-ATTACHED
+	// within the link-death grace — z.players holds it, and its current room is the market.
+	out := login(t, shard, z, "Rex")
+	waitRow(t, mem, "Rex")
+	waitEntityPID(t, z, "Rex")
+	drainChan(out)
+	sendInput(z, "Rex", "north") // temple -> market
+	waitFrame(t, out, "Market")
+
+	// Let the live session flush its current (market) state durably so the row reflects the live
+	// truth before we fire the stale final flush.
+	z.post(drainFlushMsg{})
+	live := waitRowWhere(t, mem, "Rex", func(s CharSnapshot) bool { return s.RoomRef == "midgaard:room:market" })
+
+	// A STALE logout snapshot for the SAME name: an OLD room (temple) at an OLD version. Were
+	// finalizeFlush to blindly force-rebase + write this, it would REVERT the live session's market
+	// room to temple. Because a live session is present, it must instead yield to the reconcile path.
+	stale := CharSnapshot{
+		PID: live.PID, Name: "Rex", ZoneRef: "midgaard", RoomRef: "midgaard:room:temple", StateVersion: 0,
+	}
+	req := saveRequest{snap: stale, zone: z, id: "Rex", reason: saveFinal}
+	ctx, cancel := context.WithTimeout(context.Background(), finalFlushBudget)
+	defer cancel()
+	z.saver.finalizeFlush(ctx, req, stale)
+
+	// The durable row must NOT have been reverted to temple. The yield posts saveConflictMsg, whose
+	// reconcile re-dumps the LIVE session's current (market) state — so the row stays at market.
+	settle := waitRowWhere(t, mem, "Rex", func(s CharSnapshot) bool { return s.RoomRef == "midgaard:room:market" })
+	if settle.RoomRef != "midgaard:room:market" {
+		t.Fatalf("final flush reverted a re-attached live session: durable room = %q, want market (never temple)", settle.RoomRef)
 	}
 }
 

@@ -320,7 +320,23 @@ func (s *Server) runStream(ctx context.Context, c *connState, addr, token string
 	// flagged a redirect/disconnect. Wait for the writer to finish so we read its result
 	// without a race.
 	wg.Wait()
-	return br.result()
+	target, redirected := br.result()
+	if !redirected {
+		// A real teardown (a player quit / world Disconnect, or socket EOF), NOT a re-dial.
+		// Half-close the world stream's send side so the shard's reader loop promptly sees
+		// end-of-input and runs its leave/detach (and thus the logout DURABLE FLUSH) NOW,
+		// rather than waiting for the per-connection context to be cancelled when runConn
+		// unwinds — an asynchronous, racy teardown that left the logout flush deferred to the
+		// 60s link-death reap (or lost on a crash in that window). The forwarder's own EOF path
+		// already CloseSends on socket EOF; this covers the world-initiated Disconnect path,
+		// where the forwarder returns via `done` without closing the send side. Idempotent: a
+		// second CloseSend (the forwarder already closed it) is a harmless no-op error we drop.
+		// A redirect must NOT take this path — the socket stays open for the re-dial.
+		br.sendMu.Lock()
+		_ = stream.CloseSend()
+		br.sendMu.Unlock()
+	}
+	return target, redirected
 }
 
 // bridge runs the two halves of one Play stream for a connection. It shares the
