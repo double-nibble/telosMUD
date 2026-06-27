@@ -59,4 +59,14 @@ message PlayerSnapshot {
   // dedup high-water mark from this and drops replayed lines with seq <= applied_seq,
   // tying the freeze-point to the gate's replay-point (Redirect.resume_input_seq).
   uint64 applied_seq = 12;
+  // persist_id is the character's durable-row PersistID (characters.id), carried so the
+  // DESTINATION can flush the player to the SAME durable row — without it a handed-off
+  // session has no id to CAS on and a quit on the destination is silently not persisted
+  // (the location never advances, so the next login routes back to the stale home_zone).
+  // Empty in the async-create window (a brand-new char handed off BEFORE its CreateCharacter
+  // returned the PID at the SOURCE); the destination then re-resolves it by name on bind
+  // (the engine-universal crash-rehydrate primitive, docs/PERSISTENCE.md §6). Paired with
+  // state_version (field 11): adopting the id and the CAS base together keeps a destination
+  // save monotonic against the row.
+  string persist_id = 13;
 }

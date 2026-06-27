@@ -53,10 +53,22 @@ func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 	// unique/enchanted item survives the hop). That is a proto change scoped OUT of Phase 3
 	// (the ROADMAP milestone is single-zone); no Phase-3 test transfers a player with items,
 	// so the snapshot stays minimal — identity + the applied-input high-water mark only.
+	// Carry the durable PersistID so the DESTINATION can flush this player to the SAME durable
+	// row (characters.id). Without it the handed-off session has no id to CAS on, so a quit on the
+	// destination is silently skipped (leave's pid==nil guard) — the location never advances and the
+	// next login routes back to the stale home_zone (the cross-shard reconnect bug). Empty only in
+	// the async-create window: a brand-new char can hand off BEFORE its CreateCharacter returned the
+	// PID at the source, so e.pid is still nil here; the destination then re-resolves it by name on
+	// bind. Paired with StateVersion below so the id and the CAS base cross the seam together.
+	var pid string
+	if s.entity.pid != nil {
+		pid = string(*s.entity.pid)
+	}
 	return &handoffv1.PlayerSnapshot{
 		CharacterId: s.character,
 		Name:        s.entity.Name(),
 		AppliedSeq:  s.appliedSeq,
+		PersistId:   pid,
 		// Carry the optimistic-concurrency version through the handoff so a later save on the
 		// destination CASes from the right base and a handoff + a save stay monotonic (slice 4.2,
 		// docs/PERSISTENCE.md §7). The destination seeds its session.stateVersion from this on

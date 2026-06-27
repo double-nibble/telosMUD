@@ -329,6 +329,184 @@ func TestFreezeExpireGenGuard(t *testing.T) {
 	}
 }
 
+// TestBuildSnapshotCarriesPersistID (CROSS-SHARD PERSIST FIX, C1) asserts the handoff snapshot
+// carries the source's durable PersistID so the destination can flush to the SAME row. Without it
+// the destination has no id to CAS on and a quit there is silently skipped (the bug).
+func TestBuildSnapshotCarriesPersistID(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	out := make(chan *playv1.ServerFrame, 16)
+	s := &session{character: "Carry", out: out, epoch: 1, stateVersion: 7}
+	z.newPlayerEntity(s, "Carry")
+	pid := PersistID("row-uuid-123")
+	s.entity.pid = &pid
+
+	snap := buildSnapshot(s)
+	if snap.GetPersistId() != "row-uuid-123" {
+		t.Fatalf("buildSnapshot PersistId = %q, want row-uuid-123", snap.GetPersistId())
+	}
+	if snap.GetStateVersion() != 7 {
+		t.Fatalf("buildSnapshot StateVersion = %d, want 7 (paired with the PID)", snap.GetStateVersion())
+	}
+
+	// And when the source has no PID yet (the async-create window), the snapshot carries none —
+	// the destination then re-resolves by name on bind.
+	s.entity.pid = nil
+	if got := buildSnapshot(s).GetPersistId(); got != "" {
+		t.Fatalf("buildSnapshot PersistId with nil pid = %q, want empty", got)
+	}
+}
+
+// TestPrepareAdoptsCarriedPersistID (C1, destination side) asserts prepare seeds the rehydrated
+// pending entity's PersistID + state_version from the snapshot, so the destination can persist it.
+func TestPrepareAdoptsCarriedPersistID(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+
+	reply := make(chan error, 1)
+	z.prepare(prepareMsg{
+		snap: &handoffv1.PlayerSnapshot{
+			CharacterId:  "Arriver",
+			Name:         "Arriver",
+			PersistId:    "row-uuid-999",
+			StateVersion: 4,
+		},
+		room:  "", // start room
+		epoch: 3,
+		token: "tok",
+		reply: reply,
+	})
+	if err := <-reply; err != nil {
+		t.Fatalf("prepare replied error: %v", err)
+	}
+	s := z.players["Arriver"]
+	if s == nil || s.entity == nil {
+		t.Fatal("prepare did not park a pending entity")
+	}
+	if s.entity.pid == nil || *s.entity.pid != "row-uuid-999" {
+		t.Fatalf("prepare did not adopt carried PersistID: pid=%v", s.entity.pid)
+	}
+	if s.stateVersion != 4 {
+		t.Fatalf("prepare did not seed state_version: got %d, want 4", s.stateVersion)
+	}
+}
+
+// TestAttachReapsHandedOffOrphanAsFreshLogin (FIX A, the "mid-transfer" direct fix) asserts that an
+// attach landing on a frozen, HANDED-OFF source orphan reaps it and proceeds as a fresh login,
+// rather than rejecting "character is mid-transfer". A genuinely in-flight (NOT handedOff) frozen
+// copy must still reject — the both-own guard.
+func TestAttachReapsHandedOffOrphanAsFreshLogin(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+
+	// Seed a handed-off orphan: frozen + handedOff (the directory already moved ownership).
+	out := make(chan *playv1.ServerFrame, 16)
+	s := &session{character: "Returner", out: out, epoch: 2}
+	z.newPlayerEntity(s, "Returner")
+	z.players["Returner"] = s
+	Move(s.entity, nil)
+	s.frozen = true
+	s.handedOff = true
+	orphanEntity := s.entity
+
+	// A reconnect routed back to the source: attach must reap + proceed as fresh login.
+	var cz atomic.Pointer[Zone]
+	out2 := make(chan *playv1.ServerFrame, 16)
+	z.attach(attachMsg{character: "Returner", out: out2, curZone: &cz})
+
+	ns := z.players["Returner"]
+	if ns == nil {
+		t.Fatal("attach should have created a fresh live session after reaping the orphan")
+	}
+	if ns == s {
+		t.Fatal("attach must REPLACE the orphan session, not resume it")
+	}
+	if ns.frozen || ns.pending {
+		t.Fatalf("re-attached session must be live: frozen=%v pending=%v", ns.frozen, ns.pending)
+	}
+	if ns.entity == orphanEntity {
+		t.Fatal("fresh login must build a new entity, not the orphan's")
+	}
+
+	// The OLD out channel must NOT receive a "mid-transfer" disconnect — the new one gets Attached.
+	gotAttached := false
+	for {
+		select {
+		case f := <-out2:
+			if f.GetAttached() != nil {
+				gotAttached = true
+			}
+			if f.GetDisconnect() != nil {
+				t.Fatalf("fresh login got a disconnect: %q", f.GetDisconnect().GetReason())
+			}
+			if f.GetOutput() != nil && gotAttached {
+				return // attached + room look: a clean fresh login
+			}
+		default:
+			if !gotAttached {
+				t.Fatal("fresh login never produced an Attached frame")
+			}
+			return
+		}
+	}
+}
+
+// TestAttachRejectsInFlightFrozenCopy (FIX A, the both-own guard) confirms the complement: a frozen
+// but NOT-handed-off copy (a re-dial DURING the actual handoff) is still rejected, never reaped.
+func TestAttachRejectsInFlightFrozenCopy(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+
+	out := make(chan *playv1.ServerFrame, 16)
+	s := &session{character: "InFlight", out: out, epoch: 2}
+	z.newPlayerEntity(s, "InFlight")
+	z.players["InFlight"] = s
+	Move(s.entity, nil)
+	s.frozen = true
+	s.handedOff = false // handoff NOT committed: re-dial during the actual handoff
+
+	var cz atomic.Pointer[Zone]
+	out2 := make(chan *playv1.ServerFrame, 16)
+	z.attach(attachMsg{character: "InFlight", out: out2, curZone: &cz})
+
+	// The original frozen session must remain untouched and the new stream rejected.
+	if z.players["InFlight"] != s {
+		t.Fatal("an in-flight frozen copy must NOT be reaped/replaced (both-own guard)")
+	}
+	select {
+	case f := <-out2:
+		if f.GetDisconnect() == nil {
+			t.Fatalf("expected a mid-transfer disconnect, got %v", f)
+		}
+	default:
+		t.Fatal("expected a disconnect frame on the rejected stream")
+	}
+}
+
+// TestAdoptHandoffPidByName (C2, the async-create window) drives the by-name PID adoption directly:
+// a bound destination session with no PID adopts the row's PID + version posted by resolveHandoffPid,
+// so it becomes persistable. Guarded: a session that already has a PID is not clobbered.
+func TestAdoptHandoffPidByName(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	z.saver = newSaver(NewMemStore(), nil)
+
+	out := make(chan *playv1.ServerFrame, 16)
+	s := &session{character: "Late", out: out, epoch: 2}
+	z.newPlayerEntity(s, "Late")
+	z.players["Late"] = s
+	// Place it so enqueueSave's dump has a zone/room (dumpCharacter reads s.entity.zone).
+
+	z.adoptHandoffPid("Late", PersistID("resolved-uuid-7"), 5)
+	if s.entity.pid == nil || *s.entity.pid != "resolved-uuid-7" {
+		t.Fatalf("adoptHandoffPid did not install the PID: pid=%v", s.entity.pid)
+	}
+	if s.stateVersion != 5 {
+		t.Fatalf("adoptHandoffPid did not adopt the version: got %d, want 5", s.stateVersion)
+	}
+
+	// Guard: a second adopt with a different PID must NOT clobber the now-real identity.
+	z.adoptHandoffPid("Late", PersistID("other-uuid"), 99)
+	if *s.entity.pid != "resolved-uuid-7" {
+		t.Fatalf("adoptHandoffPid clobbered an existing PID: %v", *s.entity.pid)
+	}
+}
+
 // TestPrepareRejectsUnplaceableRoom (FIX 3A) asserts a Prepare for a zone that cannot place
 // any room is REJECTED (error reply) rather than parking a nil-location pending entity that
 // later null-derefs on bind.

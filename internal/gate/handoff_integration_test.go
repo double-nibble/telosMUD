@@ -2,7 +2,9 @@ package gate
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -89,6 +91,130 @@ func TestGateCrossShardHandoff(t *testing.T) {
 
 	// Clean teardown: closing the client end ends the gate's reader loop.
 	term.close(t)
+}
+
+// TestCrossShardHandoffPersistsAndReconnects is the regression for the live 2-shard reconnect bug:
+// a brand-new character logs in on shard-A (midgaard), walks the cross-shard exit into shard-B
+// (darkwood), walks once more, then quits on B. A reconnect must (1) NOT be rejected "mid-transfer"
+// and (2) land back in darkwood (the destination room) — proving the handoff carried/re-resolved the
+// PersistID so the destination flushed the new location, and the gate routed the relog by the
+// directory's placement to the owning shard. Both shards share one MemStore so a row created on A is
+// visible to B's by-name PID re-resolve (the async-create window: a brand-new char is handed off
+// before its CreateCharacter returns the PID at A, so the snapshot carries none and B re-resolves).
+func TestCrossShardHandoffPersistsAndReconnects(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mr.Close)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	dir := directory.NewRedis(rdb, "test")
+
+	ctx := context.Background()
+	for _, sh := range []struct{ id, addr string }{{"shard-a", "addr-a"}, {"shard-b", "addr-b"}} {
+		if err := dir.RegisterShard(ctx, sh.id, sh.addr, directory.DefaultShardLease); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := dir.RegisterZone(ctx, "midgaard", "shard-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.RegisterZone(ctx, "darkwood", "shard-b"); err != nil {
+		t.Fatal(err)
+	}
+
+	// One store shared by both shards (the live stack's single Postgres): A creates kurt's row, B
+	// re-resolves + flushes the post-handoff location to it.
+	store := world.NewMemStore()
+
+	h := newHarness(t)
+	// B comes up first so A can reach its Handoff service. Both get the shared store.
+	h.serveShard("addr-b", world.NewShard("darkwood", "addr-b", dir, nil).WithPersistence(store, nil))
+	peers := func(addr string) (handoffv1.HandoffClient, error) {
+		if addr != "addr-b" {
+			return nil, errUnknownShard(addr)
+		}
+		return h.dialHandoff("addr-b")
+	}
+	h.serveShard("addr-a", world.NewShard("midgaard", "addr-a", dir, peers).WithPersistence(store, nil))
+
+	// The gate routes a login by the directory's per-character placement FIRST (where the player
+	// actually lives), falling back to the home zone — mirroring cmd/telos-gate's loginDirectory.
+	h.serveGate(placementDir{redis: dir, homeZone: "midgaard"})
+
+	// --- Session 1: brand-new kurt walks temple -> market -> (cross-shard) grove -> hollow, quits.
+	term := h.dial(t)
+	term.login(t, "kurt")
+	term.expect(t, "Temple Square")
+	term.send(t, "north") // temple -> market
+	term.expect(t, "Market Square")
+	term.send(t, "north")           // market -> darkwood:grove (CROSS-SHARD handoff)
+	term.expect(t, "Moonlit Grove") // gate re-dialed B; activation look landed
+	term.send(t, "north")           // grove -> hollow
+	term.expect(t, "Dark Hollow")
+	term.send(t, "quit")
+	term.expectClose(t)
+
+	// The directory records kurt on shard-b (the handoff CAS) so the relog routes there.
+	place, err := dir.PlayerPlacement(ctx, "kurt")
+	if err != nil {
+		t.Fatalf("placement after handoff: %v", err)
+	}
+	if place.ShardID != "shard-b" {
+		t.Fatalf("placement = %+v, want shard-b", place)
+	}
+
+	// The durable row must have advanced to the destination zone/room — proof the destination
+	// persisted across the handoff (the PID was carried/re-resolved). Poll: the quit flush is async.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snap, found, _ := store.LoadCharacter(ctx, "kurt")
+		if found && snap.ZoneRef == "darkwood" && snap.RoomRef == "darkwood:room:hollow" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable row never advanced to darkwood:hollow: found=%v snap=%+v", found, snap)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// --- Session 2: reconnect kurt. Must NOT be "mid-transfer"; must land in darkwood (hollow).
+	term2 := h.dial(t)
+	term2.login(t, "kurt")
+	// A failure mode of the bug: the gate rejects with "character is mid-transfer". expect() would
+	// time out on "Dark Hollow" and surface the accumulated output, so a regression is observable.
+	term2.expect(t, "Dark Hollow")
+	if strings.Contains(term2.acc.String(), "mid-transfer") {
+		t.Fatalf("reconnect was rejected mid-transfer: %q", term2.acc.String())
+	}
+	term2.close(t)
+}
+
+// placementDir routes a login by the directory's per-character placement first (the shard the player
+// actually lives on, persisted across logout), falling back to the home zone — the test twin of
+// cmd/telos-gate's loginDirectory after the reconnect-routing fix.
+type placementDir struct {
+	redis    *directory.Redis
+	homeZone string
+}
+
+func (d placementDir) ShardForCharacter(characterID string) (string, bool) {
+	ctx := context.Background()
+	if place, err := d.redis.PlayerPlacement(ctx, characterID); err == nil && place.ShardID != "" {
+		if endpoint, eerr := d.redis.EndpointForShard(ctx, place.ShardID); eerr == nil && endpoint != "" {
+			return endpoint, true
+		}
+	}
+	shardID, err := d.redis.ShardForZone(ctx, d.homeZone)
+	if err != nil || shardID == "" {
+		return "", false
+	}
+	endpoint, err := d.redis.EndpointForShard(ctx, shardID)
+	if err != nil || endpoint == "" {
+		return "", false
+	}
+	return endpoint, true
 }
 
 func errUnknownShard(addr string) error {

@@ -89,6 +89,29 @@ type loginDirectory struct {
 
 func (d loginDirectory) ShardForCharacter(characterID string) (string, bool) {
 	ctx := context.Background()
+	// FIRST consult the per-character placement: the directory is the authoritative ownership
+	// record (the handoff CAS writes it, and it PERSISTS across logout — ClearPlayer is deferred).
+	// A character who was handed off to another shard and logged out there must reconnect to THAT
+	// shard, not to the fixed home zone — otherwise a fresh login routed back to the home shard
+	// rehydrates the player at a room the home shard cannot place (the cross-shard reconnect bug).
+	// Falls through to the home-zone resolution when the player has no placement yet (brand-new, or
+	// never handed off), so a first-ever login is unchanged. Resolving the placement's shard id to
+	// an endpoint reuses the same id->endpoint hop as the home-zone path.
+	if place, perr := d.redis.PlayerPlacement(ctx, characterID); perr == nil && place.ShardID != "" {
+		if endpoint, eerr := d.redis.EndpointForShard(ctx, place.ShardID); eerr == nil && endpoint != "" {
+			slog.Debug("login directory resolved by placement",
+				"component", "gate", "character", characterID,
+				"shard_id", place.ShardID, "epoch", place.Epoch, "endpoint", endpoint)
+			return endpoint, true
+		}
+	}
+	// Fallback: route to the home zone's shard. This is correct ONLY while ClearPlayer is deferred
+	// (placement persists across logout, so a returning handed-off player resolves via the branch
+	// above and never reaches here). COUPLED INVARIANT — do not decouple: if a future slice wires
+	// ClearPlayer-on-quit, a returning player will have no placement and fall through HERE, and this
+	// fallback MUST then resolve the player's DURABLE zone_ref (load the row, route to whoever owns
+	// that zone), not the fixed home zone — otherwise it reintroduces the cross-shard reconnect bug
+	// for anyone who quit outside their home zone. (distsys review, 6.3a handoff fix.)
 	// Two hops: which shard owns the home zone, then where that shard is reachable.
 	shardID, err := d.redis.ShardForZone(ctx, d.homeZone)
 	if err == nil && shardID != "" {

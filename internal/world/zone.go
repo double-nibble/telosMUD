@@ -306,6 +306,19 @@ type createdMsg struct {
 	pid PersistID
 }
 
+// adoptPidMsg carries a PersistID + durable state_version RESOLVED BY NAME back to the zone after a
+// cross-shard bind found the handed-off session had no PID (the async-create window: a brand-new
+// char handed off BEFORE its CreateCharacter returned the PID at the source, so the snapshot carried
+// none). The destination re-resolves the row by name OFF the zone goroutine (resolveHandoffPid) and
+// adopts it here so it can flush the player to the SAME durable row. version is adopted WITH the PID
+// so the destination's first save CASes against the right base (monotonic). Idempotent + guarded:
+// adopted only if the entity still has no PID (a concurrent createdMsg or a carried PID wins first).
+type adoptPidMsg struct {
+	id      string
+	pid     PersistID
+	version uint64
+}
+
 // presenceMsg is a synchronous query answered ON the zone goroutine: it reports whether a player
 // is currently registered and whether its entity has a durable PersistID yet (the brand-new-
 // character create is async, so the PID lands a beat after login). Because z.players is
@@ -353,6 +366,7 @@ func (saveOkMsg) zoneMsg()        {}
 func (saveReconcileMsg) zoneMsg() {}
 func (drainFlushMsg) zoneMsg()    {}
 func (createdMsg) zoneMsg()       {}
+func (adoptPidMsg) zoneMsg()      {}
 func (presenceMsg) zoneMsg()      {}
 func (loadObjectsMsg) zoneMsg()   {}
 
@@ -472,6 +486,8 @@ func (z *Zone) handle(m msg) {
 		z.saveAll(saveFlush)
 	case createdMsg:
 		z.characterCreated(v.id, v.pid)
+	case adoptPidMsg:
+		z.adoptHandoffPid(v.id, v.pid, v.version)
 	case presenceMsg:
 		s, present := z.players[v.id]
 		pidSet := present && s.entity != nil && s.entity.pid != nil
@@ -687,6 +703,24 @@ func (z *Zone) transferIn(m transferInMsg) {
 func (z *Zone) attach(m attachMsg) {
 	character, token, out, curZone, resumeEpoch := m.character, m.token, m.out, m.curZone, m.resumeEpoch
 	s := z.players[character]
+	// Eagerly reap a handed-off ORPHAN before the switch (the direct fix for a reconnect routed
+	// back to the source after a successful cross-shard handoff). A frozen session with handedOff
+	// is the leftover source copy of a handoff whose directory ownership CAS already COMMITTED — the
+	// destination is the sole owner. A reconnect that lands here (the directory still pointed at the
+	// home_zone) must REAP this copy (delete + dropToken, exactly like freezeExpire's handedOff
+	// branch) and proceed AS A FRESH LOGIN — which then loads the player's durable record and routes
+	// correctly — rather than rejecting "mid-transfer". This is NOT a both-own window: reaping a
+	// handed-off orphan removes a copy the directory already disowned. A genuinely in-flight (frozen
+	// but NOT handedOff) copy is a re-dial DURING the handoff and is still rejected below (the
+	// both-own guard). Setting s=nil falls the switch through to the fresh-login default.
+	if s != nil && s.frozen && s.handedOff {
+		z.log.Debug("attach: reaping orphaned handed-off source copy; proceeding as fresh login", "player", character)
+		delete(z.players, character)
+		if z.shard != nil && s.token != "" {
+			z.shard.dropToken(s.token)
+		}
+		s = nil
+	}
 	switch {
 	case s != nil && s.pending:
 		// Handoff bind: the gate re-dialed here after a Redirect. Activate the session
@@ -724,6 +758,15 @@ func (z *Zone) attach(m attachMsg) {
 		s.send(promptFrame())
 		z.log.Debug("handoff committed: player activated", "player", character,
 			"room", roomRef(s.entity.location), "applied", s.appliedSeq, "epoch", s.epoch)
+		// Async-create window: the snapshot carried no PersistID (the source's CreateCharacter had
+		// not yet returned when the handoff fired), so this destination has no id to flush against —
+		// a quit here would be silently skipped (leave's pid==nil guard). Re-resolve the durable row
+		// BY NAME off the zone goroutine (the row exists by now: the source's create committed it)
+		// and adopt the PID + version, so the destination becomes able to persist. No-op when the PID
+		// already crossed in the snapshot (the common case) or no store is configured.
+		if s.entity.pid == nil {
+			z.resolveHandoffPid(s)
+		}
 
 	case token != "":
 		// A handoff token was presented but no pending player matches it
@@ -887,6 +930,17 @@ func (z *Zone) prepare(m prepareMsg) {
 		token:        m.token,
 	}
 	e := z.newPlayerEntity(s, character)
+	// Adopt the durable PersistID carried in the snapshot so a save on THIS (destination) shard
+	// CASes against the SAME row the source created — the fix for "a handed-off character can't be
+	// persisted on the destination". Paired with the stateVersion seeded above, the id + CAS base
+	// cross the seam together, keeping the destination's first flush monotonic. Empty in the async-
+	// create window (the row's PID had not returned at the source when the handoff fired); the bind
+	// path (attach) then re-resolves it by name. INVARIANT: only SET here from a non-empty snapshot
+	// PID — never clear a PID — so a later by-name resolve can't be clobbered by an empty carry.
+	if pid := m.snap.GetPersistId(); pid != "" {
+		p := PersistID(pid)
+		e.pid = &p
+	}
 	// Defense-in-depth: the snapshot's Name is externally-sourced and the cross-shard
 	// handoff is currently UNAUTHENTICATED (docs/PROTOCOL.md §5) — a forged/tampered
 	// snapshot could carry a control-laden Name that would land here as a passively
@@ -1279,6 +1333,65 @@ func (z *Zone) characterCreated(id string, pid PersistID) {
 	// while pid==nil (enqueueSave's guard), so persist current state now rather than waiting for
 	// the next cadence tick — closes the new-character first-actions loss window for a player who
 	// is still connected when the create returns.
+	z.enqueueSave(id, s, saveFlush)
+}
+
+// resolveHandoffPid recovers a handed-off player's durable PersistID BY NAME when the handoff
+// snapshot carried none (the async-create window, §C2). It reads the durable row off the zone
+// goroutine — mirroring beginHandoff/saveConflict — and posts the PID + state_version back as
+// adoptPidMsg. This is the engine-universal crash-rehydrate-by-name primitive (docs/PERSISTENCE.md
+// §6): the row is keyed by name, so the destination can recover the id without the source having
+// carried it. A graceful no-op when no store is configured (ephemeral) or the row is not found yet
+// (the create still in flight) — the player simply stays unpersisted, the same observable as today's
+// pre-create window, and a later cadence tick is NOT needed because the bind only fires once; if the
+// row truly never appears the character is ephemeral, exactly the prior behavior.
+func (z *Zone) resolveHandoffPid(s *session) {
+	if z.saver == nil || z.saver.store == nil {
+		return // ephemeral: nothing to resolve against
+	}
+	store := z.saver.store
+	name := s.character
+	z.log.Debug("handoff bind: PID absent, re-resolving by name", "player", name)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), saveIOTimeout)
+		defer cancel()
+		snap, found, err := store.LoadCharacter(ctx, name)
+		if err != nil || !found {
+			// The async create has not committed the row yet (or an infra hiccup). Non-fatal: the
+			// character stays ephemeral on this shard, same as a pre-create login. We do NOT retry —
+			// a brand-new char that races this hard is already an extreme edge; the row is durable
+			// once the create lands and the NEXT login will load it.
+			z.log.Debug("handoff PID re-resolve: row not found (staying ephemeral)", "player", name, "found", found, "err", err)
+			return
+		}
+		z.post(adoptPidMsg{id: name, pid: snap.PID, version: snap.StateVersion})
+	}()
+}
+
+// adoptHandoffPid installs a BY-NAME-resolved PersistID (+ the row's current state_version) onto a
+// handed-off player's live entity, on the zone goroutine (single-writer). It is the destination twin
+// of characterCreated for the async-create window: PersistID becomes REAL so cadence/logout flushes
+// can CAS the row. Idempotent + guarded: it adopts only when the entity STILL has no PID (a carried
+// snapshot PID or a racing createdMsg wins first) so it never clobbers an already-real identity. The
+// version is adopted alongside the PID so the destination's first save CASes against the right base —
+// never letting a stale snapshot version clobber a row the source may have advanced (monotonic CAS,
+// docs/PERSISTENCE.md §7). After adopting, flush once so the player's post-handoff location (and any
+// actions taken on this shard before the PID landed) reach the durable row promptly.
+func (z *Zone) adoptHandoffPid(id string, pid PersistID, version uint64) {
+	s := z.players[id]
+	if s == nil || s.entity == nil {
+		z.log.Debug("handoff PID adopt: session gone; row loads next login", "player", id)
+		return
+	}
+	if s.entity.pid != nil {
+		return // a carried PID or a racing create already made identity real
+	}
+	p := pid
+	s.entity.pid = &p
+	if version > s.stateVersion {
+		s.stateVersion = version // adopt the row's CAS base so the first save is monotonic
+	}
+	z.log.Debug("handoff PID adopted by name", "player", id, "pid", pid, "state_version", s.stateVersion)
 	z.enqueueSave(id, s, saveFlush)
 }
 
