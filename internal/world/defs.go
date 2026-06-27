@@ -211,6 +211,11 @@ type resourceDef struct {
 	vital             bool   // depletion drives death (on_depleted) — wired in 5.2/combat
 	regen             int    // per-tick flat regen (reserved; regen ticks ride 5.2)
 	depletedThreshold int    // reserved (vital depletion threshold)
+	// perRound marks a per-round REACTION budget ([G9], combat.go topUpReactions): a resource topped up to
+	// its derived max at the start of EVERY combat round, so a reactor gets a bounded number of reactions
+	// (opportunity attacks) per round and a spent reaction does not refill until the next round. Content
+	// declares `per_round: true`; the engine names no "reactions" pool — the flag is the convention.
+	perRound bool
 	// onEvent subscribes content op-lists to in-zone engine events ([G3], event.go). An entity that
 	// HAS this resource (a positive max or a stored current) reacts to the keyed event — e.g. a `rage`
 	// pool with onEvent[OnHit] = modify_resource rage +N is the canonical builder. nil => no handlers.

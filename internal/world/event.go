@@ -32,6 +32,28 @@ import (
 // A handler's op-list is ordinary ops: a harmful op (deal_damage / a detrimental apply_affect / a
 // cross-player resource write) funnels the SAME guardHarmful (effect_op.go). An event handler is NOT a
 // PvP-gate bypass — the gate lives at the op, not at the subscription.
+//
+// # Named interruptible checkpoints ([G9], P6-D4, docs/PHASE6-PLAN.md §1.3.1)
+//
+// The swing/cast/movement pipelines fire events at NAMED checkpoints so content (and Phase-7 Lua) can
+// react. v1 reactions are DECLARATIVE: a handler may run a granted op-list (an opportunity attack) +
+// spend a per-round reaction resource; it may NOT alter the in-flight action (cancel a cast, add to AC
+// after the roll) — that RESULT-ALTERING path is the Phase-7 Lua hatch, which only adds handlers at
+// these same checkpoints, never pipeline surgery. The checkpoints:
+//
+//	OnHit / OnDamageTaken  — the swing landed / a target took damage (combat.go, live 6.3a)
+//	OnLeaveRoom            — an engaged foe is LEAVING a foe's room (combat.go fireLeaveRoom, live 6.4b)
+//	BeforeCastCommit       — an ability is about to commit (ability.go, reserved fire point, live 6.4b)
+//	OnKill                 — a target died (death.go, live 6.3b)
+//
+// # The OnLeaveRoom subject convention (the opportunity attack)
+//
+// fireLeaveRoom fires OnLeaveRoom about each ENGAGED REACTOR (subject = a foe fighting the leaver), with
+// `other` = the LEAVER. The bus gathers handlers from the SUBJECT, so the reactor's OWN subscription
+// (a `reactions` resource carrying on_event[OnLeaveRoom]) runs; its ops bind the leaver via `target:
+// other` and deal the granted swing through the SAME gated deal_damage. The reactor must be engaged with
+// the leaver in the same room (fireLeaveRoom's gather) — and content decides whether to spend a reaction
+// (an `if reactions>=1` guard), so a spent budget = no opportunity attack (the second flee gets none).
 
 // eventKind is an engine-named in-zone event. The engine OWNS this closed set (content subscribes to
 // it, never defines new kinds); an unknown name in content `on_event` is dropped at parse with a lint
@@ -42,10 +64,11 @@ type eventKind string
 const (
 	evOnCheck           eventKind = "OnCheck"           // a check/save/contested resolved (check.go) — live 6.2
 	evOnAbilityResolved eventKind = "OnAbilityResolved" // an ability finished step 8 (ability.go) — live 6.2
-	evOnHit             eventKind = "OnHit"             // a swing landed (combat) — reserved 6.3
-	evOnDamageTaken     eventKind = "OnDamageTaken"     // an entity took damage — reserved 6.3
-	evOnKill            eventKind = "OnKill"            // an entity died to the subject — reserved 6.3
-	evOnLeaveRoom       eventKind = "OnLeaveRoom"       // the subject left a room — reserved 6.4
+	evOnHit             eventKind = "OnHit"             // a swing landed (combat) — live 6.3a
+	evOnDamageTaken     eventKind = "OnDamageTaken"     // an entity took damage — live 6.3a
+	evOnKill            eventKind = "OnKill"            // an entity died to the subject — live 6.3b
+	evOnLeaveRoom       eventKind = "OnLeaveRoom"       // an engaged foe is leaving a room (the OA checkpoint) — live 6.4b
+	evBeforeCastCommit  eventKind = "BeforeCastCommit"  // an ability is about to commit (the cast checkpoint) — live 6.4b
 	evOnRest            eventKind = "OnRest"            // the subject rested — reserved 6.2b (regen/rest)
 	evOnApplyAffect     eventKind = "OnApplyAffect"     // an affect attached — reserved
 	evOnAffectTick      eventKind = "OnAffectTick"      // an affect ticked — reserved
@@ -55,8 +78,8 @@ const (
 // knownEventKinds is the closed set the parser validates content `on_event` keys against.
 var knownEventKinds = map[eventKind]bool{
 	evOnCheck: true, evOnAbilityResolved: true, evOnHit: true, evOnDamageTaken: true,
-	evOnKill: true, evOnLeaveRoom: true, evOnRest: true, evOnApplyAffect: true,
-	evOnAffectTick: true, evOnAffectExpire: true,
+	evOnKill: true, evOnLeaveRoom: true, evBeforeCastCommit: true, evOnRest: true,
+	evOnApplyAffect: true, evOnAffectTick: true, evOnAffectExpire: true,
 }
 
 // maxEventDepth bounds how many event-fires may NEST before the bus refuses to fire further (the

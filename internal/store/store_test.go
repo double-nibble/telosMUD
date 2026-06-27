@@ -150,6 +150,29 @@ func TestStorePackRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip: 'web' affect scope was DROPPED on the DB path: got %q, want 'room' "+
 			"(room-scoped affect would attach to one entity instead of the room)", dbWeb.Scope)
 	}
+
+	// Pin the per-round reaction-budget flag round-trip (Phase 6.4b, [G9]): the `reactions` resource's
+	// top-level PerRound must survive the DB path (it rides the resource body JSONB). Same global-def
+	// gap class as the web scope / goblin Living above — without it the reaction budget never refreshes,
+	// so the live opportunity-attack feature silently breaks.
+	dbReactions := findResource(fromDB.Resources, "reactions")
+	if dbReactions == nil {
+		t.Fatal("round-trip: 'reactions' resource missing from DB-loaded content")
+	}
+	if !dbReactions.PerRound {
+		t.Fatal("round-trip: 'reactions' resource per_round was DROPPED on the DB path (the reaction " +
+			"budget would never refresh, breaking opportunity attacks)")
+	}
+}
+
+// findResource returns the pack-global ResourceDTO with the given ref, or nil.
+func findResource(resources []content.ResourceDTO, ref string) *content.ResourceDTO {
+	for i := range resources {
+		if resources[i].Ref == ref {
+			return &resources[i]
+		}
+	}
+	return nil
 }
 
 // findAffect returns the pack-global AffectDTO with the given ref, or nil.

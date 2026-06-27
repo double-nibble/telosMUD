@@ -183,6 +183,19 @@ func parseOp(v any) (effectOp, error) {
 	if has := firstStr(m, "has_affect"); has != "" {
 		op.affect = has
 	}
+	// `if` resource-threshold condition ([G9] reaction budget): `resource_min: {resource: reactions,
+	// min: 1}` OR the flat keys `if_resource`/`if_resource_min`. Branches on the ctx subject's pool
+	// CURRENT >= min. Used by the opportunity-attack handler's "do I have a reaction left?" guard.
+	if rm, ok := asMap(m["resource_min"]); ok {
+		op.ifResource = mapStr(rm, "resource")
+		op.ifResourceMin = mapFloat(rm, "min")
+	}
+	if r := mapStr(m, "if_resource"); r != "" {
+		op.ifResource = r
+	}
+	if _, present := m["if_resource_min"]; present {
+		op.ifResourceMin = mapFloat(m, "if_resource_min")
+	}
 	// Dice: "<N>d<S>" form for deal_damage; or explicit dice_num/dice_size.
 	if dice := mapStr(m, "dice"); dice != "" {
 		n, s, err := parseDice(dice)

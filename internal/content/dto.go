@@ -90,6 +90,10 @@ type ResourceDTO struct {
 	Vital             bool   `json:"vital" yaml:"vital"`
 	Regen             int    `json:"regen" yaml:"regen"`                           // per-tick flat regen (reserved; ticks ride 5.2)
 	DepletedThreshold int    `json:"depleted_threshold" yaml:"depleted_threshold"` // reserved (vital depletion, 5.2)
+	// PerRound marks a per-round REACTION budget ([G9], Phase 6.4b): the resource is topped up to its max
+	// at the start of every combat round, so a reactor (e.g. a mob with an OnLeaveRoom opportunity attack)
+	// gets a bounded number of reactions/round and a spent reaction does not refill until the next round.
+	PerRound bool `json:"per_round" yaml:"per_round"`
 	// OnEvent subscribes op-lists to in-zone engine events ([G3]) for an entity that HAS this resource
 	// (a rage pool that builds on OnHit). Map of event-name -> op-list. Phase 6.2.
 	OnEvent map[string]any `json:"on_event" yaml:"on_event"`

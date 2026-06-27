@@ -58,6 +58,11 @@ type effectCtx struct {
 	// in resolveCheckScope) — PF iterative attacks (-5/-10/-15 by swing) are authorable without it. It is
 	// 0 outside the swing loop (a spell's deal_damage / a check unrelated to a swing reads $swing.index 0).
 	swingIndex int
+	// lastDamage is the integer damage the most recent dealDamage call applied through THIS ctx (6.5).
+	// The swing path reads it for the combat message / threat instead of re-reading the victim's vital
+	// after opDealDamage returns — that read-back corrupts when death/respawn fires inside dealDamage (a
+	// player respawn restores full hp, so a `before - after` delta goes negative). 0 until dealDamage runs.
+	lastDamage int
 }
 
 // rollChance returns true with probability p (clamped to [0,1]). Uses the ctx rng when present so a
@@ -111,6 +116,14 @@ type effectOp struct {
 	// the looped per-target ctx). Same-zone-contained (areaTargets never dereferences a cross-zone room).
 	area string
 
+	// ifResource + ifResourceMin are the `if` flow op's RESOURCE-threshold condition ([G9] reaction
+	// budget): `if <ifResource> >= <ifResourceMin>` over the CURRENT of the ctx subject's pool (the actor
+	// by default; `target: other` selects the counterpart). This is what lets a content reaction guard on
+	// "do I have a reaction left?" — `if reactions >= 1, then [spend + opportunity attack]`. Empty
+	// ifResource leaves `if` on its has_affect condition (op.affect), unchanged.
+	ifResource    string
+	ifResourceMin float64
+
 	// then/els are the nested branches for the flow ops (if/chance). Parsed recursively.
 	then []effectOp
 	els  []effectOp
@@ -153,6 +166,16 @@ func init() {
 // runOps interprets an op-list in order (the step-8 entry point + the if/chance recursion). It walks
 // the ops, dispatching each to its registered handler; an unknown op is logged+skipped (content-lint
 // is the real gate). Single-writer: zone goroutine. Never blocks.
+//
+// CROSS-RESPAWN HAZARD (security S1, documented-not-fixed this slice): runOps holds c.target across
+// SIBLING ops. With 6.5 uniform death, an op-list like `[deal_damage <lethal>, apply_affect rooted]` on
+// one bound target now KILLS+respawns on op1 (the shared funnel runs death inside deal_damage) and then
+// lands op2 (the debuff) on the RESPAWNED player — the same *Entity, fresh hp, at the start room. This is
+// SAFE today: op2 still funnels guardHarmful (it re-validates the now-respawned target every op, so no
+// crash and the PvP gate still holds), and there is no respawn-invulnerability window to violate yet. It
+// is a LATENT grief vector once respawn-sickness / spawn-protection exists. The real fix — skip the
+// remaining same-op-list ops on a target that died/respawned mid-list (track the target's pre-op
+// position/identity and bail) — lands WITH respawn-sickness, not here. Not marking it now by design.
 func runOps(c *effectCtx, ops []effectOp) {
 	for i := range ops {
 		op := &ops[i]
@@ -276,17 +299,45 @@ func guardCrossPlayerWrite(c *effectCtx, target *Entity) bool {
 	return guardHarmful(c, target)
 }
 
-// dealDamage is the SHARED MITIGATION PIPELINE (docs/PHASE5-PLAN.md §1.6): the ONE function a spell's
-// deal_damage op and (Phase 6) a sword swing both route through, so they obey the same armor/resist/
-// PvP rules. The flow is:
+// dealDamage is the SHARED MITIGATION + DEATH PIPELINE (docs/PHASE5-PLAN.md §1.6, docs/COMBAT.md §3):
+// the ONE function a spell's deal_damage op, a sword swing, an AoE, a DoT tick, and an opportunity
+// attack all route through, so they obey the same armor/resist/PvP rules AND the same death seam. The
+// flow is:
 //
 //	guardHarmful (PvP)  ->  raw  ->  ×resist/vuln/immune (from the damage_type_def matrix)
 //	  ->  −soak  ->  clamp at >=0  ->  subtract from the target's vital resource (clamp current at 0)
+//	  ->  threat  ->  OnDamageTaken (all damage)  ->  OnHit (attributable hit)  ->  depletion checkpoint
 //
-// Death / on_depleted is RESERVED (Phase 6): this never crosses 0 into a death path — it clamps the
-// current at 0 and stops. Returns the damage actually applied (0 on a gated block / a non-living
-// target). Single-writer: zone goroutine.
+// 6.5 — UNIFORM DEATH: the depletion->death seam lives HERE, not in the swing path, so EVERY content
+// damage source kills through one path (a pure-caster's fireball/DoT can now land a killing blow). When
+// the applied damage empties the target's vital pool, onVitalDepleted runs the content on_depleted hook
+// (which can CANCEL the death by reviving the victim — death.go) then die().
+//
+// BOUNDING (security M1): the death seam is NOT reached through fireEvent, so it does not inherit the
+// bus's depth/width guard for free. onVitalDepleted->runDeathHook (death.go) does the bounding EXPLICITLY
+// at the seam: it INCREMENTS c.depth per hook level and DECREMENTS the shared eventBudget when present,
+// refusing the hook past maxEventDepth. So a recursive on_depleted (`deal_damage self`, or a `tgt: other`
+// ping-pong) that loops back through this checkpoint terminates at maxEventDepth instead of overflowing
+// the stack. depth alone bounds it (a command-issued cast reaches here with eventBudget==nil).
+//
+// ORDERING (LOAD-BEARING — do not reorder): apply -> threat -> OnDamageTaken -> OnHit -> depletion
+// checkpoint.
+//   - OnDamageTaken (about the victim) fires for ALL damage incl. a sourceless DoT, BEFORE the checkpoint,
+//     so a thorns reflect / "below-20% hp" reaction lands on the SAME blow that then kills. A handler here
+//     MAY kill or respawn an entity (a reflect that kills the attacker) — which is exactly why the
+//     checkpoint below RE-READS current state instead of trusting a pre-fire snapshot, and why the OnHit
+//     fire re-checks src liveness (SC1): reordering these would reopen a double-fire / dead-subject window.
+//   - OnHit (about the attacker — lifesteal/rage) fires only when c.source is an attributable attacker
+//     that is not the victim (a self/ambient DoT doesn't spuriously "hit"), AND only if that attacker is
+//     still alive/in-room after OnDamageTaken (SC1 liveness re-check — a reflect may have killed it).
+//   - The depletion checkpoint precedes nothing combat-event-wise (it is last), so OnDamageTaken/OnHit
+//     always precede death.
+//
+// The swing path no longer re-reads the vital to compute the applied amount (that read corrupts if death/
+// respawn fires mid-call); it reads the returned int / c.lastDamage instead. Returns the damage actually
+// applied (0 on a gated block / a non-living target). Single-writer: zone goroutine.
 func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType string) int {
+	c.lastDamage = 0
 	if target == nil || target.living == nil {
 		return 0
 	}
@@ -300,16 +351,51 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType string) int {
 		return 0
 	}
 	// Apply to the target's vital resource pool (the first vital resource — hp in the demo). The pool
-	// clamps its current at 0 (resources.go); death/on_depleted is Phase 6.
+	// clamps its current at 0 (resources.go); the depletion checkpoint below turns a 0-crossing into death.
 	pool := vitalResource(target)
 	if pool == "" {
 		c.z.log.Debug("deal_damage: target has no vital resource; damage discarded", "target", target.short)
+		c.lastDamage = dmg
 		return dmg
 	}
 	cur := resourceCurrent(target, pool)
 	setResourceCurrent(target, pool, cur-dmg)
+	c.lastDamage = dmg
 	c.z.log.Debug("deal_damage applied", "target", target.short, "type", dmgType,
 		"raw", raw, "applied", dmg, "pool", pool, "from", cur, "to", resourceCurrent(target, pool))
+
+	// --- Threat + the lit combat events, now UNIFORM across all damage (moved out of the swing path so a
+	// spell/AoE/DoT builds threat and triggers reactions identically to a melee swing). source is the
+	// attacker the damage is attributed to (the swing attacker; a DoT's applier; nil for a sourceless
+	// environmental hit). A self/ambient DoT (source == target) is NOT an attacker — no threat, no OnHit.
+	src := c.source
+	attributable := src != nil && src != target
+	if attributable {
+		// Threat the attacker built on the target — accrued BEFORE the death scrub (die() clears the
+		// table) so a killing blow is still attributed. A non-living/zero amount is a no-op (addThreat).
+		addThreat(target, src, float64(dmg))
+	}
+	// OnDamageTaken is ABOUT the defender and fires for ALL damage (a DoT must be able to trigger a
+	// thorns reflect / a "below 20% hp" reaction). other = the attacker (nil for a sourceless hit). It
+	// runs BEFORE the depletion checkpoint so a thorns reflect lands on the same blow that then kills.
+	c.z.fireEvent(c, evOnDamageTaken, target, src, float64(dmg))
+	// OnHit is ABOUT the attacker (lifesteal/rage). Only an attributable attacker "hits" — a self/ambient
+	// DoT does not. This unifies OnHit across swings AND offensive spells (both carry source = caster).
+	// SC1 liveness re-check: OnDamageTaken above may have KILLED/respawned src (a thorns reflect that fells
+	// the attacker), so re-validate src is alive + in-room before firing OnHit — never proc on a dead mob
+	// or a just-respawned full-hp player. (src is captured pre-OnDamageTaken; this re-reads its state.)
+	if attributable && src.living != nil && src.location != nil && position(src) != posDead {
+		c.z.fireEvent(c, evOnHit, src, target, float64(dmg))
+	}
+
+	// --- Depletion checkpoint (6.5, the uniform death seam): the applied damage emptied the vital pool ->
+	// run the content on_depleted hook (which may CANCEL death by reviving the victim) then die(). source
+	// is the killer attribution (nil for a sourceless death — no OnKill subject). Idempotent via the
+	// posDead latch (onVitalDepleted/die). Shares this ctx's budget/depth so a death inside an event
+	// cascade stays bounded. resourceCurrent already clamped at 0; <= 0 is the depleted test.
+	if resourceCurrent(target, pool) <= 0 {
+		c.z.onVitalDepleted(target, src, c)
+	}
 	return dmg
 }
 
@@ -372,6 +458,13 @@ func applyDebuff(c *effectCtx, target *Entity, affectRef string, opts attachOpts
 // more than one vital still resolves the same pool every time, not whichever Go's randomized map
 // iteration yields first. Content convention is ONE vital; lintVitalResources warns at load on >1.
 // Reads the registry (lock-free atomic.Load).
+//
+// MULTI-VITAL UNSUPPORTED (latent flag, NOT this slice): the 6.5 death seam damages and tests depletion
+// against THIS single lowest-ref pool (dealDamage's checkpoint) while the cancel re-check uses
+// vitalCurrent — both collapse to the same lowest-ref vital here, so they cannot disagree TODAY. But if
+// content ever marks two resources `vital`, only the lowest-ref pool damages/kills and the other is dead
+// config (a target could sit at 0 in a higher-ref vital and never die). Multi-vital is unsupported; a
+// real "death when ANY/ALL vitals deplete" policy is a future design decision, not a bug here.
 func vitalResource(e *Entity) string {
 	if e == nil || e.zone == nil {
 		return ""

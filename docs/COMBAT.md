@@ -122,6 +122,17 @@ OnDeath(victim, killer)
 OnApplyAffect / OnAffectTick / OnAffectExpire
 ```
 
+**Named interruptible checkpoints ([G9], Phase 6.4b).** The swing/cast/movement pipelines fire in-zone
+events at named checkpoints content subscribes to via `on_event` (the event bus, event.go). The lit set:
+`OnHit`/`OnDamageTaken` (a swing landed / a target took damage), `OnKill` (a target died), `OnLeaveRoom`
+(an engaged foe is LEAVING a room — fired about each engaged reactor, the leaver bound as `other`, BEFORE
+the leaver detaches so the harm gate sees live in-room entities), and `BeforeCastCommit` (an ability is
+about to commit). v1 reactions are **declarative**: a handler may run a granted op-list + spend a
+**per-round reaction resource** (`per_round: true`) — e.g. a mob's `OnLeaveRoom` opportunity attack on a
+fleeing player, bounded to one/round so a second flee the same round provokes nothing. Reactions that
+**alter the in-flight action** (Counterspell cancelling a cast, Shield adding AC after the roll) are the
+Phase-7 Lua hatch: it only adds handlers at these same checkpoints — no pipeline surgery.
+
 Formulas (to-hit, soak curve, attacks/round, crit) live in a tunable ruleset table so balance
 changes don't require a recompile. Combat runs entirely inside the zone goroutine, so scripts
 and procs see a consistent single-threaded fight.

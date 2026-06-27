@@ -257,19 +257,33 @@ func opSend(c *effectCtx, op *effectOp) error {
 	return nil
 }
 
-// opIf: if(cond, then, else). A minimal v1 condition: it branches on whether the target has the named
-// affect (op.affect) — the common "if poisoned, then ..." shape. An empty affect ref is treated as
-// false. The query vocabulary (has_affect/attr/...) expands in later slices; the flow op itself is the
-// registered seam. Branches recurse back into runOps (same ctx).
+// opIf: if(cond, then, else). A minimal v1 condition with two predicate shapes:
+//   - has_affect (op.affect): branch on whether the target has the named affect ("if poisoned, then ...");
+//   - resource_min (op.ifResource >= op.ifResourceMin): branch on the SUBJECT's resource current — the
+//     [G9] reaction-budget guard "if reactions >= 1, then [spend + opportunity attack]". The pool is read
+//     off the ctx SUBJECT: the actor by default, or the counterpart when the if itself carries `target:
+//     other` (runOps rebinds c.target before the handler, so the read tracks the selected entity).
+//
+// An empty affect ref AND an empty resource leave cond false. The query vocabulary expands in later
+// slices; the flow op itself is the registered seam. Branches recurse back into runOps (same ctx).
 func opIf(c *effectCtx, op *effectOp) error {
 	cond := false
+	if op.ifResource != "" {
+		// Read the pool off the resolved ctx target (runOps already applied any `target: self|other`).
+		subject := c.target
+		if subject == nil {
+			subject = c.actor
+		}
+		cond = subject != nil && float64(resourceCurrent(subject, op.ifResource)) >= op.ifResourceMin
+	}
 	if op.affect != "" && c.target != nil {
 		if def := c.target.zone.affectDefs().get(op.affect); def != nil {
 			if a, ok := Get[*Affected](c.target); ok {
-				_, cond = a.byKey[keyFor(def, c.source)]
-				if !cond {
-					_, cond = a.byKey[keyFor(def, nil)]
+				_, has := a.byKey[keyFor(def, c.source)]
+				if !has {
+					_, has = a.byKey[keyFor(def, nil)]
 				}
+				cond = cond || has
 			}
 		}
 	}

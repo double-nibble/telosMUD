@@ -342,6 +342,7 @@ type resourceBody struct {
 	DepletedThreshold int            `json:"depleted_threshold,omitempty"`
 	OnEvent           map[string]any `json:"on_event,omitempty"`    // [G3] event subscriptions (6.2)
 	OnDepleted        []any          `json:"on_depleted,omitempty"` // [G-D] death hook (6.3b)
+	PerRound          bool           `json:"per_round,omitempty"`   // [G9] per-round reaction budget (6.4b)
 }
 
 type dmgBody struct {
@@ -434,6 +435,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 			}
 			r.Regen, r.DepletedThreshold = b.Regen, b.DepletedThreshold
 			r.OnEvent, r.OnDepleted = b.OnEvent, b.OnDepleted
+			r.PerRound = b.PerRound
 		}
 		pp := pack(pk)
 		pp.Resources = append(pp.Resources, r)

@@ -143,6 +143,69 @@ func (z *Zone) disengage(e *Entity) {
 	z.stopFight(e)
 }
 
+// fireLeaveRoom is the OnLeaveRoom CHECKPOINT ([G9], docs/PHASE6-PLAN.md §1.3.1 / §4 slice 6.4): it
+// fires the in-zone OnLeaveRoom event when `leaver` is about to depart its room, so an ENGAGED foe can
+// react with a declarative opportunity attack. It MUST be called BEFORE the leaver is detached from the
+// room (Move(e, nil/to)) — while both the leaver and every reactor are still live and in-room — so the
+// granted attack's guardHarmful sees a valid actor+target (the fail-closed-on-detached funnel, event.go).
+//
+// The SUBJECT of each fire is the REACTOR (a foe in the room whose fighting link points at the leaver),
+// with `other` = the leaver. The bus gathers handlers from the subject, so the reactor's own
+// subscription (a `reactions` resource's on_event[OnLeaveRoom]) runs and its ops bind the leaver via
+// `target: other`. We fire about EACH engaged reactor independently, so a leaver mobbed by two foes can
+// provoke two opportunity attacks (each spends its OWN reaction budget). The cascade shares the action's
+// event budget (the depth+width guard, event.go) — a reaction firing here can't blow the heartbeat, and
+// because the granted attack does NOT itself fire OnLeaveRoom there is no A-flees -> B's-OA -> ... loop.
+// Single-writer: zone goroutine; `leaver` and the reactors are all this zone's (a same-room departure).
+func (z *Zone) fireLeaveRoom(parent *effectCtx, leaver *Entity) {
+	if z == nil || leaver == nil || leaver.living == nil || leaver.location == nil {
+		return
+	}
+	// Share ONE event budget across every reactor's OnLeaveRoom handler (distsys/security SC1), matching
+	// the round driver's discipline — not a fresh maxEventHandlers per reactor. A nil parent (the command
+	// call sites) roots a fresh cascade here; a non-nil parent (a future nested fire) inherits its budget.
+	if parent == nil {
+		budget := maxEventHandlers
+		parent = &effectCtx{z: z, eventBudget: &budget}
+	}
+	// Snapshot the reactors first (a handler runs ops that could mutate room contents). A reactor is a
+	// living foe in the leaver's room whose fighting link points AT the leaver — the "engaged with the
+	// leaver" requirement the engine enforces structurally (content additionally gates on a reaction).
+	var reactors []*Entity
+	for _, e := range leaver.location.contents {
+		if e != leaver && e.living != nil && e.living.fighting == leaver {
+			reactors = append(reactors, e)
+		}
+	}
+	for _, reactor := range reactors {
+		// Re-validate per reactor: a prior reactor's handler may have moved/killed it or the leaver.
+		if reactor.living == nil || reactor.location == nil ||
+			leaver.living == nil || leaver.location == nil || reactor.location != leaver.location {
+			continue
+		}
+		z.fireEvent(parent, evOnLeaveRoom, reactor, leaver, 1)
+	}
+}
+
+// topUpReactions refills a combatant's per-round reaction resources to their derived max at the START of
+// a combat round — the "regens 1/round" tie to the round the reaction budget needs ([G9]). A resource
+// declares `per_round: true` (content) to be topped up here; the engine names no "reactions" pool (the
+// per-round flag is the convention, not the ref). This is why a reactor that spent its reaction on one
+// flee can opportunity-attack again only on a LATER round, never twice in the same round. Single-writer.
+func (z *Zone) topUpReactions(e *Entity) {
+	if e == nil || e.living == nil || e.zone == nil {
+		return
+	}
+	for ref, def := range e.zone.resourceDefs().table() {
+		if !def.perRound {
+			continue
+		}
+		if max := resourceMax(e, ref); max > 0 {
+			setResourceCurrent(e, ref, max)
+		}
+	}
+}
+
 // ensureCombatRound arms the per-zone round driver on the pulse scheduler if it is not already running.
 // It is idempotent (a stored handle gates re-registration) and called from startFight. ONE callback per
 // zone drives ALL fights in the zone — the centralized iteration the [G-G] order seam needs. The
@@ -188,6 +251,13 @@ func (z *Zone) runCombatRound(pulse uint64) bool {
 	// swings×combatants and was a heartbeat-starvation vector). Matches event.go's "TOTAL work bounded"
 	// intent; the budget refreshes each round (a new round is a new action).
 	budget := maxEventHandlers
+	// Per-round reaction budget ([G9]): refresh every combatant's per-round reaction pool to its max at
+	// the START of the round, so a reactor gets its bounded number of reactions (opportunity attacks) per
+	// round. A reaction spent mid-round (an OA on a fleeing foe) stays spent until the next round tops it
+	// up here — this is what makes a SECOND flee in the same round provoke no opportunity attack.
+	for _, c := range combatants {
+		z.topUpReactions(c)
+	}
 	anyFighting := false
 	for _, atk := range combatants {
 		// Threat retarget (6.3b): a MOB re-points at its highest-threat live foe before swinging, so a
@@ -383,12 +453,13 @@ func (z *Zone) swingGatesPass(attacker, target *Entity) bool {
 	return true
 }
 
-// applySwingDamage runs the damage + soak + apply + OnHit stages for a landed swing. The damage is a
-// deal_damage op carrying the attacker's WEAPON profile ([G-A] scoped bonus); a crit multiplies it via
-// the `crit_mult` attribute on the ctx mag (so the one deal_damage path crits cleanly). dealDamage ->
-// guardHarmful -> mitigate(resist/vuln/immune + soak) is UNCHANGED (the harm funnel). On a non-zero
-// applied amount it fires OnHit (subject=attacker, other=defender) and OnDamageTaken (subject=defender,
-// other=attacker) — the reserved combat events, now lit. Single-writer: zone goroutine.
+// applySwingDamage runs the damage stage for a landed swing. The damage is a deal_damage op carrying the
+// attacker's WEAPON profile ([G-A] scoped bonus); a crit multiplies it via the `crit_mult` attribute on
+// the ctx mag (so the one deal_damage path crits cleanly). The whole consequence chain — threat,
+// OnDamageTaken, OnHit, and the death/on_depleted checkpoint — now lives INSIDE the shared dealDamage
+// funnel (effect_op.go, 6.5 uniform death), so a swing, a spell, an AoE, and a DoT all kill and react
+// through ONE path. Here we only build the swing op, apply the crit multiplier, emit the swing message,
+// then run it. Single-writer: zone goroutine.
 func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit bool) {
 	dmgOp := buildSwingDamageOp(attacker)
 	// Crit multiplier: a content `crit_mult` attribute (>1) scales the whole damage roll through the ctx
@@ -400,37 +471,19 @@ func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit boo
 			c.mag = prevMag * m
 		}
 	}
-	// opDealDamage reads c.target; the swing's target IS c.target already. Run it through the registered
-	// handler so the [G-A] formula bonus + dice_count and the mitigation pipeline all apply identically
-	// to a spell. The damage actually applied is read back from the target's vital pool delta.
-	before := vitalCurrent(target)
-	_ = opDealDamage(c, dmgOp)
-	c.mag = prevMag
-	dealt := before - vitalCurrent(target)
-	if dealt < 0 {
-		dealt = 0
-	}
-
+	// SC2 (distsys): emit the "You hit $N" message BEFORE opDealDamage. The funnel now runs death INSIDE
+	// the op (death narration / respawn message), so emitting after would invert the ordering — the room
+	// would read "$n is DEAD!" / the player the respawn line BEFORE the hit that caused it. combatMsg does
+	// not depend on the applied amount (c.lastDamage), so it is safe to emit ahead of the damage.
 	z.combatMsg(attacker, target, hitOrCrit(crit), "")
 
-	// Threat (6.3b): the damage this swing dealt is threat the attacker built on the target, so a MOB
-	// targets its highest-threat foe (death.go retargetMob). Accrued BEFORE the death check so the kill
-	// is attributed correctly even though a dead target's table is scrubbed immediately after.
-	addThreat(target, attacker, float64(dealt))
-
-	// --- Stage OnHit / OnDamageTaken (the reserved combat events, now LIT). OnHit is ABOUT the attacker
-	// (a rage build, a lifesteal proc); OnDamageTaken is ABOUT the defender (a thorns reflect, a "below
-	// 20% hp" trigger). mag = damage dealt. The cascade is depth+width guarded (event.go). ----------
-	z.fireEvent(c, evOnHit, attacker, target, float64(dealt))
-	z.fireEvent(c, evOnDamageTaken, target, attacker, float64(dealt))
-
-	// --- Death path (6.3b): when the swing emptied the target's vital pool, run the content on_depleted
-	// hook then die() (death.go) — drop combat, fire OnKill, build the corpse (mob) / respawn (player).
-	// Idempotent on an already-dead target. The death path introduces NO new harm vector (it is
-	// triggered by the harm that already gated above); the on_depleted/OnKill ops re-gate themselves. --
-	if vitalCurrent(target) <= 0 && vitalResource(target) != "" {
-		z.onVitalDepleted(target, attacker, c)
-	}
+	// opDealDamage reads c.target; the swing's target IS c.target already. Run it through the registered
+	// handler so the [G-A] formula bonus + dice_count and the FULL funnel (mitigation, threat, OnDamage-
+	// Taken/OnHit, the death checkpoint) all apply identically to a spell. dealDamage may have killed the
+	// target and (for a player) respawned it before this returns — do NOT re-read the victim's vital here
+	// (c.lastDamage carries the applied amount for anything downstream that needs it).
+	_ = opDealDamage(c, dmgOp)
+	c.mag = prevMag
 }
 
 // buildSwingDamageOp builds the deal_damage op for an attacker's swing from its WEAPON profile + the

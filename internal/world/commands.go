@@ -265,6 +265,20 @@ func (z *Zone) move(s *session, dir string) bool {
 		s.send(textFrame("You can't go that way."))
 		return false
 	}
+	// OnLeaveRoom checkpoint ([G9], combat.go): fire BEFORE detach so any foe engaged with the leaver
+	// can react (an opportunity attack) while both are still live and in-room (the harm gate's fail-
+	// closed-on-detached funnel). move() refuses while posFighting, so the leaver here is unengaged; the
+	// fire is the general movement checkpoint (a foe with a one-sided fighting link still provokes). A
+	// directional `flee` (combat_commands.go) is the engaged-leaver path that exercises the OA milestone.
+	moveOrigin := s.entity.location
+	z.fireLeaveRoom(nil, s.entity)
+	// M1 (distsys review): if a reaction killed the mover, die()->respawnPlayer already relocated them —
+	// don't continue the move (it would teleport the respawned player to the move destination). A changed
+	// location is the signal (respawn clears posDead). Unengaged movers rarely take a lethal reaction, but
+	// a one-sided fighting link can still provoke, so guard the same way as the flee path.
+	if s.entity.location != moveOrigin || position(s.entity) == posDead {
+		return false
+	}
 	z.act("$n leaves "+dir+".", s.entity, nil, nil, "", "", ToRoom) // announced from `from`
 	Move(s.entity, to)
 	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom) // announced from `to`
