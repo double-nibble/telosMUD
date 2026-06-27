@@ -64,10 +64,10 @@ The generic substrate + the effect-op vocabulary. ([ABILITIES.md](ABILITIES.md))
 **Done when:** a data-defined `fireball` casts, costs mana, deals typed damage, and applies a
 content-defined affect — all without engine code changes.
 
-### Phase 6 — Combat (+ the check primitive, the event bus, AoE & room affects)
-Round-based resolution on top of the substrate — and the phase that builds the load-bearing
-primitives combat is assembled *from*. ([COMBAT.md](COMBAT.md), [PHASE6-PLAN.md](PHASE6-PLAN.md),
-[GAME-SYSTEMS-GAP-ANALYSIS.md](GAME-SYSTEMS-GAP-ANALYSIS.md))
+### Phase 6 — Combat (+ the check primitive, the event bus, AoE & room affects) ✅
+**Status: complete (slices 6.1–6.5).** Round-based resolution on top of the substrate — and the phase
+that builds the load-bearing primitives combat is assembled *from*. ([COMBAT.md](COMBAT.md),
+[PHASE6-PLAN.md](PHASE6-PLAN.md), [GAME-SYSTEMS-GAP-ANALYSIS.md](GAME-SYSTEMS-GAP-ANALYSIS.md))
 
 Foundational primitives (built *with/before* the fight loop — to-hit and saves *are* these):
 - **The check/save/contested primitive** [G2] — a `check` flow op beside `if`/`chance`: a
@@ -78,7 +78,10 @@ Foundational primitives (built *with/before* the fight loop — to-hit and saves
 - **The event-bus origin** [G3] — engine events (`OnHit`/`OnDamageTaken`/`OnKill`/
   `OnAbilityResolved`/`OnCheck`/`OnLeaveRoom`) fire to content op-lists. The universal glue:
   rage/combo builders, XP-on-kill, procs, and the reaction checkpoints all hang off it (declarative
-  handlers here; Lua handlers in Phase 7).
+  handlers here; Lua handlers in Phase 7). The first realization of the
+  [universal-hookability pillar](PRINCIPLES.md#pillar-every-action-and-event-is-hookable) — the
+  taxonomy ships *partial* (several kinds reserved-but-unlit, no builder-defined events yet); Phase 7
+  completes it.
 - **AoE / area targeting** [G12] — loop the *built* `dealDamage` harm-gate per target (the room, or
   the room + adjacent rooms) with a per-target save.
 - **Room-scoped affects** [G13] — affects attached to the room entity, ticking over its occupants
@@ -94,7 +97,10 @@ Combat resolution on those primitives:
   (Counterspell/Shield) are Lua (Phase 7).
 - Conditional/formula resource regen [G4] + a `rest`/`recover` event [G5]; `floor`/`ceil`/`round`/
   `mod` formula heads [G1]; gear modifiers into the attr mod-stack [G14].
-- Skills-as-commands with lag/cooldowns; death → corpse; threat/assist.
+- Skills-as-commands with lag/cooldowns; threat/assist; **uniform, cancellable death** (6.5) — the
+  depletion→death seam lives in the shared `dealDamage` funnel so *any* damage (swing/spell/AoE/DoT/OA)
+  kills, and an `on_depleted` hook can cancel death (a death-ward: hp→1 + rooted) — the reference
+  before-checkpoint for the hookability pillar.
 
 **Done when:** you fight a mob through the full pipeline (to-hit check → miss/dodge/parry/block →
 soak), a fireball's save halves its damage across everyone in the room, a rage bar builds on hit via
@@ -108,8 +114,20 @@ express. ([LUA.md](LUA.md))
 - Lua **event handlers** on the Phase 6 bus; **result-altering reactions** [G9] (Counterspell/Shield
   reaching into an in-flight ability), **concentration** [G11], and the 5e **multiclass spell-slot
   table** [G7] — the documented escape-hatch cases.
+- **Builder-defined events + taxonomy completion** — the
+  [universal-hookability pillar](PRINCIPLES.md#pillar-every-action-and-event-is-hookable) made
+  concrete on the bus:
+  - A **content-namespaced custom-event lane**: builders *fire* and *subscribe to* their own named
+    events (a sailing system's `OnShipDock`), not just the engine's enumerated kinds — today's closed
+    `eventKinds` validation map grows a `pack:event` lane (still depth/width-budgeted and gate-funneled
+    like an engine event; no privileged status).
+  - **Light the reserved engine kinds** whose owners exist by now — `OnApplyAffect`/`OnAffectTick`/
+    `OnAffectExpire` and an `OnEnter` movement hook — so "a missing hook is an engine bug" holds. The
+    cross-phase kinds get lit by their owning phase (`OnRest` with regen [G5], `OnLevelUp` with
+    progression Phase 11, `OnLogin` with auth Phase 14).
 
-**Done when:** a room script fires on entry and a scripted mob greets you — edited live.
+**Done when:** a room script fires on entry and a scripted mob greets you — edited live — and a pack
+defines, fires, and handles an event the engine has never heard of.
 
 Phase 6 (the event bus) + Phase 7 (Lua) are the prerequisites for the progression phase (Phase 11).
 
