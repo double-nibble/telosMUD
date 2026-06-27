@@ -3,6 +3,7 @@ package world
 import (
 	"fmt"
 
+	"github.com/double-nibble/telosmud/internal/textsan"
 	lua "github.com/yuin/gopher-lua"
 )
 
@@ -64,8 +65,10 @@ func (rt *luaRuntime) installHandleType() {
 	// method table. Belt-and-suspenders alongside the dropped getmetatable/setmetatable.
 	L.SetField(mt, "__metatable", lua.LString("locked"))
 
-	// __index is the method table — read methods only this slice.
+	// __index is the method table. Read/query + traversal + comms (slices 7.2 + 7.3a). NO
+	// effect ops / harm surface — those are 7.3c.
 	methods := map[string]lua.LGFunction{
+		// 7.2 identity/query (read)
 		"id":               rt.hID,
 		"name":             rt.hName,
 		"short":            rt.hShort,
@@ -76,6 +79,18 @@ func (rt *luaRuntime) installHandleType() {
 		"affect_magnitude": rt.hAffectMagnitude,
 		"has_flag":         rt.hHasFlag,
 		"room":             rt.hRoom,
+		// 7.3a traversal (handle-returning / bool reads)
+		"contents":  rt.hContents,
+		"equipment": rt.hEquipment,
+		"group":     rt.hGroup,
+		"is_enemy":  rt.hIsEnemy,
+		"distance":  rt.hDistance,
+		"can_see":   rt.hCanSee,
+		// 7.3a comms (message via the existing act()/send — no harm)
+		"send":  rt.hSend,
+		"act":   rt.hAct,
+		"say":   rt.hSay,
+		"emote": rt.hEmote,
 	}
 	L.SetField(mt, "__index", L.SetFuncs(L.NewTable(), methods))
 }
@@ -258,6 +273,206 @@ func (rt *luaRuntime) hRoom(l *lua.LState) int {
 	}
 	l.Push(rt.newHandle(e.location))
 	return 1
+}
+
+// --- 7.3a traversal (handle-returning / bool reads; no harm) ------------------------------
+
+// pushHandleList pushes a Lua array-table of validated handles, one per entity in es (nil
+// entities skipped). An empty input yields an empty table — a departed-entity traversal
+// no-ops to {} rather than nil so a script can always `for _,h in ipairs(...)` safely.
+func (rt *luaRuntime) pushHandleList(l *lua.LState, es []*Entity) int {
+	t := l.NewTable()
+	n := 0
+	for _, e := range es {
+		if e == nil {
+			continue
+		}
+		n++
+		t.RawSetInt(n, rt.newHandle(e))
+	}
+	l.Push(t)
+	return 1
+}
+
+// hContents returns a table of handles for the entity's contents (a room's occupants + ground
+// items, a container's items, a mob/player's inventory). A departed/unresolved handle yields
+// an empty table.
+func (rt *luaRuntime) hContents(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	if e == nil {
+		return rt.pushHandleList(l, nil)
+	}
+	return rt.pushHandleList(l, e.contents)
+}
+
+// hEquipment returns a table of handles for the entity's WORN items (the Wearer component's
+// worn slots). A non-wearer / unresolved handle yields an empty table.
+func (rt *luaRuntime) hEquipment(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	if e == nil {
+		return rt.pushHandleList(l, nil)
+	}
+	return rt.pushHandleList(l, equipmentItems(e))
+}
+
+// hGroup returns the entity's party/group members as handles. The engine has NO party/group
+// model yet (it is Phase-11 progression/social work), so this is a RESERVED STUB that returns
+// an empty table — never invents a grouping. When the party model lands, this method reads it
+// without any script-API change.
+func (rt *luaRuntime) hGroup(l *lua.LState) int {
+	if e := resolveHandle(l, 1); e == nil {
+		return rt.pushHandleList(l, nil)
+	}
+	return rt.pushHandleList(l, nil)
+}
+
+// hIsEnemy reports whether `other` is a hostile target of the entity. The engine has no
+// faction/aggro-relationship model exposed as a predicate yet; the honest read available now
+// is "they are different living entities in the same room" — a placeholder the faction/aggro
+// follow-up will replace at this one chokepoint. Returns false for an unresolved handle or a
+// missing/!living counterpart.
+func (rt *luaRuntime) hIsEnemy(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	other := resolveHandle(l, 2)
+	if e == nil || other == nil || e == other {
+		l.Push(lua.LFalse)
+		return 1
+	}
+	// Placeholder relationship: both living and co-located. NOTE: the real faction/aggro
+	// predicate lands here (the single is_enemy chokepoint) when that model exists.
+	enemy := e.living != nil && other.living != nil && e.location != nil && e.location == other.location
+	l.Push(lua.LBool(enemy))
+	return 1
+}
+
+// hDistance returns a coarse distance between the entity and `other`: 0 if the same entity, 1
+// if co-located (same room), else a large sentinel (math.huge-like) for "not reachable in this
+// zone's adjacency model". The engine has no room-graph distance metric yet (room coordinates
+// are deferred — see the room-coordinates memory), so this is the honest same-room/elsewhere
+// split; the metric lands here when coordinates do. Returns nil for an unresolved handle.
+func (rt *luaRuntime) hDistance(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	other := resolveHandle(l, 2)
+	if e == nil || other == nil {
+		l.Push(lua.LNil)
+		return 1
+	}
+	switch {
+	case e == other:
+		l.Push(lua.LNumber(0))
+	case e.location != nil && e.location == other.location:
+		l.Push(lua.LNumber(1))
+	default:
+		l.Push(lua.LNumber(999)) // "elsewhere in/beyond the zone" sentinel
+	}
+	return 1
+}
+
+// hCanSee routes the engine's existing visibility chokepoint (Zone.canSee — targeting.go),
+// the SAME predicate the resolver + act() leak-surface consult. Today canSee is the trivial
+// "everything in scope is visible" filter; when content supplies dark/invis/hidden flags the
+// rule lands there and this method inherits it (the builder-visibility follow-up owns that
+// chokepoint). Returns false for an unresolved handle or counterpart.
+func (rt *luaRuntime) hCanSee(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	other := resolveHandle(l, 2)
+	if e == nil || other == nil {
+		l.Push(lua.LFalse)
+		return 1
+	}
+	l.Push(lua.LBool(e.zone.canSee(e, other)))
+	return 1
+}
+
+// --- 7.3a comms (message via the existing act()/send; no resource/affect writes) ----------
+
+// hSend sends markup to the entity's player session (if it has one; a mob/item has no session
+// and the send is a silent no-op). Read/message only — no state mutation. The markup is
+// SCRIPT-SUPPLIED, so it is run through textsan.CleanMarkup at the world boundary (ISSUE-B):
+// control/ESC sequences are stripped (terminal-injection defense for a non-telnet sink) while
+// legitimate markup/color is preserved.
+func (rt *luaRuntime) hSend(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	markup := textsan.CleanMarkup(l.CheckString(2))
+	if e == nil {
+		return 0
+	}
+	if pc, ok := sessionOf(e); ok {
+		pc.send(textFrame(markup))
+	}
+	return 0
+}
+
+// hAct renders a perspective template to the room from the entity's viewpoint, the engine's
+// standard act() messaging. Signature: h:act(tmpl, obj, vict, to) where obj/vict are optional
+// entity handles ($p/$N referents) and `to` is an optional recipient selector string
+// ("room"/"actor"/"victim"; default "room"). Message-only — act() writes no game state. The
+// template is SCRIPT-SUPPLIED, so it is textsan.CleanMarkup'd (ISSUE-B); the '$'-referent
+// tokens are ordinary printable chars and survive, only control/ESC sequences are stripped.
+func (rt *luaRuntime) hAct(l *lua.LState) int {
+	actor := resolveHandle(l, 1)
+	tmpl := textsan.CleanMarkup(l.CheckString(2))
+	if actor == nil {
+		return 0
+	}
+	obj := optResolve(l, 3)
+	vict := optResolve(l, 4)
+	to := actToFromString(l.OptString(5, "room"))
+	actor.zone.act(tmpl, actor, obj, vict, "", "", to)
+	return 0
+}
+
+// hSay makes the entity say text to its room (the standard say templates: "You say,
+// '<text>'" to the speaker, "<Name> says, '<text>'" to bystanders). Message-only. Only the
+// script-supplied TEXT is cleaned (ISSUE-B) — the engine-generated template is already safe and
+// is not re-sanitized.
+func (rt *luaRuntime) hSay(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	text := textsan.CleanMarkup(l.CheckString(2))
+	if e == nil {
+		return 0
+	}
+	e.zone.act("You say, '$t'", e, nil, nil, text, "", ToActor)
+	e.zone.act("$n says, '$t'", e, nil, nil, text, "", ToRoom)
+	return 0
+}
+
+// hEmote makes the entity emote text to its room ("$n <text>" to bystanders, "You <text>" to
+// the actor). Message-only. Only the script-supplied text is cleaned (ISSUE-B).
+func (rt *luaRuntime) hEmote(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	text := textsan.CleanMarkup(l.CheckString(2))
+	if e == nil {
+		return 0
+	}
+	e.zone.act("You $t", e, nil, nil, text, "", ToActor)
+	e.zone.act("$n $t", e, nil, nil, text, "", ToRoom)
+	return 0
+}
+
+// optResolve resolves an OPTIONAL handle argument at index n: nil if the slot is absent/nil or
+// not a handle. Used for act()'s optional obj/vict referents.
+func optResolve(l *lua.LState, n int) *Entity {
+	if n > l.GetTop() || l.Get(n) == lua.LNil {
+		return nil
+	}
+	return resolveHandle(l, n)
+}
+
+// actToFromString maps a script-supplied recipient selector to an ActTo. Unknown values
+// default to ToRoom (the safe, most common broadcast). Closed mapping — never a reflection
+// into the engine.
+func actToFromString(s string) ActTo {
+	switch s {
+	case "actor":
+		return ToActor
+	case "victim":
+		return ToVictim
+	case "room_except_actor":
+		return ToRoomExceptActor
+	default:
+		return ToRoom
+	}
 }
 
 // runChunkWithSelf compiles and runs src in the sandbox with `self` bound to a handle for

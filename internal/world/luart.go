@@ -94,6 +94,26 @@ type luaRuntime struct {
 	// script-reachable global (T14 — the load-bearing invariant). No Lua value references a
 	// mutable copy of it.
 	stringMeta *lua.LTable
+
+	// zone is the runtime's owning Zone — the world the mud.* table reads/messages/spawns into
+	// and whose pulse wheel mud.after schedules on (luamud.go). Set by newZone right after the
+	// runtime is built (the runtime is created from the zone id; the back-pointer is wired once
+	// the Zone exists). nil only on a runtime built standalone in a test before a zone wires it;
+	// the mud.* functions nil-check it. Only the zone goroutine touches it.
+	zone *Zone
+
+	// spawnThisCall / spawnTotal bound mud.spawn (T-abuse/DoS, luamud.go): the entities spawned
+	// in the CURRENT entry-point call and the TOTAL spawned since build. spawnThisCall is reset
+	// at the runChunk/callFn chokepoint (per call); spawnTotal is the monotonic standing budget.
+	// Zone goroutine only.
+	spawnThisCall int
+	spawnTotal    int
+
+	// chunkGen is the runtime's current chunk generation — the hot-reload drop seam a mud.after
+	// timer captures at scheduling time so a callback bound to a swapped chunk is dropped on
+	// fire (mirrors the zone-gen handle guard). Wired but NEVER bumped until slice 7.7. Zone
+	// goroutine only.
+	chunkGen uint64
 }
 
 // newLuaRuntime builds the per-zone VM and installs the restricted-globals sandbox. The
@@ -222,6 +242,11 @@ func (rt *luaRuntime) installSandbox() {
 	// so it survives the setGlobals swap and is never script-reachable as a global. Read-only
 	// handles — no effect ops / harm surface this slice.
 	rt.installHandleType()
+
+	// Register the `mud` world/util table (luamud.go, slice 7.3b): RNG/clock/log/scan/
+	// broadcast/spawn/after/pvp_allowed — the NON-HARM world API + the timer-handle userdata
+	// type (with its pointer-safe __tostring, T15). No harm surface this slice.
+	rt.installMudTable()
 
 	// Arm the default per-call budgets (T3/T4). The per-call re-arm chokepoint is slice 7.5;
 	// arming once here makes the abort path live and testable now.
@@ -696,13 +721,14 @@ func (rt *luaRuntime) runChunk(name, src string) error {
 	if err != nil {
 		return fmt.Errorf("lua compile %s: %w", name, err)
 	}
-	// Arm a fresh per-call deadline (T3 layer 2) and reset the instruction count (T3 layer
-	// 1) — the per-call chokepoint shape slice 7.5 generalizes. Always clear the context
-	// after so a stale/cancelled context can't fail the NEXT call.
-	ctx, cancel := context.WithTimeout(context.Background(), luaCallDeadline)
+	// Arm a fresh per-call deadline (T3 layer 2), reset the instruction count (T3 layer 1) and
+	// the per-call spawn budget (T-abuse) — the per-call chokepoint shape slice 7.5 generalizes.
+	// Always clear the context after so a stale/cancelled context can't fail the NEXT call.
+	ctx, cancel := contextWithLuaDeadline()
 	defer cancel()
 	L.SetContext(ctx)
 	L.ResetInstructionCount()
+	rt.resetSpawnBudget()
 	defer L.RemoveContext()
 
 	L.Push(fn)
@@ -710,4 +736,11 @@ func (rt *luaRuntime) runChunk(name, src string) error {
 		return fmt.Errorf("lua run %s: %w", name, err)
 	}
 	return nil
+}
+
+// contextWithLuaDeadline returns a fresh per-call wall-clock deadline context (T3 layer 2),
+// the one place the deadline duration is set so every Lua-entry chokepoint (runChunk, callFn)
+// arms an identical fresh deadline. The caller MUST defer the returned cancel.
+func contextWithLuaDeadline() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), luaCallDeadline)
 }

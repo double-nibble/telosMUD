@@ -418,6 +418,10 @@ func newZone(id string) *Zone {
 	// through it, so the bare-engine invariant holds. Seeded deterministically from the zone id
 	// so script RNG is reproducible (T9).
 	z.lua = newLuaRuntime(id, z.log)
+	// Wire the runtime's back-pointer to its owning zone so the mud.* world table (luamud.go)
+	// can read/message/spawn into the zone and schedule on its pulse wheel. The runtime is
+	// built from the zone id; the *Zone exists only now, so the back-pointer is set here.
+	z.lua.zone = z
 	return z
 }
 

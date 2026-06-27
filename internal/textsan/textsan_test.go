@@ -31,6 +31,41 @@ func TestCleanLine(t *testing.T) {
 	}
 }
 
+// TestCleanMarkup proves the script-supplied-markup cleaner strips control/ESC sequences
+// (terminal-injection defense) while PRESERVING legitimate markup: color tokens, act()
+// '$'-referents, punctuation, and multibyte runes all survive — only control runes are dropped.
+func TestCleanMarkup(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"clean markup passthrough", "{red}Hello{x} $n waves", "{red}Hello{x} $n waves"},
+		{"strips esc sequence", "before\x1b[31mred\x1b[0mafter", "before[31mred[0mafter"},
+		{"strips bare ESC", "a\x1bb", "ab"},
+		{"strips bel + c0", "ding\x07\x00 done", "ding done"},
+		{"preserves dollar referents", "$n says '$t' to $N", "$n says '$t' to $N"},
+		{"preserves color + punctuation", "{g}+5 HP!{x} (50%)", "{g}+5 HP!{x} (50%)"},
+		{"keeps multibyte", "café 😀 héllo", "café 😀 héllo"},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CleanMarkup(tt.in); got != tt.want {
+				t.Fatalf("CleanMarkup(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCleanMarkupCaps proves CleanMarkup caps an over-long broadcast at MaxLineBytes.
+func TestCleanMarkupCaps(t *testing.T) {
+	in := strings.Repeat("A", MaxLineBytes*2)
+	if got := CleanMarkup(in); len(got) != MaxLineBytes {
+		t.Fatalf("CleanMarkup over-long len = %d, want %d", len(got), MaxLineBytes)
+	}
+}
+
 // TestCleanLineCaps proves the byte cap holds at the world's own ingress, mirroring
 // the edge's MaxLineBytes — a producer that skipped the edge cannot deliver an
 // unbounded line.

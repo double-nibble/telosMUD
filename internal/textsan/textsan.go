@@ -50,6 +50,21 @@ func CleanName(s string, maxRunes int) string {
 	return capRunes(stripNonGraphic(s), maxRunes)
 }
 
+// CleanMarkup makes SCRIPT-SUPPLIED outbound markup safe to deliver to a player client
+// (docs/PHASE7-PLAN.md slice 7.3 — builder Lua is a separate trust boundary). It strips
+// every control/escape rune (ESC U+001B and friends) — the terminal-injection vector a
+// non-telnet sink (GMCP, the planned ANSI renderer that stops stripping ESC) would otherwise
+// pass through to other players' clients — while PRESERVING all printable runes, so the
+// engine's markup survives intact: color tokens, the act() '$'-referents ($n/$N/$t/...), and
+// ordinary punctuation are ordinary printable characters, never control runes, so
+// stripControl leaves them untouched. It also caps the result at MaxLineBytes (defense in
+// depth against an over-long broadcast fanning out per room occupant). Engine-generated text
+// is already safe and need not be re-cleaned — apply this ONLY to script-supplied args. A
+// clean, in-bounds string is returned unchanged and unallocated.
+func CleanMarkup(s string) string {
+	return stripControl(capBytes(s, MaxLineBytes))
+}
+
 // capBytes truncates s to at most max bytes, backing off to the nearest rune
 // boundary so a multibyte rune is never split. A string already within the limit is
 // returned unchanged.

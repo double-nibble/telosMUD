@@ -336,6 +336,22 @@ func wornSet(e *Entity) map[*Entity]bool {
 	return set
 }
 
+// equipmentItems returns the entity's worn items as a slice (any wear order), for the Lua
+// handle layer's h:equipment() traversal. A non-wearer / empty wearer returns nil. Read-only.
+func equipmentItems(e *Entity) []*Entity {
+	wr, ok := Get[*Wearer](e)
+	if !ok || len(wr.worn) == 0 {
+		return nil
+	}
+	items := make([]*Entity, 0, len(wr.worn))
+	for _, item := range wr.worn {
+		if item != nil {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
 // loadCharacter applies a durable CharSnapshot onto a freshly-built player entity, rehydrating
 // its PersistID, its room, and its carried/worn items. It runs ON the zone goroutine (called from
 // attach's fresh-login branch, after newPlayerEntity), so every mutation is single-writer. The

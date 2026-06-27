@@ -1,8 +1,10 @@
 package world
 
 import (
+	"strings"
 	"testing"
 
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	lua "github.com/yuin/gopher-lua"
 )
 
@@ -260,5 +262,166 @@ func TestHandleTostringStandalone(t *testing.T) {
 		assert(s:find("0x") == nil and s:find("userdata") == nil, "pointer/tag leak: "..s)
 	`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// --- 7.3a traversal -----------------------------------------------------------------------
+
+// TestHandleTraversal asserts the traversal methods return tables of validated handles: a
+// room's contents, a wearer's equipment, the group stub, and the is_enemy/distance/can_see
+// reads. Returned values are handles (have :name()).
+func TestHandleTraversal(t *testing.T) {
+	z, rt, self := handleTestZone(t)
+	// Add two more entities into self's room so contents has >1 occupant.
+	other := z.newEntity("handle:mob:rat")
+	Add(other, &Living{})
+	other.short = "a rat"
+	Move(other, self.location)
+
+	rt.L.SetGlobal("other", rt.newHandle(other))
+	defer rt.L.SetGlobal("other", lua.LNil)
+
+	runSelf(t, rt, self, `
+		local room = self:room()
+		local occ = room:contents()
+		assert(type(occ) == "table", "contents is a table")
+		local names = {}
+		for _, h in ipairs(occ) do names[h:name()] = true end
+		assert(names["a stern guard"], "self in room contents")
+		assert(names["a rat"], "rat in room contents")
+	`)
+	runSelf(t, rt, self, `
+		local eq = self:equipment()
+		assert(type(eq) == "table", "equipment is a table")
+		assert(#eq == 0, "guard wears nothing")
+	`)
+	runSelf(t, rt, self, `
+		local g = self:group()
+		assert(type(g) == "table" and #g == 0, "group stub is an empty table")
+	`)
+	runSelf(t, rt, self, `
+		assert(self:is_enemy(other) == true, "co-located living = enemy (placeholder)")
+		assert(self:is_enemy(self) == false, "self is not its own enemy")
+		assert(self:distance(self) == 0, "distance to self is 0")
+		assert(self:distance(other) == 1, "distance to co-located is 1")
+		assert(self:can_see(other) == true, "can_see (trivial filter true)")
+	`)
+}
+
+// TestHandleTraversalDepartedNoOps asserts a departed entity's traversal no-ops to an empty
+// table, never nil and never a panic.
+func TestHandleTraversalDepartedNoOps(t *testing.T) {
+	_, rt, self := handleTestZone(t)
+	Move(self, nil)
+	runSelf(t, rt, self, `
+		local c = self:contents()
+		assert(type(c) == "table" and #c == 0, "departed contents = empty table")
+		local e = self:equipment()
+		assert(type(e) == "table" and #e == 0, "departed equipment = empty table")
+	`)
+}
+
+// --- 7.3a comms reach a session/room ------------------------------------------------------
+
+// TestHandleCommsReachSession asserts h:send / h:say reach a player's session via the existing
+// act()/send messaging (no game-state writes). We drive a player entity with an out channel and
+// read the frame.
+func TestHandleCommsReachSession(t *testing.T) {
+	z := newZone("comms")
+	rt := z.lua
+	room := z.newEntity("comms:room:hall")
+	Add(room, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["comms:room:hall"] = room
+
+	s := &session{character: "Listener", out: make(chan *playv1.ServerFrame, 16), epoch: 1}
+	z.newPlayerEntity(s, "Listener")
+	Move(s.entity, room)
+	z.players["Listener"] = s
+
+	rt.L.SetGlobal("player", rt.newHandle(s.entity))
+	defer rt.L.SetGlobal("player", lua.LNil)
+
+	// h:send reaches the session.
+	if err := rt.runChunk(t.Name(), `player:send("hello there")`); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainText(t, s.out); !strings.Contains(got, "hello there") {
+		t.Fatalf("h:send did not reach the session: %q", got)
+	}
+
+	// h:say reaches the speaker's own session (the "You say" perspective).
+	if err := rt.runChunk(t.Name(), `player:say("greetings")`); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainText(t, s.out); !strings.Contains(got, "greetings") {
+		t.Fatalf("h:say did not reach the session: %q", got)
+	}
+}
+
+// TestHandleCommsSanitizesMarkup is the ISSUE-B regression: SCRIPT-SUPPLIED markup carrying a
+// control/ESC sequence has it stripped at the WORLD layer (asserted on the emitted frame, not
+// relying on the telnet edge), while legitimate markup/color tokens survive. Covers h:send,
+// h:say, and h:act.
+func TestHandleCommsSanitizesMarkup(t *testing.T) {
+	z := newZone("san")
+	rt := z.lua
+	room := z.newEntity("san:room:hall")
+	Add(room, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["san:room:hall"] = room
+	s := &session{character: "Reader", out: make(chan *playv1.ServerFrame, 16), epoch: 1}
+	z.newPlayerEntity(s, "Reader")
+	Move(s.entity, room)
+	z.players["Reader"] = s
+	rt.L.SetGlobal("player", rt.newHandle(s.entity))
+	defer rt.L.SetGlobal("player", lua.LNil)
+
+	// h:send — an ESC color-injection attempt plus legitimate markup.
+	if err := rt.runChunk(t.Name(), `player:send("{red}safe\27[2J\7 part{x}")`); err != nil {
+		t.Fatal(err)
+	}
+	got := drainText(t, s.out)
+	if strings.ContainsRune(got, '\x1b') || strings.ContainsRune(got, '\x07') {
+		t.Fatalf("h:send leaked a control/ESC rune to the frame: %q", got)
+	}
+	if !strings.Contains(got, "{red}") || !strings.Contains(got, "{x}") || !strings.Contains(got, "safe") {
+		t.Fatalf("h:send stripped legitimate markup: %q", got)
+	}
+
+	// h:say — the script-supplied text arg is cleaned; the engine "You say" wrapper survives.
+	if err := rt.runChunk(t.Name(), `player:say("hi\27[31m there")`); err != nil {
+		t.Fatal(err)
+	}
+	got = drainText(t, s.out)
+	if strings.ContainsRune(got, '\x1b') {
+		t.Fatalf("h:say leaked an ESC rune: %q", got)
+	}
+	if !strings.Contains(got, "You say") || !strings.Contains(got, "hi") {
+		t.Fatalf("h:say lost the say wrapper or text: %q", got)
+	}
+
+	// h:act — the script-supplied template is cleaned; the $-referent survives.
+	if err := rt.runChunk(t.Name(), `player:act("$n waves\27[0m gravely", nil, nil, "actor")`); err != nil {
+		t.Fatal(err)
+	}
+	got = drainText(t, s.out)
+	if strings.ContainsRune(got, '\x1b') {
+		t.Fatalf("h:act leaked an ESC rune: %q", got)
+	}
+	if !strings.Contains(got, "waves") || !strings.Contains(got, "gravely") {
+		t.Fatalf("h:act lost legitimate content: %q", got)
+	}
+}
+
+// drainText pulls the next text frame's body from a session out channel (test helper).
+func drainText(t *testing.T, out chan *playv1.ServerFrame) string {
+	t.Helper()
+	select {
+	case f := <-out:
+		if o := f.GetOutput(); o != nil {
+			return o.GetMarkup()
+		}
+		return ""
+	default:
+		return ""
 	}
 }

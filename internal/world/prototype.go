@@ -190,6 +190,19 @@ func (p *Prototype) exits() map[string]ProtoRef {
 	return r.(*Room).exits
 }
 
+// protoIsPlayerControlled reports whether the prototype named by ref carries a PlayerControlled
+// component template (luamud.go ISSUE-A — mud.spawn must reject spawning a player-controlled
+// proto). An unknown ref reports false: the spawn then takes the unknown-proto nil path, not a
+// rejection. Read-only; zone goroutine.
+func (z *Zone) protoIsPlayerControlled(ref ProtoRef) bool {
+	p := z.protos.get(ref)
+	if p == nil {
+		return false
+	}
+	_, ok := p.comps[reflect.TypeFor[*PlayerControlled]()]
+	return ok
+}
+
 // spawn instantiates the prototype named by ref into zone z as a fresh Entity that is a
 // DELTA over its prototype (MUDLIB §5). The instance:
 //
