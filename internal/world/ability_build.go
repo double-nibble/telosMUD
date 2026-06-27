@@ -138,7 +138,151 @@ func parseOp(v any) (effectOp, error) {
 		}
 		op.els = sub
 	}
+	// The `check` flow op carries its spec (dice/bonus/vs/bands) under a nested `check` object, kept
+	// separate from deal_damage's top-level `dice` so the richer notation never entangles the two.
+	if op.kind == "check" {
+		spec, err := parseCheckSpec(m["check"])
+		if err != nil {
+			return effectOp{}, fmt.Errorf("check: %w", err)
+		}
+		op.check = spec
+	}
 	return op, nil
+}
+
+// parseCheckSpec parses a decoded check object (check.go [G2]) into a typed checkSpec. Build-time only.
+// Shape:
+//
+//	check:
+//	  label: "Dexterity save"
+//	  dice: "1d20"
+//	  bonus: ["attr", "$target.dex_save"]
+//	  vs: ["attr", "$source.spell_dc"]        # or a literal 15, or {contested: <spec>}
+//	  visibility: hide                        # hide | show | summary (default: hide)
+//	  bands:
+//	    - { margin_min: 0, label: success, ops: [ ... ] }   # made the save
+//	    - { label: failure, ops: [ ... ] }                  # default (no test)
+func parseCheckSpec(v any) (*checkSpec, error) {
+	m, ok := asMap(v)
+	if !ok {
+		return nil, fmt.Errorf("check spec must be an object, got %T", v)
+	}
+	spec := &checkSpec{label: mapStr(m, "label"), visibility: parseVisibility(mapStr(m, "visibility"))}
+
+	dice, err := parseDiceSpec(mapStr(m, "dice"))
+	if err != nil {
+		return nil, err
+	}
+	spec.dice = dice
+
+	if b, present := m["bonus"]; present {
+		node, err := parseFormula(b)
+		if err != nil {
+			return nil, fmt.Errorf("bonus: %w", err)
+		}
+		spec.bonus = node
+	}
+
+	vs, err := parseCheckVs(m["vs"])
+	if err != nil {
+		return nil, fmt.Errorf("vs: %w", err)
+	}
+	spec.vs = vs
+
+	bandsRaw, ok := asList(m["bands"])
+	if !ok {
+		return nil, fmt.Errorf("bands must be a list")
+	}
+	for i, raw := range bandsRaw {
+		band, err := parseCheckBand(raw)
+		if err != nil {
+			return nil, fmt.Errorf("band[%d]: %w", i, err)
+		}
+		spec.bands = append(spec.bands, band)
+	}
+	return spec, nil
+}
+
+// parseCheckVs parses the `vs` term: a {contested: <spec>} object, else a literal/formula DC. A nil
+// vs (absent) is a pure-total check (bands test the total directly).
+func parseCheckVs(v any) (checkVs, error) {
+	if v == nil {
+		return checkVs{}, nil
+	}
+	if m, ok := asMap(v); ok {
+		if cv, present := m["contested"]; present {
+			sub, err := parseCheckSpec(cv)
+			if err != nil {
+				return checkVs{}, fmt.Errorf("contested: %w", err)
+			}
+			return checkVs{contested: sub}, nil
+		}
+	}
+	node, err := parseFormula(v)
+	if err != nil {
+		return checkVs{}, err
+	}
+	return checkVs{dc: node}, nil
+}
+
+// parseCheckBand parses one ordered outcome band. Numeric bounds (min/max/margin_min/margin_max) are
+// FORMULAS (a bare number is a literal node), absent => nil (unbounded on that side); face_eq/face_count
+// are the natural-face test.
+func parseCheckBand(v any) (checkBand, error) {
+	m, ok := asMap(v)
+	if !ok {
+		return checkBand{}, fmt.Errorf("band must be an object, got %T", v)
+	}
+	band := checkBand{
+		label:     mapStr(m, "label"),
+		faceEq:    mapFloatPtr(m, "face_eq"),
+		faceCount: int(mapFloat(m, "face_count")),
+	}
+	for _, e := range []struct {
+		key string
+		dst *formulaNode
+	}{
+		{"min", &band.min}, {"max", &band.max}, {"margin_min", &band.marginMin}, {"margin_max", &band.marginMax},
+	} {
+		if raw, present := m[e.key]; present {
+			node, err := parseFormula(raw)
+			if err != nil {
+				return checkBand{}, fmt.Errorf("%s: %w", e.key, err)
+			}
+			*e.dst = node
+		}
+	}
+	ops, err := parseOpList(m["ops"])
+	if err != nil {
+		return checkBand{}, fmt.Errorf("ops: %w", err)
+	}
+	band.ops = ops
+	return band, nil
+}
+
+// parseVisibility maps a content string to a checkVisibility ("" / unknown -> visInherit, the
+// engine-default-hide case).
+func parseVisibility(s string) checkVisibility {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "hide":
+		return visHide
+	case "show":
+		return visShow
+	case "summary":
+		return visSummary
+	default:
+		return visInherit
+	}
+}
+
+// mapFloatPtr returns a pointer to the float at key, or nil if the key is absent (so a band can
+// distinguish "no lower bound" from "lower bound 0").
+func mapFloatPtr(m map[string]any, key string) *float64 {
+	if _, ok := m[key]; !ok {
+		return nil
+	}
+	f := mapFloat(m, key)
+	return &f
 }
 
 // maxDice bounds both the dice COUNT and the dice SIZE a "<N>d<S>" spec may declare. rollDice loops
@@ -270,6 +414,11 @@ func lintAbilityOps(ref string, ops []effectOp) int {
 			}
 			walk(op.then)
 			walk(op.els)
+			if op.check != nil {
+				for i := range op.check.bands {
+					walk(op.check.bands[i].ops)
+				}
+			}
 		}
 	}
 	walk(ops)

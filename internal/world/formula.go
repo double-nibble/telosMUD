@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math"
 )
 
 // formula.go is the prefix-AST expression evaluator for derived attributes (docs/PHASE5-PLAN.md
@@ -9,9 +10,12 @@ import (
 //
 //	["+", ["*", ["attr","con"], 10], ["*", ["attr","level"], 5]]   == con*10 + level*5
 //
-// Allowed heads: + - * / min max clamp, ["attr", name], ["lit", n]. A bare JSON number is also a
-// literal (a convenience so {"lit": 5} and 5 both parse). An ["attr", name] node pulls that
-// attribute's RESOLVED value (recursive attr()), so derived-of-derived works. Parsing happens once
+// Allowed heads: + - * / min max clamp floor ceil round mod, the 3-ary conditional ["if",c,t,e]
+// (short-circuiting), ["attr", name], ["lit", n]. A bare JSON number is also a literal (a convenience
+// so {"lit": 5} and 5 both parse). An ["attr", name] node pulls that attribute's RESOLVED value
+// (recursive attr()), so derived-of-derived works. floor/ceil/round/mod/if are the Phase 6 [G1]
+// additions for exact integer derivation; in a CHECK formula (check.go) an attr ref may carry a
+// `$actor.`/`$target.`/`$source.` scope prefix the check resolver dispatches on. Parsing happens once
 // at content-load (parseFormula -> a typed tree); evaluation happens per attr() call (memoized by
 // the caller). Both parse-time and eval-time guard against reference cycles.
 
@@ -63,6 +67,23 @@ func (n opNode) refs(into map[string]bool) {
 }
 
 func (n opNode) eval(r *formulaResolver) (float64, error) {
+	// `if` SHORT-CIRCUITS (the only non-strict head): evaluate the condition, then ONLY the taken
+	// branch — so a div-by-zero / costly subtree in the untaken branch never runs. ["if",cond,then,else],
+	// cond != 0 => then. Phase 6 [G1] — exact integer derivation (5e mods, PF BAB, WoW ratings).
+	if n.op == "if" {
+		if len(n.args) != 3 {
+			return 0, fmt.Errorf("formula: if needs exactly 3 args (cond, then, else), got %d", len(n.args))
+		}
+		cond, err := n.args[0].eval(r)
+		if err != nil {
+			return 0, err
+		}
+		if cond != 0 {
+			return n.args[1].eval(r)
+		}
+		return n.args[2].eval(r)
+	}
+
 	vals := make([]float64, len(n.args))
 	for i, a := range n.args {
 		v, err := a.eval(r)
@@ -143,6 +164,30 @@ func (n opNode) eval(r *formulaResolver) (float64, error) {
 			return hi, nil
 		}
 		return x, nil
+	case "floor":
+		if len(vals) != 1 {
+			return 0, fmt.Errorf("formula: floor needs exactly 1 arg, got %d", len(vals))
+		}
+		return math.Floor(vals[0]), nil
+	case "ceil":
+		if len(vals) != 1 {
+			return 0, fmt.Errorf("formula: ceil needs exactly 1 arg, got %d", len(vals))
+		}
+		return math.Ceil(vals[0]), nil
+	case "round":
+		if len(vals) != 1 {
+			return 0, fmt.Errorf("formula: round needs exactly 1 arg, got %d", len(vals))
+		}
+		return math.Round(vals[0]), nil
+	case "mod":
+		// mod(a, b): the remainder a − b·trunc(a/b) (Go/math.Mod semantics). b==0 errors.
+		if len(vals) != 2 {
+			return 0, fmt.Errorf("formula: mod needs exactly 2 args, got %d", len(vals))
+		}
+		if vals[1] == 0 {
+			return 0, fmt.Errorf("formula: mod by zero")
+		}
+		return math.Mod(vals[0], vals[1]), nil
 	default:
 		return 0, fmt.Errorf("formula: unknown op %q", n.op)
 	}
@@ -202,7 +247,7 @@ func parseArrayNode(arr []any) (formulaNode, error) {
 			return nil, fmt.Errorf("formula: attr name must be a string, got %T", arr[1])
 		}
 		return attrNode{ref: name}, nil
-	case "+", "-", "*", "/", "min", "max", "clamp":
+	case "+", "-", "*", "/", "min", "max", "clamp", "floor", "ceil", "round", "mod", "if":
 		args := make([]formulaNode, 0, len(arr)-1)
 		for _, a := range arr[1:] {
 			child, err := parseFormula(a)

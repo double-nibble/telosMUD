@@ -66,6 +66,46 @@ func TestFormulaDivByZero(t *testing.T) {
 	}
 }
 
+// TestFormulaPhase6Heads covers the [G1] additions: floor/ceil/round/mod and the short-circuiting
+// conditional. The canonical use is an exact ability modifier: floor((score − 10) / 2).
+func TestFormulaPhase6Heads(t *testing.T) {
+	attrs := map[string]float64{"score": 15, "zero": 0}
+	cases := []struct {
+		name string
+		ast  any
+		want float64
+	}{
+		{"floor", []any{"floor", 2.9}, 2},
+		{"ceil", []any{"ceil", 2.1}, 3},
+		{"round", []any{"round", 2.5}, 3},
+		{"mod", []any{"mod", 17.0, 5.0}, 2},
+		// 5e ability modifier: floor((15 − 10) / 2) = 2.
+		{"abil-mod", []any{"floor", []any{"/", []any{"-", []any{"attr", "score"}, 10.0}, 2.0}}, 2},
+		// if: cond != 0 -> then.
+		{"if-true", []any{"if", 1.0, 7.0, 9.0}, 7},
+		{"if-false", []any{"if", 0.0, 7.0, 9.0}, 9},
+		// if SHORT-CIRCUITS: the untaken branch's div-by-zero never runs.
+		{"if-short-circuit", []any{"if", 1.0, 42.0, []any{"/", 1.0, []any{"attr", "zero"}}}, 42},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := evalStandalone(t, c.ast, attrs)
+			if err != nil {
+				t.Fatalf("eval: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestFormulaModByZero(t *testing.T) {
+	if _, err := evalStandalone(t, []any{"mod", 5.0, 0.0}, nil); err == nil {
+		t.Fatal("expected mod-by-zero error")
+	}
+}
+
 func TestFormulaUnknownHead(t *testing.T) {
 	if _, err := parseFormula([]any{"pow", 2.0, 3.0}); err == nil {
 		t.Fatal("expected unknown-head parse error")

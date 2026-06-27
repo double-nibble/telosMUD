@@ -265,6 +265,23 @@ func opChance(c *effectCtx, op *effectOp) error {
 	return nil
 }
 
+// opCheck: check(spec). The check/save/contested flow op ([G2], check.go) — resolves a content dice
+// roll against a DC (or a contested defender), classifies into the first matching ORDERED band, and
+// runs that band's nested op-list via runOps (the same recursion if/chance use). A check that BRANCHES
+// into a harmful op does NOT bypass the PvP gate: the harm decision still lives at the op (dealDamage/
+// applyDebuff -> guardHarmful), not at the check. A spec with no bands is a no-op (the roll still emits
+// per visibility). Single-writer: zone goroutine; deterministic under the ctx rng.
+func opCheck(c *effectCtx, op *effectOp) error {
+	if op.check == nil {
+		return fmt.Errorf("check: no spec")
+	}
+	res := resolveCheck(c, op.check)
+	if res.band != nil {
+		runOps(c, res.band.ops)
+	}
+	return nil
+}
+
 // rollDice rolls diceNum d diceSize (each die 1..size), using the ctx rng when present for
 // determinism. Returns the sum. Used by deal_damage's <N>d<S> form.
 func rollDice(c *effectCtx, num, size int) int {

@@ -83,6 +83,10 @@ type effectOp struct {
 	// then/els are the nested branches for the flow ops (if/chance). Parsed recursively.
 	then []effectOp
 	els  []effectOp
+
+	// check is the parsed check spec for the `check` flow op (nil for every other op). Its bands
+	// carry their own nested op-lists (check.go), so a check recurses into runOps like if/chance.
+	check *checkSpec
 }
 
 // effectOpHandler is a registered op implementation. It runs on the zone goroutine with full single-
@@ -111,6 +115,7 @@ func init() {
 		"send":            opSend,
 		"if":              opIf,
 		"chance":          opChance,
+		"check":           opCheck,
 	}
 }
 
