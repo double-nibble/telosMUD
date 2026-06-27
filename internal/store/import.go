@@ -78,6 +78,7 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM resource_defs WHERE pack=$1`,
 		`DELETE FROM damage_type_defs WHERE pack=$1`,
 		`DELETE FROM affect_defs WHERE pack=$1`,
+		`DELETE FROM ability_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
