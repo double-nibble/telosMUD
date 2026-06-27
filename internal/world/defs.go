@@ -215,6 +215,11 @@ type resourceDef struct {
 	// HAS this resource (a positive max or a stored current) reacts to the keyed event — e.g. a `rage`
 	// pool with onEvent[OnHit] = modify_resource rage +N is the canonical builder. nil => no handlers.
 	onEvent map[eventKind][]effectOp
+	// onDepleted is the parsed op-list the engine runs on the dying entity when this VITAL resource
+	// hits 0 ([G-D] death hook, death.go). Runs BEFORE die() drops combat / builds the corpse, with the
+	// victim as $actor, so content can narrate / fire a last effect. nil/empty => engine default death
+	// only. Only consulted for the vital resource (vitalResource). Immutable after build.
+	onDepleted []effectOp
 }
 
 // damageTypeDef is the runtime form of a DamageTypeDTO: a named damage type with a resist/vuln/

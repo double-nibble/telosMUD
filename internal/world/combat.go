@@ -190,8 +190,13 @@ func (z *Zone) runCombatRound(pulse uint64) bool {
 	budget := maxEventHandlers
 	anyFighting := false
 	for _, atk := range combatants {
+		// Threat retarget (6.3b): a MOB re-points at its highest-threat live foe before swinging, so a
+		// mob whose current target died/fled this round turns to the next threat rather than idling or
+		// swinging at a departed entity. A no-op for players and for a mob whose target is still valid.
+		z.retargetMob(atk)
 		// Re-validate the attacker each iteration: a prior swing this round may have ended its fight
-		// (its target left / a future death path fired). Skip a no-longer-fighting attacker cleanly.
+		// (its target left / the death path fired), or retargetMob found no live foe and stopFought it.
+		// Skip a no-longer-fighting attacker cleanly.
 		if atk.living == nil || atk.living.fighting == nil {
 			continue
 		}
@@ -217,9 +222,15 @@ func (z *Zone) runCombatRound(pulse uint64) bool {
 // this slice — see the TODO below). A frozen/absent player is skipped (resolve-by-presence). De-duped by
 // entity so a mob in two players' rooms is counted once. Zone-goroutine-owned reads only.
 //
-// TODO(6.3b): the player-room scan silently FREEZES an all-mob fight if the last player leaves the room
-// (no player => the mob is never re-gathered => it idles posFighting). 6.3b's zone-level Fighting set /
-// threat list removes the player-presence dependency.
+// 6.3b status (the S4 distsys boundary): the death path now SCRUBS a departed/dead player's opponents
+// (die() -> disengage, respawnPlayer -> disengage, flee -> stopFight) so a fight whose last player
+// LEAVES no longer strands a mob posFighting at a stale target — the common case the TODO worried about
+// is closed. The residual gap is a pure MOB-vs-MOB fight with NO player ever in the room: such a fight
+// is never gathered (no player anchors the room scan) and idles. A true zone-level Fighting SET (not
+// player-anchored) is the clean fix; deferred because no current content starts a playerless mob fight
+// (aggro/assist/retaliate all originate from a player), so it cannot arise from 6.3b content. The
+// threat list (death.go) drives mob TARGET selection within a gathered fight; it does not (yet) replace
+// the player-anchored GATHER.
 func (z *Zone) gatherCombatants() []*Entity {
 	ids := make([]string, 0, len(z.players))
 	for id := range z.players {
@@ -402,19 +413,23 @@ func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit boo
 
 	z.combatMsg(attacker, target, hitOrCrit(crit), "")
 
+	// Threat (6.3b): the damage this swing dealt is threat the attacker built on the target, so a MOB
+	// targets its highest-threat foe (death.go retargetMob). Accrued BEFORE the death check so the kill
+	// is attributed correctly even though a dead target's table is scrubbed immediately after.
+	addThreat(target, attacker, float64(dealt))
+
 	// --- Stage OnHit / OnDamageTaken (the reserved combat events, now LIT). OnHit is ABOUT the attacker
 	// (a rage build, a lifesteal proc); OnDamageTaken is ABOUT the defender (a thorns reflect, a "below
 	// 20% hp" trigger). mag = damage dealt. The cascade is depth+width guarded (event.go). ----------
 	z.fireEvent(c, evOnHit, attacker, target, float64(dealt))
 	z.fireEvent(c, evOnDamageTaken, target, attacker, float64(dealt))
 
-	// --- Reserved death path: when the target's vital pool hit 0, the FULL death machinery (corpse,
-	// OnKill, loot, threat drop) is 6.3b. This slice LOGS the depletion so the seam is observable and
-	// leaves the mob at 0 hp still in the Fighting state — a follow-up round simply re-swings a 0-hp
-	// target (harmless: dealDamage clamps the pool at 0). 6.3b wires on_depleted -> die() here. ------
+	// --- Death path (6.3b): when the swing emptied the target's vital pool, run the content on_depleted
+	// hook then die() (death.go) — drop combat, fire OnKill, build the corpse (mob) / respawn (player).
+	// Idempotent on an already-dead target. The death path introduces NO new harm vector (it is
+	// triggered by the harm that already gated above); the on_depleted/OnKill ops re-gate themselves. --
 	if vitalCurrent(target) <= 0 && vitalResource(target) != "" {
-		z.log.Debug("combat: target vital depleted (death reserved 6.3b)",
-			"attacker", attacker.short, "target", target.short)
+		z.onVitalDepleted(target, attacker, c)
 	}
 }
 

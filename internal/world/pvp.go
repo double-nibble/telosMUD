@@ -51,6 +51,15 @@ func pvpAllowed(actor, target *Entity) bool {
 	if !isPlayer(target) {
 		return true
 	}
+	// PvE: a MOB harming a player is always allowed (the gate is PLAYER-vs-player only). Without this a
+	// mob could never hit a player in a non-arena room unless the player had opted into PvP — i.e. PvE
+	// combat would be impossible (the 6.3b player-death path could never trigger). A nil actor (an
+	// orphaned DoT whose source left) is treated as non-player here, so an unattributed harm still lands
+	// on a player (the kill is just unattributed); the detached-actor FAIL-CLOSED in guardHarmful covers
+	// the stale-pointer case before this is reached.
+	if actor != nil && !isPlayer(actor) {
+		return true
+	}
 	// Self-harm is always allowed (the gate guards harming OTHER players).
 	if actor == target {
 		return true

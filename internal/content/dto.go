@@ -93,6 +93,12 @@ type ResourceDTO struct {
 	// OnEvent subscribes op-lists to in-zone engine events ([G3]) for an entity that HAS this resource
 	// (a rage pool that builds on OnHit). Map of event-name -> op-list. Phase 6.2.
 	OnEvent map[string]any `json:"on_event" yaml:"on_event"`
+	// OnDepleted is the op-list the engine runs when a VITAL resource hits 0 — the [G-D] death hook
+	// (Phase 6.3b). It runs ON the dying entity (the victim is $actor) BEFORE the engine's die() drops
+	// combat and builds the corpse, so content can narrate or fire a last-gasp effect. An empty/absent
+	// list means "default death" (the engine still runs die()); the op-list is additive flavor, not a
+	// replacement for the engine death machinery. Only meaningful on a vital resource.
+	OnDepleted []any `json:"on_depleted" yaml:"on_depleted"`
 }
 
 // DamageTypeDTO is one content-defined damage type with its resist/vuln/immune matrix (§1). The

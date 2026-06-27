@@ -109,6 +109,13 @@ func cmdGet(c *Context) error {
 	if item, cont, ok := splitFrom(c.Rest()); ok {
 		return c.z.getFrom(c, item, cont)
 	}
+	// Diku shorthand `get <item> <container>` (e.g. `get all corpse`): two-or-more words where the LAST
+	// word resolves to a container present in the room/inventory is treated as a get-from. The bare-floor
+	// path below still wins when the tail is NOT a container (so `get steel sword` off the floor is
+	// unaffected — "sword" is not a container). This makes looting a corpse the natural `get all corpse`.
+	if item, cont, ok := splitTrailingContainer(c); ok {
+		return c.z.getFrom(c, item, cont)
+	}
 	target, ok := c.Target(ScopeRoomItems)
 	if !ok {
 		c.Send("You don't see that here.")
@@ -450,6 +457,25 @@ func actorWearer(actor *Entity) *Wearer {
 // returning the item phrase, container phrase, and whether the token was present.
 func splitFrom(rest string) (item, cont string, ok bool) {
 	return splitKeyword(rest, "from")
+}
+
+// splitTrailingContainer recognizes the Diku `get <item> <container>` shorthand (no "from"): if the
+// player typed 2+ words and the LAST word names a *Container present in the room or inventory, it
+// returns (everything-before, the-last-word, true) so cmdGet routes it through getFrom. It returns
+// false for a single word, or when the trailing word is not a container (so `get steel sword` off the
+// floor stays a plain floor get). A read-only resolve against the room/inventory; no mutation.
+func splitTrailingContainer(c *Context) (item, cont string, ok bool) {
+	words := strings.Fields(c.Rest())
+	if len(words) < 2 {
+		return "", "", false
+	}
+	last := words[len(words)-1]
+	for _, e := range c.z.Resolve(c.Actor, parseTargetSpec(last), ScopeRoomItems, ScopeInventory) {
+		if _, isContainer := Get[*Container](e); isContainer {
+			return strings.Join(words[:len(words)-1], " "), last, true
+		}
+	}
+	return "", "", false
 }
 
 // splitIn splits "<item> in <container>" on the first standalone " in " token.

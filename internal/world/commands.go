@@ -58,8 +58,44 @@ func registerCommands() []*Command {
 // identical to slice 1: it always describes the room (targeted `look <thing>` is a slice-4
 // concern once items exist). Routes to the existing lookRoom so the output is unchanged.
 func cmdLook(c *Context) error {
+	// `look <target>` examines a specific entity (an item, a corpse, an occupant); a bare `look` shows
+	// the room. Examining a CONTAINER (a corpse, a chest) lists its contents, so `look corpse` reveals
+	// the loot before `get all corpse` (Phase 6.3b). Scopes: room items, the floor occupants, and
+	// inventory so you can look at what you carry.
+	if c.Arg(0) != "" {
+		target, ok := c.Target(ScopeRoomItems, ScopeRoomLiving, ScopeInventory)
+		if !ok {
+			c.Send("You don't see that here.")
+			return nil
+		}
+		c.z.lookAt(c.s, target)
+		return nil
+	}
 	c.z.lookRoom(c.s)
 	return nil
+}
+
+// lookAt examines a single entity: its long description, and — if it is a CONTAINER (a corpse, a
+// chest) — its contents, so a player can see a corpse's loot before looting it. A closed container
+// shows as closed (no contents revealed). Pure read; the contents walk is over the entity's own
+// contents (zone-goroutine-owned). Single-writer: zone goroutine.
+func (z *Zone) lookAt(s *session, target *Entity) {
+	var b strings.Builder
+	b.WriteString(target.Long())
+	if cc, ok := Get[*Container](target); ok {
+		if cc.closed {
+			b.WriteString("\nIt is closed.")
+		} else if len(target.contents) == 0 {
+			b.WriteString("\nIt is empty.")
+		} else {
+			b.WriteString("\nIt holds:")
+			for _, item := range target.contents {
+				b.WriteString("\n  ")
+				b.WriteString(item.Name())
+			}
+		}
+	}
+	s.send(textFrame(b.String()))
 }
 
 // cmdSay echoes a message to the actor and broadcasts it to everyone else in the room.
@@ -234,6 +270,10 @@ func (z *Zone) move(s *session, dir string) bool {
 	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom) // announced from `to`
 	z.lookRoom(s)
 	z.log.Debug("player moved", "player", s.character, "dir", dir, "from", from.proto, "to", destRoom)
+	// Aggro (6.3b): an aggressive mob in the destination room initiates combat on the entrant — a content
+	// `aggressive` attribute, not an engine flag (death.go). Done after the arrival look so the player
+	// sees the room, then the attack. A local move only; cross-zone arrivals (transferIn) are a later hook.
+	z.aggroOnEntry(s.entity, to)
 	return false
 }
 

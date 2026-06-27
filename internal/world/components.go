@@ -105,6 +105,12 @@ type Living struct {
 	// (zone-goroutine-owned); serialized as REMAINING pulses into StateJSON.Cooldowns (P6-D8). nil until
 	// the first armed cooldown.
 	cooldowns map[string]uint64
+	// threat is this entity's threat table (death.go, Phase 6.3b): attacker entity -> accumulated threat
+	// (damage dealt + heals weighted). A MOB picks its round target as the highest-threat live attacker
+	// in its room, so pulling aggro is a content-numbers consequence, not engine-hardcoded. TRANSIENT
+	// (never persisted, like fighting) and keyed by live *Entity — die()/disengage scrub the dead/departed
+	// entry so no stale pointer survives. nil until the first threat is added. Zone-goroutine-owned.
+	threat map[*Entity]float64
 }
 
 func (*Living) componentKind() Kind { return KindLiving }

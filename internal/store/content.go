@@ -338,8 +338,10 @@ type attrBody struct {
 }
 
 type resourceBody struct {
-	Regen             int `json:"regen,omitempty"`
-	DepletedThreshold int `json:"depleted_threshold,omitempty"`
+	Regen             int            `json:"regen,omitempty"`
+	DepletedThreshold int            `json:"depleted_threshold,omitempty"`
+	OnEvent           map[string]any `json:"on_event,omitempty"`    // [G3] event subscriptions (6.2)
+	OnDepleted        []any          `json:"on_depleted,omitempty"` // [G-D] death hook (6.3b)
 }
 
 type dmgBody struct {
@@ -431,6 +433,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				return fmt.Errorf("store: resource_def %s body: %w", r.Ref, err)
 			}
 			r.Regen, r.DepletedThreshold = b.Regen, b.DepletedThreshold
+			r.OnEvent, r.OnDepleted = b.OnEvent, b.OnDepleted
 		}
 		pp := pack(pk)
 		pp.Resources = append(pp.Resources, r)

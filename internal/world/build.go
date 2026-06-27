@@ -75,6 +75,17 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 			vital: r.Vital, regen: r.Regen, depletedThreshold: r.DepletedThreshold,
 			onEvent: parseEventMap(r.OnEvent, "resource "+r.Ref),
 		}
+		// on_depleted ([G-D]): the death-hook op-list, parsed like any op-list. A malformed list logs
+		// loudly and registers with whatever parsed (content-lint discipline); nil/absent => engine default
+		// death only.
+		if len(r.OnDepleted) > 0 {
+			ops, err := parseOpList(r.OnDepleted)
+			if err != nil {
+				slog.Error("content: resource on_depleted parse failed; death hook runs parsed ops only",
+					"resource", r.Ref, "err", err)
+			}
+			rd.onDepleted = ops
+		}
 		lintEventMap("resource "+r.Ref, rd.onEvent)
 		d.res.register(r.Ref, rd)
 	}

@@ -70,11 +70,23 @@ attributes:
   # the gather order is preserved). An OnEnterCombat initiative check would write this; the demo leaves
   # it at 0 (no initiative) — the simultaneous default the acceptance gate validated.
   - {ref: combat_order, display_name: Combat Order, value_kind: int, default_base: {lit: 0}}
+  # aggressive: a CONTENT flag (a number the engine reads, P6-D6) — a mob with aggressive > 0 initiates
+  # combat on a player entering its room (death.go aggroOnEntry). Default 0 (passive); a mob's Living
+  # block overrides it to 1. The engine never names "aggressive"; it reads whatever this attribute is.
+  - {ref: aggressive, display_name: Aggressive, value_kind: int, default_base: {lit: 0}}
 
 resources:
-  # hp is VITAL: at 0 = death (the on_depleted hook is content, wired in 5.2/combat). Its max is the
-  # derived max_hp attribute, so anything that raises constitution/level/max_hp raises the cap.
-  - {ref: hp,   display_name: Health, max_attr: max_hp,   vital: true, regen: 1}
+  # hp is VITAL: at 0 = death. The on_depleted op-list is the [G-D] death hook (Phase 6.3b): the engine
+  # runs it on the dying entity BEFORE die() drops combat / builds the corpse, then proceeds to death.
+  # Here it is a pure narration (the engine's own "$n is DEAD!" room line still fires after). Its max is
+  # the derived max_hp attribute, so anything that raises constitution/level/max_hp raises the cap.
+  - ref: hp
+    display_name: Health
+    max_attr: max_hp
+    vital: true
+    regen: 1
+    on_depleted:
+      - {op: act, to: room, text: "$n collapses, lifeless."}
   - {ref: mana, display_name: Mana,   max_attr: max_mana, vital: false, regen: 1}
 
 damage_types:
@@ -271,9 +283,27 @@ zones:
         long: The trees crowd close and the moonlight fails. Something rustles, unseen.
         exits:
           south: darkwood:room:grove
-    # A combat mob (Phase 6.3a): the goblin carries a Living block (its stat sheet + the `melee` combat
-    # profile) and a Weapon (its rusty knife = its natural attack dice). `kill goblin` runs the full
-    # swing pipeline against it. NOTHING engine-side names "goblin" — it is data, like every item.
+          north: darkwood:room:lair
+      - ref: darkwood:room:lair
+        name: A Reeking Lair
+        long: Bones and gnawed scraps litter a foul den. The stench of goblin is overpowering.
+        exits:
+          south: darkwood:room:hollow
+    item_prototypes:
+      # The goblin's loot: a rusty knife it carries (armed via the reset `into` the mob). When the goblin
+      # dies (Phase 6.3b) its inventory flows into its corpse, so `get all corpse` recovers the knife.
+      - ref: darkwood:obj:rusty-knife
+        keywords: [knife, rusty]
+        short: a rusty knife
+        long: A rusty, notched knife lies here.
+        physical: {weight: 1, material: iron}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 1, dice_size: 4, damage_type: slash, class: knife, attack_verb: stab}
+    # A combat mob (Phase 6.3a/b): the goblin carries a Living block (its stat sheet + the `melee` combat
+    # profile) and a Weapon (its natural attack dice). `kill goblin` runs the full swing pipeline against
+    # it; at 0 hp it dies, drops a lootable corpse holding its rusty knife, and fires OnKill (Phase 6.3b).
+    # The lair goblin sets `aggressive: 1` so it initiates combat the moment a player enters its room.
+    # NOTHING engine-side names "goblin"/"corpse"/"loot" — it is all data, like every item.
     mob_prototypes:
       - ref: darkwood:mob:goblin
         keywords: [goblin, small]
@@ -296,5 +326,31 @@ zones:
             parry: 0              # no parry skill -> roll-under-0 auto-fails ([G-C], gear-gated by 0)
             block: 0              # no shield -> block auto-fails
             soak_slash: 1         # 1 flat slash soak (its hide)
+      # An AGGRESSIVE goblin (Phase 6.3b): `aggressive: 1` is a CONTENT number the engine reads to make
+      # the mob initiate combat on a player entering its room (death.go aggroOnEntry) — no engine flag.
+      - ref: darkwood:mob:goblin-chief
+        keywords: [goblin, chief, large]
+        short: a goblin chief
+        long: A scarred goblin chief looms here, snarling at all who approach.
+        weapon: {dice_num: 1, dice_size: 8, damage_type: slash, class: knife, attack_verb: slash}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 16
+            constitution: 10       # max_hp = 10*10 + 1*5 = 105
+            level: 1
+            accuracy: 4
+            damroll: 2
+            attacks: 1
+            evasion: 8
+            dodge: 10
+            parry: 0
+            block: 0
+            soak_slash: 2
+            aggressive: 1          # initiates combat on a player entering the room
     resets:
       - {op: spawn_mob, proto: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}
+      # Arm the goblin with its rusty knife: the item spawns INTO the goblin's inventory (reset `into` a
+      # mob, reset.go), so its corpse holds it. Script order matters — the goblin must spawn first.
+      - {op: spawn_item, proto: darkwood:obj:rusty-knife, into: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}
+      - {op: spawn_mob, proto: darkwood:mob:goblin-chief, room: darkwood:room:lair, count: 1}

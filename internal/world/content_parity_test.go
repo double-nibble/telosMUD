@@ -60,7 +60,7 @@ func TestDemoPackPrototypeParity(t *testing.T) {
 		"darkwood:room:hollow": {
 			short: "A Dark Hollow",
 			long:  "The trees crowd close and the moonlight fails. Something rustles, unseen.",
-			exits: map[string]ProtoRef{"south": "darkwood:room:grove"},
+			exits: map[string]ProtoRef{"south": "darkwood:room:grove", "north": "darkwood:room:lair"},
 			comps: []reflect.Type{roomT},
 		},
 		"midgaard:obj:torch": {

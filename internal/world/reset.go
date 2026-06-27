@@ -81,12 +81,15 @@ func (z *Zone) applyReset(r *content.ResetDTO) {
 		return
 	}
 
-	// Resolve the placement target: the room floor, or a container already present in the room.
+	// Resolve the placement target: the room floor, a container present in the room, or a MOB present in
+	// the room (so a goblin can carry loot — its inventory becomes its corpse's loot, Phase 6.3b). The
+	// into-target is whichever live instance of `into` is in the room: a container if it has one, else a
+	// living mob (its contents are its inventory).
 	target := room
 	if r.Into != "" {
-		c := containerInRoom(room, ProtoRef(r.Into))
+		c := intoTargetInRoom(room, ProtoRef(r.Into))
 		if c == nil {
-			z.log.Warn("reset skipped: into-container not present in room",
+			z.log.Warn("reset skipped: into-target not present in room",
 				"op", r.Op, "room", r.Room, "into", r.Into, "proto", r.Proto)
 			return
 		}
@@ -158,6 +161,24 @@ func containerInRoom(room *Entity, proto ProtoRef) *Entity {
 			if _, ok := Get[*Container](e); ok {
 				return e
 			}
+		}
+	}
+	return nil
+}
+
+// intoTargetInRoom resolves a reset `into` target in room: a CONTAINER instance of `proto` (a chest),
+// or — if none — a LIVING instance of `proto` (a mob), whose contents are its inventory. This is what
+// lets a reset arm a mob with carried loot (`spawn_item ... into: <mob_proto>`): the item lands in the
+// mob's inventory and, when the mob dies, flows into its corpse (death.go). The mob must already have
+// been spawned by an earlier op in the same script (spawn the goblin, then arm it). Returns nil when
+// neither a container nor a living instance of `proto` is present.
+func intoTargetInRoom(room *Entity, proto ProtoRef) *Entity {
+	if c := containerInRoom(room, proto); c != nil {
+		return c
+	}
+	for _, e := range room.contents {
+		if e.proto == proto && e.living != nil {
+			return e
 		}
 	}
 	return nil
