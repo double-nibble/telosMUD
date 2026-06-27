@@ -81,6 +81,26 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
 - **`combat_test.go:448` empty `if z.move(...)`** — a combat test that may not assert
   the move outcome it intends. Make it assert. · *combat* · chip `task_0db5e6e9`
 
-## 4. Housekeeping
+## 4. Deferred features / design directions
+
+- **Builder/wizard trust tier — elevated visibility + debug tooling** (much later; post-core).
+  Builders/immortals need a privilege level ABOVE player:
+  - **See-all visibility.** A builder always sees what players can't — an `invisible`-affected
+    player (a skill that hides them from other players, modulo a perception/`canSee` check) is
+    ALWAYS visible to a builder; likewise hidden/dark/wizinvis entities. This is the ELEVATED end
+    of the `canSee`/`nameFor` chokepoint the dark/invis flags will introduce (the
+    `phase5-visibility` TODO in `internal/world/commands.go` `lookRoom`). The "holylight" tradition.
+  - **Inspection surfaces underlying object data.** A builder examining a thing sees instance +
+    prototype identity and internal state a player never does — illustratively "a rusty dagger
+    (instance 0x342f of 0x33ee)" where a player sees just "a rusty dagger". Likely an
+    inspect/`stat`-style command or a builder-facing long description, NOT the player short. The
+    Diku `stat`/vnum-display lineage.
+  - **Runtime-tweakable per-builder toggles.** e.g. show/hide my own combat dice rolls, holylight
+    on/off, wizinvis level, verbose event/debug echoes — flipped live, scoped to that session.
+  - General: builders are first-class *debuggers/inspectors*, not just authors. Ties to the builder
+    persona in the end-of-roadmap wiki and the permission/trust model; the visibility half is the
+    elevated counterpart to the player-facing `canSee` gate. · *mudlib/edge*
+
+## 5. Housekeeping
 
 - Delete merged local branches as work lands (e.g. `test-standard-structure`).
