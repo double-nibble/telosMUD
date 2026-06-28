@@ -37,15 +37,24 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
 
 ## 2. Code tech-debt / design deferrals
 
-- **`rx:replace_target` redirect is not wired (only re-gated)** — `luareact.go`
-  `rxReplaceTarget` (Phase 7.9): the SECURITY half is live and tested — a retarget onto a
-  non-consenting player is gate-BLOCKED (it re-runs `guardHarmful(harmActor, newTarget)`, the same
-  funnel, with the original attacker as the gate actor). But the actual blow-REDIRECTION is
-  deferred: even on a PASSED re-gate the method returns `false` (honestly — never a silent success)
-  and the pending action keeps its original target. Full wiring needs the OnDamageTaken seam to
-  re-MITIGATE against the new target's resistances/soak and apply to ITS pool (a real harm-path
-  change, with its own re-entrancy/budget audit). When built, route a focused security + combat
-  re-review of just that seam. (deferred capability) · *scripting/combat/security*
+- ~~**`rx:replace_target` redirect is not wired (only re-gated)**~~ — **RESOLVED** (7.9
+  completion): `luareact.go` `rxReplaceTarget` now RECORDS `r.newTarget` on a PASSED
+  `guardHarmful(harmActor, newTarget)` re-gate and returns `true`; a FAILED re-gate (non-consenting
+  player / detached / cross-zone) still returns `false` and records nothing (the gate-block test
+  holds). The OnDamageTaken seam `applyDamageReaction` reads `r.newTarget` back and re-runs the WHOLE
+  RAW blow against the new target through the SHARED `dealDamage` pipeline (`applyDamageRedirect`), so
+  the blow is RE-MITIGATED against the new target's OWN resistances/soak, fires its OWN OnDamageTaken
+  reactions/affects, builds threat + the lit combat events, and can kill it through the uniform death
+  seam — while the ORIGINAL target takes 0. The redirect threads the SAME `eventBudget`/`depth` as the
+  firing reaction ctx (no fresh root, no privileged depth — `depthOf`/`budgetOf`), so an A→B→A redirect
+  loop terminates at the shared `maxEventDepth`/`maxEventHandlers` budget and the zone-level
+  `eventCascadeDepth` backstop (never crashes/spins the zone). The re-applied blow re-routes the normal
+  `dealDamage`/`guardHarmful` gate; no direct entity-state write (the `luaharm_lint` binding-funnel lint
+  stays green). Tests (`luareact_test.go`): redirect lands re-mitigated against the new target's soak
+  (original takes 0); the new target's OWN damage-shield reaction fires on the redirected blow; an
+  A→B→A redirect loop terminates and the zone keeps serving; the existing non-consenting-player retarget
+  stays gate-BLOCKED. Verified `make verify` green incl. `-race`. (deferred capability — DONE) ·
+  *scripting/combat/security*
 - ~~**`pendingFinalFlush` stash has no active eviction**~~ — RESOLVED: `zone.go` now posts a
   one-shot `createFailedMsg` on the create goroutine's permanent-failure branch, and
   `characterCreateFailed` delete-evicts the orphaned stash (security-auditor re-confirmed the

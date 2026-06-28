@@ -368,6 +368,134 @@ func TestReplaceTargetReGatesOntoNonConsentingPlayer(t *testing.T) {
 	}
 }
 
+// --- 7.9 completion: rx:replace_target REDIRECTS the blow (re-mitigated against the new target) ---
+
+// redirectMobTo gives mob an OnDamageTaken reaction that redirects the blow onto the handle the test
+// seeds into mob's reaction state (state.guardee), recording the rx:replace_target return in
+// state.redirected. The guardian/misdirection shape: the original target takes 0, the seeded target
+// takes the blow re-mitigated against ITS own resistances/soak.
+func redirectMobTo(z *Zone, mob, guardee *Entity) {
+	reactScriptedDefender(z, mob, `
+		on("OnDamageTaken", function(ev, rx)
+			if state.guardee ~= nil then
+				state.redirected = rx:replace_target(state.guardee)
+			end
+		end)
+	`)
+	es := z.lua.ensureEntityScript(mob)
+	es.state.RawSetString("guardee", z.lua.newHandle(guardee))
+}
+
+// TestReplaceTargetRedirectsBlowReMitigatedAgainstNewTarget is the headline 7.9-completion done-when:
+// a PASSED re-gate redirects the WHOLE blow onto the new target, which takes it RE-MITIGATED against
+// ITS OWN soak (not the original target's), while the original target takes 0.
+func TestReplaceTargetRedirectsBlowReMitigatedAgainstNewTarget(t *testing.T) {
+	z, s := combatZone(t)
+	attacker := s.entity
+	registerRoom(z, attacker.location)
+
+	// The guardee (a mob, so the re-gate passes — mobs always consent to harm) has a DIFFERENT
+	// per-target mitigation than the original target: soak_slash 7 (the original mob has 0). A 10 blow
+	// redirected onto it lands as 10 - 7 = 3 (re-mitigated against ITS soak), proving re-mitigation
+	// runs against the NEW target, not the original.
+	guardee := combatMob(z, attacker, "guardee", "", 100)
+	setAttrBase(guardee, "soak_slash", 7)
+
+	mob := combatMob(z, attacker, "ward", "", 100) // soak_slash 0; would take the full 10
+	redirectMobTo(z, mob, guardee)
+
+	c := &effectCtx{z: z, actor: attacker, source: attacker, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
+	applied := dealDamage(c, mob, 10, "slash")
+
+	// dealDamage to the ORIGINAL target returns 0 (the blow moved off it).
+	if applied != 0 {
+		t.Fatalf("dealDamage to original target = %d, want 0 (the blow redirected away)", applied)
+	}
+	// The original target took NOTHING.
+	if got := resourceCurrent(mob, "hp"); got != 100 {
+		t.Fatalf("original target hp = %d, want 100 (the blow redirected away — it takes 0)", got)
+	}
+	// The guardee took the blow RE-MITIGATED against ITS soak: 10 - 7 = 3 (NOT the original's 10).
+	if got := resourceCurrent(guardee, "hp"); got != 97 {
+		t.Fatalf("guardee hp = %d, want 97 (10 blow re-mitigated against ITS soak_slash 7 = 3 applied)", got)
+	}
+	// rx:replace_target returned true (the re-gate passed; the redirect was recorded).
+	es := z.lua.ensureEntityScript(mob)
+	if got := es.state.RawGetString("redirected"); got != lua.LTrue {
+		t.Fatalf("rx:replace_target returned %v, want true (re-gate passed; redirect recorded)", got)
+	}
+}
+
+// TestReplaceTargetRedirectFiresNewTargetOwnReaction proves the redirect goes through the REAL
+// pipeline: the new target's OWN OnDamageTaken reaction (a damage-shield) fires on the redirected
+// blow and reduces it further — the redirect is not a raw pool-write, it re-enters dealDamage.
+func TestReplaceTargetRedirectFiresNewTargetOwnReaction(t *testing.T) {
+	z, s := combatZone(t)
+	attacker := s.entity
+	registerRoom(z, attacker.location)
+
+	// The guardee carries its own damage-shield reaction (-4) — it must fire on the redirected blow.
+	z.defs.affect.register("guardeeshield", &affectDef{
+		ref: "guardeeshield", name: "Guardee Shield", stacking: stackIgnore, maxStacks: 1, duration: 100,
+		onReactionLua: map[eventKind]string{evOnDamageTaken: `rx:modify("amount", -4)`},
+	})
+	guardee := combatMob(z, attacker, "guardee", "", 100)
+	applyAffect(guardee, "guardeeshield", attachOpts{duration: 100}, nil)
+	registerRoom(z, guardee.location)
+
+	mob := combatMob(z, attacker, "ward", "", 100)
+	redirectMobTo(z, mob, guardee)
+
+	c := &effectCtx{z: z, actor: attacker, source: attacker, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
+	dealDamage(c, mob, 10, "slash")
+
+	if got := resourceCurrent(mob, "hp"); got != 100 {
+		t.Fatalf("original target hp = %d, want 100 (blow redirected away)", got)
+	}
+	// 10 blow, redirected, then the guardee's OWN shield reaction soaks 4 => 6 applied (100 - 6 = 94).
+	if got := resourceCurrent(guardee, "hp"); got != 94 {
+		t.Fatalf("guardee hp = %d, want 94 (redirected 10 - its own 4 damage-shield reaction = 6 applied — the redirect went through the real pipeline)", got)
+	}
+}
+
+// TestReplaceTargetRedirectLoopTerminates is the load-bearing safety req: A redirects to B and B
+// redirects back to A — a redirect LOOP. It must TERMINATE (bounded by the shared cascade budget +
+// the zone-level eventCascadeDepth backstop), never hang/crash, and the zone keeps serving.
+func TestReplaceTargetRedirectLoopTerminates(t *testing.T) {
+	z, s := combatZone(t)
+	attacker := s.entity
+	registerRoom(z, attacker.location)
+
+	// Two mobs with HUGE pools so the loop bounds on BUDGET, not on death. Each redirects the blow it
+	// takes onto the other — A -> B -> A -> ... a ping-pong redirect loop.
+	a := combatMob(z, attacker, "alpha", "", 1000000)
+	b := combatMob(z, attacker, "beta", "", 1000000)
+	setResourceCurrent(a, "hp", 1000000)
+	setResourceCurrent(b, "hp", 1000000)
+	redirectMobTo(z, a, b)
+	redirectMobTo(z, b, a)
+
+	c := &effectCtx{z: z, actor: attacker, source: attacker, target: a, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
+
+	done := make(chan struct{})
+	go func() {
+		dealDamage(c, a, 10, "slash")
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Terminated (bounded) — good.
+	case <-timeAfter():
+		t.Fatal("the redirect loop did NOT terminate — the cascade backstop failed to bound it")
+	}
+	// The zone still serves: a fresh harmful op against a third target still works.
+	mob := combatMob(z, attacker, "ogre", "", 100)
+	c2 := &effectCtx{z: z, actor: attacker, source: attacker, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
+	if dealDamage(c2, mob, 5, "slash") <= 0 {
+		t.Fatal("the zone did not keep serving after the bounded redirect loop")
+	}
+}
+
 // --- Deliverable B: the 5e MULTICLASS spell-slot Lua FORMULA [G7] -------------------------------
 //
 // This is an INDEPENDENT escape-hatch case: a Lua formula over MULTIPLE class levels that computes

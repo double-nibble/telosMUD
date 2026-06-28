@@ -365,7 +365,7 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType string) int {
 	// reaction threads THIS ctx's eventBudget (T12 invariant 3) so an OnDamageTaken→reaction→damage loop
 	// is bounded. Observe-then-recheck: we re-read the recorded mutations here and apply only what the
 	// checkpoint permits ("amount" is the sole modify field; concentration's cancelAffect is dropped).
-	if dmg = c.z.applyDamageReaction(c, target, dmg); dmg <= 0 {
+	if dmg = c.z.applyDamageReaction(c, target, dmg, raw, dmgType); dmg <= 0 {
 		c.z.log.Debug("deal_damage fully negated by an OnDamageTaken reaction", "target", target.short)
 		return 0
 	}

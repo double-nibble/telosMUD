@@ -31,9 +31,12 @@ import (
 //  2. rx:replace_target RE-RUNS guardHarmful against the NEW target. The original gate ran against
 //     the ORIGINAL target; redirecting harm onto a non-consenting player would otherwise bypass
 //     the PvP/consent gate. The re-gate (guardHarmful(harmActor, newTarget)) is the SECURITY
-//     property — a redirect onto a non-consenting player is gate-BLOCKED. (The actual blow-redirect
-//     is deferred past this slice; rxReplaceTarget always returns false, honestly — the gate-block
-//     is what the 7.9 done-when relies on. See docs/FOLLOW-UPS.md.)
+//     property — a redirect onto a non-consenting player is gate-BLOCKED. On a PASSED re-gate the
+//     OnDamageTaken seam (applyDamageReaction → applyDamageRedirect) re-runs the WHOLE RAW blow
+//     against the new target through the SHARED dealDamage pipeline — RE-MITIGATED against the new
+//     target's OWN resistances/soak, firing ITS own reactions, threading the SAME eventBudget/depth
+//     so a redirect loop terminates — and the original target takes 0. The re-applied blow re-routes
+//     the normal dealDamage gate (the harm funnel holds; no direct state write).
 //
 //  3. THE REACTION PATH THREADS THE SAME eventBudget (effect_op.go:56). A reaction is fired through
 //     the SAME fireEvent cascade (the checkpoint is a fired event), so a reaction that triggers a
@@ -113,6 +116,16 @@ type reaction struct {
 
 	// canceled is set by a permitted rx:cancel(); the engine vetoes the in-flight action when true.
 	canceled bool
+	// newTarget is the entity a PASSED rx:replace_target() re-gate recorded — the entity the harmful
+	// blow should be REDIRECTED onto (the OnDamageTaken checkpoint, invariant 2). It is set ONLY after
+	// guardHarmful(harmActor, newTarget) PASSED, so the engine never honors a redirect onto a non-
+	// consenting player. The seam (applyDamageReaction) reads it back and re-runs the WHOLE blow against
+	// newTarget — RE-MITIGATED against ITS OWN resistances/soak, firing ITS OWN OnDamageTaken reactions,
+	// threading the SAME eventBudget/depth (so a redirect loop is bounded) — and the ORIGINAL target then
+	// takes 0. nil when no permitted redirect was recorded (the common path). A guardian/misdirection
+	// mechanic. A second rx:replace_target in the same reaction overwrites (last-writer-wins), still
+	// re-gated each time.
+	newTarget *Entity
 	// mods accumulates the permitted rx:modify(field, delta) deltas, keyed by the (allowlisted)
 	// field name. A non-allowlisted field never lands here (rxModify drops it). The engine reads
 	// the field it cares about at the seam (e.g. mods["ac"] at to-hit, mods["amount"] at damage).
@@ -261,23 +274,23 @@ func (rt *luaRuntime) rxModify(l *lua.LState) int {
 	return 1
 }
 
-// rxReplaceTarget is the retarget reaction surface — RE-GATED but NOT YET WIRED to actually
-// redirect the pending action (deferred, docs/FOLLOW-UPS.md). It ALWAYS returns false:
+// rxReplaceTarget is the retarget reaction surface — RE-GATED, and (7.9 completion) WIRED to
+// REDIRECT the harmful blow at the OnDamageTaken checkpoint:
 //
 //   - At a checkpoint that cannot retarget, or with no harm originator to re-gate against, it is a
 //     clean no-op (false) — fail-closed.
-//   - Otherwise it RE-RUNS guardHarmful against the new target (invariant 2): the SECURITY property
-//     the done-when requires — a redirect onto a NON-CONSENTING player is gate-BLOCKED exactly as an
-//     original harmful op would be. The re-gate runs the SAME funnel with the ORIGINAL harm
-//     originator (r.harmActor) as the actor — "may the ATTACKER harm this new target?".
-//   - On a PASSED re-gate the redirect would be VALID, but the actual blow-redirection (re-mitigate
-//     against the new target's resistances + apply to ITS pool) is a real harm-path change deferred
-//     past this slice. Rather than silently record an intent the seam never reads (a content-author
-//     trap), it returns false + a clear debug. So a content author sees an honest "redirect did not
-//     take" today, never a false success.
+//   - Otherwise it RE-RUNS guardHarmful against the new target (invariant 2): the SECURITY property —
+//     a redirect onto a NON-CONSENTING player is gate-BLOCKED exactly as an original harmful op would
+//     be. The re-gate runs the SAME funnel with the ORIGINAL harm originator (r.harmActor) as the
+//     actor — "may the ATTACKER harm this new target?".
+//   - On a PASSED re-gate it RECORDS newTarget on the reaction and returns true. The seam
+//     (applyDamageReaction) reads it back and re-runs the WHOLE blow against newTarget — RE-MITIGATED
+//     against ITS OWN resistances/soak, firing ITS OWN OnDamageTaken reactions, threading the SAME
+//     eventBudget/depth (so a redirect loop terminates at the shared cascade bound) — and the ORIGINAL
+//     target then takes 0. A guardian/misdirection mechanic.
 //
-// This keeps the surface HONEST: it never claims a redirect it cannot deliver, and the gate-block
-// (the only behavior the 7.9 done-when relies on) holds. The full wiring is FOLLOW-UPS-tracked.
+// The surface stays HONEST: a FAILED re-gate returns false and records nothing (the original target
+// keeps the blow); a redirect is only ever honored after the gate that an original harmful op routes.
 func (rt *luaRuntime) rxReplaceTarget(l *lua.LState) int {
 	r := checkReaction(l, 1)
 	newTarget := resolveHandle(l, 2)
@@ -311,12 +324,13 @@ func (rt *luaRuntime) rxReplaceTarget(l *lua.LState) int {
 		l.Push(lua.LFalse)
 		return 1
 	}
-	// PASSED the re-gate, but the redirect itself is NOT WIRED this slice (it needs re-mitigation +
-	// apply against the new target — a real harm-path change, deferred). Return false honestly rather
-	// than record an intent nothing reads. (docs/FOLLOW-UPS.md tracks the full wiring.)
-	rt.log.Debug("rx:replace_target re-gate passed but redirect is not yet wired (deferred); no-op",
-		"new_target", newTarget.short)
-	l.Push(lua.LFalse)
+	// PASSED the re-gate: record the redirect. The seam (applyDamageReaction) re-runs the blow against
+	// newTarget — re-mitigated against ITS resistances, firing ITS reactions, threading the SAME budget
+	// — and zeroes the original target. The redirect is authorized; the harm-funnel discipline holds
+	// (the re-applied blow routes the normal dealDamage gate again).
+	r.newTarget = newTarget
+	rt.log.Debug("rx:replace_target redirect recorded (re-gate passed)", "new_target", newTarget.short)
+	l.Push(lua.LTrue)
 	return 1
 }
 
@@ -490,8 +504,8 @@ func (z *Zone) fireToHitReaction(c *effectCtx, attacker, target *Entity) float64
 
 // applyDamageReaction runs the OnDamageTaken REACTION pass about the damage TAKER `target` with the
 // pending (post-mitigation) damage `dmg` as the event mag, and returns the damage to actually apply
-// after the reaction's recorded mutations (observe-then-recheck). Three result-altering moves are
-// honored at this checkpoint (luareact.go's reactPolicy(reactOnDamageTaken)):
+// to `target` after the reaction's recorded mutations (observe-then-recheck). Four result-altering
+// moves are honored at this checkpoint (luareact.go's reactPolicy(reactOnDamageTaken)):
 //
 //   - rx:modify("amount", delta) — the SOLE allowlisted modify field here. CONTRACT (combat Finding):
 //     "amount" is a DAMAGE-SHIELD — REDUCE-ONLY. Only a NEGATIVE delta is honored (a positive delta
@@ -502,10 +516,16 @@ func (z *Zone) fireToHitReaction(c *effectCtx, attacker, target *Entity) float64
 //   - rx:cancel() WITHOUT an affect handler firing — negate the blow entirely (return 0).
 //   - rx:cancel() FROM a concentration affect's handler — drop THAT affect (the concentration break,
 //     r.cancelAffect); the damage itself still lands (concentration breaking doesn't soak the hit).
+//   - rx:replace_target(handle) (7.9 completion) — REDIRECT the whole blow. On a PASSED re-gate the
+//     reaction recorded r.newTarget; this seam re-runs the SAME RAW blow against newTarget through
+//     dealDamage (RE-MITIGATED against newTarget's OWN resistances/soak, firing newTarget's OWN
+//     OnDamageTaken reactions), threading the SAME eventBudget/depth, and returns 0 so the ORIGINAL
+//     target takes nothing. See applyDamageRedirect.
 //
 // It threads `c` (the SAME eventBudget — T12 invariant 3) so an OnDamageTaken→reaction→damage loop
-// is bounded by the shared cascade budget. Zone goroutine.
-func (z *Zone) applyDamageReaction(c *effectCtx, target *Entity, dmg int) int {
+// is bounded by the shared cascade budget. `raw`/`dmgType` are the PRE-mitigation blow (needed so a
+// redirect re-mitigates against newTarget's resistances, not the original target's). Zone goroutine.
+func (z *Zone) applyDamageReaction(c *effectCtx, target *Entity, dmg int, raw float64, dmgType string) int {
 	if z == nil || z.lua == nil || target == nil {
 		return dmg
 	}
@@ -516,6 +536,19 @@ func (z *Zone) applyDamageReaction(c *effectCtx, target *Entity, dmg int) int {
 		mag: float64(dmg), disp: dispNeutral, rng: c.rng, depth: c.depth, eventBudget: c.eventBudget,
 	}
 	r := z.fireReaction(rc, evOnDamageTaken, reactOnDamageTaken, target, c.source, c.source, float64(dmg))
+
+	// REDIRECT (7.9 completion): a PASSED rx:replace_target re-gate recorded r.newTarget. Re-run the
+	// WHOLE RAW blow against newTarget — re-mitigated against ITS resistances, firing ITS reactions,
+	// threading the SAME cascade budget so a redirect loop terminates — and return 0 so the ORIGINAL
+	// target takes nothing. The redirect SUPERSEDES the original target's outcome and is honored BEFORE
+	// the cancel/amount/concentration handling below: those mutate what the ORIGINAL target takes, but
+	// the original target takes nothing once the blow moves. A concentration break is deliberately NOT
+	// applied here — the subject did NOT take the damage (it redirected away), so its concentration is
+	// not jeopardized by a blow it never absorbed.
+	if r.newTarget != nil {
+		z.applyDamageRedirect(c, target, r, raw, dmgType)
+		return 0
+	}
 
 	// Concentration break (affect-scoped cancel): drop the affect the reaction canceled, by ROUTING THE
 	// EXISTING opRemoveAffect op handler (the only affect-removal path, P7-D3 invariant 3) — never a
@@ -548,6 +581,68 @@ func (z *Zone) applyDamageReaction(c *effectCtx, target *Entity, dmg int) int {
 		return 0
 	}
 	return dmg
+}
+
+// applyDamageRedirect lands a redirected harmful blow on `newTarget` (recorded by a PASSED
+// rx:replace_target re-gate, r.newTarget) and is the seam that makes the redirect HONEST: it re-runs
+// the WHOLE RAW blow through the SHARED dealDamage pipeline against newTarget, so the blow is
+// RE-MITIGATED against newTarget's OWN resistances/soak (NOT the original target's), fires newTarget's
+// OWN OnDamageTaken reactions/affects, builds threat + the lit combat events for newTarget, and can
+// kill newTarget through the uniform death seam — exactly as if the original op had targeted newTarget.
+//
+// RE-ENTRANCY BOUND (the load-bearing safety req, T12 invariant 3): the redirect ctx threads the SAME
+// eventBudget pointer and the SAME depth as the firing reaction's ctx (r.c) — it ROOTS NO fresh budget
+// and grants NO privileged depth. So an A→B→A redirect loop (B's reaction redirects back to A, whose
+// reaction redirects to B, …) re-enters dealDamage at ever-deeper cascade levels and TERMINATES at the
+// shared maxEventDepth / maxEventHandlers width budget, and — as a can't-forget backstop independent of
+// whether the budget was threaded — the zone-level eventCascadeDepth bound (fireReaction) truncates the
+// reaction fire. A redirect loop returns (truncated with a warning), never crashes or spins the zone.
+//
+// HARM FUNNEL: the re-applied blow routes the NORMAL dealDamage gate (guardHarmful) again — the
+// rx:replace_target re-gate authorized the redirect, and dealDamage re-gates the actual application, so
+// no direct entity-state write happens here (the binding-funnel lint stays green). The ORIGINAL harm
+// originator (c.source / c.actor) is preserved as the attribution so threat/OnHit/death attribute to the
+// real attacker, not the redirecting subject. Zone goroutine.
+func (z *Zone) applyDamageRedirect(c *effectCtx, origTarget *Entity, r *reaction, raw float64, dmgType string) {
+	newTarget := r.newTarget
+	if newTarget == nil || newTarget.living == nil {
+		return
+	}
+	// Thread the SAME budget + depth as the firing reaction ctx (r.c) — never a fresh root, never a
+	// privileged depth — so the redirect re-enters dealDamage under the shared cascade bound (T12
+	// invariant 3). Preserve the ORIGINAL attacker (c.actor/c.source) as the actor/source so the
+	// redirected blow is attributed + gated exactly as the original harmful op (threat/OnHit/death go to
+	// the real attacker, and guardHarmful re-runs with the attacker as the gate actor).
+	rc := &effectCtx{
+		z: z, actor: c.actor, source: c.source, target: newTarget,
+		// mag carried for ctx-shape parity only — it is NOT re-applied on this path: dealDamage takes
+		// `raw` directly (crit already baked in) and never re-multiplies by ctx mag. Do NOT route the
+		// redirect back through opDealDamage (which does `raw *= mag`) without dropping mag here, or the
+		// blow would double-scale.
+		mag: c.mag, disp: dispHarmful, rng: c.rng,
+		depth: depthOf(r.c, c), eventBudget: budgetOf(r.c, c),
+	}
+	z.log.Debug("rx:replace_target redirect: re-running blow against new target",
+		"orig", origTarget.short, "new", newTarget.short, "raw", raw, "type", dmgType)
+	_ = dealDamage(rc, newTarget, raw, dmgType)
+}
+
+// depthOf returns the firing reaction ctx's depth when present (so the redirect re-enters one level
+// into the SAME cascade), else the firing damage ctx's depth — never a privileged 0 inside a cascade.
+func depthOf(reactionCtx, dmgCtx *effectCtx) int {
+	if reactionCtx != nil {
+		return reactionCtx.depth
+	}
+	return dmgCtx.depth
+}
+
+// budgetOf returns the firing reaction ctx's SHARED eventBudget pointer when present (the redirect
+// must inherit it — invariant 3), else the firing damage ctx's. Never allocates a fresh budget.
+func budgetOf(reactionCtx, dmgCtx *effectCtx) *int {
+	if reactionCtx != nil && reactionCtx.eventBudget != nil {
+		return reactionCtx.eventBudget
+	}
+	return dmgCtx.eventBudget
 }
 
 // runReactionHandlers gathers and runs the subject's Lua reaction handlers for `kind`, binding the
