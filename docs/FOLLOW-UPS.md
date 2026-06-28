@@ -24,24 +24,16 @@ end of the roadmap.
   (the reload swap stays on the subscription/zone goroutine; old-code-vs-new-state),
   **persistence-engineer** (`self.state` survives the swap). Run when capacity resets.
 
-## 1. Lint nolint `TODO(owner)` cleanups
+## 1. Lint nolint `TODO(owner)` cleanups — ~~RESOLVED~~
 
-The golangci-lint gate is clean + blocking; genuine findings are parked behind
-reasoned `//nolint:<linter> // TODO(owner): …`. Resolve each (and remove the
-nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
-
-| Item | Location | Owner |
-|---|---|---|
-| `state_version` CAS int↔uint conversions — add explicit non-negative bound | `internal/store/character.go:58,114,123` | persistence |
-| Pulse/cooldown/cast-time `uint64()` conversions — add small-count bounds | `internal/world/ability.go:170,354,358`, `character.go:252`, `pulse_test.go:45` | world |
-| `renew*` goroutines use `ctx.Background()` — confirm the right lifetime ctx | `cmd/telos-world/main.go:145,166` | distsys |
-| `max` local shadows the builtin in the per-round refresh hot path — rename | `internal/world/combat.go:203` | world |
-| `PULSE_VIOLENCE` ALL_CAPS (Diku homage) — decide rename vs keep (touches code+tests+docs) | `internal/world/combat.go:47` | world |
-| telnet `writeRaw` mid-protocol writes unchecked — decide if a failed negotiation write drops the session | `internal/telnet/telnet.go:250,252` | edge |
-| Config path is operator-supplied — validate/confine (G304); test-file perms (G306) | `internal/config/config.go:77`, `config_test.go:31` | config |
-| Test-only `unsafe` pointer-identity helper (G103) | `internal/world/prototype_test.go:32` | world |
-| Unused Phase-N placeholders — hot-reload hook, tick-stop helper, containment-query hook, `flags`/`account` stubs | `internal/world/{defs.go:90, affect_runtime.go:187, entity.go:167, components.go:28,130}` | world |
-| Journey-test scaffolding (`waitFor`, `echoAbsent`) for tests not yet written | `internal/gate/{harness_test.go:328, persistence_journey_test.go:176}` | test-eng |
+The whole TODO-nolint backlog was burned down: mechanical conversions bounded
+(`pulseCount`/`pulsesToInt`/`nonNegU64`/`stateVersionParam`); `max` shadow renamed;
+config perms/path, telnet best-effort writes, and the `unsafe` test helper fixed;
+the unused `maybeStopTick`/`defRegistry.reload`/`contentsByKeyword`/`waitFor`/`echoAbsent`
+deleted; and the deliberate suppressions (`PULSE_VIOLENCE` Diku name, the `renew*` ctx
+G118, the operator-supplied config G304, the `flags`/`account` data-model stubs) reclassified
+from TODO to permanent reasoned nolints. The golangci-lint gate is clean + blocking with
+no TODO-nolints remaining; new ones should be resolved or reclassified as they appear.
 
 ## 2. Code tech-debt / design deferrals
 
@@ -126,8 +118,10 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
   `resume_input_seq` was a redundant source-side estimate. Dropped the dead `runStream`
   param + its nolint (kept `redirectTarget.resumeSeq` for the diagnostic log). The
   remaining *wire-level* redundancy is now tracked in §2 below.
-- **`combat_test.go:448` empty `if z.move(...)`** — a combat test that may not assert
-  the move outcome it intends. Make it assert. · *combat* · chip `task_0db5e6e9`
+- ~~**`combat_test.go` empty `if z.move(...)`**~~ — RESOLVED: `TestCannotMoveWhileFighting`
+  asserts the move outcome on `s.entity.location` + the exclusion message (the `if z.move(...)`
+  refusal Fatals); the one local-move whose bool is always-false is now an explicit `_ =` with a
+  comment, the relocation asserted on location. · *combat* · chip `task_0db5e6e9`
 - ~~**Single-session takeover leaves the first connection silently mute**~~ — *edge/persistence*
   design call surfaced by `TestSecondLoginTakesOverSession` (the coverage wave-1 push). **RESOLVED:**
   implemented the single-session CLEAN-KICK contract. A second login for a still-live character now

@@ -15,7 +15,7 @@ package gate
 //
 // Design rules this harness enforces (house rules):
 //   - Determinism over sleeps: every wait polls a condition with a deadline
-//     (term.expect, waitFor). Nothing sleeps-and-hopes.
+//     (term.expect). Nothing sleeps-and-hopes.
 //   - Real seams, fake transport: shards are dialed over bufconn (the same Play /
 //     Handoff services production registers), the gate uses its real pool via an
 //     injected dialer, the "socket" is a net.Pipe — only the wire is in-process.
@@ -318,27 +318,5 @@ func (term *terminal) close(t *testing.T) {
 	}
 }
 
-// --- generic wait-for-condition -----------------------------------------------------
-
-// waitFor polls cond until it returns true or the deadline elapses, failing the test
-// with msg otherwise. The deterministic alternative to time.Sleep for an out-of-band
-// condition (a directory placement appearing, a shard count settling) that isn't
-// observable on the player's socket.
-//
-//nolint:unused // TODO(test-engineer): wait-for-condition scaffolding for journey tests not yet written; keep (Phase-N harness)
-func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
-	t.Helper()
-	deadline := time.After(timeout)
-	tick := time.NewTicker(5 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		if cond() {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("waitFor timed out: %s", msg)
-		case <-tick.C:
-		}
-	}
-}
+// (a generic poll-until-condition helper lived here; removed as unused — the journey
+// tests sync on observable socket output via term.expect, not out-of-band polling.)

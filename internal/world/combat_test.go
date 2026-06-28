@@ -484,7 +484,7 @@ func TestCannotMoveWhileFighting(t *testing.T) {
 	// false whether it succeeds or is refused; the relocation itself is the only observable outcome, so
 	// assert on s.entity.location rather than the return.
 	z.stopFight(s.entity)
-	z.move(s, "north")
+	_ = z.move(s, "north") // bool intentionally ignored (always false for a local move); the relocation is asserted on location below
 	if s.entity.location == z.rooms[z.startRoom] {
 		t.Fatal("after flee the move should have succeeded")
 	}
