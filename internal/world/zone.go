@@ -257,6 +257,11 @@ type reapMsg struct {
 // leaveMsg removes a player from the zone immediately.
 type leaveMsg struct{ id string }
 
+// whoFallbackMsg is posted back by the async cross-shard `who` read (cmdWho) when the roster read FAILED:
+// the fallback zone-local render runs on the zone goroutine (single-writer over z.players) and writes to
+// the captured out channel. A roster miss thus degrades to the local list, never an error to the player.
+type whoFallbackMsg struct{ out chan *playv1.ServerFrame }
+
 // transferInMsg hands an existing session (and its entity) from a sibling zone on the
 // SAME shard (an intra-shard cross-zone walk). The destination zone takes ownership: it
 // Moves the entity into room, Stores itself into the session's currentZone pointer so
@@ -451,6 +456,7 @@ func (adoptPidMsg) zoneMsg()      {}
 func (presenceMsg) zoneMsg()      {}
 func (loadObjectsMsg) zoneMsg()   {}
 func (reloadLuaMsg) zoneMsg()     {}
+func (whoFallbackMsg) zoneMsg()   {}
 
 func newZone(id string) *Zone {
 	z := &Zone{
@@ -597,6 +603,8 @@ func (z *Zone) handle(m msg) {
 		z.rehydrateObjects(v)
 	case reloadLuaMsg:
 		z.reloadLua(v.kind, v.ref)
+	case whoFallbackMsg:
+		writeFrameTo(v.out, textFrame(z.whoLocal()))
 	}
 }
 
@@ -684,6 +692,9 @@ func (z *Zone) join(s *session, room ProtoRef) {
 	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
 	z.lookRoom(s)
 	s.send(promptFrame())
+	// Publish to the cross-shard `who` roster: this shard now hosts the player (8.4). Off the zone
+	// goroutine — presenceJoin only records + enqueues; the background loop does the Redis write.
+	z.presenceJoin(s)
 	z.log.Debug("player joined", "player", s.character, "room", r.proto, "population", len(z.players))
 }
 
@@ -747,6 +758,10 @@ func (z *Zone) leave(id string) {
 		z.lua.dropEntityScript(s.entity.rid)
 	}
 	delete(z.players, id)
+	// Eager removal from the cross-shard `who` roster: a clean quit/leave drops the player immediately,
+	// before the TTL (8.4). The roster's owner-guard means a handoff AWAY whose source-leave races the
+	// destination's join can't evict the destination's fresh entry.
+	z.presenceLeave(id)
 	z.log.Debug("player left", "player", id, "population", len(z.players))
 }
 
@@ -840,6 +855,9 @@ func (z *Zone) attach(m attachMsg) {
 		if z.shard != nil && s.token != "" {
 			z.shard.dropToken(s.token)
 		}
+		// The handoff to another shard committed: this source copy is an orphan. Drop our roster entry
+		// (owner-guarded, so it can't evict the destination's fresh one if it already SET) (8.4).
+		z.presenceLeave(character)
 		s = nil
 	}
 	switch {
@@ -883,6 +901,10 @@ func (z *Zone) attach(m attachMsg) {
 		}
 		z.lookRoom(s)
 		s.send(promptFrame())
+		// This shard is now the player's host (cross-shard handoff arrival): publish them to the `who`
+		// roster. The roster's owner-guard lets this destination SET win over the source's stale entry,
+		// and the source shard's own presenceLeave (handed-off orphan reap) drops its copy (8.4).
+		z.presenceJoin(s)
 		z.log.Debug("handoff committed: player activated", "player", character,
 			"room", roomRef(s.entity.location), "applied", s.appliedSeq, "epoch", s.epoch)
 		// Async-create window: the snapshot carried no PersistID (the source's CreateCharacter had
@@ -1198,6 +1220,7 @@ func (z *Zone) freezeExpire(id string, gen uint64) {
 		if z.shard != nil && s.token != "" {
 			z.shard.dropToken(s.token)
 		}
+		z.presenceLeave(id) // drop the orphaned source copy from the `who` roster (owner-guarded) (8.4)
 		return
 	}
 	// Handoff never completed: thaw in place and restore to the room they tried to leave.

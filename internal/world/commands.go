@@ -1,6 +1,7 @@
 package world
 
 import (
+	"context"
 	"strings"
 	"time"
 )
@@ -117,10 +118,42 @@ func cmdSay(c *Context) error {
 	return nil
 }
 
-// cmdWho lists every player currently online in the zone (MUDLIB §6). Unchanged output.
+// cmdWho lists every player online ACROSS ALL SHARDS (docs/PHASE8-PLAN.md slice 8.4). It reads the shared
+// presence roster (every shard's residents), not just this zone's players. When presence is disabled (no
+// Redis / single-shard run) it falls back to the zone-local list, so the pre-8.4 behavior — and the
+// existing who tests — are preserved.
+//
+// The roster read is blocking Redis I/O, so it must NEVER run on the zone goroutine. We capture the
+// session's out channel on-goroutine and spawn a short-lived goroutine for the List + render + write — the
+// same off-goroutine discipline the login epoch-resume and async character create use. The async frame is
+// written straight to the out channel (ack 0, like a comms frame), so it does not touch the zone-owned
+// appliedSeq from another goroutine.
 func cmdWho(c *Context) error {
-	c.z.who(c.s)
+	z := c.z
+	out := c.s.out
+	if !z.presenceEnabled() {
+		z.who(c.s) // zone-local fallback (no roster): unchanged output
+		return nil
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), presenceIOTimeout)
+		defer cancel()
+		entries, ok := z.rosterList(ctx)
+		if !ok {
+			// A roster read error degrades to the zone-local list — never an error to the player. We post
+			// a message back to the zone goroutine so the fallback render stays single-writer.
+			z.post(whoFallbackMsg{out: out})
+			return
+		}
+		writeFrameTo(out, textFrame(renderWho(entries)))
+	}()
 	return nil
+}
+
+// presenceEnabled reports whether this zone's shard has a live presence roster (so `who` should read it
+// cross-shard rather than the zone-local list). False on a bare zone or a no-Redis run.
+func (z *Zone) presenceEnabled() bool {
+	return z.shard != nil && z.shard.presence != nil && z.shard.presence.enabled()
 }
 
 // cmdQuit marks a clean, intentional disconnect and closes the stream (MUDLIB §6).
@@ -352,8 +385,15 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 	dest.post(transferInMsg{s: s, room: destRoom})
 }
 
-// who lists every player currently online in the zone.
+// who lists every player currently online in the zone (the zone-local fallback when presence is
+// disabled / a roster read failed). Sends the whoLocal() render to s.
 func (z *Zone) who(s *session) {
+	s.send(textFrame(z.whoLocal()))
+}
+
+// whoLocal builds the zone-local "Players online:" list (this zone's players only). It is the pre-8.4
+// who output, kept as the no-roster fallback. Runs on the zone goroutine (reads z.players single-writer).
+func (z *Zone) whoLocal() string {
 	var b strings.Builder
 	b.WriteString("Players online:")
 	// TODO(phase5-visibility): this online list discloses presence/name bypassing the
@@ -363,5 +403,5 @@ func (z *Zone) who(s *session) {
 		b.WriteByte(' ')
 		b.WriteString(o.entity.Name())
 	}
-	s.send(textFrame(b.String()))
+	return b.String()
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
+	roster "github.com/double-nibble/telosmud/internal/presence"
 )
 
 // handoffRPCTimeout bounds the whole source-side handoff conversation (ShardForZone/
@@ -111,6 +112,13 @@ type Shard struct {
 	// wires a live one), shared read-only by every hosted zone exactly like protos/defs — a busless
 	// shard publishes to nowhere and is byte-identical to a pre-Phase-8 shard.
 	comms *commSource
+
+	// presence is the shard's Phase-8 cross-shard `who` plumbing (presence.go): the resident-player set
+	// THIS shard hosts plus the background loop that publishes it to the shared presence roster (Redis in
+	// prod). Always non-nil (DISABLED — a nil roster, every method a no-op — until WithPresence wires one),
+	// shared read-only by every hosted zone exactly like comms/saver. A busless/rosterless shard does zero
+	// presence work and `who` falls back to the zone-local list — byte-identical to a pre-8.4 shard.
+	presence *presenceTracker
 }
 
 // NewDemoShard builds a single-shard midgaard world with no directory wiring — its
@@ -208,6 +216,9 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		// Comms SOURCE plumbing (comm.go), DISABLED until WithComms wires a live RoleWorld bus — a
 		// shard with no comms bus publishes channel lines to nowhere (the never-fatal degradation).
 		comms: newCommSource(),
+		// Cross-shard presence tracker (presence.go), DISABLED until WithPresence wires a live roster — a
+		// shard with no roster does no presence I/O and `who` reads the zone-local list (pre-8.4 behavior).
+		presence: newPresenceTracker(),
 	}
 }
 
@@ -238,6 +249,21 @@ func (s *Shard) WithPersistence(store CharacterStore, ckpt Checkpointer) *Shard 
 func (s *Shard) WithComms(bus commbus.Bus) *Shard {
 	if bus != nil {
 		s.comms.bus = bus
+	}
+	return s
+}
+
+// WithPresence wires the shard's Phase-8 cross-shard `who` roster (docs/PHASE8-PLAN.md slice 8.4, P8-D4):
+// the shared presence store (presence.NewRedis in prod, presence.NewMem in the cross-shard tests) and the
+// stable shardID this shard writes under (the write-authority key, P8-A4 — a shard writes ONLY its own
+// residents). It is OPTIONAL and never fatal: a nil roster (no Redis) leaves presence DISABLED, so `who`
+// falls back to the zone-local list and the existing who tests stay green. MUST be called before Run (the
+// background heartbeat loop is started there). Returns the shard for chaining; the production constructor
+// wires it from the same Redis the directory uses, tests inject a Mem roster the same way.
+func (s *Shard) WithPresence(rost roster.Roster, shardID string) *Shard {
+	if rost != nil {
+		s.presence.roster = rost
+		s.presence.shardID = shardID
 	}
 	return s
 }
@@ -323,7 +349,8 @@ func (s *Shard) ZoneByID(id string) *Zone { return s.zones[id] }
 // single-writer; the saver drainer is the ONE place character I/O runs, never on a zone
 // goroutine. A disabled saver's run returns immediately (no goroutine cost for a storeless boot).
 func (s *Shard) Run(ctx context.Context) {
-	go s.saver.run(ctx) // off-zone-goroutine character writer (no-op if disabled)
+	go s.saver.run(ctx)    // off-zone-goroutine character writer (no-op if disabled)
+	go s.presence.run(ctx) // off-zone-goroutine cross-shard `who` heartbeat (no-op if disabled)
 	// Hot reload runs on the bus's own subscription goroutine (no shard goroutine of its own);
 	// just tear the subscription down when the shard stops so a restart doesn't double-subscribe.
 	if s.reloader != nil {

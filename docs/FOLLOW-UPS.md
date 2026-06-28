@@ -107,6 +107,18 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   clobbers a live value (e.g. a quest counter) on an unrelated edit. Idiomatic content guards it
   (`state.x = state.x or 0`). One-liner for `docs/PERSISTENCE.md` (the `self.state` section) + the
   builder authoring guide. (doc) · *persistence/mudlib*
+- **`who` scale: SCAN + N×HMGET per call, unbounded** — `internal/presence/redis.go` (8.4): every
+  `who` spawns a goroutine doing a full keyspace SCAN + an HMGET per online player, with no rate-limit
+  or result cache; a `who` flood or a large roster is the first scale pressure point. Off-zone-goroutine
+  + 5s-timeout-bounded so it can't stall the actor loop, so it's a scale item not a correctness bug.
+  Before high-concurrency launch: a short per-session `who` cooldown OR a shared ~1s-TTL cached roster
+  snapshot (collapse N spammers to one SCAN/sec). (scale, deferred) · *distsys/persistence*
+- **`who` visibility filter** — `internal/world/presence.go` `renderWho` (8.4): `who` lists every online
+  player cross-shard with NO visibility filter, so an invisible/builder-hidden/wizinvis player appears.
+  Acceptable now (no visibility flags exist yet); when the visibility tier lands (the [[builder/wizard
+  trust tier]] §4 + the `phase5-visibility` TODO), `renderWho` must filter hidden players at the RENDER
+  boundary (the cross-shard read returns all entries; the per-viewer privilege filter is the chokepoint),
+  and presence should carry a visibility flag. (feature, tied to the visibility tier) · *mudlib/edge*
 - **`ClearPlayer` deferred coupling** — `cmd/telos-gate/main.go:93,108`: reconnect
   routing falls back to the home-zone shard, correct ONLY while `ClearPlayer` is
   deferred. Revisit when `ClearPlayer` (directory cleanup on logout) lands. · *gate/distsys*

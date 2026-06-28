@@ -27,6 +27,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/contentbus"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
+	"github.com/double-nibble/telosmud/internal/presence"
 	"github.com/double-nibble/telosmud/internal/store"
 	"github.com/double-nibble/telosmud/internal/world"
 )
@@ -147,6 +148,11 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	}
 	dir := directory.NewRedis(rdb, "telos")
 	ckpt := checkpoint.NewRedis(rdb, "telos") // ~10s Redis checkpoint tier of the ladder
+	// Cross-shard `who` roster (Phase 8.4): the same Redis the directory uses, namespaced "<ns>:presence:*"
+	// so it never collides with the directory's "<ns>:dir:*". Each shard writes ONLY its own residents
+	// (write authority keyed by cfg.ShardID — P8-A4) and `who` reads the whole roster. Operational/ephemeral
+	// (PERSISTENCE.md Redis tier); a crashed shard's players age out via the TTL.
+	roster := presence.NewRedis(rdb, "telos")
 
 	// Publish where THIS shard is reachable (shard-id -> endpoint) BEFORE claiming any
 	// zone, so the moment a zone names us as owner, peers can resolve us to a live
@@ -183,7 +189,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	return world.NewShardFromContent(lc, zones, home, cfg.ShardAddr, dir, world.GRPCDialer()).
 		WithPersistence(charStore, ckpt).
 		WithHotReload(defSource, bus, enabledPacks).
-		WithComms(comms)
+		WithComms(comms).
+		WithPresence(roster, cfg.ShardID)
 }
 
 // openLivePool opens the long-lived Postgres pool the shard keeps for its lifetime: it backs both
