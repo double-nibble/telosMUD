@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -77,6 +79,9 @@ func TestCharacterCRUD(t *testing.T) {
 	snap.RoomRef = "midgaard:room:market"
 	snap.State.AppliedSeq = 7
 	snap.State.Inventory = []world.ItemJSON{{ProtoRef: "midgaard:obj:torch"}}
+	// Phase 7.6: a populated self.state Script subtree must survive the real-PG JSONB round-trip
+	// (same whole-blob path as Inventory; this closes the Script-specific coverage gap).
+	snap.State.Script = json.RawMessage(`{"q":1}`)
 	newV, ok, err := p.SaveCharacter(ctx, snap)
 	if err != nil || !ok {
 		t.Fatalf("save (matching version): ok=%v err=%v, want ok", ok, err)
@@ -97,6 +102,18 @@ func TestCharacterCRUD(t *testing.T) {
 	}
 	if reloaded.State.AppliedSeq != 7 {
 		t.Fatalf("reloaded applied_seq = %d, want 7", reloaded.State.AppliedSeq)
+	}
+	// Phase 7.6: the self.state Script subtree survived the JSONB round-trip. Compare SEMANTICALLY, not
+	// byte-for-byte: Postgres JSONB canonicalizes whitespace (it returns `{"q": 1}`, a space after the
+	// colon), which is irrelevant — the real load path (unmarshalLuaState → json.Unmarshal) is
+	// whitespace-insensitive. A byte assertion would be a false failure on JSONB's canonical form.
+	var gotScript, wantScript map[string]any
+	if err := json.Unmarshal(reloaded.State.Script, &gotScript); err != nil {
+		t.Fatalf("reloaded self.state Script not valid JSON: %v (%s)", err, reloaded.State.Script)
+	}
+	_ = json.Unmarshal([]byte(`{"q":1}`), &wantScript)
+	if !reflect.DeepEqual(gotScript, wantScript) {
+		t.Fatalf("reloaded self.state Script = %s, want {\"q\":1} (semantically)", reloaded.State.Script)
 	}
 
 	// A STALE save (still holding version 0) must LOSE the CAS — the zombie-writer fence.

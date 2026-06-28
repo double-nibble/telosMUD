@@ -73,6 +73,15 @@ type StateJSON struct {
 	// state (Fighting/target/threat) is NOT persisted — combat drops cleanly on a crash/handoff. A
 	// pre-6.3 save (no cooldowns) loads with none.
 	Cooldowns map[string]int `json:"cooldowns,omitempty"`
+	// Script is the PLAYER's data-only Lua self.state subtree (Phase 7.6, P7-D5, T10): the durable
+	// form of the per-instance entityScripts[rid].state table (a quest counter, "have I greeted you",
+	// …), marshalled through the DATA-ONLY allowlist + caps (luastate.go) — numbers/strings/bools/
+	// nested tables of those ONLY, no functions/handles/userdata. dumpCharacter marshals it; load
+	// re-hydrates a PLAIN table (never executes code, never resurrects a handle). A pre-7.6 save (no
+	// Script) loads with an empty state — the established backward-compat default. MOB/item self.state
+	// is RUNTIME-ONLY (flyweight respawn; dropped on death) — only a PLAYER's persists (the 7.6
+	// boundary; a unique-persistent-mob mechanism is a later phase's concern).
+	Script json.RawMessage `json:"script,omitempty"`
 }
 
 // AffectJSON is the durable form of one active affect: the def ref, the remaining duration in PULSES,
@@ -169,6 +178,7 @@ func dumpCharacter(s *session) CharSnapshot {
 		Affects:    dumpAffects(e),
 		Flags:      dumpFlags(e),
 		Cooldowns:  dumpCooldowns(e),
+		Script:     dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
 	}
 	return CharSnapshot{
 		PID:          pid,
@@ -252,6 +262,51 @@ func dumpCooldowns(e *Entity) map[string]int {
 		out[ref] = int(at - now) //nolint:gosec // TODO(world-engineer): remaining-cooldown delta is bounded; add a guard
 	}
 	return out
+}
+
+// dumpScriptState marshals the PLAYER's data-only Lua self.state subtree (Phase 7.6, luastate.go)
+// into durable JSON. It reads the per-instance entityScripts[rid].state table and runs it through
+// the data-only allowlist + caps. Returns nil when the entity has no script state (the common
+// case — a player with no quest/script state, and the backward-compat default). A marshaller
+// REJECTION (a handle/function in self.state, or an over-cap subtree) is logged LOUDLY (naming the
+// bad key) and the Script subtree is OMITTED from this save — the rest of the character's state
+// still persists, but the bad script state is NOT silently persisted as garbage; the loud log is
+// the author-facing surface. Runs on the zone goroutine.
+func dumpScriptState(e *Entity) json.RawMessage {
+	if e == nil || e.zone == nil || e.zone.lua == nil {
+		return nil
+	}
+	es := e.zone.lua.entityScripts[e.rid]
+	if es == nil || es.state == nil {
+		return nil // no script state for this entity
+	}
+	b, err := marshalLuaState(es.state)
+	if err != nil {
+		e.zone.log.Error("self.state save REJECTED (not persisted; fix the script state)",
+			"rid", e.rid, "err", err.Error())
+		return nil
+	}
+	return b
+}
+
+// loadScriptState re-hydrates a player's persisted self.state JSON (Phase 7.6) into a PLAIN Lua
+// table installed as the entity's self.state (entityScripts[rid].state). Empty/nil bytes install a
+// fresh empty state (pre-7.6 / no-script-state default). A malformed blob degrades to an empty
+// state with a loud log. Never executes code, never resurrects a handle (the persisted form has
+// none). Runs on the zone goroutine.
+func loadScriptState(z *Zone, e *Entity, b json.RawMessage) {
+	if z == nil || z.lua == nil || e == nil {
+		return
+	}
+	if len(b) == 0 {
+		return // no script state to install (the entity's state, if accessed, is created empty)
+	}
+	t, err := z.lua.unmarshalLuaState(b)
+	if err != nil {
+		z.log.Error("self.state load degraded to empty (malformed persisted state)", "rid", e.rid, "err", err.Error())
+		return
+	}
+	z.lua.setStateTable(e, t)
 }
 
 // dumpFlags renders the entity's SET named flags (Living.flags) as a stable sorted slice so the
@@ -415,6 +470,12 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 			z.rearmCooldown(s, ref, remaining)
 		}
 	}
+
+	// Rehydrate the PLAYER's data-only self.state subtree (Phase 7.6, luastate.go) into a PLAIN Lua
+	// table on the zone's LState — never executes code, never resurrects a handle. A pre-7.6 save (no
+	// Script) installs an empty state (the backward-compat default). A malformed blob degrades to an
+	// empty state with a loud log, never a crash.
+	loadScriptState(z, e, snap.State.Script)
 
 	// Rehydrate carried items into the player's contents (inventory).
 	for _, it := range snap.State.Inventory {

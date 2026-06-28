@@ -80,6 +80,44 @@ func (rt *luaRuntime) ensureEntityScript(e *Entity) *entityScript {
 	return es
 }
 
+// ensureStateTable returns (creating if needed) the per-instance self.state table for entity e,
+// WITHOUT requiring a *Scripted source. A scripted entity's state lives on its entityScript (built
+// by ensureEntityScript); a player (or any entity) that has no trigger source but DOES carry
+// self.state (a quest counter written by an ability/quest hook, or rehydrated from a save) gets a
+// minimal entityScript here holding just the state table (no handlers). This is the seam the 7.6
+// persistence load uses to install a rehydrated state, and the accessor a future quest hook uses to
+// read/write a player's self.state. Zone goroutine only.
+func (rt *luaRuntime) ensureStateTable(e *Entity) *lua.LTable {
+	if rt == nil || rt.L == nil || e == nil {
+		return nil
+	}
+	if es := rt.ensureEntityScript(e); es != nil {
+		return es.state // a scripted entity already has one
+	}
+	// No *Scripted source: a state-only entityScript (handlers empty).
+	es, ok := rt.entityScripts[e.rid]
+	if !ok {
+		es = &entityScript{handlers: rt.L.NewTable(), state: rt.L.NewTable(), rid: e.rid}
+		rt.entityScripts[e.rid] = es
+	}
+	return es.state
+}
+
+// setStateTable installs a (rehydrated, plain-data) state table as entity e's self.state — used by
+// the 7.6 load path. It replaces the entity's entityScript.state with `t`, creating a state-only
+// entityScript if none exists. Zone goroutine only.
+func (rt *luaRuntime) setStateTable(e *Entity, t *lua.LTable) {
+	if rt == nil || rt.L == nil || e == nil || t == nil {
+		return
+	}
+	es, ok := rt.entityScripts[e.rid]
+	if !ok {
+		es = &entityScript{handlers: rt.L.NewTable(), rid: e.rid}
+		rt.entityScripts[e.rid] = es
+	}
+	es.state = t
+}
+
 // dropEntityScript removes the per-instance trigger state (handler table + self.state) for the
 // entity with this rid, freeing the *lua.LTable values it held on the zone's LState. It MUST be
 // called when a scripted entity leaves the world tree for good (death->corpse, a non-corpse reap)

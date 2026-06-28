@@ -663,6 +663,11 @@ func (z *Zone) leave(id string) {
 		z.act("$n leaves.", s.entity, nil, nil, "", "", ToRoom)
 		Move(s.entity, nil)
 	}
+	// Drop the player's in-memory Lua self.state entry (it was just dumped to durable JSONB above,
+	// so the next login re-hydrates it) — otherwise a per-login entityScript would leak (7.5/7.6).
+	if z.lua != nil && s.entity != nil {
+		z.lua.dropEntityScript(s.entity.rid)
+	}
 	delete(z.players, id)
 	z.log.Debug("player left", "player", id, "population", len(z.players))
 }
