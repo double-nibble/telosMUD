@@ -64,8 +64,15 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
   `TestShardRestartCreateRaceLosesMove` is MemStore-only; real Postgres widens the create
   window (the higher-risk env). Add a `TELOS_TEST_DSN`-gated pgx equivalent + a chaos variant
   that quits at randomized offsets within the create round-trip. (test coverage) · *test-engineer/persistence*
-- **Room-affect tick cadence** — `affect_room.go:189`: the room tick fires EVERY
-  pulse and re-leases the CC to every occupant; should lease at `tickInterval`. (perf/hardening) · *world*
+- ~~**Room-affect tick cadence** — `affect_room.go:189`: the room tick fires EVERY
+  pulse and re-leases the CC to every occupant; should lease at `tickInterval`. (perf/hardening) · *world*~~
+  **RESOLVED:** `roomTickOnce` now mirrors the per-entity tick — the per-occupant re-lease
+  fires only at the affect's `tickInterval` boundary (`sinceTick >= tickInterval`); a tickless
+  CC field (no `tick:` block) is leased once for its whole duration and does ZERO per-occupant
+  pulse work. `roomAffectLeaseSlack` (>=1) keeps coverage continuous (lease > interval) for both
+  a standing occupant and a worst-phase mid-interval entrant. Tests:
+  `TestRoomAffectReleasesAtTickInterval` (cadence, controlled-breakable) +
+  `TestRoomAffectMidIntervalEntrantStaysRooted` (entry contract).
 - **`ClearPlayer` deferred coupling** — `cmd/telos-gate/main.go:93,108`: reconnect
   routing falls back to the home-zone shard, correct ONLY while `ClearPlayer` is
   deferred. Revisit when `ClearPlayer` (directory cleanup on logout) lands. · *gate/distsys*

@@ -383,6 +383,103 @@ func TestWebRootsOccupantsAndEntrants(t *testing.T) {
 	}
 }
 
+// leaseRemaining returns the per-occupant leased copy's `remaining` for room affect `ref` applied by
+// `source` on `occ` (0 if no lease present). The room re-lease resets this back to the full lease length
+// (tickInterval + roomAffectLeaseSlack); the occupant's own per-entity tick decrements it each pulse. So
+// sampling it across pulses reveals the RE-LEASE CADENCE: a sawtooth that resets only at a tickInterval
+// boundary. At the old every-pulse rate it would pin at the full lease and never decrement.
+func leaseRemaining(occ *Entity, ref string, source *Entity) int {
+	a, ok := Get[*Affected](occ)
+	if !ok {
+		return 0
+	}
+	z := occ.zone
+	def := z.affectDefs().get(ref)
+	if def == nil {
+		return 0
+	}
+	if inst := a.byKey[keyFor(def, source)]; inst != nil {
+		return inst.remaining
+	}
+	return 0
+}
+
+// TestRoomAffectReleasesAtTickInterval pins the cadence fix (FOLLOW-UPS §2, affect_room.go): the per-
+// occupant CC RE-LEASE fires at the affect's tickInterval, NOT every pulse. The web leases each occupant
+// for tickInterval(2)+slack(1)=3 pulses; the room re-leases every 2 pulses. So a standing occupant's
+// lease sawtooths 3 -> (decrements) -> reset at the 2-pulse boundary. If the room re-leased EVERY pulse
+// (the old behavior) the lease would pin at 3 and never dip — which this test's expected sequence
+// FALSIFIES (the pulse-1 sample MUST read 2, the post-decrement value). Coverage stays continuous: the
+// lease (3) always exceeds the re-lease gap (2), so the occupant is never un-rooted mid-field.
+func TestRoomAffectReleasesAtTickInterval(t *testing.T) {
+	z, caster, room := webZone(t)
+	occ := aoeMob(z, room, "occupant", 100)
+
+	// Cast the web (lands on the occupant immediately at lease=3) — caster is the source key.
+	src := caster.entity
+	c := &effectCtx{z: z, actor: src, source: src, mag: 1, disp: dispHarmful}
+	opApplyAffect(c, &effectOp{kind: "apply_affect", affect: "web"})
+
+	if got := leaseRemaining(occ, "web", src); got != 3 {
+		t.Fatalf("initial lease remaining = %d, want 3 (tickInterval 2 + slack 1)", got)
+	}
+
+	// Expected lease-remaining after each pulse, for the first two re-lease cycles. With re-lease at the
+	// 2-pulse boundary and a per-pulse occupant decrement:
+	//   p1: 3->2 (decremented; no re-lease, sinceTick 1)         -> 2
+	//   p2: 2->1 then re-lease resets to 3 (sinceTick hit 2)     -> 3
+	//   p3: 3->2 (decremented; sinceTick 1)                      -> 2
+	//   p4: 2->1 then re-lease resets to 3                       -> 3
+	// (At the OLD every-pulse rate every sample would read 3 — the value 2 at p1/p3 is the falsifier.)
+	want := []int{2, 3, 2, 3}
+	for i, w := range want {
+		z.pulses.tick()
+		if got := leaseRemaining(occ, "web", src); got != w {
+			t.Fatalf("pulse %d: lease remaining = %d, want %d (re-lease must be at tickInterval, not every pulse)", i+1, got, w)
+		}
+		// The occupant must stay rooted throughout — the cadence change must not open a coverage gap.
+		if !preventsTag(occ, "move") {
+			t.Fatalf("pulse %d: occupant must remain rooted across the re-lease cadence", i+1)
+		}
+	}
+}
+
+// TestRoomAffectMidIntervalEntrantStaysRooted pins the entrant subtlety (FOLLOW-UPS §2): a creature
+// entering BETWEEN re-lease boundaries is leased on arrival (applyRoomAffectsTo) and the slack keeps it
+// rooted until the next room re-lease catches it — even at the worst phase (arriving right after a
+// boundary, so the next re-lease is a full tickInterval away). This is the apply-on-entry contract the
+// cadence change must preserve: an entrant never escapes the field by slipping in mid-interval.
+func TestRoomAffectMidIntervalEntrantStaysRooted(t *testing.T) {
+	z, caster, room := webZone(t)
+	src := caster.entity
+	c := &effectCtx{z: z, actor: src, source: src, mag: 1, disp: dispHarmful}
+	opApplyAffect(c, &effectOp{kind: "apply_affect", affect: "web"})
+
+	// Advance to a re-lease boundary so an entrant the NEXT pulse is at the worst phase (a full
+	// tickInterval until the following re-lease).
+	z.pulses.tick() // p1: sinceTick 1
+	z.pulses.tick() // p2: re-lease boundary (sinceTick reset)
+
+	// A mob walks in just after the boundary and is leased on arrival.
+	entrant := aoeMob(z, room, "latecomer", 100)
+	applyRoomAffectsTo(entrant)
+	if !preventsTag(entrant, "move") {
+		t.Fatal("a mid-interval entrant must be rooted on arrival (apply-on-entry contract)")
+	}
+	if got := leaseRemaining(entrant, "web", src); got != 3 {
+		t.Fatalf("entrant arrival lease = %d, want 3", got)
+	}
+
+	// Drive a full tickInterval of pulses (the gap until the next room re-lease). The slack (lease 3 >
+	// interval 2) must keep the entrant rooted the whole way — no flicker between arrival and re-lease.
+	for i := 0; i < 2; i++ {
+		z.pulses.tick()
+		if !preventsTag(entrant, "move") {
+			t.Fatalf("pulse %d after entry: entrant must stay rooted until the next re-lease (slack coverage)", i+1)
+		}
+	}
+}
+
 // TestWebGatesEntrantPerCreature confirms the room-affect's per-creature harm funnel: a non-consenting
 // PLAYER entering a (player-cast, harmful) web is NOT rooted (the gate blocks the leased CC), while a mob
 // entrant IS. The room-affect landing routes the same guardHarmful every harm vector does.

@@ -41,6 +41,13 @@ package world
 // room renews (refreshes) the copy every interval; the slack ensures the lease never lapses BETWEEN two
 // consecutive room ticks for a creature that stays put (so the CC is continuous while you're in the
 // room), yet still expires shortly after you leave or the room affect ends.
+//
+// MUST be >= 1: the per-occupant lease is `tickInterval + slack`, so slack>=1 makes lease > tickInterval.
+// That strict inequality is the coverage guarantee for a creature standing through a re-lease (its lease
+// outlives the gap to the next room tick) AND for a MID-INTERVAL ENTRANT — applyRoomAffectsTo leases an
+// entrant the same `tickInterval + slack` on arrival, so even an entrant arriving the pulse right after a
+// re-lease boundary (the worst phase: the next room re-lease is a full tickInterval away) stays covered
+// until that re-lease catches it. With slack=0 a worst-phase entrant could flicker free for one pulse.
 const roomAffectLeaseSlack = 1
 
 // applyRoomAffect attaches room-scoped affect `ref` to room entity `room`, applied by `source` ([G13]).
@@ -179,6 +186,11 @@ func nonNilSource(src, fallback *Entity) *Entity {
 // per room affect) drives every room affect's countdown + occupant re-lease + expiry. It honours the
 // pulse contract: a room never migrates zones (id "" path) so the captured *Entity is the owner's own
 // and safe to use directly — the resolve-by-id concern is players, and a room is never a player.
+//
+// The callback fires every pulse (the per-room affect's `remaining` is a per-pulse countdown, like the
+// per-entity tick), but the EXPENSIVE per-occupant re-lease/re-tick (landRoomAffectOnOccupants) runs at
+// each affect's `tickInterval` cadence, NOT every pulse — see roomTickOnce. So a high-population room ×
+// many fields is bounded by (#fields × occupants) / interval, not × every pulse.
 func ensureRoomTick(room *Entity, a *Affected) {
 	if a.tick != nil {
 		return
@@ -186,20 +198,15 @@ func ensureRoomTick(room *Entity, a *Affected) {
 	if !a.hasActiveAffects() {
 		return
 	}
-	// TODO(security review, hardening): the room tick fires EVERY pulse and re-leases the CC to every
-	// occupant, so a pathological pack (a high-population room × many stacked fields) is heartbeat
-	// pressure on the single-writer goroutine. Lease at the field's tickInterval instead of every pulse
-	// (roomAffectLeaseSlack already covers a >1 renewal gap so coverage stays continuous), and/or cap
-	// concurrent room affects per room. Linear + population-self-limited today (the milestone is one web
-	// in a small room), so deferred — but close before any large-scale room-field content.
 	a.tick = room.zone.pulses.every(1, roomTickFor(room))
 }
 
-// roomTickFor builds the per-room tick callback ([G13]). Each pulse it advances every room affect by one
-// (re-leasing the CC/modifier + running any on_tick on the current occupants at the affect's interval)
-// and expires any whose remaining hit 0, clearing it from occupants. It re-reads room.contents fresh
-// each pulse (never a stale occupant pointer). The room is zone-owned and never migrates, so the
-// captured *Entity is safe. Returns false to retire when no room affects remain. Zone goroutine.
+// roomTickFor builds the per-room tick callback ([G13]). Each pulse it advances every room affect's
+// countdown by one and, AT THE AFFECT'S tickInterval (not every pulse), re-leases the CC/modifier +
+// runs any on_tick over the current occupants; it expires any affect whose remaining hit 0, clearing it
+// from occupants. It re-reads room.contents fresh each pulse (never a stale occupant pointer). The room
+// is zone-owned and never migrates, so the captured *Entity is safe. Returns false to retire when no
+// room affects remain. Zone goroutine.
 func roomTickFor(room *Entity) pulseFunc {
 	return func(pulse uint64) bool {
 		a, ok := Get[*Affected](room)
@@ -215,10 +222,19 @@ func roomTickFor(room *Entity) pulseFunc {
 	}
 }
 
-// roomTickOnce advances every room affect one pulse: at each affect's interval it RE-LEASES the CC/
-// modifier and runs any on_tick over the CURRENT occupants; it decrements remaining and EXPIRES (clearing
-// the field from occupants) at 0. Snapshots the instance slice so an expiry mid-loop is safe. Single-
-// writer: zone goroutine.
+// roomTickOnce advances every room affect one pulse. It mirrors the per-ENTITY tick (affect_runtime.go
+// tickOnce): the per-occupant RE-LEASE/RE-TICK fires only AT THE AFFECT'S tickInterval (the same
+// `sinceTick >= tickInterval` boundary the per-entity DoT uses), NOT every pulse — so a room field's
+// per-occupant cost is amortized over its interval. It always decrements remaining and EXPIRES (clearing
+// the field from occupants) at 0. Snapshots the instance slice so an expiry mid-loop is safe.
+//
+// A TICKLESS room field (no tick: block, tickInterval <= 0 — a pure CC web/silence-field) is NOT
+// re-leased on a cadence at all: its lease is granted for the whole remaining duration at apply/entry
+// (landRoomAffectOn leases `def.duration` when there is no interval), so it needs no per-pulse renewal.
+// This is the case the old code re-leased EVERY pulse; it now does zero per-occupant tick work between
+// apply and expiry. Apply-on-entry (applyRoomAffectsTo) still leases an entrant correctly regardless.
+//
+// Single-writer: zone goroutine.
 func roomTickOnce(room *Entity, a *Affected, _ uint64) {
 	snapshot := make([]*affectInstance, len(a.list))
 	copy(snapshot, a.list)
@@ -226,16 +242,15 @@ func roomTickOnce(room *Entity, a *Affected, _ uint64) {
 		if !inst.def.roomScoped {
 			continue // an entity affect mis-attached to a room (defensive) — never tick it as a room field
 		}
-		// Re-lease / re-tick over occupants at the affect's interval (every pulse for a tickless CC
-		// field so the lease is continuously renewed; at the on_tick interval for a damage field).
-		interval := inst.def.tickInterval
-		if interval <= 0 {
-			interval = 1 // a tickless CC room field renews its lease every pulse
-		}
-		inst.sinceTick++
-		if inst.sinceTick >= interval {
-			inst.sinceTick = 0
-			landRoomAffectOnOccupants(room, inst)
+		// Re-lease / re-tick over occupants ONLY at the affect's tickInterval boundary — the proven
+		// per-entity-tick cadence. A tickless field (interval <= 0) skips this entirely (its lease
+		// already spans its whole duration), so it never does per-occupant work on the pulse path.
+		if inst.def.tickInterval > 0 {
+			inst.sinceTick++
+			if inst.sinceTick >= inst.def.tickInterval {
+				inst.sinceTick = 0
+				landRoomAffectOnOccupants(room, inst)
+			}
 		}
 		if inst.remaining > 0 {
 			inst.remaining--
