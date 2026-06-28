@@ -212,6 +212,39 @@ func TestBreakerResetOnHotReload(t *testing.T) {
 	}
 }
 
+// TestPerInstanceBreakerResetsOnHotReload is the 7.7 security-review follow-up: a per-INSTANCE
+// trigger breaker (keyed by rid, not the shared (kind,ref) key) must also reset on a fix-reload,
+// so a corrected mob script re-enables immediately instead of staying inert until the instance
+// repops. Trips a live guard's per-instance breaker with a broken greet, then reloads a fixed
+// source and asserts the breaker cleared.
+func TestPerInstanceBreakerResetsOnHotReload(t *testing.T) {
+	z, room, guard := reloadScriptedZone(t, `on("greet", function(ev) error("boom") end)`)
+	var player *Entity
+	for _, e := range room.contents {
+		if e.short == "Hero" {
+			player = e
+		}
+	}
+	key := breakerKeyInstance(guard.rid)
+	// Trip the per-instance breaker via the repeatedly-erroring greet trigger.
+	for i := 0; i < 50 && !z.lua.breakerDisabled(key); i++ {
+		z.fireRoomEntry(player, room)
+	}
+	if !z.lua.breakerDisabled(key) {
+		t.Fatal("the per-instance breaker did not trip on the broken trigger")
+	}
+	// Fix the script and reload: the per-instance breaker must reset (re-enable the corrected trigger).
+	z.protos.reload("rl:mob:guard", newPrototype("rl:mob:guard", nil, "the guard", "A guard stands here.",
+		componentSet{
+			reflect.TypeFor[*Living]():   &Living{},
+			reflect.TypeFor[*Scripted](): &Scripted{source: `on("greet", function(ev) end)`},
+		}))
+	z.reloadLua("mob", "rl:mob:guard")
+	if z.lua.breakerDisabled(key) {
+		t.Fatal("the per-instance breaker was not reset on the fix-reload (the corrected trigger stays quarantined)")
+	}
+}
+
 // --- the FULL bus path (subscriber goroutine -> notifyZones -> inbox -> reloadLua) ---------
 
 // scriptedReloadPack is a pack with a scripted greeter mob, for the full-path reload test.

@@ -152,6 +152,12 @@ func (rt *luaRuntime) reloadEntityScriptsForProto(ref ProtoRef) {
 		if newSrc == "" {
 			continue // the reloaded proto dropped its script; the instance becomes scriptless
 		}
+		// A fix-reload re-enables a per-INSTANCE-quarantined trigger: clear this rid's breaker so the
+		// corrected script runs immediately instead of staying inert until the instance repops (the
+		// shared (kind,ref) breaker is reset in chunkFor; per-instance keys were previously left tripped
+		// — 7.7 security-review follow-up). Availability-only, fail-toward-inert: a still-broken script
+		// just re-trips on its next fire.
+		rt.breakerReset(breakerKeyInstance(rid))
 		// Rebuild handlers from the NEW source, KEEPING the existing self.state table (the DATA
 		// survives the code swap). chunkFor recompiles because the source changed.
 		rt.registerEntityScript(e, newSrc, state)

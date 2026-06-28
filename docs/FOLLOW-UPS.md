@@ -14,15 +14,15 @@ end of the roadmap.
 
 ## 0. Pending reviews (committed with reduced rigor)
 
-- **Phase 7 slice 7.7 (hot reload, commit `abfc5d9`) needs its formal review trio.**
-  Committed with coordinator **self-review** of the security/distsys-critical paths
-  (`chunkFor` source/gen recompile; the single-writer inbox-posted reload) + the full
-  test suite green — because the implementing agent hit a capacity limit before the
-  reviews. Still owed: **security-auditor** (the `chunkFor` stale-policy fix + that a
-  reload can't open a gate; the per-instance vs shared breaker-reset-on-reload scope —
-  the code comment notes per-instance keys aren't swept), **distributed-systems-architect**
-  (the reload swap stays on the subscription/zone goroutine; old-code-vs-new-state),
-  **persistence-engineer** (`self.state` survives the swap). Run when capacity resets.
+- ~~**Phase 7 slice 7.7 (hot reload, commit `abfc5d9`) needs its formal review trio.**~~
+  **DISCHARGED** — the security-auditor, distributed-systems-architect, and persistence-engineer
+  all formally reviewed 7.7 and returned **CLEAR / SOUND** (no HIGH/MEDIUM). `chunkFor` recompile
+  is fail-safe (broken edit keeps last-good; nil chunk denies); the reload can't open a gate; the
+  single-writer spine (atomic cache swap on the subscriber goroutine, per-zone Lua via inbox post)
+  holds; old-gen timers drop; `self.state` survives the swap; boot/reload prototype parity holds.
+  One auditor recommendation was applied here (per-instance breaker reset on a fix-reload, with
+  `TestPerInstanceBreakerResetsOnHotReload`); the rest are recorded as new §2 items below.
+  **(No pending reduced-rigor reviews remain.)**
 
 ## 1. Lint nolint `TODO(owner)` cleanups — ~~RESOLVED~~
 
@@ -66,6 +66,32 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   a standing occupant and a worst-phase mid-interval entrant. Tests:
   `TestRoomAffectReleasesAtTickInterval` (cadence, controlled-breakable) +
   `TestRoomAffectMidIntervalEntrantStaysRooted` (entry contract).
+- **Shared-def hot reload is not wired (7.7 scope)** — `reload.go` `buildPrototype` handles only
+  Room/Item/Mob; a `(kind,ref)` invalidation for a SHARED def (ability/affect/formula/`pvp_allowed`
+  policy) is "unbuildable, skipped" and `z.defs` is boot-immutable, so there is NO live edit path to
+  a pvp policy / formula today. The source-aware `chunkFor` + the `reloadLua` chunk-drop are the
+  correct fail-safe FOUNDATION for it; when a slice swaps `z.defs` at runtime, hook that seam and
+  **re-run the pvp permissive→restrictive end-to-end check** against a live policy edit. (deferred) · *scripting/security*
+- **`notifyZones` blocking-posts can head-of-line-stall the shard reload pipeline** — `reload.go:180`:
+  the subscriber goroutine does a blocking `z.post(reloadLuaMsg)` to EVERY hosted zone; one wedged /
+  saturated zone inbox stalls all later invalidations shard-wide. Low-probability today; if a shard
+  hosts many zones (Phase-10 placement packs more per process), make the `reloadLuaMsg` post
+  non-blocking (a dropped notice is recoverable — the cache is already swapped; next invalidation
+  re-posts). (distsys/hardening) · *world/distsys*
+- **`reloadLua` chunk-cache invalidation is a substring match** — `reload.go:163` uses
+  `strings.Contains(key, ref)` (plus dropping `pvp_allowed`/`formula:` every reload), so it
+  over-invalidates (a harmless recompile-from-current-source). Correctness-safe; tighten with a keyed
+  `ref → {chunk keys}` index if the chunk cache ever grows large. (perf, minor) · *world*
+- **Phase-10: `r.shard.zones` concurrent iteration** — `notifyZones` iterates the shard's zone map
+  from the subscriber goroutine; safe now because the map is written only during boot (`adopt`,
+  pre-`Run`). When dynamic zone placement (Phase 10) lets a shard claim/release zones at runtime, this
+  becomes a concurrent read vs a live writer — snapshot under a lock or post through a shard-owned
+  goroutine. (distsys) · *world/distsys, Phase 10*
+- **Doc: a top-level `state.x = …` initializer re-runs on hot reload** — the reloaded script's
+  non-handler body re-executes against the PRESERVED `self.state` table, so a top-level `state.x = 0`
+  clobbers a live value (e.g. a quest counter) on an unrelated edit. Idiomatic content guards it
+  (`state.x = state.x or 0`). One-liner for `docs/PERSISTENCE.md` (the `self.state` section) + the
+  builder authoring guide. (doc) · *persistence/mudlib*
 - **`ClearPlayer` deferred coupling** — `cmd/telos-gate/main.go:93,108`: reconnect
   routing falls back to the home-zone shard, correct ONLY while `ClearPlayer` is
   deferred. Revisit when `ClearPlayer` (directory cleanup on logout) lands. · *gate/distsys*
