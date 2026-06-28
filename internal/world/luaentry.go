@@ -67,6 +67,9 @@ func (rt *luaRuntime) chunkFor(key, src string) *compiledChunk {
 	if e, ok := rt.chunks[key]; ok {
 		return e.chunk // cached (nil if previously empty/failed — not retried)
 	}
+	// The first compiled chunk means this zone runs scripts: register the periodic memory-metric
+	// pulse lazily (a scriptless zone never pays for it — the bare-engine invariant).
+	rt.ensureMetricPulse()
 	ch, err := rt.compileChunk(key, src)
 	rt.chunks[key] = &chunkCacheEntry{chunk: ch, failed: err != nil}
 	return ch
@@ -83,6 +86,10 @@ func (rt *luaRuntime) invoke(ch *compiledChunk, inv *luaInvocation, binds map[st
 	if rt == nil || rt.L == nil || ch == nil || ch.proto == nil {
 		return nil // no body => nothing to run (the no-Lua-content path)
 	}
+	key := rt.breakerKeyFor(inv, ch.origin)
+	if rt.breakerDisabled(key) {
+		return nil // quarantined script: a clean no-op (the zone serves on)
+	}
 	L := rt.L
 
 	// A fresh per-call environment that falls through to the sandbox globals for reads
@@ -93,13 +100,15 @@ func (rt *luaRuntime) invoke(ch *compiledChunk, inv *luaInvocation, binds map[st
 	L.SetFEnv(fn, env)
 
 	// Establish the invocation (who the script acts as + the threaded cascade budget) and run
-	// through the shared chokepoint, pcall-isolated.
+	// through THE chokepoint (pcallGuarded), pcall-isolated + breaker-tracked.
 	prev := rt.inv
 	rt.inv = inv
 	defer func() { rt.inv = prev }()
 
-	if err := rt.callProtoFn(ch.origin, fn); err != nil {
-		// Fail-closed isolation (invariant 3): log, never propagate. The breaker is 7.5.
+	if err := rt.runGuardedFn(key, ch.origin, fn, 0, lua.MultRet); err != nil {
+		// Fail-closed isolation (invariant 3): the raw error/stack goes to OPS logs only, never to
+		// a player (the caller renders a generic fizzle). The breaker accounting already happened
+		// inside pcallGuarded.
 		rt.log.Warn("lua entry-point error (isolated; action fizzled, zone unaffected)",
 			"origin", ch.origin, "err", err.Error())
 		return err
@@ -147,24 +156,6 @@ func (rt *luaRuntime) freshCallEnv(binds map[string]lua.LValue) *lua.LTable {
 	return env
 }
 
-// callProtoFn runs an already-environment-set function through the budget/deadline + spawn-budget
-// chokepoint (the same one runChunk uses) and pcall. Returns the pcall error.
-func (rt *luaRuntime) callProtoFn(origin string, fn *lua.LFunction) error {
-	L := rt.L
-	ctx, cancel := contextWithLuaDeadline()
-	defer cancel()
-	L.SetContext(ctx)
-	L.ResetInstructionCount()
-	rt.resetSpawnBudget()
-	defer L.RemoveContext()
-
-	L.Push(fn)
-	if err := L.PCall(0, lua.MultRet, nil); err != nil {
-		return fmt.Errorf("lua run %s: %w", origin, err)
-	}
-	return nil
-}
-
 // invokeForNumber runs a compiled chunk (a Lua FORMULA) and returns its first numeric return
 // value. A formula reads via handles bound in `binds` and returns a number. On a compile-absent
 // chunk, a runtime error, or a non-number return it returns (0, false) — the caller falls back
@@ -173,6 +164,10 @@ func (rt *luaRuntime) callProtoFn(origin string, fn *lua.LFunction) error {
 func (rt *luaRuntime) invokeForNumber(ch *compiledChunk, inv *luaInvocation, binds map[string]lua.LValue) (float64, bool) {
 	if rt == nil || rt.L == nil || ch == nil || ch.proto == nil {
 		return 0, false
+	}
+	key := rt.breakerKeyFor(inv, ch.origin)
+	if rt.breakerDisabled(key) {
+		return 0, false // quarantined: caller uses the engine default
 	}
 	L := rt.L
 	env := rt.freshCallEnv(binds)
@@ -183,16 +178,8 @@ func (rt *luaRuntime) invokeForNumber(ch *compiledChunk, inv *luaInvocation, bin
 	rt.inv = inv
 	defer func() { rt.inv = prev }()
 
-	ctx, cancel := contextWithLuaDeadline()
-	defer cancel()
-	L.SetContext(ctx)
-	L.ResetInstructionCount()
-	rt.resetSpawnBudget()
-	defer L.RemoveContext()
-
 	top := L.GetTop()
-	L.Push(fn)
-	if err := L.PCall(0, 1, nil); err != nil {
+	if err := rt.runGuardedFn(key, ch.origin, fn, 0, 1); err != nil {
 		rt.log.Warn("lua formula error (isolated; using engine default)", "origin", ch.origin, "err", err.Error())
 		L.SetTop(top)
 		return 0, false
@@ -213,6 +200,10 @@ func (rt *luaRuntime) invokeForBool(ch *compiledChunk, inv *luaInvocation, binds
 	if rt == nil || rt.L == nil || ch == nil || ch.proto == nil {
 		return false // no policy => deny (fail-closed)
 	}
+	key := rt.breakerKeyFor(inv, ch.origin)
+	if rt.breakerDisabled(key) {
+		return false // quarantined policy => deny (fail-closed)
+	}
 	L := rt.L
 	env := rt.freshCallEnv(binds)
 	fn := L.NewFunctionFromProto(ch.proto)
@@ -222,16 +213,8 @@ func (rt *luaRuntime) invokeForBool(ch *compiledChunk, inv *luaInvocation, binds
 	rt.inv = inv
 	defer func() { rt.inv = prev }()
 
-	ctx, cancel := contextWithLuaDeadline()
-	defer cancel()
-	L.SetContext(ctx)
-	L.ResetInstructionCount()
-	rt.resetSpawnBudget()
-	defer L.RemoveContext()
-
 	top := L.GetTop()
-	L.Push(fn)
-	if err := L.PCall(0, 1, nil); err != nil {
+	if err := rt.runGuardedFn(key, ch.origin, fn, 0, 1); err != nil {
 		rt.log.Warn("lua pvp_allowed policy error (isolated; FAIL-CLOSED, harm denied)",
 			"origin", ch.origin, "err", err.Error())
 		L.SetTop(top)

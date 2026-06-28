@@ -2276,6 +2276,19 @@ func (ls *LState) RemoveContext() context.Context {
 	return oldctx
 }
 
+// RegistryCap returns the CAPACITY (in LValue slots) of this LState's value-stack registry.
+// TELOSMUD FORK (docs/PHASE7-PLAN.md slice 7.5, T5): the registry is the VM's primary growable
+// allocation (it grows toward RegistryMaxSize as scripts use stack depth and never shrinks), so
+// its capacity is a cheap, monotonic proxy for the VM's value-stack memory footprint — used for
+// the DETECTION-ONLY per-zone memory metric. This exposes only a count; it allocates nothing and
+// touches no script-reachable state.
+func (ls *LState) RegistryCap() int {
+	if ls.reg == nil {
+		return 0
+	}
+	return cap(ls.reg.array)
+}
+
 // Converts the Lua value at the given acceptable index to the chan LValue.
 func (ls *LState) ToChannel(n int) chan LValue {
 	if lv, ok := ls.Get(n).(LChannel); ok {

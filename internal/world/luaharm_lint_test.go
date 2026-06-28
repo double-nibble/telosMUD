@@ -290,6 +290,111 @@ func baseName(full string) string {
 	return full
 }
 
+// --- the SOLE-CHOKEPOINT lint (slice 7.5, §4 invariant — security-critical) ----------------
+
+// rawLuaCallMethods are the LState methods that ENTER the Lua interpreter (run bytecode). Every
+// one must be reached ONLY through the single chokepoint, because both the instruction-count abort
+// and the wall-clock deadline live in the fork's mainLoopWithContext — a path that calls these
+// without SetContext silently loses BOTH budgets (the 7.1 review finding).
+var rawLuaCallMethods = map[string]bool{
+	"PCall":       true,
+	"DoString":    true,
+	"DoFile":      true,
+	"CallByParam": true,
+}
+
+// chokepointFuncs are the ONLY functions allowed to call a raw Lua-entry method. pcallGuarded is
+// THE chokepoint (the sole SetContext+PCall site). The two string-builtin delegates
+// (callDelegate / callLuaFuncRepl) call `L.Call` INSIDE a Go builtin while the VM is ALREADY
+// running under an armed context (the outer pcallGuarded set it), so they are not independent
+// entry points and are exempt — but ONLY for `Call`, never `PCall`/`DoString`.
+var chokepointFuncs = map[string]bool{
+	"pcallGuarded": true,
+}
+
+// callExemptFuncs are the functions allowed to call `L.Call` specifically (the lower-level
+// interpreter entry used INSIDE a Go builtin already under an armed context). `Call` is separated
+// from the rawLuaCallMethods set because these legitimate in-builtin uses exist; PCall/DoString
+// have NO such exemption.
+var callExemptFuncs = map[string]bool{
+	"callDelegate":      true, // string-builtin arg forwarding (capped string.format/gsub/find)
+	"callLuaFuncRepl":   true, // string.gsub function-replacement callback
+	"tableLookupRepl":   true, // string.gsub table-replacement lookup (no Call, defensive)
+	"outputGuardedFunc": true, // the gsub output-guard wrapper (no Call, defensive)
+}
+
+// TestNoRawLuaCallsOutsideChokepoint is the SOLE-CHOKEPOINT build-failing lint. It loads the world
+// package with type info and FAILS if any function OTHER than the chokepoint calls a raw Lua-entry
+// method (PCall/DoString/DoFile/CallByParam) on a *lua.LState, or if any function other than the
+// chokepoint + the in-builtin exemptions calls `L.Call`. This is what makes "every Lua-invoking
+// path arms the deadline+count" a build-enforced invariant, not a discipline.
+func TestNoRawLuaCallsOutsideChokepoint(t *testing.T) {
+	pkg := loadWorldPackage(t)
+	for _, f := range pkg.Syntax {
+		name := baseName(pkg.Fset.Position(f.Pos()).Filename)
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		for _, v := range inspectRawLuaCalls(pkg.Fset, f, pkg.TypesInfo, name) {
+			t.Errorf("%s:%d: %s — raw Lua-entry call OUTSIDE the chokepoint (pcallGuarded). Route rt.pcallGuarded/runGuardedFn so the deadline+instruction budget are armed (§4 sole-chokepoint invariant, 7.1 finding)",
+				v.file, v.line, v.what)
+		}
+	}
+}
+
+// inspectRawLuaCalls finds raw Lua-entry method calls outside the allowed functions. It tracks the
+// ENCLOSING function name (so the allow-lists apply) and resolves the call receiver's type to
+// *lua.LState (so an unrelated `.Call` on some other type is ignored).
+func inspectRawLuaCalls(fset *token.FileSet, f *ast.File, info *types.Info, file string) []lintViolation {
+	var out []lintViolation
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		fnName := fn.Name.Name
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			method := sel.Sel.Name
+			isRaw := rawLuaCallMethods[method]
+			isCall := method == "Call"
+			if !isRaw && !isCall {
+				return true
+			}
+			// The receiver must be a *lua.LState (ignore an unrelated .Call on another type).
+			if !isLStateReceiver(sel.X, info) {
+				return true
+			}
+			switch {
+			case isRaw && !chokepointFuncs[fnName]:
+				out = append(out, lintViolation{
+					file, fset.Position(call.Pos()).Line,
+					"raw L." + method + " in " + fnName + "()",
+				})
+			case isCall && !chokepointFuncs[fnName] && !callExemptFuncs[fnName]:
+				out = append(out, lintViolation{
+					file, fset.Position(call.Pos()).Line,
+					"raw L.Call in " + fnName + "()",
+				})
+			}
+			return true
+		})
+	}
+	return out
+}
+
+// isLStateReceiver reports whether expr's type is *lua.LState (the gopher-lua state).
+func isLStateReceiver(expr ast.Expr, info *types.Info) bool {
+	return namedTypeName(exprType(expr, info)) == "LState"
+}
+
 // --- the META-test: the lint catches every class, and does NOT over-reject -----------------
 
 // TestLuaLintCatchesAViolation proves the type-aware inspection DETECTS each write class (the

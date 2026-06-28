@@ -102,12 +102,11 @@ type luaRuntime struct {
 	// the mud.* functions nil-check it. Only the zone goroutine touches it.
 	zone *Zone
 
-	// spawnThisCall / spawnTotal bound mud.spawn (T-abuse/DoS, luamud.go): the entities spawned
-	// in the CURRENT entry-point call and the TOTAL spawned since build. spawnThisCall is reset
-	// at the runChunk/callFn chokepoint (per call); spawnTotal is the monotonic standing budget.
-	// Zone goroutine only.
+	// spawnThisCall is the per-CALL mud.spawn count (T-abuse/DoS, luamud.go): the entities spawned
+	// in the CURRENT entry-point call, reset at the chokepoint (per call). The per-ZONE standing
+	// bound is the LIVE census luaSpawnsLive (below), not a monotonic lifetime count. Zone
+	// goroutine only.
 	spawnThisCall int
-	spawnTotal    int
 
 	// chunkGen is the runtime's current chunk generation — the hot-reload drop seam a mud.after
 	// timer captures at scheduling time so a callback bound to a swapped chunk is dropped on
@@ -143,6 +142,35 @@ type luaRuntime struct {
 	// unique). In-memory only at 7.4c — the self.state ↔ JSONB persistence is slice 7.6 (the seam
 	// is noted there). Zone goroutine only.
 	entityScripts map[RuntimeID]*entityScript
+
+	// breakers is the per-script error-budget circuit breaker (luabreaker.go, slice 7.5, P7-D10):
+	// keyed by a SCRIPT KEY (per-instance for entity-scoped scripts: "trigger:#<rid>"; per-(kind,
+	// ref) for shared defs: "ability:<ref>:on_resolve"). A chronically-failing script trips its
+	// breaker and is DISABLED (its invocations no-op) — never the zone. Reset on a successful hot
+	// reload (7.7). Zone goroutine only.
+	breakers map[string]*breakerState
+
+	// luaTimersLive counts the live Lua-scheduled mud.after wheel entries (luamud.go, slice 7.5):
+	// a callback that schedules ≥1 timer each fire would otherwise grow the wheel unboundedly
+	// across ticks (bounded by neither the per-call budget nor the spawn cap). Incremented on a
+	// mud.after schedule, decremented when the timer fires or is cancelled; over the cap, a
+	// mud.after is a clean error. Zone goroutine only.
+	luaTimersLive int
+
+	// luaSpawnsLive is the LIVE census of Lua-spawned entities (luamud.go, slice 7.5): incremented
+	// on a mud.spawn, DECREMENTED when such an entity dies/despawns, so the per-zone spawn cap
+	// bounds the LIVE population (not the lifetime count) — a long-lived zone keeps spawning as its
+	// Lua-spawned mobs die. Zone goroutine only.
+	luaSpawnsLive int
+
+	// luaSpawnedRIDs is the set of rids mud.spawn created, so death/despawn can decrement the live
+	// census (dropLuaSpawn). Lazily allocated on the first spawn. Zone goroutine only.
+	luaSpawnedRIDs map[RuntimeID]bool
+
+	// metricPulse is the cancel handle for the periodic per-zone Lua memory-metric pulse (T5,
+	// luaentry_chokepoint.go), registered LAZILY on the first compiled chunk so a scriptless zone
+	// never pays for it. Zone goroutine only.
+	metricPulse *pulseHandle
 }
 
 // chunkCacheEntry is one cached compile result: the chunk (nil if the source was empty or the
@@ -170,6 +198,13 @@ type luaInvocation struct {
 	// invoked the script; 7.3c threads them so the binding is correct from the first harm op.
 	depth       int
 	eventBudget *int
+
+	// breakerKey, when set, OVERRIDES the chokepoint's default (shared-by-origin) circuit-breaker
+	// key (luabreaker.go, slice 7.5). An ENTITY-SCOPED invocation (a trigger / a self.state-bearing
+	// script) sets it to a per-INSTANCE key (breakerKeyInstance(rid)) so one buggy instance is
+	// quarantined, not its whole prototype. Empty => the chokepoint derives the per-(kind,ref)
+	// shared key from the chunk origin (the right scope for a shared ability/affect/formula/policy).
+	breakerKey string
 }
 
 // newLuaRuntime builds the per-zone VM and installs the restricted-globals sandbox. The
@@ -194,6 +229,7 @@ func newLuaRuntime(zoneID string, log *slog.Logger) *luaRuntime {
 		log:           log.With("subsystem", "lua"),
 		chunks:        map[string]*chunkCacheEntry{},
 		entityScripts: map[RuntimeID]*entityScript{},
+		breakers:      map[string]*breakerState{},
 	}
 
 	rt.installSandbox()
@@ -779,21 +815,11 @@ func (rt *luaRuntime) runChunk(name, src string) error {
 	if err != nil {
 		return fmt.Errorf("lua compile %s: %w", name, err)
 	}
-	// Arm a fresh per-call deadline (T3 layer 2), reset the instruction count (T3 layer 1) and
-	// the per-call spawn budget (T-abuse) — the per-call chokepoint shape slice 7.5 generalizes.
-	// Always clear the context after so a stale/cancelled context can't fail the NEXT call.
-	ctx, cancel := contextWithLuaDeadline()
-	defer cancel()
-	L.SetContext(ctx)
-	L.ResetInstructionCount()
-	rt.resetSpawnBudget()
-	defer L.RemoveContext()
-
-	L.Push(fn)
-	if err := L.PCall(0, lua.MultRet, nil); err != nil {
-		return fmt.Errorf("lua run %s: %w", name, err)
-	}
-	return nil
+	// Route THE chokepoint (pcallGuarded). runChunk is the standalone runner (slice 7.1 / tests);
+	// it is NOT breaker-tracked (empty scriptKey) — the breaker tracks the entry-point invoke*
+	// paths, not the bare runner. The deadline + instruction count + spawn budget are armed inside
+	// pcallGuarded, the SOLE place SetContext+PCall live.
+	return rt.runGuardedFn("", name, fn, 0, lua.MultRet)
 }
 
 // contextWithLuaDeadline returns a fresh per-call wall-clock deadline context (T3 layer 2),

@@ -237,12 +237,12 @@ func TestMudSpawnPerZoneCap(t *testing.T) {
 	_, rt, room := mudSpawnZone(t)
 	rt.L.SetGlobal("__room", rt.newHandle(room))
 	tripped := false
-	// Each call spawns 32; after enough calls the per-zone total (1024) trips even though no
-	// single call exceeds the per-call cap (64).
+	// Each call spawns 32; after enough calls the per-zone LIVE census (1024) trips even though no
+	// single call exceeds the per-call cap (64) — the mobs never die, so the live count accumulates.
 	for call := 0; call < 100; call++ {
 		err := rt.runChunk("spawn", `for i=1,32 do mud.spawn("spawn:mob:goblin", __room) end`)
 		if err != nil {
-			if strings.Contains(err.Error(), "per-zone spawn cap") {
+			if strings.Contains(err.Error(), "per-zone LIVE spawn cap") {
 				tripped = true
 				break
 			}
@@ -250,7 +250,7 @@ func TestMudSpawnPerZoneCap(t *testing.T) {
 		}
 	}
 	if !tripped {
-		t.Fatal("the per-zone spawn cap never tripped across many calls")
+		t.Fatal("the per-zone LIVE spawn cap never tripped across many calls")
 	}
 }
 
@@ -308,8 +308,8 @@ func TestMudSpawnRejectsPlayerProto(t *testing.T) {
 	if !strings.Contains(err.Error(), "player-controlled") {
 		t.Fatalf("error should cite the player-proto rejection, got: %v", err)
 	}
-	if rt.spawnTotal != 0 {
-		t.Fatalf("a rejected player-proto spawn consumed the budget (spawnTotal=%d)", rt.spawnTotal)
+	if rt.luaSpawnsLive != 0 {
+		t.Fatalf("a rejected player-proto spawn consumed the live census (luaSpawnsLive=%d)", rt.luaSpawnsLive)
 	}
 }
 

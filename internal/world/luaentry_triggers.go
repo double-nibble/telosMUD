@@ -129,6 +129,12 @@ func (rt *luaRuntime) fireTrigger(e *Entity, event string, c *effectCtx, ev *lua
 // nothing leaks, threads the firing ctx's budget into rt.inv (invariant 1), and is pcall-isolated
 // (invariant 3).
 func (rt *luaRuntime) fireTriggerCall(es *entityScript, h *lua.LFunction, c *effectCtx, binds map[string]lua.LValue, ev *lua.LTable) {
+	// PER-INSTANCE breaker (P7-D10 (a)): a trigger is entity-scoped, so one buggy mob instance is
+	// quarantined, not its whole prototype. Key by the instance rid.
+	key := breakerKeyInstance(es.rid)
+	if rt.breakerDisabled(key) {
+		return // quarantined instance: a clean no-op
+	}
 	L := rt.L
 	// Fresh per-call env for the handler (so self/state/ev resolve via __index fall-through to the
 	// sandbox globals, and any global write is discarded). NOTE: setting h.Env here is the handle
@@ -137,21 +143,16 @@ func (rt *luaRuntime) fireTriggerCall(es *entityScript, h *lua.LFunction, c *eff
 	env := rt.freshCallEnv(binds)
 	h.Env = env
 
-	inv := &luaInvocation{actor: c.actor, depth: c.depth, eventBudget: c.eventBudget}
+	inv := &luaInvocation{actor: c.actor, depth: c.depth, eventBudget: c.eventBudget, breakerKey: key}
 	prev := rt.inv
 	rt.inv = inv
 	defer func() { rt.inv = prev }()
 
-	ctx, cancel := contextWithLuaDeadline()
-	defer cancel()
-	L.SetContext(ctx)
-	L.ResetInstructionCount()
-	rt.resetSpawnBudget()
-	defer L.RemoveContext()
-
+	// THE chokepoint: push the handler + its ev arg, run guarded. The handler signature is
+	// on(event, function(ev) ... end) — one argument, no return.
 	L.Push(h)
-	L.Push(ev) // the handler signature is on(event, function(ev) ... end)
-	if err := L.PCall(1, 0, nil); err != nil {
+	L.Push(ev)
+	if err := rt.pcallGuarded(key, "trigger:#"+ridStr(es.rid), 1, 0); err != nil {
 		rt.log.Warn("lua trigger error (isolated; action fizzled, zone unaffected)",
 			"event", "trigger", "rid", es.rid, "err", err.Error())
 	}

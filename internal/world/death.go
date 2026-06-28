@@ -227,10 +227,12 @@ func (z *Zone) makeCorpse(victim, killer *Entity) {
 		"corpse_items", len(carried), "killer", targetShort(killer))
 	Move(victim, nil)
 	// The victim has left the world tree for good — drop its per-instance Lua trigger state so a
-	// repop-on-timer zone doesn't leak an entityScript per dead scripted mob (7.4c review MUST-FIX).
-	// 7.6 will flush self.state to JSONB immediately before this drop. nil-safe.
+	// repop-on-timer zone doesn't leak an entityScript per dead scripted mob (7.4c review MUST-FIX),
+	// and decrement the live Lua-spawn census so the per-zone spawn cap bounds the LIVE population
+	// (7.5). 7.6 will flush self.state to JSONB immediately before the script drop. nil-safe.
 	if z.lua != nil {
 		z.lua.dropEntityScript(victim.rid)
+		z.lua.dropLuaSpawn(victim.rid)
 	}
 }
 

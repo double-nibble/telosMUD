@@ -57,6 +57,11 @@ The abort uses `RaiseError` — the **same mechanism the context deadline alread
 it surfaces as an ordinary Lua error caught by the engine's outer `pcall` (no new error
 channel, no special-casing on the engine side beyond recognizing the message string).
 
+4. **`state.go`** — added one read-only accessor `(*LState).RegistryCap() int` (slice 7.5),
+   returning `cap(ls.reg.array)` — the value-stack registry capacity, a cheap monotonic proxy
+   for the VM's growable memory footprint, for the detection-only per-zone memory metric (T5).
+   Read-only; allocates nothing; exposes only a count. (The registry is otherwise unexported.)
+
 ### Removed from the vendored copy
 
 To keep the fork lean and dependency-free, the upstream **`cmd/glua` REPL** and **`_tools`

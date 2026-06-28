@@ -1,8 +1,6 @@
 package world
 
 import (
-	"fmt"
-
 	"github.com/double-nibble/telosmud/internal/textsan"
 	lua "github.com/yuin/gopher-lua"
 )
@@ -29,13 +27,21 @@ const (
 	// count. Tunable.
 	luaSpawnPerCallCap = 64
 
-	// luaSpawnPerZoneCap bounds the TOTAL live script-spawned entities a zone may hold at once
-	// (the standing population a script is responsible for). It backstops the per-call cap
-	// against a script that spawns a few per call across many calls/timers. 1024 is well past
-	// any legitimate scripted population in one zone while bounding the worst case. Tunable.
-	// (This is a soft accounting cap — it counts spawns, not a live census; a future slice can
-	// decrement on despawn. For 7.3b it is the monotonic-since-build spawn budget, documented.)
+	// luaSpawnPerZoneCap bounds the LIVE script-spawned population a zone may hold at once (the
+	// standing population a script is responsible for). It backstops the per-call cap against a
+	// script that spawns a few per call across many calls/timers. 1024 is well past any legitimate
+	// scripted population in one zone while bounding the worst case. Tunable. As of slice 7.5 this
+	// is a LIVE CENSUS (luaSpawnsLive): incremented on a mud.spawn, decremented when such an entity
+	// dies/despawns — so a long-lived zone keeps spawning as its Lua-spawned mobs die (it bounds
+	// the live population, not the lifetime count).
 	luaSpawnPerZoneCap = 1024
+
+	// luaTimerLiveCap bounds the number of LIVE Lua-scheduled mud.after wheel entries (slice 7.5
+	// distsys carry-forward). A callback that schedules ≥1 timer each fire would otherwise grow the
+	// wheel unboundedly across ticks — bounded by neither the per-call instruction budget nor the
+	// spawn cap. Over the cap, mud.after is a clean error. 256 is far past any legitimate scripted
+	// scheduling while bounding the wheel. Tunable.
+	luaTimerLiveCap = 256
 )
 
 // luaTimer is the Go payload of a mud.after timer-handle userdata. It holds the pulse-wheel
@@ -44,6 +50,7 @@ const (
 type luaTimer struct {
 	h        *pulseHandle
 	chunkGen uint64 // the runtime's chunk generation at scheduling time (7.7 drop seam)
+	fired    bool   // the wheel fired/retired it (so cancel doesn't double-decrement the live census)
 }
 
 // installMudTable builds the `mud` global and registers the timer-handle userdata type. Called
@@ -210,8 +217,11 @@ func (rt *luaRuntime) mudSpawn(l *lua.LState) int {
 		l.RaiseError("mud.spawn: per-call spawn cap (%d) exceeded", luaSpawnPerCallCap)
 		return 0
 	}
-	if rt.spawnTotal >= luaSpawnPerZoneCap {
-		l.RaiseError("mud.spawn: per-zone spawn cap (%d) exceeded", luaSpawnPerZoneCap)
+	// Per-zone cap is now a LIVE CENSUS (slice 7.5): luaSpawnsLive bounds the standing population,
+	// decremented when a Lua-spawned entity dies/despawns — so a long-lived zone keeps spawning as
+	// its Lua-spawned mobs die (it bounds the live population, not the lifetime count).
+	if rt.luaSpawnsLive >= luaSpawnPerZoneCap {
+		l.RaiseError("mud.spawn: per-zone LIVE spawn cap (%d) exceeded", luaSpawnPerZoneCap)
 		return 0
 	}
 	e := rt.zone.spawn(ProtoRef(proto))
@@ -220,10 +230,28 @@ func (rt *luaRuntime) mudSpawn(l *lua.LState) int {
 		return 1
 	}
 	rt.spawnThisCall++
-	rt.spawnTotal++
+	rt.luaSpawnsLive++
+	if rt.luaSpawnedRIDs == nil {
+		rt.luaSpawnedRIDs = map[RuntimeID]bool{}
+	}
+	rt.luaSpawnedRIDs[e.rid] = true // tag for the census decrement on death/despawn
 	Move(e, dest)
 	l.Push(rt.newHandle(e))
 	return 1
+}
+
+// dropLuaSpawn decrements the live Lua-spawn census when a Lua-spawned entity leaves the world
+// (death/despawn). A no-op for an entity that was not Lua-spawned. Called at the same extraction
+// chokepoint as dropEntityScript (death.go makeCorpse). Idempotent (the rid is removed from the
+// set so a double-call can't double-decrement). Zone goroutine only.
+func (rt *luaRuntime) dropLuaSpawn(rid RuntimeID) {
+	if rt == nil || rt.luaSpawnedRIDs == nil || !rt.luaSpawnedRIDs[rid] {
+		return
+	}
+	delete(rt.luaSpawnedRIDs, rid)
+	if rt.luaSpawnsLive > 0 {
+		rt.luaSpawnsLive--
+	}
 }
 
 // mudTransform re-points an existing entity at a new prototype (mud.transform(h, proto)) — a
@@ -277,25 +305,39 @@ func (rt *luaRuntime) mudAfter(l *lua.LState) int {
 		l.Push(lua.LNil)
 		return 1
 	}
+	// LIVE-TIMER CAP (slice 7.5): a callback that schedules ≥1 timer each fire would grow the wheel
+	// unboundedly across ticks. Over the cap, this is a clean error (not a silent drop).
+	if rt.luaTimersLive >= luaTimerLiveCap {
+		l.RaiseError("mud.after: live timer cap (%d) exceeded", luaTimerLiveCap)
+		return 0
+	}
 	gen := rt.chunkGen
+	rt.luaTimersLive++
+	t := &luaTimer{chunkGen: gen}
 	handle := rt.zone.pulses.after(uint64(pulses), func(uint64) bool {
-		// The wheel calls this ON THE ZONE GOROUTINE. Run the Lua callback pcall-isolated. The
-		// generation guard (inert until 7.7) will drop a callback bound to a swapped chunk.
+		// The wheel calls this ON THE ZONE GOROUTINE. The timer is firing (and retiring), so it
+		// leaves the live census BEFORE the callback runs — so a callback that re-schedules nets to
+		// the same count, not +1 each tick. The generation guard (inert until 7.7) drops a callback
+		// bound to a swapped chunk; either way the live count decrements exactly once per timer.
+		t.fired = true
+		rt.luaTimersLive--
 		if gen != rt.chunkGen {
 			return false
 		}
 		rt.runCallback("mud.after", fn)
 		return false // one-shot
 	})
+	t.h = handle
 	ud := l.NewUserData()
-	ud.Value = &luaTimer{h: handle, chunkGen: gen}
+	ud.Value = t
 	l.SetMetatable(ud, l.GetTypeMetatable(luaTimerTypeName))
 	l.Push(ud)
 	return 1
 }
 
 // mudCancel cancels a mud.after timer by its handle (mud.cancel(timer)). A non-timer / already-
-// fired handle is a safe no-op.
+// fired handle is a safe no-op. Cancelling an UNFIRED timer frees its live-census slot (the wheel
+// will never fire it, so its decrement must happen here instead).
 func (rt *luaRuntime) mudCancel(l *lua.LState) int {
 	ud, ok := l.Get(1).(*lua.LUserData)
 	if !ok {
@@ -304,6 +346,12 @@ func (rt *luaRuntime) mudCancel(l *lua.LState) int {
 	t, ok := ud.Value.(*luaTimer)
 	if !ok || t.h == nil {
 		return 0
+	}
+	if !t.fired {
+		t.fired = true // latch so a double-cancel can't double-decrement
+		if rt.luaTimersLive > 0 {
+			rt.luaTimersLive--
+		}
 	}
 	t.h.cancel()
 	return 0
@@ -339,20 +387,10 @@ func (rt *luaRuntime) runCallback(what string, fn *lua.LFunction) {
 	}
 }
 
-// callFn runs fn() through the same fresh-deadline + instruction-budget + pcall chokepoint as
-// runChunk (so a timer callback is bounded exactly like a top-level entry). Returns the pcall
-// error if any.
+// callFn runs fn() through THE chokepoint (pcallGuarded) — so a mud.after timer callback is
+// bounded by the deadline + instruction count + spawn budget exactly like a top-level entry, and
+// is breaker-tracked. Returns the pcall error if any. The breaker key is the shared "mud.after"
+// origin (a runaway timer callback quarantines the timer surface, not the whole zone).
 func (rt *luaRuntime) callFn(fn *lua.LFunction) error {
-	L := rt.L
-	ctx, cancel := contextWithLuaDeadline()
-	defer cancel()
-	L.SetContext(ctx)
-	L.ResetInstructionCount()
-	rt.resetSpawnBudget()
-	defer L.RemoveContext()
-	L.Push(fn)
-	if err := L.PCall(0, lua.MultRet, nil); err != nil {
-		return fmt.Errorf("lua callback: %w", err)
-	}
-	return nil
+	return rt.runGuardedFn(breakerKeyShared("mud.after"), "mud.after", fn, 0, lua.MultRet)
 }
