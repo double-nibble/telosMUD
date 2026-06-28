@@ -62,11 +62,13 @@ These are the highest-confidence-per-test rows: the failure already happened onc
 
 | Behavior | Best tier | Status | Priority |
 | --- | --- | --- | --- |
-| Cross-shard walk, no visible seam, no lost input | in-process + e2e | **DONE** — `TestGateCrossShardHandoff`; e2e journey | P0 |
+| Cross-shard walk, no visible seam, no lost input | in-process + e2e | **DONE** — `TestGateCrossShardHandoff`; `TestCrossShardHandoffInputContinuity` (Wave 2: ordered far-side burst lands intact + placement transfers); e2e journey | P0 |
+| **Cross-shard handoff preserves state + input continuity** | in-process | **DONE (Wave 2)** — `internal/gate/handoff_state_test.go::TestCrossShardHandoffInputContinuity` (player-visible no-loss/ordered carry over the seam + directory placement). NOTE: the exactly-once dedup *mechanism* is the unit test `TestCrossShardHandoff`'s; the in-process gate timing doesn't reproduce a replay double-apply (documented in the test) | P0 |
 | Shard drop while a player is connected (the headline chaos) | in-process | **DONE** — `TestShardDropWhileConnected` (pins today's contract: socket closes, no auto-reconnect) | P0 |
 | Shard-drop blast radius is one connection | in-process | **DONE** — `TestShardDropDoesNotHangOtherPlayers` | P1 |
-| **Handoff interrupted mid-move** (dest shard unreachable mid-transfer) — player not lost/duplicated | in-process | **GAP** — `dropShard` exists; no test drops shard B *during* the handoff window. The "ownership conflict" hardening (zone.go) is unit-pinned only | P0 |
-| **Shard restart with epoch resume** — directory epoch monotonicity holds; reconnecting player resumes | in-process / integration | **THIN** — `internal/world/resume_test.go` (unit); no black-box restart-and-resume journey | P1 |
+| **Handoff interrupted mid-move** (dest shard unreachable) — player not lost/duplicated | in-process | **DONE (Wave 2)** — `handoff_state_test.go::TestHandoffInterruptedDestinationUnreachable` (dest unreachable → player thawed, restored to source room, "The way is barred.", no phantom directory ownership; controlled-break verified). See contract note below | P0 |
+| **True shard restart with persistence** — shard process down→up, character state survives, routes correctly | in-process / integration | **DONE (Wave 2)** — `internal/gate/shard_restart_test.go::TestShardRestartPreservesPersistedState` (drop shard, boot a FRESH shard from the same store at a new endpoint, reconnect → saved room; controlled-break verified). The *epoch-monotonicity* leg remains unit-only (`resume_test.go`) | P1 |
+| **state_version CAS contention** — concurrent saves of one character; exactly one wins | integration (gated) | **DONE (Wave 2)** — `internal/store/store_test.go::TestSaveCharacterConcurrentCAS` (8 concurrent saves at the same base version → exactly one ok, rest cleanly rejected, final version=base+1; verified against real Postgres + controlled-break) | P0 |
 | **Both world servers race to register** (the docker double-registration) — must not wedge | integration / smoke | **GAP** — debugged by hand, never pinned. Needs a real-Redis directory race test | P1 |
 | **Backpressure / slow client** — non-blocking drop-on-full holds; the zone goroutine never stalls | in-process | **GAP** — `session.send`'s drop-on-full is unit-adjacent at best; no test wedges a reader and asserts the zone keeps pulsing | P1 |
 | **Directory lease loss / expiry** — a zone's lease lapses and another shard claims it | integration | **GAP** — Redis-lease semantics untested black-box | P2 |
@@ -117,14 +119,26 @@ the owning engineer decides the intended contract:
 - **Second-login first-input drop** — the takeover re-binds the session preserving its input-seq
   fence, so the new connection's *first* input can be dropped as a stale replay (it needs a couple
   of inputs to get past the fence). A UX wart, not yet a correctness bug — flagged for the edge-engineer.
+- **Handoff interrupted — destination unreachable (`TestHandoffInterruptedDestinationUnreachable`)** —
+  when the source can't even reach the destination's Handoff service, the player is cleanly thawed,
+  restored to the source room, and told "The way is barred." (a non-event for their location). This is
+  the GOOD contract and is now pinned. NOTE the *other* interruption — destination Prepare SUCCEEDED
+  but the gate then can't re-dial the destination for the Redirect — has a HARSHER observable: the gate
+  writes "The world is unreachable. Goodbye." and drops the socket, while the directory already moved
+  ownership to the (unreachable) destination. That window is the crash-failover case PLACEMENT.md §6
+  describes and is NOT yet covered (it needs the gate to retry the directory / re-resolve a healthy
+  shard). Flagged for the distributed-systems-architect; tracked as a remaining Area-2 gap.
 
 ## Wave plan (burn-down order)
 
-1. **Wave 1 — regression-proofing** (this change): rows 1–4 above (COW cycle, look-render journey,
-   persistence round-trip, single-session takeover). DONE.
-2. **Wave 2 — distributed correctness**: handoff-interrupted-mid-move, shard-restart-with-epoch-resume,
-   double-registration race, backpressure/slow-client.
+1. **Wave 1 — regression-proofing** (committed): COW cycle, look-render journey, persistence
+   round-trip, single-session takeover. DONE.
+2. **Wave 2 — distributed correctness** (this change): cross-shard input continuity, handoff
+   interrupted (destination unreachable), true shard-restart persistence, state_version CAS
+   contention. DONE. Remaining Area-2 gaps deferred to a later wave: the redirect-target-unreachable
+   crash-failover window, the double-registration race, backpressure/slow-client, the epoch-monotonicity
+   leg of shard restart, directory-lease expiry, NATS hot-reload.
 3. **Wave 3 — Phase 7 sandbox**: whole-zone panic recovery journey, live hot-reload, runaway-budget
    doesn't stall the zone, the Phase 7 "Done when" milestone journeys.
 4. **Wave 4 — onboarding journeys**: get/wield/wear `act()` journey, fireball cast journey, the
-   AoE-save + rage-on-hit legs of the Phase 6 milestone, true shard-restart persistence.
+   AoE-save + rage-on-hit legs of the Phase 6 milestone.
