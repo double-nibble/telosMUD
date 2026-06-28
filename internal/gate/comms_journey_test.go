@@ -30,9 +30,11 @@ import (
 )
 
 // publishSyntheticTell publishes a synthetic comms message to a player's personal tell subject over a
-// WORLD-role bus (the only role allowed to publish chan/tell — the impersonation gate). For 8.2 there
-// are no real channels/tells yet, so this stands in for the source world. The author is engine-set on
-// the message (as a real source world would set it from the live *Entity; P8-A2).
+// WORLD-role bus (the only role allowed to publish chan/tell — the impersonation gate). It stands in
+// for the source world's tell-drain emit: as of slice 8.5 the world renders the FULL line into Body
+// ("X tells you, '…'") and the gate writes it VERBATIM (a pure sink), so this helper renders the same
+// full line here. The author is engine-set on the message (as a real source world sets it from the live
+// *Entity; P8-A2).
 func publishSyntheticTell(t *testing.T, world commbus.Bus, target, author, body string, seq uint64) {
 	t.Helper()
 	msg := commbus.Message{
@@ -40,7 +42,7 @@ func publishSyntheticTell(t *testing.T, world commbus.Bus, target, author, body 
 		AuthorName:     author,
 		Seq:            seq,
 		IdempotencyKey: commbus.NewIdempotencyKey(author, seq),
-		Body:           body,
+		Body:           author + " tells you, '" + body + "'", // the world renders the full line; the gate is a verbatim sink
 	}
 	if err := world.Publish(context.Background(), commbus.TellSubject(target), msg); err != nil {
 		t.Fatalf("world publish to %s: %v", commbus.TellSubject(target), err)

@@ -1,6 +1,7 @@
 package commbus
 
 import (
+	"context"
 	"sync"
 )
 
@@ -34,6 +35,13 @@ type MemJetStream struct {
 	// cursor is the consumer-side delivered cursor: cursor[subject][consumerID] = count of entries
 	// already delivered to that consumer (the next DeliverPending starts there).
 	cursor map[string]map[string]int
+	// wakers is the per-subject wake channel a live Consume goroutine (jetstream.go) blocks on; an
+	// Append closes-and-replaces it so a publish wakes every consumer to re-drain. Closed signals
+	// "something changed"; the consumer re-reads DeliverPending after the wake. nil entry => no
+	// consumer has asked for a wake channel yet (lazily created in wakeChan).
+	wakers map[string]chan struct{}
+	// closed marks the stand-in closed (Close): PublishDurable/Consume then refuse like a closed broker.
+	closed bool
 }
 
 // NewMemJetStream returns an empty durable-log stand-in.
@@ -42,6 +50,7 @@ func NewMemJetStream() *MemJetStream {
 		log:    map[string][]Message{},
 		seen:   map[string]map[string]struct{}{},
 		cursor: map[string]map[string]int{},
+		wakers: map[string]chan struct{}{},
 	}
 }
 
@@ -66,6 +75,7 @@ func (js *MemJetStream) Append(subj string, msg Message) bool {
 	}
 	msg.Subject = subj
 	js.log[subj] = append(js.log[subj], msg)
+	js.wakeLocked(subj) // wake any live Consume goroutine so it re-drains the new entry
 	return true
 }
 
@@ -103,4 +113,85 @@ func (js *MemJetStream) Pending(subj, consumerID string) int {
 		return 0
 	}
 	return n
+}
+
+// PublishDurable implements the JetStream interface (jetstream.go) for the stand-in: it appends with
+// publish-side idempotency dedup (Append) and discards the newly-stored bool — the durable-tell path
+// cares only that the message is now in the log (a duplicate is harmlessly absorbed). A closed
+// stand-in refuses, mirroring a closed broker.
+func (js *MemJetStream) PublishDurable(_ context.Context, subj string, msg Message) error {
+	js.mu.Lock()
+	closed := js.closed
+	js.mu.Unlock()
+	if closed {
+		return ErrJetStreamClosed
+	}
+	js.Append(subj, msg)
+	return nil
+}
+
+// deliverPendingForConsume is DeliverPending used by the live Consume goroutine: it returns the
+// backlog past the consumer's cursor and advances it. Split out (rather than calling DeliverPending)
+// so the consume path and the test-facing DeliverPending stay one implementation while reading
+// clearly at the call site (the consumer DRAINS; a test PEEKS+drains). Returns nil on a closed stand-in.
+func (js *MemJetStream) deliverPendingForConsume(subj, consumerID string) []Message {
+	js.mu.Lock()
+	if js.closed {
+		js.mu.Unlock()
+		return nil
+	}
+	js.mu.Unlock()
+	return js.DeliverPending(subj, consumerID)
+}
+
+// wakeChan returns the current per-subject wake channel a consumer blocks on. It is closed-and-
+// replaced by wakeLocked on the next Append, so a consumer that reads this channel AFTER its drain
+// and THEN selects on it cannot miss a publish that lands in between (the publish closes the channel
+// the consumer is about to wait on). Lazily creates the channel.
+func (js *MemJetStream) wakeChan(subj string) <-chan struct{} {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	return js.wakeChanLocked(subj)
+}
+
+func (js *MemJetStream) wakeChanLocked(subj string) chan struct{} {
+	ch := js.wakers[subj]
+	if ch == nil {
+		ch = make(chan struct{})
+		js.wakers[subj] = ch
+	}
+	return ch
+}
+
+// wake closes-and-replaces the subject's wake channel under the lock (the public form used by
+// Consumer.Stop to unblock a parked run loop).
+func (js *MemJetStream) wake(subj string) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	js.wakeLocked(subj)
+}
+
+// wakeLocked closes the current wake channel (broadcasting to every consumer blocked on it) and
+// installs a fresh one for the next wait. Caller holds js.mu.
+func (js *MemJetStream) wakeLocked(subj string) {
+	ch := js.wakers[subj]
+	if ch != nil {
+		close(ch)
+	}
+	js.wakers[subj] = make(chan struct{})
+}
+
+// Close marks the stand-in closed and wakes every consumer so its run loop exits. Idempotent.
+func (js *MemJetStream) Close() error {
+	js.mu.Lock()
+	if js.closed {
+		js.mu.Unlock()
+		return nil
+	}
+	js.closed = true
+	for subj := range js.wakers {
+		js.wakeLocked(subj)
+	}
+	js.mu.Unlock()
+	return nil
 }

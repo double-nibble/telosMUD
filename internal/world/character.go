@@ -82,7 +82,37 @@ type StateJSON struct {
 	// is RUNTIME-ONLY (flyweight respawn; dropped on death) — only a PLAYER's persists (the 7.6
 	// boundary; a unique-persistent-mob mechanism is a later phase's concern).
 	Script json.RawMessage `json:"script,omitempty"`
+	// Tells is the per-player DELIVERED-CURSOR for durable tells (Phase 8.5, OQ-4, P8-A5): the last
+	// tell sequence DELIVERED from each sender, keyed by sender (author) id. It is the consumer-side
+	// consumer-side idempotency layer atop JetStream's at-least-once delivery: the world drains the
+	// durable dtell stream and renders a message only when its Seq is strictly GREATER than the stored
+	// cursor for its author, then advances the cursor. JetStream's own dedup window covers recent
+	// redeliveries; this DURABLE cursor covers redeliveries AFTER the window (a consumer restart minutes
+	// later). The guarantee is RENDER-AT-LEAST-ONCE / USUALLY-EXACTLY-ONCE / NEVER-LOST: a tell is never
+	// lost, and renders exactly once in steady state; the one exception is a crash in the narrow window
+	// between the gate emit and the next PERSISTENCE of the advanced cursor (this field rides the save
+	// cadence), which can re-render that one tell ONCE on restart before the re-advanced cursor
+	// re-suppresses it — bounded, never a loop or a storm; not a literal exactly-once durable guarantee.
+	// It is DATA ONLY (a map of id->uint64, the Script-subtree
+	// precedent) — no code, no handles — and is size-guarded (tellCursorMaxSenders) like the Lua state
+	// subtree. A pre-8.5 save (no Tells) loads with an empty cursor (the backward-compat default), so a
+	// returning player's first post-upgrade tells deliver from seq 0 — never a silent drop.
+	Tells *TellCursorJSON `json:"tells,omitempty"`
 }
+
+// TellCursorJSON is the durable per-player delivered-cursor (Phase 8.5, OQ-4): Delivered[authorID] is
+// the highest tell Seq from that author this player has already had rendered. The render gate is
+// strictly-greater (msg.Seq > Delivered[author]) so a redelivery (Seq <= stored) is suppressed.
+type TellCursorJSON struct {
+	Delivered map[string]uint64 `json:"delivered,omitempty"`
+}
+
+// tellCursorMaxSenders caps how many distinct senders a player's delivered-cursor tracks (the size
+// guard, the Lua-state-cap precedent): a player tracking an unbounded number of senders would grow
+// the state subtree without bound. When at cap, dumpTellCursor keeps the most-recently-advanced
+// senders (the cursor is a dedup optimization, not a ledger — a dropped old sender at worst risks one
+// re-render of a very old tell that has itself almost certainly aged out of the stream).
+const tellCursorMaxSenders = 1024
 
 // AffectJSON is the durable form of one active affect: the def ref, the remaining duration in PULSES,
 // the magnitude, and the stack count. The §3 PERSISTENCE shape ([{id, remaining, mag, stacks}]).
@@ -179,6 +209,7 @@ func dumpCharacter(s *session) CharSnapshot {
 		Flags:      dumpFlags(e),
 		Cooldowns:  dumpCooldowns(e),
 		Script:     dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
+		Tells:      dumpTellCursor(s),  // Phase 8.5 — the durable-tell delivered-cursor (OQ-4)
 	}
 	return CharSnapshot{
 		PID:          pid,
@@ -476,6 +507,10 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 	// Script) installs an empty state (the backward-compat default). A malformed blob degrades to an
 	// empty state with a loud log, never a crash.
 	loadScriptState(z, e, snap.State.Script)
+
+	// Rehydrate the durable-tell delivered-cursor (Phase 8.5, OQ-4) so a redelivery after this login
+	// renders ONCE. A pre-8.5 save (nil Tells) installs an empty cursor (the backward-compat default).
+	loadTellCursor(s, snap.State.Tells)
 
 	// Rehydrate carried items into the player's contents (inventory).
 	for _, it := range snap.State.Inventory {

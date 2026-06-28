@@ -46,6 +46,8 @@ func registerCommands() []*Command {
 		{Name: "look", Aliases: []string{"l"}, Run: cmdLook},
 		{Name: "say", Aliases: []string{"'"}, Run: cmdSay},
 		{Name: "who", Run: cmdWho},
+		{Name: "tell", Run: cmdTell},
+		{Name: "reply", Run: cmdReply},
 		{Name: "quit", Run: cmdQuit},
 	}
 	// Container/inventory/equipment verbs, then combat verbs (kill/flee), last: lower priority than
@@ -154,6 +156,21 @@ func cmdWho(c *Context) error {
 // cross-shard rather than the zone-local list). False on a bare zone or a no-Redis run.
 func (z *Zone) presenceEnabled() bool {
 	return z.shard != nil && z.shard.presence != nil && z.shard.presence.enabled()
+}
+
+// cmdTell is `tell <name> <msg>` (Phase 8.5, durable-always): a directed player->player message. It
+// delegates to the zone's source tell path (tell.go), which resolves the target via the directory,
+// sanitizes, stamps the engine-set author, and PublishDurable's to the durable stream. Tells are
+// ENGINE mechanism (no content needed). It never releases ownership, so dispatch prompts on return.
+func cmdTell(c *Context) error {
+	c.z.cmdTell(c.s, c.Rest())
+	return nil
+}
+
+// cmdReply is `reply <msg>` (Phase 8.5): a tell to the last player who told YOU this session.
+func cmdReply(c *Context) error {
+	c.z.cmdReply(c.s, c.Rest())
+	return nil
 }
 
 // cmdQuit marks a clean, intentional disconnect and closes the stream (MUDLIB §6).

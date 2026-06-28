@@ -605,6 +605,12 @@ func (z *Zone) handle(m msg) {
 		z.reloadLua(v.kind, v.ref)
 	case whoFallbackMsg:
 		writeFrameTo(v.out, textFrame(z.whoLocal()))
+	case tellDeliverMsg:
+		v.ack <- z.deliverDrainedTell(v) // drained durable tell: dedup-via-cursor, render+emit, ack/nak
+	case tellCursorProbeMsg:
+		z.probeTellCursor(v)
+	case lastTellProbeMsg:
+		z.probeLastTell(v)
 	}
 }
 
@@ -695,6 +701,9 @@ func (z *Zone) join(s *session, room ProtoRef) {
 	// Publish to the cross-shard `who` roster: this shard now hosts the player (8.4). Off the zone
 	// goroutine — presenceJoin only records + enqueues; the background loop does the Redis write.
 	z.presenceJoin(s)
+	// Start the player's durable-tell consumer (Phase 8.5): it drains any OFFLINE backlog (paced,
+	// "while you were away…") and then delivers live tells. Idempotent; one per resident on this shard.
+	z.startTellConsumer(s)
 	z.log.Debug("player joined", "player", s.character, "room", r.proto, "population", len(z.players))
 }
 
@@ -762,6 +771,9 @@ func (z *Zone) leave(id string) {
 	// before the TTL (8.4). The roster's owner-guard means a handoff AWAY whose source-leave races the
 	// destination's join can't evict the destination's fresh entry.
 	z.presenceLeave(id)
+	// Stop the player's durable-tell consumer: they no longer live here, so their tells accumulate in
+	// the durable stream for their next host to drain (never delivered to a gone socket) (8.5).
+	z.stopTellConsumer(id)
 	z.log.Debug("player left", "player", id, "population", len(z.players))
 }
 
@@ -858,6 +870,7 @@ func (z *Zone) attach(m attachMsg) {
 		// The handoff to another shard committed: this source copy is an orphan. Drop our roster entry
 		// (owner-guarded, so it can't evict the destination's fresh one if it already SET) (8.4).
 		z.presenceLeave(character)
+		z.stopTellConsumer(character) // the handed-off orphan no longer lives here; the destination drains its tells (8.5)
 		s = nil
 	}
 	switch {
@@ -905,6 +918,9 @@ func (z *Zone) attach(m attachMsg) {
 		// roster. The roster's owner-guard lets this destination SET win over the source's stale entry,
 		// and the source shard's own presenceLeave (handed-off orphan reap) drops its copy (8.4).
 		z.presenceJoin(s)
+		// This shard now hosts the player (cross-shard arrival): start their durable-tell consumer so
+		// tells to them drain here (8.5). Idempotent.
+		z.startTellConsumer(s)
 		z.log.Debug("handoff committed: player activated", "player", character,
 			"room", roomRef(s.entity.location), "applied", s.appliedSeq, "epoch", s.epoch)
 		// Async-create window: the snapshot carried no PersistID (the source's CreateCharacter had
@@ -1220,7 +1236,8 @@ func (z *Zone) freezeExpire(id string, gen uint64) {
 		if z.shard != nil && s.token != "" {
 			z.shard.dropToken(s.token)
 		}
-		z.presenceLeave(id) // drop the orphaned source copy from the `who` roster (owner-guarded) (8.4)
+		z.presenceLeave(id)    // drop the orphaned source copy from the `who` roster (owner-guarded) (8.4)
+		z.stopTellConsumer(id) // ensure the source consumer is gone (idempotent; normally stopped at markHandedOff) (8.5)
 		return
 	}
 	// Handoff never completed: thaw in place and restore to the room they tried to leave.
@@ -1323,6 +1340,12 @@ func (z *Zone) markHandedOff(id string) {
 	}
 	s.handedOff = true
 	s.frozenFrom = nil // committed to leaving: the failure-restore is no longer valid
+	// The directory CAS committed: the DESTINATION shard is now the sole owner and starts its own
+	// durable-tell consumer on arrival. Stop THIS (source) shard's consumer at the commit point so the
+	// two shards never BOTH drain telos.comms.dtell.<player> — a double-drain would render a tell twice
+	// (the two shards' delivered-cursors are independent sessions, so the per-session cursor can't
+	// dedup across them). The destination drains everything from here (8.5).
+	z.stopTellConsumer(id)
 	z.log.Debug("handoff committed (directory CAS done)", "player", id)
 }
 

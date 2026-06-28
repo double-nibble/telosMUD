@@ -97,6 +97,24 @@ type session struct {
 	// Only meaningful while frozen.
 	handedOff bool
 
+	// tellCursor is the in-memory mirror of the durable delivered-cursor (Phase 8.5, OQ-4,
+	// character.go TellCursorJSON): tellCursor[authorID] is the highest tell Seq from that author
+	// already RENDERED to this player. The durable-tell drain (tell.go) renders a message only when
+	// its Seq strictly exceeds the stored value, then advances it — the per-sender idempotency that
+	// suppresses a redelivery (<= the cursor) — exactly-once in steady state, never-lost always; the
+	// only re-render is the bounded crash-window case (see tell.go's guarantee note). Zone-owned: only the zone
+	// goroutine reads/writes it (the drain posts a tellDeliverMsg to the zone, which owns the session),
+	// so it needs no lock, exactly like appliedSeq. Loaded from StateJSON on login, dumped on save.
+	// nil until first touched (loadTellCursor / the drain lazily create it).
+	tellCursor map[string]uint64
+
+	// lastTellFrom is the author id of the most recent tell this player RECEIVED (Phase 8.5): the
+	// `reply` target. Zone-owned (set on the zone goroutine when a tell is delivered). Empty until the
+	// player has received a tell; `reply` with none tells them there is no one to reply to. It is
+	// session-scoped runtime state (not persisted) — a relog clears who you would `reply` to, which is
+	// the conventional MUD behavior.
+	lastTellFrom string
+
 	// Destination side: a PENDING session has been rehydrated by Prepare and is waiting
 	// for the gate to re-dial. Its entity is not yet in a room's contents and it applies
 	// no input until an Attach carrying the matching token activates it. token is the

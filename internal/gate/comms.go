@@ -89,14 +89,19 @@ func (c *commsClient) subscribe(bus commbus.Bus, subject string, handler func(co
 	c.log.Debug("comms subscribed", "subject", subject)
 }
 
-// deliverTell renders one received TELL onto the connection's socket via the EXISTING writer path
+// deliverTell writes one received TELL onto the connection's socket via the EXISTING writer path
 // (telnet.Conn.Write — the same mutex-guarded sink the per-stream writer uses). It runs on the bus's
 // own per-subscription delivery goroutine (never a stream goroutine), so it touches only the conn-
-// scoped tc, which is concurrency-safe. The 8.5 tell-rendering is a stand-in (a tell-shaped line); 8.5
-// gives it real senders. AuthorName is the ENGINE-SET author (P8-A2): the gate renders, never authors.
+// scoped tc, which is concurrency-safe. As of slice 8.5 (durable-always tells), the SOURCE WORLD's
+// drain renders the FULL tell line ("X tells you, '…'" / "While you were away, X told you, '…'") into
+// Body with the sender's text already sanitized as DATA (P8-A7), and emits it on the player's concrete
+// telos.comms.tell.<self> subject. The gate writes Body VERBATIM — a pure sink, exactly like
+// deliverChannel: it does not re-render, re-wrap, or trust any field for markup (the engine=mechanism /
+// content=flavor split; the world owns the wording). AuthorName is the ENGINE-SET author (P8-A2), kept
+// for logging only — the gate renders nothing from it.
 func (c *commsClient) deliverTell(msg commbus.Message) {
 	c.log.Debug("comms tell delivered", "subject", msg.Subject, "author", msg.AuthorName, "seq", msg.Seq)
-	_ = c.tc.Write(msg.AuthorName + " tells you, '" + msg.Body + "'\r\n")
+	_ = c.tc.Write(msg.Body + "\r\n")
 }
 
 // deliverChannel renders one received CHANNEL line (Phase 8.3). The Body is the FULLY-rendered line the

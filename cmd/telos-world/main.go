@@ -134,6 +134,18 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		slog.Info("comms bus ready (world source)", "url", cfg.NATS.URL)
 	})
 
+	// Optional DURABLE-tell transport (Phase 8.5, OQ-1 durable-always): the world PublishDurable's every
+	// tell here and runs a per-resident durable consumer. JetStream unreachable => DisabledJetStream =>
+	// tells degrade to "temporarily offline", never a boot failure (the never-fatal rule, mirroring the
+	// comms bus). Same TELOS_NATS_URL — JetStream rides the same broker.
+	tellJS := commbus.OpenJetStream(cfg.NATS.URL, func(err error) {
+		if err != nil {
+			slog.Warn("jetstream unavailable; durable tells disabled", "url", cfg.NATS.URL, "err", err)
+			return
+		}
+		slog.Info("durable tell stream ready", "url", cfg.NATS.URL)
+	})
+
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
@@ -144,7 +156,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		return world.NewShardFromContent(lc, zones, home, "", nil, nil).
 			WithPersistence(charStore, nil).
 			WithHotReload(defSource, bus, enabledPacks).
-			WithComms(comms)
+			WithComms(comms).
+			WithTells(tellJS)
 	}
 	dir := directory.NewRedis(rdb, "telos")
 	ckpt := checkpoint.NewRedis(rdb, "telos") // ~10s Redis checkpoint tier of the ladder
@@ -190,7 +203,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithPersistence(charStore, ckpt).
 		WithHotReload(defSource, bus, enabledPacks).
 		WithComms(comms).
-		WithPresence(roster, cfg.ShardID)
+		WithPresence(roster, cfg.ShardID).
+		WithTells(tellJS)
 }
 
 // openLivePool opens the long-lived Postgres pool the shard keeps for its lifetime: it backs both

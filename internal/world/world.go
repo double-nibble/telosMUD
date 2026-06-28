@@ -253,6 +253,20 @@ func (s *Shard) WithComms(bus commbus.Bus) *Shard {
 	return s
 }
 
+// WithTells wires the shard's Phase-8.5 DURABLE-tell transport (docs/PHASE8-PLAN.md slice 8.5, OQ-1):
+// the JetStream handle the world PublishDurable's tells through and runs the per-resident durable
+// consumer on. js MUST be a JetStream handle (commbus.OpenJetStream from cmd/telos-world). It is
+// OPTIONAL and never fatal: a nil handle (or the DisabledJetStream a NATS-down OpenJetStream returns)
+// leaves tells disabled — `tell` reports "temporarily offline" to the sender, the existing tests stay
+// green, and the shard is byte-identical to a pre-8.5 one. MUST be called before Run. Returns the
+// shard for chaining; the production constructor wires it, tests inject a MemJetStream the same way.
+func (s *Shard) WithTells(js commbus.JetStream) *Shard {
+	if js != nil {
+		s.comms.js = js
+	}
+	return s
+}
+
 // WithPresence wires the shard's Phase-8 cross-shard `who` roster (docs/PHASE8-PLAN.md slice 8.4, P8-D4):
 // the shared presence store (presence.NewRedis in prod, presence.NewMem in the cross-shard tests) and the
 // stable shardID this shard writes under (the write-authority key, P8-A4 — a shard writes ONLY its own
@@ -349,8 +363,9 @@ func (s *Shard) ZoneByID(id string) *Zone { return s.zones[id] }
 // single-writer; the saver drainer is the ONE place character I/O runs, never on a zone
 // goroutine. A disabled saver's run returns immediately (no goroutine cost for a storeless boot).
 func (s *Shard) Run(ctx context.Context) {
-	go s.saver.run(ctx)    // off-zone-goroutine character writer (no-op if disabled)
-	go s.presence.run(ctx) // off-zone-goroutine cross-shard `who` heartbeat (no-op if disabled)
+	go s.saver.run(ctx)         // off-zone-goroutine character writer (no-op if disabled)
+	go s.presence.run(ctx)      // off-zone-goroutine cross-shard `who` heartbeat (no-op if disabled)
+	go s.comms.publishLoop(ctx) // off-zone-goroutine single-writer durable-tell publisher (8.5)
 	// Hot reload runs on the bus's own subscription goroutine (no shard goroutine of its own);
 	// just tear the subscription down when the shard stops so a restart doesn't double-subscribe.
 	if s.reloader != nil {

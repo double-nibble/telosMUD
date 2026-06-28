@@ -301,3 +301,19 @@ func (r *Redis) PlayerEpoch(ctx context.Context, playerID string) (uint64, bool,
 func (r *Redis) ClearPlayer(ctx context.Context, playerID string) error {
 	return r.rdb.Del(ctx, r.playerKey(playerID)).Err()
 }
+
+// PlayerShard is the world-Locator-facing wrapper over PlayerPlacement (Phase 8.5 tell routing,
+// P8-D5): it resolves which shard a player currently lives on as (shardID, found, err) without the
+// caller importing Placement, mirroring PlayerEpoch's wrapper shape. found=false (nil error) when the
+// player has no placement yet (a never-seen name) — the tell path refuses such a target. This is the
+// EPOCH-AUTHORITATIVE player->shard map; tell routing reads it, NEVER the presence roster (P8-A4).
+func (r *Redis) PlayerShard(ctx context.Context, playerID string) (string, bool, error) {
+	place, err := r.PlayerPlacement(ctx, playerID)
+	if errors.Is(err, ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return place.ShardID, true, nil
+}

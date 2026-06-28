@@ -24,6 +24,15 @@ type Locator interface {
 	// "ownership conflict". found=false (not an error) when the player has no placement yet
 	// (a brand-new character). Read OFF the zone goroutine (server.go), never on it.
 	PlayerEpoch(ctx context.Context, playerID string) (epoch uint64, found bool, err error)
+	// PlayerShard resolves which shard a player currently lives on (Phase 8.5 tell routing, P8-D5)
+	// — a thin world-facing wrapper over directory.PlayerPlacement. It is the EPOCH-AUTHORITATIVE
+	// player->shard map — NEVER the presence roster (a stale
+	// presence entry must never route or validate a tell; P8-A4). For durable-always tells (OQ-1) the
+	// sender's world does not need the shard to DELIVER (it publishes to the per-target durable subject
+	// and the target's own world drains it); it reads this only to VALIDATE the target exists — a
+	// resolve MISS (found=false) refuses the tell to the sender ("no player by that name"). A character
+	// that has ever logged in has a placement; a never-seen name does not. Read OFF the zone goroutine.
+	PlayerShard(ctx context.Context, playerID string) (shardID string, found bool, err error)
 }
 
 // buildSnapshot serializes a player's authoritative in-memory state for transfer to
