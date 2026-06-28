@@ -106,7 +106,7 @@ Combat resolution on those primitives:
 soak), a fireball's save halves its damage across everyone in the room, a rage bar builds on hit via
 an `OnHit` handler, you kill the mob and loot its corpse — all from content, no engine changes.
 
-### Phase 7 — Lua scripting
+### Phase 7 — Lua scripting ✅
 The curated escape hatch + sandbox — and the home of the complex ~20% the declarative op-list can't
 express. ([LUA.md](LUA.md))
 - `gopher-lua`, one VM per zone, curated handle API, strict budget + circuit breaker.
@@ -133,7 +133,7 @@ Phase 6 (the event bus) + Phase 7 (Lua) are the prerequisites for the progressio
 
 ## Track C — World & clients
 
-### Phase 8 — Comms over NATS
+### Phase 8 — Comms over NATS ✅
 - Channels (`gossip`, `newbie`), tells, `who`, presence — all cross-shard via NATS.
 - JetStream for offline tells/mail.
 
