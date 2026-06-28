@@ -348,6 +348,19 @@ type createdMsg struct {
 	pid PersistID
 }
 
+// createFailedMsg signals that a brand-new character's async CreateCharacter (createCharacter's
+// goroutine) FAILED PERMANENTLY — it returned an error and will never post a createdMsg. This is a
+// clean one-shot terminal signal (the goroutine has a single error-return; there is no retry loop),
+// so it is the precise eviction trigger for the create-window logout stash: if the player ALSO quit
+// inside the create round-trip, leave() parked a snapshot in pendingFinalFlush that createdMsg would
+// normally replay-or-drop. With no createdMsg ever coming, that entry would linger for the zone's
+// lifetime (FOLLOW-UPS §2). The zone handles this by deleting the stash entry — delete-only, so it
+// can never resurrect or mis-key a flush. It is a no-op when the player is still present (the live
+// cadence/logout path owns the record) or when there was no stash (the common fast-create case).
+type createFailedMsg struct {
+	id string
+}
+
 // adoptPidMsg carries a PersistID + durable state_version RESOLVED BY NAME back to the zone after a
 // cross-shard bind found the handed-off session had no PID (the async-create window: a brand-new
 // char handed off BEFORE its CreateCharacter returned the PID at the source, so the snapshot carried
@@ -377,6 +390,7 @@ type presenceMsg struct {
 type presence struct {
 	present bool // the player is registered in this zone
 	pidSet  bool // its entity has a durable PersistID (the create returned)
+	stashed bool // a create-window logout snapshot is parked in pendingFinalFlush for this name
 }
 
 // loadObjectsMsg carries durable world-objects (object_instances rows) read OFF the zone goroutine
@@ -417,6 +431,7 @@ func (saveOkMsg) zoneMsg()        {}
 func (saveReconcileMsg) zoneMsg() {}
 func (drainFlushMsg) zoneMsg()    {}
 func (createdMsg) zoneMsg()       {}
+func (createFailedMsg) zoneMsg()  {}
 func (adoptPidMsg) zoneMsg()      {}
 func (presenceMsg) zoneMsg()      {}
 func (loadObjectsMsg) zoneMsg()   {}
@@ -554,12 +569,15 @@ func (z *Zone) handle(m msg) {
 		z.saveAll(saveFlush)
 	case createdMsg:
 		z.characterCreated(v.id, v.pid)
+	case createFailedMsg:
+		z.characterCreateFailed(v.id)
 	case adoptPidMsg:
 		z.adoptHandoffPid(v.id, v.pid, v.version)
 	case presenceMsg:
 		s, present := z.players[v.id]
 		pidSet := present && s.entity != nil && s.entity.pid != nil
-		v.reply <- presence{present: present, pidSet: pidSet}
+		_, stashed := z.pendingFinalFlush[v.id]
+		v.reply <- presence{present: present, pidSet: pidSet, stashed: stashed}
 	case loadObjectsMsg:
 		z.rehydrateObjects(v)
 	case reloadLuaMsg:
@@ -967,6 +985,11 @@ func (z *Zone) createCharacter(s *session) {
 		pid, err := store.CreateCharacter(ctx, name, zoneRef, roomRef)
 		if err != nil {
 			z.log.Debug("character create failed (staying ephemeral)", "player", name, "err", err)
+			// Terminal failure: no createdMsg will ever come. Signal the zone so it can evict any
+			// create-window logout stash this name parked (leave() while pid==nil). Without this the
+			// orphaned entry would linger for the zone's lifetime (FOLLOW-UPS §2). Delete-only on the
+			// zone goroutine — it cannot resurrect or mis-route a flush.
+			z.post(createFailedMsg{id: name})
 			return
 		}
 		z.post(createdMsg{id: name, pid: pid})
@@ -1446,6 +1469,26 @@ func (z *Zone) characterCreated(id string, pid PersistID) {
 	// the next cadence tick — closes the new-character first-actions loss window for a player who
 	// is still connected when the create returns.
 	z.enqueueSave(id, s, saveFlush)
+}
+
+// characterCreateFailed evicts the create-window logout stash for a brand-new character whose async
+// CreateCharacter failed permanently (createCharacter's goroutine posted createFailedMsg instead of
+// createdMsg). It runs ON the zone goroutine (single-writer over the zone-owned map). If the player
+// quit inside the create round-trip, leave() parked a final snapshot in pendingFinalFlush that
+// characterCreated would normally replay; with the create dead there is no replay, so the entry would
+// linger for the zone's lifetime (FOLLOW-UPS §2 — bounded, one cold entry per failed name, no
+// amplification, but no active eviction). This reclaims it immediately. The op is DELETE-ONLY: it can
+// neither resurrect a flush nor land one on the wrong row. A live session (the player re-attached, or
+// a fast-create that never stashed) is left untouched — the live cadence/logout path owns the record;
+// dropping a stash that does not exist is a no-op. This NEVER drops an entry a legitimate createdMsg
+// will still replay: a permanent create failure is mutually exclusive with a (slow-but-successful)
+// createdMsg — the goroutine posts exactly one of the two, so a slow success is never falsely evicted.
+func (z *Zone) characterCreateFailed(id string) {
+	if _, ok := z.pendingFinalFlush[id]; !ok {
+		return // the common case: a fast create that returned an error but never stashed a logout
+	}
+	delete(z.pendingFinalFlush, id)
+	z.log.Info("evicted create-window logout stash after permanent create failure (data was never persistable)", "player", id)
 }
 
 // resolveHandoffPid recovers a handed-off player's durable PersistID BY NAME when the handoff

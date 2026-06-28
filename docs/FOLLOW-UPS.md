@@ -54,16 +54,17 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
   re-MITIGATE against the new target's resistances/soak and apply to ITS pool (a real harm-path
   change, with its own re-entrancy/budget audit). When built, route a focused security + combat
   re-review of just that seam. (deferred capability) · *scripting/combat/security*
-- **`pendingFinalFlush` stash has no active eviction** — `zone.go` (the create-window
-  logout-flush fix): if `CreateCharacter` PERMANENTLY fails AND the player quit inside the
-  create round-trip, one name-keyed `CharSnapshot` lingers for the zone's lifetime (reclaimed
-  only by a later successful create of that name). Bounded + benign (one small cold snapshot
-  per distinct authenticated name, no attacker amplification — security-auditor confirmed),
-  but a TTL sweep / drop-on-create-failure signal would close it cleanly. (hardening) · *world/persistence*
-- **pgx-gated + chaos coverage for the create-window logout race** — the regression
-  `TestShardRestartCreateRaceLosesMove` is MemStore-only; real Postgres widens the create
-  window (the higher-risk env). Add a `TELOS_TEST_DSN`-gated pgx equivalent + a chaos variant
-  that quits at randomized offsets within the create round-trip. (test coverage) · *test-engineer/persistence*
+- ~~**`pendingFinalFlush` stash has no active eviction**~~ — RESOLVED: `zone.go` now posts a
+  one-shot `createFailedMsg` on the create goroutine's permanent-failure branch, and
+  `characterCreateFailed` delete-evicts the orphaned stash (security-auditor re-confirmed the
+  cross-session same-name deletion is structurally impossible). Tests: eviction + false-eviction guard.
+- **pgx-gated + chaos coverage for the create-window logout race** — the regressions
+  `TestShardRestartCreateRaceLosesMove` + `TestCreateWindowFailEvictsLogoutStash` are MemStore-only;
+  real Postgres widens the create window (the higher-risk env). Add a `TELOS_TEST_DSN`-gated pgx
+  equivalent + a chaos variant that quits at randomized offsets within the create round-trip, AND a
+  belt-and-suspenders cross-session same-name test (A gated-fail + quit-in-window, then B gated-success
+  reusing the name + quit-after-move, A's failure released last → assert B's row survives — locks the
+  eviction invariant against future refactors). (test coverage) · *test-engineer/persistence*
 - ~~**Room-affect tick cadence** — `affect_room.go:189`: the room tick fires EVERY
   pulse and re-leases the CC to every occupant; should lease at `tickInterval`. (perf/hardening) · *world*~~
   **RESOLVED:** `roomTickOnce` now mirrors the per-entity tick — the per-occupant re-lease
