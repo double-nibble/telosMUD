@@ -76,23 +76,18 @@ func TestReconnectRoundTripPreservesMovedRoom(t *testing.T) {
 	s2.close(t)
 }
 
-// TestSecondLoginTakesOverSession pins the SINGLE-SESSION contract observed live: a second login for
-// an ALREADY-CONNECTED character does NOT spawn a second body or get rejected — it re-binds (the
-// link-dead resume path, zone.go attach `case s != nil`) so the NEWEST connection becomes the live
-// one and the FIRST connection is displaced (left mute: its s.out was swapped to the new socket).
+// TestSecondLoginTakesOverSession asserts the SINGLE-SESSION CLEAN-KICK contract (FOLLOW-UPS §3): a
+// second login for an ALREADY-CONNECTED character does NOT spawn a second body or get rejected — the
+// NEWEST connection takes over (zone.go attach `case s != nil`, the !s.detached live-takeover branch)
+// and the FIRST connection is CLEANLY KICKED, not left mute:
 //
-// REPRODUCE-THEN-ASSERT (the chaos discipline): we first establish BOTH connections are for the same
-// character, then assert the observable contract — (1) the second connection is LIVE (a command
-// echoes), and (2) the first connection is MUTE (its command does NOT echo, because the world session
-// now writes to the second socket). This proves there is effectively ONE live session per character
-// and the newest wins.
+//	(1) the displaced FIRST connection receives a player-visible "logged in elsewhere" NOTICE, and
+//	(2) its socket is then CLOSED (the gate renders the Disconnect frame and tears the connection down).
+//	(3) the SECOND connection's FIRST command is PROCESSED (the carried-over dedup fence is reset to the
+//	    fresh gate session's resume point, so seq 1 is NOT swallowed as a stale replay).
 //
-// CONTRACT NOTE (for the edge-engineer / persistence-engineer): today the displaced FIRST connection
-// is left silently mute rather than getting a clean "logged in elsewhere" disconnect + socket close.
-// A friendlier contract would send the old connection a notice and close its socket. This test pins
-// TODAY's behavior (newest-wins, old-goes-mute); update the first-connection assertion when the
-// contract is hardened. The takeover ITSELF (newest connection is live, no duplicate body) is the
-// invariant that must hold regardless.
+// This replaces the OLD wart this test used to pin (first connection left connected-yet-MUTE, second
+// connection's first input droppable). The takeover ITSELF (newest wins, one body) still holds.
 func TestSecondLoginTakesOverSession(t *testing.T) {
 	const addr = "addr-a"
 	store := world.NewMemStore()
@@ -101,38 +96,71 @@ func TestSecondLoginTakesOverSession(t *testing.T) {
 	h.serveShard(addr, sh)
 	h.serveGate(directory.Static{Addr: addr})
 
-	// First connection: live in the world.
+	// First connection: live in the world. Run a command so the world's dedup fence (appliedSeq)
+	// advances PAST a fresh session's first seq — this is what used to swallow the takeover's first
+	// input, and what the fence-reset (assertion 3) must defeat.
 	first := h.dial(t)
 	first.login(t, "Twin")
 	first.expect(t, "Temple Square")
+	first.send(t, "say one")
+	first.expect(t, "You say, 'one'")
+	first.send(t, "say two")
+	first.expect(t, "You say, 'two'") // appliedSeq is now 2 on the world session.
 
-	// Second connection, SAME character name, while the first is still connected. It re-binds the
-	// existing session (re-attach) and renders the room — the takeover.
+	// Second connection, SAME character name, while the first is still LIVE. It takes over the session
+	// (re-attach) and renders the room — the takeover.
 	second := h.dial(t)
 	second.login(t, "Twin")
 	second.expect(t, "Temple Square")
 
-	// (1) The SECOND connection is LIVE: a command round-trips. The world's input-seq fence may drop
-	// the very first input as a stale replay (the re-attach preserves the prior appliedSeq while the
-	// fresh gate session restarts at seq 1), so we send a few times and assert the echo lands — the
-	// takeover is "the newest connection controls the body", not "the first input is never deduped".
-	live := false
-	for i := 0; i < 5 && !live; i++ {
-		second.send(t, "say takeover")
-		live = !echoAbsent(second, "You say, 'takeover'", 500*time.Millisecond)
-	}
-	if !live {
-		t.Fatalf("second login never became live (the takeover did not bind the new connection); output:\n%s", second.acc.String())
-	}
+	// (1) + (2) The displaced FIRST connection gets the clean kick: a visible notice, then its socket
+	// closes. expectClose drains trailing bytes into acc so the notice still lands for inspection.
+	first.expect(t, "your character logged in from another location")
+	first.expectClose(t)
 
-	// (2) The FIRST connection is now MUTE: its command does NOT echo back, because the world session
-	// writes to the second socket now (single live session; the first was displaced). A regression that
-	// left the first connection ALSO live (two bodies / two live sockets for one character) fails here.
-	first.send(t, "say still mine")
-	if !echoAbsent(first, "You say, 'still mine'", 1*time.Second) {
-		t.Fatalf("the displaced FIRST connection is still live — two live sessions for one character (single-session contract broken); output:\n%s", first.acc.String())
-	}
+	// (3) The SECOND connection's FIRST command is PROCESSED — NOT dropped against the stale fence. The
+	// new gate session starts at seq 1; the world re-attach reset appliedSeq (2 -> 0) to the fresh
+	// resume point, so this single send round-trips immediately (no retry loop).
+	second.send(t, "say takeover")
+	second.expect(t, "You say, 'takeover'")
 
 	second.close(t)
-	first.close(t)
+}
+
+// TestTakeoverResetsInputFence isolates assertion (3) of the clean-kick contract: the input-seq fence
+// reset on a live takeover. It drives the prior session's dedup high-water (appliedSeq) up with SEVERAL
+// commands, then takes over with a fresh second login and asserts the new connection's VERY FIRST input
+// (gate seq 1) is applied on the FIRST try — proving the carried-over fence was clamped to the fresh
+// session's resume point, not left at the stale high-water (which would have swallowed the first N
+// inputs as replays). A regression that drops the fence-reset fails here: the single first send is
+// deduped and never echoes.
+func TestTakeoverResetsInputFence(t *testing.T) {
+	const addr = "addr-a"
+	store := world.NewMemStore()
+	h := newHarness(t)
+	sh := world.NewShard("midgaard", addr, nil, nil).WithPersistence(store, nil)
+	h.serveShard(addr, sh)
+	h.serveGate(directory.Static{Addr: addr})
+
+	// Push the first session's appliedSeq well above 1 (four applied commands), so a fresh session's
+	// seq 1..4 would ALL be deduped without the fence reset.
+	first := h.dial(t)
+	first.login(t, "Fencer")
+	first.expect(t, "Temple Square")
+	for _, w := range []string{"alpha", "bravo", "charlie", "delta"} {
+		first.send(t, "say "+w)
+		first.expect(t, "You say, '"+w+"'")
+	}
+
+	// Take over with a brand-new gate session (its input seq restarts at 1).
+	second := h.dial(t)
+	second.login(t, "Fencer")
+	second.expect(t, "Temple Square")
+	first.expectClose(t) // the displaced connection is kicked.
+
+	// The fresh session's FIRST input (seq 1) must be applied immediately — one send, it echoes.
+	second.send(t, "say clean")
+	second.expect(t, "You say, 'clean'")
+
+	second.close(t)
 }

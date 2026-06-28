@@ -203,6 +203,16 @@ type attachMsg struct {
 	// brand-new character or a token re-dial (which carries its own epoch).
 	resumeEpoch uint64
 
+	// inputSeq is the gate's Attach.input_seq: the NEXT input seq this connection will send
+	// (docs/PROTOCOL.md §5). It is the resume point the link-dead re-attach branch uses to
+	// reconcile the dedup fence: when a connection presents a fresh, restarted numbering
+	// (input_seq >= 1 and <= the carried appliedSeq), the gate minted a NEW session — a fresh
+	// reconnect or a SECOND concurrent login — whose seq 1 would otherwise be wrongly dropped as
+	// a replay against the stale high-water. attach clamps appliedSeq = inputSeq-1 so the new
+	// connection starts clean. 0 means unspecified (the test/internal path and the redirect
+	// replay path, which carry no restarted numbering and MUST preserve appliedSeq).
+	inputSeq uint64
+
 	// loaded is the character's durable snapshot, read OFF the zone goroutine (server.go) before
 	// this attach was posted — sibling to resumeEpoch, the freshest of {Postgres row, Redis
 	// checkpoint}. Only the fresh-login branch consults it: a present snapshot rehydrates the
@@ -896,7 +906,42 @@ func (z *Zone) attach(m attachMsg) {
 		return
 
 	case s != nil:
-		// Re-attach (link-dead resume): re-bind the existing session, preserving state.
+		// Re-attach. TWO shapes land here (token == "", not pending, not frozen):
+		//
+		//   - a genuine link-dead RESUME: the prior stream already dropped (s.detached) or its
+		//     reader loop is on its way to detaching; the new connection picks up the same player.
+		//   - a SECOND CONCURRENT login: the prior connection is STILL LIVE (!s.detached). The
+		//     newest socket wins (single-session), but the old one must not be left connected-yet-
+		//     MUTE — it gets a clean "logged in elsewhere" notice and its socket is torn down.
+		//
+		// We discriminate on s.detached: a still-attached prior connection is a live takeover to
+		// KICK; a detached one is a resume (nothing to displace — the old socket is already gone).
+		// Either way the new out is bound below; capture the OLD out FIRST so the kick reaches the
+		// displaced connection's writer goroutine (which is still draining it) before we swap.
+		if !s.detached && s.out != nil && s.out != out {
+			old := s.out
+			z.log.Debug("second login displaces live session; kicking old connection", "player", character)
+			// Send on the OLD channel directly (s.out is about to be reassigned). The displaced
+			// gate connection renders the notice + Disconnect and closes its socket — the same
+			// teardown path "quit" uses (renderFrame -> Disconnect -> nc.Close). Non-blocking, like
+			// session.send: if the old writer already stopped (a near-simultaneous drop) the frames
+			// are harmlessly dropped — the old socket is gone anyway.
+			displacedKick(old, s.appliedSeq)
+		}
+		// Reconcile the dedup fence with the gate's reported resume point. A fresh gate session
+		// (reconnect or second login) restarts its input numbering at 1, so its first seqs sit AT
+		// OR BELOW the carried appliedSeq and would be wrongly dropped as replays. When the gate
+		// presents such a restarted numbering (inputSeq >= 1 and <= appliedSeq), clamp the fence to
+		// inputSeq-1 so the new connection's first line is applied. inputSeq == 0 (test/internal,
+		// and the redirect replay path) means "unspecified" — preserve appliedSeq for exactly-once
+		// replay dedup (TestExactlyOnceAcrossRedial). The redirect replay path never reaches here
+		// (it carries a handoff token and binds via the pending branch), so this only ever clamps
+		// a fresh-session reconnect/takeover, never a legitimate replay.
+		if m.inputSeq >= 1 && m.inputSeq <= s.appliedSeq {
+			z.log.Debug("re-attach fence reset to fresh session resume point",
+				"player", character, "old_applied", s.appliedSeq, "input_seq", m.inputSeq)
+			s.appliedSeq = m.inputSeq - 1
+		}
 		s.out = out
 		s.currentZone = curZone
 		if curZone != nil {

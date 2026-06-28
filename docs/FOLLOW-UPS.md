@@ -88,24 +88,23 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
   `mag = victim max-hp` is builder-influenceable; `death.go:194` the corpse is an
   UNOWNED free-for-all (no loot ownership). Both are intentional minimal-slice
   behavior to revisit with the progression/loot ruleset. · *progression/security*
-- **Retire the redundant resume-seq wire fields (`Play` protocol)** —
-  `api/proto/telosmud/play/v1/play.proto:34` (`Attach.input_seq`) and `:143`
-  (`Redirect.resume_input_seq`). Both carry a resume point that the *receiving* side
-  already derives authoritatively and ignores on the wire: the world ignores
-  `Attach.input_seq` (it dedups by its own `appliedSeq`, seeded from the handoff
-  snapshot), and the gate ignores `Redirect.resume_input_seq` (it replays from the
-  destination's `ServerFrame.ack_input_seq` on the `Attached` frame — see
+- **Retire the redundant `Redirect.resume_input_seq` wire field (`Play` protocol)** —
+  `api/proto/telosmud/play/v1/play.proto:143`. The gate ignores it: it replays from the
+  destination's `ServerFrame.ack_input_seq` on the `Attached` frame (see
   `internal/gate/gate.go` `runStream`/`doReplay`). The Go-side dead `resumeSeq` param is
-  already gone (§3); what remains is the *protocol-level* cleanup.
+  already gone (§3); what remains is the *protocol-level* cleanup of this one field.
+
+  **NOTE (updated):** `Attach.input_seq` (`play.proto:34`) is **NO LONGER retirable** — the
+  single-session clean-kick (§3, resolved) made it **load-bearing**: `zone.go attach` consumes
+  it to reset the input-seq fence so a takeover's first command isn't swallowed. Deleting it
+  would silently re-break that. Only `Redirect.resume_input_seq` remains a candidate.
 
   **Deferred deliberately — this touches the gate↔world contract** (`play.proto`,
   PROTOCOL.md §1, the handoff path) and is a coordinated wire change, not a local edit.
-  Options when next touched: (a) **delete both fields** and lean entirely on the
-  receiver-authoritative `ack_input_seq` (simplest; the cleaner end state), or (b) **keep
-  them but reclassify as diagnostics-only** in the proto comments (a cheap sanity/observability
-  signal — source's *claimed* resume point vs. what the destination actually acked).
-  Recommend (a) unless we find a use for the cross-check. Do this in an end-of-roadmap
-  protocol sweep or whenever `play.proto` is next revised. · *edge/distsys*
+  Options when next touched: (a) **delete `Redirect.resume_input_seq`** and lean on the
+  receiver-authoritative `ack_input_seq` (the cleaner end state), or (b) **keep it but
+  reclassify as diagnostics-only** in the proto comments. Recommend (a). Do this in an
+  end-of-roadmap protocol sweep or whenever `play.proto` is next revised. · *edge/distsys*
 - **Lua relocation combat-fidelity** (7.3c distsys review) — `relocateWithinZone`
   (`internal/world/luaharm.go`) for `h:move`/`h:teleport`/`h:recall`: (a) it fires no
   `OnLeaveRoom` checkpoint and no post-`Move` liveness re-check, so a Lua teleport skips
@@ -129,15 +128,18 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
   remaining *wire-level* redundancy is now tracked in §2 below.
 - **`combat_test.go:448` empty `if z.move(...)`** — a combat test that may not assert
   the move outcome it intends. Make it assert. · *combat* · chip `task_0db5e6e9`
-- **Single-session takeover leaves the first connection silently mute** — *edge/persistence*
-  design call surfaced by `TestSecondLoginTakesOverSession` (the coverage wave-1 push). A
-  second login for an already-connected character re-binds the existing world session (the
-  link-dead resume path), so the newest socket wins but the first is left connected-yet-mute
-  with **no "logged in elsewhere" disconnect**. Two related warts: (a) the takeover's first
-  input can be dropped by the stale input-seq fence; (b) the displaced socket is never
-  explicitly closed. The test PINS today's behavior so it can't regress silently — but the
-  *desired* contract (clean kick of the old session + a notice) is a deliberate decision for
-  the edge/persistence engineers. See docs/TEST-COVERAGE.md "open contract questions".
+- ~~**Single-session takeover leaves the first connection silently mute**~~ — *edge/persistence*
+  design call surfaced by `TestSecondLoginTakesOverSession` (the coverage wave-1 push). **RESOLVED:**
+  implemented the single-session CLEAN-KICK contract. A second login for a still-live character now
+  cleanly kicks the old connection: the displaced socket gets a player-visible "logged in elsewhere"
+  notice + a Disconnect frame (the quit teardown path) and is closed; the new connection's stale
+  dedup fence is reset to its fresh resume point so its first input is applied, not swallowed. The
+  takeover decision lives in the world (`zone.go attach` `case s != nil`, discriminating a live
+  takeover via `!s.detached` from a link-dead resume); the fence reset keys off the gate's
+  `Attach.input_seq` (a fresh, restarted numbering at-or-below the carried `appliedSeq` clamps the
+  fence). A genuine link-dead RECONNECT/handoff resume is untouched — only a SECOND CONCURRENT login
+  triggers the kick. `TestSecondLoginTakesOverSession` + `TestTakeoverResetsInputFence` assert the new
+  contract.
 
 ## 4. Deferred features / design directions
 

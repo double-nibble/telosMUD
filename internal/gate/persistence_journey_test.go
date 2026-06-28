@@ -168,26 +168,3 @@ func TestQuitFlushReliableAfterMove(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
-
-// echoAbsent returns true if want does NOT appear in the terminal's output within d. It is
-// the deliberate inverse of terminal.expect — asserting the ABSENCE of an echo, with a
-// bounded wait so the test stays fast and deterministic (no open-ended sleep). Used by the
-// single-session takeover test (reconnect_roundtrip_test.go) to assert a displaced or muted
-// connection does NOT echo.
-func echoAbsent(term *terminal, want string, d time.Duration) bool {
-	deadline := time.After(d)
-	for {
-		if strings.Contains(term.acc.String(), want) {
-			return false
-		}
-		select {
-		case b, ok := <-term.bytes:
-			if !ok {
-				return !strings.Contains(term.acc.String(), want)
-			}
-			term.acc.WriteByte(b)
-		case <-deadline:
-			return !strings.Contains(term.acc.String(), want)
-		}
-	}
-}

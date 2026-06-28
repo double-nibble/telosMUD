@@ -166,6 +166,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		out:         out,
 		curZone:     &currentZone,
 		resumeEpoch: resumeEpoch,
+		inputSeq:    attach.GetInputSeq(),
 		loaded:      loaded,
 		loadedOK:    loadedOK,
 	})
