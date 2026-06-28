@@ -129,16 +129,17 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   receiver-authoritative `ack_input_seq` (the cleaner end state), or (b) **keep it but
   reclassify as diagnostics-only** in the proto comments. Recommend (a). Do this in an
   end-of-roadmap protocol sweep or whenever `play.proto` is next revised. · *edge/distsys*
-- **Lua relocation combat-fidelity** (7.3c distsys review) — `relocateWithinZone`
-  (`internal/world/luaharm.go`) for `h:move`/`h:teleport`/`h:recall`: (a) it fires no
-  `OnLeaveRoom` checkpoint and no post-`Move` liveness re-check, so a Lua teleport skips
-  opportunity attacks and won't notice an arrival-hook reaction (e.g. a lethal `aggroOnEntry`
-  cascade) that killed/relocated the mover; (b) it permits relocating a *fighting* entity
-  within-zone with no `posFighting` gate (unlike the engine `move`), leaving combatants engaged
-  across two rooms — contained by the round driver's same-room re-validation (not a correctness
-  bug), but a combat-model oddity. Decide per-method: teleport may *intend* to bypass OAs, but a
-  relocated fighter should likely `disengage`. Safe for now (single-writer intact, security
-  reviewed); refine when relocation gets richer. · *combat*
+- ~~**Lua relocation combat-fidelity** (7.3c distsys review)~~ — RESOLVED: `relocateWithinZone`
+  now applies per-method semantics — `h:move` fires `OnLeaveRoom` + PROVOKES opportunity attacks
+  (walk-like); `h:teleport`/`h:recall` BYPASS (blink/yank, no OA — the point of a teleport). All
+  three force-`disengage` the mover (preserving the no-fighting-pointer-spans-a-room invariant),
+  fire `OnEnter` on arrival (parity with the engine move), and re-check liveness (`stillHere()`)
+  after the leave checkpoint and each arrival hook (a lethal `aggroOnEntry`/OnEnter can't cause a
+  use-after-relocation). The new fires thread `parentCtx()` (shared depth/eventBudget); a
+  teleport→OnEnter→teleport loop is bounded by the 7.8 `eventCascadeDepth` backstop (terminates,
+  no crash — scripting/security reviewed SOUND, combat reviewed). Tests in
+  `luaharm_relocate_test.go` (disengage, per-method OA, liveness-recheck — mutation-verified).
+  Note: Lua relocation now fires `OnEnter`, so content subscribed to it reacts to Lua moves too. · *combat*
 
 ## 3. Possible latent bugs (also surfaced as chips)
 

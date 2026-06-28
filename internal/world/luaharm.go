@@ -237,9 +237,10 @@ func (rt *luaRuntime) hDispel(l *lua.LState) int {
 // hMove moves the handle's entity one step in the given direction, WITHIN this zone only. A
 // direction whose exit leads to ANOTHER zone is a clean no-op — a Lua move must NOT smuggle an
 // entity across the single-writer/handoff boundary (that is the engine's transfer/handoff path,
-// reserved for the Phase-10 director). It uses the existing Move primitive + the arrival hooks
-// (room affects, aggro), the same containment path the move command uses. Returns true if the
-// entity moved.
+// reserved for the Phase-10 director). It uses relocateWithinZone with provokeOAs=true — a
+// walk-like relocation fires the OnLeaveRoom checkpoint (opportunity attacks), disengages a
+// fighting mover, and re-checks liveness — the same combat discipline the move command has.
+// Returns true if the entity moved.
 func (rt *luaRuntime) hMove(l *lua.LState) int {
 	e := resolveHandle(l, 1)
 	dir := l.CheckString(2)
@@ -264,8 +265,11 @@ func (rt *luaRuntime) hMove(l *lua.LState) int {
 		l.Push(lua.LFalse)
 		return 1
 	}
-	rt.relocateWithinZone(e, to)
-	l.Push(lua.LTrue)
+	// h:move is a WALK-like relocation — it fires the OnLeaveRoom checkpoint (provokes opportunity
+	// attacks), mirroring the engine move's combat discipline. A scripted walk should not be a free
+	// pass past the foes the leaver is engaged with.
+	moved := rt.relocateWithinZone(e, to, true /* provoke OAs */)
+	l.Push(lua.LBool(moved))
 	return 1
 }
 
@@ -293,8 +297,11 @@ func (rt *luaRuntime) hTeleport(l *lua.LState) int {
 		l.Push(lua.LFalse)
 		return 1
 	}
-	rt.relocateWithinZone(e, dest)
-	l.Push(lua.LTrue)
+	// h:teleport INTENTIONALLY bypasses the OnLeaveRoom checkpoint — blinking away with no opportunity
+	// attack is the POINT of a teleport (that's its combat value). It still disengages the mover (no
+	// fighting pointer crosses a room) and still re-checks liveness after the move.
+	moved := rt.relocateWithinZone(e, dest, false /* no OAs */)
+	l.Push(lua.LBool(moved))
 	return 1
 }
 
@@ -316,8 +323,11 @@ func (rt *luaRuntime) hRecall(l *lua.LState) int {
 		l.Push(lua.LFalse)
 		return 1
 	}
-	rt.relocateWithinZone(e, to)
-	l.Push(lua.LTrue)
+	// h:recall, like h:teleport, INTENTIONALLY bypasses the OnLeaveRoom checkpoint — a magical yank to
+	// the recall point is not a walk and grants no opportunity attack. Disengage + liveness re-check
+	// still apply.
+	moved := rt.relocateWithinZone(e, to, false /* no OAs */)
+	l.Push(lua.LBool(moved))
 	return 1
 }
 
@@ -348,15 +358,80 @@ func (rt *luaRuntime) destIsLocalRoom(dest *Entity) bool {
 	return false
 }
 
-// relocateWithinZone performs a same-zone containment move + the standard arrival hooks (room
-// affects, aggro-on-entry), mirroring the move command's local-move tail. It uses the existing
-// Move primitive — NOT a direct contents/location write. Single-writer: zone goroutine. Both e
-// and the destination are this zone's (the callers guarantee same-zone), so no cross-zone entity
-// is ever dereferenced.
-func (rt *luaRuntime) relocateWithinZone(e, dest *Entity) {
+// relocateWithinZone performs a same-zone containment move with the engine move's COMBAT
+// DISCIPLINE: the optional OnLeaveRoom checkpoint (opportunity attacks), a forced disengage so no
+// `fighting` pointer / posFighting survives the room change (the load-bearing invariant the round
+// driver rests on), and a POST-MOVE LIVENESS RE-CHECK before the arrival hooks. It uses the
+// existing Move primitive — NOT a direct contents/location write. Single-writer: zone goroutine.
+// Both e and dest are this zone's (the callers guarantee same-zone), so no cross-zone entity is
+// ever dereferenced. Returns true if the entity actually relocated (false if a leave reaction
+// killed/moved it, or it was already gone).
+//
+// provokeOAs selects the per-METHOD model (FOLLOW-UPS §2): h:move (walk-like) fires the checkpoint
+// and provokes; h:teleport / h:recall bypass it (a blink grants no opportunity attack — the point
+// of the ability). Whichever fires threads the invocation's cascade depth/eventBudget (invariant 5)
+// via parentCtx — never a fresh root — so a relocation inside an event cascade shares its budget.
+func (rt *luaRuntime) relocateWithinZone(e, dest *Entity, provokeOAs bool) bool {
+	if e == nil || dest == nil || e.location == nil {
+		return false
+	}
+	origin := e.location
+	// (a) The OnLeaveRoom checkpoint — only for the walk-like h:move. Fired BEFORE detach, while the
+	// leaver and every engaged reactor are still live + in-room (the fail-closed-on-detached harm
+	// funnel). The cascade ctx threads rt.inv's budget (invariant 5), not a fresh root.
+	if provokeOAs {
+		rt.zone.fireLeaveRoom(rt.parentCtx(), e)
+		// Post-checkpoint liveness re-check: a lethal opportunity attack may have killed the leaver
+		// (die -> respawn relocated them; a changed location / posDead is the signal) — abort cleanly
+		// rather than continuing to relocate a respawned/dead mover. Mirrors the engine move/flee guard.
+		if e.location != origin || position(e) == posDead {
+			return false
+		}
+	}
+	// (c) The fighting entity: a relocated FIGHTER disengages BOTH directions, so no `fighting` pointer
+	// or posFighting spans two rooms (the invariant the same-room round driver depends on). disengage is
+	// a no-op for an unengaged mover. Done while e is still in `origin`, so its opponents are still
+	// reachable to have their links to e dropped.
+	rt.zone.disengage(e)
+	// The move itself.
 	Move(e, dest)
+	// (b) The arrival hooks, each guarded by a POST-hook LIVENESS RE-CHECK: a hook (a room death-field,
+	// an aggro-on-entry cascade, the OnEnter bus — now that 7.8 lit OnEnter) can kill the entrant or
+	// re-relocate it mid-arrival. After EACH hook, re-validate that e is still alive and still where we
+	// put it before running the NEXT hook — fail safe (stop, no use-after-relocation) otherwise. The
+	// arrival order mirrors the engine move's local-move tail (affects -> aggro -> OnEnter).
+	stillHere := func() bool { return e.location == dest && position(e) != posDead }
 	applyRoomAffectsTo(e)
+	if !stillHere() {
+		return true // it DID relocate; an arrival hook then killed/moved it — that path owns it now
+	}
 	rt.zone.aggroOnEntry(e, dest)
+	if !stillHere() {
+		return true
+	}
+	// OnEnter bus (7.8): the movement hook a resource/affect on_event or a Lua bus handler subscribes
+	// to — fired about the entrant (subject), dest the counterpart. Threads the invocation's budget
+	// (invariant 5) via parentCtx, NOT a fresh root, so a relocation inside a cascade shares its caps.
+	rt.zone.fireEvent(rt.parentCtx(), evOnEnter, e, dest, 1)
+	return true
+}
+
+// parentCtx builds the parent effectCtx that threads the current invocation's cascade depth +
+// eventBudget into an engine fire (fireLeaveRoom here), so a relocation inside an event/reaction
+// cascade shares the SAME width/depth budget (invariant 5) rather than rooting a fresh one. nil
+// invocation => nil parent (fireLeaveRoom then roots a fresh budget, the command-call-site shape).
+func (rt *luaRuntime) parentCtx() *effectCtx {
+	if rt.inv == nil {
+		return nil
+	}
+	return &effectCtx{
+		z:           rt.zone,
+		actor:       rt.inv.actor,
+		source:      rt.inv.actor,
+		rng:         rt.rng,
+		depth:       rt.inv.depth,
+		eventBudget: rt.inv.eventBudget,
+	}
 }
 
 // --- small table-arg readers (Lua opts tables) --------------------------------------------
