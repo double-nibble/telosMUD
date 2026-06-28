@@ -363,6 +363,32 @@ func (term *terminal) expect(t *testing.T, substr string) {
 	}
 }
 
+// tryExpect is the NON-FATAL bounded variant of expect: it returns true if substr appears within d,
+// false on timeout — never failing the test. For retry-until-async-subscription-live loops where a
+// comms line sent before a per-player hear-set subscription is established (the async login →
+// config-publish → gate-subscribe round-trip) may legitimately be missed, so the test retries to a
+// deterministic flowing/stopped state instead of sleep-and-hope against the round-trip latency.
+func (term *terminal) tryExpect(substr string, d time.Duration) bool {
+	if strings.Contains(term.acc.String(), substr) {
+		return true
+	}
+	deadline := time.After(d)
+	for {
+		select {
+		case b, ok := <-term.bytes:
+			if !ok {
+				return false
+			}
+			term.acc.WriteByte(b)
+			if strings.Contains(term.acc.String(), substr) {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}
+
 // expectClose asserts the gate closed the socket (the reader saw EOF) within a deadline
 // — the observable a player gets when the connection is dropped. It drains any trailing
 // bytes so a final message (e.g. a disconnect notice) still lands in acc for inspection.
