@@ -436,6 +436,28 @@ state persistence) is last (it depends on the comms paths + the store). **If 8.5
 online-tell (core) from offline-durable-tell (JetStream) into two commits — the JetStream
 idempotency/redelivery machinery is the heavier, security-reviewed half.
 
+### 8.1 review — carried-forward obligations (security-auditor, sign-off 2026-06-28)
+
+8.1's trust boundary cleared SOUND (publish ACL enforced identically across NATS/Mem/disabled, role
+immutable, author-is-engine-set shape has no client path). The auditor flagged obligations the later
+slices MUST satisfy for the boundary to hold end-to-end — fold each into the named slice + its review:
+- **8.2 (wiring):** grep that `cmd/telos-gate` opens comms via `commbus.OpenGate` ONLY (never `OpenWorld`
+  / the test-only `MemBus.WorldHandle()`), and `cmd/telos-world` via `OpenWorld`. A gate handed a world
+  handle defeats the whole ACL.
+- **8.3 (author stamp + channel access):** stamp `AuthorID`/`AuthorName` from the server-resolved live
+  `*Entity`, NEVER from a client frame field; `Seq` from a server-held monotonic counter (the ACL stops a
+  gate publishing, NOT a world publishing a badly-sourced author — that's 8.3's job). Render `Body` through
+  the terminal sanitizer (P8-A7). Reject a channel ref not in loaded `channel_defs` BEFORE `ChanSubject`
+  (it does no validation — P8-A8). Check the channel `access` predicate against the author entity.
+- **8.4 (presence):** presence is deliberately NOT ACL-guarded (a gate CAN publish it today). Consumers
+  MUST validate/key each presence frame by the player the publishing shard actually hosts, so a forged
+  frame can't mark an arbitrary player online or evict a real one; tell routing reads the epoch-
+  authoritative directory, NEVER presence (P8-A4).
+- **8.5 (per-player subjects):** a gate subscribes ONLY to concrete `telos.comms.tell.<hostedPlayerId>`
+  subjects for players it currently hosts — NEVER `telos.comms.tell.*` (subscribe is not ACL'd, so the
+  concrete-subject choice is the only thing preventing a cross-player tell leak). Always set the
+  `IdempotencyKey` (the `MemJetStream` stand-in does not dedup an empty key).
+
 ---
 
 ## 5. Schema / loader / proto touchpoints
