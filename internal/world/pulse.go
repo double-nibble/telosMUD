@@ -1,6 +1,29 @@
 package world
 
-import "time"
+import (
+	"math"
+	"time"
+)
+
+// pulseCount converts a content-defined, non-negative pulse count (an ability castTime/cooldown)
+// to the wheel's uint64, flooring a nonsensical negative at 0 — the explicit non-negative bound
+// the gosec G115 conversion check requires, and a defensive floor against malformed content.
+func pulseCount(n int) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
+}
+
+// pulsesToInt narrows a BOUNDED pulse delta (a remaining-cooldown count: small and non-negative,
+// after callers apply the `at > now` guard) to int, capping an implausibly large value at MaxInt
+// so the narrowing can never wrap to a negative.
+func pulsesToInt(d uint64) int {
+	if d > uint64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(d)
+}
 
 // Heartbeat / pulse scheduler (docs/PHASE3-PLAN.md slice 4; the COMBAT.md/affects
 // substrate). A MUD's world ticks: items decay, affects wear off, mobs wander, combat

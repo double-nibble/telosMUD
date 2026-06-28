@@ -5,12 +5,36 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/double-nibble/telosmud/internal/world"
 )
+
+// state_version is a monotonic counter: a `bigint` (int64) column the app models as uint64. These
+// two helpers make the type-boundary conversions explicit + bounded (the gosec G115 requirement),
+// and defensively floor/cap so neither direction can ever produce a value the CAS would misread.
+
+// nonNegU64 clamps a DB-sourced signed state_version to uint64. The column defaults to 0 and only
+// ever increments, so a negative is impossible barring corruption — where 0 is the safe floor.
+func nonNegU64(v int64) uint64 {
+	if v < 0 {
+		return 0
+	}
+	return uint64(v)
+}
+
+// stateVersionParam narrows the app's uint64 state_version to the int64 the bigint CAS predicate
+// binds. A counter incremented by 1 per save cannot realistically approach MaxInt64; cap defensively
+// so the conversion never wraps to a negative the `WHERE state_version = $n` predicate would misread.
+func stateVersionParam(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
 
 // character.go is the pgx implementation of world.CharacterStore against the `characters` table
 // (slice 4.1 created it; docs/PERSISTENCE.md §2, docs/PHASE4-PLAN.md §2). The table is the
@@ -55,7 +79,7 @@ func (p *Pool) LoadCharacter(ctx context.Context, name string) (world.CharSnapsh
 		Name:         name,
 		ZoneRef:      derefStr(zoneRef),
 		RoomRef:      derefStr(roomRef),
-		StateVersion: uint64(stateVersion), //nolint:gosec // TODO(persistence-engineer): bounded state_version counter; add explicit non-negative guard
+		StateVersion: nonNegU64(stateVersion),
 	}
 	if len(stateJSON) > 0 {
 		if err := json.Unmarshal(stateJSON, &snap.State); err != nil {
@@ -111,7 +135,7 @@ func (p *Pool) SaveCharacter(ctx context.Context, snap world.CharSnapshot) (uint
 		        last_saved_at = now()
 		  WHERE id = $4 AND state_version = $5
 		 RETURNING state_version`,
-		stateJSON, nullStr(snap.ZoneRef), nullStr(snap.RoomRef), id, int64(snap.StateVersion)). //nolint:gosec // TODO(persistence-engineer): bounded state_version counter; add explicit non-negative guard
+		stateJSON, nullStr(snap.ZoneRef), nullStr(snap.RoomRef), id, stateVersionParam(snap.StateVersion)).
 		Scan(&newVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// CAS lost: the stored state_version moved past snap.StateVersion (or the row is gone).
@@ -120,7 +144,7 @@ func (p *Pool) SaveCharacter(ctx context.Context, snap world.CharSnapshot) (uint
 	if err != nil {
 		return 0, false, fmt.Errorf("store: save character %q: %w", snap.Name, err)
 	}
-	return uint64(newVersion), true, nil //nolint:gosec // TODO(persistence-engineer): bounded state_version counter; add explicit non-negative guard
+	return nonNegU64(newVersion), true, nil
 }
 
 // derefStr returns the pointed-to string, or "" for a SQL NULL.

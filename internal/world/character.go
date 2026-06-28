@@ -259,7 +259,7 @@ func dumpCooldowns(e *Entity) map[string]int {
 		if out == nil {
 			out = map[string]int{}
 		}
-		out[ref] = int(at - now) //nolint:gosec // TODO(world-engineer): remaining-cooldown delta is bounded; add a guard
+		out[ref] = pulsesToInt(at - now) // at > now (guarded above): a small, bounded remaining-cooldown delta
 	}
 	return out
 }

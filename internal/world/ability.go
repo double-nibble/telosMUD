@@ -167,7 +167,7 @@ func (ct castTarget) resolve(z *Zone, caster *Entity) (*Entity, bool) {
 func (z *Zone) scheduleCast(s *session, def *abilityDef, target *Entity, rng *rand.Rand) {
 	id := s.character
 	ct := captureCastTarget(s.entity, target)
-	z.pulses.after(uint64(def.castTime), func(_ uint64) bool { //nolint:gosec // TODO(world-engineer): castTime is a small non-negative pulse count; add a bound
+	z.pulses.after(pulseCount(def.castTime), func(_ uint64) bool {
 		// Resolve-by-id: the caster may have transferred zones or frozen since the cast began.
 		live, ok := z.players[id]
 		if !ok || live == nil || live.entity == nil {
@@ -369,11 +369,11 @@ func (z *Zone) armCooldown(s *session, def *abilityDef) {
 	if l.cooldowns == nil {
 		l.cooldowns = map[string]uint64{}
 	}
-	elapsesAt := z.pulses.pulse + uint64(def.cooldown) //nolint:gosec // TODO(world-engineer): cooldown is a small non-negative pulse count; add a bound
+	elapsesAt := z.pulses.pulse + pulseCount(def.cooldown)
 	l.cooldowns[def.ref] = elapsesAt
 	id := s.character
 	ref := def.ref
-	z.pulses.after(uint64(def.cooldown), func(pulse uint64) bool { //nolint:gosec // TODO(world-engineer): cooldown is a small non-negative pulse count; add a bound
+	z.pulses.after(pulseCount(def.cooldown), func(pulse uint64) bool {
 		// Resolve-by-id: clear the entry only on the live player. Absent/frozen => the entity left;
 		// do not touch it (the destination owns the map after a handoff). A re-armed cooldown (a
 		// fresh use during this one) overwrote elapsesAt with a LATER pulse — only clear if this

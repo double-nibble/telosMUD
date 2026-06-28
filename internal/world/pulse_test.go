@@ -42,7 +42,7 @@ func TestPulseFiresOnZoneGoroutine(t *testing.T) {
 		// Reading z.players here is only safe because this runs on the zone goroutine.
 		_ = len(z.players)
 		firedFromZone.Store(true)
-		fired <- int(pulse) //nolint:gosec // TODO(world-engineer): test-only bounded pulse-count conversion
+		fired <- pulsesToInt(pulse)
 		return false
 	})
 

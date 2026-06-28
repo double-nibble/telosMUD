@@ -200,8 +200,8 @@ func (z *Zone) topUpReactions(e *Entity) {
 		if !def.perRound {
 			continue
 		}
-		if max := resourceMax(e, ref); max > 0 { //nolint:revive // TODO(world-engineer): rename `max` local (shadows builtin) in the per-round refresh hot path
-			setResourceCurrent(e, ref, max)
+		if m := resourceMax(e, ref); m > 0 {
+			setResourceCurrent(e, ref, m)
 		}
 	}
 }
