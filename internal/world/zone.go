@@ -90,6 +90,17 @@ type Zone struct {
 	// (Phase 5) hang off it. Plain zone-owned data; only this goroutine touches it.
 	pulses *pulseScheduler
 
+	// eventCascadeDepth is the CAN'T-FORGET recursion backstop for the in-zone event bus
+	// (event.go fireEvent). The per-fire effectCtx.depth/eventBudget guards bound a cascade ONLY
+	// when every fire site threads its parent ctx — a forget-prone discipline (the 7.8 affect-
+	// lifecycle fires were exactly such a forgotten site, resetting depth to 0 and recursing the Go
+	// stack unbounded until a FATAL panic took the whole process down — no Lua VM, so no sandbox
+	// defense). This zone-scoped counter trips REGARDLESS of whether a fire threaded its parent:
+	// fireEvent increments it on entry, decrements on return, and bails (with a Warn) past
+	// maxEventCascadeDepth. The zone is single-writer, so a plain int is race-free. It honors the
+	// pillar: the engine ENFORCES the bound, it does not assume well-behaved content.
+	eventCascadeDepth int
+
 	// saver is the shard's async character writer (saver.go), shared read-only by every
 	// hosted zone. The zone produces a CharSnapshot on its own goroutine (dumpCharacter) and
 	// hands it to the saver over a buffered channel; the saver does the blocking Redis/Postgres

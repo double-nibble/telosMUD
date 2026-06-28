@@ -310,7 +310,7 @@ func TestRootedCannotFlee(t *testing.T) {
 	setPosition(fleer.entity, posFighting)
 	setPosition(mob, posFighting)
 	z.topUpReactions(mob)
-	applyAffect(fleer.entity, "root", attachOpts{})
+	applyAffect(fleer.entity, "root", attachOpts{}, nil)
 
 	startHP := resourceCurrent(fleer.entity, "hp")
 	ctx := &Context{z: z, s: fleer, Actor: fleer.entity, arg: "north"}

@@ -143,7 +143,7 @@ func landRoomAffectOn(room *Entity, occ *Entity, inst *affectInstance) {
 			c := &effectCtx{z: room.zone, actor: nonNilSource(src, occ), source: nonNilSource(src, occ), target: occ, mag: 1, disp: dispHarmful}
 			applyDebuff(c, occ, def.ref, opts)
 		} else {
-			applyAffect(occ, def.ref, opts)
+			applyAffect(occ, def.ref, opts, nil) // a room-affect lease is a root apply (fresh cascade)
 		}
 	}
 
@@ -273,7 +273,7 @@ func clearRoomAffectFromOccupants(room *Entity, inst *affectInstance) {
 			continue
 		}
 		if copyInst, present := oa.byKey[keyFor(inst.def, inst.source)]; present {
-			oa.expire(occ, copyInst)
+			oa.expire(occ, copyInst, nil) // a room-affect clear is a root expire (fresh cascade)
 		}
 	}
 }

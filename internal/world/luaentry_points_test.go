@@ -347,7 +347,7 @@ func TestAffectLuaHooks(t *testing.T) {
 	setResourceCurrent(e, "hp", 50)
 
 	// Apply: on_apply heals +10.
-	applyAffect(e, "blessing", attachOpts{})
+	applyAffect(e, "blessing", attachOpts{}, nil)
 	if got := resourceCurrent(e, "hp"); got != 60 {
 		t.Fatalf("hp after on_apply = %d, want 60 (+10)", got)
 	}
@@ -377,7 +377,7 @@ func TestAffectLuaHookFailClosed(t *testing.T) {
 	Add(e, &Living{})
 	Move(e, room)
 	// Applying with a broken on_apply must not crash; the affect still attaches.
-	applyAffect(e, "brokenbuff", attachOpts{})
+	applyAffect(e, "brokenbuff", attachOpts{}, nil)
 	if !hasAffect(e, "brokenbuff") {
 		t.Fatal("the affect did not attach despite a broken on_apply hook")
 	}

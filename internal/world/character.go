@@ -453,7 +453,7 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 		for _, af := range snap.State.Affects {
 			applyAffect(e, af.ID, attachOpts{
 				duration: af.Remaining, magnitude: af.Mag, stacks: af.Stacks, reattach: true,
-			})
+			}, nil) // a persistence reattach is a root (and skips on_apply/the bus fire anyway)
 		}
 		// Re-install the entity's named flags (Phase 5.3, flags.go) — e.g. a player's "pvp" consent.
 		for _, name := range snap.State.Flags {

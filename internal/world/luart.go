@@ -171,6 +171,13 @@ type luaRuntime struct {
 	// luaentry_chokepoint.go), registered LAZILY on the first compiled chunk so a scriptless zone
 	// never pays for it. Zone goroutine only.
 	metricPulse *pulseHandle
+
+	// fireData carries the firer's plain-data table for the custom event CURRENTLY being dispatched
+	// (mud.fire's 3rd arg, event.go fireCustomEvent). It is set immediately before mud.fire enters
+	// z.fireEvent and cleared immediately after — so the engine's shared fireEvent signature never
+	// has to carry a Lua value, and a nested custom fire (a handler that fires another) save/restores
+	// it stack-discipline so each handler reads ITS firer's data. Zone goroutine only (single-writer).
+	fireData *lua.LTable
 }
 
 // chunkCacheEntry is one cached compile result: the chunk (nil if the source was empty or the

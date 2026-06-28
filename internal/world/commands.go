@@ -310,6 +310,13 @@ func (z *Zone) move(s *session, dir string) bool {
 	// `aggressive` attribute, not an engine flag (death.go). Done after the arrival look so the player
 	// sees the room, then the attack. A local move only; cross-zone arrivals (transferIn) are a later hook.
 	z.aggroOnEntry(s.entity, to)
+	// EVENT BUS (7.8b): light the new OnEnter movement hook — the event is ABOUT the entrant
+	// (subject) entering, with the destination room as the counterpart. Distinct from the per-room/
+	// per-mob `enter`/`greet` TRIGGERS below (those are entity scripts; this is the bus a resource/
+	// affect on_event or a Lua bus handler subscribes to). Fired independent of Lua presence (an
+	// op-list subscriber works in a script-less zone). A clean ROOT fire (a movement, not inside a
+	// cascade). "A missing hook is an engine bug" — OnEnter now actually fires.
+	z.fireEvent(nil, evOnEnter, s.entity, to, 1)
 	// Lua `enter`/`greet` triggers (7.4c): the room reacts to the arrival, and each scripted mob
 	// in the room greets the entrant. After aggro so a hostile greeting reads naturally. nil-safe.
 	z.fireRoomEntry(s.entity, to)

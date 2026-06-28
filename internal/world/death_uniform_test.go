@@ -126,7 +126,7 @@ func TestDoTTickKills(t *testing.T) {
 
 	mob := combatMob(z, s.entity, "goblin", "", 4) // 4 hp: one 5-damage tick empties it
 	room := mob.location
-	applyAffect(mob, "poison", attachOpts{source: s.entity})
+	applyAffect(mob, "poison", attachOpts{source: s.entity}, nil)
 
 	// Fire the tick directly (the runtime path fireOnTick uses for a DoT). It routes deal_damage through
 	// the shared funnel, which now owns the death seam.

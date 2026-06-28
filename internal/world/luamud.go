@@ -83,6 +83,7 @@ func (rt *luaRuntime) installMudTable() {
 		"after":       rt.mudAfter,
 		"cancel":      rt.mudCancel,
 		"pvp_allowed": rt.mudPvpAllowed,
+		"fire":        rt.mudFire,
 	}
 	L.SetFuncs(mud, fns)
 
@@ -386,6 +387,65 @@ func (rt *luaRuntime) mudPvpAllowed(l *lua.LState) int {
 	}
 	l.Push(lua.LBool(pvpAllowed(a, b)))
 	return 1
+}
+
+// --- custom-event lane (the pack: hookability obligation) ---------------------------------
+
+// mudFire fires a CONTENT-NAMESPACED custom event the engine never heard of (the pack: lane,
+// PHASE7-PLAN.md §5 7.8a): mud.fire("sailing:OnShipDock", subject, data). A sailing/quest system
+// defines, fires, and handles its own events ENTIRELY in content. The event has NO privileged
+// status — it goes through the SAME z.fireEvent path engine kinds use, so it inherits the depth
+// (maxEventDepth re-entrancy) + width (maxEventHandlers) budget AND the harm gate (a harmful op in
+// the subscribed handler funnels guardHarmful through the threaded cascade ctx, invariant 1).
+//
+// SECURITY / NAMESPACE (7.8a): the kind MUST be a namespaced custom kind ("<pack>:Name") — a bare
+// name with no separator is an ENGINE kind, and firing an arbitrary bare name is REJECTED (a clean
+// error). This keeps the lane from becoming a hole where any string is a valid engine event, and the
+// pack prefix namespaces it so two packs' same-named events never collide. An unknown bare engine
+// kind (e.g. mud.fire("OnTotallyMadeUp", …)) is likewise rejected.
+//
+// The cascade is threaded FROM rt.inv (the current invocation): if mud.fire is called from inside an
+// event handler, the SAME depth + shared eventBudget pointer thread through, so a handler that
+// re-fires is bounded by the same caps it ran under (no escape). Fired from a top-level trigger
+// (rt.inv with nil eventBudget), z.fireEvent allocates the cascade's root budget. An unresolved
+// subject is a clean no-op. The data table (arg 3, optional) is bound as `ev.data` on the handler.
+func (rt *luaRuntime) mudFire(l *lua.LState) int {
+	name := eventKind(l.CheckString(1))
+	subject := resolveHandle(l, 2)
+	// NAMESPACE GATE: only a namespaced custom kind may be fired from content. A bare name is an
+	// engine kind whose fire points the ENGINE owns — content may not synthesize one (and a bare name
+	// not even in knownEventKinds is a typo/abuse). Reject cleanly, never silently.
+	if !isCustomEventKind(name) {
+		l.RaiseError("mud.fire: %q is not a namespaced custom event (use \"<pack>:Name\"); engine events are fired by the engine, not content", string(name))
+		return 0
+	}
+	if subject == nil || rt.zone == nil {
+		return 0 // unresolved subject: a clean no-op (the firer doesn't know who, if anyone, subscribes)
+	}
+	// Optional data table (arg 3): the firer's arbitrary plain-data payload, bound as ev.data on the
+	// handler. Threaded via rt.fireData (NOT the engine fireEvent signature). Save/restore around the
+	// fire so a NESTED custom fire (a handler that fires another) restores the outer firer's data.
+	var data *lua.LTable
+	if l.GetTop() >= 3 {
+		if t, ok := l.Get(3).(*lua.LTable); ok {
+			data = t
+		}
+	}
+	prevData := rt.fireData
+	rt.fireData = data
+	defer func() { rt.fireData = prevData }()
+
+	// Build the cascade ctx FROM the current invocation (invariant 1/5): the subject is the event
+	// subject (who it is ABOUT); the threaded depth/eventBudget come from rt.inv so a fire from inside
+	// a handler shares the cascade's caps. A top-level trigger fire (nil eventBudget) starts a fresh
+	// cascade in z.fireEvent.
+	parent := &effectCtx{z: rt.zone, actor: subject, source: subject, rng: rt.rng}
+	if rt.inv != nil {
+		parent.depth = rt.inv.depth
+		parent.eventBudget = rt.inv.eventBudget
+	}
+	rt.zone.fireEvent(parent, name, subject, nil, 1)
+	return 0
 }
 
 // runCallback invokes a stored Lua function pcall-isolated, logging (not propagating) any

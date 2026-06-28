@@ -449,7 +449,7 @@ func applyDebuff(c *effectCtx, target *Entity, affectRef string, opts attachOpts
 	if !guardHarmful(c, target) {
 		return false
 	}
-	applyAffect(target, affectRef, opts)
+	applyAffect(target, affectRef, opts, c) // thread the cascade ctx (bounds a nested OnApplyAffect)
 	return true
 }
 

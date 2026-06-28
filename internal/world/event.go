@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"sort"
+	"strings"
 
 	lua "github.com/yuin/gopher-lua"
 )
@@ -78,11 +79,42 @@ const (
 	evOnAffectExpire    eventKind = "OnAffectExpire"    // an affect expired — reserved
 )
 
-// knownEventKinds is the closed set the parser validates content `on_event` keys against.
+const (
+	evOnEnter eventKind = "OnEnter" // an entity entered a room (the movement hook) — live 7.8
+)
+
+// knownEventKinds is the closed set the parser validates content `on_event` keys against. It is the
+// ENGINE-OWNED set: a content `on_event` key that is neither one of these NOR a namespaced custom
+// kind (the pack: lane below) is dropped at parse with a lint warning — content can't invent a BARE
+// engine event (that would silently fail to fire forever).
 var knownEventKinds = map[eventKind]bool{
 	evOnCheck: true, evOnAbilityResolved: true, evOnHit: true, evOnDamageTaken: true,
 	evOnKill: true, evOnLeaveRoom: true, evBeforeCastCommit: true, evOnRest: true,
-	evOnApplyAffect: true, evOnAffectTick: true, evOnAffectExpire: true,
+	evOnApplyAffect: true, evOnAffectTick: true, evOnAffectExpire: true, evOnEnter: true,
+}
+
+// customEventSep is the namespace separator that makes a custom (content-defined) event kind
+// SYNTACTICALLY distinguishable from an engine kind (the bare OnX consts above). A custom kind is
+// "<pack>:Name" (e.g. "sailing:OnShipDock"); the prefix namespaces it BY PACK so two packs' same-
+// named events ("a:OnDock" vs "b:OnDock") never collide. A bare name with no separator is an ENGINE
+// kind and MUST be in knownEventKinds — so an unknown bare kind is still rejected/lint-caught (the
+// pack: lane does NOT open a hole where any string becomes a valid engine event).
+const customEventSep = ":"
+
+// isCustomEventKind reports whether `kind` is a content-namespaced custom event (the pack: lane,
+// PHASE7-PLAN.md §5 7.8a) rather than a bare engine kind. The separator is the discriminator: an
+// engine kind is a bare OnX; a custom kind carries the "<pack>:" namespace. A custom kind is NOT in
+// knownEventKinds (the engine never heard of it) — it dispatches to per-entity on(name,fn) trigger
+// handlers, under the SAME depth/width budget + harm gate as an engine event (no privileged status).
+func isCustomEventKind(kind eventKind) bool {
+	return strings.Contains(string(kind), customEventSep)
+}
+
+// isFireableEventKind reports whether `kind` is a name content may fire/subscribe: a known ENGINE
+// kind OR a namespaced CUSTOM kind. A bare name not in knownEventKinds is neither (an unknown engine
+// kind) and is rejected — the lane stays namespaced.
+func isFireableEventKind(kind eventKind) bool {
+	return knownEventKinds[kind] || isCustomEventKind(kind)
 }
 
 // maxEventDepth bounds how many event-fires may NEST before the bus refuses to fire further (the
@@ -97,6 +129,19 @@ const maxEventDepth = 8
 // zone goroutine and starve the heartbeat. 256 is far past any legitimate proc cascade; exhausting it
 // truncates the cascade with a warning (the triggering action still completes).
 const maxEventHandlers = 256
+
+// maxEventCascadeDepth is the ZONE-LEVEL recursion backstop (Zone.eventCascadeDepth) — the can't-
+// forget guard that bounds NESTED fireEvent calls REGARDLESS of whether each fire threaded its
+// parent ctx. The per-ctx depth guard (maxEventDepth) only holds when every fire site remembers to
+// thread its parent; a site that passes nil parent resets depth to 0, and a self-perpetuating cycle
+// through such a site would recurse the Go stack unbounded (the 7.8 affect-lifecycle CRITICAL). This
+// cap trips on the COUNT OF LIVE fireEvent FRAMES on the goroutine stack, so it bounds the Go
+// recursion even when the logical-depth guard is defeated. It is set ABOVE maxEventDepth (so a
+// legitimately deep, properly-threaded cascade — at most maxEventDepth logical levels — never trips
+// it) and a small multiple over (so a short chain of distinct ROOT cascades, each itself depth-
+// bounded, still completes), but FAR below the goroutine-stack-exhaustion frontier. 32 = 4×
+// maxEventDepth: generous for any real proc graph, decisive against an unbounded loop.
+const maxEventCascadeDepth = 4 * maxEventDepth
 
 // eventHandler is one subscribed handler plus where it came from (for logging/lint). It is EITHER
 // an op-list (ops) OR a Lua body (luaSrc) — a content event handler is one or the other (7.4g).
@@ -185,6 +230,20 @@ func (z *Zone) fireEvent(parent *effectCtx, kind eventKind, subject, other *Enti
 	if z == nil || subject == nil {
 		return
 	}
+	// ZONE-LEVEL RECURSION BACKSTOP (the can't-forget guard, maxEventCascadeDepth): bound the COUNT
+	// of live fireEvent frames on the goroutine stack, independent of whether each fire threaded its
+	// parent ctx. This is what stops an unbounded Go-stack recursion when a fire site forgets to
+	// thread `parent` (the 7.8 affect-lifecycle CRITICAL: a depth-0-resetting cycle the per-ctx
+	// maxEventDepth never catches). The engine enforces the bound; it does not trust every fire site
+	// to thread correctly. Single-writer: the counter is plain zone-owned int (no lock).
+	if z.eventCascadeDepth >= maxEventCascadeDepth {
+		z.log.Warn("event cascade depth backstop tripped; cascade truncated (a fire site likely did not thread its parent ctx)",
+			"event", string(kind), "subject", subject.short, "cascade_depth", z.eventCascadeDepth)
+		return
+	}
+	z.eventCascadeDepth++
+	defer func() { z.eventCascadeDepth-- }()
+
 	depth := 0
 	var rng *rand.Rand
 	var budget *int
@@ -202,6 +261,16 @@ func (z *Zone) fireEvent(parent *effectCtx, kind eventKind, subject, other *Enti
 		// Root of a new cascade: allocate the shared total-work budget the whole tree decrements.
 		b := maxEventHandlers
 		budget = &b
+	}
+	// A CUSTOM (namespaced) kind has no engine handler source (resource/affect defs subscribe to
+	// engine kinds only) — it dispatches to the subject's on(name,fn) TRIGGER handler. Route it
+	// through the SAME budget-threading we just computed (depth + the shared width budget) so a
+	// content custom event has NO privileged status: a custom handler that re-fires is bounded by
+	// maxEventDepth, the cascade's TOTAL handler runs by maxEventHandlers, and any harm op in it
+	// funnels guardHarmful exactly like an engine-event handler. (PHASE7-PLAN.md §5 7.8a.)
+	if isCustomEventKind(kind) {
+		z.fireCustomEvent(kind, subject, other, mag, rng, depth, budget)
+		return
 	}
 	handlers := gatherEventHandlers(subject, kind)
 	for _, h := range handlers {
@@ -250,4 +319,63 @@ func (z *Zone) runLuaEventHandler(c *effectCtx, h eventHandler, subject, other *
 	}
 	ev.RawSetString("mag", lua.LNumber(mag))
 	_ = rt.invokeFromCtx(ch, c, subject, map[string]lua.LValue{"ev": ev})
+}
+
+// fireCustomEvent dispatches a CONTENT-NAMESPACED custom event (the pack: lane, PHASE7-PLAN.md §5
+// 7.8a) to the subject's on(name,fn) TRIGGER handler. It is fired from fireEvent (NOT a parallel
+// dispatcher) so it threads the SAME cascade state: `depth` (the re-entrancy guard) and the shared
+// `budget` pointer (the width guard) the rest of the bus uses. A custom event has NO privileged
+// status — it decrements the same width budget, refuses to nest past maxEventDepth (fireEvent
+// checked `depth` before calling us), and any harm op in the handler funnels guardHarmful through
+// the trigger's threaded ctx (invariant 1) exactly like an engine-event handler.
+//
+// The handler receives `ev.mag`, `ev.data` (the firer's arbitrary plain-data table — mud.fire's
+// third arg), and `ev.other` IF the fire supplied a counterpart (mud.fire passes none, so content
+// threads any counterpart through `ev.data`; `other` is here for a future engine-internal custom
+// fire). A subject with no on(name,fn) handler for this kind is a clean no-op (the firer doesn't
+// know who, if anyone, subscribes — the loose coupling the event bus exists for). Zone goroutine.
+func (z *Zone) fireCustomEvent(kind eventKind, subject, other *Entity, mag float64, rng *rand.Rand, depth int, budget *int) {
+	if z == nil || z.lua == nil || subject == nil {
+		return
+	}
+	rt := z.lua
+	es := rt.ensureEntityScript(subject)
+	if es == nil {
+		return // the subject carries no trigger handlers (no *Scripted source / no state)
+	}
+	h, ok := es.handlers.RawGetString(string(kind)).(*lua.LFunction)
+	if !ok {
+		return // no handler subscribed to this custom kind on this subject
+	}
+	if *budget <= 0 {
+		z.log.Warn("event handler budget exhausted; custom cascade truncated",
+			"event", string(kind), "subject", subject.short)
+		return
+	}
+	*budget--
+	if z.log.Enabled(context.Background(), slog.LevelDebug) {
+		z.log.Debug("custom event fire", "event", string(kind), "subject", subject.short,
+			"origin", "trigger:#"+ridStr(subject.rid), "depth", depth+1)
+	}
+	// The cascade ctx the handler runs under: the SUBJECT acts (a harm op in the handler is
+	// attributed to it + gated), the counterpart is `other`, and the depth+budget are threaded so a
+	// re-fire from inside the handler stays bounded by the same caps. This is the identical ctx shape
+	// an engine-event Lua handler runs under (runLuaEventHandler above).
+	c := &effectCtx{
+		z: z, actor: subject, source: subject, target: subject, other: other,
+		mag: mag, disp: dispNeutral, rng: rng, depth: depth + 1, eventBudget: budget,
+	}
+	ev := rt.evTable(other, "")
+	ev.RawSetString("mag", lua.LNumber(mag))
+	if rt.fireData != nil {
+		// The firer's plain-data table (mud.fire's 3rd arg), threaded via the runtime (NOT the engine
+		// fireEvent signature, which is shared by every engine kind and must not carry a Lua value).
+		ev.RawSetString("data", rt.fireData)
+	}
+	binds := map[string]lua.LValue{
+		"self":  rt.newHandle(subject),
+		"state": es.state,
+		"ev":    ev,
+	}
+	rt.fireTriggerCall(es, h, c, binds, ev)
 }

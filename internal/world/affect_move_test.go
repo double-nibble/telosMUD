@@ -23,7 +23,7 @@ func TestAffectTickSurvivesIntraShardMove(t *testing.T) {
 	e := s.entity
 	A.join(s, "")
 
-	inst := applyAffect(e, "poison", attachOpts{})
+	inst := applyAffect(e, "poison", attachOpts{}, nil)
 	if inst == nil {
 		t.Fatal("poison not applied (demo affect def missing?)")
 	}

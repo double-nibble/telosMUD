@@ -32,7 +32,14 @@ type attachOpts struct {
 // and ensures the per-entity tick is running. Returns the live instance (nil if the ref is unknown /
 // no Living). Single-writer: zone goroutine. (Named applyAffect, not attach — a test helper owns the
 // `attach` identifier in the package; this also reads as the apply_affect op name 5.3 will register.)
-func applyAffect(e *Entity, ref string, opts attachOpts) *affectInstance {
+// `parent` is the IN-FLIGHT effect cascade ctx when this apply happens INSIDE one (an apply_affect op
+// run by an event handler) — threaded into the OnApplyAffect bus fire so a NESTED apply inherits the
+// cascade's depth + width budget and trips maxEventDepth/maxEventHandlers (event.go) instead of
+// resetting to a fresh depth-0 root each pass. Without it, two mutually-applying affects recurse the
+// Go stack unbounded (no Lua VM, so no sandbox defense) until the process fatal-panics. A TRUE root
+// apply (a cast step, a tick, an equip, a persistence load) passes nil — a fresh root cascade. The
+// zone-level backstop in fireEvent is the can't-forget second guard.
+func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *affectInstance {
 	if e == nil || e.living == nil || e.zone == nil {
 		return nil
 	}
@@ -108,7 +115,7 @@ func applyAffect(e *Entity, ref string, opts attachOpts) *affectInstance {
 	a.recomputeMods()
 	markAttrsDirty(e)
 	a.ensureTick(e)
-	fireOnApplyAffect(e, inst) // RESERVED hook (5.3 wires the gated op-list)
+	fireOnApplyAffect(e, inst, parent) // RESERVED hook + OnApplyAffect bus fire (threads the cascade)
 	e.zone.log.Debug("affect attached", "ref", ref, "rid", e.rid,
 		"remaining", inst.remaining, "stacks", inst.stacks, "stacking", def.stacking)
 	return inst
@@ -117,7 +124,13 @@ func applyAffect(e *Entity, ref string, opts attachOpts) *affectInstance {
 // expire removes an affect instance from the entity: drops it from list + byKey, recomputes the
 // modifiers + prevents (so its contribution is gone), re-dirties the attr cache, and fires the
 // RESERVED OnAffectExpire hook. Single-writer: zone goroutine (called from the tick).
-func (a *Affected) expire(e *Entity, inst *affectInstance) {
+//
+// `parent` is the in-flight cascade ctx when expiry happens INSIDE an effect cascade (a remove_affect/
+// dispel op run by a handler) — threaded into the OnAffectExpire bus fire so a NESTED expire (an
+// OnAffectExpire handler that dispels another affect, …) inherits the cascade depth/width budget and
+// trips the guards instead of resetting to a fresh root. A true root expire (the tick's countdown,
+// a room-affect clear) passes nil. fireEvent's zone-level backstop is the can't-forget second guard.
+func (a *Affected) expire(e *Entity, inst *affectInstance, parent *effectCtx) {
 	for i, x := range a.list {
 		if x == inst {
 			a.list = append(a.list[:i], a.list[i+1:]...)
@@ -127,7 +140,7 @@ func (a *Affected) expire(e *Entity, inst *affectInstance) {
 	delete(a.byKey, keyFor(inst.def, inst.source))
 	a.recomputeMods()
 	markAttrsDirty(e)
-	fireOnAffectExpire(e, inst) // RESERVED hook (5.3)
+	fireOnAffectExpire(e, inst, parent) // RESERVED hook + OnAffectExpire bus fire (threads the cascade)
 	e.zone.log.Debug("affect expired", "ref", inst.def.ref, "rid", e.rid)
 }
 
@@ -264,13 +277,18 @@ func (a *Affected) tickOnce(e *Entity, pulse uint64) {
 			if inst.sinceTick >= inst.def.tickInterval {
 				inst.sinceTick = 0
 				fireOnTick(e, inst, pulse) // RESERVED op-list (5.3 wires the gated deal_damage etc.)
+				// EVENT BUS (7.8b): light the reserved OnAffectTick kind at each tick-interval
+				// boundary, INDEPENDENT of the def's op-list (a subscriber reacts to the tick even
+				// for an affect with no tickOps). Subject = the affected entity, counterpart = the
+				// affect's source. A clean root fire (a tick, like the affect lifecycle hooks).
+				e.zone.fireEvent(nil, evOnAffectTick, e, inst.source, float64(maxInt(inst.stacks, 1)))
 			}
 		}
 		if inst.remaining > 0 {
 			inst.remaining--
 		}
 		if inst.remaining <= 0 {
-			a.expire(e, inst)
+			a.expire(e, inst, nil) // a tick-countdown expiry is a genuine root (fresh cascade)
 		}
 	}
 	runRegen(e)
@@ -280,27 +298,37 @@ func (a *Affected) tickOnce(e *Entity, pulse uint64) {
 // §8, docs/PHASE5-PLAN.md §1.4 / 5.2 scope boundary). This slice builds the hook POINTS and logs at
 // DEBUG; the gated effect-op interpreter that runs the op-list lands in 5.3. They are intentionally
 // no-op-with-a-log so the runtime is whole and 5.3 only fills the body — no lifecycle change.
-func fireOnApplyAffect(e *Entity, inst *affectInstance) {
+func fireOnApplyAffect(e *Entity, inst *affectInstance, parent *effectCtx) {
 	// Lua on_apply hook (7.4d): runs when the affect attaches. `self` = e, actor = the affect's
 	// source. nil-safe / no-op when no Lua hook. The op-list onApply remains reserved.
 	if inst.def.onApplyLua != "" {
 		e.zone.runAffectHookLua(e, inst, "on_apply", inst.def.onApplyLua)
 	}
-	if inst.def.onApply == nil {
-		return
+	if inst.def.onApply != nil {
+		e.zone.log.Debug("affect on_apply hook (reserved op-list; 5.3)", "ref", inst.def.ref, "rid", e.rid)
 	}
-	e.zone.log.Debug("affect on_apply hook (reserved op-list; 5.3)", "ref", inst.def.ref, "rid", e.rid)
+	// EVENT BUS (7.8b): light the reserved OnApplyAffect kind. The affect ATTACHED, so the bus fires
+	// the event ABOUT the affected entity (subject = e) with the affect's source as the counterpart —
+	// content/Lua subscribers (a resource/affect on_event, a Lua bus handler) react. `parent` THREADS
+	// the in-flight cascade when this apply ran inside an effect cascade (an apply_affect op a handler
+	// fired), so a NESTED apply trips maxEventDepth/maxEventHandlers; a true root (cast step/equip/load)
+	// passes nil for a fresh cascade. So "a missing hook is an engine bug" holds AND the cascade stays
+	// bounded (the fireEvent zone-backstop guards a forgotten thread besides).
+	e.zone.fireEvent(parent, evOnApplyAffect, e, inst.source, 1)
 }
 
-func fireOnAffectExpire(e *Entity, inst *affectInstance) {
+func fireOnAffectExpire(e *Entity, inst *affectInstance, parent *effectCtx) {
 	// Lua on_expire hook (7.4d): runs when the affect expires.
 	if inst.def.onExpireLua != "" {
 		e.zone.runAffectHookLua(e, inst, "on_expire", inst.def.onExpireLua)
 	}
-	if inst.def.onExpire == nil {
-		return
+	if inst.def.onExpire != nil {
+		e.zone.log.Debug("affect on_expire hook (reserved op-list; 5.3)", "ref", inst.def.ref, "rid", e.rid)
 	}
-	e.zone.log.Debug("affect on_expire hook (reserved op-list; 5.3)", "ref", inst.def.ref, "rid", e.rid)
+	// EVENT BUS (7.8b): light the reserved OnAffectExpire kind (subject = the affected entity, the
+	// affect's source as the counterpart). `parent` threads the in-flight cascade for a NESTED expire
+	// (a remove_affect/dispel op a handler ran) so it trips the guards; a root expire passes nil.
+	e.zone.fireEvent(parent, evOnAffectExpire, e, inst.source, 1)
 }
 
 // fireOnTick runs an affect's on_tick op-list through the GATED effect-op interpreter (Phase 5.3

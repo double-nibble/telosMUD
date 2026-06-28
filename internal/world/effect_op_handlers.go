@@ -159,7 +159,7 @@ func opApplyAffect(c *effectCtx, op *effectOp) error {
 		applyDebuff(c, c.target, op.affect, opts)
 		return nil
 	}
-	applyAffect(c.target, op.affect, opts)
+	applyAffect(c.target, op.affect, opts, c) // thread the cascade ctx (bounds a nested OnApplyAffect)
 	return nil
 }
 
@@ -187,7 +187,7 @@ func opRemoveAffect(c *effectCtx, op *effectOp) error {
 		return nil
 	}
 	if inst, present := a.byKey[keyFor(def, c.source)]; present {
-		a.expire(c.target, inst)
+		a.expire(c.target, inst, c) // thread the cascade ctx (bounds a nested OnAffectExpire)
 	}
 	return nil
 }
@@ -230,7 +230,7 @@ func opDispel(c *effectCtx, op *effectOp) error {
 		if inst.def.onDispelLua != "" {
 			c.z.runAffectHookLua(c.target, inst, "on_dispel", inst.def.onDispelLua)
 		}
-		a.expire(c.target, inst)
+		a.expire(c.target, inst, c) // thread the cascade ctx (bounds a nested OnAffectExpire)
 		removed++
 	}
 	return nil

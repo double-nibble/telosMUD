@@ -189,7 +189,7 @@ func TestOpIfBranchesOnHasAffect(t *testing.T) {
 	if resourceCurrent(mob, "hp") != 95 {
 		t.Fatalf("if-else (not poisoned) -> hp %d, want 95", resourceCurrent(mob, "hp"))
 	}
-	applyAffect(mob, "poison", attachOpts{source: caster.entity})
+	applyAffect(mob, "poison", attachOpts{source: caster.entity}, nil)
 	opIf(c, ifOp) // poisoned -> then (50)
 	if resourceCurrent(mob, "hp") != 45 {
 		t.Fatalf("if-then (poisoned) -> hp %d, want 45", resourceCurrent(mob, "hp"))
@@ -332,7 +332,7 @@ func TestLifecycleTagCCBlocksAtStep3(t *testing.T) {
 		ref: "silence", name: "Silenced", stacking: stackRefresh, maxStacks: 1, duration: 10,
 		prevents: []string{"verbal"},
 	})
-	applyAffect(caster.entity, "silence", attachOpts{})
+	applyAffect(caster.entity, "silence", attachOpts{}, nil)
 	def := z.defs.ability.get("fireball")
 	z.castAbility(caster, def, "goblin", rand.New(rand.NewSource(1)))
 	if resourceCurrent(caster.entity, "mana") != 100 {
@@ -450,7 +450,7 @@ func TestPvPGuardBlocksDoTTick(t *testing.T) {
 	// Apply poison while consenting (both opted in), then revoke consent before the tick.
 	setFlag(caster.entity, flagPvP, true)
 	setFlag(victim.entity, flagPvP, true)
-	applyAffect(victim.entity, "poison", attachOpts{source: caster.entity})
+	applyAffect(victim.entity, "poison", attachOpts{source: caster.entity}, nil)
 	setFlag(victim.entity, flagPvP, false) // victim opts out
 
 	// Drive the affect tick to the poison interval (6). The DoT's deal_damage must funnel through the
@@ -541,7 +541,7 @@ func TestDispelAndRemoveAffectGatedOnProtectedPlayer(t *testing.T) {
 	// dispel: victim has a dispellable buff; an attacker with no consent must not strip it.
 	{
 		victim := makePlayerTargetInRoom(z, caster.entity, "DispelVic")
-		applyAffect(victim.entity, "haste", attachOpts{}) // dispellable buff
+		applyAffect(victim.entity, "haste", attachOpts{}, nil) // dispellable buff
 		c := seededCtx(z, caster.entity, victim.entity, dispNeutral)
 		opDispel(c, &effectOp{}) // any category, all
 		if a, ok := Get[*Affected](victim.entity); !ok || len(a.list) != 1 {
@@ -551,7 +551,7 @@ func TestDispelAndRemoveAffectGatedOnProtectedPlayer(t *testing.T) {
 	// remove_affect: same — keyed per-source by the caster, applied by the caster so the key matches.
 	{
 		victim := makePlayerTargetInRoom(z, caster.entity, "RemoveVic")
-		applyAffect(victim.entity, "haste", attachOpts{source: caster.entity})
+		applyAffect(victim.entity, "haste", attachOpts{source: caster.entity}, nil)
 		c := seededCtx(z, caster.entity, victim.entity, dispNeutral)
 		opRemoveAffect(c, &effectOp{affect: "haste"})
 		if a, ok := Get[*Affected](victim.entity); !ok || len(a.list) != 1 {
@@ -560,7 +560,7 @@ func TestDispelAndRemoveAffectGatedOnProtectedPlayer(t *testing.T) {
 	}
 	// Self-cleanse stays ungated: a player removing their OWN affect works.
 	{
-		applyAffect(caster.entity, "haste", attachOpts{})
+		applyAffect(caster.entity, "haste", attachOpts{}, nil)
 		c := seededCtx(z, caster.entity, caster.entity, dispNeutral)
 		opDispel(c, &effectOp{})
 		if a, ok := Get[*Affected](caster.entity); ok && len(a.list) != 0 {

@@ -54,7 +54,7 @@ func TestAffectModifierFeedsDerivation(t *testing.T) {
 	if got := attr(e, "strength"); got != 10 {
 		t.Fatalf("base strength = %v, want 10", got)
 	}
-	applyAffect(e, "weaken", attachOpts{})
+	applyAffect(e, "weaken", attachOpts{}, nil)
 	if got := attr(e, "strength"); got != 8 {
 		t.Fatalf("weakened strength = %v, want 8 (10-2)", got)
 	}
@@ -64,9 +64,9 @@ func TestAffectModifierFeedsDerivation(t *testing.T) {
 // TestStackingRefresh: a second weaken resets the timer, never doubling the modifier.
 func TestStackingRefresh(t *testing.T) {
 	_, e := affectTestZone(t)
-	inst := applyAffect(e, "weaken", attachOpts{})
+	inst := applyAffect(e, "weaken", attachOpts{}, nil)
 	inst.remaining = 3 // simulate decay
-	applyAffect(e, "weaken", attachOpts{})
+	applyAffect(e, "weaken", attachOpts{}, nil)
 	if inst.remaining != 20 {
 		t.Fatalf("refresh remaining = %d, want reset to 20", inst.remaining)
 	}
@@ -78,18 +78,18 @@ func TestStackingRefresh(t *testing.T) {
 // TestStackingCount: poison stacks up to max_stacks; magnitude (the -2 strength) scales with stacks.
 func TestStackingCount(t *testing.T) {
 	_, e := affectTestZone(t)
-	applyAffect(e, "poison", attachOpts{}) // 1 stack: -2
+	applyAffect(e, "poison", attachOpts{}, nil) // 1 stack: -2
 	if got := attr(e, "strength"); got != 8 {
 		t.Fatalf("1-stack strength = %v, want 8", got)
 	}
-	applyAffect(e, "poison", attachOpts{}) // 2 stacks: -4
-	applyAffect(e, "poison", attachOpts{}) // 3 stacks: -6
+	applyAffect(e, "poison", attachOpts{}, nil) // 2 stacks: -4
+	applyAffect(e, "poison", attachOpts{}, nil) // 3 stacks: -6
 	if got := attr(e, "strength"); got != 4 {
 		t.Fatalf("3-stack strength = %v, want 4 (10 - 2*3)", got)
 	}
 	// Push past max_stacks (5): a 6th application stays capped at 5.
 	for i := 0; i < 5; i++ {
-		applyAffect(e, "poison", attachOpts{})
+		applyAffect(e, "poison", attachOpts{}, nil)
 	}
 	a, _ := Get[*Affected](e)
 	if a.list[0].stacks != 5 {
@@ -103,8 +103,8 @@ func TestStackingCount(t *testing.T) {
 // TestStackingExtend: a second application sums the durations.
 func TestStackingExtend(t *testing.T) {
 	_, e := affectTestZone(t)
-	inst := applyAffect(e, "extender", attachOpts{}) // remaining 10
-	applyAffect(e, "extender", attachOpts{})         // remaining 20
+	inst := applyAffect(e, "extender", attachOpts{}, nil) // remaining 10
+	applyAffect(e, "extender", attachOpts{}, nil)         // remaining 20
 	if inst.remaining != 20 {
 		t.Fatalf("extend remaining = %d, want 20 (10+10)", inst.remaining)
 	}
@@ -113,9 +113,9 @@ func TestStackingExtend(t *testing.T) {
 // TestStackingIgnore: first wins — a second application is a no-op (timer + modifier unchanged).
 func TestStackingIgnore(t *testing.T) {
 	_, e := affectTestZone(t)
-	inst := applyAffect(e, "oncebuff", attachOpts{})
+	inst := applyAffect(e, "oncebuff", attachOpts{}, nil)
 	inst.remaining = 4
-	applyAffect(e, "oncebuff", attachOpts{}) // ignored
+	applyAffect(e, "oncebuff", attachOpts{}, nil) // ignored
 	if inst.remaining != 4 {
 		t.Fatalf("ignore remaining = %d, want unchanged 4", inst.remaining)
 	}
@@ -133,7 +133,7 @@ func TestAffectExpires(t *testing.T) {
 		modifiers: []affectModifier{{attr: "strength", add: true, value: -2}},
 		prevents:  []string{"move"},
 	})
-	applyAffect(e, "brief", attachOpts{})
+	applyAffect(e, "brief", attachOpts{}, nil)
 	if got := attr(e, "strength"); got != 8 || !preventsTag(e, "move") {
 		t.Fatalf("pre-expire: strength=%v prevents-move=%v", got, preventsTag(e, "move"))
 	}
@@ -159,7 +159,7 @@ func TestPreventsTagQuery(t *testing.T) {
 	if preventsTag(e, "move") {
 		t.Fatal("no affect yet, must not prevent move")
 	}
-	applyAffect(e, "root", attachOpts{})
+	applyAffect(e, "root", attachOpts{}, nil)
 	if !preventsTag(e, "move") {
 		t.Fatal("root must prevent move")
 	}
@@ -230,7 +230,7 @@ func TestResourceRegenInCombatOptIn(t *testing.T) {
 // interval — proven by the sinceTick counter resetting AND the affect still decrementing/expiring.
 func TestPoisonTickHookFires(t *testing.T) {
 	z, e := affectTestZone(t)
-	inst := applyAffect(e, "poison", attachOpts{})
+	inst := applyAffect(e, "poison", attachOpts{}, nil)
 	// poison: duration 30, tick interval 6. After 6 ticks the hook fires (sinceTick resets to 0) and
 	// remaining has dropped by 6.
 	for i := 0; i < 6; i++ {
@@ -253,7 +253,7 @@ func TestAffectSurvivesSaveLoad(t *testing.T) {
 	z.players["Wynne"] = src
 
 	// Apply a demo poison, then decay it to a partial remaining.
-	inst := applyAffect(e, "poison", attachOpts{})
+	inst := applyAffect(e, "poison", attachOpts{}, nil)
 	inst.remaining = 11
 	inst.stacks = 3
 
@@ -303,7 +303,7 @@ func TestLoadAffectlessSnapshotSane(t *testing.T) {
 // tick re-resolves by id, finds nothing, and CANCELS (does not touch a stale captured entity).
 func TestTickCancelsWhenPlayerAbsent(t *testing.T) {
 	z, e := affectTestZone(t)
-	applyAffect(e, "weaken", attachOpts{})
+	applyAffect(e, "weaken", attachOpts{}, nil)
 	a, _ := Get[*Affected](e)
 	if a.tick == nil {
 		t.Fatal("tick not registered after attach")
@@ -330,7 +330,7 @@ func TestTickCancelsWhenPlayerAbsent(t *testing.T) {
 func TestTickSkipsFrozenPlayer(t *testing.T) {
 	z, e := affectTestZone(t)
 	s := z.players["Hero"]
-	applyAffect(e, "weaken", attachOpts{})
+	applyAffect(e, "weaken", attachOpts{}, nil)
 	a, _ := Get[*Affected](e)
 	before := a.list[0].remaining
 
@@ -342,7 +342,7 @@ func TestTickSkipsFrozenPlayer(t *testing.T) {
 
 	// Thawing resumes ticking — but the cancelled callback is gone, so re-arm via a fresh attach path.
 	s.frozen = false
-	applyAffect(e, "weaken", attachOpts{}) // refresh re-ensures the tick
+	applyAffect(e, "weaken", attachOpts{}, nil) // refresh re-ensures the tick
 	z.pulses.tick()
 	if a.list[0].remaining == 20 {
 		t.Fatal("thawed player still not ticking (remaining never decremented)")
@@ -354,7 +354,7 @@ func TestTickSkipsFrozenPlayer(t *testing.T) {
 // the zone goroutine each fire. A departed player cancels cleanly with no race.
 func TestTickContractUnderZoneLoop(t *testing.T) {
 	z, e := affectTestZone(t)
-	applyAffect(e, "poison", attachOpts{})
+	applyAffect(e, "poison", attachOpts{}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -374,7 +374,7 @@ func TestTickContractUnderZoneLoop(t *testing.T) {
 // aliased instances, maps, or tick handle.
 func TestAffectedCOWReset(t *testing.T) {
 	_, e := affectTestZone(t)
-	applyAffect(e, "poison", attachOpts{})
+	applyAffect(e, "poison", attachOpts{}, nil)
 	orig, _ := Get[*Affected](e)
 	clone := cloneComponent(orig).(*Affected)
 	if len(clone.list) != 0 || clone.byKey == nil || len(clone.byKey) != 0 {

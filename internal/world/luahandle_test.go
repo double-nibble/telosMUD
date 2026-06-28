@@ -43,7 +43,7 @@ func handleTestZone(t *testing.T) (*Zone, *luaRuntime, *Entity) {
 	Move(self, room)
 	setFlag(self, "aggressive", true)
 	setResourceCurrent(self, "hp", 73)
-	applyAffect(self, "blessed", attachOpts{magnitude: 3})
+	applyAffect(self, "blessed", attachOpts{magnitude: 3}, nil)
 
 	return z, z.lua, self
 }

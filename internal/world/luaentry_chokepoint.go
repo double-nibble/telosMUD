@@ -64,12 +64,28 @@ func classifyLuaError(err error) luaAbortKind {
 // reads results off the stack after (for nret>0).
 func (rt *luaRuntime) pcallGuarded(scriptKey, origin string, nargs, nret int) error {
 	L := rt.L
-	ctx, cancel := contextWithLuaDeadline()
-	defer cancel()
-	L.SetContext(ctx)
-	L.ResetInstructionCount()
-	rt.resetSpawnBudget()
-	defer L.RemoveContext()
+
+	// NESTING (the single-writer re-entrant case): a Lua entry point can run a Go builtin (a harm op,
+	// mud.fire) that fires an event whose handler is ITSELF Lua — a NESTED pcallGuarded on the same
+	// LState, while the OUTER call is still mid-flight on the Go stack. The outer call is executing
+	// mainLoopWithContext, which reads L.ctx every op (vm.go); if the nested call RemoveContext'd on
+	// return, the outer loop would deref a nil ctx (a crash) the moment it ran its next bytecode op.
+	// So a nested call must NOT tear down the parent's context — it REUSES it: the nested Lua runs
+	// under the parent's wall-clock deadline and the parent's running instruction count (STRICTER,
+	// never weaker — nested work counts against the same budget, so a script cannot re-nest to reset
+	// its instruction tally and run unbounded). Only the TOP-LEVEL entry (no context set) arms a
+	// fresh deadline + zeroes the count, and only it tears the context down after. The spawn budget
+	// is likewise per-cascade: only the top-level entry resets it (a nested spawn counts against the
+	// outer call's per-call cap, the same stricter discipline).
+	nested := L.Context() != nil
+	if !nested {
+		ctx, cancel := contextWithLuaDeadline()
+		defer cancel()
+		L.SetContext(ctx)
+		L.ResetInstructionCount()
+		rt.resetSpawnBudget()
+		defer L.RemoveContext()
+	}
 
 	err := L.PCall(nargs, nret, nil)
 	kind := classifyLuaError(err)
