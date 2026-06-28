@@ -50,13 +50,19 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   one-shot `createFailedMsg` on the create goroutine's permanent-failure branch, and
   `characterCreateFailed` delete-evicts the orphaned stash (security-auditor re-confirmed the
   cross-session same-name deletion is structurally impossible). Tests: eviction + false-eviction guard.
-- **pgx-gated + chaos coverage for the create-window logout race** — the regressions
-  `TestShardRestartCreateRaceLosesMove` + `TestCreateWindowFailEvictsLogoutStash` are MemStore-only;
-  real Postgres widens the create window (the higher-risk env). Add a `TELOS_TEST_DSN`-gated pgx
-  equivalent + a chaos variant that quits at randomized offsets within the create round-trip, AND a
-  belt-and-suspenders cross-session same-name test (A gated-fail + quit-in-window, then B gated-success
-  reusing the name + quit-after-move, A's failure released last → assert B's row survives — locks the
-  eviction invariant against future refactors). (test coverage) · *test-engineer/persistence*
+- ~~**pgx-gated + chaos coverage for the create-window logout race**~~ — RESOLVED: the
+  `TELOS_TEST_DSN`-gated, real-Postgres tier landed in `internal/gate/createrace_pgx_test.go` (co-located
+  with the MemStore `createrace_repro_test.go`), driving the full gate→world Play path with a real
+  `*store.Pool` wrapped in a thin `gatedPgxStore` decorator that blocks/delays `CreateCharacter`:
+  (1) `TestPgxCreateWindowLogoutRacePersistsMove` — move+quit inside the window, release the real INSERT,
+  assert the moved room is durably persisted; (2) `TestPgxCreateWindowFailLeavesNoRow` — permanent create
+  failure leaves Postgres with zero rows (eviction holds, nothing resurrected); (3)
+  `TestPgxCreateWindowChaosRandomOffsets` — 20 iterations (looped to 400 in CI-style runs) at randomized
+  create-completion offsets across success/failure, asserting the durable end-state is ALWAYS correct;
+  (4) `TestPgxCrossSessionSameNameEvictionDoesNotClobber` — the belt-and-suspenders cross-session test (A
+  gated-fail + quit-in-window, B gated-success reusing the name on a second zone + quit-after-move, A's
+  failure released LAST → B's market row survives). All four `t.Skip` with no DSN; verified green against
+  real PG (incl. `-race`). (test coverage) · *test-engineer/persistence*
 - ~~**Room-affect tick cadence** — `affect_room.go:189`: the room tick fires EVERY
   pulse and re-leases the CC to every occupant; should lease at `tickInterval`. (perf/hardening) · *world*~~
   **RESOLVED:** `roomTickOnce` now mirrors the per-entity tick — the per-occupant re-lease
