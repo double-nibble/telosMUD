@@ -81,6 +81,13 @@ const (
 
 const (
 	evOnEnter eventKind = "OnEnter" // an entity entered a room (the movement hook) — live 7.8
+	// evToHit is the to-hit REACTION checkpoint (7.9, P7-D8): fired about the DEFENDER right BEFORE a
+	// swing's to-hit roll (combat.go), carrying the attacker as `other`. It is a RESULT-ALTERING
+	// reaction checkpoint (a Lua Shield hook raises the defender's AC for the triggering swing via
+	// rx:modify("ac", +delta)) — the engine consults the reaction's recorded "ac" delta at the seam.
+	// Unlike the other lit kinds it is fired through the reaction path (luareact.go), not a plain
+	// declarative fireEvent, because only a Lua body carrying an `rx` can alter the to-hit result.
+	evToHit eventKind = "ToHit"
 )
 
 // knownEventKinds is the closed set the parser validates content `on_event` keys against. It is the
@@ -91,6 +98,7 @@ var knownEventKinds = map[eventKind]bool{
 	evOnCheck: true, evOnAbilityResolved: true, evOnHit: true, evOnDamageTaken: true,
 	evOnKill: true, evOnLeaveRoom: true, evBeforeCastCommit: true, evOnRest: true,
 	evOnApplyAffect: true, evOnAffectTick: true, evOnAffectExpire: true, evOnEnter: true,
+	evToHit: true,
 }
 
 // customEventSep is the namespace separator that makes a custom (content-defined) event kind

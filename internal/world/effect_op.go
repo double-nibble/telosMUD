@@ -64,6 +64,12 @@ type effectCtx struct {
 	// after opDealDamage returns — that read-back corrupts when death/respawn fires inside dealDamage (a
 	// player respawn restores full hp, so a `before - after` delta goes negative). 0 until dealDamage runs.
 	lastDamage int
+	// reactACBonus is a TRANSIENT, swing-scoped defender-AC bump recorded by a to-hit REACTION (7.9,
+	// Shield: rx:modify("ac", +delta)). The swing pipeline (combat.go) sets it on this per-swing ctx
+	// from the reaction's "ac" delta BEFORE the to-hit check; resolveCheck (check.go) adds it to the
+	// to-hit DC (the DC IS the defender's AC) so the bump re-classifies hit/miss for THIS swing only and
+	// never persists on the defender. 0 outside the swing's to-hit path (every other check ignores it).
+	reactACBonus float64
 }
 
 // rollChance returns true with probability p (clamped to [0,1]). Uses the ctx rng when present so a
@@ -349,6 +355,18 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType string) int {
 	dmg := mitigate(target, raw, dmgType)
 	if dmg <= 0 {
 		c.z.log.Debug("deal_damage fully mitigated", "target", target.short, "type", dmgType, "raw", raw)
+		return 0
+	}
+	// --- OnDamageTaken REACTION checkpoint (7.9, P7-D8 / T12): BEFORE applying the (mitigated) damage,
+	// fire a result-altering reaction about the TARGET (subject) carrying the pending `dmg` as the event
+	// mag and the attacker as `other`. A Lua hook may reduce the pending amount (rx:modify("amount",
+	// -soak)), CANCEL it (rx:cancel() negates the blow), or — the concentration case — rx:cancel() ITSELF
+	// (drop the concentration affect on a failed save; the affect break is applied at the seam). The
+	// reaction threads THIS ctx's eventBudget (T12 invariant 3) so an OnDamageTaken→reaction→damage loop
+	// is bounded. Observe-then-recheck: we re-read the recorded mutations here and apply only what the
+	// checkpoint permits ("amount" is the sole modify field; concentration's cancelAffect is dropped).
+	if dmg = c.z.applyDamageReaction(c, target, dmg); dmg <= 0 {
+		c.z.log.Debug("deal_damage fully negated by an OnDamageTaken reaction", "target", target.short)
 		return 0
 	}
 	// Apply to the target's vital resource pool (the first vital resource — hp in the demo). The pool

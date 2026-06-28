@@ -159,6 +159,13 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 	default:
 		res.dc = 0 // a pure-total check (e.g. PbtA): bands test the total directly, margin == total
 	}
+	// Transient to-hit AC bump (7.9 Shield reaction): a defender's reaction may raise its effective AC
+	// for the triggering swing only (combat.go sets c.reactACBonus from the to-hit reaction's "ac"
+	// delta). The to-hit DC IS the defender's AC, so adding it here raises the threshold the attacker's
+	// roll must beat — BEFORE the bands match, so hit/miss re-classifies correctly. 0 (the default) for
+	// every other check, so this is inert outside the swing's to-hit path. The bump lives only on this
+	// per-swing ctx; it never writes the defender's stored AC.
+	res.dc += c.reactACBonus
 	res.margin = res.total - res.dc
 
 	// Band edges are formulas scoped like bonus/vs (default $actor), evaluated lazily per band.

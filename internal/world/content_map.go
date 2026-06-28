@@ -106,16 +106,17 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		dispellable: a.Dispellable,
 		roomScoped:  a.Scope == "room", // [G13] room-scoped affect (web/darkness/...); default entity-scoped
 
-		duration:    a.Body.Duration,
-		modifiers:   mods,
-		prevents:    prevents,
-		onApply:     a.Body.OnApply,
-		onExpire:    a.Body.OnExpire,
-		onApplyLua:  a.Body.OnApplyLua,
-		onExpireLua: a.Body.OnExpireLua,
-		onDispelLua: a.Body.OnDispelLua,
-		onEvent:     parseEventMap(a.Body.OnEvent, "affect "+a.Ref),
-		onEventLua:  parseLuaEventMap(a.Body.OnEventLua, "affect "+a.Ref),
+		duration:      a.Body.Duration,
+		modifiers:     mods,
+		prevents:      prevents,
+		onApply:       a.Body.OnApply,
+		onExpire:      a.Body.OnExpire,
+		onApplyLua:    a.Body.OnApplyLua,
+		onExpireLua:   a.Body.OnExpireLua,
+		onDispelLua:   a.Body.OnDispelLua,
+		onEvent:       parseEventMap(a.Body.OnEvent, "affect "+a.Ref),
+		onEventLua:    parseLuaEventMap(a.Body.OnEventLua, "affect "+a.Ref),
+		onReactionLua: parseLuaEventMap(a.Body.OnReactionLua, "affect "+a.Ref+" (reaction)"),
 	}
 	if t := a.Body.Tick; t != nil {
 		def.hasTick = true

@@ -77,6 +77,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 			perRound:          r.PerRound,
 			onEvent:           parseEventMap(r.OnEvent, "resource "+r.Ref),
 			onEventLua:        parseLuaEventMap(r.OnEventLua, "resource "+r.Ref),
+			onReactionLua:     parseLuaEventMap(r.OnReactionLua, "resource "+r.Ref+" (reaction)"),
 		}
 		// on_depleted ([G-D]): the death-hook op-list, parsed like any op-list. A malformed list logs
 		// loudly and registers with whatever parsed (content-lint discipline); nil/absent => engine default

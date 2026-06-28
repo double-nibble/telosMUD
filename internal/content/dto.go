@@ -130,6 +130,11 @@ type ResourceDTO struct {
 	OnEvent map[string]any `json:"on_event" yaml:"on_event"`
 	// OnEventLua is the Lua-BODY alternative to OnEvent (Phase 7.4g): event-name -> Lua handler body.
 	OnEventLua map[string]string `json:"on_event_lua" yaml:"on_event_lua"`
+	// OnReactionLua is the RESULT-ALTERING reaction surface (Phase 7.9): a Lua handler keyed by a
+	// reaction checkpoint (BeforeCastCommit/ToHit/OnDamageTaken) that receives a typed `rx` (cancel/
+	// modify/replace_target/consume_resource). Distinct from OnEventLua so a dual-fired checkpoint never
+	// runs one handler twice.
+	OnReactionLua map[string]string `json:"on_reaction_lua" yaml:"on_reaction_lua"`
 	// OnDepleted is the op-list the engine runs when a VITAL resource hits 0 — the [G-D] death hook
 	// (Phase 6.3b). It runs ON the dying entity (the victim is $actor) BEFORE the engine's die() drops
 	// combat and builds the corpse, so content can narrate or fire a last-gasp effect. An empty/absent
@@ -198,6 +203,11 @@ type AffectBodyDTO struct {
 	OnEvent map[string]any `json:"on_event" yaml:"on_event"`
 	// OnEventLua is the Lua-BODY alternative to OnEvent (Phase 7.4g): event-name -> Lua handler body.
 	OnEventLua map[string]string `json:"on_event_lua" yaml:"on_event_lua"`
+	// OnReactionLua is the RESULT-ALTERING reaction surface (Phase 7.9): a Lua reaction handler keyed
+	// by a reaction checkpoint, receiving a typed `rx` (a concentration affect carries
+	// on_reaction_lua[OnDamageTaken] that rx:cancel()s itself on a failed save). Distinct from
+	// OnEventLua so a dual-fired checkpoint never double-fires one handler.
+	OnReactionLua map[string]string `json:"on_reaction_lua" yaml:"on_reaction_lua"`
 }
 
 // AffectModifierDTO is one entry of an affect's modifier list: it adds (op:add) or multiplies

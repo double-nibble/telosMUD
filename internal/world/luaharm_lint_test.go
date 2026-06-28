@@ -95,6 +95,7 @@ var luaBindingFiles = map[string]bool{
 	"luaentry_command.go":  true, // 7.4e custom commands
 	"event.go":             true, // 7.4g Lua bus handlers (runLuaEventHandler builds handle binds)
 	"luastate.go":          true, // 7.6 self.state marshaller (Lua-surface — covered for completeness)
+	"luareact.go":          true, // 7.9 reaction context (rx) — routes the funnels, never a direct write
 }
 
 // lintViolation is one detected direct write (for the build-failing test + the meta-test).

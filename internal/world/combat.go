@@ -383,6 +383,16 @@ func (z *Zone) resolveSwing(attacker, target *Entity, swingIndex int, rng *rand.
 
 	prof := combatProfileFor(attacker)
 
+	// --- To-hit REACTION checkpoint (7.9, P7-D8 / T12): BEFORE the to-hit roll, fire a result-altering
+	// reaction about the DEFENDER (subject = target, other = attacker) so a Lua Shield hook can raise
+	// the defender's AC for THIS swing only (rx:modify("ac", +5)) — a transient, swing-scoped bump, not
+	// a persistent buff. The recorded delta is threaded into the ctx (c.reactACBonus) so resolveCheck
+	// adds it to the to-hit DC (the DC IS the defender's AC) BEFORE the bands match — so a higher AC
+	// re-classifies hit/miss correctly for THIS swing only, and the bump never persists on the defender.
+	// The reaction threads the round-shared eventBudget (T12 invariant 3) so it can't blow the heartbeat.
+	// The "ac" field is the ONLY allowlisted modify at this checkpoint (luareact.go).
+	c.reactACBonus = z.fireToHitReaction(c, attacker, target)
+
 	// --- Stage to-hit: the content to-hit check classifies hit/miss/crit ([G-F] the sole classifier
 	// when no avoidance is authored). A nil profile/spec auto-hits (degenerate bare-engine case). The
 	// matched band's label drives the outcome: "miss"/"crit"/anything-else=hit; the band's OWN ops also

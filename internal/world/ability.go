@@ -197,14 +197,24 @@ func (z *Zone) scheduleCast(s *session, def *abilityDef, target *Entity, rng *ra
 func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, rng *rand.Rand) {
 	actor := s.entity
 
-	// --- BeforeCastCommit checkpoint ([G9], event.go): an ability is about to commit. v1 fires this as a
-	// reserved declarative checkpoint (a content on_event can build a resource / proc on a cast); the
-	// RESULT-ALTERING use (a Phase-7 Lua Counterspell that CANCELS the cast) only adds a handler here — no
-	// pipeline surgery. The engine does NOT consult a handler's outcome this slice (no cancel path). The
-	// subject is the caster; the cast's target rides as the event `other`. Depth+width guarded (event.go).
+	// --- BeforeCastCommit checkpoint ([G9], event.go): an ability is about to commit. It fires as a
+	// reserved DECLARATIVE checkpoint (a content on_event can build a resource / proc on a cast) AND,
+	// since 7.9, as a RESULT-ALTERING REACTION checkpoint: a Lua Counterspell hook reaches in via the
+	// typed `rx` and CANCELS the cast (rx:cancel()), observe-then-recheck — no pipeline surgery. The
+	// declarative fire's subject is the caster; the cast's target rides as the event `other`. The
+	// reaction fire (fireBeforeCastReaction) instead fires about each eligible OBSERVER in the room
+	// (the would-be counterspeller), with the caster as `other` — the OnLeaveRoom reactor convention.
+	// Depth+width guarded (event.go); the reaction threads the SAME budget (T12 invariant 3).
 	prec := &effectCtx{z: z, actor: actor, source: actor, target: actor, mag: 1, disp: def.disposition, rng: rng}
 	castOrigin := actor.location
 	z.fireEvent(prec, evBeforeCastCommit, actor, target, 1)
+	// The result-altering reaction pass (7.9): if any observer's Counterspell-style reaction cancels
+	// the cast, ABORT before committing (no costs paid, no resolve). Observe-then-recheck: the engine
+	// re-reads the recorded cancel after the inline hook ran.
+	if z.fireBeforeCastReaction(prec, actor, target) {
+		z.log.Debug("cast canceled by a BeforeCastCommit reaction (counterspell)", "ability", def.ref, "caster", actor.short)
+		return
+	}
 	// SC2 (distsys review): if a BeforeCastCommit handler KILLED the caster, die()->respawnPlayer already
 	// relocated + revived them — do NOT commit the cast (it would pay costs + resolve from the respawn
 	// room). Same liveness-after-sub-call discipline as the flee/move M1 fix: a changed location (respawn

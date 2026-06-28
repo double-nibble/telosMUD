@@ -244,6 +244,11 @@ type resourceDef struct {
 	// onEventLua is the Lua-BODY alternative to onEvent (Phase 7.4g): a Lua handler for the keyed
 	// event, run under the SAME depth/width budget as an op-list handler. nil => no Lua handlers.
 	onEventLua map[eventKind]string
+	// onReactionLua is the RESULT-ALTERING reaction surface (Phase 7.9): a Lua handler keyed by a
+	// reaction checkpoint kind that receives a typed `rx` (e.g. a `reactions` pool carrying a
+	// onReactionLua[BeforeCastCommit] counterspell). Distinct from onEventLua so a checkpoint fired by
+	// both the bus and the reaction pass never double-fires one handler. nil => none.
+	onReactionLua map[eventKind]string
 	// onDepleted is the parsed op-list the engine runs on the dying entity when this VITAL resource
 	// hits 0 ([G-D] death hook, death.go). Runs BEFORE die() drops combat / builds the corpse, with the
 	// victim as $actor, so content can narrate / fire a last effect. nil/empty => engine default death
@@ -340,6 +345,15 @@ type affectDef struct {
 	onEvent map[eventKind][]effectOp
 	// onEventLua is the Lua-BODY alternative to onEvent (Phase 7.4g), run under the SAME budget.
 	onEventLua map[eventKind]string
+	// onReactionLua is the RESULT-ALTERING reaction surface (Phase 7.9, P7-D8/T12): a Lua handler
+	// keyed by a reaction CHECKPOINT kind (BeforeCastCommit / ToHit / OnDamageTaken) that receives a
+	// typed `rx` and may cancel/modify/replace_target/consume_resource. It is DELIBERATELY SEPARATE
+	// from onEventLua (the declarative bus): a declarative bus handler runs via fireEvent and CANNOT
+	// alter a result; a reaction handler runs via the reaction pass (luareact.go) WITH an `rx`. Keeping
+	// them distinct means a checkpoint fired by BOTH the bus and the reaction pass (OnDamageTaken) never
+	// double-fires one handler. A concentration affect carries onReactionLua[OnDamageTaken] (rx:cancel()
+	// drops the affect on a failed save). nil => no reaction handlers. Run under the SAME budget.
+	onReactionLua map[eventKind]string
 }
 
 // detrimentalCategories is the set of affect categories the engine treats as harmful BY CATEGORY,

@@ -45,6 +45,15 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
 
 ## 2. Code tech-debt / design deferrals
 
+- **`rx:replace_target` redirect is not wired (only re-gated)** — `luareact.go`
+  `rxReplaceTarget` (Phase 7.9): the SECURITY half is live and tested — a retarget onto a
+  non-consenting player is gate-BLOCKED (it re-runs `guardHarmful(harmActor, newTarget)`, the same
+  funnel, with the original attacker as the gate actor). But the actual blow-REDIRECTION is
+  deferred: even on a PASSED re-gate the method returns `false` (honestly — never a silent success)
+  and the pending action keeps its original target. Full wiring needs the OnDamageTaken seam to
+  re-MITIGATE against the new target's resistances/soak and apply to ITS pool (a real harm-path
+  change, with its own re-entrancy/budget audit). When built, route a focused security + combat
+  re-review of just that seam. (deferred capability) · *scripting/combat/security*
 - **`pendingFinalFlush` stash has no active eviction** — `zone.go` (the create-window
   logout-flush fix): if `CreateCharacter` PERMANENTLY fails AND the player quit inside the
   create round-trip, one name-keyed `CharSnapshot` lingers for the zone's lifetime (reclaimed

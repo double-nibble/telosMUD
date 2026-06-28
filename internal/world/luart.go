@@ -350,6 +350,12 @@ func (rt *luaRuntime) installSandbox() {
 	// handles — no effect ops / harm surface this slice.
 	rt.installHandleType()
 
+	// Register the reaction-context userdata type (luareact.go, slice 7.9): the typed `rx`
+	// handed to a result-altering reaction hook at the Phase-6 checkpoints. Like the handle it
+	// carries a pointer-safe __tostring (T15) and an engine-owned metatable never exposed as a
+	// script global; a script only ever receives an `rx` the engine binds at a checkpoint.
+	rt.installReactType()
+
 	// Register the `mud` world/util table (luamud.go, slice 7.3b): RNG/clock/log/scan/
 	// broadcast/spawn/after/pvp_allowed — the NON-HARM world API + the timer-handle userdata
 	// type (with its pointer-safe __tostring, T15). No harm surface this slice.
