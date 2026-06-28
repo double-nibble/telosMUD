@@ -10,8 +10,14 @@ burn-down backlog: each wave of follow-up work clears rows here.
 > they structurally cannot see the stateful, multi-run, multi-service, failure-path bugs
 > that bite a distributed MUD in production (the seed/`deletePack` idempotency bug and a
 > day-long red CI from a Dockerfile/lint-config break both slipped past `go test`). The
-> black-box tiers below are where those regressions get caught. The grade for the black-box
-> tiers today is honest: **thin**.
+> black-box tiers below are where those regressions get caught.
+>
+> **UPDATE (after the four-wave coverage push):** the black-box tiers are no longer thin. The
+> in-process gate harness (`internal/gate`) and running-zone journeys (`internal/world`) now pin
+> every P0 black-box behavior and the named P1 onboarding/sandbox/distributed journeys — each
+> controlled-break-verified where a breakable line exists. The starting grade was honest ("thin",
+> 1 e2e + 2 integration on top of the unit base); the closing grade is in the per-area tables and
+> the Closing Picture section at the end.
 
 ## How we verify (the discipline this doc enforces)
 
@@ -95,13 +101,15 @@ under-serve. Strong unit coverage exists (`internal/world/lua*_test.go`); the bl
 | --- | --- | --- | --- |
 | P1: connect → look → north → look → say echoes | in-process + e2e | **DONE** — covered by every harness login + the e2e journey | P1 |
 | P2: cross-shard walk, no seam, no lost input | in-process + e2e | **DONE** | P0 |
-| P3: `get`/`wield`/`put`/`wear` + the right `act()` to bystanders | in-process | **GAP** — `internal/world/container_test.go` is unit; no black-box journey where bystander B sees A's `act()` line for get/wear | P1 |
-| P4: character + world state survive a restart | in-process + e2e | **THIN** — reconnect-to-saved-room is DONE; a true *shard restart* (process down → up → resume) black-box journey is missing | P0 |
+| P3: `get`/`wield`/`wear` + the right `act()` to bystanders | in-process | **DONE (Wave 4)** — `internal/gate/onboarding_journey_test.go::TestItemInteractionActJourney` (Actor gets/wields/wears the demo market's sword + helmet; a bystander Watcher sees every third-person `$n gets/wields/wears $p` line; equipment + inventory reflect the change; controlled-break verified on the bystander broadcast). Unit: `container_test.go` | P1 |
+| P4: character + world state survive a restart | in-process + e2e | **DONE (Wave 2)** — reconnect-to-saved-room + the true shard-restart journey (`internal/gate/shard_restart_test.go::TestShardRestartPreservesPersistedState`: process down → fresh shard from the same store at a new endpoint → reconnect into the saved room) | P0 |
 | P4: content idempotency (boot empty, seed, re-seed, intact) | integration + smoke | **DONE** | P0 |
-| P5: data-defined `fireball` — casts, costs mana, typed damage, applies affect | in-process / e2e | **GAP** — `internal/world/ability_test.go` is unit; no black-box cast-fireball-at-a-mob journey | P1 |
-| P6: full fight pipeline + fireball save-halves-AoE + rage-on-hit + kill+loot | e2e | **THIN** — death+loot is DONE; the AoE-save and OnHit-rage-bar legs are unit-only | P1 |
-| P6: a check resolves; an event handler fires | unit | **THIN** — `check_test.go` / `event_test.go` (unit); no black-box | P2 |
-| First-time login UX (name prompt, fresh spawn) | in-process + e2e | **DONE** — every harness/e2e login exercises it | P2 |
+| P5: data-defined `fireball` — casts, costs mana, typed damage, applies affect | in-process / e2e | **GAP** — `internal/world/ability_test.go` is unit; no black-box cast-fireball-at-a-mob journey. DEFERRED (no wave assigned; owner: combat/abilities engineer) | P1 |
+| P6: full fight pipeline + fireball save-halves-AoE + rage-on-hit + kill+loot | e2e | **THIN** — death+loot is DONE (e2e `combat_death_test.go`); the AoE-save and OnHit-rage-bar legs are unit-only. DEFERRED | P1 |
+| P6: a check resolves; an event handler fires | unit | **THIN** — `check_test.go` / `event_test.go` (unit); no black-box. DEFERRED | P2 |
+| First-time onboarding (connect → name prompt → spawn → look → first move) | in-process + e2e | **DONE (Wave 4)** — `onboarding_journey_test.go::TestFirstTimeOnboardingJourney` (the full new-player path, player-visible output at each step). SEAM: real chargen/auth is Phase 14 — the name IS the character today; the test notes where the class/race/stat steps slot in | P2 |
+| Connect-time errors (bad login re-prompts, recovers) | in-process | **DONE (Wave 4)** — `onboarding_journey_test.go::TestBadLoginRepromptsThenSucceeds` (a leading-digit / embedded-dot name is rejected player-visibly and the gate re-prompts, then a valid name spawns; controlled-break verified). Name collision / second-login takeover: `TestSecondLoginTakesOverSession` (Wave 1) | P2 |
+| Scripted-mob greet milestone (Phase 7 "Done when": a script fires on entry and a mob greets you) | in-process | **DONE (Wave 4)** — `internal/gate/scripted_greet_journey_test.go::TestScriptedMobGreetsPlayerThroughGate` (a content pack's Lua `greet` handler greets a real telnet player BY NAME through the gate; a second player gets their own personalized greeting; controlled-break verified on the greet fire). Unit: `luaentry_points_test.go` | P2 |
 
 ---
 
@@ -143,5 +151,33 @@ the owning engineer decides the intended contract:
    whole-zone Go-panic recovery, player self.state survives the real logout/relogin ladder. DONE.
    Live hot-reload and the custom-event lane were found ALREADY end-to-end (luareload/luahook) and
    not re-done (scoping decision). Deferred: the full gate→scripted-mob-greet milestone journey (P2).
-4. **Wave 4 — onboarding journeys**: get/wield/wear `act()` journey, fireball cast journey, the
-   AoE-save + rage-on-hit legs of the Phase 6 milestone, the gate→scripted-greet Phase 7 milestone.
+4. **Wave 4 — onboarding journeys** (this change, the FINAL coverage wave): the full first-time
+   onboarding journey, the get/wield/wear `act()` journey, the bad-login re-prompt journey, and the
+   gate→scripted-mob-greet Phase 7 milestone. DONE.
+
+## Closing picture (after Wave 4 — the coverage push is complete)
+
+The four-wave push closed every **P0** black-box GAP and all the named P1 onboarding/sandbox/distributed
+gaps. What was DONE vs. what remains DEFERRED (with the owner/tier it's tracked under):
+
+**DONE (black-box / journey coverage now exists):**
+- Regression-proofing (Wave 1): COW kill→repop→re-kill, look renders all room contents, persistence
+  round-trip, single-session takeover.
+- Distributed correctness (Wave 2): cross-shard input continuity, handoff interrupted (destination
+  unreachable), true shard-restart persistence, `state_version` CAS contention.
+- Phase 7 sandbox (Wave 3): runaway script doesn't wedge the running zone, whole-zone Go-panic
+  recovery, player self.state through the real persistence ladder. (Live hot-reload + custom-event
+  lane were already end-to-end.)
+- Onboarding (Wave 4): first-time onboarding, get/wield/wear `act()`, bad-login re-prompt,
+  scripted-mob greet milestone.
+
+**DEFERRED (still GAP/THIN — tracked for a future wave or the owning engineer):**
+- *Distributed (Area 2):* redirect-target-unreachable crash-failover window; double-registration race;
+  backpressure/slow-client; the epoch-monotonicity leg of shard restart; directory-lease expiry; NATS
+  content hot-reload. → distributed-systems-architect.
+- *Combat/abilities (Area 4):* a black-box `fireball` cast journey (P5); the AoE-save + OnHit-rage-bar
+  legs of the Phase 6 milestone (P6); a black-box check/event-handler journey (P6). → combat/abilities
+  engineer. These need content/ability scaffolding above the unit tier; the unit coverage is solid, so
+  these are P1/P2, not ship-blockers.
+- *Onboarding (Area 4):* real chargen/auth is Phase 14 — the first-time journey covers everything that
+  exists today and extends when chargen lands.
