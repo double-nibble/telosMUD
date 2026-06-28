@@ -54,6 +54,24 @@ func (rt *luaRuntime) compileChunk(origin, src string) (*compiledChunk, error) {
 	return &compiledChunk{proto: fn.Proto, origin: origin, gen: rt.chunkGen}, nil
 }
 
+// chunkFor returns the compiled chunk for content key `key` (e.g. "ability:fireball:on_resolve"),
+// compiling src ONCE on first use and caching the result in this zone's runtime. A compile error
+// or empty src caches a nil chunk (fail-closed: the def is inert and not recompiled every call).
+// The key must be STABLE across calls for the same def so the compile is amortized. This is the
+// per-zone compile-once seam every entry point uses (the shared per-shard def carries the source
+// string; the proto, bound to THIS zone's LState, lives here). Zone goroutine only.
+func (rt *luaRuntime) chunkFor(key, src string) *compiledChunk {
+	if rt == nil || rt.L == nil {
+		return nil
+	}
+	if e, ok := rt.chunks[key]; ok {
+		return e.chunk // cached (nil if previously empty/failed — not retried)
+	}
+	ch, err := rt.compileChunk(key, src)
+	rt.chunks[key] = &chunkCacheEntry{chunk: ch, failed: err != nil}
+	return ch
+}
+
 // invoke runs a compiled chunk under invocation inv, binding the given context variables (self/
 // ctx/ev/…) in a FRESH per-call environment (invariant 2). It arms the budget/deadline + spawn-
 // budget chokepoint (like runChunk), sets rt.inv for the duration (so a Lua harm op reads its

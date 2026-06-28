@@ -193,6 +193,14 @@ func (z *Zone) dispatch(s *session, line string) {
 			s.send(promptFrame())
 			return
 		}
+		// Custom Lua command (7.4e): consulted LAST and by EXACT match only, so it never shadows or
+		// abbreviates a core/movement/ability verb. A match runs the Lua body (pcall-isolated).
+		if body := z.customCommandFor(lower); body != "" {
+			z.log.Debug("dispatch: custom command", "player", s.character, "verb", lower)
+			z.runCustomCommand(s, lower, rest, body)
+			s.send(promptFrame())
+			return
+		}
 		z.log.Debug("unknown verb", "player", s.character, "verb", lower)
 		s.send(textFrame("Huh?"))
 		s.send(promptFrame())

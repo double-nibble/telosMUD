@@ -134,6 +134,31 @@ func parseEventMap(v any, owner string) map[eventKind][]effectOp {
 	return out
 }
 
+// parseLuaEventMap validates a content on_event_lua map (event-name -> Lua body) against the
+// closed knownEventKinds set, dropping (with a loud log) any unknown event — the same discipline
+// parseEventMap uses for op-lists. nil/empty => nil. Phase 7.4g.
+func parseLuaEventMap(m map[string]string, owner string) map[eventKind]string {
+	if len(m) == 0 {
+		return nil
+	}
+	var out map[eventKind]string
+	for key, body := range m {
+		if body == "" {
+			continue
+		}
+		kind := eventKind(key)
+		if !knownEventKinds[kind] {
+			slog.Error("content: on_event_lua references unknown engine event (dropped)", "def", owner, "event", key)
+			continue
+		}
+		if out == nil {
+			out = map[eventKind]string{}
+		}
+		out[kind] = body
+	}
+	return out
+}
+
 // parseOpList parses a generic decoded op-list (any -> []effectOp). nil/empty parses to nil (no ops).
 // It accepts a top-level list of op maps; each map is parsed by parseOp. This is the same shape an
 // affect's on_tick uses (a DoT's [deal_damage]). Build-time only.

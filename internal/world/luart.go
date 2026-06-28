@@ -126,6 +126,31 @@ type luaRuntime struct {
 	// reactions (7.4/7.9); here the fields exist and are threaded so the invariant is structural
 	// from the start. Zone goroutine only.
 	inv *luaInvocation
+
+	// chunks is the per-zone compiled-chunk cache (luaentry.go, slice 7.4): a content Lua body
+	// (an ability on_resolve, an affect hook, a trigger, a formula, the pvp policy) is compiled
+	// ONCE per zone on first use and cached here keyed by a stable content key. The cache is
+	// per-RUNTIME (per-zone) because a *lua.FunctionProto is bound to THIS zone's LState — the
+	// shared per-shard defs cannot carry a proto. A compile FAILURE caches a sentinel (failed)
+	// entry so a broken def is inert and not recompiled every invocation. This is also the seam
+	// slice 7.7 invalidates on a hot reload. Zone goroutine only.
+	chunks map[string]*chunkCacheEntry
+
+	// entityScripts holds the per-INSTANCE trigger state (luaentry_triggers.go, slice 7.4c): for
+	// each scripted entity (one carrying a *Scripted component), its registered on(event,fn)
+	// handler table + its self.state table, both Lua values bound to THIS zone's LState. Built
+	// lazily on first fire by running the entity's Scripted.source. Keyed by RuntimeID (per-zone
+	// unique). In-memory only at 7.4c — the self.state ↔ JSONB persistence is slice 7.6 (the seam
+	// is noted there). Zone goroutine only.
+	entityScripts map[RuntimeID]*entityScript
+}
+
+// chunkCacheEntry is one cached compile result: the chunk (nil if the source was empty or the
+// compile failed) plus a `failed` discriminator so a broken def (compiled nil) is distinguished
+// from a never-compiled key. Zone-goroutine-owned.
+type chunkCacheEntry struct {
+	chunk  *compiledChunk
+	failed bool
 }
 
 // luaInvocation is the engine-owned context of the script call currently on the stack — who it
@@ -164,9 +189,11 @@ func newLuaRuntime(zoneID string, log *slog.Logger) *luaRuntime {
 	})
 
 	rt := &luaRuntime{
-		L:   L,
-		rng: rand.New(rand.NewSource(seedFromZoneID(zoneID))), //nolint:gosec // gameplay determinism, not security
-		log: log.With("subsystem", "lua"),
+		L:             L,
+		rng:           rand.New(rand.NewSource(seedFromZoneID(zoneID))), //nolint:gosec // gameplay determinism, not security
+		log:           log.With("subsystem", "lua"),
+		chunks:        map[string]*chunkCacheEntry{},
+		entityScripts: map[RuntimeID]*entityScript{},
 	}
 
 	rt.installSandbox()

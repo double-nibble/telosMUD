@@ -281,17 +281,26 @@ func (a *Affected) tickOnce(e *Entity, pulse uint64) {
 // DEBUG; the gated effect-op interpreter that runs the op-list lands in 5.3. They are intentionally
 // no-op-with-a-log so the runtime is whole and 5.3 only fills the body — no lifecycle change.
 func fireOnApplyAffect(e *Entity, inst *affectInstance) {
+	// Lua on_apply hook (7.4d): runs when the affect attaches. `self` = e, actor = the affect's
+	// source. nil-safe / no-op when no Lua hook. The op-list onApply remains reserved.
+	if inst.def.onApplyLua != "" {
+		e.zone.runAffectHookLua(e, inst, "on_apply", inst.def.onApplyLua)
+	}
 	if inst.def.onApply == nil {
 		return
 	}
-	e.zone.log.Debug("affect on_apply hook (reserved; 5.3)", "ref", inst.def.ref, "rid", e.rid)
+	e.zone.log.Debug("affect on_apply hook (reserved op-list; 5.3)", "ref", inst.def.ref, "rid", e.rid)
 }
 
 func fireOnAffectExpire(e *Entity, inst *affectInstance) {
+	// Lua on_expire hook (7.4d): runs when the affect expires.
+	if inst.def.onExpireLua != "" {
+		e.zone.runAffectHookLua(e, inst, "on_expire", inst.def.onExpireLua)
+	}
 	if inst.def.onExpire == nil {
 		return
 	}
-	e.zone.log.Debug("affect on_expire hook (reserved; 5.3)", "ref", inst.def.ref, "rid", e.rid)
+	e.zone.log.Debug("affect on_expire hook (reserved op-list; 5.3)", "ref", inst.def.ref, "rid", e.rid)
 }
 
 // fireOnTick runs an affect's on_tick op-list through the GATED effect-op interpreter (Phase 5.3

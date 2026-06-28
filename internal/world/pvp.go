@@ -65,9 +65,21 @@ func pvpAllowed(actor, target *Entity) bool {
 		return true
 	}
 
-	// Safe room is an absolute veto: no harm lands on a player standing in a safe room.
+	// Safe room is an ABSOLUTE, ENGINE-ENFORCED veto: no harm lands on a player in a safe room —
+	// a content Lua policy CANNOT override this (the safe-room guarantee is a security property the
+	// engine owns, not delegated to content). Checked BEFORE the Lua policy so a buggy/hostile
+	// policy can never open a safe room.
 	if inSafeRoom(target) {
 		return false
+	}
+
+	// A content Lua pvp_allowed policy (7.4f), when the pack defines one, DECIDES the genuine
+	// player-vs-player case (replacing the arena/consent-flag default below). It is FAIL-CLOSED: a
+	// missing/erroring policy, or any non-`true` return, DENIES harm (invokeForBool enforces this).
+	// The safe-room veto above already ran, so the policy can only ever be MORE restrictive than
+	// the absolute vetoes, never less. Consulted via the actor/target's zone runtime.
+	if body, rt := zonePvpPolicy(actor, target); body != "" && rt != nil {
+		return rt.consultPvpPolicy(body, actor, target)
 	}
 
 	// Arena forces PvP: an arena room overrides individual consent (duels). Both must be in the
@@ -79,6 +91,32 @@ func pvpAllowed(actor, target *Entity) bool {
 	// Default: both the actor and the target must have opted in (the "pvp" consent flag). With no
 	// consent flags this is false — the safe default (players cannot harm each other).
 	return hasFlag(actor, flagPvP) && hasFlag(target, flagPvP)
+}
+
+// zonePvpPolicy returns the pack's Lua pvp_allowed body + the zone runtime to run it on, if a
+// policy is defined and a live zone is reachable from the actor/target. Empty body => use the
+// engine default.
+func zonePvpPolicy(actor, target *Entity) (string, *luaRuntime) {
+	z := entityZone(actor)
+	if z == nil {
+		z = entityZone(target)
+	}
+	if z == nil || z.lua == nil {
+		return "", nil
+	}
+	b := z.defBundle()
+	if b == nil {
+		return "", nil
+	}
+	return b.pvpLua, z.lua
+}
+
+// entityZone returns e's zone, or nil.
+func entityZone(e *Entity) *Zone {
+	if e == nil {
+		return nil
+	}
+	return e.zone
 }
 
 // The content-defined policy flag names. They are ordinary string flags (flags.go) the engine reads;

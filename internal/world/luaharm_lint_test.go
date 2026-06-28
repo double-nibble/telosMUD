@@ -57,22 +57,43 @@ var denyMethods = map[string]bool{
 // type name (pointer-unwrapped). This list is the ONE thing to extend if a NEW entity-state
 // struct is added — far more stable than a per-field list, and a missing TYPE (unlike a missing
 // field) is conspicuous. The meta-test guards the matching logic against rot.
+//
+// Coverage = ALL mutable component structs (every component an entity can carry whose fields are
+// game state), so a future binding writing any of their fields directly is caught even though no
+// current binding does — the cheap-completeness point of a type-aware guard.
+//
+// LIMITATION (tainted-alias tracking is ONE-LEVEL): `m := e.living.flags; m[k]=v` IS caught, but a
+// SECOND hop `m2 := m; m2[k]=v` is NOT (the taint does not propagate past the first alias). This is
+// not complete alias coverage — it closes the obvious one-line evasion, not a deliberate multi-hop
+// launder. A binding doing multi-hop aliasing of an entity-state collection would slip past; the
+// direct selector/index writes and the one-level alias are the realistic surface.
 var entityStateTypes = map[string]bool{
+	// Core entity + the two hot components.
 	"Entity":         true,
 	"Living":         true,
 	"Affected":       true,
 	"Room":           true,
 	"affectInstance": true,
-	"Wearer":         true,
+	// Every other mutable component an entity can carry (cheap completeness — security Finding B).
+	"Wearer":           true,
+	"Container":        true, // closed/locked/contents state
+	"Weapon":           true, // dice/damage-type state
+	"Wearable":         true, // wear-location state
+	"PlayerControlled": true, // the player-bridge state (aliases, session linkage)
+	"Physical":         true, // mass/size/material state
 }
 
 // luaBindingFiles are the source files implementing the Lua API surface — the trust boundary
 // this lint guards. As new binding files are added they MUST be added here.
 var luaBindingFiles = map[string]bool{
-	"luahandle.go": true,
-	"luamud.go":    true,
-	"luaharm.go":   true,
-	"luaentry.go":  true, // 7.4 entry points
+	"luahandle.go":         true,
+	"luamud.go":            true,
+	"luaharm.go":           true,
+	"luaentry.go":          true, // 7.4 invocation core
+	"luaentry_points.go":   true, // 7.4 per-entry-point glue
+	"luaentry_triggers.go": true, // 7.4c trigger machinery + fire points
+	"luaentry_command.go":  true, // 7.4e custom commands
+	"event.go":             true, // 7.4g Lua bus handlers (runLuaEventHandler builds handle binds)
 }
 
 // lintViolation is one detected direct write (for the build-failing test + the meta-test).
@@ -293,12 +314,13 @@ type Living struct {
 type Affected struct{ list []int }
 type affectInstance struct{ source *int }
 type Room struct{ exits map[string]string }
+type Container struct{ closed bool }
 type rt struct{ inv *int }
 
 func setFlag(a *Living, k string, v bool) {}
 func (a *Affected) expire(e *Entity, x *int) {}
 
-func mustCatch(e *Entity, a *Affected, inst *affectInstance, r *rt) {
+func mustCatch(e *Entity, a *Affected, inst *affectInstance, box *Container, r *rt) {
 	setFlag(e.living, "x", true)        // 1 call write
 	a.expire(e, nil)                    // 2 call write
 	e.zone = nil                        // 3 CRITICAL cross-zone re-parent
@@ -308,6 +330,7 @@ func mustCatch(e *Entity, a *Affected, inst *affectInstance, r *rt) {
 	e.living.cooldowns["x"] = 0         // 7 HIGH rate-gate bypass
 	a.list = append(a.list, 1)          // 8
 	e.room.exits["n"] = "x"             // 9 index-of-selector, base *Room
+	box.closed = false                  // 11 a NEWLY-COVERED component (Container) — must flag
 
 	m := e.living.flags                 //   TAINTED alias of an entity-state field
 	m["k"] = true                       // 10 alias write -> MUST flag
@@ -353,6 +376,7 @@ func mustCatch(e *Entity, a *Affected, inst *affectInstance, r *rt) {
 		"assign Living.cooldowns[]", // HIGH
 		"assign Affected.list",
 		"assign Room.exits[]",
+		"assign Container.closed", // a NEWLY-COVERED component type (Finding B)
 	}
 	for _, m := range mustCatch {
 		if !desc[m] {

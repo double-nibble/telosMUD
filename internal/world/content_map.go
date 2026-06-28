@@ -34,7 +34,11 @@ func roomComponents(r content.RoomDTO) componentSet {
 			room.namedFlags[f] = true
 		}
 	}
-	return componentSet{reflect.TypeFor[*Room](): room}
+	cs := componentSet{reflect.TypeFor[*Room](): room}
+	if r.Lua != "" {
+		cs[reflect.TypeFor[*Scripted]()] = &Scripted{source: r.Lua} // 7.4c room triggers
+	}
+	return cs
 }
 
 // protoComponents builds the component template for an item/mob prototype from the present
@@ -66,6 +70,9 @@ func protoComponents(p content.ProtoDTO) componentSet {
 	// first stat/resource write COWs it (mutableComponent), so two goblins never alias each other's hp.
 	if l := protoLiving(p.Living); l != nil {
 		comps[reflect.TypeFor[*Living]()] = l
+	}
+	if p.Lua != "" {
+		comps[reflect.TypeFor[*Scripted]()] = &Scripted{source: p.Lua} // 7.4c mob/item triggers
 	}
 	return comps
 }
@@ -99,12 +106,16 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		dispellable: a.Dispellable,
 		roomScoped:  a.Scope == "room", // [G13] room-scoped affect (web/darkness/...); default entity-scoped
 
-		duration:  a.Body.Duration,
-		modifiers: mods,
-		prevents:  prevents,
-		onApply:   a.Body.OnApply,
-		onExpire:  a.Body.OnExpire,
-		onEvent:   parseEventMap(a.Body.OnEvent, "affect "+a.Ref),
+		duration:    a.Body.Duration,
+		modifiers:   mods,
+		prevents:    prevents,
+		onApply:     a.Body.OnApply,
+		onExpire:    a.Body.OnExpire,
+		onApplyLua:  a.Body.OnApplyLua,
+		onExpireLua: a.Body.OnExpireLua,
+		onDispelLua: a.Body.OnDispelLua,
+		onEvent:     parseEventMap(a.Body.OnEvent, "affect "+a.Ref),
+		onEventLua:  parseLuaEventMap(a.Body.OnEventLua, "affect "+a.Ref),
 	}
 	if t := a.Body.Tick; t != nil {
 		def.hasTick = true

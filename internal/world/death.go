@@ -176,6 +176,12 @@ func (z *Zone) die(victim, killer *Entity, parent *effectCtx) {
 	// respawn. respawnPlayer below clears it back to standing on revive. (distsys review S1.)
 	setPosition(victim, posDead)
 
+	// Lua `death` trigger (7.4c): fired here, BEFORE the corpse/reap removes the victim from the
+	// world tree, so the handler still sees the entity in-room (a death cry, a dropped quest flag).
+	// nil-safe / no-op when the victim carries no script. A player respawns (its script, if any,
+	// persists — it is not extracted), so this fires for a scripted mob's death.
+	z.fireDeath(victim, killer)
+
 	if isPlayer(victim) {
 		z.respawnPlayer(victim)
 		return
@@ -220,6 +226,12 @@ func (z *Zone) makeCorpse(victim, killer *Entity) {
 	z.log.Debug("mob died -> corpse", "mob", victim.short, "rid", victim.rid,
 		"corpse_items", len(carried), "killer", targetShort(killer))
 	Move(victim, nil)
+	// The victim has left the world tree for good — drop its per-instance Lua trigger state so a
+	// repop-on-timer zone doesn't leak an entityScript per dead scripted mob (7.4c review MUST-FIX).
+	// 7.6 will flush self.state to JSONB immediately before this drop. nil-safe.
+	if z.lua != nil {
+		z.lua.dropEntityScript(victim.rid)
+	}
 }
 
 // newCorpse builds the engine corpse container for a dead victim: a fresh non-prototype entity with a

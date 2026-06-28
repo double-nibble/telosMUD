@@ -133,7 +133,14 @@ func runRegen(e *Entity) {
 		if cur >= maxV {
 			continue
 		}
-		next := cur + def.regen
+		// Lua `regen` formula (7.4f): a pack may compute the per-tick regen amount in Lua (a
+		// stat-scaled regen) as an alternative to the def's flat rate. Fail-closed: a missing/broken
+		// Lua formula falls back to def.regen. The data formula OR the Lua one, never both.
+		amount := def.regen
+		if v, ok := e.zone.luaFormula("regen", e, nil); ok {
+			amount = int(v)
+		}
+		next := cur + amount
 		if next > maxV {
 			next = maxV
 		}

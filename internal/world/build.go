@@ -76,6 +76,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 			depletedThreshold: r.DepletedThreshold,
 			perRound:          r.PerRound,
 			onEvent:           parseEventMap(r.OnEvent, "resource "+r.Ref),
+			onEventLua:        parseLuaEventMap(r.OnEventLua, "resource "+r.Ref),
 		}
 		// on_depleted ([G-D]): the death-hook op-list, parsed like any op-list. A malformed list logs
 		// loudly and registers with whatever parsed (content-lint discipline); nil/absent => engine default
@@ -133,6 +134,28 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		d.combat.register(cp.Ref, buildCombatProfile(cp))
 	}
 	d.defaultCombat = lc.DefaultCombat
+	// Custom Lua commands (7.4e): register each verb + its aliases into the per-shard custom-command
+	// table by EXACT word. Skips a word that collides with a BUILT-IN verb (a custom command may never
+	// shadow a core/movement verb); logs the skip loudly. dispatch consults this table last + exact.
+	for _, cmd := range lc.Commands {
+		registerCustomCommand(d, cmd)
+	}
+	// PvP policy + ruleset formulas (7.4f): carried for the gate/formula seams to consult.
+	d.pvpLua = lc.PvpLua
+	for name, body := range lc.Formulas {
+		if d.formulas == nil {
+			d.formulas = map[string]string{}
+		}
+		d.formulas[name] = body
+		// Warn LOUDLY when a content author defines a ruleset formula the engine does not yet
+		// consult (7.4f wired only `regen`; to_hit/soak/xp_for live in checkSpec/attr/OnKill and
+		// are NOT yet read from formulas[]). Without this the author's Lua body is a silently-dead
+		// seam — they'd never know it never ran. Same discipline as parseLuaEventMap's unknown-kind.
+		if !consultedLuaFormulas[name] {
+			slog.Warn("content: ruleset formula defined but NOT YET consulted (only 'regen' is live in 7.4f); the body will not run",
+				"formula", name)
+		}
+	}
 	// Load-time content-lint: reject a derived-attribute graph with a self/mutual reference.
 	for _, err := range lintAttributeCycles(d.attr.table()) {
 		slog.Error("content: attribute derivation cycle (def will resolve to 0)", "err", err)

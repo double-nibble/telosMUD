@@ -160,6 +160,14 @@ first-class so content can't forget it:
   scripted ability can't damage/debuff a player where PvP is disallowed. Against mobs the gate
   is a no-op.
 - Lua can also call `pvp_allowed` directly for custom branching.
+- **A pack `pvp_allowed` Lua policy SUPERSEDES (does not augment) the engine default** (Phase
+  7.4f). When a pack defines `pvp_lua`, the policy's boolean return is the player-vs-player
+  decision — the engine's *arena-forcing* and *both-must-consent* default **no longer run**; the
+  policy is responsible for whatever consent/arena logic it wants. Two invariants the engine keeps
+  regardless: **(1) the safe-room veto always still applies** — a content policy can never open a
+  safe room (checked before the policy); **(2) the policy is FAIL-CLOSED** — a missing/erroring
+  policy, or any non-`true` return, **denies** harm. So a custom policy can only ever be *more*
+  restrictive than the absolute vetoes, never less.
 
 This cleanly covers your enumerated cases:
 

@@ -232,6 +232,13 @@ func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, rng *r
 		mag: 1, disp: def.disposition, rng: rng,
 	}
 	runOps(c, def.ops)
+	// Lua on_resolve (slice 7.4b): a content Lua body that composes effect ops via the 7.3
+	// handles (ctx.target:damage{} …). It runs BESIDE the declarative op-list (no lifecycle
+	// change), threading the SAME step-8 effectCtx `c` — so a harm op in the Lua body inherits the
+	// gate disposition + the cascade depth/budget and gates per 7.3c, never a fresh invocation.
+	// Compile-once-per-zone + fail-closed (a broken body is inert; a runtime error fizzles this
+	// resolve and is logged — the breaker is 7.5). The body reads ctx.actor/ctx.target/ctx.room.
+	z.runAbilityResolveLua(c, def)
 
 	// --- Step 9: emit (act messages; GMCP RESERVED Phase 9) ----------------------------------
 	if def.msgActor != "" {

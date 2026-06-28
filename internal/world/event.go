@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"math/rand"
 	"sort"
+
+	lua "github.com/yuin/gopher-lua"
 )
 
 // event.go is the IN-ZONE event bus ([G3], docs/PHASE6-PLAN.md §1.2) — the universal glue the gap
@@ -96,10 +98,12 @@ const maxEventDepth = 8
 // truncates the cascade with a warning (the triggering action still completes).
 const maxEventHandlers = 256
 
-// eventHandler is one subscribed op-list plus where it came from (for logging/lint).
+// eventHandler is one subscribed handler plus where it came from (for logging/lint). It is EITHER
+// an op-list (ops) OR a Lua body (luaSrc) — a content event handler is one or the other (7.4g).
 type eventHandler struct {
 	ops    []effectOp
-	origin string // "resource:rage" | "affect:bloodlust" — diagnostic only
+	luaSrc string // a Lua-BODY handler (7.4g); empty => an op-list handler (ops)
+	origin string // "resource:rage" | "affect:bloodlust" — diagnostic + the compile-cache key tail
 }
 
 // gatherEventHandlers collects the op-lists on `subject` subscribed to `kind`, from the entity's
@@ -122,17 +126,35 @@ func gatherEventHandlers(e *Entity, kind eventKind) []eventHandler {
 			refs = append(refs, ref)
 		}
 	}
+	// Also gather resources with a Lua handler for this kind (7.4g).
+	luaRefs := make([]string, 0, len(table))
+	for ref, def := range table {
+		if def.onEventLua != nil && def.onEventLua[kind] != "" && entityHasResource(e, ref) {
+			luaRefs = append(luaRefs, ref)
+		}
+	}
 	sort.Strings(refs)
+	sort.Strings(luaRefs)
 	for _, ref := range refs {
 		out = append(out, eventHandler{ops: table[ref].onEvent[kind], origin: "resource:" + ref})
 	}
+	for _, ref := range luaRefs {
+		out = append(out, eventHandler{luaSrc: table[ref].onEventLua[kind], origin: "resource:" + ref + ":lua"})
+	}
 	if a, ok := Get[*Affected](e); ok {
 		for _, inst := range a.list {
-			if inst.def == nil || inst.def.onEvent == nil {
+			if inst.def == nil {
 				continue
 			}
-			if ops := inst.def.onEvent[kind]; len(ops) > 0 {
-				out = append(out, eventHandler{ops: ops, origin: "affect:" + inst.def.ref})
+			if inst.def.onEvent != nil {
+				if ops := inst.def.onEvent[kind]; len(ops) > 0 {
+					out = append(out, eventHandler{ops: ops, origin: "affect:" + inst.def.ref})
+				}
+			}
+			if inst.def.onEventLua != nil {
+				if src := inst.def.onEventLua[kind]; src != "" {
+					out = append(out, eventHandler{luaSrc: src, origin: "affect:" + inst.def.ref + ":lua"})
+				}
 			}
 		}
 	}
@@ -197,6 +219,35 @@ func (z *Zone) fireEvent(parent *effectCtx, kind eventKind, subject, other *Enti
 			z: z, actor: subject, source: subject, target: subject, other: other,
 			mag: mag, disp: dispNeutral, rng: rng, depth: depth + 1, eventBudget: budget,
 		}
+		if h.luaSrc != "" {
+			// A Lua-BODY handler (7.4g): run it via invokeFromCtx threading THIS cascade ctx `c` —
+			// the SAME depth+budget pointer the op-list handlers share, so a Lua handler decrements
+			// the same width budget and cannot re-fire to escape it (invariant 1). `self` = the
+			// subject, `ev` carries the counterpart + magnitude. Fail-closed (pcall-isolated).
+			z.runLuaEventHandler(c, h, subject, other, mag)
+			continue
+		}
 		runOps(c, h.ops)
 	}
+}
+
+// runLuaEventHandler runs a Lua bus handler (7.4g) under the firing cascade ctx `c`. The handler
+// reads `self` (the subject), `ev.other` (the counterpart), and `ev.mag` (the event magnitude).
+// Compile-once-per-zone (keyed by origin + kind) + fail-closed. It threads c (depth + the shared
+// eventBudget pointer) so the handler runs under the same width/depth cap as an op-list handler.
+func (z *Zone) runLuaEventHandler(c *effectCtx, h eventHandler, subject, other *Entity, mag float64) {
+	if z.lua == nil {
+		return
+	}
+	rt := z.lua
+	ch := rt.chunkFor("event:"+h.origin, h.luaSrc)
+	if ch == nil {
+		return
+	}
+	ev := rt.L.NewTable()
+	if other != nil {
+		ev.RawSetString("other", rt.newHandle(other))
+	}
+	ev.RawSetString("mag", lua.LNumber(mag))
+	_ = rt.invokeFromCtx(ch, c, subject, map[string]lua.LValue{"ev": ev})
 }

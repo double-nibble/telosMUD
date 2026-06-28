@@ -38,6 +38,30 @@ type Pack struct {
 	// — the pack's "this is how an unarmed/unspecced character fights" default. Empty => players have
 	// no combat profile (a `kill` then auto-hits with weapon-only damage — the degenerate bare case).
 	DefaultCombat string `json:"default_combat" yaml:"default_combat"`
+
+	// Commands are pack-GLOBAL custom verbs implemented in Lua (Phase 7.4e). Each registers a new
+	// verb into the command table — consulted AFTER the built-in baseTable AND content abilities, by
+	// EXACT match only, so a custom verb can never shadow or abbreviate a core/movement/ability verb.
+	Commands []CommandDTO `json:"commands" yaml:"commands"`
+
+	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
+	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
+	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
+	PvpLua string `json:"pvp_lua" yaml:"pvp_lua"`
+
+	// Formulas are the OPTIONAL Lua ruleset-formula overrides (Phase 7.4f): a map of formula name
+	// (to_hit/soak/regen/xp_for) to a Lua body that returns a number, an alternative to the prefix-AST
+	// data formula. A ref uses the data formula OR the Lua one, never both.
+	Formulas map[string]string `json:"formulas" yaml:"formulas"`
+}
+
+// CommandDTO is one custom Lua verb (Phase 7.4e). Verb is the word the player types; Lua is the
+// body (`self` = the actor, `arg` = the verb's argument tail). Aliases are optional exact
+// spellings. The verb is registered EXACT-only (no abbreviation) and never shadows a core verb.
+type CommandDTO struct {
+	Verb    string   `json:"verb" yaml:"verb"`
+	Aliases []string `json:"aliases" yaml:"aliases"`
+	Lua     string   `json:"lua" yaml:"lua"`
 }
 
 // CombatProfileDTO is one named combat profile (Phase 6.3a). to_hit is the attacker's to-hit CHECK
@@ -104,6 +128,8 @@ type ResourceDTO struct {
 	// OnEvent subscribes op-lists to in-zone engine events ([G3]) for an entity that HAS this resource
 	// (a rage pool that builds on OnHit). Map of event-name -> op-list. Phase 6.2.
 	OnEvent map[string]any `json:"on_event" yaml:"on_event"`
+	// OnEventLua is the Lua-BODY alternative to OnEvent (Phase 7.4g): event-name -> Lua handler body.
+	OnEventLua map[string]string `json:"on_event_lua" yaml:"on_event_lua"`
 	// OnDepleted is the op-list the engine runs when a VITAL resource hits 0 — the [G-D] death hook
 	// (Phase 6.3b). It runs ON the dying entity (the victim is $actor) BEFORE the engine's die() drops
 	// combat and builds the corpse, so content can narrate or fire a last-gasp effect. An empty/absent
@@ -161,9 +187,17 @@ type AffectBodyDTO struct {
 	OnApply   any                 `json:"on_apply" yaml:"on_apply"`   // RESERVED op-list (5.3)
 	OnExpire  any                 `json:"on_expire" yaml:"on_expire"` // RESERVED op-list (5.3)
 	Resist    map[string]any      `json:"resist" yaml:"resist"`       // RESERVED resist spec (5.3)
+	// OnApplyLua/OnExpireLua/OnDispelLua are the OPTIONAL Lua affect hooks (Phase 7.4d): a Lua body
+	// run when the affect attaches / expires / is dispelled, with `self` the affected entity and
+	// the affect's source as the harm actor. Empty for a pure-data affect.
+	OnApplyLua  string `json:"on_apply_lua" yaml:"on_apply_lua"`
+	OnExpireLua string `json:"on_expire_lua" yaml:"on_expire_lua"`
+	OnDispelLua string `json:"on_dispel_lua" yaml:"on_dispel_lua"`
 	// OnEvent subscribes op-lists to in-zone engine events ([G3]) while this affect is active (a proc
 	// buff). Map of event-name -> op-list. Phase 6.2.
 	OnEvent map[string]any `json:"on_event" yaml:"on_event"`
+	// OnEventLua is the Lua-BODY alternative to OnEvent (Phase 7.4g): event-name -> Lua handler body.
+	OnEventLua map[string]string `json:"on_event_lua" yaml:"on_event_lua"`
 }
 
 // AffectModifierDTO is one entry of an affect's modifier list: it adds (op:add) or multiplies
@@ -281,6 +315,9 @@ type RoomDTO struct {
 	// "arena" (PvP forced on), etc. The PvP gate (world/pvp.go) reads them; the engine never invents a
 	// flag name. Empty for an unflagged room. Mapped onto Room.namedFlags (world/content_map.go).
 	Flags []string `json:"flags" yaml:"flags"`
+	// Lua is the OPTIONAL room trigger block (Phase 7.4c): registers `on(event, fn)` triggers on the
+	// room entity (enter/leave/speech/…) and seeds `self.state`. Empty for a pure-data room.
+	Lua string `json:"lua" yaml:"lua"`
 }
 
 // ProtoDTO is one item or mob prototype: targeting keywords, the inline short and the
@@ -304,6 +341,13 @@ type ProtoDTO struct {
 	// swing pipeline uses (Phase 6.3a). A nil Living means an inert item (no stats, no combat) — every
 	// existing demo item is unchanged.
 	Living *LivingDTO `json:"living" yaml:"living"`
+
+	// Lua is the OPTIONAL trigger block (Phase 7.4c): a Lua source string that runs ONCE per
+	// spawned instance to register `on(event, fn)` triggers (enter/leave/speech/greet/death/…) and
+	// to seed `self.state`. A nil/empty Lua means a pure-data prototype (no scripts) — the
+	// bare-engine invariant. Carried opaque through the prototype to the spawned entity, compiled
+	// per-zone on first spawn (world/luaentry.go).
+	Lua string `json:"lua" yaml:"lua"`
 }
 
 // LivingDTO is the mob-statting block on a prototype (Phase 6.3a). Attributes is the per-entity

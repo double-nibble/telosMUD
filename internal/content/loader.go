@@ -53,6 +53,14 @@ type LoadedContent struct {
 	// declares none (the pack's player default). The LAST non-empty pack value wins. Empty => players
 	// have no combat profile (the degenerate auto-hit case).
 	DefaultCombat string
+	// Commands are the pack-global custom Lua verbs (Phase 7.4e), accumulated across packs (last-write
+	// -wins by verb). The world side registers them into the per-shard custom-command table.
+	Commands []CommandDTO
+	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
+	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
+	// by name).
+	PvpLua   string
+	Formulas map[string]string
 }
 
 // Zone returns the loaded zone with the given ref, or nil.
@@ -98,6 +106,16 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
 		}
+		if p.PvpLua != "" {
+			lc.PvpLua = p.PvpLua // last non-empty pack wins (7.4f)
+		}
+		for name, body := range p.Formulas { // 7.4f: last-write-wins by name
+			if lc.Formulas == nil {
+				lc.Formulas = map[string]string{}
+			}
+			lc.Formulas[name] = body
+		}
+		lc.Commands = append(lc.Commands, p.Commands...) // 7.4e: accumulate custom verbs
 		for i := range p.Zones {
 			z := p.Zones[i]
 			if idx, ok := idxByRef[z.Ref]; ok {

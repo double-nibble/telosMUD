@@ -111,6 +111,9 @@ func cmdSay(c *Context) error {
 	// say string is data ($t), never a template.
 	c.z.act("You say, '$t'", c.Actor, nil, nil, what, "", ToActor)
 	c.z.act("$n says, '$t'", c.Actor, nil, nil, what, "", ToRoom)
+	// Lua `speech` trigger (7.4c): each scripted mob in the room reacts to what was said. The
+	// raw speech is textsan-cleaned inside the ev table. nil-safe / no-op when no scripted mob.
+	c.z.fireSpeech(c.Actor, what)
 	return nil
 }
 
@@ -291,6 +294,9 @@ func (z *Zone) move(s *session, dir string) bool {
 	if s.entity.location != moveOrigin || position(s.entity) == posDead {
 		return false
 	}
+	// Lua `leave` trigger (7.4c): fire on the FROM room BEFORE the move detaches the leaver, so
+	// the room can still see them. nil-safe / no-op when the room carries no script.
+	z.fireRoomLeave(s.entity, from)
 	z.act("$n leaves "+dir+".", s.entity, nil, nil, "", "", ToRoom) // announced from `from`
 	Move(s.entity, to)
 	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom) // announced from `to`
@@ -304,6 +310,9 @@ func (z *Zone) move(s *session, dir string) bool {
 	// `aggressive` attribute, not an engine flag (death.go). Done after the arrival look so the player
 	// sees the room, then the attack. A local move only; cross-zone arrivals (transferIn) are a later hook.
 	z.aggroOnEntry(s.entity, to)
+	// Lua `enter`/`greet` triggers (7.4c): the room reacts to the arrival, and each scripted mob
+	// in the room greets the entrant. After aggro so a hostile greeting reads naturally. nil-safe.
+	z.fireRoomEntry(s.entity, to)
 	return false
 }
 

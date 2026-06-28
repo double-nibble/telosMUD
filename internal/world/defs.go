@@ -122,6 +122,18 @@ type defRegistries struct {
 	// never shadows a core verb. Built once at construction (single goroutine), then read-only — same
 	// publish-once-then-read discipline as the registries, so no lock is needed for the read path.
 	abilityCmds map[string]*abilityDef
+
+	// customCmds is the per-shard CUSTOM-COMMAND table (Phase 7.4e): a verb/alias word -> the Lua
+	// body implementing it. dispatch consults it AFTER baseTable AND abilityCmds, by EXACT match
+	// only, so a custom verb can never shadow or abbreviate a core/movement/ability verb. Built once
+	// at construction, then read-only.
+	customCmds map[string]string
+
+	// pvpLua is the pack PvP-policy Lua hook (7.4f): consulted by the harm gate; empty => the
+	// built-in policy. formulas maps a ruleset-formula name (to_hit/soak/regen/xp_for) to its Lua
+	// body (7.4f). Both built once, read-only.
+	pvpLua   string
+	formulas map[string]string
 }
 
 // newDefRegistries builds an empty bundle (all three registries empty/published). A bare zone gets
@@ -135,6 +147,8 @@ func newDefRegistries() *defRegistries {
 		ability:     newDefRegistry[*abilityDef](),
 		combat:      newDefRegistry[*combatProfile](),
 		abilityCmds: map[string]*abilityDef{},
+		customCmds:  map[string]string{},
+		formulas:    map[string]string{},
 	}
 }
 
@@ -227,6 +241,9 @@ type resourceDef struct {
 	// HAS this resource (a positive max or a stored current) reacts to the keyed event — e.g. a `rage`
 	// pool with onEvent[OnHit] = modify_resource rage +N is the canonical builder. nil => no handlers.
 	onEvent map[eventKind][]effectOp
+	// onEventLua is the Lua-BODY alternative to onEvent (Phase 7.4g): a Lua handler for the keyed
+	// event, run under the SAME depth/width budget as an op-list handler. nil => no Lua handlers.
+	onEventLua map[eventKind]string
 	// onDepleted is the parsed op-list the engine runs on the dying entity when this VITAL resource
 	// hits 0 ([G-D] death hook, death.go). Runs BEFORE die() drops combat / builds the corpse, with the
 	// victim as $actor, so content can narrate / fire a last effect. nil/empty => engine default death
@@ -309,13 +326,20 @@ type affectDef struct {
 	// tick (the interval still counts, but fires no effect).
 	onTick  any
 	tickOps []effectOp
-	// onApply/onExpire are the RESERVED apply/expire hooks (Phase 7 Lua). Read-not-run.
+	// onApply/onExpire are the RESERVED apply/expire hooks (Phase 7 Lua op-list shape). Read-not-run.
 	onApply  any
 	onExpire any
+	// onApplyLua/onExpireLua/onDispelLua are the Lua affect hooks (Phase 7.4d): run when the affect
+	// attaches/expires/is dispelled, `self` = the affected entity, actor = the affect's source.
+	onApplyLua  string
+	onExpireLua string
+	onDispelLua string
 	// onEvent subscribes content op-lists to in-zone engine events ([G3], event.go) while the affect is
 	// active on an entity — a proc affect (e.g. a "bloodlust" buff whose onEvent[OnKill] heals). The
 	// runtime gathers these from the entity's ACTIVE affects at fire time. nil => no handlers.
 	onEvent map[eventKind][]effectOp
+	// onEventLua is the Lua-BODY alternative to onEvent (Phase 7.4g), run under the SAME budget.
+	onEventLua map[eventKind]string
 }
 
 // detrimentalCategories is the set of affect categories the engine treats as harmful BY CATEGORY,

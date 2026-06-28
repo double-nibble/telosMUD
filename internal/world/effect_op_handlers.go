@@ -224,6 +224,12 @@ func opDispel(c *effectCtx, op *effectOp) error {
 		if op.text != "" && inst.def.category != op.text {
 			continue
 		}
+		// Lua on_dispel hook (7.4d): fires BEFORE removal (the affect is still attached) so the
+		// hook can read its own magnitude/state. on_expire then also fires from expire() — a
+		// dispel is an expire too. nil-safe / no-op when no Lua hook.
+		if inst.def.onDispelLua != "" {
+			c.z.runAffectHookLua(c.target, inst, "on_dispel", inst.def.onDispelLua)
+		}
 		a.expire(c.target, inst)
 		removed++
 	}

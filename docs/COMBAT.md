@@ -156,6 +156,10 @@ and procs see a consistent single-threaded fight.
 ## 10. Open / deferred
 
 - Exact to-hit and soak **curves** (linear vs diminishing-returns) — tune during content work.
-- PvP rules (consent, flagging, safe zones) — separate design pass.
+- PvP rules (consent, flagging, safe zones) — separate design pass. NOTE (Phase 7.4f): a pack
+  `pvp_allowed` Lua policy **SUPERSEDES** the engine's arena-forcing + both-must-consent default
+  (it does not augment them) — when a custom policy is defined, only it + the always-applied
+  safe-room veto decide PvP; the policy is fail-closed (a missing/erroring policy denies harm).
+  See docs/ABILITIES.md §7.
 - Whether casting uses the same lag model or a cast-time/interrupt model — leaning shared lag
   for v1; revisit if spellcasting needs interrupts.
