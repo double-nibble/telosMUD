@@ -81,12 +81,13 @@ under-serve. Strong unit coverage exists (`internal/world/lua*_test.go`); the bl
 
 | Behavior | Best tier | Status | Priority |
 | --- | --- | --- | --- |
-| Budget / circuit-breaker: a runaway script is killed, the zone survives | unit | **THIN** — `luabreaker_test.go`, `luaharm_test.go` (unit); no journey proving a runaway script in a LIVE zone doesn't stall other players | P1 |
-| Whole-zone panic recovery — a script panic doesn't crash the shard | in-process | **GAP** — the panic-recovery resilience is not pinned as "a player in the zone keeps playing through a script panic" | P0 |
-| Hot-reload a script live (edit → re-fires) without dropping players | in-process / e2e | **GAP** — `luareload_test.go` is unit; no live-reload journey | P1 |
+| Budget / circuit-breaker: a runaway script is killed, the zone survives | running-zone | **DONE (Wave 3)** — `internal/world/lua_sandbox_journey_test.go::TestRunawayLuaCommandDoesNotWedgeZone` (a `while true do end` custom command on a LIVE running zone is budget-aborted + breaker-quarantined while a SECOND player keeps playing; controlled-break confirmed the zone WEDGES without the budget). Unit layer: `luabreaker_test.go` | P1 |
+| Whole-zone panic recovery — a script panic doesn't crash the shard | running-zone | **DONE (Wave 3)** — `lua_sandbox_journey_test.go::TestPanicInLuaPathRecoversAndZoneServes` (a Go-panicking builtin reached through real Lua content; the zone survives, blast radius is one command). Defense-in-depth: I could NOT construct a crashing variant (a positive finding). Core-handler panic: `TestZoneRecoversFromHandlerPanic` | P0 |
+| Player self.state survives a logout/relogin through the real ladder | running-zone | **DONE (Wave 3)** — `internal/world/lua_state_journey_test.go::TestPlayerLuaStateSurvivesLogoutReloginLadder` (a Lua quest counter mutated in-session survives the async logout flush + fresh-login rehydrate on a RUNNING shard; controlled-break verified). The 7.6 marshaller itself: `luastate_test.go` | P1 |
+| Hot-reload a script live (edit → re-fires) without dropping players + self.state survives | running-zone | **DONE** — `luareload_test.go::TestMobGreetingReloadsLiveStatePersists` + `TestHotReloadMobLuaFullPath` (the full bus→reloader→inbox→reloadLua path; live instance picks up the new handler, self.state preserved). Already end-to-end; not re-done in Wave 3 | P1 |
 | Sandbox escape attempts (os/io/ffi denied) stay denied | unit | **DONE-ish** — `luaharm_lint_test.go` + harm tests; keep unit, harden as the handle API grows | P1 |
-| Room script fires on entry; scripted mob greets (Phase 7 "Done when") | in-process / e2e | **GAP** — the Phase 7 milestone journey has no black-box test | P1 |
-| Pack defines/fires/handles a custom (engine-unknown) event (Phase 7 "Done when") | in-process | **GAP** | P1 |
+| Pack defines/fires/handles a custom (engine-unknown) event (Phase 7 "Done when") | unit | **DONE** — `luahook_test.go::TestCustomEventRoundTrips` + `TestCustomEventBudgetAndGate` (a `mud.fire("pack:Event")` round-trip, budget-bounded + gated). Already covered; a black-box layer would not strengthen it (Wave 3 scoping decision) | P1 |
+| Room script fires on entry; scripted mob greets (Phase 7 "Done when") | in-process / e2e | **THIN** — the trigger fires (`TestTriggerGreetRemembersViaState`, unit) but no full gate→greet journey on a scripted content pack | P2 |
 
 ## Area 4 — Onboarding journeys (the ROADMAP "Done when" lines as acceptance tests)
 
@@ -138,7 +139,9 @@ the owning engineer decides the intended contract:
    contention. DONE. Remaining Area-2 gaps deferred to a later wave: the redirect-target-unreachable
    crash-failover window, the double-registration race, backpressure/slow-client, the epoch-monotonicity
    leg of shard restart, directory-lease expiry, NATS hot-reload.
-3. **Wave 3 — Phase 7 sandbox**: whole-zone panic recovery journey, live hot-reload, runaway-budget
-   doesn't stall the zone, the Phase 7 "Done when" milestone journeys.
+3. **Wave 3 — Phase 7 sandbox** (this change): runaway-script-doesn't-wedge-the-running-zone,
+   whole-zone Go-panic recovery, player self.state survives the real logout/relogin ladder. DONE.
+   Live hot-reload and the custom-event lane were found ALREADY end-to-end (luareload/luahook) and
+   not re-done (scoping decision). Deferred: the full gate→scripted-mob-greet milestone journey (P2).
 4. **Wave 4 — onboarding journeys**: get/wield/wear `act()` journey, fireball cast journey, the
-   AoE-save + rage-on-hit legs of the Phase 6 milestone.
+   AoE-save + rage-on-hit legs of the Phase 6 milestone, the gate→scripted-greet Phase 7 milestone.
