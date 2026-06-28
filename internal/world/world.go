@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
+	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
 )
@@ -103,6 +104,13 @@ type Shard struct {
 	// when no bus/source is configured — hot reload disabled, a busless shard is byte-identical
 	// to a pre-4.3 shard. Set by WithHotReload, torn down at Run end.
 	reloader *reloader
+
+	// comms is the shard's Phase-8 comms SOURCE plumbing (comm.go): the RoleWorld commbus handle the
+	// world publishes channel lines through, the server-held per-author sequence (P8-A3), and the
+	// per-author rate-limit buckets (P8-A1). Always non-nil (a Disabled no-op bus until WithComms
+	// wires a live one), shared read-only by every hosted zone exactly like protos/defs — a busless
+	// shard publishes to nowhere and is byte-identical to a pre-Phase-8 shard.
+	comms *commSource
 }
 
 // NewDemoShard builds a single-shard midgaard world with no directory wiring — its
@@ -197,6 +205,9 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		// Empty global-definition bundle (defs.go); the constructor registers content into it
 		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
 		defs: newDefRegistries(),
+		// Comms SOURCE plumbing (comm.go), DISABLED until WithComms wires a live RoleWorld bus — a
+		// shard with no comms bus publishes channel lines to nowhere (the never-fatal degradation).
+		comms: newCommSource(),
 	}
 }
 
@@ -212,6 +223,21 @@ func (s *Shard) WithPersistence(store CharacterStore, ckpt Checkpointer) *Shard 
 	// normally call this before adopting any zone, but re-pointing keeps the wiring order-free.
 	for _, z := range s.zones {
 		z.saver = s.saver
+	}
+	return s
+}
+
+// WithComms wires the shard's Phase-8 comms SOURCE bus (docs/PHASE8-PLAN.md slice 8.3, P8-D1): the
+// world is the message SOURCE for channels, so it publishes channel lines through a RoleWorld commbus
+// handle (commbus.OpenWorld from cmd/telos-world — NEVER OpenGate: a world handed a gate handle could
+// not publish at all). bus MUST be a RoleWorld handle. It is OPTIONAL and never fatal: a nil bus (or
+// the Disabled no-op a NATS-down OpenWorld returns) leaves the shard publishing to nowhere — channels
+// degrade to "temporarily offline" for the speaker, the empty-boot/bare-zone tests stay green, and the
+// shard is byte-identical to a pre-Phase-8 one. MUST be called before Run. Returns the shard for
+// chaining; the production constructor wires it, tests inject a MemBus WORLD handle the same way.
+func (s *Shard) WithComms(bus commbus.Bus) *Shard {
+	if bus != nil {
+		s.comms.bus = bus
 	}
 	return s
 }

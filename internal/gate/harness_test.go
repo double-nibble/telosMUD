@@ -79,6 +79,18 @@ func (h *harness) addShard(zoneID, addr string, dir world.Locator, peers world.H
 	return sh
 }
 
+// addShardWithComms serves one single-zone world shard at addr wired with a comms SOURCE bus (the
+// Phase-8 world-is-source role). comms MUST be a RoleWorld handle (the world publishes channel lines)
+// — the cross-shard channel tests pass the WORLD handle of the SAME MemBus whose GATE handle the gate
+// is wired with, so a `gossip` line a player types on one shard fans out over the bus to a gate
+// subscribed for a player on the OTHER shard. Returns the live shard for inspection.
+func (h *harness) addShardWithComms(zoneID, addr string, dir world.Locator, peers world.HandoffDialer, comms commbus.Bus) *world.Shard {
+	h.t.Helper()
+	sh := world.NewShard(zoneID, addr, dir, peers).WithComms(comms)
+	h.serveShard(addr, sh)
+	return sh
+}
+
 // serveShard installs an already-built shard on its bufconn listener and starts both
 // its gRPC server and its zone goroutine. Splitting this from addShard lets a test
 // build a shard with custom wiring (WithPersistence, multi-zone) and still get the

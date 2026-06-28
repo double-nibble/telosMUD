@@ -86,6 +86,10 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		// block rides mob_prototypes.body and is cleared with the mob_prototypes delete above.)
 		`DELETE FROM combat_profile_defs WHERE pack=$1`,
 		`DELETE FROM pack_meta WHERE pack=$1`,
+		// Channels (Phase 8.3): stripped on re-seed so a second import strips-and-replaces rather than
+		// colliding on a duplicate ref (the same idempotency discipline as the other def tables). No FK
+		// into the zone tree, so order-independent.
+		`DELETE FROM channel_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -297,6 +301,23 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			`INSERT INTO combat_profile_defs (ref, pack, body) VALUES ($1,$2,$3)`,
 			cp.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert combat profile %s: %w", cp.Ref, err)
+		}
+	}
+	// Channels (Phase 8.3): the whole channel SHAPE (verb/color/format/access/...) rides the JSONB body
+	// (channelBody). ref+pack is the per-kind PK. The loader reads it back into the same ChannelDTO the
+	// embedded YAML produces, so YAML and Postgres packs register channels identically.
+	for _, ch := range pk.Channels {
+		body, err := json.Marshal(channelBody{
+			Name: ch.Name, Words: ch.Words, Color: ch.Color, Format: ch.Format,
+			Access: ch.Access, DefaultOn: ch.DefaultOn, History: ch.History,
+		})
+		if err != nil {
+			return fmt.Errorf("store: marshal channel %s body: %w", ch.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO channel_defs (ref, pack, body) VALUES ($1,$2,$3)`,
+			ch.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert channel %s: %w", ch.Ref, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

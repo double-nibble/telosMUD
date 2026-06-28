@@ -63,6 +63,12 @@ type Zone struct {
 	// standalone (returning 0 — no content defined). Set to the shared bundle by a shard.
 	defs *defRegistries
 
+	// bareComm is a PRIVATE comms-source fallback (comm.go) for a bare test zone built without a
+	// shard: the per-author seq counter + rate-limit buckets the channel publish path needs. A shard-
+	// hosted zone never uses it — it reaches the shared shard.comms. Lazily created; zone-goroutine
+	// only (a bare zone has no sibling zones racing it). nil until a bare zone first emits on a channel.
+	bareComm *commSource
+
 	// shard, if set, is the world process hosting this zone. It is read (never
 	// mutated through this field) by the zone goroutine to learn its sibling zones for
 	// an intra-shard move and to populate/clear the shard token index. nil on a bare

@@ -81,6 +81,29 @@ func (r *defRegistry[T]) register(ref string, def T) {
 	r.live.Store(&next)
 }
 
+// reload swaps the def for ref race-safely (the 4.3-style hot-reload path, mirrored from
+// protoCache.reload): a non-nil def replaces/inserts the entry; a nil def REMOVES it (a deleted
+// channel_def). It copy-then-Stores a fresh table under writeMu, so a concurrent lock-free reader
+// (get on any zone goroutine) sees the old or the new table whole, never a half-applied map. Unlike
+// register (build-time, uncontended) this runs at RUNTIME off the content-bus subscription goroutine,
+// so the copy-then-swap discipline is load-bearing.
+func (r *defRegistry[T]) reload(ref string, def T, remove bool) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	cur := r.table()
+	next := make(map[string]T, len(cur)+1)
+	for k, v := range cur {
+		if remove && k == ref {
+			continue
+		}
+		next[k] = v
+	}
+	if !remove {
+		next[ref] = def
+	}
+	r.live.Store(&next)
+}
+
 // defRegistries bundles the per-shard global-definition registries so a zone holds one pointer
 // (mirroring how it holds one *protoCache). Built once at shard construction, shared read-only.
 type defRegistries struct {
@@ -90,6 +113,7 @@ type defRegistries struct {
 	affect  *defRegistry[*affectDef]
 	ability *defRegistry[*abilityDef]
 	combat  *defRegistry[*combatProfile]
+	channel *defRegistry[*channelDef]
 
 	// defaultCombat is the pack's player-default combat profile ref (Phase 6.3a): the profile a player
 	// entity fights with when its own (none — players aren't prototyped) declares none. newPlayerEntity
@@ -127,6 +151,7 @@ func newDefRegistries() *defRegistries {
 		affect:      newDefRegistry[*affectDef](),
 		ability:     newDefRegistry[*abilityDef](),
 		combat:      newDefRegistry[*combatProfile](),
+		channel:     newDefRegistry[*channelDef](),
 		abilityCmds: map[string]*abilityDef{},
 		customCmds:  map[string]string{},
 		formulas:    map[string]string{},
@@ -160,6 +185,29 @@ func (z *Zone) abilityDefs() *defRegistry[*abilityDef] {
 // Phase 6.3a). Lock-free atomic.Load; a bare zone falls back to its own empty bundle (no profiles).
 func (z *Zone) combatProfiles() *defRegistry[*combatProfile] {
 	return z.defBundle().combat
+}
+
+// channelDefs is the zone-goroutine read accessor for the global channel registry (Phase 8.3). Lock-
+// free atomic.Load; a bare zone falls back to its own empty bundle (no channels => no channel verbs).
+func (z *Zone) channelDefs() *defRegistry[*channelDef] {
+	return z.defBundle().channel
+}
+
+// channelForVerb returns the channel a verb emits on (lower-cased), or nil. The verb→channel mapping
+// is DERIVED from the channel registry on each lookup (the table is small) rather than cached in a
+// separate map, so it stays consistent with a hot-reloaded registry FOR FREE: a channel whose verb
+// changed (or that was removed) is reflected on the next dispatch without a second swap to keep in
+// sync. dispatch consults this AFTER the built-in baseTable + abilityCmds + customCmds (a channel verb
+// never shadows a core/ability/custom verb). Read-only, safe from any zone goroutine.
+func (z *Zone) channelForVerb(v string) *channelDef {
+	for _, def := range z.channelDefs().table() {
+		for _, w := range def.words {
+			if w == v {
+				return def
+			}
+		}
+	}
+	return nil
 }
 
 // abilityForVerb returns the command-invocation ability bound to verb `v` (lower-cased), or nil.

@@ -91,6 +91,16 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 	}
 	r.log.Debug("invalidation received", "kind", inv.Kind, "ref", inv.Ref, "pack", inv.Pack)
 
+	// Phase 8.3: a `channel` invalidation reloads a pack-GLOBAL channel_def into the per-shard channel
+	// REGISTRY (the atomic-swap defRegistry), not the prototype cache. It is a different swap target
+	// (a channelDef, not a *Prototype) and a different table, so it forks off here before the
+	// prototype path. Channel verbs are derived from the registry on each dispatch (channelForVerb), so
+	// a verb added/removed by the edit takes effect with no second swap.
+	if inv.Kind == content.KindChannel {
+		r.reloadChannel(inv)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), reloadIOTimeout)
 	defer cancel()
 	def, err := r.src.LoadDefinition(ctx, inv.Kind, inv.Ref, inv.Pack)
@@ -129,6 +139,46 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 	// reset the breaker. The shared-cache swap above is the cross-goroutine-safe publish; the
 	// per-zone Lua state is updated single-writer via the inbox post.
 	r.notifyZones(inv.Kind, inv.Ref)
+}
+
+// reloadChannel applies a `channel` content hot reload (Phase 8.3): it re-reads the single edited
+// channel_def, rebuilds the runtime channelDef via the SAME mapper the boot loader uses
+// (buildChannelDef), and SWAPS it into the per-shard channel registry race-safely (defRegistry.reload
+// — the atomic whole-table swap). A deleted channel (Found=false) is REMOVED from the registry, so its
+// verb stops resolving and a speak attempt falls through to "Huh?". Every failure is non-fatal
+// (logged): hot reload is best-effort and never disturbs the running world beyond the one channel.
+//
+// It runs OFF every zone goroutine (the content-bus subscription goroutine), serially per
+// subscription, and the registry swap is the cross-goroutine-safe publish (a zone goroutine reading
+// channelForVerb sees the old or the new table whole). Channel verbs are DERIVED from the registry on
+// each dispatch, so a verb the edit added/removed/renamed takes effect with no further notification —
+// nothing per-zone to re-register (unlike a scripted prototype's Lua handlers).
+func (r *reloader) reloadChannel(inv contentbus.Invalidation) {
+	if r.shard == nil || r.shard.defs == nil {
+		// A bare reloader (a test without a shard) has no channel registry to swap; nothing to do.
+		return
+	}
+	reg := r.shard.defs.channel
+	if reg == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reloadIOTimeout)
+	defer cancel()
+	def, err := r.src.LoadDefinition(ctx, inv.Kind, inv.Ref, inv.Pack)
+	if err != nil {
+		// Infrastructure failure on the re-read: keep the last-known channel_def (do NOT drop it on a
+		// transient read error). The next invalidation retries.
+		r.log.Warn("hot reload re-read failed; keeping last-known channel", "ref", inv.Ref, "err", err)
+		return
+	}
+	if !def.Found {
+		// The channel was deleted/renamed: remove it so its verb stops resolving.
+		reg.reload(inv.Ref, nil, true)
+		r.log.Debug("hot reload: channel removed (definition deleted)", "ref", inv.Ref)
+		return
+	}
+	reg.reload(inv.Ref, buildChannelDef(def.Channel), false)
+	r.log.Debug("hot reload: channel swapped", "ref", inv.Ref)
 }
 
 // reloadLua applies a content Lua hot reload for (kind, ref) ON THE ZONE GOROUTINE (slice 7.7,

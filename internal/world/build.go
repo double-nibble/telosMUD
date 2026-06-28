@@ -134,6 +134,13 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, cp := range lc.CombatProfiles {
 		d.combat.register(cp.Ref, buildCombatProfile(cp))
 	}
+	// Channels (Phase 8.3): register each content channel_def into the per-shard channel registry. Its
+	// verb(s) become channel commands (dispatch consults channelForVerb after baseTable/abilities/custom
+	// — a channel verb never shadows a core verb). An empty pack registers ZERO channels => no channel
+	// verbs (the empty-boot invariant). Channels are CONTENT; the engine names none.
+	for _, ch := range lc.Channels {
+		d.channel.register(ch.Ref, buildChannelDef(ch))
+	}
 	d.defaultCombat = lc.DefaultCombat
 	// Custom Lua commands (7.4e): register each verb + its aliases into the per-shard custom-command
 	// table by EXACT word. Skips a word that collides with a BUILT-IN verb (a custom command may never
@@ -167,7 +174,8 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	lintVitalResources(d.res.table())
 	slog.Debug("global defs registered", "attributes", d.attr.len(),
 		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len(),
-		"abilities", d.ability.len(), "ability_commands", len(d.abilityCmds))
+		"abilities", d.ability.len(), "ability_commands", len(d.abilityCmds),
+		"channels", d.channel.len())
 }
 
 // lintVitalResources warns if a pack registers more than one VITAL resource. The combat/death machinery

@@ -124,6 +124,8 @@ func (p *Pool) LoadDefinition(ctx context.Context, kind, ref, pack string) (cont
 		return p.loadProtoDefinition(ctx, "item_prototypes", kind, ref, pack)
 	case content.KindMob:
 		return p.loadProtoDefinition(ctx, "mob_prototypes", kind, ref, pack)
+	case content.KindChannel:
+		return p.loadChannelDefinition(ctx, ref, pack)
 	default:
 		// Unknown/unsupported kind (e.g. zone): nothing to reload as a prototype. Report
 		// not-found so the caller no-ops rather than erroring.
@@ -194,6 +196,33 @@ func (p *Pool) loadProtoDefinition(ctx context.Context, table, kind, ref, pack s
 		d.Living = b.Living
 	}
 	return content.Definition{Kind: kind, Ref: ref, Found: true, Proto: d}, nil
+}
+
+// loadChannelDefinition fetches one channel_defs row and decodes its JSONB body into a ChannelDTO-
+// bearing Definition — the single-ref re-read the hot-reload applier uses for a `channel` invalidation
+// (world/reload.go reloadChannel). pgx.ErrNoRows => Found=false (a deleted channel; the reloader then
+// removes it from the registry). Mirrors loadProtoDefinition's shape exactly.
+func (p *Pool) loadChannelDefinition(ctx context.Context, ref, pack string) (content.Definition, error) {
+	var ch content.ChannelDTO
+	var body []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT ref, body FROM channel_defs WHERE ref = $1 AND pack = $2`, ref, pack).
+		Scan(&ch.Ref, &body)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return content.Definition{Kind: content.KindChannel, Ref: ref, Found: false}, nil
+	}
+	if err != nil {
+		return content.Definition{}, fmt.Errorf("store: load channel definition %s: %w", ref, err)
+	}
+	if len(body) > 0 {
+		var b channelBody
+		if err := json.Unmarshal(body, &b); err != nil {
+			return content.Definition{}, fmt.Errorf("store: channel %s body: %w", ref, err)
+		}
+		ch.Name, ch.Words, ch.Color, ch.Format = b.Name, b.Words, b.Color, b.Format
+		ch.Access, ch.DefaultOn, ch.History = b.Access, b.DefaultOn, b.History
+	}
+	return content.Definition{Kind: content.KindChannel, Ref: ref, Found: true, Channel: ch}, nil
 }
 
 func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string]*content.ZoneDTO) error {
@@ -364,6 +393,20 @@ type combatProfileBody struct {
 	ToHit       any                    `json:"to_hit,omitempty"`
 	Avoidance   []any                  `json:"avoidance,omitempty"`
 	DamageBonus content.FormulaNodeDTO `json:"damage_bonus,omitempty"`
+}
+
+// channelBody is the JSONB-tail shape for a channel_defs row (Phase 8.3): everything that is not the
+// relational ref/pack PK. It mirrors content.ChannelDTO minus its Ref, so the whole channel SHAPE
+// (verb words, color/format template, access predicate, default_on, history) is content carried in the
+// body — the engine names no channel.
+type channelBody struct {
+	Name      string                   `json:"name,omitempty"`
+	Words     []string                 `json:"words,omitempty"`
+	Color     string                   `json:"color,omitempty"`
+	Format    string                   `json:"format,omitempty"`
+	Access    content.ChannelAccessDTO `json:"access,omitempty"`
+	DefaultOn bool                     `json:"default_on,omitempty"`
+	History   int                      `json:"history,omitempty"`
 }
 
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
@@ -602,6 +645,39 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	cpRows.Close()
+
+	// Channels (Phase 8.3): ref+pack first-class, the channel SHAPE (verb/color/format/access/...) in
+	// the JSONB body. Decoded into the same ChannelDTO the embedded YAML carries, so the world side
+	// registers them identically whether the pack came from YAML or Postgres.
+	chRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM channel_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query channel_defs: %w", err)
+	}
+	for chRows.Next() {
+		var ch content.ChannelDTO
+		var pk string
+		var body []byte
+		if err := chRows.Scan(&ch.Ref, &pk, &body); err != nil {
+			chRows.Close()
+			return fmt.Errorf("store: scan channel_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b channelBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				chRows.Close()
+				return fmt.Errorf("store: channel_def %s body: %w", ch.Ref, err)
+			}
+			ch.Name, ch.Words, ch.Color, ch.Format = b.Name, b.Words, b.Color, b.Format
+			ch.Access, ch.DefaultOn, ch.History = b.Access, b.DefaultOn, b.History
+		}
+		pp := pack(pk)
+		pp.Channels = append(pp.Channels, ch)
+	}
+	if err := chRows.Err(); err != nil {
+		return err
+	}
+	chRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

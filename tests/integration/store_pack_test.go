@@ -225,6 +225,7 @@ func TestStorePackRoundTrip(t *testing.T) {
 		{"affects", fromDB.Affects, fromYAML.Affects},
 		{"abilities", fromDB.Abilities, fromYAML.Abilities},
 		{"combat_profiles", fromDB.CombatProfiles, fromYAML.CombatProfiles},
+		{"channels", fromDB.Channels, fromYAML.Channels},
 	}
 	for _, tc := range defCases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -21,6 +21,7 @@ import (
 
 	"github.com/double-nibble/telosmud/db"
 	"github.com/double-nibble/telosmud/internal/checkpoint"
+	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
@@ -120,6 +121,18 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// (boot-load still works); never fatal, exactly like Redis/Postgres being down.
 	bus := openContentBus(cfg)
 
+	// Optional comms bus (Phase 8.3): the world is the comms SOURCE — it publishes channel lines through
+	// a RoleWorld commbus handle (commbus.OpenWorld ONLY — never OpenGate). NATS unreachable => a Disabled
+	// no-op bus => channels degrade to "temporarily offline" for the speaker, never a boot failure
+	// (the never-fatal rule, mirroring openContentBus + the gate's commbus.OpenGate).
+	comms := commbus.OpenWorld(cfg.NATS.URL, func(err error) {
+		if err != nil {
+			slog.Warn("nats unavailable; comms disabled (world source)", "url", cfg.NATS.URL, "err", err)
+			return
+		}
+		slog.Info("comms bus ready (world source)", "url", cfg.NATS.URL)
+	})
+
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
@@ -129,7 +142,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		// durability — a character survives a restart, just with a wider crash window.
 		return world.NewShardFromContent(lc, zones, home, "", nil, nil).
 			WithPersistence(charStore, nil).
-			WithHotReload(defSource, bus, enabledPacks)
+			WithHotReload(defSource, bus, enabledPacks).
+			WithComms(comms)
 	}
 	dir := directory.NewRedis(rdb, "telos")
 	ckpt := checkpoint.NewRedis(rdb, "telos") // ~10s Redis checkpoint tier of the ladder
@@ -168,7 +182,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 
 	return world.NewShardFromContent(lc, zones, home, cfg.ShardAddr, dir, world.GRPCDialer()).
 		WithPersistence(charStore, ckpt).
-		WithHotReload(defSource, bus, enabledPacks)
+		WithHotReload(defSource, bus, enabledPacks).
+		WithComms(comms)
 }
 
 // openLivePool opens the long-lived Postgres pool the shard keeps for its lifetime: it backs both

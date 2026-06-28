@@ -47,5 +47,15 @@ func PublishPack(ctx context.Context, bus Bus, pk content.Pack) (int, error) {
 			}
 		}
 	}
+	// Pack-GLOBAL channel_defs (Phase 8.3): a re-seed may have edited a channel's color/format/access,
+	// so publish a `channel` invalidation per channel ref. The world's reloader swaps the channel
+	// registry (world/reload.go reloadChannel). Channels are NOT under a zone, so this is the pack-level
+	// loop, not the per-zone one. (Other pack globals — attributes/abilities/... — have no hot-reload
+	// kind yet and are a boot concern; only channel is published here.)
+	for _, ch := range pk.Channels {
+		if err := pub(content.KindChannel, ch.Ref); err != nil {
+			return n, err
+		}
+	}
 	return n, nil
 }

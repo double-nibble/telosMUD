@@ -50,48 +50,65 @@ type commsClient struct {
 	subs []commbus.Subscription // every live subscription this connection holds, closed on teardown
 }
 
-// openComms establishes the connection's comms subscriptions. For slice 8.2 there are no channels or
-// tells defined yet, so the only subscription is the player's PERSONAL tell subject —
-// telos.comms.tell.<playerId> — a CONCRETE per-player subject (never a telos.comms.tell.* wildcard:
-// subscribe is not ACL-guarded, so the concrete-subject choice is the only thing preventing a
-// cross-player tell leak; PHASE8-PLAN 8.5 obligation). 8.3 (channels) adds the per-enabled-channel
-// subscriptions over this same client; 8.5 (tells) gives this subject real senders. Until then the
-// synthetic test publishes here.
+// openComms establishes the connection's comms subscriptions. Two subscriptions for slice 8.3:
+//
+//   - the player's PERSONAL tell subject — telos.comms.tell.<playerId> — a CONCRETE per-player subject
+//     (never a telos.comms.tell.* wildcard: subscribe is not ACL-guarded, so the concrete-subject
+//     choice is the only thing preventing a cross-player tell leak; PHASE8-PLAN 8.5 obligation). 8.5
+//     gives this subject real senders; until then the synthetic test publishes here.
+//   - the CHANNEL fan-out — telos.comms.chan.* (every channel). The gate has NO content (it cannot
+//     enumerate the channel_defs or run their access predicate), so for 8.3 it subscribes the wildcard
+//     and renders whatever the SOURCE WORLD published. The world is the authoritative SPEAK gate (it
+//     checked channelDef.access against the live *Entity before publishing — P8-A8), and it rendered
+//     the full line (format/color/sanitized $t) into Body, so the gate is a dumb sink. The per-player
+//     enabled-channel set + per-channel subscribe (the receiver HEAR filter, OQ-3) lands with the
+//     channel toggles + the comms-state subtree in slice 8.6; 8.3 shows every channel. The wildcard is
+//     CHANNEL-ONLY (chan.*) — never tell.* — so it can never leak another player's directed tell.
 //
 // bus is the gate's RoleGate handle (never nil — a disabled bus when NATS is down yields no-op
 // subscriptions, so comms simply delivers nothing and the connection is byte-identical to pre-Phase-8).
 func openComms(log *slog.Logger, bus commbus.Bus, tc *telnet.Conn, player string) *commsClient {
 	c := &commsClient{log: log, tc: tc, player: player}
 
-	tellSubj := commbus.TellSubject(player)
-	sub, err := bus.Subscribe(tellSubj, c.deliver)
-	if err != nil {
-		// A failed Subscribe is never fatal: comms is optional. Log and continue — the player still
-		// plays, just without comms (exactly the NATS-down degradation). A nil/disabled bus does not
-		// reach here (it returns a no-op Subscription, nil error).
-		log.Debug("comms subscribe failed", "subject", tellSubj, "err", err)
-		return c
-	}
-	c.subs = append(c.subs, sub)
-	log.Debug("comms subscribed", "subject", tellSubj)
+	c.subscribe(bus, commbus.TellSubject(player), c.deliverTell)
+	c.subscribe(bus, commbus.ChanPrefix+"*", c.deliverChannel) // every channel (8.3); per-enabled-set is 8.6
 	return c
 }
 
-// deliver renders one received comms Message onto the connection's socket via the EXISTING writer path
+// subscribe registers one subscription and records it for teardown. A failed Subscribe is never fatal:
+// comms is optional, so it logs and continues — the player still plays, just without that subscription
+// (the NATS-down degradation). A nil/disabled bus returns a no-op Subscription (nil error), so it never
+// errors here.
+func (c *commsClient) subscribe(bus commbus.Bus, subject string, handler func(commbus.Message)) {
+	sub, err := bus.Subscribe(subject, handler)
+	if err != nil {
+		c.log.Debug("comms subscribe failed", "subject", subject, "err", err)
+		return
+	}
+	c.subs = append(c.subs, sub)
+	c.log.Debug("comms subscribed", "subject", subject)
+}
+
+// deliverTell renders one received TELL onto the connection's socket via the EXISTING writer path
 // (telnet.Conn.Write — the same mutex-guarded sink the per-stream writer uses). It runs on the bus's
-// own per-subscription delivery goroutine (never a stream goroutine), so it must touch only the conn-
-// scoped tc, which is concurrency-safe.
-//
-// The 8.2 rendering is deliberately minimal — the message is shown as an Output line (a tell stand-in)
-// — because the rich channel-format/sanitize-as-$t rendering is content and lands in 8.3 (P8-A7). The
-// AuthorName is the ENGINE-SET author (set by the source world from the live *Entity; P8-A2): the gate
-// renders it, never authors it. A blocked socket here stalls only this goroutine; the bus's bounded
-// buffer drops rather than stalling the publisher (P8-A1).
-func (c *commsClient) deliver(msg commbus.Message) {
-	c.log.Debug("comms message delivered",
-		"subject", msg.Subject, "author", msg.AuthorName, "seq", msg.Seq)
-	// Minimal tell-shaped rendering for 8.2. The channel-format render (color/$t-substitution) is 8.3.
+// own per-subscription delivery goroutine (never a stream goroutine), so it touches only the conn-
+// scoped tc, which is concurrency-safe. The 8.5 tell-rendering is a stand-in (a tell-shaped line); 8.5
+// gives it real senders. AuthorName is the ENGINE-SET author (P8-A2): the gate renders, never authors.
+func (c *commsClient) deliverTell(msg commbus.Message) {
+	c.log.Debug("comms tell delivered", "subject", msg.Subject, "author", msg.AuthorName, "seq", msg.Seq)
 	_ = c.tc.Write(msg.AuthorName + " tells you, '" + msg.Body + "'\r\n")
+}
+
+// deliverChannel renders one received CHANNEL line (Phase 8.3). The Body is the FULLY-rendered line the
+// SOURCE WORLD produced from the channel_def's format/color with the player's text sanitized as the $t
+// DATA arg (P8-A7) — so a `$`/ANSI/IAC in the original message is already literal and a player could
+// not forge a "[gossip] Admin:" prefix. The gate writes it VERBATIM: it does not re-render, re-parse,
+// or trust any field for markup — the engine=mechanism / content=flavor split keeps the channel format
+// world-side (content) and the gate a dumb sink. A blocked socket stalls only this goroutine; the bus's
+// bounded buffer drops rather than stalling the publisher (P8-A1, slow-consumer).
+func (c *commsClient) deliverChannel(msg commbus.Message) {
+	c.log.Debug("comms channel delivered", "subject", msg.Subject, "author", msg.AuthorName, "seq", msg.Seq)
+	_ = c.tc.Write(msg.Body + "\r\n")
 }
 
 // close tears down every subscription this connection holds. It is called ONCE, via a single defer in

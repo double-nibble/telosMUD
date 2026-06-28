@@ -201,6 +201,17 @@ func (z *Zone) dispatch(s *session, line string) {
 			s.send(promptFrame())
 			return
 		}
+		// Content channel verb (Phase 8.3): a `gossip`/`newbie` verb defined by a channel_def. Consulted
+		// by EXACT match only (no abbreviation — a channel verb never shadows or abbreviates a core verb),
+		// AFTER abilities + custom commands. The handler runs the SOURCE publish path (access, rate-limit,
+		// sanitize, engine-set author) and publishes to the comms bus; it never releases ownership, so we
+		// prompt on return. An empty pack defines no channels => this is always nil => no channel verbs.
+		if def := z.channelForVerb(lower); def != nil {
+			z.log.Debug("dispatch: channel command", "player", s.character, "verb", lower, "channel", def.ref)
+			z.cmdChannel(s, def, rest)
+			s.send(promptFrame())
+			return
+		}
 		z.log.Debug("unknown verb", "player", s.character, "verb", lower)
 		s.send(textFrame("Huh?"))
 		s.send(promptFrame())

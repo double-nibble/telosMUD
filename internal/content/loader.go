@@ -56,6 +56,11 @@ type LoadedContent struct {
 	// Commands are the pack-global custom Lua verbs (Phase 7.4e), accumulated across packs (last-write
 	// -wins by verb). The world side registers them into the per-shard custom-command table.
 	Commands []CommandDTO
+	// Channels are the pack-global comms channel definitions (Phase 8.3), same last-write-wins
+	// override rule keyed by ref. The world side registers them into the per-shard channel registry
+	// and binds each channel's verb(s) into the per-shard channel-command table. An empty list => no
+	// channels => no channel verbs (the empty-boot invariant).
+	Channels []ChannelDTO
 	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
 	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
 	// by name).
@@ -102,6 +107,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	affIdx := make(map[string]int)
 	abilIdx := make(map[string]int)
 	cpIdx := make(map[string]int)
+	chanIdx := make(map[string]int)
 	for _, p := range packs {
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
@@ -172,6 +178,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				cpIdx[cp.Ref] = len(lc.CombatProfiles)
 				lc.CombatProfiles = append(lc.CombatProfiles, cp)
+			}
+		}
+		for _, ch := range p.Channels {
+			if idx, ok := chanIdx[ch.Ref]; ok {
+				lc.Channels[idx] = ch
+			} else {
+				chanIdx[ch.Ref] = len(lc.Channels)
+				lc.Channels = append(lc.Channels, ch)
 			}
 		}
 	}

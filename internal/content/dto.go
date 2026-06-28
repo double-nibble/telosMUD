@@ -44,6 +44,14 @@ type Pack struct {
 	// EXACT match only, so a custom verb can never shadow or abbreviate a core/movement/ability verb.
 	Commands []CommandDTO `json:"commands" yaml:"commands"`
 
+	// Channels are pack-GLOBAL comms channels (Phase 8.3, docs/PHASE8-PLAN.md P8-D3): named
+	// broadcast channels (gossip/newbie/auction/OOC) with a verb, a color/format template, an access
+	// predicate, and a default-on flag. Channels are CONTENT, not engine: the engine knows the KIND
+	// (channel_defs) and the comms transport; `gossip` exists only because a pack defines it. An empty
+	// pack ships none and there are NO channel verbs (the empty-boot invariant). Same last-write-wins
+	// override-by-ref rule as the other pack globals.
+	Channels []ChannelDTO `json:"channels" yaml:"channels"`
+
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
@@ -53,6 +61,57 @@ type Pack struct {
 	// (to_hit/soak/regen/xp_for) to a Lua body that returns a number, an alternative to the prefix-AST
 	// data formula. A ref uses the data formula OR the Lua one, never both.
 	Formulas map[string]string `json:"formulas" yaml:"formulas"`
+}
+
+// ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel
+// is pure CONTENT: the engine names no channel (no hardcoded `gossip`) and only knows the channel_def
+// shape + the comms transport. Authoring a channel registers its verb(s) and gives the source world
+// the format/color/access rules it applies before publishing a line to telos.comms.chan.<ref>.
+//
+//   - Ref is the stable channel id and the SUBJECT token (telos.comms.chan.<ref>); it is validated
+//     against the loaded channel_defs before a subject is ever built (P8-A8, subject injection).
+//   - Name is the display name; Words are the command verbs that emit on the channel (an empty pack =>
+//     no such verb). Words are registered EXACT-only beside the custom-command table.
+//   - Color is the channel's color token (markup applied to the rendered line); Format is the
+//     listener-perspective template with $-substitution ("[$channel] $name: $t") — $t is the
+//     player's text as DATA (sanitized; a `$`/`%`/ANSI in it is literal — P8-A7), $name the
+//     ENGINE-SET author, $channel the channel name. The default (empty Format) is "[$channel] $name: $t".
+//   - Access is the speak/hear predicate (who may use the channel) — a CONTENT predicate evaluated
+//     ENGINE-SIDE against the speaking *Entity, never trusting the client (P8-A8).
+//   - DefaultOn is whether a fresh character is subscribed by default (drives the gate subscription;
+//     per-player toggles are slice 8.6). History is the recent-lines buffer size (carried; retrieval
+//     is deferred — slice 8.3 only records the field).
+type ChannelDTO struct {
+	Ref       string           `json:"ref" yaml:"ref"`
+	Name      string           `json:"name" yaml:"name"`
+	Words     []string         `json:"words" yaml:"words"`
+	Color     string           `json:"color" yaml:"color"`
+	Format    string           `json:"format" yaml:"format"`
+	Access    ChannelAccessDTO `json:"access" yaml:"access"`
+	DefaultOn bool             `json:"default_on" yaml:"default_on"`
+	History   int              `json:"history" yaml:"history"`
+}
+
+// ChannelAccessDTO is a channel's access predicate (P8-A8): a small content gate the source world
+// evaluates against the speaking *Entity before publishing. All conditions present must hold (AND). A
+// zero ChannelAccessDTO (no conditions) means "anyone may speak" (the open channel). It is DATA only —
+// a flag the entity must carry, an attribute floor — never code; the engine reads the live entity, the
+// content names the rule. Hear-side access for cross-shard receivers is the gate's per-enabled-channel
+// subscription (slice 8.6 wires per-player toggles); the speak-side predicate here is authoritative.
+type ChannelAccessDTO struct {
+	// RequireFlag, if non-empty, is a named entity flag the speaker MUST carry (e.g. an "immortal"
+	// channel requires the "immortal" flag). Empty => no flag requirement.
+	RequireFlag string `json:"require_flag" yaml:"require_flag"`
+	// MinAttr, if non-nil, requires the speaker's named attribute to be >= the value (e.g. a level
+	// floor on a channel). Both Attr and Min must be set to take effect.
+	MinAttr *MinAttrDTO `json:"min_attr" yaml:"min_attr"`
+}
+
+// MinAttrDTO is one attribute-floor condition: the speaker's Attr (a content attribute ref) must
+// resolve >= Min. Used by a channel access predicate (a level-gated channel).
+type MinAttrDTO struct {
+	Attr string  `json:"attr" yaml:"attr"`
+	Min  float64 `json:"min" yaml:"min"`
 }
 
 // CommandDTO is one custom Lua verb (Phase 7.4e). Verb is the word the player types; Lua is the

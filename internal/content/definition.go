@@ -20,6 +20,11 @@ const (
 	KindItem = "item"
 	KindMob  = "mob"
 	KindZone = "zone"
+	// KindChannel is a pack-GLOBAL comms channel definition (Phase 8.3). Unlike room/item/mob it is
+	// NOT spawnable and NOT under a zone — it lives on the pack's `channels` list — so its single-ref
+	// re-read scans the pack globals, and its hot-reload swaps the channel registry (not the prototype
+	// cache). The world's reloader special-cases this kind (world/reload.go).
+	KindChannel = "channel"
 )
 
 // Definition is the result of a single-ref re-read: exactly one of Room/Proto is set (per Kind),
@@ -31,8 +36,9 @@ type Definition struct {
 	Ref   string
 	Found bool
 
-	Room  RoomDTO  // set when Kind == KindRoom && Found
-	Proto ProtoDTO // set when Kind == KindItem || KindMob, && Found
+	Room    RoomDTO    // set when Kind == KindRoom && Found
+	Proto   ProtoDTO   // set when Kind == KindItem || KindMob, && Found
+	Channel ChannelDTO // set when Kind == KindChannel && Found (Phase 8.3, a pack global, not a prototype)
 }
 
 // DefinitionSource is a content source that can re-read ONE definition by (kind, ref, pack). The
@@ -56,6 +62,9 @@ func (s EmbeddedSource) LoadDefinition(ctx context.Context, kind, ref, pack stri
 		return Definition{}, err
 	}
 	for _, p := range packs {
+		if def, ok := scanPackGlobals(kind, ref, &p); ok {
+			return def, nil
+		}
 		for zi := range p.Zones {
 			z := &p.Zones[zi]
 			if def, ok := scanZone(kind, ref, z); ok {
@@ -64,6 +73,22 @@ func (s EmbeddedSource) LoadDefinition(ctx context.Context, kind, ref, pack stri
 		}
 	}
 	return Definition{Kind: kind, Ref: ref, Found: false}, nil
+}
+
+// scanPackGlobals looks for (kind, ref) among a pack's GLOBAL (non-zone) definitions — Phase 8.3
+// channels live here (a channel is a pack global, not a zone child). It is consulted before scanZone
+// in every single-ref re-read so a `channel` invalidation resolves the edited channel_def. Returns
+// (def, true) on a hit. Only the kinds with a single-ref hot-reload path are scanned; the other pack
+// globals (attributes/abilities/...) have no hot-reload kind yet and are not single-ref re-read.
+func scanPackGlobals(kind, ref string, p *Pack) (Definition, bool) {
+	if kind == KindChannel {
+		for i := range p.Channels {
+			if p.Channels[i].Ref == ref {
+				return Definition{Kind: kind, Ref: ref, Found: true, Channel: p.Channels[i]}, true
+			}
+		}
+	}
+	return Definition{}, false
 }
 
 // scanZone looks for (kind, ref) inside one zone's child slices, returning a populated Definition
@@ -140,12 +165,34 @@ func (m *MemSource) LoadDefinition(_ context.Context, kind, ref, pack string) (D
 	if p == nil {
 		return Definition{Kind: kind, Ref: ref, Found: false}, nil
 	}
+	if def, ok := scanPackGlobals(kind, ref, p); ok {
+		return def, nil
+	}
 	for zi := range p.Zones {
 		if def, ok := scanZone(kind, ref, &p.Zones[zi]); ok {
 			return def, nil
 		}
 	}
 	return Definition{Kind: kind, Ref: ref, Found: false}, nil
+}
+
+// EditChannel is a test convenience: replace one channel_def in place (Phase 8.3 hot-reload coverage),
+// so a test can edit a channel's color/format then trigger a `channel` invalidation and assert the
+// re-read observes the edit. Returns an error if the channel is not present so a typo fails loudly.
+func (m *MemSource) EditChannel(pack string, ch ChannelDTO) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p := m.packs[pack]
+	if p == nil {
+		return fmt.Errorf("content: MemSource has no pack %q", pack)
+	}
+	for i := range p.Channels {
+		if p.Channels[i].Ref == ch.Ref {
+			p.Channels[i] = ch
+			return nil
+		}
+	}
+	return fmt.Errorf("content: MemSource pack %q has no channel %q", pack, ch.Ref)
 }
 
 // EditRoomLong is a test convenience: change one room's long description in place. Returns an

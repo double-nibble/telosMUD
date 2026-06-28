@@ -324,6 +324,32 @@ combat_profiles:
     # the attacker ($actor). This is what makes a STR-heavy fighter hit harder — as CONTENT, no Lua.
     damage_bonus: ["+", ["attr", "$actor.strength_bonus"], ["attr", "$actor.damroll"]]
 
+# Comms channels (Phase 8.3, docs/PHASE8-PLAN.md P8-D3) — CONTENT, not engine. The engine names NO
+# channel: `gossip`/`newbie` exist ONLY because this pack defines them; strip the pack (bare-engine
+# boot) and there are no channel verbs at all (the empty-boot invariant). Each channel_def gives its
+# verb(s), a color/format template (the listener line, $-substituted: $channel/$name/$t), an access
+# predicate (who may speak — content, evaluated engine-side against the live entity), and default_on.
+channels:
+  # gossip: the OOC global chatter channel. Open to everyone (no access predicate), default on. The
+  # format renders "[Gossip] <author>: <text>"; the player's text is the $t DATA arg (a `$`/ANSI in it
+  # is literal — it can never forge a "[Gossip] Admin:" prefix or inject a control sequence).
+  - ref: gossip
+    name: Gossip
+    words: [gossip, gos]
+    color: ""
+    format: "[$channel] $name: $t"
+    default_on: true
+    history: 20
+  # newbie: the help/newbie channel. Also open + default-on; a distinct verb/format demonstrates the
+  # multi-channel shape. A pack could gate this (e.g. require a "helper" flag or a level floor) via
+  # `access`; the demo keeps it open so the journey tests need no flag setup.
+  - ref: newbie
+    name: Newbie
+    words: [newbie, newb]
+    format: "[$channel] $name: $t"
+    default_on: true
+    history: 20
+
 zones:
   - ref: midgaard
     name: The City of Midgaard
