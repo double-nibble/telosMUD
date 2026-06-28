@@ -44,7 +44,7 @@ import (
 // fight in a zone resolves on this stride, hung off the zone's own heartbeat (no global lockstep). A
 // content ruleset that wants faster/slower rounds tunes this multiple (a future per-pack override is a
 // reserved seam; the constant is the engine default).
-const PULSE_VIOLENCE uint64 = 10 //nolint:revive // TODO(world-engineer): ALL_CAPS is a deliberate Diku homage; decide rename vs keep (touches combat.go + tests + docs)
+const PULSE_VIOLENCE uint64 = 10 //nolint:revive // PULSE_VIOLENCE is a deliberate Diku heritage name (combat round cadence); kept intentionally.
 
 // maxSwingsPerRound caps the swings one entity resolves per round, so a runaway `attacks` attribute (a
 // content bug or a haste stack gone wrong) can never spin the single-writer zone goroutine. Far past any

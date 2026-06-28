@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -74,7 +75,8 @@ func PathFromEnv() string { return os.Getenv("TELOS_CONFIG") }
 func Load(path string) (Config, error) {
 	cfg := Default()
 	if path != "" {
-		data, err := os.ReadFile(path) //nolint:gosec // TODO(config-owner): config path is operator-supplied; validate/confine it
+		path = filepath.Clean(path)
+		data, err := os.ReadFile(path) //nolint:gosec // config path is operator-supplied (TELOS_CONFIG); cleaned above, no privilege boundary crossed.
 		switch {
 		case err == nil:
 			if err := yaml.Unmarshal(data, &cfg); err != nil {

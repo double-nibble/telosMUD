@@ -81,25 +81,6 @@ func (r *defRegistry[T]) register(ref string, def T) {
 	r.live.Store(&next)
 }
 
-// reload atomically replaces (or, with a zero def, the caller uses remove) the def for ref AT
-// RUNTIME — the 4.3-style hot-reload swap. It builds a FRESH table copy with the one entry changed
-// and Stores it, so every concurrent reader sees the whole old or whole new table, never a partial.
-// This slice never CALLS reload (no invalidation is published yet); it exists so a later slice
-// drops in hot reload without touching the read path. (Kept for symmetry with protoCache.reload.)
-//
-//nolint:unused // TODO(world-engineer): hot-reload hook not yet called (no invalidation published); keep (Phase-N placeholder)
-func (r *defRegistry[T]) reload(ref string, def T) {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	cur := r.table()
-	next := make(map[string]T, len(cur))
-	for k, v := range cur {
-		next[k] = v
-	}
-	next[ref] = def
-	r.live.Store(&next)
-}
-
 // defRegistries bundles the per-shard global-definition registries so a zone holds one pointer
 // (mirroring how it holds one *protoCache). Built once at shard construction, shared read-only.
 type defRegistries struct {

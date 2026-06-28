@@ -25,7 +25,7 @@ type Room struct {
 	sector string
 	// flags carries the legacy bitmask room flags (dark/indoor…). Stub: the visibility filter
 	// consults it once content supplies bit flags.
-	flags uint64 //nolint:unused // TODO(world-engineer): legacy bitmask room-flags stub; keep until content supplies bit flags
+	flags uint64 //nolint:unused // reserved data-model field; consulted once room bit-flags land.
 	// namedFlags is the open-set room flag store (flags.go): builder-authored named booleans like
 	// "safe"/"arena" that the PvP gate (pvp.go) and other content rules read. Populated from the
 	// room DTO at authoring (content_map.go); immutable at runtime this phase. nil => no flags set.
@@ -127,7 +127,7 @@ type PlayerControlled struct {
 
 	// account, aliases, promptCfg, gmcpSupports — per MUDLIB §3. Stubs until the
 	// account model and GMCP negotiation arrive (Phase 8+).
-	account string //nolint:unused // TODO(world-engineer): account-model stub (MUDLIB §3); keep until Phase 8+
+	account string //nolint:unused // reserved data-model field; consulted once the Phase-8 account model lands.
 	aliases map[string]string
 }
 

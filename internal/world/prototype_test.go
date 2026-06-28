@@ -4,7 +4,6 @@ import (
 	"context"
 	"reflect"
 	"testing"
-	"unsafe"
 )
 
 // Tests for prototypes & instancing — flyweight + copy-on-write (docs/MUDLIB.md §5,
@@ -29,7 +28,7 @@ func slicePtr(s []string) uintptr {
 	if len(s) == 0 {
 		return 0
 	}
-	return uintptr(unsafe.Pointer(&s[0])) //nolint:gosec // TODO(world-engineer): test-only unsafe pointer-identity helper
+	return reflect.ValueOf(s).Pointer()
 }
 
 func TestSpawnSharesImmutableFields(t *testing.T) {

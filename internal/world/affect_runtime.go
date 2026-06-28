@@ -194,21 +194,6 @@ func (a *Affected) ensureTick(e *Entity) {
 	a.tick = e.zone.pulses.every(1, affectTickFor(e.zone, id, e))
 }
 
-// maybeStopTick cancels the per-entity tick when the entity no longer has affects OR a regen need.
-// Called at the end of a tick. Zone goroutine only.
-//
-//nolint:unused // TODO(world-engineer): tick-stop helper not yet wired into the tick path; keep (Phase-N placeholder)
-func (a *Affected) maybeStopTick(e *Entity) {
-	if a.tick == nil {
-		return
-	}
-	if a.hasActiveAffects() || needsRegen(e) {
-		return
-	}
-	a.tick.cancel()
-	a.tick = nil
-}
-
 // affectTickFor builds the per-entity tick callback. It HONOURS THE pulseFunc CONTRACT (pulse.go doc
 // comment) VERBATIM: it captures the player's stable id (character) and re-resolves the live entity
 // BY ID through z.players each tick — it NEVER closes over and mutates the *Entity captured at

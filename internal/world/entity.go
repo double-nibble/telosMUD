@@ -157,23 +157,3 @@ func (e *Entity) removeContent(child *Entity) {
 		}
 	}
 }
-
-// contentsByKeyword returns the entities in e.contents whose keywords match the typed
-// word under Diku isname semantics (the word is a prefix of one keyword). Slice 1 does
-// not use it yet — the real Diku targeting grammar (2.sword, all.coin) is slice 2 — but
-// it is the containment-side hook the resolver will build on, and keeping it here keeps
-// the contents tree the single place containment is queried.
-//
-//nolint:unused // TODO(world-engineer): containment-query hook the resolver will build on; keep (Phase-N placeholder)
-func (e *Entity) contentsByKeyword(word string) []*Entity {
-	var out []*Entity
-	for _, c := range e.contents {
-		for _, kw := range c.keywordList() {
-			if len(word) <= len(kw) && kw[:len(word)] == word {
-				out = append(out, c)
-				break
-			}
-		}
-	}
-	return out
-}

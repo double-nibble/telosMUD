@@ -245,11 +245,14 @@ func (c *Conn) refuse(cmd, opt byte) {
 		"cmd", cmd,
 		"opt", opt,
 	)
+	// A failed option-refusal write is best-effort and non-fatal: we deliberately discard the
+	// error. A genuinely dead socket surfaces on the next real write via normal teardown, so
+	// there is nothing useful to do with a negotiation-write failure here.
 	switch cmd {
 	case doo:
-		c.writeRaw([]byte{iac, wont, opt}) //nolint:errcheck,gosec // TODO(edge-engineer): mid-protocol write; decide whether a failed telnet-negotiation write should drop the session
+		_ = c.writeRaw([]byte{iac, wont, opt})
 	case will:
-		c.writeRaw([]byte{iac, dont, opt}) //nolint:errcheck,gosec // TODO(edge-engineer): mid-protocol write; decide whether a failed telnet-negotiation write should drop the session
+		_ = c.writeRaw([]byte{iac, dont, opt})
 	}
 }
 
