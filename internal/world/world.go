@@ -119,6 +119,12 @@ type Shard struct {
 	// shared read-only by every hosted zone exactly like comms/saver. A busless/rosterless shard does zero
 	// presence work and `who` falls back to the zone-local list — byte-identical to a pre-8.4 shard.
 	presence *presenceTracker
+
+	// mail is the shard's Phase-8.7 durable mail inbox (mail.go), shared read-only by every hosted zone.
+	// nil DISABLES mail (no Postgres / a storeless shard) — the mail commands degrade to "mail is
+	// unavailable", never a crash, and a pre-8.7 / storeless shard is byte-identical. Wired by WithMail.
+	// The store does its own blocking pool I/O off the zone goroutine (the mail command spawns a goroutine).
+	mail MailStore
 }
 
 // NewDemoShard builds a single-shard midgaard world with no directory wiring — its
@@ -278,6 +284,19 @@ func (s *Shard) WithPresence(rost roster.Roster, shardID string) *Shard {
 	if rost != nil {
 		s.presence.roster = rost
 		s.presence.shardID = shardID
+	}
+	return s
+}
+
+// WithMail wires the shard's Phase-8.7 durable mail inbox (docs/PHASE8-PLAN.md slice 8.7, P8-D6): the
+// store the mail commands send/list/read/delete through. store MUST be a MailStore (the same *store.Pool
+// that backs CharacterStore in prod, or a MemStore in tests). It is OPTIONAL and never fatal: a nil store
+// (no Postgres) leaves mail DISABLED — the mail commands report "mail is unavailable", the existing tests
+// stay green, and the shard is byte-identical to a pre-8.7 one. MUST be called before Run. Returns the
+// shard for chaining; the production constructor wires it from the same pool, tests inject a MemStore.
+func (s *Shard) WithMail(store MailStore) *Shard {
+	if store != nil {
+		s.mail = store
 	}
 	return s
 }

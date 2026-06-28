@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // memstore.go is the in-memory CharacterStore + Checkpointer used by tests, so the durability-
@@ -29,6 +30,14 @@ type MemStore struct {
 	// nextID mints monotonically increasing fake UUIDs ("mem-uuid-N") for CreateCharacter, enough
 	// for tests to assert PersistID became real without a uuid dependency.
 	nextID int
+
+	// mail is the in-memory durable mail inbox (Phase 8.7), a flat slice of every message. It mirrors
+	// the pgx `mail` table semantics EXACTLY — newest-first per recipient, player-scoped read/delete by
+	// 1-based position — so the hermetic mail journey asserts the same contract the gated Postgres test
+	// asserts against the real store. Guarded by the same mu (a test mails from one goroutine and reads
+	// from another, like the real store hit concurrently). nextMailID mints fake message ids.
+	mail       []MailEntry
+	nextMailID int
 }
 
 // NewMemStore returns an empty in-memory store/checkpointer.
@@ -128,8 +137,93 @@ func (m *MemStore) rowVersion(name string) (uint64, bool) {
 	return snap.StateVersion, true
 }
 
-// Compile-time assertions that *MemStore satisfies both tiers.
+// --- MailStore (Phase 8.7) ------------------------------------------------------------------
+
+// SendMail appends one message, minting a fake id. `from` is the engine-set sender the caller captured
+// (the mem store never derives it). Mirrors the pgx INSERT.
+func (m *MemStore) SendMail(_ context.Context, to, from, subject, body string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextMailID++
+	id := "mem-mail-" + strconv.Itoa(m.nextMailID)
+	m.mail = append(m.mail, MailEntry{
+		ID:      id,
+		To:      to,
+		From:    from,
+		Subject: subject,
+		Body:    body,
+		SentAt:  time.Now(),
+		Read:    false,
+	})
+	return id, nil
+}
+
+// inboxLocked returns `player`'s messages newest-first (the same order the pgx ORDER BY produces). Caller
+// holds mu. This is the player-scoped projection EVERY mem read/delete goes through, so the access-control
+// contract (a player only ever sees their own mail) holds for the mem path exactly as the SQL WHERE does.
+func (m *MemStore) inboxLocked(player string) []MailEntry {
+	key := memKey(player)
+	var out []MailEntry
+	for _, e := range m.mail {
+		if memKey(e.To) == key {
+			out = append(out, e)
+		}
+	}
+	sortMailNewestFirst(out)
+	return out
+}
+
+// ListMail returns the player's inbox newest-first (scoped to to_player). A copy, so the caller cannot
+// mutate the store's rows.
+func (m *MemStore) ListMail(_ context.Context, player string) ([]MailEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inboxLocked(player), nil
+}
+
+// ReadMail fetches + marks-read the player's nth (1-based) message newest-first. found=false when out of
+// range. SCOPED: pos indexes the player's OWN inbox, so no id another player owns is reachable.
+func (m *MemStore) ReadMail(_ context.Context, player string, pos int) (MailEntry, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inbox := m.inboxLocked(player)
+	if pos < 1 || pos > len(inbox) {
+		return MailEntry{}, false, nil
+	}
+	target := inbox[pos-1]
+	// Mark read in the backing slice (find by id — the projection is a copy).
+	for i := range m.mail {
+		if m.mail[i].ID == target.ID {
+			m.mail[i].Read = true
+			target.Read = true
+			break
+		}
+	}
+	return target, true, nil
+}
+
+// DeleteMail removes the player's nth (1-based) message newest-first. deleted=false when out of range.
+// SCOPED to the player's own inbox by position.
+func (m *MemStore) DeleteMail(_ context.Context, player string, pos int) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inbox := m.inboxLocked(player)
+	if pos < 1 || pos > len(inbox) {
+		return false, nil
+	}
+	targetID := inbox[pos-1].ID
+	for i := range m.mail {
+		if m.mail[i].ID == targetID {
+			m.mail = append(m.mail[:i], m.mail[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Compile-time assertions that *MemStore satisfies all three tiers.
 var (
 	_ CharacterStore = (*MemStore)(nil)
 	_ Checkpointer   = (*MemStore)(nil)
+	_ MailStore      = (*MemStore)(nil)
 )

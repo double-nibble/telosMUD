@@ -113,9 +113,11 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	livePool := openLivePool(ctx, cfg)
 	var charStore world.CharacterStore
 	var defSource content.DefinitionSource
+	var mailStore world.MailStore
 	if livePool != nil {
 		charStore = livePool
 		defSource = livePool
+		mailStore = livePool // Phase 8.7: the same pool backs the durable mail inbox (nil => mail disabled)
 	}
 
 	// Optional content bus for hot reload (slice 4.3). NATS unreachable => hot reload DISABLED
@@ -157,6 +159,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithPersistence(charStore, nil).
 			WithHotReload(defSource, bus, enabledPacks).
 			WithComms(comms).
+			WithMail(mailStore).
 			WithTells(tellJS)
 	}
 	dir := directory.NewRedis(rdb, "telos")
@@ -204,6 +207,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithHotReload(defSource, bus, enabledPacks).
 		WithComms(comms).
 		WithPresence(roster, cfg.ShardID).
+		WithMail(mailStore).
 		WithTells(tellJS)
 }
 

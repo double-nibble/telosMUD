@@ -57,7 +57,10 @@ func registerCommands() []*Command {
 	base = append(base, combatCommands()...)
 	// Comms toggles (Phase 8.6): channels/ignore/afk. Registered last (lowest priority) so they never
 	// shadow or abbreviate a movement/look/say verb.
-	return append(base, commsCommands()...)
+	base = append(base, commsCommands()...)
+	// Mail (Phase 8.7): the durable inbox. Registered last with the other comms commands so it never
+	// shadows a movement/look/say verb.
+	return append(base, mailCommands()...)
 }
 
 // cmdLook shows the actor their current room (MUDLIB §6). Slice 2 keeps look's behavior

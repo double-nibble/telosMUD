@@ -422,7 +422,29 @@ content-touching slice.
 | **8.4 — Cross-shard presence + `who`** | The Redis presence roster (P8-D4): each shard writes `presence:<playerId>={name,shardId,flags,lastSeen}` with a TTL on join, **batched heartbeat refresh**, eager removal on clean quit/leave (`zone.go` lifecycle). `cmdWho` becomes a **cross-shard roster read** (filtered by visibility), replacing the zone-local `z.who`. **TTL age-out** is the crashed-shard recovery (no explicit cleanup). Presence carries the AFK flag. | Two players on **different shards** both appear in `who` (the Phase-8 done-when, completed); a **crashed shard's players age out of `who`** after the TTL (the failure-mode demonstration); a clean quit removes the player from `who` immediately; a shard cannot write a non-resident's presence (P8-A4). | **cross-shard `who` test (done-when)**; **crashed-shard age-out test (P8-A4, distsys)**; clean-quit-eager-removal test; presence-write-authority test (P8-A4, security); batched-heartbeat-write-rate test. |
 | **8.5 — Tells: online routing + offline durable (JetStream)** | `tell <name> <msg>` / `reply`: resolve target via **`directory.PlayerPlacement`** (P8-D5) → online: publish `telos.comms.tell.<target>` (core); offline: publish the **JetStream** durable stream with `Nats-Msg-Id` idempotency key + per-author sequence. Login-time **durable backlog drain** (paced) renders "while you were away…". **Idempotency**: the `Nats-Msg-Id` dedup window + the per-player **delivered-cursor** (P8-A5); **bounded redelivery** (max-deliver + backoff). The online→offline race favors durable (OQ-1). | A tell to an **online cross-shard** target arrives; a tell to an **offline** target is **delivered on next login, never lost, rendered exactly once in steady state** (the JetStream done-when — see OQ-4 for the precise at-least-once / usually-exactly-once / never-lost guarantee and its bounded crash-window exception); a **redelivery renders once** (the cursor gate); a target logging out mid-tell still gets it (durable fallback, not lost, P8-A4); per-sender order holds; a poison message parks (max-deliver). | **cross-shard online tell test**; **offline-tell-delivered-on-login test (done-when)**; **redelivery-idempotency test (P8-A5, security)**; logging-out-race test (P8-A4); per-sender-order test (P8-A3); bounded-redelivery test. |
 | **8.6 — Channel toggles + ignore/AFK (receiver-side enforcement)** | `channels on/off <ref>`, `ignore <name>`, `afk [msg]` — world commands mutating the persisted comms-state subtree (P8-D7); the gate **caches** the filter set and re-subscribes channels on toggle. The **receiver gate** is the **authoritative ignore enforcement point** (P8-A6): every inbound channel/tell frame passes the receiver's ignore list before render — a **single funnel** so a new comms path inherits it. AFK auto-reply/marker. | Toggling `gossip` off stops its lines (gate unsubscribes); an **ignored sender's channel line AND tell are both dropped at the receiver** (P8-A6); a **new comms frame type is also ignore-filtered** (the funnel, not per-path); AFK marks the player in `who` and auto-replies a tell. | **toggle-unsubscribe test**; **receiver-side-ignore funnel test (channel + tell + a synthetic new type) (P8-A6, security)**; AFK test. |
-| **8.7 — Mail (Postgres durable inbox) + comms-state persistence** | The `mail` table (P8-D6) + send/list/read/delete CRUD on the existing store pool (optional/never-fatal: no Postgres ⇒ mail disabled); a "new mail" notify over the comms bus when online. The **comms-state subtree** (P8-D7) round-trips through `StateJSON` on the existing save cadence/ladder (channels-on, ignore list, AFK) — survives logout/login and a crash-rehydrate. | Sending mail to an offline player, who reads it on login; mail list/read/delete works; a "new mail" ping reaches an online recipient; the comms-state subtree (channel toggles + ignore list) **survives logout/login and a crash-rehydrate**; no Postgres ⇒ mail cleanly disabled (not a crash). | mail send/read/delete round-trip test; offline-mail-on-login test; **comms-state-survives-restart test (persistence)**; mail-disabled-without-postgres test; new-mail-notify test. |
+| **8.7 — Mail (Postgres durable inbox) + comms-state persistence — DONE (2026-06-28)** | The `mail` table (P8-D6, `00007_mail.sql`) + send/list/read/delete CRUD on the existing store pool (optional/never-fatal: no Postgres ⇒ mail disabled); a "new mail" notify over the comms bus when online. The **comms-state subtree** (P8-D7) round-trips through `StateJSON` on the existing save cadence/ladder (channels-on, ignore list, AFK) — survives logout/login and a crash-rehydrate (landed in 8.6, `StateJSON.Comms`). | **DONE** — Sending mail to an offline player, who reads it on login (`mail`); mail list/read/delete works; a "new mail" ping reaches an online recipient; the comms-state subtree (channel toggles + ignore list) **survives logout/login and a crash-rehydrate**; no Postgres ⇒ mail cleanly disabled (not a crash). | mail send/read/delete round-trip test (hermetic MemStore + gated real-PG `TestMailCRUD`); offline-mail-on-login test; **comms-state-survives-restart test (persistence, 8.6)**; mail-disabled-without-postgres test; new-mail-notify test; **read/delete access-control test (security)**; **from-player engine-set test (security)**; recipient-refusal test. |
+
+### 8.7 implementation notes (mail)
+
+- **Table/migration:** `db/migrations/00007_mail.sql` — `mail(id, to_player CITEXT, from_player CITEXT,
+  subject, body, sent_at, read_at NULL)`, index `mail (to_player, sent_at DESC)` for the inbox read.
+  Mail is MUTABLE player state (engine mechanism), not a `*_def` content table. Down migration verified
+  clean (down + re-up).
+- **Store CRUD:** `internal/store/mail.go` (`*Pool`) — `SendMail`/`ListMail`/`ReadMail`/`DeleteMail`.
+  Read/delete address a message by its 1-based **inbox position** (`OFFSET` within the player-scoped
+  newest-first inbox), never a guessable id; every read/delete query is double-scoped by
+  `WHERE to_player = $player` (the access control lives in the SQL). A hermetic `MemStore` mail impl
+  (`internal/world/memstore.go`) mirrors the same semantics so the world-level journey is hermetic.
+- **World commands:** `internal/world/mailcmds.go` — `mail` (list), `mail read <n>`, `mail delete <n>`,
+  `mail send <name> <subject> | <body>` (one-line compose, `|` separates subject/body). All store I/O
+  runs off the zone goroutine (the `cmdWho`/`sendTell` discipline). Registered with the comms commands
+  (lowest priority).
+- **Security:** `from_player` is engine-set from `s.character` (P8-A2); subject/body sanitized via
+  `textsan.CleanLine` + a subject rune cap (P8-A7); recipient resolved via `directory.PlayerShard` — a
+  never-seen name is refused (no directory ⇒ accept-and-store, durable-always); per-author rate limit
+  shared with channels/tells (`commRateOK`, P8-A1). The new-mail notify rides
+  `commbus.TellSubject(recipient)` (the gate sink) and carries **no body** (a pure presence ping, so no
+  mail text leaks past the recipient's own inbox scoping).
 
 **Adjustment / justification.** 8.1–8.2 land the **transport + the topology** first so the trust/
 ordering boundary (the publish ACL, the per-author sequence, the gate-subscription-vs-handoff
@@ -574,7 +596,11 @@ swappable and separable.
 
 ---
 
-## 8. Done-when (the phase capstone)
+## 8. Done-when (the phase capstone) — **PHASE 8 COMPLETE (2026-06-28)**
+
+All four ROADMAP done-when items below are met (8.1–8.7 landed), plus the mail capstone from 8.7
+(durable inbox: send/list/read/delete, offline-mail-on-login, online new-mail notify, player-scoped
+read/delete access control, from-player engine-set, storeless degrade) and the abuse/safety capstone.
 
 The ROADMAP Phase 8 done-when, made concrete on this plan:
 

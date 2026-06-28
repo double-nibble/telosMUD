@@ -132,6 +132,15 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   whole in-process chan/tell ACL already rests on. When subject-level NATS authz lands, put `config.*`
   under world-publish-only alongside `chan`/`tell` so the `isACLGuarded` exclusion isn't misread.
   (security note, no code now) · *distsys/security*
+- **Mail inbox cap / retention / `ListMail` LIMIT** — `internal/store/mail.go` + `internal/world/mailcmds.go`
+  (8.7): mail send is rate-limited PER-SENDER, but nothing bounds a RECIPIENT's total inbox — N senders
+  (or one attacker's several characters) can grow a victim's inbox without bound, and `ListMail` does an
+  unbounded `SELECT`/render of the whole inbox each `mail`. Integrity/confidentiality are sound (the
+  `WHERE to_player` scope holds); this is a griefing/storage vector (security MEDIUM, both reviewers
+  deferred-with-record). Add: a per-recipient inbox cap on `SendMail` (reject or evict-oldest past a
+  ceiling), a `LIMIT`/paging on `ListMail` (bound the query+render; the position-by-OFFSET addressing
+  must page with it), and/or a read-mail retention sweep. Also reaps the directory-error dead-letter rows.
+  (security/persistence MEDIUM, deferred) · *persistence/security*
 - **`ClearPlayer` deferred coupling** — `cmd/telos-gate/main.go:93,108`: reconnect
   routing falls back to the home-zone shard, correct ONLY while `ClearPlayer` is
   deferred. Revisit when `ClearPlayer` (directory cleanup on logout) lands. · *gate/distsys*
