@@ -67,6 +67,16 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
   signal — source's *claimed* resume point vs. what the destination actually acked).
   Recommend (a) unless we find a use for the cross-check. Do this in an end-of-roadmap
   protocol sweep or whenever `play.proto` is next revised. · *edge/distsys*
+- **Lua relocation combat-fidelity** (7.3c distsys review) — `relocateWithinZone`
+  (`internal/world/luaharm.go`) for `h:move`/`h:teleport`/`h:recall`: (a) it fires no
+  `OnLeaveRoom` checkpoint and no post-`Move` liveness re-check, so a Lua teleport skips
+  opportunity attacks and won't notice an arrival-hook reaction (e.g. a lethal `aggroOnEntry`
+  cascade) that killed/relocated the mover; (b) it permits relocating a *fighting* entity
+  within-zone with no `posFighting` gate (unlike the engine `move`), leaving combatants engaged
+  across two rooms — contained by the round driver's same-room re-validation (not a correctness
+  bug), but a combat-model oddity. Decide per-method: teleport may *intend* to bypass OAs, but a
+  relocated fighter should likely `disengage`. Safe for now (single-writer intact, security
+  reviewed); refine when relocation gets richer. · *combat*
 
 ## 3. Possible latent bugs (also surfaced as chips)
 
