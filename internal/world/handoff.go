@@ -36,32 +36,24 @@ type Locator interface {
 }
 
 // buildSnapshot serializes a player's authoritative in-memory state for transfer to
-// the destination shard. Slice 1 keeps it behavior-preserving: the same minimal fields
-// — identity plus the applied-input high-water mark (the linchpin that ties the source's
-// freeze-point to the gate's replay-point, PROTOCOL.md §5) — now sourced from the
-// session and its entity instead of the old player struct. Inventory/equipment/affects
-// (proto fields 6–11) stay unset until later slices make those components carry real
-// state (PHASE3-PLAN.md §4); cross-shard inventory is deferred past Phase 3. As of Phase
-// 5.1 a player also carries content-defined attribute bases + resource currents (Living,
-// character.go StateJSON) — those are NOT in this snapshot either, so a wound/resource
-// state resolves from defaults across a cross-shard hop, exactly like inventory. As of 5.2
-// a player ALSO carries active affects (the Affected component, character.go AffectJSON);
-// those round-trip through the SAVE/LOAD (restart) path but, like attributes/resources/
-// inventory, are STILL NOT on this handoff snapshot — the same deferred set. Because affect
-// durations only decrement on the OWNING zone's pulse (the resolve-by-id/skip-frozen tick),
-// a frozen in-flight entity does not tick, so durations are conserved up to the seam; the
-// destination simply resolves from defaults until the handoff carry lands. Carry attributes/
-// resources/affects HERE together when cross-shard inventory lands. Built on the zone
-// goroutine, so the read of session/entity state is race-free.
+// the destination shard. It carries identity + the applied-input high-water mark (the
+// linchpin that ties the source's freeze-point to the gate's replay-point, PROTOCOL.md §5)
+// + the durable PersistID + the optimistic-concurrency version + the comms-state subtree
+// (field 14) AND — as of the cross-shard full-state-carry fix — the player's REMAINING
+// entity state in state_json (field 15): inventory, equipment, attribute bases, resource
+// currents, affects (with remaining durations), flags, cooldowns (remaining), and the
+// data-only self.state. dumpStateJSON reuses dumpCharacter's component dumpers so the
+// handoff carry and the durable save are byte-identical for the entity subtree (one shape).
+// The comms subtree rides field 14 (its single authority — NOT duplicated in state_json),
+// and the tell delivered-cursor is intentionally out of scope (FOLLOW-UPS). AppliedSeq
+// rides the dedicated field (12), never the embedded state, so the linchpin stays correct
+// (a fresh login restarts the fence; a handoff keeps the same gate session). Because affect
+// durations + cooldowns only decrement on the OWNING zone's pulse (resolve-by-id/skip-frozen
+// tick), a frozen in-flight entity does not tick, so remaining values are conserved up to the
+// seam and the destination re-attaches/re-arms them without reset. Built on the zone goroutine,
+// so the read of session/entity state is race-free (the same single-writer safety as
+// dumpCharacter; ItemJSON.Delta must be OWNED bytes, never aliasing a live COW buffer).
 func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
-	// DEFERRED (PHASE3-PLAN.md §4): as of slice 4 a player entity CAN carry items
-	// (s.entity.contents) and wear them (the *Wearer slot map, components.go). A future
-	// cross-shard handoff that supports a player carrying inventory would walk
-	// s.entity.contents + the Wearer slots HERE and have prepare rehydrate them — which needs
-	// the common.v1.Item shape to reference a ProtoRef plus the instance's COW delta (so a
-	// unique/enchanted item survives the hop). That is a proto change scoped OUT of Phase 3
-	// (the ROADMAP milestone is single-zone); no Phase-3 test transfers a player with items,
-	// so the snapshot stays minimal — identity + the applied-input high-water mark only.
 	// Carry the durable PersistID so the DESTINATION can flush this player to the SAME durable
 	// row (characters.id). Without it the handed-off session has no id to CAS on, so a quit on the
 	// destination is silently skipped (leave's pid==nil guard) — the location never advances and the
@@ -91,6 +83,15 @@ func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 		// the EFFECTIVE hear-set (recomputed against ITS channel_defs + the live entity) to the gate on
 		// arrival, so the gate's receiver HEAR-filter is correct for the destination's content.
 		CommsState: dumpCommsStateJSON(s),
+		// Carry the player's REMAINING entity state (inventory, equipment, attribute bases, resource
+		// currents, affects with remaining durations, flags, cooldowns with remaining, self.state) across
+		// the seam so a midgaard->darkwood walk no longer drops gear/stats/affects (the full-state-carry
+		// fix). It reuses dumpCharacter's component dumpers (dumpStateJSON -> dumpStateComponents), MINUS
+		// the comms subtree (CommsState above is the SINGLE comms authority) and the tell delivered-cursor
+		// (session state, out of scope). AppliedSeq is NOT in here — it rides the dedicated field above.
+		// Built at the freeze point on the zone goroutine, so the read is race-free and affect/cooldown
+		// remaining values are conserved (the frozen source does not tick). Empty for a bare player.
+		StateJson: dumpStateJSON(s),
 	}
 }
 

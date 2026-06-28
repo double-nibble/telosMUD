@@ -59,8 +59,10 @@ type StateJSON struct {
 	// attach path with remaining FROM THE SNAPSHOT — not the def's full duration — so a reload never
 	// resets durations, double-ticks, or re-fires on_apply. The applier (source) is NOT persisted: a
 	// reloaded affect is keyed as self-applied (its mechanical effect is identical). A pre-5.2 save
-	// (no affects array) loads sanely with none. NOT carried on the cross-shard handoff snapshot
-	// (buildSnapshot) — that is the same deferred set as inventory/stats; 5.2 does save/load only.
+	// (no affects array) loads sanely with none. As of the cross-shard full-state-carry fix this IS
+	// carried on the handoff snapshot too (handoff.go state_json) and re-attached on the destination
+	// via the shared applyStateComponents — same shape, remaining durations conserved (a frozen
+	// source does not tick).
 	Affects []AffectJSON `json:"affects,omitempty"`
 	// Flags is the entity's open-set named-flag set (Phase 5.3, flags.go): per-entity booleans like the
 	// "pvp" consent flag the PvP gate reads. Stored as the set of SET flag names. loadCharacter
@@ -256,19 +258,10 @@ func dumpCharacter(s *session) CharSnapshot {
 	if e.pid != nil {
 		pid = *e.pid
 	}
-	st := StateJSON{
-		AppliedSeq: s.appliedSeq,
-		Inventory:  dumpInventory(e),
-		Equipment:  dumpEquipment(e),
-		Attributes: dumpAttributes(e),
-		Resources:  dumpResources(e),
-		Affects:    dumpAffects(e),
-		Flags:      dumpFlags(e),
-		Cooldowns:  dumpCooldowns(e),
-		Script:     dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
-		Tells:      dumpTellCursor(s),  // Phase 8.5 — the durable-tell delivered-cursor (OQ-4)
-		Comms:      dumpCommsState(s),  // Phase 8.6 — the receiver-side comms-state subtree (P8-D7)
-	}
+	st := dumpStateComponents(e)
+	st.AppliedSeq = s.appliedSeq
+	st.Tells = dumpTellCursor(s) // Phase 8.5 — the durable-tell delivered-cursor (OQ-4)
+	st.Comms = dumpCommsState(s) // Phase 8.6 — the receiver-side comms-state subtree (P8-D7)
 	return CharSnapshot{
 		PID:          pid,
 		Name:         s.character,
@@ -277,6 +270,66 @@ func dumpCharacter(s *session) CharSnapshot {
 		StateVersion: s.stateVersion,
 		State:        st,
 	}
+}
+
+// dumpStateComponents marshals the ENTITY-scoped content subtree of a character — the
+// components that live on the *Entity (inventory, equipment, attribute bases, resource currents,
+// affects, flags, cooldowns, the data-only self.state) — into a StateJSON. It deliberately OMITS
+// the SESSION-scoped subtrees (AppliedSeq, the tell delivered-cursor, the comms-state) because
+// those are not entity state; the caller layers those in (dumpCharacter) or excludes them (the
+// handoff carry, where comms rides its own dedicated snapshot field and the tell cursor is out of
+// scope). This is the single component-dump path shared by the durable save (dumpCharacter) and
+// the cross-shard handoff carry (dumpStateJSON) — there is NO parallel serialization. Runs on the
+// zone goroutine; every component dumper copies into fresh storage so the saver/snapshot never
+// aliases live entity state (the character.go:196-201 owned-bytes invariant).
+func dumpStateComponents(e *Entity) StateJSON {
+	return StateJSON{
+		Inventory:  dumpInventory(e),
+		Equipment:  dumpEquipment(e),
+		Attributes: dumpAttributes(e),
+		Resources:  dumpResources(e),
+		Affects:    dumpAffects(e),
+		Flags:      dumpFlags(e),
+		Cooldowns:  dumpCooldowns(e),
+		Script:     dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
+	}
+}
+
+// dumpStateJSON marshals the cross-shard handoff state carry (the full-state-carry fix) to the
+// JSON string carried on the handoff snapshot (handoff.go state_json, field 15), or "" when the
+// player carries no entity state (a bare/contentless player — the destination then resolves from
+// defaults, identical to the pre-carry snapshot). It reuses dumpStateComponents so the handoff
+// carry and the durable save are byte-identical for the entity subtree (one shape, no parallel
+// serialization). It EXCLUDES:
+//   - the comms subtree: field 14 (comms_state) is the SINGLE authority for comms on the handoff
+//     (no double-writer);
+//   - the tell delivered-cursor: a session-scoped cursor, out of scope for this carry (FOLLOW-UPS);
+//   - AppliedSeq: the linchpin is seeded from the dedicated snapshot field (field 12), NEVER routed
+//     through the embedded state (a fresh login restarts the fence; a handoff keeps the session).
+//
+// Runs on the zone goroutine at the freeze point, so the read is race-free and the affect/cooldown
+// remaining values are conserved (a frozen source does not tick).
+func dumpStateJSON(s *session) string {
+	st := dumpStateComponents(s.entity)
+	if st.empty() {
+		return "" // bare/contentless player: nothing to carry (defaults on the destination)
+	}
+	b, err := json.Marshal(st)
+	if err != nil {
+		s.entity.zone.log.Error("handoff state carry marshal failed (carrying empty)",
+			"player", s.character, "err", err.Error())
+		return ""
+	}
+	return string(b)
+}
+
+// empty reports whether the entity-scoped state carry has nothing to carry, so dumpStateJSON omits
+// the field entirely for a bare player (parity with the all-default comms "" case). AppliedSeq/Tells/
+// Comms are not set on the carry form, so they do not affect this.
+func (st StateJSON) empty() bool {
+	return len(st.Inventory) == 0 && len(st.Equipment) == 0 && len(st.Attributes) == 0 &&
+		len(st.Resources) == 0 && len(st.Affects) == 0 && len(st.Flags) == 0 &&
+		len(st.Cooldowns) == 0 && len(st.Script) == 0
 }
 
 // dumpAttributes renders the entity's per-attribute BASE OVERRIDES (Living.attrBase) — bases only,
@@ -523,36 +576,93 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 	// AppliedSeq is still persisted (dumpCharacter) for the in-flight handoff snapshot shape.
 	s.appliedSeq = 0
 
-	// Rehydrate content-defined stats (Phase 5.1, §3). Install attribute BASE OVERRIDES FIRST so the
-	// derivation has them before any resource max is computed; setAttrBase dirties the cache. Then
-	// set each resource CURRENT clamped to its derived max (setResourceCurrent). DERIVED attribute
-	// values are recomputed lazily on the next attr() — never loaded — so a contentless / pre-5.1
-	// save (no attributes/resources subtrees) just installs nothing and the entity reads 0/full.
+	// Re-install the entity-scoped content subtree (items/attributes/resources/affects/flags/cooldowns/
+	// self.state) via the SHARED applier — the SAME path the cross-shard handoff rehydrate uses, so a
+	// fresh login and a handoff arrive at byte-identical entity state. AppliedSeq is NOT part of this
+	// applier (see applyStateComponents): the fresh-login reset above stays the ONLY writer of it on
+	// this path.
+	_ = applyStateComponents(z, s, snap.State) // fresh login: dropped-item count surfaced only on the handoff path
+
+	// Rehydrate the durable-tell delivered-cursor (Phase 8.5, OQ-4) so a redelivery after this login
+	// renders ONCE. A pre-8.5 save (nil Tells) installs an empty cursor (the backward-compat default).
+	// SESSION-scoped (not in applyStateComponents) and NOT carried on the handoff (out of scope).
+	loadTellCursor(s, snap.State.Tells)
+
+	// Rehydrate the receiver-side comms-state subtree (Phase 8.6, P8-D7): channel toggles, ignore list,
+	// AFK. A pre-8.6 save (nil Comms) installs all-default state (every channel at its default_on, no
+	// ignores, not AFK). loadCharacter runs on the zone goroutine that now owns the session; the caller
+	// (re)publishes the effective hear-set to the gate AFTER load (zone.go join/attach). SESSION-scoped
+	// (not in applyStateComponents); on the handoff path comms rides its own dedicated snapshot field.
+	loadCommsState(s, snap.State.Comms)
+
+	z.log.Debug("character loaded", "player", s.character, "pid", snap.PID,
+		"state_version", snap.StateVersion, "applied", s.appliedSeq,
+		"inventory", len(snap.State.Inventory), "equipment", len(snap.State.Equipment))
+}
+
+// applyStateComponents re-installs the ENTITY-scoped content subtree of a StateJSON onto a player's
+// live entity (s.entity), on the zone goroutine. It is the shared applier called by BOTH the
+// fresh-login rehydrate (loadCharacter) AND the cross-shard handoff rehydrate (zone.go prepare),
+// so a player's inventory/equipment/attributes/resources/affects/flags/cooldowns/self.state arrive
+// identically by either route.
+//
+// CRITICAL: it does NOT touch s.appliedSeq. The fresh-login path forces appliedSeq=0 (a new gate
+// session restarts the input-dedup fence) BEFORE calling this; the handoff path seeds appliedSeq
+// from the dedicated snapshot field (it keeps the SAME gate session). Routing appliedSeq through
+// here would break one of the two — so it stays OUT, owned by each caller. Likewise the comms and
+// tell-cursor subtrees are SESSION-scoped and applied by the caller, not here.
+//
+// Stats install order matters and is the WHOLE point of the sequencing here: the resource-CURRENT
+// install must happen LAST, after every input to the derived resource MAX has landed, so the
+// current is clamped to the genuinely-final max. The order is:
+//  1. attribute BASE OVERRIDES (the raw bases the derivation starts from);
+//  2. affects (reattach=true, no duration reset / on_apply re-fire) — these contribute attribute
+//     MODIFIERS that can RAISE (or lower) a resource's max attribute (a +con / +max_hp buff);
+//  3. flags; cooldowns re-armed on THIS zone goroutine (never a cross-goroutine timer write — the
+//     Phase 5.2 lesson); the data-only self.state;
+//  4. worn EQUIPMENT — gear is also a modifier source (attributes.go §1.1), so a max-raising piece
+//     of gear must be installed before the clamp too;
+//  5. ONLY NOW resource CURRENTS, clamped to the now-final derived max.
+//
+// Clamping resources earlier (the latent bug fixed here) would clamp a wounded current DOWN to a
+// pre-affect/pre-gear max and the read-side clamp (resourceCurrent) only ever clamps DOWN, so it
+// could never restore the lost headroom — a buffed/geared wounded player would arrive under-healed.
+// markAttrsDirty (fired by every base/affect/gear install) means the max is recomputed lazily on
+// the clamp's read, so the ordering is what makes it correct, not any explicit recompute. The
+// affect/equipment appliers do NOT read the resource current (verified: affect attach only edits
+// the modifier maps + dirties the cache; gear is a modSource), so installing currents last is safe.
+// A contentless / pre-feature subtree installs nothing.
+//
+// It returns the number of carried item prototypes the destination could NOT spawn (unknown on
+// this shard's enabled-pack set). For a fresh login this is ~always 0 (the saver wrote from the
+// same content); for a CROSS-SHARD handoff it CAN be non-zero (the destination may enable a
+// different pack set than the source), which is a data-loss window save/load does not have — the
+// handoff caller surfaces it loudly + as a one-line player notice (see zone.go prepare).
+func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) {
+	e := s.entity
 	if e.living != nil {
-		for ref, base := range snap.State.Attributes {
+		for ref, base := range st.Attributes {
 			setAttrBase(e, ref, base)
-		}
-		for ref, r := range snap.State.Resources {
-			setResourceCurrent(e, ref, r.Cur) // clamps to the live derived max
 		}
 		// Re-attach active affects (Phase 5.2, §3) via the runtime attach path with remaining FROM THE
 		// SNAPSHOT (reattach=true) — re-registering the per-entity tick and re-seeding the prevents +
 		// modifier contributions WITHOUT resetting duration, double-ticking, or re-firing on_apply. An
 		// unknown ref (content stripped/renamed) is skipped by attach with a debug log, never a crash.
-		for _, af := range snap.State.Affects {
+		// These can RAISE a resource's max attribute, so they MUST land before the resource clamp below.
+		for _, af := range st.Affects {
 			applyAffect(e, af.ID, attachOpts{
 				duration: af.Remaining, magnitude: af.Mag, stacks: af.Stacks, reattach: true,
 			}, nil) // a persistence reattach is a root (and skips on_apply/the bus fire anyway)
 		}
 		// Re-install the entity's named flags (Phase 5.3, flags.go) — e.g. a player's "pvp" consent.
-		for _, name := range snap.State.Flags {
+		for _, name := range st.Flags {
 			setFlag(e, name, true)
 		}
 		// Re-arm ability cooldowns ([G8] / P6-D8, Phase 6.3a) from their REMAINING pulses — on THIS
 		// (destination) zone goroutine, so the re-armed clear callback is registered on the zone that
 		// owns the entity (never a cross-goroutine timer write, the Phase 5.2 lesson). A logout mid-
 		// cooldown resumes at the saved remaining; an elapsed (<=0) entry is skipped.
-		for ref, remaining := range snap.State.Cooldowns {
+		for ref, remaining := range st.Cooldowns {
 			if remaining <= 0 {
 				continue
 			}
@@ -564,41 +674,42 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 	// table on the zone's LState — never executes code, never resurrects a handle. A pre-7.6 save (no
 	// Script) installs an empty state (the backward-compat default). A malformed blob degrades to an
 	// empty state with a loud log, never a crash.
-	loadScriptState(z, e, snap.State.Script)
-
-	// Rehydrate the durable-tell delivered-cursor (Phase 8.5, OQ-4) so a redelivery after this login
-	// renders ONCE. A pre-8.5 save (nil Tells) installs an empty cursor (the backward-compat default).
-	loadTellCursor(s, snap.State.Tells)
-
-	// Rehydrate the receiver-side comms-state subtree (Phase 8.6, P8-D7): channel toggles, ignore list,
-	// AFK. A pre-8.6 save (nil Comms) installs all-default state (every channel at its default_on, no
-	// ignores, not AFK). loadCharacter runs on the zone goroutine that now owns the session; the caller
-	// (re)publishes the effective hear-set to the gate AFTER load (zone.go join/attach).
-	loadCommsState(s, snap.State.Comms)
+	loadScriptState(z, e, st.Script)
 
 	// Rehydrate carried items into the player's contents (inventory).
-	for _, it := range snap.State.Inventory {
-		loadItem(z, e, it)
+	for _, it := range st.Inventory {
+		_, dropped := loadItem(z, e, it, 0)
+		droppedItems += dropped
 	}
 	// Rehydrate worn items: spawn each, place it in contents (equipped is a state over a carried
-	// item), and record it in the Wearer slot by its content label.
-	if len(snap.State.Equipment) > 0 {
+	// item), and record it in the Wearer slot by its content label. Gear is a modifier source, so a
+	// max-raising piece must be worn BEFORE the resource clamp below.
+	if len(st.Equipment) > 0 {
 		wr := actorWearer(e)
-		for slotName, it := range snap.State.Equipment {
+		for slotName, it := range st.Equipment {
 			loc, ok := wearLocByName[slotName]
 			if !ok {
 				z.log.Warn("character load: unknown wear slot, item dropped", "player", s.character, "slot", slotName)
+				droppedItems++
 				continue
 			}
-			item := loadItem(z, e, it)
+			item, dropped := loadItem(z, e, it, 0)
+			droppedItems += dropped
 			if item != nil {
 				wr.worn[loc] = item
 			}
 		}
 	}
-	z.log.Debug("character loaded", "player", s.character, "pid", snap.PID,
-		"state_version", snap.StateVersion, "applied", s.appliedSeq,
-		"inventory", len(snap.State.Inventory), "equipment", len(snap.State.Equipment))
+
+	// FINALLY install resource CURRENTS, clamped to the now-final derived max (after attributes +
+	// affects + gear). This is the ordering fix: a wounded current is conserved against the genuinely
+	// final, possibly-boosted max, never clamped down to a pre-affect/pre-gear max it can't recover.
+	if e.living != nil {
+		for ref, r := range st.Resources {
+			setResourceCurrent(e, ref, r.Cur) // clamps to the live (final) derived max
+		}
+	}
+	return droppedItems
 }
 
 // loadCharacterSnapshot reads the freshest durable snapshot for a character name, picking the
@@ -646,19 +757,41 @@ func (s *Shard) loadCharacterSnapshot(ctx context.Context, name string) (CharSna
 	return best, found
 }
 
+// maxItemNestDepth bounds how deep a persisted/carried inventory tree is rehydrated. Container
+// nesting is the one open-ended dimension of the StateJSON/handoff carry that is NOT otherwise
+// size-guarded (the script/comms/tell subtrees have their own caps), so a pathological or
+// adversarial snapshot could otherwise size the Prepare payload (and the rehydrate recursion)
+// without bound. A real bag-in-a-bag-in-a-bag is only a few levels; this ceiling is generous and
+// only ever trims a degenerate tree (logged loudly). FOLLOW-UPS notes a total node/byte cap as
+// the deeper guard.
+const maxItemNestDepth = 16
+
 // loadItem spawns one persisted item from its prototype ref into parent's contents, recursing
-// into container contents. Returns the spawned entity (nil if the prototype is unknown). The
-// spawn is byte-for-byte the same flyweight COW instance the world already builds; persistence
-// only chooses WHAT to spawn and WHERE to put it.
-func loadItem(z *Zone, parent *Entity, it ItemJSON) *Entity {
+// into container contents. Returns the spawned entity (nil if the prototype is unknown) and the
+// count of item prototypes that could NOT be spawned (unknown on this shard) anywhere in this
+// subtree — so the cross-shard handoff rehydrate can surface a data-loss notice. The spawn is
+// byte-for-byte the same flyweight COW instance the world already builds; persistence only
+// chooses WHAT to spawn and WHERE to put it. depth is the current nesting level (0 at the root of
+// a carried item); a subtree deeper than maxItemNestDepth is truncated with a loud log.
+func loadItem(z *Zone, parent *Entity, it ItemJSON, depth int) (*Entity, int) {
+	if depth > maxItemNestDepth {
+		z.log.Warn("character load: item nesting exceeds cap, deeper contents dropped",
+			"proto", it.ProtoRef, "depth", depth, "cap", maxItemNestDepth)
+		return nil, 1
+	}
 	item := z.spawn(ProtoRef(it.ProtoRef))
 	if item == nil {
-		z.log.Warn("character load: unknown item prototype, skipped", "proto", it.ProtoRef)
-		return nil
+		// Unknown prototype on THIS shard. For a fresh login this is content stripped/renamed; for a
+		// cross-shard handoff it is a destination enabled-pack mismatch (a genuine data-loss window) —
+		// the loud Warn here is the operator surface; the caller adds the player notice.
+		z.log.Warn("character load: unknown item prototype, skipped", "proto", it.ProtoRef, "depth", depth)
+		return nil, 1
 	}
 	Move(item, parent)
+	dropped := 0
 	for _, child := range it.Contents {
-		loadItem(z, item, child)
+		_, d := loadItem(z, item, child, depth+1)
+		dropped += d
 	}
-	return item
+	return item, dropped
 }

@@ -129,6 +129,14 @@ type session struct {
 	// handoff token that re-dial must present.
 	pending bool
 	token   string
+
+	// pendingNotice is a one-line system message queued while the session is PENDING (the
+	// destination side of a cross-shard handoff, before the gate re-dials and s.out is bound).
+	// A pending session has no out channel yet, so a notice raised during prepare (e.g. "some
+	// items did not transfer" when the destination's enabled-pack set lacks a carried item's
+	// prototype) cannot be sent immediately; it is stashed here and flushed once attach binds
+	// the stream. Empty when there is nothing to tell the arriving player.
+	pendingNotice string
 }
 
 // newPlayerEntity builds the in-world half of a player and links it to its session

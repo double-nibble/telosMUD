@@ -233,6 +233,23 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
     persona in the end-of-roadmap wiki and the permission/trust model; the visibility half is the
     elevated counterpart to the player-facing `canSee` gate. · *mudlib/edge*
 
+- **Cross-shard handoff: destination pack-set VALIDATION (the unknown-prototype data-loss window).**
+  The full-state carry (`internal/world/handoff.go` `buildSnapshot` `StateJson`, applied in
+  `internal/world/zone.go` `prepare`) re-spawns carried items by prototype ref on the destination.
+  If the destination shard enables a DIFFERENT pack set than the source, an item's prototype can be
+  unknown there: `loadItem` skips it with a LOUD `Warn` and the arriving player gets a one-line notice
+  ("Some of your items did not transfer to this area.") — but the item is GONE. This is a data-loss
+  window save/load does NOT have (same content on both ends of a reload). The deeper fix: validate the
+  destination's enabled-pack set covers the carried prototypes BEFORE accepting the handoff (reject /
+  re-route / stage the item), rather than dropping post-commit. Until then the carry conserves exactly
+  what save/load does plus the loud warn + notice. · *persistence/distsys*
+- **Cross-shard handoff: total inventory node/byte CAP (depth cap only today).** The carry's container
+  nesting is currently bounded only by `maxItemNestDepth` (`internal/world/character.go` `loadItem`):
+  a degenerate/adversarial tree is truncated at depth 16 with a loud log. The script/comms/tell
+  subtrees each have their own size caps; inventory still lacks a TOTAL node-count / byte ceiling on
+  the Prepare payload (a wide-but-shallow tree is unbounded). Add a total-node or marshalled-byte cap
+  on the carry (and ideally on the durable `characters.state` write) as the complete guard. · *persistence*
+
 ## 5. Housekeeping
 
 - Delete merged local branches as work lands (e.g. `test-standard-structure`).

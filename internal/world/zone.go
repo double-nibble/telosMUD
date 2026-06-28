@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -918,6 +919,12 @@ func (z *Zone) attach(m attachMsg) {
 			z.aggroOnEntry(s.entity, r)
 		}
 		z.lookRoom(s)
+		// Flush any notice queued while the session was pending (e.g. carried items the destination's
+		// enabled-pack set could not spawn). Sent AFTER the room look so it reads as an arrival aside.
+		if s.pendingNotice != "" {
+			s.send(textFrame(s.pendingNotice))
+			s.pendingNotice = ""
+		}
 		s.send(promptFrame())
 		// This shard is now the player's host (cross-shard handoff arrival): publish them to the `who`
 		// roster. The roster's owner-guard lets this destination SET win over the source's stale entry,
@@ -1148,6 +1155,36 @@ func (z *Zone) prepare(m prepareMsg) {
 	// ignore/AFK survive the cross-shard walk. Empty (all-default / pre-8.6 snapshot) installs nothing.
 	// The effective hear-set is re-published to the gate when this pending session activates (attach).
 	loadCommsStateJSON(s, m.snap.GetCommsState())
+	// Rehydrate the player's REMAINING entity state carried on the snapshot (the full-state-carry fix):
+	// inventory into contents + Wearer slots, attribute base overrides, resource currents clamped to the
+	// DESTINATION-derived max, affects re-attached with their REMAINING durations (no on_apply re-fire),
+	// flags, and cooldowns re-armed via rearmCooldown on THIS (destination) zone goroutine. It reuses the
+	// SAME applier loadCharacter uses (applyStateComponents), so a fresh login and a handoff arrive at
+	// byte-identical entity state — and the applier deliberately does NOT touch appliedSeq (seeded above
+	// from the dedicated snapshot field, the linchpin). The pending entity is parked (location set below,
+	// not yet in the room), so items land in contents now and become visible when attach Moves the player
+	// in. Empty (a bare/contentless player or a pre-fix snapshot) installs nothing — defaults, exactly the
+	// pre-carry behavior. dropped is the count of carried items whose prototype is unknown on THIS shard's
+	// enabled-pack set (a destination-mismatch data-loss window save/load does not have).
+	if raw := m.snap.GetStateJson(); raw != "" {
+		var st StateJSON
+		if err := json.Unmarshal([]byte(raw), &st); err != nil {
+			// A malformed carry degrades to defaults (loud log), never a crash or a rejected handoff — the
+			// player still arrives, just without the carried state (the pre-fix behavior).
+			z.log.Error("handoff state carry unmarshal failed; arriving with defaults",
+				"player", character, "err", err.Error())
+		} else {
+			dropped := applyStateComponents(z, s, st)
+			if dropped > 0 {
+				// LOUD operator surface + a one-line player notice deferred to bind (the pending session has
+				// no out channel yet). The deeper fix (destination pack-set validation BEFORE accepting the
+				// handoff) is recorded in docs/FOLLOW-UPS.md.
+				z.log.Warn("handoff: some carried items have no prototype on this shard (dropped)",
+					"player", character, "dropped", dropped, "zone", z.id)
+				s.pendingNotice = "Some of your items did not transfer to this area."
+			}
+		}
+	}
 	// Adopt the durable PersistID carried in the snapshot so a save on THIS (destination) shard
 	// CASes against the SAME row the source created — the fix for "a handed-off character can't be
 	// persisted on the destination". Paired with the stateVersion seeded above, the id + CAS base

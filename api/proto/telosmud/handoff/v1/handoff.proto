@@ -78,4 +78,19 @@ message PlayerSnapshot {
   // player with all-default comms state (the common case), which the destination loads as
   // defaults — identical to a pre-8.6 snapshot (the backward-compat default).
   string comms_state = 14;
+  // state_json is the REMAINING StateJSON content subtree carried on the cross-shard handoff
+  // (the full-state carry): inventory, equipment, attribute base overrides, resource currents,
+  // affects (remaining durations), flags, cooldowns (remaining), and the player's data-only
+  // self.state. It is the SAME marshalled JSON the durable characters.state row carries, MINUS
+  // the comms subtree (field 14 is the single authority for comms — no double-writer) and the
+  // tell delivered-cursor (session state, left out of scope). It is marshalled at the source
+  // freeze point on the zone goroutine (race-free, like dumpCharacter) so a cross-shard walk
+  // carries the player's whole mutable state; the destination's prepare re-installs it via the
+  // SAME appliers loadCharacter uses (items into contents + Wearer slots, attribute bases,
+  // resource currents clamped to the destination-derived max, affects re-attached with remaining
+  // durations, cooldowns re-armed on the destination goroutine). Empty for a bare/contentless
+  // player (the destination then resolves from defaults — identical to the pre-carry snapshot).
+  // AppliedSeq is NOT routed through this subtree: the handoff seeds it from field 12 (a fresh
+  // login restarts the input-dedup fence; a handoff keeps the same gate session).
+  string state_json = 15;
 }
