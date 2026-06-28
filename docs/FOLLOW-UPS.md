@@ -12,6 +12,18 @@ end of the roadmap.
 
 ---
 
+## 0. Pending reviews (committed with reduced rigor)
+
+- **Phase 7 slice 7.7 (hot reload, commit `abfc5d9`) needs its formal review trio.**
+  Committed with coordinator **self-review** of the security/distsys-critical paths
+  (`chunkFor` source/gen recompile; the single-writer inbox-posted reload) + the full
+  test suite green — because the implementing agent hit a capacity limit before the
+  reviews. Still owed: **security-auditor** (the `chunkFor` stale-policy fix + that a
+  reload can't open a gate; the per-instance vs shared breaker-reset-on-reload scope —
+  the code comment notes per-instance keys aren't swept), **distributed-systems-architect**
+  (the reload swap stays on the subscription/zone goroutine; old-code-vs-new-state),
+  **persistence-engineer** (`self.state` survives the swap). Run when capacity resets.
+
 ## 1. Lint nolint `TODO(owner)` cleanups
 
 The golangci-lint gate is clean + blocking; genuine findings are parked behind
