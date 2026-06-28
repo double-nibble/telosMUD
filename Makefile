@@ -13,7 +13,7 @@ TELOS_TEST_DSN ?= postgres://telos:telos@localhost:5432/telosmud?sslmode=disable
 TELOS_E2E_ADDR ?= localhost:4000
 
 .DEFAULT_GOAL := help
-.PHONY: help up deps down logs test test-race test-integration test-e2e smoke smoke-twice vet lint build tidy proto migrate migrate-status seed
+.PHONY: help up deps down logs test test-race test-integration test-e2e smoke smoke-twice vet lint build tidy proto migrate migrate-status seed verify verify-full
 
 help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | \
@@ -30,6 +30,25 @@ down: ## Stop dev dependencies
 
 logs: ## Tail dev dependency logs
 	$(COMPOSE) logs -f
+
+# verify mirrors the HERMETIC CI jobs (`go` + `lint`) EXACTLY, so "verified" locally means
+# the same surface CI checks — not a subset. The gap that let CI sit red for a day was running
+# `go test` + the golangci-lint binary but never the gofmt-as-CI-runs check or the lint config
+# the action uses. Run this before declaring any slice done; run verify-full before a release-
+# shaped milestone (it also exercises the Docker smoke/e2e surface that `go test` cannot).
+verify: ## Run the hermetic CI matrix locally (gofmt + vet + build + race tests + lint) — the pre-commit gate
+	@echo ">> gofmt (CI-strict: no file may be unformatted)"
+	@test -z "$$(gofmt -l . 2>/dev/null | grep -v '^third_party/')" || { echo "gofmt needed:"; gofmt -l . | grep -v '^third_party/'; exit 1; }
+	@echo ">> go vet" && $(GO) vet ./...
+	@echo ">> go build" && $(GO) build ./...
+	@echo ">> go test -race" && $(GO) test ./... -race
+	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not installed — see https://golangci-lint.run/welcome/install"; exit 1; }
+	@echo ">> golangci-lint" && golangci-lint run
+	@echo ">> verify OK (hermetic CI surface green)"
+
+verify-full: verify ## verify + the Docker smoke/e2e surface CI runs (catches Dockerfile/compose breaks `go test` misses)
+	@echo ">> docker smoke (the build + whole-stack surface)" && $(MAKE) smoke-twice
+	@echo ">> verify-full OK"
 
 test: ## Run all tests
 	$(GO) test ./...
