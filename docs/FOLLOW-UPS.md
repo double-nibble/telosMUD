@@ -102,6 +102,15 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
   remaining *wire-level* redundancy is now tracked in §2 below.
 - **`combat_test.go:448` empty `if z.move(...)`** — a combat test that may not assert
   the move outcome it intends. Make it assert. · *combat* · chip `task_0db5e6e9`
+- **Single-session takeover leaves the first connection silently mute** — *edge/persistence*
+  design call surfaced by `TestSecondLoginTakesOverSession` (the coverage wave-1 push). A
+  second login for an already-connected character re-binds the existing world session (the
+  link-dead resume path), so the newest socket wins but the first is left connected-yet-mute
+  with **no "logged in elsewhere" disconnect**. Two related warts: (a) the takeover's first
+  input can be dropped by the stale input-seq fence; (b) the displaced socket is never
+  explicitly closed. The test PINS today's behavior so it can't regress silently — but the
+  *desired* contract (clean kick of the old session + a notice) is a deliberate decision for
+  the edge/persistence engineers. See docs/TEST-COVERAGE.md "open contract questions".
 
 ## 4. Deferred features / design directions
 
