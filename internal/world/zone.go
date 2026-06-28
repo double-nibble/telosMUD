@@ -269,7 +269,6 @@ type redirectMsg struct {
 	id         string
 	targetAddr string
 	token      string
-	resumeSeq  uint64
 	epoch      uint64
 }
 
@@ -1309,7 +1308,7 @@ func (z *Zone) redirect(v redirectMsg) {
 		return
 	}
 	s.epoch = v.epoch
-	s.send(redirectFrame(v.targetAddr, v.token, v.resumeSeq))
+	s.send(redirectFrame(v.targetAddr, v.token))
 	z.log.Debug("redirect sent", "player", v.id, "target", v.targetAddr, "epoch", v.epoch)
 }
 

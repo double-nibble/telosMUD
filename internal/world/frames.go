@@ -63,12 +63,12 @@ func displacedKick(out chan *playv1.ServerFrame, ack uint64) {
 }
 
 // redirectFrame tells the gate to re-dial another shard (a cross-shard handoff,
-// docs/PROTOCOL.md §5): the target address, the handoff token to present, and the
-// input seq to replay from.
-func redirectFrame(targetAddr, token string, resumeSeq uint64) *playv1.ServerFrame {
+// docs/PROTOCOL.md §5): the target address + the handoff token to present. The gate
+// replays from the DESTINATION's ack_input_seq on the Attached frame, so no resume
+// point travels on the redirect (the retired resume_input_seq field).
+func redirectFrame(targetAddr, token string) *playv1.ServerFrame {
 	return &playv1.ServerFrame{Payload: &playv1.ServerFrame_Redirect{Redirect: &playv1.Redirect{
 		TargetShardAddr: targetAddr,
 		HandoffToken:    token,
-		ResumeInputSeq:  resumeSeq,
 	}}}
 }

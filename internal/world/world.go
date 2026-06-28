@@ -426,7 +426,6 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			id:         character,
 			targetAddr: resp.GetTargetShardAddr(),
 			token:      resp.GetHandoffToken(),
-			resumeSeq:  snap.GetAppliedSeq(),
 			epoch:      newEpoch,
 		})
 	}()

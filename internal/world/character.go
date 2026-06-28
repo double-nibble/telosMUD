@@ -430,8 +430,8 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 	// start at 0. Restoring the saved value here would drop the returning player's first N inputs as
 	// phantom replays (a silent mute until their seq climbs past the stale mark). The handoff and
 	// link-dead RESUME paths keep the SAME session and preserve appliedSeq separately (zone.go attach /
-	// world.go redirect resumeSeq) — only this fresh-login rehydrate resets it. The durable AppliedSeq
-	// is still persisted (dumpCharacter) for diagnostics + the in-flight handoff snapshot shape.
+	// the handoff snapshot's AppliedSeq) — only this fresh-login rehydrate resets it. The durable
+	// AppliedSeq is still persisted (dumpCharacter) for the in-flight handoff snapshot shape.
 	s.appliedSeq = 0
 
 	// Rehydrate content-defined stats (Phase 5.1, §3). Install attribute BASE OVERRIDES FIRST so the

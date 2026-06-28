@@ -140,7 +140,12 @@ message Ping {
 message Redirect {
   string target_shard_addr = 1;
   string handoff_token = 2;
-  uint64 resume_input_seq = 3;
+  // Field 3 (resume_input_seq) retired: it carried the SOURCE shard's claimed resume
+  // point, which the gate only logged — the real replay keys off the DESTINATION's
+  // ServerFrame.ack_input_seq on the Attached frame (runStream/doReplay). Reserved so the
+  // number/name are never reused.
+  reserved 3;
+  reserved "resume_input_seq";
 }
 
 message Disconnect {

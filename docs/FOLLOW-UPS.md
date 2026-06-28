@@ -112,23 +112,15 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   `mag = victim max-hp` is builder-influenceable; `death.go:194` the corpse is an
   UNOWNED free-for-all (no loot ownership). Both are intentional minimal-slice
   behavior to revisit with the progression/loot ruleset. · *progression/security*
-- **Retire the redundant `Redirect.resume_input_seq` wire field (`Play` protocol)** —
-  `api/proto/telosmud/play/v1/play.proto:143`. The gate ignores it: it replays from the
-  destination's `ServerFrame.ack_input_seq` on the `Attached` frame (see
-  `internal/gate/gate.go` `runStream`/`doReplay`). The Go-side dead `resumeSeq` param is
-  already gone (§3); what remains is the *protocol-level* cleanup of this one field.
-
-  **NOTE (updated):** `Attach.input_seq` (`play.proto:34`) is **NO LONGER retirable** — the
-  single-session clean-kick (§3, resolved) made it **load-bearing**: `zone.go attach` consumes
-  it to reset the input-seq fence so a takeover's first command isn't swallowed. Deleting it
-  would silently re-break that. Only `Redirect.resume_input_seq` remains a candidate.
-
-  **Deferred deliberately — this touches the gate↔world contract** (`play.proto`,
-  PROTOCOL.md §1, the handoff path) and is a coordinated wire change, not a local edit.
-  Options when next touched: (a) **delete `Redirect.resume_input_seq`** and lean on the
-  receiver-authoritative `ack_input_seq` (the cleaner end state), or (b) **keep it but
-  reclassify as diagnostics-only** in the proto comments. Recommend (a). Do this in an
-  end-of-roadmap protocol sweep or whenever `play.proto` is next revised. · *edge/distsys*
+- ~~**Retire the redundant `Redirect.resume_input_seq` wire field (`Play` protocol)**~~ —
+  RESOLVED (option a): deleted `Redirect.resume_input_seq` from `play.proto` (field 3 now
+  `reserved`) + all the Go plumbing that only fed its diagnostic log (the `redirectFrame`
+  param, `redirectMsg`/`redirectTarget` fields, the source-side `snap.GetAppliedSeq()` feed,
+  and the two gate debug logs). The gate replays authoritatively from the destination's
+  `ServerFrame.ack_input_seq` on the `Attached` frame, so no resume point travels on the
+  redirect. `Attach.input_seq` is KEPT — the single-session clean-kick made it load-bearing.
+  Verified: in-process handoff/resume/cross-shard tests `-race` green, and `make smoke-twice`
+  (the full Docker stack with the regenerated proto) passed incl. the cross-shard reconnect.
 - ~~**Lua relocation combat-fidelity** (7.3c distsys review)~~ — RESOLVED: `relocateWithinZone`
   now applies per-method semantics — `h:move` fires `OnLeaveRoom` + PROVOKES opportunity attacks
   (walk-like); `h:teleport`/`h:recall` BYPASS (blink/yank, no OA — the point of a teleport). All

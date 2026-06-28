@@ -222,9 +222,9 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 		if !ok {
 			return // bridge ended without a redirect: socket/world closed.
 		}
-		// next.resumeSeq is the SOURCE's claimed resume point — logged for diagnostics
-		// only; the actual replay keys off the DESTINATION's ack (runStream / doReplay).
-		log.Debug("redirect received", "target", next.addr, "resume_seq", next.resumeSeq)
+		// The actual replay keys off the DESTINATION's ack_input_seq on its first (Attached)
+		// frame (runStream / doReplay); the redirect carries no resume point.
+		log.Debug("redirect received", "target", next.addr)
 		addr, token = next.addr, next.token
 	}
 }
@@ -243,13 +243,12 @@ type connState struct {
 }
 
 // redirectTarget is what a finished bridge reports when the world asked the gate to
-// migrate: where to dial and the token to present. resumeSeq is the SOURCE shard's
-// claimed resume point, carried for diagnostics only — the actual replay keys off the
-// DESTINATION's ack_input_seq on its first (Attached) frame (see runStream / doReplay).
+// migrate: where to dial and the token to present. No resume point travels here — the
+// replay keys off the DESTINATION's ack_input_seq on its first (Attached) frame (see
+// runStream / doReplay).
 type redirectTarget struct {
-	addr      string
-	token     string
-	resumeSeq uint64
+	addr  string
+	token string
 }
 
 // runStream binds the session to the shard at addr and runs the bridge over a single
@@ -259,8 +258,8 @@ type redirectTarget struct {
 // The resume point is deliberately NOT a parameter: on a re-dial the destination shard
 // is authoritative about how much input it has applied and reports it on its first
 // (Attached) frame as ServerFrame.ack_input_seq, which the writer feeds to doReplay. The
-// redirect's resume_input_seq (a source-side estimate) is therefore carried for
-// diagnostics only, never to drive replay.
+// redirect carries no resume point at all (the source-side estimate that once rode on
+// Redirect.resume_input_seq was retired — it only ever fed a diagnostic log).
 //
 // It returns (target, true) when the stream ended in a Redirect — the caller re-dials
 // target. It returns (_, false) when the bridge ended for any other reason (socket
@@ -405,12 +404,10 @@ func (b *bridge) runWriter() {
 		}
 
 		if r := f.GetRedirect(); r != nil {
-			b.log.Debug("redirect frame received",
-				"target", r.GetTargetShardAddr(), "resume_seq", r.GetResumeInputSeq())
+			b.log.Debug("redirect frame received", "target", r.GetTargetShardAddr())
 			b.setRedirect(redirectTarget{
-				addr:      r.GetTargetShardAddr(),
-				token:     r.GetHandoffToken(),
-				resumeSeq: r.GetResumeInputSeq(),
+				addr:  r.GetTargetShardAddr(),
+				token: r.GetHandoffToken(),
 			})
 			// Stop forwarding to this shard: close our send side so the forwarder's next
 			// Send errors out (it then returns to re-dial, the line safely buffered).
