@@ -11,6 +11,13 @@ replace github.com/yuin/gopher-lua => ./third_party/gopher-lua
 The module path is **unchanged** (`github.com/yuin/gopher-lua`), so engine code imports
 it as `lua "github.com/yuin/gopher-lua"` with no awareness of the fork.
 
+> **DO NOT run `gofumpt` / `golangci-lint fmt` / a mass formatter across this directory.**
+> Upstream gopher-lua is `gofmt`-formatted, not `gofumpt`-formatted; a reformat rewrites
+> ~every file and **bloats the minimal delta**, making the next upstream re-apply (below) a
+> merge nightmare. This module is excluded from the main module's lint/CI by design. Keep the
+> fork **upstream-formatted** and touch ONLY the tagged sites. If you must edit a fork file,
+> hand-edit just the tagged hunk and leave the rest byte-for-byte upstream.
+
 ## Why we fork (docs/PHASE7-PLAN.md P7-D6 / T3)
 
 The Lua sandbox needs a **deterministic per-call instruction-count abort** so a tight
