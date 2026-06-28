@@ -175,10 +175,16 @@ type luaRuntime struct {
 
 // chunkCacheEntry is one cached compile result: the chunk (nil if the source was empty or the
 // compile failed) plus a `failed` discriminator so a broken def (compiled nil) is distinguished
-// from a never-compiled key. Zone-goroutine-owned.
+// from a never-compiled key, plus the SOURCE STRING it was compiled from (the hot-reload key —
+// slice 7.7). chunkFor recompiles when the passed src differs from `src` here, so a content edit
+// actually takes effect (the 7.4/7.5 review MUST-FIX: caching by key alone made hot-reload a
+// silent no-op — and, for pvp_allowed, kept a stale permissive policy). On a recompile that FAILS,
+// the LAST-GOOD chunk is kept (a broken edit keeps the old behavior, like the prototype reloader).
+// Zone-goroutine-owned.
 type chunkCacheEntry struct {
 	chunk  *compiledChunk
 	failed bool
+	src    string // the source this entry was compiled from (the recompile-on-change key)
 }
 
 // luaInvocation is the engine-owned context of the script call currently on the stack — who it

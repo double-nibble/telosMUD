@@ -225,7 +225,7 @@ func (s *Shard) WithPersistence(store CharacterStore, ckpt Checkpointer) *Shard 
 // at Run end). Returns the shard for chaining. The production constructor wires it; tests inject an
 // in-memory bus + source the same way.
 func (s *Shard) WithHotReload(src content.DefinitionSource, bus contentbus.Bus, enabledPacks []string) *Shard {
-	s.reloader = newReloader(src, s.protos, bus, enabledPacks)
+	s.reloader = newReloader(src, s.protos, bus, enabledPacks, s)
 	return s
 }
 

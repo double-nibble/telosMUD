@@ -49,7 +49,8 @@ const (
 // mirroring the zone-gen handle guard). NO *Entity, no closure state beyond the wheel handle.
 type luaTimer struct {
 	h        *pulseHandle
-	chunkGen uint64 // the runtime's chunk generation at scheduling time (7.7 drop seam)
+	chunkGen uint64 // the runtime's chunk generation at scheduling time (7.7 hot-reload drop seam)
+	durable  bool   // mud.after{durable=true}: complete even across a reload (a finalizer)
 	fired    bool   // the wheel fired/retired it (so cancel doesn't double-decrement the live census)
 }
 
@@ -292,14 +293,25 @@ func (rt *luaRuntime) mudSummon(l *lua.LState) int {
 // WHEEL (pulse.go after), NOT the OS scheduler and NOT a new goroutine — the callback runs
 // INLINE on the zone goroutine, with the same single-writer access a command has (T6). It
 // returns a timer-handle userdata (cancellable via mud.cancel) carrying a pointer-safe
-// __tostring (T15). The callback is invoked through runChunkFn (pcall-isolated); the FULL
-// per-call budget/deadline chokepoint over timer callbacks is slice 7.5 — here it is pcall-
-// wrapped and on the wheel, which is the 7.3b done-when.
+// __tostring (T15). The callback is invoked through the chokepoint (pcall-isolated, slice 7.5).
+//
+// HOT-RELOAD DROP (slice 7.7, P7-D7): the callback captures the runtime's chunk generation at
+// SCHEDULE time; on a content reload (chunkFor bumps chunkGen) a pending old-gen timer is a clean
+// NO-OP at fire — it never runs OLD code against NEW state. The OPT-IN `mud.after(pulses, fn,
+// {durable=true})` exempts a timer from the drop (a state-cleanup finalizer that must complete
+// even across a reload — release a held resource, clear a flag).
 func (rt *luaRuntime) mudAfter(l *lua.LState) int {
 	pulses := l.CheckInt(1)
 	fn := l.CheckFunction(2)
 	if pulses < 1 {
 		pulses = 1
+	}
+	// Optional opts table (arg 3): {durable=true} exempts the timer from the hot-reload drop.
+	durable := false
+	if l.GetTop() >= 3 {
+		if opts, ok := l.Get(3).(*lua.LTable); ok {
+			durable = lua.LVAsBool(opts.RawGetString("durable"))
+		}
 	}
 	if rt.zone == nil || rt.zone.pulses == nil {
 		l.Push(lua.LNil)
@@ -313,15 +325,17 @@ func (rt *luaRuntime) mudAfter(l *lua.LState) int {
 	}
 	gen := rt.chunkGen
 	rt.luaTimersLive++
-	t := &luaTimer{chunkGen: gen}
+	t := &luaTimer{chunkGen: gen, durable: durable}
 	handle := rt.zone.pulses.after(uint64(pulses), func(uint64) bool {
 		// The wheel calls this ON THE ZONE GOROUTINE. The timer is firing (and retiring), so it
 		// leaves the live census BEFORE the callback runs — so a callback that re-schedules nets to
-		// the same count, not +1 each tick. The generation guard (inert until 7.7) drops a callback
-		// bound to a swapped chunk; either way the live count decrements exactly once per timer.
+		// the same count, not +1 each tick. The live count decrements exactly once per timer.
 		t.fired = true
 		rt.luaTimersLive--
-		if gen != rt.chunkGen {
+		// HOT-RELOAD DROP (P7-D7): an old-gen callback is dropped (don't run old code against new
+		// state) UNLESS it opted into durable=true (a finalizer that must complete).
+		if gen != rt.chunkGen && !durable {
+			rt.log.Debug("mud.after callback dropped (old chunk generation, hot-reload)", "sched_gen", gen, "cur_gen", rt.chunkGen)
 			return false
 		}
 		rt.runCallback("mud.after", fn)

@@ -203,6 +203,25 @@ func (z *Zone) protoIsPlayerControlled(ref ProtoRef) bool {
 	return ok
 }
 
+// protoScriptSource returns the CURRENT (post-reload) Lua trigger-block source of the prototype
+// named by ref from the shared cache, or "" if the prototype is unknown or carries no Scripted
+// component. Used by the hot-reload path (slice 7.7) to re-register live instances' handlers from
+// the NEW source — a live instance still aliases its OLD prototype's *Scripted component (the
+// flyweight is kept alive by the instance), so the reload reads the swapped prototype here, not
+// the instance's stale component. Read-only; zone goroutine.
+func (z *Zone) protoScriptSource(ref ProtoRef) string {
+	p := z.protos.get(ref)
+	if p == nil {
+		return ""
+	}
+	if c, ok := p.comps[reflect.TypeFor[*Scripted]()]; ok {
+		if s, ok := c.(*Scripted); ok {
+			return s.source
+		}
+	}
+	return ""
+}
+
 // spawn instantiates the prototype named by ref into zone z as a fresh Entity that is a
 // DELTA over its prototype (MUDLIB §5). The instance:
 //

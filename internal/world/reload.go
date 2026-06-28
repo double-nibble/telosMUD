@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -45,13 +46,14 @@ type reloader struct {
 	bus   contentbus.Bus           // the invalidation bus
 	sub   contentbus.Subscription  // live subscription; Unsubscribe on stop
 	packs map[string]bool          // packs this shard loads; an edit to another pack is ignored
+	shard *Shard                   // the hosting shard — to post a reloadLuaMsg to each zone (7.7); nil on a bare test
 	log   *slog.Logger
 }
 
 // newReloader wires a reloader over src/cache/bus for the given enabled packs and SUBSCRIBES. A
 // nil bus or nil src yields a nil reloader (hot reload disabled). A subscribe failure logs and
 // returns nil — never fatal, so an unreachable/closed bus simply disables hot reload.
-func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus.Bus, enabledPacks []string) *reloader {
+func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus.Bus, enabledPacks []string, shard *Shard) *reloader {
 	if bus == nil || src == nil || cache == nil {
 		return nil
 	}
@@ -60,6 +62,7 @@ func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus
 		cache: cache,
 		bus:   bus,
 		packs: map[string]bool{},
+		shard: shard,
 		log:   slog.With("component", "contentreload"),
 	}
 	for _, p := range enabledPacks {
@@ -107,6 +110,7 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 		// spawned keep their aliased prototype (GC holds it) — they are unaffected, by design.
 		r.cache.reload(ref, nil)
 		r.log.Debug("hot reload: prototype removed (definition deleted)", "kind", inv.Kind, "ref", inv.Ref)
+		r.notifyZones(inv.Kind, inv.Ref) // a deleted scripted proto → its live instances go scriptless
 		return
 	}
 
@@ -120,6 +124,66 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 	// prototype stays alive while any live instance aliases it.
 	r.cache.reload(ref, p)
 	r.log.Debug("hot reload: prototype swapped", "kind", inv.Kind, "ref", inv.Ref)
+	// Notify each hosted zone to apply the LUA reload on its own goroutine (7.7): recompile the
+	// chunk, re-register live instances' handlers (keeping self.state), bump the timer generation,
+	// reset the breaker. The shared-cache swap above is the cross-goroutine-safe publish; the
+	// per-zone Lua state is updated single-writer via the inbox post.
+	r.notifyZones(inv.Kind, inv.Ref)
+}
+
+// reloadLua applies a content Lua hot reload for (kind, ref) ON THE ZONE GOROUTINE (slice 7.7,
+// P7-D7 / §1.1). The shard reloader already swapped the new prototype/def into the shared cache;
+// this re-runs on each hosted zone so the per-zone Lua state (the chunk cache, the LState, the
+// per-instance entityScripts) — all zone-owned — is updated single-writer. It:
+//
+//  1. BUMPS the chunk generation so pending old-gen mud.after timers DROP at fire (don't run old
+//     code against new state; a durable=true finalizer still completes).
+//  2. INVALIDATES the per-(kind,ref) shared chunk cache entry (an ability on_resolve / affect hook /
+//     formula / pvp policy) so the NEXT invocation recompiles from the new source. The source-aware
+//     chunkFor would recompile anyway on a changed source, but a SHARED def's source lives on the
+//     swapped shared registry, not passed here — so we drop the cache entry and let the next entry-
+//     point invocation re-read + recompile (the security-critical pvp_allowed case takes effect on
+//     its next consult, never the stale permissive policy).
+//  3. RE-REGISTERS the handlers of every LIVE instance of a scripted prototype (a mob/room with a
+//     `lua` block) from the NEW source, PRESERVING each instance's self.state (the DATA survives).
+//  4. RESETS the circuit breaker for that def so a script a bug had quarantined is re-enabled by the
+//     fix reload.
+func (z *Zone) reloadLua(kind, ref string) {
+	if z.lua == nil {
+		return
+	}
+	rt := z.lua
+	rt.chunkGen++ // (1) old-gen mud.after timers drop at fire (P7-D7)
+
+	// (2) Invalidate the shared chunk cache entries that key off this ref, so the next invocation
+	// recompiles from the swapped registry source. Keys are "<area>:<ref>:<hook>" / "<area>:<ref>" /
+	// "formula:<name>" / "pvp_allowed". We drop every cache entry whose key contains the ref (cheap;
+	// the chunk cache is small) plus the global policy/formula keys, and reset their breakers.
+	for key := range rt.chunks {
+		if strings.Contains(key, ref) || key == "pvp_allowed" || strings.HasPrefix(key, "formula:") {
+			delete(rt.chunks, key)
+			rt.breakerReset(breakerKeyShared(key)) // (4) re-enable a quarantined shared def
+		}
+	}
+
+	// (3) Re-register live instances of the reloaded scripted prototype from the new source, keeping
+	// their self.state. A non-prototype (ability/affect/formula) reload has no instances to walk.
+	rt.reloadEntityScriptsForProto(ProtoRef(ref))
+
+	z.log.Debug("lua hot reload applied", "kind", kind, "ref", ref, "gen", rt.chunkGen)
+}
+
+// notifyZones posts a reloadLuaMsg to every hosted zone's inbox so each applies the Lua reload on
+// its own goroutine (the per-zone Lua state is zone-owned). Called by the subscriber goroutine
+// AFTER the shared prototype cache swap; the post is the cross-goroutine-safe hand-off (the only
+// sanctioned way to reach zone state). A reloader with no shard (a bare test) skips it.
+func (r *reloader) notifyZones(kind, ref string) {
+	if r == nil || r.shard == nil {
+		return
+	}
+	for _, z := range r.shard.zones {
+		z.post(reloadLuaMsg{kind: kind, ref: ref})
+	}
 }
 
 // stop unsubscribes the reloader from the bus. Idempotent; safe on a nil reloader.

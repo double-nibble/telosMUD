@@ -366,6 +366,15 @@ type loadObjectsMsg struct {
 	objects []PersistentObject // the durable instances to rehydrate
 }
 
+// reloadLuaMsg tells a zone to apply a content Lua hot reload for a (kind, ref) whose prototype the
+// shard reloader already swapped into the shared cache (slice 7.7). It is posted to EACH hosted
+// zone's inbox so the chunk recompile + the per-instance handler re-registration run ON THE ZONE
+// GOROUTINE (the per-zone LState + entityScripts are zone-owned — never written cross-goroutine).
+type reloadLuaMsg struct {
+	kind string // the content kind ("mob"/"room"/"item"/"ability"/"affect"/...)
+	ref  string // the (kind, ref) whose Lua was edited
+}
+
 func (joinMsg) zoneMsg()          {}
 func (attachMsg) zoneMsg()        {}
 func (inputMsg) zoneMsg()         {}
@@ -388,6 +397,7 @@ func (createdMsg) zoneMsg()       {}
 func (adoptPidMsg) zoneMsg()      {}
 func (presenceMsg) zoneMsg()      {}
 func (loadObjectsMsg) zoneMsg()   {}
+func (reloadLuaMsg) zoneMsg()     {}
 
 func newZone(id string) *Zone {
 	z := &Zone{
@@ -528,6 +538,8 @@ func (z *Zone) handle(m msg) {
 		v.reply <- presence{present: present, pidSet: pidSet}
 	case loadObjectsMsg:
 		z.rehydrateObjects(v)
+	case reloadLuaMsg:
+		z.reloadLua(v.kind, v.ref)
 	}
 }
 

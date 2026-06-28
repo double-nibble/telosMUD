@@ -55,23 +55,45 @@ func (rt *luaRuntime) compileChunk(origin, src string) (*compiledChunk, error) {
 }
 
 // chunkFor returns the compiled chunk for content key `key` (e.g. "ability:fireball:on_resolve"),
-// compiling src ONCE on first use and caching the result in this zone's runtime. A compile error
-// or empty src caches a nil chunk (fail-closed: the def is inert and not recompiled every call).
-// The key must be STABLE across calls for the same def so the compile is amortized. This is the
-// per-zone compile-once seam every entry point uses (the shared per-shard def carries the source
-// string; the proto, bound to THIS zone's LState, lives here). Zone goroutine only.
+// compiling src on first use and caching it. It is SOURCE-AWARE (slice 7.7 hot reload): if the
+// cached entry was compiled from the SAME src it is reused (the common hot path — compile once);
+// if src DIFFERS (a content edit) it RECOMPILES and bumps the chunk generation, so the new body
+// actually takes effect. A recompile that FAILS keeps the LAST-GOOD chunk (a syntactically-broken
+// edit keeps the old behavior, logged — like the prototype reloader keeps the last-known on a bad
+// re-read). An empty src caches a nil chunk (the def is inert). Zone goroutine only.
 func (rt *luaRuntime) chunkFor(key, src string) *compiledChunk {
 	if rt == nil || rt.L == nil {
 		return nil
 	}
-	if e, ok := rt.chunks[key]; ok {
-		return e.chunk // cached (nil if previously empty/failed — not retried)
+	if e, ok := rt.chunks[key]; ok && e.src == src {
+		return e.chunk // cached for THIS source (nil if empty/failed — not retried)
 	}
 	// The first compiled chunk means this zone runs scripts: register the periodic memory-metric
 	// pulse lazily (a scriptless zone never pays for it — the bare-engine invariant).
 	rt.ensureMetricPulse()
+
+	prev, hadPrev := rt.chunks[key]
 	ch, err := rt.compileChunk(key, src)
-	rt.chunks[key] = &chunkCacheEntry{chunk: ch, failed: err != nil}
+	if err != nil && hadPrev && prev.chunk != nil {
+		// A RECOMPILE on a changed source FAILED: keep the last-good chunk (don't blank a working
+		// def on a broken edit). Record the new (bad) src so we don't re-attempt every call, but
+		// leave prev.chunk in place so the old behavior persists until the edit is fixed.
+		rt.log.Warn("lua recompile failed; keeping last-good chunk (broken edit ignored)",
+			"key", key, "err", err.Error())
+		prev.src = src // remember the bad source so a re-call with the same bad src doesn't recompile
+		return prev.chunk
+	}
+	if hadPrev {
+		// A SUCCESSFUL recompile of a CHANGED source is a hot reload of this def: bump the chunk
+		// generation (P7-D7 — old-gen mud.after timers drop on fire, never running old code against
+		// new state) and reset this script's circuit breaker (the 7.5 carry-forward — a fix reload
+		// re-enables a script a bug had quarantined). breakerReset clears BOTH the shared key and the
+		// per-instance keys would need a sweep, but the shared (kind,ref) key matches `key`'s origin.
+		rt.chunkGen++
+		rt.breakerReset(breakerKeyShared(key))
+		rt.log.Debug("lua chunk hot-reloaded", "key", key, "gen", rt.chunkGen)
+	}
+	rt.chunks[key] = &chunkCacheEntry{chunk: ch, failed: err != nil, src: src}
 	return ch
 }
 

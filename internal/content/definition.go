@@ -190,6 +190,26 @@ func (m *MemSource) EditItemKeywords(pack, ref string, keywords []string) error 
 	return fmt.Errorf("content: MemSource pack %q has no item %q", pack, ref)
 }
 
+// EditMobLua is a test convenience: replace one MOB prototype's `lua` trigger block in place
+// (Phase 7.7 hot-reload coverage). Returns an error if the mob is not present.
+func (m *MemSource) EditMobLua(pack, ref, lua string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p := m.packs[pack]
+	if p == nil {
+		return fmt.Errorf("content: MemSource has no pack %q", pack)
+	}
+	for zi := range p.Zones {
+		for mi := range p.Zones[zi].Mobs {
+			if p.Zones[zi].Mobs[mi].Ref == ref {
+				p.Zones[zi].Mobs[mi].Lua = lua
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("content: MemSource pack %q has no mob %q", pack, ref)
+}
+
 // Compile-time assertions.
 var (
 	_ Source           = (*MemSource)(nil)

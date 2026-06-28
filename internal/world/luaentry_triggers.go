@@ -46,8 +46,21 @@ func (rt *luaRuntime) ensureEntityScript(e *Entity) *entityScript {
 	if src == "" {
 		return nil
 	}
+	return rt.registerEntityScript(e, src, nil)
+}
+
+// registerEntityScript builds (or rebuilds) an entityScript for e from the EXPLICIT source `src`,
+// running the registration body so `on(event, fn)` populates a fresh handler table. If `keepState`
+// is non-nil it is re-used as the self.state table (the hot-reload path passes the existing state
+// so the DATA survives the code swap, P7-D7 / §1.1); otherwise a fresh empty state is created.
+// Stores and returns the new entityScript. Zone goroutine only.
+func (rt *luaRuntime) registerEntityScript(e *Entity, src string, keepState *lua.LTable) *entityScript {
 	L := rt.L
-	es := &entityScript{handlers: L.NewTable(), state: L.NewTable(), rid: e.rid}
+	state := keepState
+	if state == nil {
+		state = L.NewTable()
+	}
+	es := &entityScript{handlers: L.NewTable(), state: state, rid: e.rid}
 	rt.entityScripts[e.rid] = es
 
 	ch := rt.chunkFor("trigger:"+string(e.proto)+":register", src)
@@ -60,8 +73,6 @@ func (rt *luaRuntime) ensureEntityScript(e *Entity) *entityScript {
 	// (== self.state) is es.state. A clean root invocation (the registration is not inside a
 	// cascade) — it registers handlers, it does not itself harm.
 	self := rt.newHandle(e)
-
-	// Bind `on` (registration), `self`, and the state table (as `state`) for the registration run.
 	onFn := L.NewFunction(func(l *lua.LState) int {
 		event := l.CheckString(1)
 		fn := l.CheckFunction(2)
@@ -116,6 +127,35 @@ func (rt *luaRuntime) setStateTable(e *Entity, t *lua.LTable) {
 		rt.entityScripts[e.rid] = es
 	}
 	es.state = t
+}
+
+// reloadEntityScriptsForProto re-registers the trigger handlers for every LIVE instance of proto
+// `ref` from its NEW (post-swap) Scripted source, while PRESERVING each instance's self.state table
+// (slice 7.7 hot reload — P7-D7 / §1.1: swap the CHUNK/handlers, keep the data). The new source is
+// read from the SWAPPED prototype in the cache (a live instance still aliases its OLD prototype's
+// component, so protoScriptSource gives the edit). Zone goroutine only.
+func (rt *luaRuntime) reloadEntityScriptsForProto(ref ProtoRef) {
+	if rt == nil || rt.zone == nil {
+		return
+	}
+	newSrc := rt.zone.protoScriptSource(ref)
+	for rid, es := range rt.entityScripts {
+		if es == nil {
+			continue
+		}
+		e := rt.zone.entityByRID(rid)
+		if e == nil || e.proto != ref {
+			continue // not a live instance of the reloaded proto
+		}
+		state := es.state
+		delete(rt.entityScripts, rid)
+		if newSrc == "" {
+			continue // the reloaded proto dropped its script; the instance becomes scriptless
+		}
+		// Rebuild handlers from the NEW source, KEEPING the existing self.state table (the DATA
+		// survives the code swap). chunkFor recompiles because the source changed.
+		rt.registerEntityScript(e, newSrc, state)
+	}
 }
 
 // dropEntityScript removes the per-instance trigger state (handler table + self.state) for the
