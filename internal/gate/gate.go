@@ -64,6 +64,7 @@ import (
 	"github.com/google/uuid"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
@@ -75,28 +76,43 @@ const maxNameLen = 20
 
 // Server accepts telnet connections and bridges them to world shards. It is
 // stateless beyond its live sockets: a listen address, the directory seam (initial
-// shard resolution), and a per-address Play client pool for dialing shards.
+// shard resolution), a per-address Play client pool for dialing shards, and the
+// Phase-8 comms bus (the gate is a comms SINK — RoleGate, subscribe-only on
+// chan/tell; docs/PHASE8-PLAN §1, P8-D1-B).
 type Server struct {
 	listen string
 	dir    directory.Directory
 	pool   *pool
+	comms  commbus.Bus  // RoleGate comms handle; never nil (Disabled when NATS is down)
 	log    *slog.Logger // scoped logger, tagged component=gate
 }
 
 // New builds a gate over a real (insecure) client pool. dir resolves the initial
 // shard for a login; the pool caches one gRPC conn per shard address, dialed on
-// demand as players walk to new shards.
-func New(listen string, dir directory.Directory) *Server {
-	return newServer(listen, dir, newPool())
+// demand as players walk to new shards. comms is the gate's RoleGate comms bus
+// (commbus.OpenGate from cmd/telos-gate — NEVER OpenWorld: a gate handed a world
+// handle would defeat the publish ACL / impersonation gate; PHASE8-PLAN 8.1 review).
+// A nil comms bus is normalized to a Disabled RoleGate no-op so comms degrades
+// cleanly (NATS-down) rather than panicking.
+func New(listen string, dir directory.Directory, comms commbus.Bus) *Server {
+	return newServer(listen, dir, newPool(), comms)
 }
 
 // newServer is the injectable constructor: tests pass a pool wired to in-process
-// bufconn shards.
-func newServer(listen string, dir directory.Directory, p *pool) *Server {
+// bufconn shards and a MemBus GATE handle (commbus.NewWorldBus's gate side / a
+// MemBus.GateHandle()) — NEVER a world handle, so a test exercises the same
+// subscribe-only role production wires. A nil comms bus becomes a Disabled RoleGate
+// bus so the gate still works exactly as pre-Phase-8 (the existing journey tests pass
+// nil and stay green).
+func newServer(listen string, dir directory.Directory, p *pool, comms commbus.Bus) *Server {
+	if comms == nil {
+		comms = commbus.Disabled(commbus.RoleGate)
+	}
 	return &Server{
 		listen: listen,
 		dir:    dir,
 		pool:   p,
+		comms:  comms,
 		log:    slog.With("component", "gate"),
 	}
 }
@@ -172,6 +188,16 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 	sess := newSession(uuid.NewString())
 	log = log.With("session", sess.id, "character", name)
 	log.Debug("session minted")
+
+	// --- open the connection's comms client (Phase 8, P8-D1-B: the gate is the SINK).
+	// This is established at CONNECTION scope — after login (the playerId is now known) and
+	// OUTSIDE the re-dial loop below — and torn down by this single defer on the same return that
+	// drops the session. That placement is the load-bearing handoff-transparency proof: a re-dial
+	// (A→B) runs entirely inside runStream and never touches this subscription, so the player keeps
+	// receiving comms across a cross-shard walk (PHASE8-PLAN §1, P8-D1; comms.go). A disabled bus
+	// (NATS down) yields no-op subscriptions, so this is a clean no-op when comms are unavailable.
+	cc := openComms(log, s.comms, tc, name)
+	defer cc.close()
 
 	// --- directory seam: resolve the initial shard for this character ---
 	addr, ok := s.dir.ShardForCharacter(name)

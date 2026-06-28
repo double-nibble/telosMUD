@@ -38,6 +38,7 @@ import (
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/world"
 )
@@ -180,13 +181,24 @@ func (h *harness) dialConn(lis *bufconn.Listener) (*grpc.ClientConn, error) {
 
 // serveGate builds the gate over a pool that dials this harness's shards (by address,
 // over their bufconns) and resolves logins through dir. Call after every shard the
-// login can land on is added.
+// login can land on is added. The gate's comms bus is a Disabled RoleGate no-op (the
+// existing journey tests run without comms; nil normalizes to Disabled in newServer).
 func (h *harness) serveGate(dir directory.Directory) {
+	h.t.Helper()
+	h.serveGateWithComms(dir, nil)
+}
+
+// serveGateWithComms is serveGate with an explicit gate-role comms bus injected — the
+// comms tests (8.2) pass the GATE handle of a shared MemBus so a separate WORLD handle
+// can publish the synthetic message that the gate must render. comms MUST be a
+// RoleGate handle (never a world handle): the gate is structurally subscribe-only on
+// chan/tell, mirroring how cmd/telos-gate wires commbus.OpenGate (never OpenWorld).
+func (h *harness) serveGateWithComms(dir directory.Directory, comms commbus.Bus) {
 	h.t.Helper()
 	p := newPoolWithDialer(func(addr string) (playv1.PlayClient, error) {
 		return h.dialPlay(addr)
 	})
-	h.srv = newServer(":0", dir, p)
+	h.srv = newServer(":0", dir, p, comms)
 }
 
 // dial opens one scripted player connection to the gate and returns its terminal. The
@@ -226,13 +238,46 @@ type terminal struct {
 
 	conn net.Conn      // the player's socket end (for send / close)
 	done chan struct{} // closed when the gate's handle goroutine returns
+
+	// resume gates the reader goroutine. The reader receives one token from it before EACH socket
+	// read; pauseReader stops feeding tokens (the reader blocks, NOT draining the socket, so the
+	// kernel pipe buffer fills and the gate's writes to this terminal block — the slow/blocked-socket
+	// primitive). A background feeder normally keeps it topped up; pause/resume flip the feeder.
+	resume   chan struct{}
+	pauseMu  sync.Mutex
+	paused   bool
+	pauseSig chan struct{} // closed-and-replaced to wake the feeder when resumed
 }
 
 func newTerminal(c net.Conn) *terminal {
-	t := &terminal{bytes: make(chan byte, 4096), conn: c}
+	t := &terminal{
+		bytes:    make(chan byte, 4096),
+		conn:     c,
+		resume:   make(chan struct{}),
+		pauseSig: make(chan struct{}),
+	}
+	// Feeder: while not paused, keep a token available so the reader proceeds; while paused, withhold
+	// tokens so the reader blocks before its next socket read.
+	go func() {
+		for {
+			t.pauseMu.Lock()
+			paused := t.paused
+			sig := t.pauseSig
+			t.pauseMu.Unlock()
+			if paused {
+				<-sig // wait until resumed, then loop and start feeding again
+				continue
+			}
+			select {
+			case t.resume <- struct{}{}:
+			case <-sig: // paused mid-feed: stop, re-evaluate
+			}
+		}
+	}()
 	go func() {
 		r := bufio.NewReader(c)
 		for {
+			<-t.resume // gate: a paused terminal stops here, NOT reading the socket
 			b, err := r.ReadByte()
 			if err != nil {
 				close(t.bytes)
@@ -242,6 +287,28 @@ func newTerminal(c net.Conn) *terminal {
 		}
 	}()
 	return t
+}
+
+// pauseReader stops the terminal's reader from draining the socket, so the gate's writes to this
+// terminal back up and eventually block — the slow/blocked-consumer primitive (the gate's comms
+// delivery goroutine parks on tc.Write). Idempotent.
+func (term *terminal) pauseReader() {
+	term.pauseMu.Lock()
+	term.paused = true
+	close(term.pauseSig) // wake the feeder so it sees paused and stops feeding tokens
+	term.pauseSig = make(chan struct{})
+	term.pauseMu.Unlock()
+}
+
+// resumeReader lets the reader drain again. Idempotent.
+func (term *terminal) resumeReader() {
+	term.pauseMu.Lock()
+	if term.paused {
+		term.paused = false
+		close(term.pauseSig) // wake the feeder so it resumes feeding tokens
+		term.pauseSig = make(chan struct{})
+	}
+	term.pauseMu.Unlock()
 }
 
 // send writes one CRLF-terminated line as the player's terminal would.

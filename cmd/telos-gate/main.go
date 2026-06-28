@@ -28,6 +28,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/gate"
@@ -64,7 +65,23 @@ func main() {
 		fallback: cfg.WorldTarget,
 	}
 
-	srv := gate.New(cfg.GateListen, dir)
+	// The Phase-8 comms bus (P8-D1-B: the gate is the comms SINK). It is opened via
+	// commbus.OpenGate ONLY — NEVER OpenWorld and NEVER the test-only MemBus.WorldHandle():
+	// a gate is structurally subscribe-only on chan/tell subjects (the publish ACL / the
+	// impersonation gate, P8-A2). A gate handed a world handle would let a forged client author
+	// a channel/tell line, defeating the whole boundary. Optional/never-fatal, mirroring
+	// cmd/telos-world's openContentBus: an unreachable broker (or an empty URL) yields a Disabled
+	// RoleGate no-op so comms degrade to unavailable, never a boot failure.
+	comms := commbus.OpenGate(cfg.NATS.URL, func(err error) {
+		if err != nil {
+			slog.Warn("nats unavailable; comms disabled (gate)", "url", cfg.NATS.URL, "err", err)
+			return
+		}
+		slog.Info("comms bus ready (gate sink)", "url", cfg.NATS.URL)
+	})
+	defer func() { _ = comms.Close() }()
+
+	srv := gate.New(cfg.GateListen, dir, comms)
 	slog.Info("starting", "env", cfg.Env, "listen", cfg.GateListen,
 		"home_zone", homeZone, "fallback", cfg.WorldTarget)
 	if err := srv.ListenAndServe(ctx); err != nil {
