@@ -91,6 +91,17 @@ func (rt *luaRuntime) installHandleType() {
 		"act":   rt.hAct,
 		"say":   rt.hSay,
 		"emote": rt.hEmote,
+		// 7.3c effect ops (THE harm surface — each routes the EXISTING funnel; luaharm.go)
+		"damage":          rt.hDamage,
+		"heal":            rt.hHeal,
+		"modify_resource": rt.hModifyResource,
+		"drain":           rt.hDrain,
+		"apply_affect":    rt.hApplyAffect,
+		"remove_affect":   rt.hRemoveAffect,
+		"dispel":          rt.hDispel,
+		"move":            rt.hMove,
+		"teleport":        rt.hTeleport,
+		"recall":          rt.hRecall,
 	}
 	L.SetField(mt, "__index", L.SetFuncs(L.NewTable(), methods))
 }
@@ -476,16 +487,34 @@ func actToFromString(s string) ActTo {
 }
 
 // runChunkWithSelf compiles and runs src in the sandbox with `self` bound to a handle for
-// entity e — a TRIVIAL trigger context, just enough to exercise the handle methods from a
-// script (slice 7.2). The full entry points (on(...), ability/affect hooks) are slice 7.4;
-// this is not those. It sets `self` as a global for the duration of the call and clears it
-// after, so one chunk's self cannot leak into an unrelated later call. Re-uses runChunk's
-// budget/deadline chokepoint by delegating to it.
+// entity e — a TRIVIAL trigger context, just enough to exercise the handles + the harm methods
+// from a script (slices 7.2/7.3a/7.3c). The full entry points (on(...), ability/affect hooks)
+// are slice 7.4; this is not those. It binds `self` AND sets the ENGINE-owned invocation
+// context (rt.inv) with e as the invocation actor/source — the sole, non-script-supplied source
+// of a harm op's actor (P7-D3 invariant 1). Both are cleared after, so neither `self` nor the
+// invocation leaks into an unrelated later call. Re-uses runChunk's budget/deadline chokepoint.
 func (rt *luaRuntime) runChunkWithSelf(name, src string, e *Entity) error {
+	return rt.runChunkAs(name, src, &luaInvocation{actor: e})
+}
+
+// runChunkAs runs src with `self` bound to inv.actor and the engine-owned invocation context
+// set to inv (carrying the actor/source + the threaded depth/eventBudget). It is the single
+// entry that establishes "who the script acts as" — every Lua harm op reads its effectCtx from
+// rt.inv, never from a Lua argument. The invocation is cleared on return (a harm op outside any
+// invocation has no actor and no-ops).
+func (rt *luaRuntime) runChunkAs(name, src string, inv *luaInvocation) error {
 	if rt == nil || rt.L == nil {
 		return fmt.Errorf("lua runtime not initialized")
 	}
-	rt.L.SetGlobal("self", rt.newHandle(e))
-	defer rt.L.SetGlobal("self", lua.LNil)
+	var self *Entity
+	if inv != nil {
+		self = inv.actor
+	}
+	rt.L.SetGlobal("self", rt.newHandle(self))
+	rt.inv = inv
+	defer func() {
+		rt.L.SetGlobal("self", lua.LNil)
+		rt.inv = nil
+	}()
 	return rt.runChunk(name, src)
 }

@@ -114,6 +114,37 @@ type luaRuntime struct {
 	// fire (mirrors the zone-gen handle guard). Wired but NEVER bumped until slice 7.7. Zone
 	// goroutine only.
 	chunkGen uint64
+
+	// inv is the CURRENT invocation context (luahandle.go, slice 7.3c) — the ENGINE-owned
+	// answer to "on whose behalf, and inside what cascade, is this script running?" It is the
+	// sole source of the actor/source/disp/rng/depth/eventBudget a Lua harm op's effectCtx is
+	// built from (P7-D3's five invariants): a harm method NEVER takes actor/source/disp from a
+	// Lua argument. It is set when an entry point invokes a script (runChunkWithSelf binds the
+	// scripted entity as the invocation actor) and cleared after, so a harm op outside any
+	// invocation (a bare runChunk) has no actor and every harm method cleanly no-ops. The full
+	// cascade-threading (depth/eventBudget from a fired event) lands with the entry points/
+	// reactions (7.4/7.9); here the fields exist and are threaded so the invariant is structural
+	// from the start. Zone goroutine only.
+	inv *luaInvocation
+}
+
+// luaInvocation is the engine-owned context of the script call currently on the stack — who it
+// acts as and what cascade budget it inherits. It is the ONLY place a Lua harm op's
+// actor/source/depth/eventBudget come from (never a Lua argument — P7-D3 invariants 1 & 5). A
+// nil runtime.inv means "no entry-point invocation is active": a harm op then has no actor and
+// no-ops (fail-closed).
+type luaInvocation struct {
+	// actor is the entity on whose behalf the script runs (the scripted mob for a trigger, the
+	// caster for an ability on_resolve). It is BOTH the effectCtx actor and source — a script
+	// cannot name a different source to spoof attribution past the gate (invariant 1).
+	actor *Entity
+	// depth / eventBudget are threaded from the invoking cascade (invariant 5) so a Lua harm op
+	// fired inside an event/reaction cascade inherits the SAME shared depth/width budget and
+	// cannot escape it. nil eventBudget outside a cascade (a top-level trigger), exactly like a
+	// command-issued cast (effect_op.go). Entry points (7.4) populate these from the fire that
+	// invoked the script; 7.3c threads them so the binding is correct from the first harm op.
+	depth       int
+	eventBudget *int
 }
 
 // newLuaRuntime builds the per-zone VM and installs the restricted-globals sandbox. The
