@@ -119,6 +119,19 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   trust tier]] §4 + the `phase5-visibility` TODO), `renderWho` must filter hidden players at the RENDER
   boundary (the cross-shard read returns all entries; the per-viewer privilege filter is the chokepoint),
   and presence should carry a visibility flag. (feature, tied to the visibility tier) · *mudlib/edge*
+- **Mid-session hear-access staleness** — `internal/world/commsstate.go` (8.6): the gate's channel
+  hear-set is re-published on login/handoff/toggle, but NOT on a mid-session hear-ACCESS change (an
+  affect/attribute change crossing a channel's `min_attr` floor). So a player who drops below a
+  restricted channel's threshold keeps HEARING it until their next toggle/handoff/relog — a bounded,
+  hear-only window (speaking is gated live per-send; `require_flag` access can't change mid-session).
+  Only matters once a `min_attr`-gated restricted channel ships. Fix: call `publishCommsConfig` from
+  the affect-apply/expire + attribute-recompute hook. (security LOW, bounded) · *edge/world*
+- **`config.<player>` comms subject under future NATS authz** — `commbus` (8.6): `telos.comms.config.*`
+  is deliberately NOT `isACLGuarded` (engine mechanism, like presence; a gate subscribes only its
+  concrete `config.<self>`, gates never publish). Safe today on the same broker-honesty assumption the
+  whole in-process chan/tell ACL already rests on. When subject-level NATS authz lands, put `config.*`
+  under world-publish-only alongside `chan`/`tell` so the `isACLGuarded` exclusion isn't misread.
+  (security note, no code now) · *distsys/security*
 - **`ClearPlayer` deferred coupling** — `cmd/telos-gate/main.go:93,108`: reconnect
   routing falls back to the home-zone shard, correct ONLY while `ClearPlayer` is
   deferred. Revisit when `ClearPlayer` (directory cleanup on logout) lands. · *gate/distsys*
@@ -183,6 +196,16 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
 
 ## 4. Deferred features / design directions
 
+- **"Comms unavailable" player notice (Phase 8.6, 8.2-note).** When the comms bus is wholly down
+  (NATS unreachable ⇒ a disabled `commbus.Bus`), comms are silently off — a player sees no channels/
+  tells and no notice. Deferred deliberately in 8.6: a disabled bus is byte-identical to a pre-Phase-8
+  process, and detecting "disabled" from the `Bus` interface would couple the gate to bus internals,
+  weakening the content-free-sink invariant. If wanted, expose a `Bus.Available()`/role-degraded probe
+  and have the gate emit a one-line notice after login. · *edge/orchestration*
+- **Channel HEAR vs SPEAK access split (Phase 8.6).** `channelDef.canHear` currently delegates to the
+  same predicate as `canSpeak` (a restricted channel restricts both). A content shape for "hear-only"
+  / "speak-only" channels (an announce channel anyone hears but only admins speak) would split the
+  `channelAccess` into separate hear/speak predicates at the obvious `canHear` divergence point. · *content/world*
 - **Builder/wizard trust tier — elevated visibility + debug tooling** (much later; post-core).
   Builders/immortals need a privilege level ABOVE player:
   - **See-all visibility.** A builder always sees what players can't — an `invisible`-affected

@@ -83,6 +83,15 @@ func TestCharacterCRUD(t *testing.T) {
 	// Phase 7.6: a populated self.state Script subtree must survive the real-PG JSONB round-trip
 	// (same whole-blob path as Inventory; this closes the Script-specific coverage gap).
 	snap.State.Script = json.RawMessage(`{"q":1}`)
+	// Phase 8.6: the receiver-side comms-state subtree (channel toggles + ignore list + AFK) must survive
+	// the same real-PG JSONB round-trip — the persistence done-when (comms state survives logout/login +
+	// crash-rehydrate, since StateJSON is the durable form).
+	snap.State.Comms = &world.CommsStateJSON{
+		Channels: map[string]bool{"gossip": false, "newbie": true},
+		Ignore:   []string{"Spammer", "Troll"},
+		AFK:      true,
+		AFKMsg:   "back soon",
+	}
 	newV, ok, err := p.SaveCharacter(ctx, snap)
 	if err != nil || !ok {
 		t.Fatalf("save (matching version): ok=%v err=%v, want ok", ok, err)
@@ -115,6 +124,20 @@ func TestCharacterCRUD(t *testing.T) {
 	_ = json.Unmarshal([]byte(`{"q":1}`), &wantScript)
 	if !reflect.DeepEqual(gotScript, wantScript) {
 		t.Fatalf("reloaded self.state Script = %s, want {\"q\":1} (semantically)", reloaded.State.Script)
+	}
+
+	// Phase 8.6: the comms-state subtree survived the JSONB round-trip (channel toggles + ignore + AFK).
+	if reloaded.State.Comms == nil {
+		t.Fatal("reloaded comms-state subtree is nil; it did not survive the round-trip")
+	}
+	if on, ok := reloaded.State.Comms.Channels["gossip"]; !ok || on {
+		t.Fatalf("reloaded gossip override = (%v,%v), want (false,true)", on, ok)
+	}
+	if reloaded.State.Comms.AFK != true || reloaded.State.Comms.AFKMsg != "back soon" {
+		t.Fatalf("reloaded AFK = (%v,%q), want (true,\"back soon\")", reloaded.State.Comms.AFK, reloaded.State.Comms.AFKMsg)
+	}
+	if len(reloaded.State.Comms.Ignore) != 2 {
+		t.Fatalf("reloaded ignore list = %v, want 2 entries", reloaded.State.Comms.Ignore)
 	}
 
 	// A STALE save (still holding version 0) must LOSE the CAS — the zombie-writer fence.

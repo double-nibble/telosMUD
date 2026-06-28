@@ -181,6 +181,13 @@ func (z *Zone) dispatch(s *session, line string) {
 
 	verb, rest := split(line)
 	lower := strings.ToLower(verb)
+
+	// AFK clears on the player's NEXT input (Phase 8.6): any non-blank command they type un-AFKs them and
+	// refreshes presence/who. The `afk` command runs AFTER this clear, so `afk <msg>` still SETS afk (it
+	// re-sets it inside the handler) — only a DIFFERENT command clears a standing AFK. Cheap: a no-op
+	// unless the player is currently AFK.
+	z.clearAFKOnInput(s, lower)
+
 	cmd, ok := baseTable.resolve(lower)
 	if !ok {
 		// Not a built-in verb: try a content-defined ability command (Phase 5.3). The ability table is

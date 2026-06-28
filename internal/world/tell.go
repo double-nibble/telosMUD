@@ -280,6 +280,22 @@ func (z *Zone) deliverDrainedTell(m tellDeliverMsg) bool {
 	s.tellCursor[author] = m.msg.Seq // advance the per-sender cursor (rides StateJSON.Tells on save)
 	s.lastTellFrom = author          // the `reply` target
 	z.log.Debug("durable tell delivered", "to", m.target, "from", author, "seq", m.msg.Seq)
+
+	// AFK auto-reply (Phase 8.6): a LIVE tell to an AFK target sends a one-line "X is AFK: <msg>" back to
+	// the SENDER over their concrete tell subject — so the sender learns the target is away. NOT for a
+	// backlog (offline catch-up) drain: those are old tells whose senders should not get a stale
+	// auto-reply now. The reply is itself a transient tell on commbus.TellSubject(author); a disabled bus
+	// makes it a clean no-op. The sender's gate renders it like any tell (and the sender's own ignore
+	// funnel applies — an auto-reply from a player they ignore is still dropped at their gate).
+	if !m.backlog {
+		if reply := afkAutoReply(s); reply != "" {
+			_ = z.commsBus().Publish(context.Background(), commbus.TellSubject(author), commbus.Message{
+				AuthorID:   m.target, // the AFK player is the author of the auto-reply
+				AuthorName: s.entity.Name(),
+				Body:       reply,
+			})
+		}
+	}
 	return true
 }
 

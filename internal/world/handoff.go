@@ -84,6 +84,13 @@ func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 		// Prepare, exactly as it seeds appliedSeq.
 		StateVersion: s.stateVersion,
 		Flags:        map[string]string{},
+		// Carry the receiver-side comms-state subtree (Phase 8.6, P8-D7) across the handoff so a
+		// cross-shard walk is comms-transparent: channel toggles, the ignore list, and AFK do not reset
+		// when the player changes shard. Empty for an all-default player (the common case); the
+		// destination then loads defaults (identical to a pre-8.6 snapshot). The destination re-publishes
+		// the EFFECTIVE hear-set (recomputed against ITS channel_defs + the live entity) to the gate on
+		// arrival, so the gate's receiver HEAR-filter is correct for the destination's content.
+		CommsState: dumpCommsStateJSON(s),
 	}
 }
 

@@ -704,6 +704,11 @@ func (z *Zone) join(s *session, room ProtoRef) {
 	// Start the player's durable-tell consumer (Phase 8.5): it drains any OFFLINE backlog (paced,
 	// "while you were away…") and then delivers live tells. Idempotent; one per resident on this shard.
 	z.startTellConsumer(s)
+	// Publish the player's effective {enabled ∩ hearable} hear-set + ignore list to their gate (Phase
+	// 8.6, the receiver HEAR-filter + the ignore funnel): the gate subscribes exactly these concrete
+	// channel subjects and caches the ignore list. Recomputed from THIS shard's channel_defs + the live
+	// entity + the loaded comms state. A disabled bus is a clean no-op.
+	z.publishCommsConfig(s)
 	z.log.Debug("player joined", "player", s.character, "room", r.proto, "population", len(z.players))
 }
 
@@ -921,6 +926,10 @@ func (z *Zone) attach(m attachMsg) {
 		// This shard now hosts the player (cross-shard arrival): start their durable-tell consumer so
 		// tells to them drain here (8.5). Idempotent.
 		z.startTellConsumer(s)
+		// Re-publish the effective hear-set + ignore list to the gate (Phase 8.6): recomputed against
+		// THIS shard's channel_defs (which may differ) + the live entity + the carried comms state, so
+		// the gate's receiver HEAR-filter is correct for the destination's content after the walk.
+		z.publishCommsConfig(s)
 		z.log.Debug("handoff committed: player activated", "player", character,
 			"room", roomRef(s.entity.location), "applied", s.appliedSeq, "epoch", s.epoch)
 		// Async-create window: the snapshot carried no PersistID (the source's CreateCharacter had
@@ -1135,6 +1144,10 @@ func (z *Zone) prepare(m prepareMsg) {
 		token:        m.token,
 	}
 	e := z.newPlayerEntity(s, character)
+	// Rehydrate the receiver-side comms-state subtree carried on the snapshot (Phase 8.6) so toggles/
+	// ignore/AFK survive the cross-shard walk. Empty (all-default / pre-8.6 snapshot) installs nothing.
+	// The effective hear-set is re-published to the gate when this pending session activates (attach).
+	loadCommsStateJSON(s, m.snap.GetCommsState())
 	// Adopt the durable PersistID carried in the snapshot so a save on THIS (destination) shard
 	// CASes against the SAME row the source created — the fix for "a handed-off character can't be
 	// persisted on the destination". Paired with the stateVersion seeded above, the id + CAS base

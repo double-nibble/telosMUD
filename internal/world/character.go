@@ -98,6 +98,63 @@ type StateJSON struct {
 	// subtree. A pre-8.5 save (no Tells) loads with an empty cursor (the backward-compat default), so a
 	// returning player's first post-upgrade tells deliver from seq 0 — never a silent drop.
 	Tells *TellCursorJSON `json:"tells,omitempty"`
+	// Comms is the player's data-only comms-state subtree (Phase 8.6, P8-D7): the per-channel
+	// enabled/disabled OVERRIDES (vs each channel's default_on), the ignore list, and the AFK
+	// flag + message. It is the durable home of the receiver-side comms preferences the gate
+	// enforces (the hear-set + the ignore funnel) — the Script/Tells additive-JSONB precedent.
+	// dumpCommsState marshals it; loadCommsState rehydrates it. It is DATA ONLY (bools/strings/
+	// lists of ids) — no code, no handles — and size-guarded (commsIgnoreMaxIDs, commsChanMaxRefs)
+	// like the Lua state + tell-cursor subtrees. A pre-8.6 save (nil Comms) loads with defaults:
+	// every channel at its default_on, no ignores, not AFK — the established backward-compat
+	// default, so a returning player keeps the pre-8.6 behavior.
+	Comms *CommsStateJSON `json:"comms,omitempty"`
+}
+
+// CommsStateJSON is the durable form of a player's receiver-side comms preferences (Phase 8.6,
+// P8-D7). It is data only — the engine names no channel; the refs here are content channel refs and
+// the ids are player ids. A zero value (all maps/lists empty, AFK false) is the default state and is
+// OMITTED from the save (the omitempty + the nil-return from dumpCommsState), so a player who has
+// never toggled anything writes no comms subtree at all.
+type CommsStateJSON struct {
+	// Channels is the per-channel ENABLED OVERRIDE keyed by channel ref: a present entry forces a
+	// channel on (true) or off (false) regardless of its default_on; an ABSENT entry means "use the
+	// channel's default_on". Storing only overrides (not the full enabled set) keeps a hot-reload of a
+	// channel's default_on meaningful for players who never touched it — the Attributes-base-overrides
+	// precedent (store the delta from the content default, never the derived value).
+	Channels map[string]bool `json:"channels,omitempty"`
+	// Ignore is the set of sender (author) ids this player has ignored — applied authoritatively at the
+	// RECEIVER gate (the single ignore funnel, P8-A6). A sorted, de-duplicated slice (a set on the wire).
+	Ignore []string `json:"ignore,omitempty"`
+	// AFK / AFKMsg are the away flag and the optional auto-reply message. AFK is surfaced in `who` (the
+	// 8.4 presence flag) and triggers a one-line auto-reply to a tell sender ("X is AFK: <msg>"); it
+	// clears on the player's next input.
+	AFK    bool   `json:"afk,omitempty"`
+	AFKMsg string `json:"afk_msg,omitempty"`
+}
+
+// commsIgnoreMaxIDs / commsChanMaxRefs cap the comms-state subtree's two open-ended collections (the
+// size guard, the tellCursorMaxSenders / Lua-state-cap precedent): a player cannot grow the durable
+// state without bound by ignoring an unbounded number of senders or toggling unbounded refs. At cap the
+// oldest entries are dropped (ignore is a set, channel overrides are bounded by the loaded channel_defs
+// anyway, so the cap is a defensive ceiling, rarely hit).
+const (
+	commsIgnoreMaxIDs = 1024
+	commsChanMaxRefs  = 256
+)
+
+// marshalCommsState / unmarshalCommsState keep the comms-state JSON encode/decode in one place so the
+// durable form (StateJSON.Comms) and the handoff-carry form (handoff.go CommsState) are byte-identical.
+func marshalCommsState(c *CommsStateJSON) (string, error) {
+	b, err := json.Marshal(c)
+	return string(b), err
+}
+
+func unmarshalCommsState(raw string) (*CommsStateJSON, error) {
+	var c CommsStateJSON
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 // TellCursorJSON is the durable per-player delivered-cursor (Phase 8.5, OQ-4): Delivered[authorID] is
@@ -210,6 +267,7 @@ func dumpCharacter(s *session) CharSnapshot {
 		Cooldowns:  dumpCooldowns(e),
 		Script:     dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
 		Tells:      dumpTellCursor(s),  // Phase 8.5 — the durable-tell delivered-cursor (OQ-4)
+		Comms:      dumpCommsState(s),  // Phase 8.6 — the receiver-side comms-state subtree (P8-D7)
 	}
 	return CharSnapshot{
 		PID:          pid,
@@ -511,6 +569,12 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 	// Rehydrate the durable-tell delivered-cursor (Phase 8.5, OQ-4) so a redelivery after this login
 	// renders ONCE. A pre-8.5 save (nil Tells) installs an empty cursor (the backward-compat default).
 	loadTellCursor(s, snap.State.Tells)
+
+	// Rehydrate the receiver-side comms-state subtree (Phase 8.6, P8-D7): channel toggles, ignore list,
+	// AFK. A pre-8.6 save (nil Comms) installs all-default state (every channel at its default_on, no
+	// ignores, not AFK). loadCharacter runs on the zone goroutine that now owns the session; the caller
+	// (re)publishes the effective hear-set to the gate AFTER load (zone.go join/attach).
+	loadCommsState(s, snap.State.Comms)
 
 	// Rehydrate carried items into the player's contents (inventory).
 	for _, it := range snap.State.Inventory {

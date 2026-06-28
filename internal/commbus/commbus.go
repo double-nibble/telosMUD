@@ -59,6 +59,15 @@ const (
 	ChanPrefix      = SubjectRoot + "chan." // telos.comms.chan.<channelRef>
 	TellPrefix      = SubjectRoot + "tell." // telos.comms.tell.<targetPlayerId>
 	PresenceSubject = SubjectRoot + "presence"
+	// ConfigPrefix is the per-player COMMS-CONFIG root (Phase 8.6): telos.comms.config.<playerId>. The
+	// SOURCE world publishes a player's effective receiver-side comms config — the {enabled ∩ hearable}
+	// channel hear-set, the ignore list, the AFK flag — to their personal config subject; the player's
+	// GATE subscribes to its OWN config subject and re-subscribes its concrete channel subjects + caches
+	// the ignore funnel from it. Like presence (and unlike chan/tell) it is engine mechanism, NOT
+	// player-authored, so it is deliberately NOT under the chan/tell publish ACL (a world publishing a
+	// player's own derived config is not impersonation). A gate subscribes ONLY its own concrete
+	// config.<self> subject — never a config.* wildcard — so no config can leak across players.
+	ConfigPrefix = SubjectRoot + "config." // telos.comms.config.<playerId>
 )
 
 // ChanSubject / TellSubject build the per-ref / per-target subject from a VALIDATED token. The
@@ -69,6 +78,10 @@ func ChanSubject(channelRef string) string { return ChanPrefix + channelRef }
 
 // TellSubject builds the per-target tell subject — see ChanSubject for the validation contract.
 func TellSubject(playerID string) string { return TellPrefix + playerID }
+
+// ConfigSubject builds the per-player comms-config subject (Phase 8.6). Same validated-token contract
+// as TellSubject: the caller passes a resolved player id, never free-form client text.
+func ConfigSubject(playerID string) string { return ConfigPrefix + playerID }
 
 // isACLGuarded reports whether subj is a player-authored subject the publish ACL protects (chan/tell).
 // These are the subjects a GATE may subscribe to but must NEVER publish to (P8-A2). Presence and any
@@ -142,6 +155,41 @@ type Message struct {
 	Seq            uint64 `json:"seq"`             // monotonic per-author sequence (P8-A3)
 	IdempotencyKey string `json:"idempotency_key"` // "<AuthorID>:<Seq>" — the 8.5 dedup key, carried now
 	Body           string `json:"body"`            // player-supplied text — DATA, sanitized as $t at render (P8-A7)
+}
+
+// ConfigPayload is the per-player comms-config the SOURCE world publishes to ConfigSubject(player)
+// (Phase 8.6) and the GATE applies. It carries the receiver-side filter state the gate enforces:
+//
+//   - HearChannels: the player's EFFECTIVE {enabled ∩ hearable} channel REF set — the channels the
+//     gate should subscribe to (concrete ChanSubject(ref) each) and render. The world computes it
+//     because the hear-access predicate needs the live *Entity + the channel_defs (both world-side);
+//     the gate just subscribes the named subjects. A channel the player disabled OR cannot hear is
+//     simply absent. The gate drops the chan.* wildcard and subscribes exactly this set (the edge-
+//     preferred receiver HEAR-filter), so a restricted channel reaches only sockets whose world put it
+//     in their hear-set (the content guardrail, now closed).
+//   - Ignore: the receiver's ignore list — the gate caches it and drops EVERY inbound chan/tell/config-
+//     less comms frame whose AuthorID is in it, at the single receiver-side funnel (P8-A6).
+//
+// It is transported as the Body of a Message published on ConfigSubject(player) (JSON-in-JSON), so the
+// bus wire format stays uniform; MarshalConfig / UnmarshalConfig keep the encode/decode in one place.
+type ConfigPayload struct {
+	HearChannels []string `json:"hear_channels,omitempty"` // effective {enabled ∩ hearable} channel refs
+	Ignore       []string `json:"ignore,omitempty"`        // receiver ignore list (author ids), funnel input
+}
+
+// MarshalConfig encodes a ConfigPayload to the Body string of a config Message. Errors are degenerate
+// (the payload is plain slices of strings); a caller treats a marshal error as "skip this publish".
+func MarshalConfig(p ConfigPayload) (string, error) {
+	b, err := json.Marshal(p)
+	return string(b), err
+}
+
+// UnmarshalConfig decodes a config Message Body back into a ConfigPayload. A malformed body is a handled
+// error (the gate logs + ignores it), never a panic — the contentbus wire discipline.
+func UnmarshalConfig(body string) (ConfigPayload, error) {
+	var p ConfigPayload
+	err := json.Unmarshal([]byte(body), &p)
+	return p, err
 }
 
 // NewIdempotencyKey builds the canonical "<authorID>:<seq>" key. Kept in one place so the publish

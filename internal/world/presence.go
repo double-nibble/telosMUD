@@ -224,9 +224,12 @@ func (z *Zone) presenceLeave(id string) {
 	z.shard.presence.leave(id)
 }
 
-// playerAFK reports the session's AFK flag for presence. 8.4 carries the field; the `afk` command that
-// sets it lands in 8.6, so this is false today (a hook point — no AFK state subtree exists yet).
-func playerAFK(_ *session) bool { return false }
+// playerAFK reports the session's AFK flag for presence (Phase 8.6): true iff the player has set AFK
+// (the `afk` command). Read from the in-memory comms state; nil/all-default => not AFK. The flag rides
+// the presence roster so `who` marks an AFK player.
+func playerAFK(s *session) bool {
+	return s != nil && s.comms != nil && s.comms.afk
+}
 
 // rosterList reads the whole cross-shard presence roster for `who` (off the zone goroutine — see cmdWho).
 // Returns nil + false when presence is disabled (no roster) or the read errors, so cmdWho falls back to

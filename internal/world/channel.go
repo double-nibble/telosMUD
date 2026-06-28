@@ -47,12 +47,13 @@ import (
 // *abilityDef/*affectDef — and swapped wholesale by the hot-reload path (defRegistry.reload). The
 // publish path reads it (canSpeak/render); the gate never sees it (the world renders into Body).
 type channelDef struct {
-	ref     string
-	name    string
-	words   []string // command verbs that emit on this channel (lower-cased, registered exact-only)
-	color   string   // color/markup token prepended to the rendered line (content; empty => none)
-	format  string   // listener-perspective template ("[$channel] $name: $t"); empty => defaultChannelFormat
-	history int      // recent-lines buffer size (carried; retrieval deferred — P8-D3)
+	ref       string
+	name      string
+	words     []string // command verbs that emit on this channel (lower-cased, registered exact-only)
+	color     string   // color/markup token prepended to the rendered line (content; empty => none)
+	format    string   // listener-perspective template ("[$channel] $name: $t"); empty => defaultChannelFormat
+	history   int      // recent-lines buffer size (carried; retrieval deferred — P8-D3)
+	defaultOn bool     // is a fresh character subscribed by default (drives the hear-set vs a toggle, 8.6)
 
 	// access is the parsed speak/hear predicate (P8-A8). A zero predicate (no conditions) is the open
 	// channel — anyone may speak. canSpeak evaluates it against the live *Entity.
@@ -89,12 +90,13 @@ func buildChannelDef(c content.ChannelDTO) *channelDef {
 		format = defaultChannelFormat
 	}
 	def := &channelDef{
-		ref:     c.Ref,
-		name:    c.Name,
-		words:   words,
-		color:   c.Color,
-		format:  format,
-		history: c.History,
+		ref:       c.Ref,
+		name:      c.Name,
+		words:     words,
+		color:     c.Color,
+		format:    format,
+		history:   c.History,
+		defaultOn: c.DefaultOn,
 	}
 	def.access.requireFlag = c.Access.RequireFlag
 	if c.Access.MinAttr != nil && c.Access.MinAttr.Attr != "" {
@@ -109,6 +111,27 @@ func buildChannelDef(c content.ChannelDTO) *channelDef {
 // content rule is checked, never the client. A nil entity (defensive) is refused. An open channel (no
 // conditions) admits anyone. Pure read of the immutable def + the live entity; zone-goroutine only.
 func (d *channelDef) canSpeak(e *Entity) bool {
+	if e == nil {
+		return false
+	}
+	if d.access.requireFlag != "" && !hasFlag(e, d.access.requireFlag) {
+		return false
+	}
+	if d.access.minAttrName != "" && attr(e, d.access.minAttrName) < d.access.minAttrVal {
+		return false
+	}
+	return true
+}
+
+// canHear evaluates the channel's access predicate against the LISTENING entity (Phase 8.6, the
+// receiver HEAR-filter). For v1 a channel's HEAR access is the SAME predicate as its SPEAK access (a
+// restricted channel restricts both sending and hearing) — so this delegates to the same evaluation as
+// canSpeak. It is a DISTINCT method so a future content shape (a channel you may hear but not speak, or
+// vice versa) has an obvious divergence point without touching the call sites. The world evaluates it
+// against the live *Entity (zone-goroutine) when computing the player's effective hear-set
+// (effectiveHearSet); the gate never runs it (it has no content) — it just subscribes the refs the world
+// put in the hear-set. A nil entity is refused (defensive).
+func (d *channelDef) canHear(e *Entity) bool {
 	if e == nil {
 		return false
 	}

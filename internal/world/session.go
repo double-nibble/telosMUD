@@ -115,6 +115,14 @@ type session struct {
 	// the conventional MUD behavior.
 	lastTellFrom string
 
+	// comms is the player's in-memory receiver-side comms state (Phase 8.6, commsstate.go): channel
+	// toggles, the ignore list, the AFK flag/message. Zone-owned (only the zone goroutine reads/writes
+	// it), so it needs no lock — exactly like tellCursor. Loaded from StateJSON.Comms on login, carried
+	// on the handoff snapshot (handoff-transparency), dumped on save. nil until first touched
+	// (loadCommsState / a toggle lazily create it); a nil comms is all-default (every channel at its
+	// default_on, no ignores, not AFK).
+	comms *commsState
+
 	// Destination side: a PENDING session has been rehydrated by Prepare and is waiting
 	// for the gate to re-dial. Its entity is not yet in a room's contents and it applies
 	// no input until an Attach carrying the matching token activates it. token is the

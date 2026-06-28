@@ -54,7 +54,10 @@ func registerCommands() []*Command {
 	// movement/look/say so abbreviation precedence (the "n->north not nuke" rule) is unchanged. They
 	// live in container.go (Phase 3) and combat_commands.go (Phase 6.3a).
 	base = append(base, containerCommands()...)
-	return append(base, combatCommands()...)
+	base = append(base, combatCommands()...)
+	// Comms toggles (Phase 8.6): channels/ignore/afk. Registered last (lowest priority) so they never
+	// shadow or abbreviate a movement/look/say verb.
+	return append(base, commsCommands()...)
 }
 
 // cmdLook shows the actor their current room (MUDLIB §6). Slice 2 keeps look's behavior

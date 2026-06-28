@@ -458,21 +458,34 @@ slices MUST satisfy for the boundary to hold end-to-end — fold each into the n
   concrete-subject choice is the only thing preventing a cross-player tell leak). Always set the
   `IdempotencyKey` (the `MemJetStream` stand-in does not dedup an empty key).
 
-### 8.3 review — carried-forward obligations (security/edge, sign-off 2026-06-28)
+### 8.3 review — carried-forward obligations (security/edge) — RESOLVED in 8.6 (2026-06-28)
 
 8.3 cleared SOUND (the 5 publish obligations enforced in order; prefix-forge/ANSI defense holds; the
-`chan.*` wildcard can't match `tell.*`). The deferred **receiver HEAR-filter** is the carry-forward:
-- **8.6 MUST add a receiver-side hear filter** — preferred: the gate subscribes only the player's
-  enabled/hearable channels (concrete `ChanSubject(ref)` per channel, added/dropped on toggle), under the
-  same connection-scoped `commsClient.close()` teardown; OR a gate-side hear-access check before
-  `deliverChannel`. Today the gate subscribes `chan.*` and renders EVERY channel (access is speak-side
-  only), so a player currently HEARS every channel.
-- **CONTENT GUARDRAIL (enforce NOW, until 8.6):** do NOT author a RESTRICTED-access channel
-  (`access.require_flag`/`min_attr`) in shipped content until the 8.6 hear-filter exists — a restricted
-  channel's lines would fan out to EVERY connected socket (the speak-gate gates sending, not hearing).
-  The demo `gossip`/`newbie` are open, so 8.3 is safe; an admin/guild channel must wait for 8.6.
-- Non-blocking (8.2 note still open): consider surfacing a wholly-failed `openComms` as a one-line
-  "comms unavailable" notice when 8.6 adds per-channel subs (today it's silently off).
+`chan.*` wildcard can't match `tell.*`). The deferred **receiver HEAR-filter** was the carry-forward, and
+**slice 8.6 has now closed it**:
+- **DONE — the receiver HEAR-filter.** The gate **no longer subscribes the `chan.*` wildcard**. The
+  SOURCE world computes each player's effective **{enabled ∩ hearable}** channel-ref set (it has the live
+  `*Entity` + the `channel_defs`; `effectiveHearSet` in `internal/world/commsstate.go`) and publishes it,
+  with the player's ignore list, to a **per-player config subject** (`telos.comms.config.<playerId>`,
+  `commbus.ConfigSubject` / `ConfigPayload`). The gate subscribes its OWN concrete config subject (never a
+  `config.*` wildcard) and re-subscribes exactly the named **concrete `ChanSubject(ref)`** channels —
+  added/dropped on every toggle — under the same connection-scoped `commsClient.close()` teardown
+  (`internal/gate/comms.go`). Recomputed + re-published on login, on a handoff arrival, and on every
+  `channels`/`ignore` mutation. Handoff-transparent: the hear-set + ignore set live on the CONNECTION
+  (survive a re-dial), and the comms-state subtree rides the handoff snapshot (`comms_state`), so a
+  cross-shard walk does not reset toggles.
+- **DONE — the CONTENT GUARDRAIL is now CLOSED.** A RESTRICTED-access channel
+  (`access.require_flag`/`min_attr`) is now HEARD only by a player who passes its predicate (the world
+  omits it from a non-hearer's hear-set, so the gate never subscribes it for them). **Restricted
+  channels (admin/guild) MAY now ship.** Tested both speak-side (the publish access predicate, 8.3) and
+  hear-side (`TestEffectiveHearSetEnabledIntersectHearable`, `TestHearFilterSubscribesOnlyHearSet`).
+- **DONE — the receiver IGNORE funnel (P8-A6).** The gate caches the receiver's ignore list and drops
+  EVERY inbound comms frame whose `AuthorID` is in it at a SINGLE chokepoint (`commsClient.ignored`),
+  shared by the channel AND tell paths, so a synthetic NEW comms frame type inherits it
+  (`TestIgnoreFunnelIsSingleChokepointForNewFrameType`).
+- **Still open (non-blocking, 8.2 note):** surfacing a wholly-failed `openComms` as a one-line "comms
+  unavailable" notice. DEFERRED — a disabled bus is byte-identical to pre-Phase-8 and detecting it from
+  the `Bus` interface would couple the gate to bus internals; the gate stays a content-free sink.
 
 ---
 

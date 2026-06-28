@@ -69,4 +69,13 @@ message PlayerSnapshot {
   // state_version (field 11): adopting the id and the CAS base together keeps a destination
   // save monotonic against the row.
   string persist_id = 13;
+  // comms_state is the player's data-only comms-state subtree (Phase 8.6, P8-D7): the
+  // per-channel enabled/disabled overrides, the ignore list, and the AFK flag/message,
+  // marshalled as the same JSON the StateJSON.Comms subtree persists. It is carried on the
+  // handoff so a cross-shard walk is comms-transparent: the destination re-publishes the
+  // receiver's effective {enabled ∩ hearable} hear-set + ignore list to the gate from this
+  // state, so toggles/ignores/AFK do not reset when the player changes shard. Empty for a
+  // player with all-default comms state (the common case), which the destination loads as
+  // defaults — identical to a pre-8.6 snapshot (the backward-compat default).
+  string comms_state = 14;
 }
