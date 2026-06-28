@@ -152,6 +152,18 @@ type Zone struct {
 	// ops, and entry points hang off it in 7.2+.
 	lua *luaRuntime
 
+	// pendingFinalFlush stashes the LOGOUT snapshot of a brand-new character that quit BEFORE its
+	// async CreateCharacter returned a PersistID (createCharacter's goroutine had not posted
+	// createdMsg yet). At leave() time the durable flush would otherwise be SKIPPED (enqueueSave
+	// guards on pid != nil) and then DROPPED when createdMsg finally arrives to a gone session —
+	// silently losing every action the player took during the create round-trip (e.g. the room they
+	// walked to). Instead leave() dumps the final snapshot here ON the zone goroutine (race-free:
+	// e.location is current) keyed by character name; characterCreated stamps the freshly-minted PID
+	// onto it and enqueues the saveFinal once the row exists, so logout stays a true flush point
+	// (docs/PERSISTENCE.md §6) even across the create window. Keyed by character name (the create key).
+	// Zone-owned; only the zone goroutine writes it.
+	pendingFinalFlush map[string]CharSnapshot
+
 	// gen is the zone's generation counter — the forward-looking guard a Lua handle captures
 	// at creation (luahandle.go, §1.2) so a handle minted before a hot-reload swap can be
 	// recognized as stale. In slice 7.2 it is captured into every handle and re-checked on
@@ -412,12 +424,13 @@ func (reloadLuaMsg) zoneMsg()     {}
 
 func newZone(id string) *Zone {
 	z := &Zone{
-		id:             id,
-		rooms:          map[ProtoRef]*Entity{},
-		players:        map[string]*session{},
-		forwarding:     map[string]*Zone{},
-		persistentDone: map[string]bool{},
-		inbox:          make(chan msg, 256),
+		id:                id,
+		rooms:             map[ProtoRef]*Entity{},
+		players:           map[string]*session{},
+		forwarding:        map[string]*Zone{},
+		persistentDone:    map[string]bool{},
+		pendingFinalFlush: map[string]CharSnapshot{},
+		inbox:             make(chan msg, 256),
 		// A private, empty prototype cache by default. A shard-hosted zone has this
 		// replaced with the shared per-shard cache (newShard); a bare test zone keeps its
 		// own so spawn works standalone.
@@ -671,10 +684,19 @@ func (z *Zone) leave(id string) {
 	// the dump is on this goroutine (race-free) and the write is the saver's job (off-goroutine),
 	// so removal does not wait on I/O. A storeless/ephemeral player is a no-op.
 	if z.saver != nil && z.saver.enabled() && s.entity != nil && s.entity.pid == nil {
-		// Brand-new character that quit before its async create returned a PersistID: the flush
-		// is skipped (no id to CAS on), so this session's actions are not persisted. Narrow
-		// (the create round-trip window) but a real silent-loss path — log it so it's observable.
-		z.log.Info("character logged out before its durable id was assigned; session not persisted", "player", id)
+		// Brand-new character that quit BEFORE its async create returned a PersistID. The normal
+		// enqueueSave below would be SKIPPED (no PID to CAS on) and the in-flight createdMsg, when it
+		// finally lands on a now-gone session, would DROP the data — silently losing every action the
+		// player took during the create round-trip (e.g. the room they walked to). Instead, DUMP the
+		// final snapshot NOW (on this goroutine: e.location is current, room_ref reflects the move) and
+		// stash it keyed by name; characterCreated stamps the freshly-minted PID onto it and enqueues
+		// the saveFinal once the row exists. The CreateCharacter INSERT starts the row at version 0, so
+		// this deferred snapshot CASes at version 0 (dumpCharacter reads s.stateVersion, still 0 — no
+		// save has bumped it). This keeps logout a true flush point across the create window. If the
+		// create ultimately FAILS (stays ephemeral), the stash is simply never replayed — no worse than
+		// the prior behavior, but the common case (a fast create that just hadn't returned yet) is saved.
+		z.pendingFinalFlush[id] = dumpCharacter(s)
+		z.log.Info("character logged out before its durable id was assigned; deferring final flush to create completion", "player", id)
 	}
 	// saveFinal (not saveFlush): the session is removed below in this same handler, so a CAS miss
 	// must NOT bounce a conflict back (there would be no session to re-dump). The saver instead
@@ -1392,9 +1414,27 @@ func (z *Zone) saveConflict(id string) {
 func (z *Zone) characterCreated(id string, pid PersistID) {
 	s := z.players[id]
 	if s == nil || s.entity == nil {
+		// The player logged out DURING the create round-trip. If leave() stashed a final logout
+		// snapshot (the create-window flush deferral), replay it now: stamp the freshly-minted PID on
+		// and enqueue the saveFinal so the actions taken during the create window (e.g. the room they
+		// walked to) are durable — logout stays a true flush point (docs/PERSISTENCE.md §6). The
+		// CreateCharacter INSERT started the row at version 0 and the snapshot was dumped at version 0,
+		// so its CAS lands cleanly; saveFinal's saver reconcile (finalizeFlush) covers any late cadence
+		// race (there is none here — the session is gone). No stash => genuinely nothing to persist.
+		if snap, ok := z.pendingFinalFlush[id]; ok {
+			delete(z.pendingFinalFlush, id)
+			snap.PID = pid
+			z.log.Info("replaying deferred logout flush after create completion", "player", id, "pid", pid, "room", snap.RoomRef)
+			z.saver.enqueue(saveRequest{snap: snap, zone: z, id: id, reason: saveFinal})
+			return
+		}
 		z.log.Debug("character created but session gone; row will load next login", "player", id)
 		return
 	}
+	// The player is still present: a stale stash (they quit then re-attached within the grace, or a
+	// duplicate createdMsg) must not later clobber the live record — drop it; the live cadence/logout
+	// flush is authoritative.
+	delete(z.pendingFinalFlush, id)
 	if s.entity.pid != nil {
 		return // already has one (a prior create/load won the race)
 	}

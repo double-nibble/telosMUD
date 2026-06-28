@@ -45,6 +45,16 @@ nolint) when the area is next touched, or in an end-of-roadmap lint sweep.
 
 ## 2. Code tech-debt / design deferrals
 
+- **`pendingFinalFlush` stash has no active eviction** — `zone.go` (the create-window
+  logout-flush fix): if `CreateCharacter` PERMANENTLY fails AND the player quit inside the
+  create round-trip, one name-keyed `CharSnapshot` lingers for the zone's lifetime (reclaimed
+  only by a later successful create of that name). Bounded + benign (one small cold snapshot
+  per distinct authenticated name, no attacker amplification — security-auditor confirmed),
+  but a TTL sweep / drop-on-create-failure signal would close it cleanly. (hardening) · *world/persistence*
+- **pgx-gated + chaos coverage for the create-window logout race** — the regression
+  `TestShardRestartCreateRaceLosesMove` is MemStore-only; real Postgres widens the create
+  window (the higher-risk env). Add a `TELOS_TEST_DSN`-gated pgx equivalent + a chaos variant
+  that quits at randomized offsets within the create round-trip. (test coverage) · *test-engineer/persistence*
 - **Room-affect tick cadence** — `affect_room.go:189`: the room tick fires EVERY
   pulse and re-leases the CC to every occupant; should lease at `tickInterval`. (perf/hardening) · *world*
 - **`ClearPlayer` deferred coupling** — `cmd/telos-gate/main.go:93,108`: reconnect
