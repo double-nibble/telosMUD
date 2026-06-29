@@ -1,0 +1,142 @@
+package world
+
+import (
+	"strings"
+	"testing"
+)
+
+// effect_op_matrix_test.go fills the direct-unit-coverage gaps in the declarative effect-op vocabulary
+// (effect_op.go effectOpHandlers): opRestore, opSend, and opAct had no focused handler test — every
+// other op (deal_damage/heal/modify_resource/apply_affect/remove_affect/dispel/if/chance/check) is
+// pinned in ability_test.go or check_test.go. These three are the "flavor/utility" ops, but they ship
+// in content op-lists and their contracts (alias equivalence, no-session no-op, to-routing) are exactly
+// the kind of quiet behavior a refactor can break without any other test noticing.
+
+// TestOpRestoreRaisesPoolClampedAtMax pins opRestore's OWN contract: it raises a depleted pool and
+// clamps at the pool max. It deliberately does NOT assert equivalence with heal — opRestore delegates to
+// opHeal TODAY (effect_op_handlers.go), but the handler doc names a planned divergence (a later slice
+// where restore ignores healing-reduction debuffs), so equivalence is an implementation detail the
+// design intends to remove, not an invariant to lock. These raise+clamp assertions stay true across
+// that future specialization.
+func TestOpRestoreRaisesPoolClampedAtMax(t *testing.T) {
+	z, caster := abilityTestZone(t)
+
+	// restore raises a depleted pool...
+	setResourceCurrent(caster.entity, "hp", 40)
+	c := seededCtx(z, caster.entity, caster.entity, dispHelpful)
+	if err := opRestore(c, &effectOp{resource: "hp", amount: 25}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if got := resourceCurrent(caster.entity, "hp"); got != 65 {
+		t.Fatalf("restore 25 from 40 -> %d, want 65", got)
+	}
+	// ...and clamps at the pool max (max_hp = 100 in abilityTestZone).
+	if err := opRestore(c, &effectOp{resource: "hp", amount: 1000}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if got := resourceCurrent(caster.entity, "hp"); got != 100 {
+		t.Fatalf("restore past max -> %d, want clamp 100", got)
+	}
+}
+
+// TestOpSendDeliversToPlayerAndNoOpsOtherwise pins opSend's three cases: it puts the text on a PLAYER
+// target's session, and is a clean no-op (no panic, no error) for a session-less MOB target and for a
+// nil target. opSend is the direct-to-target whisper op; a mob/nil target reaching the s.send path would
+// panic, so the no-op guards matter.
+func TestOpSendDeliversToPlayerAndNoOpsOtherwise(t *testing.T) {
+	z, caster := abilityTestZone(t)
+
+	// PLAYER target: the text lands on their session.
+	target := makePlayerTargetInRoom(z, caster.entity, "Listener")
+	if err := opSend(seededCtx(z, caster.entity, target.entity, dispHelpful), &effectOp{text: "a whisper reaches you"}); err != nil {
+		t.Fatalf("send to player: %v", err)
+	}
+	if !drainContains(t, target, "a whisper reaches you") {
+		t.Fatal("opSend did not deliver its text to the player target's session")
+	}
+
+	// MOB target (no session): a silent, clean no-op.
+	mob := makeMobTarget(z, caster.entity, "goblin")
+	if err := opSend(seededCtx(z, caster.entity, mob, dispHelpful), &effectOp{text: "ignored"}); err != nil {
+		t.Fatalf("send to a session-less mob should be a clean no-op, got %v", err)
+	}
+
+	// nil target: a clean no-op.
+	if err := opSend(seededCtx(z, caster.entity, nil, dispHelpful), &effectOp{text: "void"}); err != nil {
+		t.Fatalf("send to a nil target should be a clean no-op, got %v", err)
+	}
+
+	// VERBATIM (markup-is-data): opSend delivers op.text RAW — it does NOT route through act-style
+	// $-token rendering (contrast opAct below). A text full of would-be tokens must arrive byte-for-byte,
+	// so a refactor that "unifies the comms ops" and starts rendering opSend is caught here.
+	raw := "you owe $n 50% of the {gold} — $N keeps the rest"
+	if err := opSend(seededCtx(z, caster.entity, target.entity, dispHelpful), &effectOp{text: raw}); err != nil {
+		t.Fatalf("send verbatim: %v", err)
+	}
+	if !drainContains(t, target, raw) {
+		t.Fatal("opSend rendered/altered its text; it must deliver markup verbatim ($-tokens are data)")
+	}
+}
+
+// TestOpActRoutesByTo pins opAct's to-routing: `to: actor` reaches only the actor, `to: victim` reaches
+// only the bound target, and the default (`to: room`) reaches the room's other occupants but NOT the
+// actor. opAct maps op.to -> ToActor/ToVictim/ToRoom and calls z.act with the target as the VICTIM
+// referent; this asserts each fan-out lands on exactly the right session(s).
+func TestOpActRoutesByTo(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	victim := makePlayerTargetInRoom(z, caster.entity, "Victim")
+	bystander := makePlayerTargetInRoom(z, caster.entity, "Bystander")
+	// caster, victim, bystander now share caster's room.
+
+	clear := func() { drainCombat(caster); drainCombat(victim); drainCombat(bystander) }
+	got := func(s *session) []string { return drainCombat(s) }
+	has := func(lines []string, sub string) bool {
+		for _, l := range lines {
+			if strings.Contains(l, sub) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// to: actor — only the actor sees it.
+	clear()
+	opAct(seededCtx(z, caster.entity, victim.entity, dispHelpful), &effectOp{text: "ACTOR_ONLY_LINE", to: "actor"})
+	if !has(got(caster), "ACTOR_ONLY_LINE") {
+		t.Fatal("opAct to:actor did not reach the actor")
+	}
+	if v, b := got(victim), got(bystander); has(v, "ACTOR_ONLY_LINE") || has(b, "ACTOR_ONLY_LINE") {
+		t.Fatal("opAct to:actor leaked to the victim/bystander")
+	}
+
+	// to: victim — only the bound target sees it.
+	clear()
+	opAct(seededCtx(z, caster.entity, victim.entity, dispHelpful), &effectOp{text: "VICTIM_ONLY_LINE", to: "victim"})
+	if !has(got(victim), "VICTIM_ONLY_LINE") {
+		t.Fatal("opAct to:victim did not reach the victim")
+	}
+	if cl, b := got(caster), got(bystander); has(cl, "VICTIM_ONLY_LINE") || has(b, "VICTIM_ONLY_LINE") {
+		t.Fatal("opAct to:victim leaked to the actor/bystander")
+	}
+
+	// default (to: room) — every other room occupant sees it, the actor does not.
+	clear()
+	opAct(seededCtx(z, caster.entity, victim.entity, dispHelpful), &effectOp{text: "ROOM_LINE"})
+	if v, b := got(victim), got(bystander); !has(v, "ROOM_LINE") || !has(b, "ROOM_LINE") {
+		t.Fatal("opAct default to:room did not reach both other room occupants")
+	}
+	if has(got(caster), "ROOM_LINE") {
+		t.Fatal("opAct default to:room echoed back to the acting player (should be room-except-actor)")
+	}
+
+	// $N RENDERING (the load-bearing contract): opAct threads c.target as the VICTIM referent, so a
+	// `$N` token in the text must render the bound target's name. Without this, swapping the obj/vict
+	// arg positions in the handler would pass every routing case above silently. A bystander sees the
+	// room line with the victim's name filled in.
+	clear()
+	opAct(seededCtx(z, caster.entity, victim.entity, dispHelpful), &effectOp{text: "$N is struck by the spell!"})
+	by := got(bystander)
+	if !has(by, "Victim") || !has(by, "is struck by the spell!") {
+		t.Fatalf("opAct $N did not render the bound target's name into the room line; bystander saw %v", by)
+	}
+}
