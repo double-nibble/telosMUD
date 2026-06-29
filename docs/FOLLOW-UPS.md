@@ -205,6 +205,34 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
 
 ## 4. Deferred features / design directions
 
+### Player command/HUD ideas (user, 2026-06-29)
+
+- **`vitals enable/disable` + live vitals updates.** Players should be able to opt IN to having their
+  vitals (hp/mana/move/…) pushed on every CHANGE — not just on the prompt. Two delivery paths, one
+  toggle: (a) the TEXT prompt re-sent whenever a vital changes (combat damage, regen) for a plain
+  client, and (b) GMCP Char.Vitals on change for a rich client (already emitted on the prompt today;
+  this drives it on the underlying change too). A `vitals enable`/`vitals disable` verb stores the
+  preference (the per-player config / comms-state-style subtree). This SUBSUMES the existing "combat-tick
+  HUD emit" Phase-9 follow-up: the real shape is a player-toggleable on-change emitter, hooked at
+  setResourceCurrent (the one place a vital changes), change-detected, gated on the player's toggle. · *edge/mudlib*
+- **A builder-defined `help` system.** An exhaustive, BROWSABLE help command — `help` lists commands/
+  topics, `help <topic>` shows detail, more than a bare verb list. Topics are CONTENT (builders author
+  them, like channels/abilities): a `help_defs` content table (topic ref, title, body, category, "see
+  also" links, and which command/ability it documents) so the engine names no help text. Auto-include
+  the registered command set (each Command/ability can carry a short help string) plus builder topics.
+  Ties to the documentation-engineer agent + the end-of-roadmap wiki. · *mudlib/content*
+- **Inventory shows equipment; can't drop equipped; `keep`/`unkeep` no-drop flag.** Three related
+  item-handling changes: (1) `inventory` should fold in the `equipment` view (show worn items, flagged),
+  so one command is the full picture — the GMCP Char.Items.List already carries worn items with the "W"
+  attrib; mirror that in the text command. (2) `drop` must REFUSE an equipped item (today cmdDrop silently
+  auto-removes the worn slot before dropping — `container.go`; change it to require an explicit `remove`
+  first, so you can't fat-finger your weapon onto the floor mid-fight). (3) A `keep <item>` / `unkeep
+  <item>` verb sets a per-item no-drop flag (an ItemJSON/Wearable-adjacent bool that rides the carry +
+  the durable save) so a player can't accidentally drop a kept item — important for items that GRANT
+  skills/abilities by being carried (a guild totem), which Phase 11 progression will lean on. The
+  keep-flag + carried-item-grants-abilities shape fits the Phase 11/12 itemization pass. · *mudlib/progression*
+
+
 - **"Comms unavailable" player notice (Phase 8.6, 8.2-note).** When the comms bus is wholly down
   (NATS unreachable ⇒ a disabled `commbus.Bus`), comms are silently off — a player sees no channels/
   tells and no notice. Deferred deliberately in 8.6: a disabled bus is byte-identical to a pre-Phase-8
@@ -326,9 +354,9 @@ something an author would reasonably want to:
 - **Combat-tick HUD emit (the live HP gauge).** Char.Vitals is emitted only alongside the text prompt
   (sendPrompt), so it updates on each command — but a combat round (`runCombatRound`/`resolveSwings`,
   combat.go) drains HP on the pulse with NO prompt, so a rich client's gauge FREEZES mid-fight and only
-  catches up on the next keystroke. Add a post-round change-detected vitals/status emit for fighting
-  residents (not a full prompt). The "updates as you walk" case works; the "updates as you fight" case
-  is the gap. · *edge/combat*
+  catches up on the next keystroke. **SUBSUMED by the `vitals enable/disable` + live-vitals-updates
+  item in §4** — the real fix is a player-toggleable on-CHANGE emitter hooked at setResourceCurrent
+  (where every vital change funnels), driving both the text prompt and GMCP Char.Vitals. · *edge/combat*
 - **Player-facing-gauge / stat flags (content schema).** Char.Vitals (gmcp.go charVitalsJSON) emits EVERY
   registered resource, including internal pools a builder may define (`perRound` reactions budgets, a
   `rage`/counter pool) that are mechanics, not gauges — they'd leak as `"reactions":N` in the HUD. Latent
