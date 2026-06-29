@@ -2,6 +2,7 @@ package commbus
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -28,18 +29,30 @@ func TestJetStreamRealOfflineThenOnline(t *testing.T) {
 	t.Cleanup(func() { _ = js.Close() })
 
 	// A unique target per run keeps the per-target subject + durable consumer isolated across reruns.
-	target := "itplayer-" + time.Now().Format("150405.000")
+	// It MUST be dot-free: real NATS JetStream rejects a consumer name containing "." (the subject-token
+	// separator) with "invalid consumer name", and the consumer name is derived from the target. A
+	// UnixNano suffix is unique and dot-free (a timestamp like "150405.000" embeds a dot and fails only
+	// against real NATS — MemJetStream does not validate the name, which is why this test must run gated
+	// against a real broker, not just the mem stand-in). Real player ids are dot-free (gate-enforced).
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	target := "itplayer-" + suffix
+	// The author (and thus the idempotency key) is ALSO unique per run. JetStream's publish dedup is
+	// STREAM-WIDE on the Nats-Msg-Id (the idempotency key), so a constant key would be suppressed on a
+	// rerun against the same broker (within the dedup window) — the publish would silently no-op and the
+	// consumer would time out. A per-run author keeps the dedup assertion below honest within the run
+	// while staying collision-free across runs / `-count>1`. (Real authors are distinct players.)
+	author := "bob-" + suffix
 	subj := DtellSubject(target)
 	ctx := context.Background()
 
 	// Publish while the target is OFFLINE (no consumer yet).
 	require.NoError(t, js.PublishDurable(ctx, subj, Message{
-		AuthorID: "bob", AuthorName: "Bob", Seq: 1, IdempotencyKey: NewIdempotencyKey("bob", 1), Body: "offline tell",
+		AuthorID: author, AuthorName: "Bob", Seq: 1, IdempotencyKey: NewIdempotencyKey(author, 1), Body: "offline tell",
 	}))
 
 	// The publish-side dedup absorbs a duplicate (same Nats-Msg-Id) within the window.
 	require.NoError(t, js.PublishDurable(ctx, subj, Message{
-		AuthorID: "bob", AuthorName: "Bob", Seq: 1, IdempotencyKey: NewIdempotencyKey("bob", 1), Body: "offline tell (dup)",
+		AuthorID: author, AuthorName: "Bob", Seq: 1, IdempotencyKey: NewIdempotencyKey(author, 1), Body: "offline tell (dup)",
 	}))
 
 	got := make(chan Message, 4)

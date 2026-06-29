@@ -98,6 +98,38 @@ jobs:
       # The tests migrate the schema themselves (db.Migrate) before each gated test.
       - run: go test -count=1 ./tests/integration/... ./internal/store/... -v
 
+  # Gated real-NATS comms integration. The commbus + contentbus packages carry gated tests
+  # (TELOS_NATS_URL) that t.Skip without a broker — so the hermetic `go` job never runs them, and
+  # they were effectively DEAD in CI: the JetStream-real test had latently rotted (an invalid dotted
+  # consumer name + a constant idempotency key) precisely because nothing ran it against a real broker.
+  # This job starts NATS WITH JetStream (-js, mirroring deploy/docker-compose.yml) and exports
+  # TELOS_NATS_URL so the real-transport tests actually run — the layer that catches MemJetStream-vs-NATS
+  # divergences (consumer-name validation, stream-wide publish dedup, durable offline→online delivery).
+  comms:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.71.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: buf generate
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      # Service containers can't override the image CMD to pass -js, so run NATS as a step.
+      - name: start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 nats:2.10-alpine -js
+          for i in $(seq 1 20); do
+            if nc -z 127.0.0.1 4222; then echo "nats up"; break; fi; sleep 0.5;
+          done
+      - name: gated comms integration (real NATS + JetStream)
+        env:
+          TELOS_NATS_URL: nats://127.0.0.1:4222
+        run: go test -count=1 ./internal/commbus/... ./internal/contentbus/... -v
+
   # Whole-stack smoke: the cheapest catch for the seed-class bug. Brings the docker
   # compose stack up TWICE against the same Postgres volume (the populated-volume
   # re-seed that originally collided), asserts every service is healthy, the seed
