@@ -5,12 +5,47 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"strings"
 	"testing"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
+
+// TestDeliverChannelEmitsGMCP pins the Comm.Channel.Text mirror (Phase 9.5): a channel line delivered to
+// a client that advertised "Comm" is ALSO emitted as structured Comm.Channel.Text {channel, talker,
+// text}; a client that did not advertise Comm gets only the text line, no GMCP.
+func TestDeliverChannelEmitsGMCP(t *testing.T) {
+	msg := commbus.Message{Subject: commbus.ChanSubject("gossip"), AuthorName: "Alice", Body: "[Gossip] Alice: hi"}
+
+	// Advertised "Comm" → the GMCP frame is emitted with the channel/talker.
+	var out bytes.Buffer
+	tc := telnet.NewReadWriter(bytes.NewReader([]byte{255, 253, 201}), &out) // IAC DO 201 → GMCP enabled
+	tc.ReadLine()
+	g := newGMCPState()
+	g.setSupports([]string{"Comm"})
+	cc := &commsClient{log: discardLog(), tc: tc, gmcp: g, ignore: map[string]struct{}{}}
+	cc.deliverChannel(msg)
+	got := out.String()
+	if !strings.Contains(got, string([]byte{255, 250, 201})+"Comm.Channel.Text ") {
+		t.Fatalf("no Comm.Channel.Text GMCP frame; out = %q", got)
+	}
+	if !strings.Contains(got, `"channel":"gossip"`) || !strings.Contains(got, `"talker":"Alice"`) {
+		t.Fatalf("Comm.Channel.Text payload missing channel/talker; out = %q", got)
+	}
+
+	// NOT advertised → only the text line, no GMCP subnegotiation.
+	var out2 bytes.Buffer
+	tc2 := telnet.NewReadWriter(bytes.NewReader([]byte{255, 253, 201}), &out2)
+	tc2.ReadLine()
+	cc2 := &commsClient{log: discardLog(), tc: tc2, gmcp: newGMCPState(), ignore: map[string]struct{}{}}
+	cc2.deliverChannel(msg)
+	if strings.Contains(out2.String(), string([]byte{255, 250, 201})) {
+		t.Fatalf("a Comm GMCP frame reached a client that didn't advertise Comm; out = %q", out2.String())
+	}
+}
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
@@ -183,6 +218,39 @@ func TestGMCPCharVitalsReachesClient(t *testing.T) {
 	// The world emits Char.Vitals on the login prompt; the gate frames it as IAC SB 201 "Char.Vitals " …
 	term.expectBytes(t, []byte{255, 250, 201, 'C', 'h', 'a', 'r', '.', 'V', 'i', 't', 'a', 'l', 's', ' '})
 	term.close(t)
+}
+
+// TestGMCPCommChannelReachesClient is the channel-routing e2e: a listener advertising "Comm" receives
+// a gossip line BOTH as text AND as a structured Comm.Channel.Text GMCP frame.
+func TestGMCPCommChannelReachesClient(t *testing.T) {
+	const addr = "addr-a"
+	core := commbus.NewMemBus()
+	t.Cleanup(func() { _ = core.Close() })
+
+	h := newHarness(t)
+	h.addShardWithComms("midgaard", addr, nil, nil, core.WorldHandle())
+	h.serveGateWithComms(directory.Static{Addr: addr}, core.GateHandle())
+
+	speaker := h.dial(t)
+	speaker.login(t, "Speaker")
+	speaker.expect(t, "Temple Square")
+
+	listener := h.dial(t)
+	listener.expectBytes(t, []byte{255, 251, 201}) // the GMCP offer
+	if _, err := listener.conn.Write([]byte{255, 253, 201}); err != nil {
+		t.Fatal(err)
+	}
+	listener.sendGMCP(t, "Core.Supports.Set", `["Comm 1"]`)
+	listener.login(t, "Listener")
+	listener.expect(t, "Temple Square")
+
+	// Wait until the listener's gate has subscribed to gossip (the async hear-set), then a fresh gossip
+	// arrives as a Comm.Channel.Text GMCP frame.
+	syncChannelLive(t, speaker, listener)
+	speaker.send(t, "gossip hello gmcp world")
+	listener.expectBytes(t, append([]byte{255, 250, 201}, []byte("Comm.Channel.Text ")...))
+	listener.close(t)
+	speaker.close(t)
 }
 
 // TestGMCPCharItemsReachesClient is the inventory-panel e2e: a client advertising "Char" receives a

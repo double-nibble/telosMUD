@@ -326,6 +326,11 @@ something an author would reasonably want to:
   shows on the viewer's next command (not live). Add the incremental delta messages (bandwidth + live
   room updates) and `Char.Items.Contents` (a container the player opened) when the panels need them. The
   room "icon" field is also unfilled (no content icon yet). · *edge*
+- **Comm.Channel.Text raw text (Phase 9.5).** The GMCP Comm.Channel.Text `text` field carries the
+  fully-RENDERED line ("[Gossip] Alice: hi") because that is all the gate's commsClient has — the raw
+  message body isn't carried separately on the comms bus Message. A client routing to a per-channel tab
+  would prefer the raw text ("hi") + the talker. Carry the raw text as a Message field (a Phase-8 comms
+  shape change) and emit it here. Also Comm.Channel.List/Players are not yet emitted. · *edge/comms*
 - **Char.Status target visibility.** charStatusJSON emits `e.living.fighting.Name()` (the entity short),
   bypassing the act/look visibility filter. Safe today (it's the player's OWN opponent — you can't fight
   what you can't perceive), but once invis/disguise content lands it would surface a hidden foe's true

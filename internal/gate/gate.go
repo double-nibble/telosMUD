@@ -203,7 +203,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 	// (A→B) runs entirely inside runStream and never touches this subscription, so the player keeps
 	// receiving comms across a cross-shard walk (PHASE8-PLAN §1, P8-D1; comms.go). A disabled bus
 	// (NATS down) yields no-op subscriptions, so this is a clean no-op when comms are unavailable.
-	cc := openComms(log, s.comms, tc, name)
+	cc := openComms(log, s.comms, tc, gmcp, name)
 	defer cc.close()
 
 	// --- directory seam: resolve the initial shard for this character ---

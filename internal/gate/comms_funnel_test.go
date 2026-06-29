@@ -56,7 +56,7 @@ func newPipeComms(t *testing.T, player string) (*commsClient, commbus.Bus, *sock
 	t.Cleanup(func() { _ = client.Close() })
 	tc := telnet.New(server)
 
-	cc := openComms(slog.New(slog.NewTextHandler(io.Discard, nil)), gateBus, tc, player)
+	cc := openComms(slog.New(slog.NewTextHandler(io.Discard, nil)), gateBus, tc, newGMCPState(), player)
 	t.Cleanup(cc.close)
 
 	return cc, worldBus, newSocketReader(client)

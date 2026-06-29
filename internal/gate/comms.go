@@ -50,7 +50,9 @@ package gate
 // subscription's delivery goroutine; Publish is non-blocking and drops on a full buffer.
 
 import (
+	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
@@ -71,6 +73,7 @@ type commsClient struct {
 	tc     *telnet.Conn
 	player string // the playerId (the stub login name today; the comms identity, P8-D5/OQ-5)
 	bus    commbus.Bus
+	gmcp   *gmcpState // for the GMCP Comm.Channel.Text mirror (Phase 9.5); never nil
 
 	mu       sync.Mutex
 	stable   []commbus.Subscription          // tell + config subscriptions (lifetime = connection)
@@ -95,12 +98,13 @@ type commsClient struct {
 //
 // bus is the gate's RoleGate handle (never nil — a disabled bus when NATS is down yields no-op
 // subscriptions, so comms simply delivers nothing and the connection is byte-identical to pre-Phase-8).
-func openComms(log *slog.Logger, bus commbus.Bus, tc *telnet.Conn, player string) *commsClient {
+func openComms(log *slog.Logger, bus commbus.Bus, tc *telnet.Conn, gmcp *gmcpState, player string) *commsClient {
 	c := &commsClient{
 		log:      log,
 		tc:       tc,
 		player:   player,
 		bus:      bus,
+		gmcp:     gmcp,
 		chanSubs: map[string]commbus.Subscription{},
 		ignore:   map[string]struct{}{},
 	}
@@ -240,6 +244,19 @@ func (c *commsClient) deliverChannel(msg commbus.Message) {
 	}
 	c.log.Debug("comms channel delivered", "subject", msg.Subject, "author", msg.AuthorName, "seq", msg.Seq)
 	_ = c.tc.Write(msg.Body + "\r\n")
+
+	// GMCP mirror (Phase 9.5): a rich client that advertised Comm gets the same line as structured
+	// Comm.Channel.Text {channel, talker, text} so it can route to a per-channel tab. Same hear-set +
+	// ignore funnel as the text line (we are past both gates here), so a muted/ignored line emits no
+	// GMCP either. (text is the rendered line today; carrying the raw message text is a follow-up.)
+	if c.gmcp.supported("Comm.Channel.Text") {
+		payload, _ := json.Marshal(map[string]string{
+			"channel": strings.TrimPrefix(msg.Subject, commbus.ChanPrefix),
+			"talker":  msg.AuthorName,
+			"text":    msg.Body,
+		})
+		_ = c.tc.WriteGMCP("Comm.Channel.Text", payload)
+	}
 }
 
 // close tears down every subscription this connection holds (the stable tell/config subs + every dynamic
