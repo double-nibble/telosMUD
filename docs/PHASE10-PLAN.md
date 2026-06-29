@@ -58,35 +58,49 @@ subagent reviews. New persistence fields are round-trip-verified through real Po
   `Pack.Regions`/`LoadedContent.Regions` (last-write-wins merge-by-ref) + store read/write/strip +
   demo "heartlands" region (midgaard+darkwood). Tests: demo-load + merge-override (hermetic) + gated PG
   round-trip & idempotency. Modeled on the 8.3 channel_defs precedent.
-- **10.3b TODO (zone read-replica + Lua reads):** each shard keeps a read-only replica of the region/world
-  state it cares about, updated when a director broadcasts a change over the scoped bus. Entry points:
-  the shard struct (internal/world/world.go `Shard`) holds the replica + a `scopebus.Subscribe` on its
-  region/world scopes; the Lua surface is added in internal/world/luaentry.go (the `world`/`region` handle
-  tables) → synchronous cached `world.flag("x")` / `region:get("k")`. Each zone learns its region from
-  `LoadedContent.Regions` (a zone-ref → region-ref lookup). The director doesn't broadcast yet (10.4), so
-  10.3b is tested by publishing a synthetic scope broadcast on the bus and asserting the Lua read sees it.
-- **10.3c TODO (signal-up):** `signal_region`/`signal_world` Lua builtins → a zone commands UP to the
-  director via `scopebus.SignalDurable` (a command, never a cross-scope mutation). The director-side
-  apply is 10.4; 10.3c is the zone→bus emit + its Lua surface + the no-cross-scope-write invariant test.
+- **10.3b DONE (zone read-replica + Lua reads):** per-zone `scopeReplica` (world+region maps + regionID),
+  written only by `applyScopeDelta` (posted `scopeDeltaMsg`, applied on the zone goroutine — golden rule).
+  Shard-side `scopeReplication` (`WithScopeBus`) derives zone→region from region_defs, subscribes to the
+  world + hosted-region scopes, routes a director broadcast DOWN (world→all zones, region→members). Lua
+  read-only `world`/`region` globals: `world.flag`/`world.get`/`region:get`/`region.id` (luascope.go).
+  Wired in cmd/telos-world. Tested hermetic (-race): Lua reads, region isolation, delete, shard routing.
+- **10.3c DONE (signal-up):** `signal_region`/`signal_world` Lua globals → enqueue (zone goroutine) → a
+  shard `signalLoop` publishes DURABLE (`SignalDurable`) off-goroutine. Region-less / busless = clean
+  no-op. cmd/telos-world wires the durable tier (OpenScopeJetStream, run-unique source). Tested: signal
+  up to region+world with payload via a durable consumer; region-less no-op. The director-side apply is 10.4.
 
-### 10.4 — Director writes + broadcast + remote effects
-- The director's authoritative write API (`world.set`/`region:set` — single-writer, versioned persist +
-  broadcast down). `broadcast_region`/`broadcast_world` fan-out to member zones across shards.
-  `spawn_in`/remote-effect → a COMMAND on the target zone's inbox, applied locally. `on_region`/`on_world`
-  zone handlers react to broadcasts locally.
+### 10.4 — Director writes + broadcast + remote effects — **COMPLETE**
+- The director's authoritative write API + broadcast + remote effects.
+- **10.4a DONE:** `director/signals.go` — `WithScopeBus` + `WithSignalHandler`. A `SignalHandler` (the
+  "director script") runs on the actor goroutine with an `API`: `Get`, `Set` (persist via the 10.1 CAS +
+  broadcast the delta DOWN as `scopebus.EventStateSet`), `Broadcast` (a custom remote-effect event). The
+  durable signal-up consumer is bound to LEADERSHIP (only the leader consumes+applies; stable consumerID
+  so a restart resumes), applied apply-once via a per-source idempotency-key high-water. The DOWN vocab
+  (`EventStateSet`/`StatePayload`) moved to scopebus as the one shared contract. cmd/telos-director wires
+  the bus (nil handler for now — a content-defined director script is future). Tested: boss-ripple apply +
+  broadcast, remote-effect, apply-once.
+- **10.4b DONE:** `on_world`/`on_region` Lua handlers (luaentry_triggers registration binds → namespaced
+  es.handlers keys) fire on a director's custom (non-state) broadcast — the shard splits EventStateSet
+  (read-replica) from any other event (a `scopeEventMsg` → `fireScopeEvent` runs every registered handler
+  with the payload as `ev`). Tested: on_world fires with payload; remote-effect routing.
 
-### 10.5 — Capstone (the done-when)
-- Boss death → `signal_region` (durable) → region director sets mood + `broadcast_region` → member zones
-  on different shards react locally — surviving a director restart (standby promotion + JetStream replay +
-  idempotency). Demo content + the e2e milestone + the director-restart-mid-ripple chaos test.
+### 10.5 — Capstone (the done-when) — **COMPLETE**
+- `internal/world/orchestration_capstone_test.go`: the full boss ripple, hermetic + `-race` (8x stable). A
+  zone signals a kill UP (durable); director #1 counts 2 (persisted); director #1 is STOPPED and director
+  #2 brought up on the SAME store + transports — it RELOADS the count + RESUMES the durable stream; the 3rd
+  kill crosses the threshold and a scripted mob reacts to the director's remote effect (race-free via a Go
+  callback). Proves durable signal survives the restart, persisted state reloads, apply-once across failover
+  (exactly 3, never 4), the gate persists.
 
-### 10.6 — Dynamic zone placement (director as zone coordinator)
-- World servers CLAIM zones from a pool (replaces `TELOS_ZONES`). LIVENESS stays decentralized via the
-  existing lease-claim (any server/standby claims an orphan on lease expiry; directory CAS = one winner;
-  jittered retries) — works with NO director. The director adds BALANCE: nudge toward `floor(Z/S)`/server,
-  locality-aware, with rebalance hysteresis + cooldowns; standby promotion; graceful zone DRAIN (the
-  per-player handoff fanned over a zone); crash-failover rehydrate from the durability ladder. Adopting it
-  touches ZERO gate/handoff code (the directory seam already decouples "which zone" from "which server").
+### 10.6 — Dynamic zone placement (director as zone coordinator) — **COMPLETE (core; drain executor deferred)**
+- `internal/placement`: `ClaimFromPool` (decentralized liveness — a world server claims free zones via the
+  directory CAS at boot, standby if none) + `Plan` (the coordinator decision: assign unclaimed/orphaned to
+  the least-loaded, rebalance busiest→idlest past a hysteresis threshold; count-based v1) + `Observe`.
+  `directory.ListShards` (the live-fleet view). cmd/telos-world boots via claim-from-pool (single server
+  wins all — smoke/e2e unchanged); cmd/telos-director runs a leader-only observe→plan→log coordinator.
+- **Deferred (documented next mile, PLACEMENT.md):** EXECUTING a rebalance move — draining a zone's live
+  players to the new owner via the cross-shard handoff fanned over the zone (`Shard.Drain`) — and runtime
+  zone-add for a standby reclaiming an orphan live. The boot-time claim + the optimizer brain are done.
 
 ## Open decisions (WORLD-EVENTS §10 flagged three; surface + settle with the owning engineer as hit)
 - D1/D2/D3 (the doc references a §10 that isn't written): the signal coalescing/debounce shape; the

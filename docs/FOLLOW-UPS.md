@@ -383,3 +383,26 @@ something an author would reasonably want to:
 ## 5. Housekeeping
 
 - Delete merged local branches as work lands (e.g. `test-standard-structure`).
+
+## 6. Phase 10 (orchestration) deferred work
+
+- **Rebalance DRAIN executor (Phase 10.6).** `placement.Plan` computes the desired moves and the director
+  coordinator LOGS them, but nothing EXECUTES a graceful rebalance: draining a zone's live players to the
+  new owner via the cross-shard handoff fanned over the whole zone (reusing `Shard.Drain` + the per-player
+  handoff). Until then the coordinator is observe-only and balance is boot-time/failover-driven. · *orchestration*
+- **Runtime zone-add for a standby (Phase 10.6).** A standby world server that re-claims an orphaned zone
+  after a failure cannot host it without a restart — a live shard cannot add a zone at runtime today. Needs
+  a `Shard.AdoptZone(lc, zoneID)` that builds + starts a zone goroutine into a running shard. Until then,
+  decentralized failover re-claims the lease but the zone is served only after the claimer restarts. · *orchestration*
+- **Content-defined director script (Phase 10.4).** The director's `SignalHandler` (orchestration logic) is
+  a Go func — the production `cmd/telos-director` wires a NIL handler (signals are drained+acked, no logic).
+  A real deployment needs director logic as CONTENT (a sandboxed Lua VM in the director, the same model as a
+  zone, reacting to signal-up + scheduling on the director tick). The 10.5 capstone proves the machinery
+  with a Go handler. · *orchestration/scripting*
+- **Durable DOWN state broadcast + snapshot-on-join (Phase 10.4).** The director's state broadcast DOWN is
+  TRANSIENT (a live push). A zone that was down when a flag flipped misses it until the next set; it has no
+  initial snapshot of current scope state on join. Add a snapshot fetch (read region_state/world_state at
+  zone boot, or a director "sync" reply to a zone "I'm here") and/or a durable down tier. · *orchestration*
+- **Load/locality-aware placement balance (Phase 10.6).** `placement.Plan` balances by zone COUNT; a newbie
+  town ≫ an empty wilderness. Move to load-aware (player count / tick time) and locality-aware (keep adjacent
+  zones colocated so common moves stay in-process) balancing, with rebalance cooldowns (PLACEMENT.md §7). · *orchestration*
