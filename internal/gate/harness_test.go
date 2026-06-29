@@ -331,6 +331,47 @@ func (term *terminal) send(t *testing.T, s string) {
 	}
 }
 
+// sendGMCP writes a raw GMCP subnegotiation (IAC SB 201 <pkg> SP <json> IAC SE) on the wire, the way a
+// rich client emits Core.Hello / Core.Supports.
+func (term *terminal) sendGMCP(t *testing.T, pkg, json string) {
+	t.Helper()
+	frame := []byte{255, 250, 201} // IAC SB GMCP(201)
+	frame = append(frame, []byte(pkg)...)
+	if json != "" {
+		frame = append(frame, ' ')
+		frame = append(frame, []byte(json)...)
+	}
+	frame = append(frame, 255, 240) // IAC SE
+	if _, err := term.conn.Write(frame); err != nil {
+		t.Fatalf("sendGMCP %s: %v", pkg, err)
+	}
+}
+
+// expectBytes blocks until the exact byte subsequence appears in the accumulated stream — for telnet
+// control bytes (e.g. the IAC WILL 201 GMCP offer) that the markup-oriented expect can't assert.
+func (term *terminal) expectBytes(t *testing.T, seq []byte) {
+	t.Helper()
+	want := string(seq)
+	if strings.Contains(term.acc.String(), want) {
+		return
+	}
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case b, ok := <-term.bytes:
+			if !ok {
+				t.Fatalf("socket closed waiting for bytes % x; got % x", seq, term.acc.String())
+			}
+			term.acc.WriteByte(b)
+			if strings.Contains(term.acc.String(), want) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for bytes % x; got % x", seq, term.acc.String())
+		}
+	}
+}
+
 // login walks the gate's name prompt and submits name. It is the common first two
 // steps of every journey, factored so a test starts at "in the world".
 func (term *terminal) login(t *testing.T, name string) {

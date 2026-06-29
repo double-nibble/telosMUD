@@ -158,6 +158,13 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 
 	tc := telnet.New(nc)
 
+	// --- GMCP: offer option 201 immediately and install the inbound Core.* handler, BEFORE the login
+	// prompt, so a rich client (Mudlet) that negotiates + sends Core.Hello/Supports at connect is handled.
+	// The handler runs on the line-pump's ReadLine goroutine as each IAC SB 201 message is parsed.
+	gmcp := newGMCPState()
+	_ = tc.OfferGMCP()
+	tc.SetGMCPHandler(gmcpHandler(gmcp, tc, log))
+
 	// --- minimal login: read a name (stand-in for real auth) ---
 	// Loop until we get a name that is safe to render and safe to use as a
 	// targeting keyword; an unsafe name re-prompts rather than dropping the
@@ -241,6 +248,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 		sess:  sess,
 		name:  name,
 		lines: lines,
+		gmcp:  gmcp,
 	}
 	var token string
 	for {
@@ -266,6 +274,7 @@ type connState struct {
 	sess  *session
 	name  string
 	lines <-chan string
+	gmcp  *gmcpState // per-connection GMCP negotiation state (Phase 9.1); never nil
 }
 
 // redirectTarget is what a finished bridge reports when the world asked the gate to
@@ -445,7 +454,7 @@ func (b *bridge) runWriter() {
 			return
 		}
 
-		b.srv.renderFrame(b.log, b.conn.tc, f)
+		b.srv.renderFrame(b.log, b.conn, f)
 
 		if f.GetDisconnect() != nil {
 			b.log.Debug("disconnect frame received, closing socket")
@@ -578,7 +587,8 @@ func (b *bridge) result() (redirectTarget, bool) {
 // PromptUpdate / Disconnect / Attached) and the gate decides how it lands on the
 // wire. Redirect is handled in runWriter, not here. The frame kind is logged at Debug
 // so DEBUG=1 shows what the world sent.
-func (s *Server) renderFrame(log *slog.Logger, tc *telnet.Conn, f *playv1.ServerFrame) {
+func (s *Server) renderFrame(log *slog.Logger, c *connState, f *playv1.ServerFrame) {
+	tc := c.tc
 	switch pl := f.Payload.(type) {
 	case *playv1.ServerFrame_Output:
 		// Text to show; append a newline unless the frame opts out (no_newline).
@@ -592,6 +602,24 @@ func (s *Server) renderFrame(log *slog.Logger, tc *telnet.Conn, f *playv1.Server
 		// Prompts are emitted without a trailing newline (partial line).
 		log.Debug("frame rendered", "frame", "prompt")
 		_ = tc.Write(pl.Prompt.GetMarkup())
+	case *playv1.ServerFrame_Gmcp:
+		// Structured GMCP (Phase 9): emit only if the client advertised the package (or an ancestor) via
+		// Core.Supports; the codec's WriteGMCP is itself a no-op until the client enabled GMCP. The
+		// support filter keeps a client that asked for nothing silent.
+		pkg := pl.Gmcp.GetPkg()
+		switch {
+		case !validGMCPPackage(pkg):
+			// Defense-in-depth on the OUTBOUND side, symmetric with the inbound gate: the package is
+			// engine-set today (trusted), but the moment a content/Lua path can name a GMCP package, a
+			// CR/LF/ESC in the name would inject into the client's terminal. Drop+log (len only) so that
+			// can never happen, regardless of who set the name.
+			log.Debug("gmcp frame dropped: invalid package name from world", "len", len(pkg))
+		case c.gmcp.supported(pkg):
+			log.Debug("frame rendered", "frame", "gmcp", "pkg", pkg)
+			_ = tc.WriteGMCP(pkg, pl.Gmcp.GetJson())
+		default:
+			log.Debug("gmcp frame dropped: package not advertised", "pkg", pkg)
+		}
 	case *playv1.ServerFrame_Disconnect:
 		log.Debug("frame rendered", "frame", "disconnect", "reason", pl.Disconnect.GetReason())
 		_ = tc.Write("\r\n" + pl.Disconnect.GetReason() + "\r\n")
