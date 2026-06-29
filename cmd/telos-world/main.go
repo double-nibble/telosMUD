@@ -28,6 +28,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
 	"github.com/double-nibble/telosmud/internal/presence"
+	"github.com/double-nibble/telosmud/internal/scopebus"
 	"github.com/double-nibble/telosmud/internal/store"
 	"github.com/double-nibble/telosmud/internal/world"
 )
@@ -136,6 +137,12 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		slog.Info("comms bus ready (world source)", "url", cfg.NATS.URL)
 	})
 
+	// Optional scoped event bus (Phase 10.3b): the world SUBSCRIBES to the region/world scopes so a
+	// director's state broadcast updates each hosted zone's read-replica (world.flag/region:get). It
+	// rides the SAME transient comms transport (a Disabled bus => no scope updates, never a boot
+	// failure). lc.Regions is the loaded region_defs membership the shard derives zone→region from.
+	scopeBus := scopebus.New(comms)
+
 	// Optional DURABLE-tell transport (Phase 8.5, OQ-1 durable-always): the world PublishDurable's every
 	// tell here and runs a per-resident durable consumer. JetStream unreachable => DisabledJetStream =>
 	// tells degrade to "temporarily offline", never a boot failure (the never-fatal rule, mirroring the
@@ -159,6 +166,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithPersistence(charStore, nil).
 			WithHotReload(defSource, bus, enabledPacks).
 			WithComms(comms).
+			WithScopeBus(scopeBus, lc.Regions).
 			WithMail(mailStore).
 			WithTells(tellJS)
 	}
@@ -206,6 +214,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithPersistence(charStore, ckpt).
 		WithHotReload(defSource, bus, enabledPacks).
 		WithComms(comms).
+		WithScopeBus(scopeBus, lc.Regions).
 		WithPresence(roster, cfg.ShardID).
 		WithMail(mailStore).
 		WithTells(tellJS)

@@ -125,6 +125,13 @@ type Shard struct {
 	// unavailable", never a crash, and a pre-8.7 / storeless shard is byte-identical. Wired by WithMail.
 	// The store does its own blocking pool I/O off the zone goroutine (the mail command spawns a goroutine).
 	mail MailStore
+
+	// scopes is the shard's Phase-10.3b scoped-event-bus wiring (scope.go): it subscribes to the world
+	// scope + each hosted region and routes a director's state broadcast DOWN to the affected zones'
+	// read-replicas. nil DISABLES scope replication (no scoped bus / the single-shard tests) — such a
+	// shard does zero scope work and is byte-identical to a pre-10.3 shard. Wired by WithScopeBus;
+	// started in Run, torn down at Run end.
+	scopes *scopeReplication
 }
 
 // NewDemoShard builds a single-shard midgaard world with no directory wiring — its
@@ -401,6 +408,14 @@ func (s *Shard) Run(ctx context.Context) {
 	// just tear the subscription down when the shard stops so a restart doesn't double-subscribe.
 	if s.reloader != nil {
 		defer s.reloader.stop()
+	}
+	// Scope replication (10.3b): subscribe to the world + hosted-region scopes so a director's broadcast
+	// updates the zone replicas. Like hot reload it runs on the bus's subscription goroutines; tear the
+	// subscriptions down at stop. Started AFTER the zones exist (they do — adopted at construction) so a
+	// delivered delta always has a live zone inbox to post to.
+	if s.scopes != nil {
+		s.scopes.start()
+		defer s.scopes.stop()
 	}
 	var wg sync.WaitGroup
 	for _, z := range s.zones {

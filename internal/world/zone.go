@@ -97,6 +97,14 @@ type Zone struct {
 	// (Phase 5) hang off it. Plain zone-owned data; only this goroutine touches it.
 	pulses *pulseScheduler
 
+	// scopes is this zone's read-only REPLICA of the region/world scope state it cares about
+	// (Phase 10.3b, docs/WORLD-EVENTS.md §2). A director owns the authoritative region/world state
+	// and broadcasts a change DOWN over the scoped event bus; the shard's subscription posts a
+	// scopeDeltaMsg, and applyScopeDelta updates this replica — ALL on the zone goroutine, so the
+	// Lua world.flag/world.get/region:get reads are lock-free and never cross a scope boundary (the
+	// golden rule: reads are local & cached, writes signal UP). Never nil (newZone builds it empty).
+	scopes *scopeReplica
+
 	// eventCascadeDepth is the CAN'T-FORGET recursion backstop for the in-zone event bus
 	// (event.go fireEvent). The per-fire effectCtx.depth/eventBudget guards bound a cascade ONLY
 	// when every fire site threads its parent ctx — a forget-prone discipline (the 7.8 affect-
@@ -479,6 +487,10 @@ func newZone(id string) *Zone {
 		// Per-zone heartbeat scheduler (pulse.go). Empty until something registers a
 		// callback; the ticker in Run is a cheap no-op until then.
 		pulses: newPulseScheduler(),
+		// Per-zone region/world scope-state replica (scope.go, Phase 10.3b). Empty until the shard's
+		// scoped-bus subscription delivers a director broadcast; regionID is set when a shard adopts
+		// the zone into a region (WithScopeBus). A bare/regionless zone keeps an empty replica.
+		scopes: newScopeReplica(),
 		// Scoped logger so every line this zone emits is tagged with its id; all
 		// the verbose control-flow tracing below goes through z.log at Debug.
 		log: slog.With("component", "zone", "zone", id),
@@ -612,6 +624,8 @@ func (z *Zone) handle(m msg) {
 		z.probeTellCursor(v)
 	case lastTellProbeMsg:
 		z.probeLastTell(v)
+	case scopeDeltaMsg:
+		z.applyScopeDelta(v) // a director's region/world broadcast updates this zone's read-replica
 	}
 }
 
