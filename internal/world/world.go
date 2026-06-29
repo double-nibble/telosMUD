@@ -416,6 +416,7 @@ func (s *Shard) Run(ctx context.Context) {
 	if s.scopes != nil {
 		s.scopes.start()
 		defer s.scopes.stop()
+		go s.scopes.signalLoop(ctx) // off-zone-goroutine signal-up publisher (durable; 10.3c)
 	}
 	var wg sync.WaitGroup
 	for _, z := range s.zones {

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/double-nibble/telosmud/internal/scopebus"
 )
 
 // luascope.go — the Lua READ surface over a zone's region/world scope replica (docs/WORLD-EVENTS.md §5,
@@ -38,6 +40,12 @@ func (rt *luaRuntime) installScopeTables() {
 	g := L.Get(lua.GlobalsIndex).(*lua.LTable)
 	g.RawSetString("world", rt.readOnly(world))
 	g.RawSetString("region", rt.readOnly(region))
+
+	// signal_region / signal_world (10.3c): the WRITE surface — a zone commands UP to its director. They
+	// are plain globals (not on the read-only world/region tables, to keep "reads vs writes" visually
+	// distinct in scripts) and emit a durable scoped event off the zone goroutine; the director applies it.
+	g.RawSetString("signal_region", L.NewFunction(rt.scopeSignalRegion))
+	g.RawSetString("signal_world", L.NewFunction(rt.scopeSignalWorld))
 }
 
 // scopeKey reads the key argument tolerating both call forms: world.get("k") / region.get("k") (key at
@@ -113,6 +121,48 @@ func (rt *luaRuntime) scopeRegionID(l *lua.LState) int {
 	}
 	l.Push(lua.LString(rt.zone.scopes.regionID))
 	return 1
+}
+
+// scopeSignalRegion implements signal_region(event, payload?) — a zone reports an event UP to its REGION
+// director. event is the script-named event ("boss_slain"); payload is an optional data table. A no-op
+// (with a debug log) on a region-less zone or a shard without a scoped bus — never an error to the script.
+func (rt *luaRuntime) scopeSignalRegion(l *lua.LState) int {
+	if rt.zone == nil || rt.zone.scopes == nil || rt.zone.scopes.regionID == "" {
+		rt.log.Debug("signal_region ignored (region-less zone)")
+		return 0
+	}
+	rt.enqueueScopeSignal(l, scopebus.Region(rt.zone.scopes.regionID))
+	return 0
+}
+
+// scopeSignalWorld implements signal_world(event, payload?) — a zone reports an event UP to the WORLD
+// director. Always available (every zone is in the world scope).
+func (rt *luaRuntime) scopeSignalWorld(l *lua.LState) int {
+	rt.enqueueScopeSignal(l, scopebus.World())
+	return 0
+}
+
+// enqueueScopeSignal reads (event, payload?) off the Lua stack, marshals the payload table, and hands the
+// signal to the shard's off-goroutine publisher. Runs on the zone goroutine; the actual durable publish
+// happens on the signal loop (never here). An empty event name or a shardless zone is a no-op.
+func (rt *luaRuntime) enqueueScopeSignal(l *lua.LState, scope scopebus.Scope) {
+	event := l.CheckString(1)
+	if event == "" {
+		return
+	}
+	var payload json.RawMessage
+	if tbl, ok := l.Get(2).(*lua.LTable); ok {
+		if raw, err := marshalLuaState(tbl); err != nil {
+			rt.log.Warn("signal payload not serializable; signalled with no payload", "event", event, "err", err)
+		} else {
+			payload = raw
+		}
+	}
+	if rt.zone == nil || rt.zone.shard == nil || rt.zone.shard.scopes == nil {
+		rt.log.Debug("signal ignored (no scoped bus wired)", "event", event)
+		return
+	}
+	rt.zone.shard.scopes.enqueueSignal(scopeSignalJob{scope: scope, event: event, payload: payload})
 }
 
 // jsonTruthy reports whether a stored scope value counts as a SET flag: present and not JSON false/null.

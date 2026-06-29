@@ -1,6 +1,7 @@
 package world
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 
@@ -8,6 +9,11 @@ import (
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/scopebus"
 )
+
+// scopeSignalQueue bounds the shard's outbound signal-up queue. A signal is a low-rate event (a boss
+// died, a gate opened), so a small buffer absorbs a burst; a full queue drops with a log rather than
+// blocking the zone goroutine (signal-up is fire-and-forget from the script's view).
+const scopeSignalQueue = 256
 
 // scope.go is the ZONE-SIDE half of the cross-zone orchestration (docs/WORLD-EVENTS.md §2, Phase 10.3b):
 // each zone keeps a read-only REPLICA of the region/world scope state it cares about, and the shard
@@ -99,7 +105,18 @@ type scopeReplication struct {
 	zoneRegion map[string]string // hosted zone id -> its region id (only zones that are in a region)
 	regions    map[string]bool   // the distinct regions this shard hosts a member of
 	subs       []commbus.Subscription
+	signals    chan scopeSignalJob // outbound signal-up queue, drained by signalLoop off the zone goroutine
 	log        *slog.Logger
+}
+
+// scopeSignalJob is one queued signal-UP (a zone commanding its region/world director). The event name +
+// payload are the script's (signal_region("boss_slain", {...})); the scope is the zone's region or the
+// world. Drained by signalLoop, which publishes it on the DURABLE tier so a momentary broker blip never
+// loses a state-changing report.
+type scopeSignalJob struct {
+	scope   scopebus.Scope
+	event   string
+	payload json.RawMessage
 }
 
 // WithScopeBus wires the shard's scoped event bus + region membership (docs/WORLD-EVENTS.md §2, Phase
@@ -132,6 +149,7 @@ func (s *Shard) WithScopeBus(bus *scopebus.Bus, regions []content.RegionDTO) *Sh
 		shard:      s,
 		zoneRegion: zoneRegion,
 		regions:    regionSet,
+		signals:    make(chan scopeSignalJob, scopeSignalQueue),
 		log:        slog.With("component", "scope-replication"),
 	}
 	return s
@@ -200,4 +218,42 @@ func (sr *scopeReplication) stop() {
 		_ = sub.Unsubscribe()
 	}
 	sr.subs = nil
+}
+
+// --- Signal UP (a zone commands its director) --------------------------------------------------
+
+// enqueueSignal hands a signal-up job to the shard's drain loop WITHOUT blocking the zone goroutine
+// (the publish does network I/O — it must never run on a zone actor). A full queue drops with a log
+// rather than stalling the simulation. Concurrency-safe; called from a zone goroutine via the Lua
+// signal_region/signal_world builtins. A nil replication (no scoped bus) silently no-ops.
+func (sr *scopeReplication) enqueueSignal(j scopeSignalJob) {
+	if sr == nil {
+		return
+	}
+	select {
+	case sr.signals <- j:
+	default:
+		sr.log.Warn("signal-up queue full; dropping", "event", j.event, "scope", j.scope.Label())
+	}
+}
+
+// signalLoop is the shard's SINGLE signal-up publisher (started by Shard.Run). It drains the queue and
+// publishes each signal on the DURABLE tier so a state-changing report (a boss slain) survives a broker
+// blip and a director restart — the at-least-once half of the golden rule. A bus with no durable tier
+// (no JetStream wired) makes every publish a logged no-op, never a crash (the never-fatal posture,
+// mirroring the durable-tell publishLoop). Runs off every zone goroutine.
+func (sr *scopeReplication) signalLoop(ctx context.Context) {
+	if sr == nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case j := <-sr.signals:
+			if err := sr.bus.SignalDurable(ctx, j.scope, j.event, j.payload); err != nil {
+				sr.log.Warn("signal-up publish failed; dropped", "event", j.event, "scope", j.scope.Label(), "err", err)
+			}
+		}
+	}
 }

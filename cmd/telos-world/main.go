@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
@@ -137,11 +138,22 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		slog.Info("comms bus ready (world source)", "url", cfg.NATS.URL)
 	})
 
-	// Optional scoped event bus (Phase 10.3b): the world SUBSCRIBES to the region/world scopes so a
-	// director's state broadcast updates each hosted zone's read-replica (world.flag/region:get). It
-	// rides the SAME transient comms transport (a Disabled bus => no scope updates, never a boot
-	// failure). lc.Regions is the loaded region_defs membership the shard derives zone→region from.
-	scopeBus := scopebus.New(comms)
+	// Optional scoped event bus (Phase 10.3b/c): the world SUBSCRIBES to the region/world scopes so a
+	// director's state broadcast updates each hosted zone's read-replica (world.flag/region:get), and it
+	// SIGNALS UP (signal_region/signal_world) on the durable tier so a state-changing report survives a
+	// blip. The transient half rides the comms transport; the durable half is the WORLD_EVENTS JetStream
+	// stream (OpenScopeJetStream — Disabled if NATS is down, so signal-up degrades, never a boot failure).
+	// source is run-unique (shard id + a random suffix) so the per-process idempotency keys never collide
+	// with a prior run's. lc.Regions is the region_defs membership the shard derives zone→region from.
+	scopeJS := commbus.OpenScopeJetStream(cfg.NATS.URL, func(err error) {
+		if err != nil {
+			slog.Warn("scope jetstream unavailable; durable signal-up disabled", "url", cfg.NATS.URL, "err", err)
+			return
+		}
+		slog.Info("scope event stream ready", "url", cfg.NATS.URL)
+	})
+	scopeSource := "world-" + cfg.ShardID + "-" + uuid.NewString()[:8]
+	scopeBus := scopebus.New(comms).WithDurable(scopeJS, scopeSource)
 
 	// Optional DURABLE-tell transport (Phase 8.5, OQ-1 durable-always): the world PublishDurable's every
 	// tell here and runs a per-resident durable consumer. JetStream unreachable => DisabledJetStream =>

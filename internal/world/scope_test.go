@@ -159,6 +159,125 @@ func TestScopeReplicationRouting(t *testing.T) {
 	}
 }
 
+// TestScopeSignalUp proves a zone script's signal_region/signal_world emits a DURABLE scoped event UP to
+// the director, off the zone goroutine: the Lua builtin enqueues, the shard's signalLoop publishes, and a
+// durable consumer on the scope receives the event + payload. The region signal carries the zone's region;
+// the world signal goes to the world scope.
+func TestScopeSignalUp(t *testing.T) {
+	regions, err := content.LoadDemoPack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewMultiShard([]string{"midgaard"}, "midgaard", "", nil, nil)
+	js := commbus.NewMemJetStream()
+	bus := scopebus.New(commbus.NewMemBus()).WithDurable(js, "world-test")
+	s.WithScopeBus(bus, regions.Regions)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.scopes.signalLoop(ctx) // the off-zone-goroutine durable publisher
+
+	// Durable consumers standing in for the region + world directors.
+	regionEvents := make(chan scopebus.DurableEvent, 4)
+	rc, err := bus.SubscribeDurable(scopebus.Region("heartlands"), "region-dir", func(ev scopebus.DurableEvent) bool {
+		regionEvents <- ev
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Stop() }()
+
+	worldEvents := make(chan scopebus.DurableEvent, 4)
+	wc, err := bus.SubscribeDurable(scopebus.World(), "world-dir", func(ev scopebus.DurableEvent) bool {
+		worldEvents <- ev
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = wc.Stop() }()
+
+	// A midgaard script (region = heartlands) signals up to BOTH its region and the world.
+	z := s.zones["midgaard"]
+	src := `
+		signal_region("boss_slain", {by = "hero", boss = "vurgoth"})
+		signal_world("gate_opened", {gate = "north"})
+	`
+	if err := z.lua.runChunk("signal", src); err != nil {
+		t.Fatal(err)
+	}
+
+	rev := waitEvent(t, regionEvents, "region signal")
+	if rev.Event != "boss_slain" {
+		t.Fatalf("region event = %q, want boss_slain", rev.Event)
+	}
+	var rp map[string]any
+	if err := json.Unmarshal(rev.Payload, &rp); err != nil {
+		t.Fatalf("region payload: %v", err)
+	}
+	if rp["by"] != "hero" || rp["boss"] != "vurgoth" {
+		t.Fatalf("region payload = %v, want by=hero boss=vurgoth", rp)
+	}
+
+	wev := waitEvent(t, worldEvents, "world signal")
+	if wev.Event != "gate_opened" {
+		t.Fatalf("world event = %q, want gate_opened", wev.Event)
+	}
+}
+
+// TestScopeSignalRegionlessNoop proves signal_region from a region-less zone is a silent no-op (no event
+// published) — a script never errors, and the world director sees nothing it shouldn't.
+func TestScopeSignalRegionlessNoop(t *testing.T) {
+	regions, err := content.LoadDemoPack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewMultiShard([]string{"crypt"}, "crypt", "", nil, nil) // crypt is region-less
+	js := commbus.NewMemJetStream()
+	bus := scopebus.New(commbus.NewMemBus()).WithDurable(js, "world-test")
+	s.WithScopeBus(bus, regions.Regions)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.scopes.signalLoop(ctx)
+
+	got := make(chan scopebus.DurableEvent, 4)
+	// A region director can't subscribe to a region the crypt isn't in; the only mis-route risk is the
+	// crypt signalling to SOME region. We assert nothing lands on the world scope from a region signal.
+	wc, err := bus.SubscribeDurable(scopebus.World(), "world-dir", func(ev scopebus.DurableEvent) bool {
+		got <- ev
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = wc.Stop() }()
+
+	z := s.zones["crypt"]
+	if err := z.lua.runChunk("signal", `signal_region("boss_slain", {by = "nobody"})`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-got:
+		t.Fatalf("a region-less signal_region leaked an event: %+v", ev)
+	case <-time.After(300 * time.Millisecond):
+		// no event — correct.
+	}
+}
+
+// waitEvent reads one durable event or fails the test.
+func waitEvent(t *testing.T, ch <-chan scopebus.DurableEvent, what string) scopebus.DurableEvent {
+	t.Helper()
+	select {
+	case ev := <-ch:
+		return ev
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s not delivered", what)
+		return scopebus.DurableEvent{}
+	}
+}
+
 // drainScopeDeltas reads the scopeDeltaMsgs that landed on a (not-Run) zone's inbox within a short
 // window, reporting whether a world and a region delta arrived. Non-scope messages are ignored.
 func drainScopeDeltas(t *testing.T, z *Zone) (world, region bool) {
