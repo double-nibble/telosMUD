@@ -24,21 +24,6 @@ const scopeSignalQueue = 256
 // posted as a scopeDeltaMsg, exactly like the hot-reload reloadLuaMsg), so the single-writer invariant
 // holds one scope level up.
 
-// Scope-event wire vocabulary. The director (10.4) emits a state change as a scopeEventStateSet event on
-// the target scope subject, carrying a scopeStatePayload; the zone subscription decodes it and posts a
-// scopeDeltaMsg. The event name rides the message body (scopebus addresses by scope, not event), so one
-// subscription per scope receives every state set for it.
-const scopeEventStateSet = "scope.state.set"
-
-// scopeStatePayload is one region/world state delta on the wire: a key and its new value (data-only
-// JSON — numbers/strings/bools/nested objects, the same discipline as player self.state). A nil/JSON-null
-// Value DELETES the key (a flag cleared). The director is the single writer of the authoritative state;
-// this is just the broadcast of one change.
-type scopeStatePayload struct {
-	Key   string          `json:"key"`
-	Value json.RawMessage `json:"value,omitempty"`
-}
-
 // scopeReplica is a zone's read-only cache of region + world scope state (Phase 10.3b). Owned by the zone
 // goroutine: written ONLY by applyScopeDelta (from a posted scopeDeltaMsg) and read ONLY by the Lua
 // world.*/region:* surface — both on the zone goroutine, so it needs no lock. regionID is the zone's
@@ -186,10 +171,10 @@ func (sr *scopeReplication) start() {
 // onScopeEvent decodes a state-set broadcast and posts a scopeDeltaMsg to the affected zones. Runs OFF
 // the zone goroutines (a bus-owned goroutine), so it only ever POSTS — it never touches zone state.
 func (sr *scopeReplication) onScopeEvent(kind, regionID, event string, payload json.RawMessage) {
-	if event != scopeEventStateSet {
+	if event != scopebus.EventStateSet {
 		return // 10.3b handles state sets; richer director events (on_world/on_region hooks) are 10.4
 	}
-	var p scopeStatePayload
+	var p scopebus.StatePayload
 	if err := json.Unmarshal(payload, &p); err != nil || p.Key == "" {
 		sr.log.Debug("dropping malformed scope state delta", "kind", kind, "event", event)
 		return

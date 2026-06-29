@@ -17,6 +17,9 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"time"
+
+	"github.com/double-nibble/telosmud/internal/commbus"
+	"github.com/double-nibble/telosmud/internal/scopebus"
 )
 
 // ScopeStore is the persistence seam for director scope state (the world_state / region_state tables).
@@ -58,6 +61,17 @@ type Director struct {
 	leaseID    string
 	leaseTTL   time.Duration
 	leader     atomic.Bool
+
+	// Scoped event bus (10.4). The director CONSUMES signal-up events from its zones (durable) and
+	// BROADCASTS state + remote effects DOWN (transient). nil disables orchestration I/O (a state-only
+	// director / the 10.1 tests). source seeds the down-broadcast author; handler is the orchestration
+	// logic (the "director script") invoked per signal-up. applied is the per-source dedup high-water for
+	// the at-least-once durable stream; consumer is the live durable subscription (only while leader).
+	bus      *scopebus.Bus
+	source   string
+	handler  SignalHandler
+	applied  map[string]uint64
+	consumer commbus.Consumer
 }
 
 // New builds a director for a scope. regionID "" makes the WORLD director; a non-empty ref makes that
@@ -71,6 +85,7 @@ func New(regionID string, store ScopeStore, log *slog.Logger) *Director {
 		inbox:    make(chan msg, 256),
 		state:    map[string]json.RawMessage{},
 		versions: map[string]uint64{},
+		applied:  map[string]uint64{},
 	}
 }
 
@@ -116,6 +131,11 @@ func (d *Director) Run(ctx context.Context) {
 		defer ct.Stop()
 		campaignC = ct.C
 	}
+	// Bind the durable signal-up consumer to LEADERSHIP: only the live leader consumes + applies its
+	// scope's events (a standby must not). syncScopeSubscription subscribes on becoming leader and tears
+	// down on losing it; called now (initial state) and after every campaign. Torn down at loop exit.
+	d.syncScopeSubscription(ctx)
+	defer d.unsubscribeSignals()
 
 	for {
 		select {
@@ -129,6 +149,7 @@ func (d *Director) Run(ctx context.Context) {
 			d.onTick(ctx)
 		case <-campaignC:
 			d.campaign(ctx)
+			d.syncScopeSubscription(ctx)
 		}
 	}
 }
@@ -143,6 +164,8 @@ func (d *Director) handle(ctx context.Context, m msg) {
 		v.reply <- d.get(ctx, v.key)
 	case setMsg:
 		v.reply <- d.set(ctx, v.key, v.value)
+	case signalMsg:
+		d.handleSignal(ctx, v)
 	default:
 		d.log.Warn("director: unknown inbox message", "type", v)
 	}

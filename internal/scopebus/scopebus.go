@@ -30,6 +30,20 @@ import (
 // from that same const, so the publisher subject and the stream binding can never drift apart.
 const SubjectRoot = commbus.ScopeSubjectPrefix
 
+// EventStateSet is the RESERVED event name a director broadcasts DOWN to carry one region/world state
+// delta (Phase 10.4). Its payload is a StatePayload. It is the single shared contract between the director
+// (producer) and the zone read-replica (consumer) — kept here so neither side hardcodes the other's
+// string. A script's own signal-up events (a content-named "boss_slain") use any OTHER name.
+const EventStateSet = "scope.state.set"
+
+// StatePayload is one region/world state delta on the wire (Phase 10.4): a key and its new value
+// (data-only JSON — numbers/strings/bools/nested objects). A nil/JSON-null Value DELETES the key. The
+// director is the single writer of the authoritative state; this is the broadcast of one applied change.
+type StatePayload struct {
+	Key   string          `json:"key"`
+	Value json.RawMessage `json:"value,omitempty"`
+}
+
 // Scope is an addressable event scope. Kind is "world", "region", or "zone"; ID is the region/zone ref
 // (empty for world). It is the WORLD-EVENTS §1 scope hierarchy's two routable upper levels (region,
 // world) plus the zone level a director targets with a remote effect.

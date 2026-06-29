@@ -137,8 +137,8 @@ func TestScopeReplicationRouting(t *testing.T) {
 
 	mustSignal := func(scope scopebus.Scope, key string, value any) {
 		raw, _ := json.Marshal(value)
-		p, _ := json.Marshal(scopeStatePayload{Key: key, Value: raw})
-		if err := bus.Signal(ctx, scope, scopeEventStateSet, p, "world-director"); err != nil {
+		p, _ := json.Marshal(scopebus.StatePayload{Key: key, Value: raw})
+		if err := bus.Signal(ctx, scope, scopebus.EventStateSet, p, "world-director"); err != nil {
 			t.Fatal(err)
 		}
 	}

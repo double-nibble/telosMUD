@@ -22,10 +22,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/director"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
+	"github.com/double-nibble/telosmud/internal/scopebus"
 	"github.com/double-nibble/telosmud/internal/store"
 )
 
@@ -71,9 +73,30 @@ func main() {
 		slog.Warn("no Redis configured: running as a single always-leader director (no failover)")
 	}
 
+	// Scoped event bus (Phase 10.4): the director CONSUMES its scope's signal-up events (durable) and
+	// BROADCASTS state + remote effects DOWN (transient). The transient half is a RoleWorld commbus handle
+	// (the scope subjects are not ACL-guarded; only chan/tell are); the durable half is the WORLD_EVENTS
+	// JetStream stream. Both degrade to Disabled when NATS is down (orchestration input/output goes quiet,
+	// never a boot failure). The instanceID seeds the down-broadcast author + the durable idempotency keys.
+	scopeComms := commbus.OpenWorld(cfg.NATS.URL, func(err error) {
+		if err != nil {
+			slog.Warn("nats unavailable; director scope broadcast disabled", "url", cfg.NATS.URL, "err", err)
+		}
+	})
+	scopeJS := commbus.OpenScopeJetStream(cfg.NATS.URL, func(err error) {
+		if err != nil {
+			slog.Warn("scope jetstream unavailable; director signal-up consume disabled", "url", cfg.NATS.URL, "err", err)
+		}
+	})
+	scopeBus := scopebus.New(scopeComms).WithDurable(scopeJS, instanceID)
+
 	// Build + run the WORLD director. Region directors (one per region_defs) join here once region
-	// content lands (10.3+); for now the world scope is the deployable.
-	world := director.New("", pool, slog.Default())
+	// content lands (10.3+); for now the world scope is the deployable. The signal HANDLER (the
+	// orchestration "director script") is content-defined — not yet authored — so the director currently
+	// drains + acks signals (the write/broadcast machinery is live via the API; the built-in logic plugs
+	// in here when director-script content lands).
+	world := director.New("", pool, slog.Default()).
+		WithScopeBus(scopeBus, instanceID)
 	if claimer != nil {
 		world.WithElection(claimer, instanceID)
 	}
