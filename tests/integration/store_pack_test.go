@@ -226,6 +226,7 @@ func TestStorePackRoundTrip(t *testing.T) {
 		{"abilities", fromDB.Abilities, fromYAML.Abilities},
 		{"combat_profiles", fromDB.CombatProfiles, fromYAML.CombatProfiles},
 		{"channels", fromDB.Channels, fromYAML.Channels},
+		{"regions", fromDB.Regions, fromYAML.Regions},
 	}
 	for _, tc := range defCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -301,6 +302,7 @@ func TestImportPackIdempotent(t *testing.T) {
 	}{
 		{"ability fireball (the original deletePack collision)", abilityRefs(lc), "fireball"},
 		{"combat profile melee (Phase 6.3a)", combatProfileRefs(lc), "melee"},
+		{"region heartlands (Phase 10.3)", regionRefs(lc), "heartlands"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -336,6 +338,14 @@ func combatProfileRefs(lc *content.LoadedContent) []string {
 	out := make([]string, 0, len(lc.CombatProfiles))
 	for _, cp := range lc.CombatProfiles {
 		out = append(out, cp.Ref)
+	}
+	return out
+}
+
+func regionRefs(lc *content.LoadedContent) []string {
+	out := make([]string, 0, len(lc.Regions))
+	for _, rg := range lc.Regions {
+		out = append(out, rg.Ref)
 	}
 	return out
 }

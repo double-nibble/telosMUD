@@ -90,6 +90,9 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		// colliding on a duplicate ref (the same idempotency discipline as the other def tables). No FK
 		// into the zone tree, so order-independent.
 		`DELETE FROM channel_defs WHERE pack=$1`,
+		// Regions (Phase 10.3): stripped on re-seed, same strips-and-replaces idempotency. No FK into the
+		// zone tree (a region just NAMES member zone refs as data), so order-independent.
+		`DELETE FROM region_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -323,6 +326,20 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			`INSERT INTO channel_defs (ref, pack, body) VALUES ($1,$2,$3)`,
 			ch.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert channel %s: %w", ch.Ref, err)
+		}
+	}
+	// Regions (Phase 10.3): the region SHAPE (name + member zone refs) rides the JSONB body (regionBody).
+	// ref+pack is the per-kind PK. The loader reads it back into the same RegionDTO the embedded YAML
+	// produces, so YAML and Postgres packs define regions identically.
+	for _, rg := range pk.Regions {
+		body, err := json.Marshal(regionBody{Name: rg.Name, Zones: rg.Zones})
+		if err != nil {
+			return fmt.Errorf("store: marshal region %s body: %w", rg.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO region_defs (ref, pack, body) VALUES ($1,$2,$3)`,
+			rg.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert region %s: %w", rg.Ref, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

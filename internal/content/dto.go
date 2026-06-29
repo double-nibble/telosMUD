@@ -52,6 +52,14 @@ type Pack struct {
 	// override-by-ref rule as the other pack globals.
 	Channels []ChannelDTO `json:"channels" yaml:"channels"`
 
+	// Regions are pack-GLOBAL region definitions (Phase 10.3, docs/WORLD-EVENTS.md §1): a content-
+	// defined grouping of member zones (an "area/city" a builder thinks of as one place) that a region
+	// director owns the supra-zone state of. A region is pure CONTENT — the engine knows the KIND
+	// (region_defs: a ref + its member zone refs), not which regions exist; a pack names them. Same
+	// last-write-wins override-by-ref rule as the other pack globals. Empty => no regions (only the
+	// world scope exists), the empty-boot invariant.
+	Regions []RegionDTO `json:"regions" yaml:"regions"`
+
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
@@ -61,6 +69,19 @@ type Pack struct {
 	// (to_hit/soak/regen/xp_for) to a Lua body that returns a number, an alternative to the prefix-AST
 	// data formula. A ref uses the data formula OR the Lua one, never both.
 	Formulas map[string]string `json:"formulas" yaml:"formulas"`
+}
+
+// RegionDTO is one content-defined region (Phase 10.3, docs/WORLD-EVENTS.md §1): a named grouping of
+// member zones whose supra-zone state a region director owns. A region may span multiple zones/shards —
+// a "city" a builder treats as one place is often several zones (a hot zone can be split). Region ≠
+// shard. It is pure DATA: Ref is the stable region id (and the scoped-event subject token,
+// telos.scope.region.<ref> — validated before a subject is built); Name is the display name; Zones are
+// the member zone refs (a zone's membership in at most one region drives which region state it
+// replicates). The director/zone wiring (read replica + signal-up) is 10.3b/c.
+type RegionDTO struct {
+	Ref   string   `json:"ref" yaml:"ref"`
+	Name  string   `json:"name" yaml:"name"`
+	Zones []string `json:"zones" yaml:"zones"`
 }
 
 // ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel

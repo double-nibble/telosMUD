@@ -61,6 +61,10 @@ type LoadedContent struct {
 	// and binds each channel's verb(s) into the per-shard channel-command table. An empty list => no
 	// channels => no channel verbs (the empty-boot invariant).
 	Channels []ChannelDTO
+	// Regions are the pack-global region definitions (Phase 10.3), same last-write-wins override rule
+	// keyed by ref. A region groups member zones a director owns the supra-zone state of; an empty list
+	// => no regions (only the world scope). The director/zone wiring consumes these in 10.3b/c.
+	Regions []RegionDTO
 	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
 	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
 	// by name).
@@ -108,6 +112,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	abilIdx := make(map[string]int)
 	cpIdx := make(map[string]int)
 	chanIdx := make(map[string]int)
+	regIdx := make(map[string]int)
 	for _, p := range packs {
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
@@ -186,6 +191,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				chanIdx[ch.Ref] = len(lc.Channels)
 				lc.Channels = append(lc.Channels, ch)
+			}
+		}
+		for _, rg := range p.Regions {
+			if idx, ok := regIdx[rg.Ref]; ok {
+				lc.Regions[idx] = rg
+			} else {
+				regIdx[rg.Ref] = len(lc.Regions)
+				lc.Regions = append(lc.Regions, rg)
 			}
 		}
 	}

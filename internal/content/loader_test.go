@@ -5,6 +5,14 @@ import (
 	"testing"
 )
 
+// staticSource is a test Source that returns a fixed list of packs in order, so a merge test can feed
+// two packs and assert the last-write-wins / accumulate semantics without touching the embedded YAML.
+type staticSource []Pack
+
+func (s staticSource) LoadPacks(_ context.Context, _ []string) ([]Pack, error) {
+	return []Pack(s), nil
+}
+
 // TestEmbeddedDemoPackLoads proves the embedded demo YAML parses into the expected zones,
 // rooms, prototypes, and resets — the source the unit tests and a bare dev run rely on (no
 // Postgres). The byte-for-byte prototype parity lives in the world package
@@ -81,6 +89,54 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	}
 	if mid.Resets[0].Proto != "midgaard:obj:torch" || mid.Resets[0].Count != 5 {
 		t.Fatalf("first reset = %+v, want torch count 5", mid.Resets[0])
+	}
+
+	// Regions (Phase 10.3): the demo defines one region "heartlands" grouping midgaard + darkwood; the
+	// crypt is region-less. The region is a pack global (not under a zone), so it loads onto lc.Regions.
+	if len(lc.Regions) != 1 {
+		t.Fatalf("regions = %d, want 1 (heartlands)", len(lc.Regions))
+	}
+	hl := lc.Regions[0]
+	if hl.Ref != "heartlands" || hl.Name != "The Heartlands" {
+		t.Fatalf("region[0] = %+v, want heartlands/The Heartlands", hl)
+	}
+	if len(hl.Zones) != 2 || hl.Zones[0] != "midgaard" || hl.Zones[1] != "darkwood" {
+		t.Fatalf("heartlands zones = %v, want [midgaard darkwood]", hl.Zones)
+	}
+}
+
+// TestRegionMergeLastWriteWins proves a later pack overrides an earlier region by ref (the same
+// last-write-wins rule as the other pack globals) while a distinct ref accumulates — the merge
+// semantics the director relies on to resolve a region's final member set.
+func TestRegionMergeLastWriteWins(t *testing.T) {
+	base := Pack{Pack: "base", Regions: []RegionDTO{
+		{Ref: "heartlands", Name: "Heartlands", Zones: []string{"midgaard"}},
+		{Ref: "frontier", Name: "Frontier", Zones: []string{"darkwood"}},
+	}}
+	override := Pack{Pack: "override", Regions: []RegionDTO{
+		{Ref: "heartlands", Name: "Greater Heartlands", Zones: []string{"midgaard", "darkwood"}},
+	}}
+	lc, err := Load(context.Background(), staticSource{base, override}, []string{"base", "override"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lc.Regions) != 2 {
+		t.Fatalf("regions = %d, want 2 (heartlands overridden in place + frontier)", len(lc.Regions))
+	}
+	var hl, fr *RegionDTO
+	for i := range lc.Regions {
+		switch lc.Regions[i].Ref {
+		case "heartlands":
+			hl = &lc.Regions[i]
+		case "frontier":
+			fr = &lc.Regions[i]
+		}
+	}
+	if hl == nil || hl.Name != "Greater Heartlands" || len(hl.Zones) != 2 {
+		t.Fatalf("heartlands not overridden by the later pack: %+v", hl)
+	}
+	if fr == nil || fr.Name != "Frontier" {
+		t.Fatalf("frontier (distinct ref) should accumulate: %+v", fr)
 	}
 }
 

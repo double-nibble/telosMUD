@@ -428,6 +428,14 @@ type channelBody struct {
 	History   int                      `json:"history,omitempty"`
 }
 
+// regionBody is the JSONB-tail shape for a region_defs row (Phase 10.3): everything that is not the
+// relational ref/pack PK. It mirrors content.RegionDTO minus its Ref, so the whole region SHAPE (its
+// display name + member zone refs) is content carried in the body — the engine names no region.
+type regionBody struct {
+	Name  string   `json:"name,omitempty"`
+	Zones []string `json:"zones,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -697,6 +705,38 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	chRows.Close()
+
+	// Regions (Phase 10.3): ref+pack first-class, the region SHAPE (name + member zone refs) in the JSONB
+	// body. Decoded into the same RegionDTO the embedded YAML carries, so the director/zone wiring sees
+	// regions identically whether the pack came from YAML or Postgres.
+	rgRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM region_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query region_defs: %w", err)
+	}
+	for rgRows.Next() {
+		var rg content.RegionDTO
+		var pk string
+		var body []byte
+		if err := rgRows.Scan(&rg.Ref, &pk, &body); err != nil {
+			rgRows.Close()
+			return fmt.Errorf("store: scan region_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b regionBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				rgRows.Close()
+				return fmt.Errorf("store: region_def %s body: %w", rg.Ref, err)
+			}
+			rg.Name, rg.Zones = b.Name, b.Zones
+		}
+		pp := pack(pk)
+		pp.Regions = append(pp.Regions, rg)
+	}
+	if err := rgRows.Err(); err != nil {
+		return err
+	}
+	rgRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

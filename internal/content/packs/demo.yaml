@@ -670,6 +670,15 @@ channels:
     default_on: false
     history: 20
 
+# regions: content-defined groupings of member zones (Phase 10.3, docs/WORLD-EVENTS.md §1). A region's
+# supra-zone state is owned by a region director; member zones keep a cached read-replica of it and signal
+# UP to the director (10.3b/c). A region may span several zones (region ≠ shard). The demo groups the two
+# overworld zones into a "heartlands" region; the crypt is left region-less (it has only the world scope).
+regions:
+  - ref: heartlands
+    name: The Heartlands
+    zones: [midgaard, darkwood]
+
 zones:
   - ref: midgaard
     name: The City of Midgaard
