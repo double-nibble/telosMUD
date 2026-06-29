@@ -33,6 +33,16 @@ import (
 // jsStreamName is the durable-tell stream. Captures every per-target dtell subject.
 const jsStreamName = "COMMS_TELL"
 
+// jsScopeStreamName is the durable SCOPED-EVENT stream (Phase 10.2b): it captures every scoped-event
+// subject (telos.scope.>) so a director/zone's durable consumer replays the state-changing world events
+// it missed while down. ScopeSubjectPrefix is the single source of truth for that subject root — the
+// scopebus package's SubjectRoot is defined as this, so the stream binding and the publisher can never
+// drift apart. (Kept here, not in scopebus, because scopebus imports commbus, not the reverse.)
+const (
+	jsScopeStreamName  = "WORLD_EVENTS"
+	ScopeSubjectPrefix = "telos.scope."
+)
+
 // DtellPrefix / DtellSubject build the durable per-target tell subject (P8-D2). DtellSubject is built
 // from a RESOLVED player id (the source world resolved the target via the directory) — never free-
 // form client text concatenated into the subject space (P8-A8, subject injection).
@@ -65,6 +75,19 @@ type NATSJetStream struct {
 // (the caller degrades to DisabledJetStream). An empty url is a configuration "no JetStream" and is a
 // caller decision (open() handles it), not an error here.
 func NewJetStream(url string) (*NATSJetStream, error) {
+	return dialJetStream(url, jsStreamName, DtellPrefix+">")
+}
+
+// NewScopeJetStream is the durable transport for the SCOPED EVENT BUS (Phase 10.2b): same machinery as
+// the tell stream, bound to the WORLD_EVENTS stream over telos.scope.>. A director/zone wires this as
+// the scopebus durable tier so a state-changing world event survives a restart. Empty url is a caller
+// decision (degrade to DisabledJetStream), not an error here.
+func NewScopeJetStream(url string) (*NATSJetStream, error) {
+	return dialJetStream(url, jsScopeStreamName, ScopeSubjectPrefix+">")
+}
+
+// dialJetStream opens a connection and ensures the named stream over subjectFilter.
+func dialJetStream(url, streamName, subjectFilter string) (*NATSJetStream, error) {
 	nc, err := nats.Connect(url,
 		nats.Timeout(connectTimeout),
 		nats.Name("telos-commbus-jetstream"),
@@ -74,12 +97,14 @@ func NewJetStream(url string) (*NATSJetStream, error) {
 	if err != nil {
 		return nil, fmt.Errorf("commbus: jetstream connect %q: %w", url, err)
 	}
-	return newJetStreamFromConn(nc)
+	return newJetStreamFromConn(nc, streamName, subjectFilter)
 }
 
-// newJetStreamFromConn builds the JetStream context + ensures the stream over an existing connection.
-// Split out so a future wiring can share the transient bus's *nats.Conn rather than dialing twice.
-func newJetStreamFromConn(nc *nats.Conn) (*NATSJetStream, error) {
+// newJetStreamFromConn builds the JetStream context + ensures the named stream (over subjectFilter, e.g.
+// "telos.comms.dtell.>" or "telos.scope.>") on an existing connection. Split out so a future wiring can
+// share the transient bus's *nats.Conn rather than dialing twice, and parameterized by stream so the
+// tell stream and the scoped-event stream share one code path.
+func newJetStreamFromConn(nc *nats.Conn, streamName, subjectFilter string) (*NATSJetStream, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 	js, err := jetstream.New(nc)
@@ -87,15 +112,15 @@ func newJetStreamFromConn(nc *nats.Conn) (*NATSJetStream, error) {
 		return nil, fmt.Errorf("commbus: jetstream new: %w", err)
 	}
 	stream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:       jsStreamName,
-		Subjects:   []string{DtellPrefix + ">"},
+		Name:       streamName,
+		Subjects:   []string{subjectFilter},
 		Storage:    jetstream.FileStorage,
 		Retention:  jetstream.LimitsPolicy,
 		Duplicates: jsDedupWindow,
 		MaxAge:     jsMaxAge,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("commbus: ensure stream %s: %w", jsStreamName, err)
+		return nil, fmt.Errorf("commbus: ensure stream %s: %w", streamName, err)
 	}
 	return &NATSJetStream{js: js, stream: stream, log: slog.With("component", "commbus", "transport", "jetstream")}, nil
 }
@@ -198,6 +223,26 @@ func OpenJetStream(url string, logf func(err error)) JetStream {
 		return DisabledJetStream()
 	}
 	js, err := NewJetStream(url)
+	if err != nil {
+		if logf != nil {
+			logf(err)
+		}
+		return DisabledJetStream()
+	}
+	return js
+}
+
+// OpenScopeJetStream is OpenJetStream for the scoped-event stream (the scopebus durable tier): never
+// fatal — an empty/unreachable url degrades to DisabledJetStream so a director runs without durable
+// orchestration rather than failing boot.
+func OpenScopeJetStream(url string, logf func(err error)) JetStream {
+	if url == "" {
+		if logf != nil {
+			logf(nil)
+		}
+		return DisabledJetStream()
+	}
+	js, err := NewScopeJetStream(url)
 	if err != nil {
 		if logf != nil {
 			logf(err)

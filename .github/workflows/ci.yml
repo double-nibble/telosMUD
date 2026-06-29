@@ -128,7 +128,7 @@ jobs:
       - name: gated comms integration (real NATS + JetStream)
         env:
           TELOS_NATS_URL: nats://127.0.0.1:4222
-        run: go test -count=1 ./internal/commbus/... ./internal/contentbus/... -v
+        run: go test -count=1 ./internal/commbus/... ./internal/contentbus/... ./internal/scopebus/... -v
 
   # Whole-stack smoke: the cheapest catch for the seed-class bug. Brings the docker
   # compose stack up TWICE against the same Postgres volume (the populated-volume

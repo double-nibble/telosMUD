@@ -3,6 +3,7 @@ package scopebus
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -110,4 +111,132 @@ func TestScopeBusRejectsBadScopeAndEmptyEvent(t *testing.T) {
 
 	assert.Error(t, b.Signal(ctx, Region("bad!"), "ev", nil, "s"), "a malformed scope id must be refused")
 	assert.Error(t, b.Signal(ctx, World(), "  ", nil, "s"), "an empty event name must be refused")
+}
+
+// --- durable tier (10.2b) ----------------------------------------------------------------------
+
+func durableBus(t *testing.T, source string) (*Bus, *commbus.MemJetStream) {
+	t.Helper()
+	js := commbus.NewMemJetStream()
+	b := New(commbus.NewMemBus()).WithDurable(js, source)
+	return b, js
+}
+
+func TestScopeBusDurableRoundTrip(t *testing.T) {
+	b, _ := durableBus(t, "world-director-run1")
+	ctx := context.Background()
+
+	got := make(chan DurableEvent, 8)
+	cons, err := b.SubscribeDurable(World(), "world-dir", func(ev DurableEvent) bool {
+		got <- ev
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	require.NoError(t, b.SignalDurable(ctx, World(), "invasion.phase", json.RawMessage(`{"phase":2}`)))
+
+	select {
+	case ev := <-got:
+		assert.Equal(t, "invasion.phase", ev.Event)
+		assert.JSONEq(t, `{"phase":2}`, string(ev.Payload))
+		assert.Equal(t, "world-director-run1", ev.Source)
+		assert.Equal(t, "world-director-run1:1", ev.Key, "idempotency key is <source>:<seq>")
+		assert.False(t, ev.Backlog, "a live event is not backlog")
+	case <-time.After(time.Second):
+		t.Fatal("durable event not delivered")
+	}
+}
+
+// The headline durable guarantee: an event published while NO subscriber is running survives, and a
+// subscriber that starts LATER (a restarted director) replays it as BACKLOG. This is the foundation of
+// the 10.5 boss ripple "survives a director restart".
+func TestScopeBusDurableSurvivesLateSubscriber(t *testing.T) {
+	b, _ := durableBus(t, "world-director-run1")
+	ctx := context.Background()
+
+	// Publish BEFORE any subscriber exists.
+	require.NoError(t, b.SignalDurable(ctx, World(), "boss.slain", json.RawMessage(`{"boss":"vurgoth"}`)))
+
+	// A director starts up afterwards and must still receive it, flagged backlog.
+	got := make(chan DurableEvent, 8)
+	cons, err := b.SubscribeDurable(World(), "world-dir", func(ev DurableEvent) bool {
+		got <- ev
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	select {
+	case ev := <-got:
+		assert.Equal(t, "boss.slain", ev.Event)
+		assert.True(t, ev.Backlog, "an event stored before the subscriber started must replay as backlog")
+	case <-time.After(time.Second):
+		t.Fatal("durable backlog event not replayed to a late subscriber")
+	}
+}
+
+// A NAK (handler returns false on a transient failure) redelivers; once it succeeds the consumer
+// advances. Proves a state-applying subscriber that fails mid-apply gets another chance.
+func TestScopeBusDurableNakRedelivers(t *testing.T) {
+	b, _ := durableBus(t, "run1")
+	ctx := context.Background()
+
+	var attempts atomic.Int32
+	done := make(chan struct{})
+	cons, err := b.SubscribeDurable(World(), "world-dir", func(_ DurableEvent) bool {
+		if attempts.Add(1) < 3 {
+			return false // transient failure: NAK, redeliver
+		}
+		close(done)
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	require.NoError(t, b.SignalDurable(ctx, World(), "ev", nil))
+	select {
+	case <-done:
+		assert.GreaterOrEqual(t, attempts.Load(), int32(3), "the event was redelivered until acked")
+	case <-time.After(2 * time.Second):
+		t.Fatal("a NAK'd event was not redelivered to success")
+	}
+}
+
+func TestScopeBusDurableRequiresConfig(t *testing.T) {
+	b := New(commbus.NewMemBus()) // transient only, no WithDurable
+	ctx := context.Background()
+
+	assert.Error(t, b.SignalDurable(ctx, World(), "ev", nil), "durable signal without a durable tier must error")
+	_, err := b.SubscribeDurable(World(), "c", func(_ DurableEvent) bool { return true })
+	assert.Error(t, err, "durable subscribe without a durable tier must error")
+}
+
+// Idempotency keys are monotonic per process so a redelivery can be deduped by a state-applying
+// subscriber (track the highest applied seq per source).
+func TestScopeBusDurableKeysAreMonotonic(t *testing.T) {
+	b, _ := durableBus(t, "run1")
+	ctx := context.Background()
+
+	keys := make(chan string, 8)
+	cons, err := b.SubscribeDurable(World(), "world-dir", func(ev DurableEvent) bool {
+		keys <- ev.Key
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	require.NoError(t, b.SignalDurable(ctx, World(), "a", nil))
+	require.NoError(t, b.SignalDurable(ctx, World(), "b", nil))
+
+	var got []string
+	for i := 0; i < 2; i++ {
+		select {
+		case k := <-keys:
+			got = append(got, k)
+		case <-time.After(time.Second):
+			t.Fatal("durable event not delivered")
+		}
+	}
+	assert.Equal(t, []string{"run1:1", "run1:2"}, got, "keys advance monotonically per process")
 }
