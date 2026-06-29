@@ -198,6 +198,40 @@ func TestCharItemsInvAndRoom(t *testing.T) {
 	}
 }
 
+func TestCharItemsRoomIncludesCorpse(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+
+	// A live mob (excluded — it has Living) and the corpse it leaves (a Container with no Physical) in
+	// the room. The corpse MUST appear so a client can see lootable remains on the ground.
+	mob := makeMobTarget(z, e, "goblin")
+	corpse := z.newCorpse(mob)
+	Move(corpse, e.location)
+
+	var room gmcpItemList
+	if err := json.Unmarshal(charItemsRoomJSON(e), &room); err != nil {
+		t.Fatal(err)
+	}
+	var sawCorpse, sawMob bool
+	for _, it := range room.Items {
+		if contains([]string{it.Name}, "corpse") {
+			sawCorpse = true
+			if !contains([]string{it.Attrib}, "c") {
+				t.Errorf("corpse attrib = %q, want it to include c (container, so a client knows it's lootable)", it.Attrib)
+			}
+		}
+		if it.Name == "goblin" {
+			sawMob = true
+		}
+	}
+	if !sawCorpse {
+		t.Fatalf("the corpse did not appear in the room items: %+v", room.Items)
+	}
+	if sawMob {
+		t.Error("the live mob leaked into the room ITEMS (a creature, not an item)")
+	}
+}
+
 func TestSendPromptEmitsItemsOnInventoryChange(t *testing.T) {
 	z, caster := abilityTestZone(t)
 	z.sendPrompt(caster)

@@ -305,7 +305,23 @@ something an author would reasonably want to:
   the speaker thinks went out. Needs a delivery-dropping double (a Subscribe that stops feeding the
   handler). · *distsys/test*
 
-### Phase 9 (GMCP) follow-ups (from the 9.2 edge-engineer review)
+### Phase 9 (GMCP) follow-ups
+
+- **Mobs/occupants in the room over GMCP (user request).** Char.Items.List "room" carries ground items
+  + corpses, but not the LIVING occupants (other players, mobs) — a rich client can't show "who/what is
+  here" structurally. Add a Room.Players (other players) and a mob/occupant list (the GMCP doc names
+  Room.Players; a Room.Mobs or a richer occupants payload covers mobs), emitted from lookRoom alongside
+  Room.Info, change-detected. Route player names through the canSee/nameFor chokepoint (visibility). · *edge*
+- **Builder-extensible GMCP hooks (user request / design direction).** Today every GMCP package is
+  engine-emitted (Char.*/Room.*/Comm.*). Let CONTENT/Lua emit custom GMCP — a builder-defined package
+  (the Mud.* namespace, or an arbitrary advertised package) pushed from a Lua trigger / a content rule —
+  so a builder can send quest/HUD/widget data without an engine change. Needs: a sandboxed Lua handle
+  (e.g. `gmcp.send(player, pkg, table)`) that marshals a data-only table to JSON, routes through the gate
+  support filter + validGMCPPackage (the same outbound injection guard), and a package-name allowlist/
+  namespace policy so content can't spoof Char.*/Core.*. Ties to the "every action is hookable" pillar
+  and the Mud.* namespace already reserved in docs/GMCP.md. · *edge/scripting*
+
+#### From the 9.2 edge-engineer review
 
 - **Combat-tick HUD emit (the live HP gauge).** Char.Vitals is emitted only alongside the text prompt
   (sendPrompt), so it updates on each command — but a combat round (`runCombatRound`/`resolveSwings`,

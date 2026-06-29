@@ -160,8 +160,12 @@ func charItemsRoomJSON(e *Entity) []byte {
 	items := []gmcpItem{}
 	if e.location != nil {
 		for _, occ := range e.location.contents {
-			if occ == e || !Has[*Physical](occ) {
-				continue // skip self + non-items (players/mobs have Living, not Physical)
+			// A ground item is any room occupant that is NOT a living creature: real items, CORPSES (a
+			// Container, no Physical), and dropped containers all qualify; players and mobs (Living) do
+			// not. Filtering on Has[*Living] rather than Has[*Physical] is what lets a corpse — which
+			// carries only a Container — show up in the panel so a client can see loot on the ground.
+			if occ == e || Has[*Living](occ) {
+				continue
 			}
 			items = append(items, itemEntry(occ, nil))
 		}
