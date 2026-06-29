@@ -122,6 +122,40 @@ func TestShardRegistryAndEndpoint(t *testing.T) {
 	}
 }
 
+// TestListShards covers the live-fleet view the placement coordinator watches: only registered,
+// unexpired shards are listed; a deregistered (or lapsed) one drops out.
+func TestListShards(t *testing.T) {
+	d := newTestRedis(t)
+	ctx := context.Background()
+
+	if got, err := d.ListShards(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("ListShards on empty = %v, %v; want []", got, err)
+	}
+	for _, s := range []struct{ id, ep string }{{"shard-a", "world-a:9090"}, {"shard-b", "world-b:9090"}} {
+		if err := d.RegisterShard(ctx, s.id, s.ep, DefaultShardLease); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := d.ListShards(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListShards = %v, want 2 live shards", got)
+	}
+	// Deregister one: it leaves the live view.
+	if err := d.DeregisterShard(ctx, "shard-a", "world-a:9090"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.ListShards(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "shard-b" {
+		t.Fatalf("after deregister: ListShards = %v, want [shard-b]", got)
+	}
+}
+
 // TestShardIdConflict covers the two-writer guard: a second process booting with the
 // same shard id but a different endpoint is refused, while the legitimate owner keeps
 // renewing and a same-endpoint restart is allowed.

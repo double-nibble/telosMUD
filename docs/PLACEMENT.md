@@ -4,10 +4,14 @@ How zones are assigned to world servers so the fleet can scale in/out and surviv
 server failure without operator intervention. This is the **policy** layer on top of
 the directory **mechanism** (zone leases) that already exists.
 
-Status: **design settled, deferred to Phase 10** (it builds on Phase 4 persistence —
-see §6). The current static `TELOS_ZONES` config is the honest stand-in until then.
-Adopting this changes **zero** gate or handoff code — the directory seam already
-decouples "which zone" from "which server."
+Status: **Phase 10.6 — claim-from-pool + the coordinator brain landed.** `internal/placement` holds the
+two pure cores (`ClaimFromPool` for decentralized liveness, `Plan` for the balance decision), wired into
+`telos-world` (a server now CLAIMS its zones from the pool at boot and runs as a STANDBY if it wins none)
+and `telos-director` (the leader observes the live fleet via `directory.ListShards` + `Plan`s the desired
+rebalancing, logging the recommended moves). **Remaining (the documented next mile):** EXECUTING a planned
+rebalance move — draining a zone's live players to the new owner via the cross-shard handoff fanned over
+the zone (`Shard.Drain`) — and a standby spinning up a re-claimed orphan at runtime (live zone-add). The
+boot-time claim + the optimizer's decision are done; the live multi-player drain is the heavy follow-on.
 
 Prior art: this is **Akka Cluster Sharding** (a singleton `ShardCoordinator` allocates
 shards to nodes and rebalances; nodes host the entities; entities recover from

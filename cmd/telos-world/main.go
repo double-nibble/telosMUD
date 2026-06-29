@@ -28,6 +28,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/contentbus"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
+	"github.com/double-nibble/telosmud/internal/placement"
 	"github.com/double-nibble/telosmud/internal/presence"
 	"github.com/double-nibble/telosmud/internal/scopebus"
 	"github.com/double-nibble/telosmud/internal/store"
@@ -200,29 +201,35 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	slog.Info("registered shard", "shard_id", cfg.ShardID, "endpoint", cfg.ShardAddr, "lease", directory.DefaultShardLease)
 	go renewShardRegistration(ctx, dir, cfg.ShardID, cfg.ShardAddr) //nolint:gosec // G118: ctx is the shard's main lifetime ctx (cancelled on shutdown) — exactly what this renewal goroutine should follow.
 
-	// Claim an EXCLUSIVE lease on EACH zone, owned by this shard's id. A live, different
-	// shard already owning one is a misconfiguration we refuse to start with — rather
-	// than silently both claiming it and becoming two writers for one zone.
-	for _, zoneID := range zones {
-		ok, err := dir.ClaimZone(ctx, zoneID, cfg.ShardID, directory.DefaultZoneLease)
-		if err != nil {
-			slog.Error("zone claim failed", "zone", zoneID, "err", err)
-			os.Exit(1)
-		}
-		if !ok {
-			owner, _ := dir.ShardForZone(ctx, zoneID)
-			slog.Error("zone already claimed by another live shard; refusing to start", "zone", zoneID, "owner_shard", owner)
-			os.Exit(1)
-		}
+	// CLAIM-FROM-POOL (docs/PLACEMENT.md §4, Phase 10.6a): this server no longer DECLARES a fixed zone
+	// set — it CLAIMS what is free from the pool (the configured `zones`) via the directory's time-fenced
+	// CAS. It hosts exactly what it WINS; a zone already owned by another live shard is simply skipped
+	// (normal in a fleet, not a misconfiguration — the two-writer guard is the shard-id RegisterShard
+	// check above, not the zone claim). A server that wins NOTHING (a saturated fleet) runs as a STANDBY:
+	// registered + heartbeating, hosting no zone, ready to take an orphan on the next failure. Decentralized
+	// LIVENESS: this works with no director running. (Live re-claim of an orphan by a standby needs runtime
+	// zone-add — the documented next step; boot-time claim is the slice here.)
+	won, claimErrs := placement.ClaimFromPool(ctx, dir, cfg.ShardID, zones, directory.DefaultZoneLease)
+	for zoneID, cerr := range claimErrs {
+		slog.Warn("zone claim error; skipped (left for another server / a retry)", "zone", zoneID, "err", cerr)
+	}
+	for _, zoneID := range won {
 		slog.Info("claimed zone", "zone", zoneID, "shard_id", cfg.ShardID, "lease", directory.DefaultZoneLease)
-
-		// Keep each lease alive while we run; release it on shutdown so another shard can
-		// take over immediately instead of waiting out the lease. stop fences us if we
-		// ever lose any lease.
+		// Keep each won lease alive while we run; release it on shutdown so another shard can take over
+		// immediately. stop fences us if we ever lose any lease.
 		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardID) //nolint:gosec // G118: ctx is the shard's main lifetime ctx (cancelled on shutdown) — exactly what this lease goroutine should follow.
 	}
+	if len(won) == 0 {
+		slog.Warn("won no zones from the pool: running as a STANDBY (registered, hosting nothing, ready to take over)", "pool", zones)
+	}
+	// The spawn home must be a zone this server actually hosts: keep the configured home if won, else the
+	// first won zone. A standby (won nothing) keeps the configured home unhosted — no login lands here.
+	hostHome := home
+	if len(won) > 0 && !contains(won, home) {
+		hostHome = won[0]
+	}
 
-	return world.NewShardFromContent(lc, zones, home, cfg.ShardAddr, dir, world.GRPCDialer()).
+	return world.NewShardFromContent(lc, won, hostHome, cfg.ShardAddr, dir, world.GRPCDialer()).
 		WithPersistence(charStore, ckpt).
 		WithHotReload(defSource, bus, enabledPacks).
 		WithComms(comms).
@@ -354,4 +361,14 @@ func renewZoneLease(ctx context.Context, stop func(), dir *directory.Redis, zone
 			}
 		}
 	}
+}
+
+// contains reports whether s is in xs.
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

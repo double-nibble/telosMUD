@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/director"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
+	"github.com/double-nibble/telosmud/internal/placement"
 	"github.com/double-nibble/telosmud/internal/scopebus"
 	"github.com/double-nibble/telosmud/internal/store"
 )
@@ -63,11 +65,13 @@ func main() {
 	// Leader election needs Redis (the lease). Without it a single director is always the leader — fine
 	// for a single-process dev run, unsafe for a multi-instance deployment (no failover arbitration).
 	var claimer director.LeaseClaimer
+	var dir *directory.Redis // the fleet view the placement coordinator watches (nil without Redis)
 	instanceID := directorInstanceID(cfg)
 	if cfg.Redis.Addr != "" {
 		rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 		defer func() { _ = rdb.Close() }()
-		claimer = directory.NewRedis(rdb, "telos")
+		dir = directory.NewRedis(rdb, "telos")
+		claimer = dir
 		slog.Info("leader election enabled", "instance", instanceID)
 	} else {
 		slog.Warn("no Redis configured: running as a single always-leader director (no failover)")
@@ -108,6 +112,20 @@ func main() {
 		world.Run(ctx) // returns on ctx cancel, resigning its lease
 	}()
 
+	// Zone-placement COORDINATOR (docs/PLACEMENT.md §2/§4, Phase 10.6b): while this director is the leader,
+	// observe the live fleet + the zone assignment and compute the desired rebalancing PLAN. The coordinator
+	// is an OPTIMIZER, not a dependency — liveness (claim-from-pool, failover) is decentralized in the world
+	// servers, so this only nudges toward balance. It currently OBSERVES + PLANS + LOGS the recommended
+	// moves; executing a move drains a zone's live players via the cross-shard handoff (Shard.Drain) — the
+	// documented next integration. Runs only with Redis (the fleet view) + a configured pool.
+	if dir != nil && len(cfg.Zones) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runPlacementCoordinator(ctx, dir, world, cfg.Zones)
+		}()
+	}
+
 	slog.Info("starting", "env", cfg.Env, "instance", instanceID)
 	<-ctx.Done()
 	slog.Info("shutting down")
@@ -115,6 +133,61 @@ func main() {
 	if err := shutdown(context.Background()); err != nil {
 		slog.Error("shutdown error", "err", err)
 	}
+}
+
+// placementCoordinatorTick is how often the leader recomputes the placement plan. A moderate cadence: the
+// directory leases (15s) already give liveness; balance is a slow-changing optimization, not a hot path.
+const placementCoordinatorTick = 10 * time.Second
+
+// runPlacementCoordinator is the leader-only observe→plan→report loop. It honors leadership (a standby
+// director does nothing) and surfaces the desired moves; the drain executor is the documented next step.
+func runPlacementCoordinator(ctx context.Context, dir *directory.Redis, d *director.Director, pool []string) {
+	ticker := time.NewTicker(placementCoordinatorTick)
+	defer ticker.Stop()
+	fleet := fleetView{dir: dir}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !d.IsLeader() {
+				continue // only the leader coordinates placement
+			}
+			live, assignment, err := placement.Observe(ctx, fleet, pool)
+			if err != nil {
+				slog.Warn("placement: fleet observe failed", "err", err)
+				continue
+			}
+			moves := placement.Plan(live, assignment, pool)
+			if len(moves) == 0 {
+				continue // balanced + fully claimed: nothing to do
+			}
+			for _, m := range moves {
+				if m.From == "" {
+					slog.Info("placement: zone needs (re)assignment", "zone", m.Zone, "to", m.To)
+				} else {
+					slog.Info("placement: rebalance drain recommended", "zone", m.Zone, "from", m.From, "to", m.To)
+				}
+			}
+		}
+	}
+}
+
+// fleetView adapts *directory.Redis to placement.Fleet: ListShards is direct; ShardForZone maps the
+// directory's ErrNotFound (an unclaimed zone) to found=false so the coordinator reassigns it.
+type fleetView struct{ dir *directory.Redis }
+
+func (f fleetView) ListShards(ctx context.Context) ([]string, error) { return f.dir.ListShards(ctx) }
+
+func (f fleetView) ShardForZone(ctx context.Context, zone string) (string, bool, error) {
+	owner, err := f.dir.ShardForZone(ctx, zone)
+	if errors.Is(err, directory.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return owner, true, nil
 }
 
 // directorInstanceID is this director process's stable-per-run identity for the lease owner field. It

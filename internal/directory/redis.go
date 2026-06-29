@@ -251,6 +251,37 @@ func (r *Redis) DeregisterShard(ctx context.Context, shardID, endpoint string) e
 	return deregisterShard.Run(ctx, r.rdb, []string{r.shardKey(shardID)}, endpoint).Err()
 }
 
+// ListShards returns the ids of every LIVE shard (registered with an unexpired endpoint) — the live-fleet
+// view the placement coordinator watches (docs/PLACEMENT.md §2/§4). It SCANs the shard-key namespace and
+// filters by the same live-endpoint check as EndpointForShard, so a crashed shard whose registration has
+// lapsed is excluded (its zones are then orphans to reassign). Order is unspecified; the coordinator sorts.
+func (r *Redis) ListShards(ctx context.Context) ([]string, error) {
+	prefix := r.shardKey("")
+	var ids []string
+	var cursor uint64
+	for {
+		keys, next, err := r.rdb.Scan(ctx, cursor, prefix+"*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range keys {
+			shardID := k[len(prefix):]
+			if shardID == "" {
+				continue
+			}
+			// Reuse the live-endpoint judgement: a lapsed registration resolves to "" and is skipped.
+			if ep, err := shardEndpoint.Run(ctx, r.rdb, []string{k}).Text(); err == nil && ep != "" {
+				ids = append(ids, shardID)
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	return ids, nil
+}
+
 // Placement is which shard a player currently lives on and the epoch that put them
 // there. ShardID is a stable shard id; resolve it to a dial endpoint with
 // EndpointForShard.
