@@ -34,10 +34,21 @@ subagent reviews. New persistence fields are round-trip-verified through real Po
   (goose migration), versioned for the same optimistic-concurrency backstop as characters. The director
   owns + persists them. No event routing yet.
 
-### 10.2 — Scoped event bus (cross-zone transport)
+### 10.2 — Scoped event bus (cross-zone transport) — **COMPLETE**
 - Scope channels `world.<event>` / `region.<id>.<event>` / `zone.<id>.<event>` over NATS core
   (`transient`) + JetStream (`durable`: at-least-once, idempotency keys, per-scope ordering, director =
   sequencer). The signal/broadcast plumbing, extending the Phase-8 commbus pattern.
+- **DONE:** `internal/scopebus` — ONE subject per scope (`telos.scope.world`/`.region.<id>`/`.zone.<id>`),
+  the event name + payload in the body (channel-subject pattern, no wildcard gymnastics), a subject-
+  injection guard on the id. **10.2a transient** (`Signal`/`Subscribe` over `commbus.Bus`). **10.2b
+  durable** (`SignalDurable`/`SubscribeDurable` over JetStream): a new `WORLD_EVENTS` stream binds
+  `telos.scope.>` (`commbus.NewScopeJetStream`/`OpenScopeJetStream`, sharing the tell stream's
+  Publish/Consume machinery via `dialJetStream`); per-process `<source>:<seq>` idempotency key, a
+  `DurableEvent{Backlog,Key,...}` for consumer-side apply-once dedup + restart catch-up, NAK-redelivery.
+  `scopebus.SubjectRoot == commbus.ScopeSubjectPrefix` (one source of truth, no binding/publisher drift).
+- Tests: hermetic (MemBus + MemJetStream — round-trip, region isolation, survives-late-subscriber,
+  NAK-to-success, monotonic keys, requires-config) + gated real-NATS (`WORLD_EVENTS` offline→online
+  backlog replay, now in the comms CI job).
 
 ### 10.3 — region_defs + zone read-replica + signal-up
 - `region_defs` content (id + member zones) in the definition tables. The zone-side CACHED read replica
