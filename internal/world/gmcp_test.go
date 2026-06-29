@@ -123,6 +123,101 @@ func TestLookRoomEmitsRoomInfoOnChangeOnly(t *testing.T) {
 	}
 }
 
+type gmcpItemList struct {
+	Location string `json:"location"`
+	Items    []struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Attrib string `json:"attrib"`
+	} `json:"items"`
+}
+
+func TestCharItemsInvAndRoom(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+
+	// Inventory: a wearable helm (WORN → attrib "W") and a container chest (attrib "c").
+	helm := z.newEntity("test:helm")
+	helm.short = "a helm"
+	Add(helm, wearableFor(WearLocHead))
+	Add(helm, &Physical{})
+	Move(helm, e)
+	wr := actorWearer(e)
+	wr.worn[WearLocHead] = helm // mark it worn
+
+	chest := z.newEntity("test:chest")
+	chest.short = "a chest"
+	Add(chest, &Container{})
+	Move(chest, e)
+
+	// Ground: a sword in the room (an item, not a player/mob).
+	sword := z.newEntity("test:sword")
+	sword.short = "a sword"
+	Add(sword, &Physical{})
+	Move(sword, e.location)
+
+	var inv gmcpItemList
+	if err := json.Unmarshal(charItemsInvJSON(e), &inv); err != nil {
+		t.Fatal(err)
+	}
+	if inv.Location != "inv" {
+		t.Fatalf("inv location = %q", inv.Location)
+	}
+	byName := map[string]string{} // name → attrib
+	for _, it := range inv.Items {
+		byName[it.Name] = it.Attrib
+	}
+	if a, ok := byName["a helm"]; !ok || !contains([]string{a}, "W") || !contains([]string{a}, "w") {
+		t.Errorf("helm attrib = %q, want it to include w (wearable) + W (worn)", byName["a helm"])
+	}
+	if a := byName["a chest"]; !contains([]string{a}, "c") {
+		t.Errorf("chest attrib = %q, want c (container)", a)
+	}
+
+	var room gmcpItemList
+	if err := json.Unmarshal(charItemsRoomJSON(e), &room); err != nil {
+		t.Fatal(err)
+	}
+	if room.Location != "room" {
+		t.Fatalf("room location = %q", room.Location)
+	}
+	var sawSword, sawSelf bool
+	for _, it := range room.Items {
+		if it.Name == "a sword" {
+			sawSword = true
+		}
+		if it.Name == e.Name() {
+			sawSelf = true
+		}
+	}
+	if !sawSword {
+		t.Error("room items did not include the ground sword")
+	}
+	if sawSelf {
+		t.Error("room items leaked the player (only ground items belong)")
+	}
+}
+
+func TestSendPromptEmitsItemsOnInventoryChange(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	z.sendPrompt(caster)
+	drainGMCP(caster) // clear initial frames
+
+	// Pick up nothing changed → no re-emit. Then add an item → Char.Items.List re-emitted.
+	z.sendPrompt(caster)
+	if _, ok := drainGMCP(caster)["Char.Items.List"]; ok {
+		t.Fatal("Char.Items.List re-emitted with no inventory change")
+	}
+	gem := z.newEntity("test:gem")
+	gem.short = "a gem"
+	Add(gem, &Physical{})
+	Move(gem, caster.entity)
+	z.sendPrompt(caster)
+	if _, ok := drainGMCP(caster)["Char.Items.List"]; !ok {
+		t.Fatal("picking up an item did not re-emit Char.Items.List")
+	}
+}
+
 func TestCharStatsJSONOnlyFlaggedAttrs(t *testing.T) {
 	z := newDemoZone("midgaard", newProtoCache())
 	src := &session{character: "Statty"}

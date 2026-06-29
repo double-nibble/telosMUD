@@ -3,6 +3,7 @@ package world
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
@@ -117,6 +118,58 @@ func (z *Zone) roomInfoJSON(r *Entity) []byte {
 	return b
 }
 
+// gmcpItem is one entry in a Char.Items.List (Phase 9.4): a stable per-instance id, the display name,
+// and an attrib string of single-char flags (w=wearable, c=container, W=currently worn/wielded) for the
+// client's inventory/equipment panel.
+type gmcpItem struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Attrib string `json:"attrib,omitempty"`
+}
+
+// itemEntry builds a gmcpItem for e. wr (the holder's Wearer, or nil) decides the worn flag.
+func itemEntry(e *Entity, wr *Wearer) gmcpItem {
+	attrib := ""
+	if Has[*Wearable](e) {
+		attrib += "w"
+	}
+	if Has[*Container](e) {
+		attrib += "c"
+	}
+	if wr != nil && wr.slotOf(e) != WearLocNone {
+		attrib += "W"
+	}
+	return gmcpItem{ID: fmt.Sprintf("i%v", e.RuntimeID()), Name: e.Name(), Attrib: attrib}
+}
+
+// charItemsJSON builds a Char.Items.List payload {location, items}. location is "inv" (everything the
+// player carries, worn flagged with "W") or "room" (ground items in the player's room — items only, not
+// players/mobs). The Mudlet-standard one-message-per-location shape, so the client routes to the right
+// panel.
+func charItemsInvJSON(e *Entity) []byte {
+	wr, _ := Get[*Wearer](e)
+	items := []gmcpItem{}
+	for _, it := range e.contents {
+		items = append(items, itemEntry(it, wr))
+	}
+	b, _ := json.Marshal(map[string]any{"location": "inv", "items": items})
+	return b
+}
+
+func charItemsRoomJSON(e *Entity) []byte {
+	items := []gmcpItem{}
+	if e.location != nil {
+		for _, occ := range e.location.contents {
+			if occ == e || !Has[*Physical](occ) {
+				continue // skip self + non-items (players/mobs have Living, not Physical)
+			}
+			items = append(items, itemEntry(occ, nil))
+		}
+	}
+	b, _ := json.Marshal(map[string]any{"location": "room", "items": items})
+	return b
+}
+
 // sendPrompt emits the HUD frames whose payload CHANGED since the last prompt, then the text prompt —
 // the single hook every dispatch path ends on (replacing the bare promptFrame send). The HUD rides the
 // same event as the prompt so a client's gauge and the "> " never disagree. Zone-goroutine only (it
@@ -134,6 +187,14 @@ func (z *Zone) sendPrompt(s *session) {
 		if ss := z.charStatsJSON(e); !bytes.Equal(ss, s.lastStats) {
 			s.lastStats = ss
 			s.send(gmcpFrame("Char.Stats", ss))
+		}
+		if iv := charItemsInvJSON(e); !bytes.Equal(iv, s.lastInv) {
+			s.lastInv = iv
+			s.send(gmcpFrame("Char.Items.List", iv))
+		}
+		if ri := charItemsRoomJSON(e); !bytes.Equal(ri, s.lastRoomItems) {
+			s.lastRoomItems = ri
+			s.send(gmcpFrame("Char.Items.List", ri))
 		}
 	}
 	s.send(promptFrame())

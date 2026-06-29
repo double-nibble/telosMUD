@@ -41,6 +41,10 @@ type session struct {
 	lastStatus []byte
 	lastStats  []byte
 	lastRoom   []byte // last GMCP Room.Info payload (Phase 9.3); re-emitted only on a room change
+	// lastInv / lastRoomItems are the last Char.Items.List payloads (Phase 9.4) for the inventory and the
+	// room-ground panels, re-emitted only on change.
+	lastInv       []byte
+	lastRoomItems []byte
 
 	// currentZone is the per-connection routing pointer the Play stream owns (server.go):
 	// it names the zone this player's input should be posted to right now. The zone that

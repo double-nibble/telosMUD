@@ -320,6 +320,12 @@ something an author would reasonably want to:
   for the SAME reason (no "which attributes are player-facing stats" predicate). Resolve both with content
   flags: a resource `gauge`/`hud` bool (Vitals) and an attribute `stat` bool (Stats) — emit only flagged
   defs. [Char.Stats is being implemented with the `stat` flag in 9.2b; mirror it for resources here.] · *edge/content*
+- **Char.Items incremental deltas + Contents (Phase 9.4 v1 deferral).** Char.Items.List (inv + room)
+  is emitted as a FULL list, change-detected on the prompt — correct panels, but a get/drop re-sends the
+  whole list rather than a `Char.Items.Add/Remove/Update` delta, and a room item another player drops only
+  shows on the viewer's next command (not live). Add the incremental delta messages (bandwidth + live
+  room updates) and `Char.Items.Contents` (a container the player opened) when the panels need them. The
+  room "icon" field is also unfilled (no content icon yet). · *edge*
 - **Char.Status target visibility.** charStatusJSON emits `e.living.fighting.Name()` (the entity short),
   bypassing the act/look visibility filter. Safe today (it's the player's OWN opponent — you can't fight
   what you can't perceive), but once invis/disguise content lands it would surface a hidden foe's true
