@@ -193,7 +193,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if err != nil {
 			return fmt.Errorf("store: marshal attribute %s base: %w", a.Ref, err)
 		}
-		body, _ := json.Marshal(attrBody{Min: a.Min, Max: a.Max})
+		body, _ := json.Marshal(attrBody{Min: a.Min, Max: a.Max, Stat: a.Stat})
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO attribute_defs (ref, pack, display_name, value_kind, default_base, body)
 			 VALUES ($1,$2,$3,$4,$5,$6)`,

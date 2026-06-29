@@ -373,6 +373,10 @@ func (p *Pool) loadResets(ctx context.Context, enabled []string, zones map[strin
 type attrBody struct {
 	Min *float64 `json:"min,omitempty"`
 	Max *float64 `json:"max,omitempty"`
+	// Stat is the player-facing-stat flag (Phase 9.2, GMCP Char.Stats). It rides the schemaless body
+	// JSONB so adding it needs no migration; without persisting it a DB round-trip would drop a flagged
+	// attribute's stat status (the Living/Lua field-drop class). Empty for every non-stat attribute.
+	Stat bool `json:"stat,omitempty"`
 }
 
 type resourceBody struct {
@@ -455,7 +459,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				rows.Close()
 				return fmt.Errorf("store: attribute_def %s body: %w", a.Ref, err)
 			}
-			a.Min, a.Max = b.Min, b.Max
+			a.Min, a.Max, a.Stat = b.Min, b.Max, b.Stat
 		}
 		pp := pack(pk)
 		pp.Attributes = append(pp.Attributes, a)

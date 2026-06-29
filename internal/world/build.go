@@ -66,7 +66,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		}
 		d.attr.register(a.Ref, &attributeDef{
 			ref: a.Ref, displayName: a.DisplayName, valueKind: a.ValueKind,
-			base: base, min: a.Min, max: a.Max,
+			base: base, min: a.Min, max: a.Max, stat: a.Stat,
 		})
 	}
 	for _, r := range lc.Resources {

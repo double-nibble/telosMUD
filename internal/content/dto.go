@@ -148,6 +148,10 @@ type AttributeDTO struct {
 	DefaultBase BaseSpecDTO `json:"default_base" yaml:"default_base"`
 	Min         *float64    `json:"min" yaml:"min"`
 	Max         *float64    `json:"max" yaml:"max"`
+	// Stat marks this attribute as a PLAYER-FACING character stat (Phase 9.2): it appears in the GMCP
+	// Char.Stats HUD payload. Defaults false so derived/internal attributes (max_hp, accuracy, soak_*)
+	// stay out of the stat panel — only the content-chosen stats (strength, level, …) are surfaced.
+	Stat bool `json:"stat" yaml:"stat"`
 }
 
 // BaseSpecDTO is an attribute's base: EXACTLY one of Lit (a literal value) or Expr (a formula AST).

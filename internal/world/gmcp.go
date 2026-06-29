@@ -34,10 +34,25 @@ func (z *Zone) charVitalsJSON(e *Entity) []byte {
 	return b
 }
 
+// charStatsJSON builds the Char.Stats payload from the CONTENT-flagged player-facing attributes: every
+// attribute a pack marked `stat: true` (AttributeDTO.Stat) → its resolved value. The engine names no
+// stat — content chooses which attributes are stats — so derived/internal attributes (max_hp, accuracy,
+// soak_*) stay out of the panel. Values are the attr()-resolved numbers; an integer-valued float
+// marshals without a decimal (14, not 14.0). Deterministic (map marshal sorts keys).
+func (z *Zone) charStatsJSON(e *Entity) []byte {
+	m := make(map[string]float64)
+	for ref, def := range z.defs.attr.table() {
+		if def != nil && def.stat {
+			m[ref] = attr(e, ref)
+		}
+	}
+	b, _ := json.Marshal(m)
+	return b
+}
+
 // charStatusJSON builds the Char.Status payload: the player's position state and, if fighting, the
 // target's name. state is "fighting" / "dead" / "standing" from the engine's position; target is the
-// current Living.fighting opponent. (Char.Stats — str/dex/level/xp — is deferred pending a content
-// "which attributes are player-facing stats" flag; see docs/FOLLOW-UPS.md.)
+// current Living.fighting opponent.
 func (z *Zone) charStatusJSON(e *Entity) []byte {
 	st := struct {
 		State  string `json:"state"`
@@ -69,6 +84,10 @@ func (z *Zone) sendPrompt(s *session) {
 		if st := z.charStatusJSON(e); !bytes.Equal(st, s.lastStatus) {
 			s.lastStatus = st
 			s.send(gmcpFrame("Char.Status", st))
+		}
+		if ss := z.charStatsJSON(e); !bytes.Equal(ss, s.lastStats) {
+			s.lastStats = ss
+			s.send(gmcpFrame("Char.Stats", ss))
 		}
 	}
 	s.send(promptFrame())

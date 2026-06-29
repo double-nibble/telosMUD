@@ -248,6 +248,11 @@ type attributeDef struct {
 	// min/max clamp the resolved value (after mods). nil means unbounded on that side.
 	min *float64
 	max *float64
+
+	// stat marks a PLAYER-FACING character stat surfaced in the GMCP Char.Stats HUD (Phase 9.2). The
+	// engine never decides which attributes are "stats" — content flags them (AttributeDTO.Stat), so a
+	// derived/internal attribute stays out of the panel. Default false.
+	stat bool
 }
 
 // resourceDef is the runtime form of a ResourceDTO: a named pool whose MAX is a derived attribute

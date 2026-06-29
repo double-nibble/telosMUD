@@ -41,6 +41,32 @@ func TestCharVitalsJSONContentDriven(t *testing.T) {
 	}
 }
 
+func TestCharStatsJSONOnlyFlaggedAttrs(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	src := &session{character: "Statty"}
+	e := z.newPlayerEntity(src, "Statty")
+
+	var m map[string]float64
+	if err := json.Unmarshal(z.charStatsJSON(e), &m); err != nil {
+		t.Fatalf("Char.Stats not valid JSON: %v", err)
+	}
+	// The demo flags strength/intellect/constitution/level as stats — they appear.
+	for _, ref := range []string{"strength", "intellect", "constitution", "level"} {
+		if _, ok := m[ref]; !ok {
+			t.Errorf("Char.Stats missing flagged stat %q (payload %v)", ref, m)
+		}
+	}
+	// Derived/internal attributes are NOT flagged — they must stay out of the stat panel.
+	for _, ref := range []string{"max_hp", "accuracy", "soak_slash", "evasion"} {
+		if _, ok := m[ref]; ok {
+			t.Errorf("Char.Stats leaked the non-stat attribute %q", ref)
+		}
+	}
+	if m["level"] != 1 {
+		t.Errorf("level = %v, want 1", m["level"])
+	}
+}
+
 func TestCharStatusJSONReflectsCombat(t *testing.T) {
 	z, caster := abilityTestZone(t)
 

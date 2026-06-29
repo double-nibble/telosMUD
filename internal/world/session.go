@@ -39,6 +39,7 @@ type session struct {
 	// sendPrompt), nil until the first prompt (so the first prompt always emits the initial HUD).
 	lastVitals []byte
 	lastStatus []byte
+	lastStats  []byte
 
 	// currentZone is the per-connection routing pointer the Play stream owns (server.go):
 	// it names the zone this player's input should be posted to right now. The zone that
