@@ -250,6 +250,36 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   the Prepare payload (a wide-but-shallow tree is unbounded). Add a total-node or marshalled-byte cap
   on the carry (and ideally on the durable `characters.state` write) as the complete guard. · *persistence*
 
+### Content-authoring gaps surfaced by the richer demo pack (Phase 8 playtest)
+
+Building the richer demo content (11 abilities, reaction mobs, 5 affects, restricted `guild`
+channel, gear) exercised authoring paths that the thin starter pack never did, exposing four
+content-expressiveness gaps. None block the engine; each is a place where content can't yet say
+something an author would reasonably want to:
+
+- **Equip applies no stat modifiers (the equip stub).** Wearing an item moves it to an equipment
+  slot and nothing more — a "+1 sword" or "ring of protection" confers no bonus, because the
+  equip path has no hook into the affect/attribute layer. **Deferred to itemization (Phase 11/12)
+  per the user's decision** — equip-mods belong with affix rolls / item quality, not bolted onto
+  the slot move now. The clean shape: an equipped item contributes a (suppressible) affect bundle
+  installed on wear and removed on remove, riding the SAME affect-stacking the ability layer
+  already has. · *abilities/progression*
+- **Wear slots are a closed enum.** The wearable slot set is engine-fixed; content can't author a
+  novel slot (e.g. a system with "tabard" or "sigil" slots, or a two-handed/off-hand split a
+  different game system wants). Folds into the itemization pass — make the slot vocabulary
+  content-defined (a `wear_slots` content table) the same way resources/attributes are, per the
+  "extensibility across game systems" pillar. · *abilities/content*
+- **The declarative `heal` effect-op ignores dice.** A content ability's `heal` op takes a flat
+  amount; it can't express a dice expression (`2d8+WIS`) the way damage-adjacent design wants,
+  so a 5e-style "cure wounds" can only approximate. The dice evaluator exists (combat uses it);
+  the gap is wiring a dice-expression form through the declarative heal op (and, by symmetry,
+  any restorative op). · *abilities/combat*
+- **No content verb/op grants a flag.** The restricted `guild` channel gates on a `guildmember`
+  flag, but no content-authored action can SET that flag on a player — it must be seeded or set
+  out-of-band, so a "join the guild" interaction can't be authored as pure content. Needs a
+  flag-grant/revoke effect-op (with the obvious authz: a content action can only grant flags the
+  pack declares it owns), closing the loop on flag-gated content. · *abilities/world*
+
 ## 5. Housekeeping
 
 - Delete merged local branches as work lands (e.g. `test-standard-structure`).
