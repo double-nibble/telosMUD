@@ -164,6 +164,7 @@ func insertProtos(ctx context.Context, tx pgx.Tx, table, pack, zoneRef string, p
 		body, err := json.Marshal(protoBody{
 			Physical: d.Physical, Wearable: d.Wearable, Weapon: d.Weapon, Container: d.Container,
 			Living: d.Living, // mob stat sheet + combat_profile ref (Phase 6.3a) rides the body JSONB
+			Lua:    d.Lua,    // the prototype's trigger/scripted Lua source (Phase 7.4c) rides the body JSONB too
 		})
 		if err != nil {
 			return fmt.Errorf("store: marshal %s %s body: %w", table, d.Ref, err)

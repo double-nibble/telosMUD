@@ -38,6 +38,13 @@ type protoBody struct {
 	// the goblin's stat sheet (Living went nil), so the swing pipeline had no mob numbers — the gap
 	// TestStorePackRoundTrip caught. nil for every inert item (omitempty keeps their body unchanged).
 	Living *content.LivingDTO `json:"living,omitempty"`
+	// Lua is the prototype's optional trigger/scripted source (Phase 7.4c): the `on(event,fn)` +
+	// self.state Lua that runs per spawned instance (a greeter mob; a reaction mob like the demo
+	// archmage's Counterspell / warden's Shield). It rides the SAME body JSONB. Without it a DB
+	// round-trip dropped a scripted prototype's Lua (a content Lua mob became a pure-data mob through
+	// Postgres) — the gap the richer demo's first Lua mobs caught, exactly like the Living gap before
+	// it. Empty for every pure-data prototype (omitempty keeps their body unchanged).
+	Lua string `json:"lua,omitempty"`
 }
 
 // LoadPacks implements content.Source: it reads every loaded definition for the enabled packs
@@ -194,6 +201,7 @@ func (p *Pool) loadProtoDefinition(ctx context.Context, table, kind, ref, pack s
 		}
 		d.Physical, d.Wearable, d.Weapon, d.Container = b.Physical, b.Wearable, b.Weapon, b.Container
 		d.Living = b.Living
+		d.Lua = b.Lua
 	}
 	return content.Definition{Kind: kind, Ref: ref, Found: true, Proto: d}, nil
 }
@@ -315,6 +323,7 @@ func (p *Pool) loadPrototypes(ctx context.Context, enabled []string, zones map[s
 				}
 				d.Physical, d.Wearable, d.Weapon, d.Container = b.Physical, b.Wearable, b.Weapon, b.Container
 				d.Living = b.Living
+				d.Lua = b.Lua
 			}
 			z := zones[zoneRef]
 			if z == nil {
