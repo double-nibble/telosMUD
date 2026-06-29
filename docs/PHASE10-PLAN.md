@@ -54,6 +54,20 @@ subagent reviews. New persistence fields are round-trip-verified through real Po
 - `region_defs` content (id + member zones) in the definition tables. The zone-side CACHED read replica
   of region/world state (eventually consistent, lock-free) → Lua `world.flag("x")` / `region:get("k")`.
   `signal_region`/`signal_world` (a zone commands UP to the director; never mutates cross-scope).
+- **10.3a DONE (regions as content):** migration 00009 `region_defs(ref,pack,body)` + `RegionDTO` +
+  `Pack.Regions`/`LoadedContent.Regions` (last-write-wins merge-by-ref) + store read/write/strip +
+  demo "heartlands" region (midgaard+darkwood). Tests: demo-load + merge-override (hermetic) + gated PG
+  round-trip & idempotency. Modeled on the 8.3 channel_defs precedent.
+- **10.3b TODO (zone read-replica + Lua reads):** each shard keeps a read-only replica of the region/world
+  state it cares about, updated when a director broadcasts a change over the scoped bus. Entry points:
+  the shard struct (internal/world/world.go `Shard`) holds the replica + a `scopebus.Subscribe` on its
+  region/world scopes; the Lua surface is added in internal/world/luaentry.go (the `world`/`region` handle
+  tables) → synchronous cached `world.flag("x")` / `region:get("k")`. Each zone learns its region from
+  `LoadedContent.Regions` (a zone-ref → region-ref lookup). The director doesn't broadcast yet (10.4), so
+  10.3b is tested by publishing a synthetic scope broadcast on the bus and asserting the Lua read sees it.
+- **10.3c TODO (signal-up):** `signal_region`/`signal_world` Lua builtins → a zone commands UP to the
+  director via `scopebus.SignalDurable` (a command, never a cross-scope mutation). The director-side
+  apply is 10.4; 10.3c is the zone→bus emit + its Lua surface + the no-cross-scope-write invariant test.
 
 ### 10.4 — Director writes + broadcast + remote effects
 - The director's authoritative write API (`world.set`/`region:set` — single-writer, versioned persist +
