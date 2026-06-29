@@ -1,0 +1,155 @@
+package world
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/double-nibble/telosmud/internal/commbus"
+)
+
+// comms_chaos_test.go is W8 failure-injection for the comms boundary: the world publishes channel lines
+// over a bus that can FAIL mid-session, and the zone must DEGRADE, never die (the PHASE8 "never-fatal"
+// rule). The only failure double shipped before was the disabled no-op bus (Publish returns nil), so the
+// `if err := bus.Publish(...); err != nil` branches (channel.go, the "Channels are temporarily offline."
+// path) were unreachable in tests. flakyBus closes that gap by returning a real error on demand.
+
+// flakyBus wraps a real Bus and returns an injected error from Publish while `fail` is set. Role,
+// Subscribe, and Close delegate to the inner bus, so a test can flip the publish path between healthy
+// and failing on a LIVE wiring (the transient-broker-outage shape) without rebuilding the shard.
+type flakyBus struct {
+	inner commbus.Bus
+	fail  atomic.Bool
+}
+
+func (b *flakyBus) Role() commbus.Role { return b.inner.Role() }
+
+func (b *flakyBus) Publish(ctx context.Context, subj string, msg commbus.Message) error {
+	if b.fail.Load() {
+		return errors.New("injected: comms bus publish failure")
+	}
+	return b.inner.Publish(ctx, subj, msg)
+}
+
+func (b *flakyBus) Subscribe(subj string, handler func(commbus.Message)) (commbus.Subscription, error) {
+	return b.inner.Subscribe(subj, handler)
+}
+
+func (b *flakyBus) Close() error { return b.inner.Close() }
+
+// TestZoneSurvivesCommsBusPublishFailure pins the never-fatal contract: when a channel publish fails
+// (a closed/unreachable broker mid-session), the speaker is told comms are offline, the ZONE KEEPS
+// SERVING, and when the bus recovers, publishing resumes with no lingering offline notice. This is the
+// player-facing degradation path (channel.go's err branch) that the no-op disabled bus could never
+// exercise — proven by injecting a real publish error and recovering from it on a live zone.
+func TestZoneSurvivesCommsBusPublishFailure(t *testing.T) {
+	wbus, _ := commbus.NewWorldBus()
+	t.Cleanup(func() { _ = wbus.Close() })
+	flaky := &flakyBus{inner: wbus}
+	sh := NewDemoShard().WithComms(flaky)
+	z := sh.Zone()
+
+	alice := newTestPlayerEntity(z, "Alice")
+	Move(alice.entity, z.rooms[z.startRoom]) // place her in the start room so `look` (the serves-probe) renders
+
+	// drain returns every markup line queued to alice since the last drain (non-blocking — dispatch is
+	// synchronous here, so all sends are already enqueued when it returns).
+	drain := func() []string { return drainCombat(alice) }
+	has := func(lines []string, sub string) bool {
+		for _, l := range lines {
+			if strings.Contains(l, sub) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 1. HEALTHY: a gossip publishes fine — no offline notice.
+	flaky.fail.Store(false)
+	z.dispatch(alice, "gossip hello")
+	if has(drain(), "temporarily offline") {
+		t.Fatal("got an offline notice while the bus was healthy")
+	}
+
+	// 2. BUS FAILS mid-session: the next gossip's publish errors. The speaker is told comms are offline.
+	flaky.fail.Store(true)
+	z.dispatch(alice, "gossip into the void")
+	if !has(drain(), "Channels are temporarily offline.") {
+		t.Fatal("a failed channel publish did not produce the graceful offline notice")
+	}
+
+	// 3. THE ZONE STILL SERVES after the bus failure — a normal command round-trips (never-fatal).
+	z.dispatch(alice, "look")
+	if !has(drain(), "Exits:") {
+		t.Fatal("the zone stopped serving a normal command after a comms-bus publish failure")
+	}
+
+	// 4. RECOVERY: the bus comes back; gossip publishes again with no lingering offline notice.
+	flaky.fail.Store(false)
+	z.dispatch(alice, "gossip back online")
+	if has(drain(), "temporarily offline") {
+		t.Fatal("the offline notice persisted after the bus recovered")
+	}
+}
+
+// TestDurableTellNotLostOnEmitFailure pins the ORDERING contract inside deliverDrainedTell that MAKES
+// "never lose the tell" safe: when the render/emit to the gate FAILS (a broker blip at delivery time),
+// deliverDrainedTell must NAK (return false) AND must NOT advance the per-sender delivered-cursor — the
+// cursor advance lives strictly AFTER the successful emit (tell.go), so a failed emit leaves the cursor
+// untouched and a later redelivery is NOT suppressed-as-already-delivered (which would silently lose the
+// tell). The test re-presents the same message DIRECTLY (a tellDeliverMsg post) to model what a
+// redelivery feeds back in; it deliberately bypasses the Consume/deliverBounded redelivery MACHINERY
+// (that bounded-retry loop is a separate concern — see docs/FOLLOW-UPS.md for the Consume-driven
+// end-to-end recover-within-maxDeliver test and the MemJetStream park-at-maxDeliver divergence from
+// NATS). What is pinned here is the cursor-after-emit ordering, the actual safety invariant.
+func TestDurableTellNotLostOnEmitFailure(t *testing.T) {
+	core := commbus.NewMemBus()
+	t.Cleanup(func() { _ = core.Close() })
+	js := commbus.NewMemJetStream()
+	t.Cleanup(func() { _ = js.Close() })
+	dir := newFakeLocator("Alice", "Bob")
+
+	flaky := &flakyBus{inner: core.WorldHandle()}
+	z := tellShard(t, flaky, js, dir)
+	bobInbox := subscribeTell(t, core.GateHandle(), "Bob")
+
+	joinTellPlayer(t, z, "Alice")
+	bob := joinTellPlayer(t, z, "Bob") // starts Bob's real Consume consumer; the stream is empty, so it
+	// delivers nothing and never races the direct tellDeliverMsg posts below (which intentionally
+	// bypass the live consumer to drive the deliverDrainedTell ordering in isolation).
+
+	cursor := func() uint64 {
+		done := make(chan uint64, 1)
+		z.post(tellCursorProbeMsg{id: "Bob", author: "Alice", reply: done})
+		return <-done
+	}
+	deliver := func() bool {
+		ack := make(chan bool, 1)
+		z.post(tellDeliverMsg{target: "Bob", msg: commbus.Message{
+			AuthorID: "Alice", AuthorName: "Alice", Seq: 1, Body: "do not lose me",
+		}, ack: ack})
+		return <-ack
+	}
+
+	// FAILURE at delivery: the emit errors → NAK (false), cursor NOT advanced, nothing reaches the gate.
+	flaky.fail.Store(true)
+	if deliver() {
+		t.Fatal("a failed tell emit must NAK (false) — it ACKed, so a redelivery would be suppressed and the tell lost")
+	}
+	if c := cursor(); c != 0 {
+		t.Fatalf("the delivered-cursor advanced to %d on a FAILED emit — a redelivery would now be suppressed and the tell lost", c)
+	}
+	assertNoTell(t, bobInbox) // nothing was emitted to the gate
+
+	// RECOVERY: redeliver the SAME tell. Now it emits once, the gate renders it, and the cursor advances.
+	flaky.fail.Store(false)
+	if !deliver() {
+		t.Fatal("the recovered redelivery should ACK (true)")
+	}
+	if m := recvTell(t, bobInbox); !strings.Contains(m.Body, "do not lose me") {
+		t.Fatalf("recovered tell not rendered to the gate: %q", m.Body)
+	}
+	waitTellCursor(t, z, bob, "Alice", 1) // the cursor advanced exactly once, post-recovery
+}

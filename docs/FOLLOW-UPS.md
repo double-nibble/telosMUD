@@ -280,6 +280,32 @@ something an author would reasonably want to:
   flag-grant/revoke effect-op (with the obvious authz: a content action can only grant flags the
   pack declares it owns), closing the loop on flag-gated content. · *abilities/world*
 
+### Comms chaos coverage follow-ups (W8, from the distsys review of comms_chaos_test.go)
+
+- **End-to-end durable-tell redelivery test (Consume-driven).** `TestDurableTellNotLostOnEmitFailure`
+  pins the cursor-after-emit ORDERING inside `deliverDrainedTell` but re-presents the message by a
+  direct `tellDeliverMsg` post — it bypasses the live `Consume`→`deliverBounded` bounded-retry loop. Add
+  a test that drives a durable tell through the real consumer with the bus failing the first 1–2 attempts
+  then recovering (within `maxDeliver`), asserting the tell renders exactly once + the cursor lands at 1
+  — the actual end-to-end never-lost guarantee. · *distsys/test*
+- **MemJetStream park-at-maxDeliver DIVERGES from NATS (document + pin).** `deliverBounded`
+  (`internal/commbus/jetstream.go`) re-runs the handler on the same in-memory msg up to `maxDeliver` (3)
+  rapid attempts then PARKS (drops); the MemJetStream cursor (`memjs.go`) advances before delivery and
+  never rewinds. So a publish outage lasting longer than 3 fast retries LOSES the tell under the test
+  double, whereas real NATS JetStream redelivers with `AckWait` backoff and only advances on ACK — so a
+  minutes-long outage survives. Pin this as known test-double behavior (a "fails past maxDeliver → parks"
+  test) so the divergence is explicit, and confirm the prod NATS path has the AckWait/redelivery config
+  that makes the never-lost promise real. · *distsys*
+- **AFK auto-reply best-effort failure (cheap, same flakyBus).** `tell.go`'s AFK auto-reply is
+  `_ = z.commsBus().Publish(...)` (error discarded, after the cursor advance). Add a chaos test: a
+  flakyBus failing during the AFK reply must still ACK the original tell + advance the cursor + render to
+  the target — i.e. a best-effort reply failure can't NAK the durable path into a redelivery storm. · *test*
+- **Subscribe-side / delivery-side partition (flakyBus can't model it).** flakyBus fails `Publish`, so it
+  models a publish-side outage. It cannot model "the broker accepted the publish but the gate's
+  subscription is dead" (world publishes nil-error, gate never renders) — a silently-dropped channel line
+  the speaker thinks went out. Needs a delivery-dropping double (a Subscribe that stops feeding the
+  handler). · *distsys/test*
+
 ## 5. Housekeeping
 
 - Delete merged local branches as work lands (e.g. `test-standard-structure`).
