@@ -86,7 +86,11 @@ func (h *harness) addShard(zoneID, addr string, dir world.Locator, peers world.H
 // subscribed for a player on the OTHER shard. Returns the live shard for inspection.
 func (h *harness) addShardWithComms(zoneID, addr string, dir world.Locator, peers world.HandoffDialer, comms commbus.Bus) *world.Shard {
 	h.t.Helper()
-	sh := world.NewShard(zoneID, addr, dir, peers).WithComms(comms)
+	// A generous per-author rate budget so a journey test's rapid confirmation burst (syncChannelLive /
+	// confirmChannelStopped send a gossip per retry while the async hear-set settles) is never throttled
+	// — the default burst of 5 is exhausted under slow CI timing, flaking the toggle test. The dedicated
+	// rate-limit test lives in internal/world with its own shard, so nothing here asserts the default.
+	sh := world.NewShard(zoneID, addr, dir, peers).WithComms(comms).WithCommsRate(100000, time.Millisecond)
 	h.serveShard(addr, sh)
 	return sh
 }

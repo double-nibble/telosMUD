@@ -259,6 +259,18 @@ func (s *Shard) WithComms(bus commbus.Bus) *Shard {
 	return s
 }
 
+// WithCommsRate overrides this shard's per-author channel/tell token-bucket (P8-A1) — burst lines, one
+// refilling every `refill`. Default is the production-tuned commRateBurst/commRateRefill. It is an
+// operator/test seam: a multi-line journey test (or a high-throughput deployment) raises it so a rapid
+// confirmation burst isn't throttled. burst<=0 leaves the default. MUST be called before Run.
+func (s *Shard) WithCommsRate(burst int, refill time.Duration) *Shard {
+	if burst > 0 {
+		s.comms.rateBurst = burst
+		s.comms.rateRefill = refill
+	}
+	return s
+}
+
 // WithTells wires the shard's Phase-8.5 DURABLE-tell transport (docs/PHASE8-PLAN.md slice 8.5, OQ-1):
 // the JetStream handle the world PublishDurable's tells through and runs the per-resident durable
 // consumer on. js MUST be a JetStream handle (commbus.OpenJetStream from cmd/telos-world). It is
