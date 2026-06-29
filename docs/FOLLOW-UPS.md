@@ -305,6 +305,26 @@ something an author would reasonably want to:
   the speaker thinks went out. Needs a delivery-dropping double (a Subscribe that stops feeding the
   handler). · *distsys/test*
 
+### Phase 9 (GMCP) follow-ups (from the 9.2 edge-engineer review)
+
+- **Combat-tick HUD emit (the live HP gauge).** Char.Vitals is emitted only alongside the text prompt
+  (sendPrompt), so it updates on each command — but a combat round (`runCombatRound`/`resolveSwings`,
+  combat.go) drains HP on the pulse with NO prompt, so a rich client's gauge FREEZES mid-fight and only
+  catches up on the next keystroke. Add a post-round change-detected vitals/status emit for fighting
+  residents (not a full prompt). The "updates as you walk" case works; the "updates as you fight" case
+  is the gap. · *edge/combat*
+- **Player-facing-gauge / stat flags (content schema).** Char.Vitals (gmcp.go charVitalsJSON) emits EVERY
+  registered resource, including internal pools a builder may define (`perRound` reactions budgets, a
+  `rage`/counter pool) that are mechanics, not gauges — they'd leak as `"reactions":N` in the HUD. Latent
+  (no sample content defines one yet), but the `perRound` convention is documented. Char.Stats is deferred
+  for the SAME reason (no "which attributes are player-facing stats" predicate). Resolve both with content
+  flags: a resource `gauge`/`hud` bool (Vitals) and an attribute `stat` bool (Stats) — emit only flagged
+  defs. [Char.Stats is being implemented with the `stat` flag in 9.2b; mirror it for resources here.] · *edge/content*
+- **Char.Status target visibility.** charStatusJSON emits `e.living.fighting.Name()` (the entity short),
+  bypassing the act/look visibility filter. Safe today (it's the player's OWN opponent — you can't fight
+  what you can't perceive), but once invis/disguise content lands it would surface a hidden foe's true
+  short; route it through the same `nameFor`/canSee chokepoint then. · *edge/mudlib*
+
 ## 5. Housekeeping
 
 - Delete merged local branches as work lands (e.g. `test-standard-structure`).

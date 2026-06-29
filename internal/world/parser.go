@@ -175,7 +175,7 @@ func (z *Zone) dispatch(s *session, line string) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		// Blank line: just re-prompt.
-		s.send(promptFrame())
+		z.sendPrompt(s)
 		return
 	}
 
@@ -197,7 +197,7 @@ func (z *Zone) dispatch(s *session, line string) {
 		if def := z.abilityForVerb(lower); def != nil {
 			z.log.Debug("dispatch: ability command", "player", s.character, "verb", lower, "ability", def.ref)
 			z.castAbility(s, def, rest, nil)
-			s.send(promptFrame())
+			z.sendPrompt(s)
 			return
 		}
 		// Custom Lua command (7.4e): consulted LAST and by EXACT match only, so it never shadows or
@@ -205,7 +205,7 @@ func (z *Zone) dispatch(s *session, line string) {
 		if body := z.customCommandFor(lower); body != "" {
 			z.log.Debug("dispatch: custom command", "player", s.character, "verb", lower)
 			z.runCustomCommand(s, lower, rest, body)
-			s.send(promptFrame())
+			z.sendPrompt(s)
 			return
 		}
 		// Content channel verb (Phase 8.3): a `gossip`/`newbie` verb defined by a channel_def. Consulted
@@ -216,12 +216,12 @@ func (z *Zone) dispatch(s *session, line string) {
 		if def := z.channelForVerb(lower); def != nil {
 			z.log.Debug("dispatch: channel command", "player", s.character, "verb", lower, "channel", def.ref)
 			z.cmdChannel(s, def, rest)
-			s.send(promptFrame())
+			z.sendPrompt(s)
 			return
 		}
 		z.log.Debug("unknown verb", "player", s.character, "verb", lower)
 		s.send(textFrame("Huh?"))
-		s.send(promptFrame())
+		z.sendPrompt(s)
 		return
 	}
 	z.log.Debug("dispatch", "player", s.character, "verb", lower, "cmd", cmd.Name, "line", line)
@@ -237,7 +237,7 @@ func (z *Zone) dispatch(s *session, line string) {
 		// slice-1 dispatch early-return invariant, preserved verbatim).
 		return
 	}
-	s.send(promptFrame())
+	z.sendPrompt(s)
 }
 
 // split returns the first whitespace-delimited word and the trimmed remainder.

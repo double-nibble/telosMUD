@@ -162,3 +162,50 @@ func TestGateOffersGMCPAndPlayWorks(t *testing.T) {
 	term.expect(t, "Exits:")
 	term.close(t)
 }
+
+// TestGMCPCharVitalsReachesClient is the world→client e2e the transport slice couldn't yet exercise:
+// a GMCP client that advertised "Char" receives a Char.Vitals frame (IAC SB 201 "Char.Vitals" …),
+// emitted by the world alongside the login prompt and framed onto the wire by the gate's filter.
+func TestGMCPCharVitalsReachesClient(t *testing.T) {
+	h := newHarness(t)
+	const addr = "addr-a"
+	h.addShard("midgaard", addr, nil, nil)
+	h.serveGate(directory.Static{Addr: addr})
+
+	term := h.dial(t)
+	term.expectBytes(t, []byte{255, 251, 201})                        // gate offers IAC WILL 201
+	if _, err := term.conn.Write([]byte{255, 253, 201}); err != nil { // client IAC DO 201
+		t.Fatal(err)
+	}
+	term.sendGMCP(t, "Core.Supports.Set", `["Char 1"]`) // advertise the Char package
+
+	term.login(t, "Hudder")
+	// The world emits Char.Vitals on the login prompt; the gate frames it as IAC SB 201 "Char.Vitals " …
+	term.expectBytes(t, []byte{255, 250, 201, 'C', 'h', 'a', 'r', '.', 'V', 'i', 't', 'a', 'l', 's', ' '})
+	term.close(t)
+}
+
+// TestGMCPNotSentToUnsubscribedClient proves the default-deny filter end-to-end: a GMCP-enabled client
+// that advertised NOTHING (no Core.Supports) receives no Char.Vitals frame even though the world emits
+// it — and normal play still works.
+func TestGMCPNotSentToUnsubscribedClient(t *testing.T) {
+	h := newHarness(t)
+	const addr = "addr-a"
+	h.addShard("midgaard", addr, nil, nil)
+	h.serveGate(directory.Static{Addr: addr})
+
+	term := h.dial(t)
+	term.expectBytes(t, []byte{255, 251, 201})
+	if _, err := term.conn.Write([]byte{255, 253, 201}); err != nil { // DO 201, but advertise nothing
+		t.Fatal(err)
+	}
+	term.login(t, "Plainish")
+	term.expect(t, "Temple Square")
+	term.send(t, "look")
+	term.expect(t, "Exits:")
+	// No package advertised ⇒ default-deny ⇒ no GMCP subnegotiation byte (0xFA after an IAC) ever sent.
+	if i := indexOf(term.acc.String(), string([]byte{255, 250, 201})); i >= 0 {
+		t.Fatalf("a GMCP frame reached a client that advertised no packages (at %d)", i)
+	}
+	term.close(t)
+}

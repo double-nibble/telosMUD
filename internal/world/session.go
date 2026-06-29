@@ -33,6 +33,13 @@ type session struct {
 	// and entity together on a transfer, so only one zone goroutine ever touches the pair.
 	entity *Entity
 
+	// lastVitals / lastStatus are the last GMCP Char.Vitals / Char.Status payloads emitted to this
+	// session (Phase 9.2). sendPrompt re-emits a HUD frame only when its payload CHANGED, so an
+	// unchanging vitals line isn't re-sent on every prompt. Zone-goroutine-owned (set only in
+	// sendPrompt), nil until the first prompt (so the first prompt always emits the initial HUD).
+	lastVitals []byte
+	lastStatus []byte
+
 	// currentZone is the per-connection routing pointer the Play stream owns (server.go):
 	// it names the zone this player's input should be posted to right now. The zone that
 	// owns the session Stores itself here on attach and on an intra-shard transfer

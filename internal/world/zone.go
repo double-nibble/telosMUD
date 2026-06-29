@@ -668,7 +668,7 @@ func (z *Zone) dispatchSafe(s *session, line string) {
 			z.log.Error("command handler panicked; zone survived",
 				"player", s.character, "line", line, "panic", r, "stack", string(debug.Stack()))
 			s.send(textFrame("Something went wrong with that command."))
-			s.send(promptFrame())
+			z.sendPrompt(s)
 		}
 	}()
 	z.dispatch(s, line)
@@ -698,7 +698,7 @@ func (z *Zone) join(s *session, room ProtoRef) {
 	Move(s.entity, r)
 	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
 	z.lookRoom(s)
-	s.send(promptFrame())
+	z.sendPrompt(s)
 	// Publish to the cross-shard `who` roster: this shard now hosts the player (8.4). Off the zone
 	// goroutine — presenceJoin only records + enqueues; the background loop does the Redis write.
 	z.presenceJoin(s)
@@ -844,7 +844,7 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// destination room is THIS zone's, the entity is now ours (single-writer), so this is safe here.
 	applyRoomAffectsTo(s.entity)
 	z.aggroOnEntry(s.entity, r) // arrival-hook parity (distsys SC2): an aggressive mob engages a transferred-in player too
-	s.send(promptFrame())
+	z.sendPrompt(s)
 	z.log.Debug("intra-shard transfer in", "player", s.character, "room", r.proto,
 		"applied", s.appliedSeq, "population", len(z.players))
 }
@@ -925,7 +925,7 @@ func (z *Zone) attach(m attachMsg) {
 			s.send(textFrame(s.pendingNotice))
 			s.pendingNotice = ""
 		}
-		s.send(promptFrame())
+		z.sendPrompt(s)
 		// This shard is now the player's host (cross-shard handoff arrival): publish them to the `who`
 		// roster. The roster's owner-guard lets this destination SET win over the source's stale entry,
 		// and the source shard's own presenceLeave (handed-off orphan reap) drops its copy (8.4).
@@ -1002,6 +1002,12 @@ func (z *Zone) attach(m attachMsg) {
 			s.appliedSeq = m.inputSeq - 1
 		}
 		s.out = out
+		// Re-attach reuses the SAME session object, so the GMCP HUD change-detection buffers survive the
+		// link-death window. The NEW gate connection has no HUD state, so clear them here to force
+		// sendPrompt to re-prime Char.Vitals/Status on reconnect (Phase 9.2) — otherwise a reconnect with
+		// unchanged vitals would leave the client's gauge blank/stale. The cross-shard handoff path gets
+		// this for free (Prepare rehydrates a fresh session with nil buffers).
+		s.lastVitals, s.lastStatus = nil, nil
 		s.currentZone = curZone
 		if curZone != nil {
 			curZone.Store(z)
@@ -1011,7 +1017,7 @@ func (z *Zone) attach(m attachMsg) {
 		s.send(attachedFrame(z.id))
 		z.log.Debug("player re-attached", "player", character, "applied_seq", s.appliedSeq, "gen", s.attachGen)
 		z.lookRoom(s)
-		s.send(promptFrame())
+		z.sendPrompt(s)
 
 	default:
 		// Fresh login. Seed the epoch from the directory's persisted placement (read off the
@@ -1304,7 +1310,7 @@ func (z *Zone) freezeExpire(id string, gen uint64) {
 		s.frozenFrom = nil
 	}
 	s.send(textFrame("The way is barred. (handoff timed out)"))
-	s.send(promptFrame())
+	z.sendPrompt(s)
 }
 
 // detach handles a player's stream dropping. out identifies which stream, so a stale
@@ -1435,7 +1441,7 @@ func (z *Zone) handoffFailed(v handoffFailMsg) {
 	}
 	z.log.Debug("handoff failed, thawing player", "player", v.id, "reason", v.reason)
 	s.send(textFrame("The way is barred. (" + v.reason + ")"))
-	s.send(promptFrame())
+	z.sendPrompt(s)
 }
 
 // --- Durability ladder: cadence + reconcile (docs/PHASE4-PLAN.md §4) -------------------
