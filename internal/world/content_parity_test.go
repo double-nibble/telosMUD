@@ -42,7 +42,10 @@ func TestDemoPackPrototypeParity(t *testing.T) {
 			short: "The Temple Square",
 			long: "A broad plaza of worn flagstones stretches before the great temple. " +
 				"Pilgrims murmur in the shade of its columns.",
-			exits: map[string]ProtoRef{"north": "midgaard:room:market"},
+			// The richer demo adds a west exit to the guild hall; the name/long/north exit stay
+			// byte-identical (the parity guarantee is about not SHIFTING existing identity, and an
+			// additive exit is a legitimate content edit reflected here).
+			exits: map[string]ProtoRef{"north": "midgaard:room:market", "west": "midgaard:room:guildhall"},
 			comps: []reflect.Type{roomT},
 		},
 		"midgaard:room:market": {

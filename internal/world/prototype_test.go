@@ -195,10 +195,11 @@ func TestRoomPrototypeRendersSameAsBefore(t *testing.T) {
 	z.post(joinMsg{s: s})
 
 	got := nextOutput(t, s)
+	// The richer demo adds a west exit (the guild hall) to the temple; the name/long are unchanged.
 	want := "The Temple Square\n" +
 		"A broad plaza of worn flagstones stretches before the great temple. " +
 		"Pilgrims murmur in the shade of its columns.\n" +
-		"Exits: north"
+		"Exits: north, west"
 	if got != want {
 		t.Fatalf("temple render changed:\n got: %q\nwant: %q", got, want)
 	}

@@ -97,6 +97,34 @@ attributes:
       expr: ["floor", ["/", ["-", ["attr", strength], 10], 2]]   # demo: reuse the STR-derived mod shape
   - {ref: spell_dc, display_name: Spell Save DC, value_kind: int, default_base: {lit: 13}}
 
+  # --- Richer-demo combat/defense attributes (content expansion) ----------------------------------
+  # ac (armor class): the DEFENSE value the Shield reaction (rx:modify "ac") bumps and a future
+  # 5e-style to-hit reads. Flat content base; armor would feed it through the mod-stack (but the equip
+  # mod path is a STUB — see the content NOTE in the docs/report). The guardian Shield reaction below
+  # raises it for one swing.
+  - {ref: ac, display_name: Armor Class, value_kind: int, default_base: {lit: 10}}
+  # soak_fire / soak_cold: per-type flat reduction, the [G-B] twins of soak_slash — a fire/cold-warded
+  # creature subtracts these in mitigate(). A flat base models worn warding; the demo leaves players at 0
+  # (no equip-mod path); a tough creature could author a flat fire/cold soak so a spell barely singes it.
+  - {ref: soak_fire, display_name: Fire Soak, value_kind: int, default_base: {lit: 0}}
+  - {ref: soak_cold, display_name: Cold Soak, value_kind: int, default_base: {lit: 0}}
+  # damroll_bonus: a STR-scaled damage rider an item COULD raise (the "+STR/damroll bonus weapon" the
+  # brief asks for is authored as a weapon whose combat profile damage_bonus reads strength_bonus +
+  # damroll; this extra attr lets a buff stack onto it). Derived from strength so a STR build hits harder.
+  - ref: damroll_bonus
+    display_name: Bonus Damage Roll
+    value_kind: int
+    default_base:
+      expr: ["floor", ["/", ["-", ["attr", strength], 10], 2]]
+  # wisdom: a primary stat a heal scales off (5e-ish), and the floor a guild channel could gate on.
+  - {ref: wisdom, display_name: Wisdom, value_kind: int, default_base: {lit: 10}}
+  # heal_power = wisdom*2 + level: the cure spell's bonus formula reads this (a WIS caster heals more).
+  - ref: heal_power
+    display_name: Heal Power
+    value_kind: int
+    default_base:
+      expr: ["+", ["*", ["attr", wisdom], 2], ["attr", level]]
+
 resources:
   # hp is VITAL: at 0 = death. The on_depleted op-list is the [G-D] death hook (Phase 6.3b): the engine
   # runs it on the dying entity BEFORE die() drops combat / builds the corpse, then proceeds to death.
@@ -138,6 +166,14 @@ damage_types:
   # mitigation pipeline (5.3) reads these; 5.1 only loads them. Multiplier <1 resist, >1 vuln, 0 immune.
   - {ref: slash, display_name: Slashing, color: white, resist: {slash: 0.9}}
   - {ref: fire,  display_name: Fire,     color: red,   resist: {fire: 1.0}}
+  # cold: the frostbrand weapon + frost spell type. Neutral self-resist; the wraith carries a flat
+  # soak_cold attribute (physical cold warding) so frost bites it less — the soak path, not the matrix.
+  - {ref: cold,  display_name: Cold,     color: cyan,  resist: {cold: 1.0}}
+  # holy: the smite spell's type. The wraith carries NO soak_holy, so smite's radiant damage bypasses
+  # its cold warding entirely — a content-only "undead is weak to holy" effect expressed purely through
+  # which soak attributes a mob does (and does not) have. No engine knowledge of "undead" or "holy".
+  - {ref: holy,  display_name: Radiant,  color: yellow, resist: {holy: 1.0}}
+  # poison already used by the §5 DoT (neutral, no matrix entry needed — kept implicit).
 
 # Affects (status effects, docs/ABILITIES.md §5). The engine's Affected runtime (Phase 5.2) owns their
 # duration/stacking/tick/expire and feeds modifiers into derivation + prevents into the tag-CC gate.
@@ -207,6 +243,83 @@ affects:
         # so a 3-stack poison ticks 12. The damage type is "poison" (neutral — no resist matrix entry).
         on_tick:
           - {op: deal_damage, type: poison, amount: 4}
+
+  # --- Richer-demo affects (content expansion) ----------------------------------------------------
+
+  # bless: a beneficial stat buff — +2 accuracy, +1 ac. ignore-stacking (re-cast is a no-op while up),
+  # NON-dispellable-by-curse category (blessing). Applied by the `bless` ability (helpful, self/ally).
+  # A genuinely-beneficial affect (only stat-RAISING modifiers, no prevents) — so the harm gate treats
+  # casting it on another player as a HELP, not harm.
+  - ref: bless
+    name: Blessed
+    category: blessing
+    stacking: ignore
+    dispellable: true
+    body:
+      duration: 40
+      modifiers:
+        - {attr: accuracy, op: add, value: 2}
+        - {attr: ac, op: add, value: 1}
+
+  # bear_endurance: THE max-RAISING resource buff ([resource-clamp ordering]). It raises constitution
+  # +4, which feeds the DERIVED max_hp (constitution*10 + level*5), which is the `hp` resource's max_attr
+  # — so this buff RAISES the hp cap. The clamp-ordering fix matters: on apply (and on a persistence
+  # reattach) the new max must land BEFORE hp is clamped, or a full-hp creature would be clipped to the
+  # OLD max. Authored as a buff to exercise exactly that path. Also +1 unarmed dice size (a beefier fist).
+  - ref: bear_endurance
+    name: Bear's Endurance
+    category: blessing
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 50
+      modifiers:
+        - {attr: constitution, op: add, value: 4}    # -> +40 max_hp via the derived formula
+        - {attr: unarmed_dice_size, op: add, value: 1}
+
+  # regen_aura: a HEAL-over-time (the beneficial DoT twin of poison). A positive modify_resource each
+  # tick — routed through the SAME resource path, no harm gate (it RESTORES hp). Exercises the tick
+  # mechanism for a benefit. Applied by the `renew` heal-buff ability.
+  - ref: regen_aura
+    name: Renewing
+    category: blessing
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 24
+      tick:
+        interval: 4
+        on_tick:
+          - {op: heal, resource: hp, amount: 6}
+
+  # frostbite: a DEBUFF DoT — cold damage each tick AND a -2 dodge slow. Harmful: applied via the harm
+  # gate (the `frost` spell's apply_affect harmful:true), so it cannot land on a non-consenting player.
+  # The cold type means a fire creature shrugs the damage (soak_fire is irrelevant; cold vuln applies).
+  - ref: frostbite
+    name: Frostbitten
+    category: curse
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 18
+      modifiers:
+        - {attr: dodge, op: add, value: -2}
+      tick:
+        interval: 3
+        on_tick:
+          - {op: deal_damage, type: cold, amount: 5}
+
+  # silence: a CASTING CC — prevents the `verbal` tag, so any verbal-tagged cast (fireball/frost/smite/
+  # bless are tagged verbal) is BLOCKED at the lifecycle step-3 tag gate while it holds. The mute spell
+  # the brief's "movement/silence CC (a prevents tag)" asks for. Harmful (a debuff).
+  - ref: silence
+    name: Silenced
+    category: curse
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 16
+      prevents: [verbal]
 
 # Abilities (skills/spells, docs/ABILITIES.md §2). The engine provides the lifecycle + the effect-op
 # vocabulary; THIS data is the whole skill — the engine has never heard of "fireball". Adding one is a
@@ -279,6 +392,195 @@ abilities:
     on_resolve:
       - {op: apply_affect, affect: web}
 
+  # --- Richer-demo abilities (content expansion) --------------------------------------------------
+
+  # frost: a single-target damage spell — 4d6 COLD + a lingering frostbite DoT. The cold type runs the
+  # resist matrix + the target's soak_cold (the wraith shrugs some); verbal-tagged so a `silence` affect
+  # blocks it. Harmful disposition -> the PvP gate guards it vs a non-consenting player.
+  - ref: frost
+    name: Frost Bolt
+    invocation: command
+    words: [frost]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic, cold]
+    costs:
+      - {resource: mana, amount: 20}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You loose a shard of ice at $N!"
+      room: "$n looses a shard of ice at $N!"
+    on_resolve:
+      - {op: deal_damage, type: cold, dice: "4d6"}
+      - {op: apply_affect, affect: frostbite, harmful: true}
+
+  # smite: a HOLY damage spell with a FORMULA bonus ([G-A]) — 2d8 + the caster's wisdom-derived
+  # heal_power/2. Demonstrates a bonus formula on deal_damage and a damage TYPE (holy) the wraith has no
+  # soak against — it bypasses the wraith's cold warding. Costs mana; verbal/somatic so CC can lock it out.
+  - ref: smite
+    name: Smite
+    invocation: command
+    words: [smite]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic, holy]
+    costs:
+      - {resource: mana, amount: 18}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You call down a searing pillar of light upon $N!"
+      room: "$n calls down a searing pillar of light upon $N!"
+    on_resolve:
+      - {op: deal_damage, type: holy, dice: "2d8", bonus: ["floor", ["/", ["attr", "$source.heal_power"], 2]]}
+
+  # cure: a HEAL (self). HELPFUL disposition (no harm gate). NOTE: the declarative `heal` op only honors a
+  # FLAT `amount` (it does NOT roll dice or evaluate a bonus formula — a real gap, see report). To make
+  # the heal SCALE with the caster's WIS (the brief's "a heal" that's more than a flat number), cure is a
+  # LUA on_resolve: it rolls 2d8 in Lua and adds the caster's heal_power, then restores hp through the
+  # SAME gated heal funnel a declarative heal uses. `cure` with no arg heals self.
+  - ref: cure
+    name: Cure Wounds
+    invocation: command
+    words: [cure]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 15}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You channel a warm, mending light."
+      room: "$n channels a warm, mending light."
+    on_resolve_lua: |
+      -- 2d8 + the caster's WIS-derived heal_power, healed onto the caster (ctx.target == ctx.actor here).
+      local amt = math.random(1, 8) + math.random(1, 8) + ctx.actor:attr("heal_power")
+      ctx.actor:heal("hp", amt)
+
+  # bless: a beneficial BUFF — applies the `bless` affect (+accuracy/+ac) to self or an ally. Helpful, so
+  # casting it on another player is treated as help (not gated). The brief's "a buff (applies a beneficial
+  # affect)". apply_affect on a helpful disposition attaches directly (no debuff path).
+  - ref: bless
+    name: Bless
+    invocation: command
+    words: [bless]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 12}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You trace a sigil of protection."
+      room: "$n traces a sigil of protection."
+    on_resolve:
+      - {op: apply_affect, affect: bless}
+
+  # renew: a heal-over-time buff — applies the `regen_aura` (heals hp every tick). Helpful self/ally.
+  - ref: renew
+    name: Renew
+    invocation: command
+    words: [renew]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 14}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You weave a slow knot of renewing energy."
+      room: "$n weaves a slow knot of renewing energy."
+    on_resolve:
+      - {op: apply_affect, affect: regen_aura}
+
+  # fortify: applies `bear_endurance` — THE max-RAISING buff (raises constitution -> derived max_hp ->
+  # the hp resource cap). A self/ally helpful buff that exercises the resource-clamp ordering.
+  - ref: fortify
+    name: Fortify
+    invocation: command
+    words: [fortify]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 16}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You steel your sinews with the endurance of a bear."
+      room: "$n's frame seems to swell with vigor."
+    on_resolve:
+      - {op: apply_affect, affect: bear_endurance}
+
+  # mute: a DEBUFF/CC — applies `silence` (prevents the verbal tag) to an enemy. Harmful disposition, so
+  # the PvP harm gate guards it vs a non-consenting player (the harm-gate exercise the brief asks for).
+  - ref: mute
+    name: Silence
+    invocation: command
+    words: [mute]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 14}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You rip the voice from $N's throat!"
+      room: "$n rips the voice from $N's throat!"
+    on_resolve:
+      - {op: apply_affect, affect: silence, harmful: true}
+
+  # lightning: a LUA on_resolve damage spell. The whole effect is a Lua body: it damages the target via
+  # the SAME ctx.target:damage funnel a declarative op uses (so the harm gate + mitigation still apply).
+  # Demonstrates the Lua-scripted ability path (Phase 7) as playable content.
+  - ref: lightning
+    name: Lightning Bolt
+    invocation: command
+    words: [lightning, bolt]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 22}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You hurl a crackling bolt of lightning at $N!"
+      room: "$n hurls a crackling bolt of lightning at $N!"
+    on_resolve_lua: |
+      -- a Lua-scripted spell: roll 5d6 in Lua and deal it through the gated damage funnel.
+      local dmg = 0
+      for i = 1, 5 do dmg = dmg + math.random(1, 6) end
+      ctx.target:damage{amount = dmg, type = "fire"}
+
+  # drain: a LUA on_resolve life-drain — damages the enemy AND heals the caster for half. Demonstrates a
+  # Lua ability that reads ctx.source/ctx.target and composes two funneled effects (damage + heal).
+  - ref: drain
+    name: Life Drain
+    invocation: command
+    words: [drain]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 20}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You siphon the life from $N!"
+      room: "$n siphons the life from $N!"
+    on_resolve_lua: |
+      -- deal 4d6 necrotic-ish (fire type, neutral) then heal the caster for half the damage dealt.
+      local dmg = 0
+      for i = 1, 4 do dmg = dmg + math.random(1, 6) end
+      ctx.target:damage{amount = dmg, type = "fire"}
+      ctx.actor:heal("hp", math.floor(dmg / 2))
+
 # Combat profiles (Phase 6.3a, docs/COMBAT.md §3) — the ROM-style to-hit / avoidance / damage SHAPE as
 # pure content. The engine runs the pipeline; THIS data is the whole ruleset. `default_combat` names the
 # profile a player fights with; a mob names its own via its `living.combat_profile`.
@@ -349,6 +651,22 @@ channels:
     format: "[$channel] $name: $t"
     default_on: true
     history: 20
+  # guild: a RESTRICTED channel (Phase 8.6 hear-filter makes this safe to ship). access.require_flag
+  # gates BOTH speak (channel.go canSpeak) and HEAR (canHear, the 8.6 receiver filter) — only an entity
+  # carrying the "guildmember" flag may speak on it OR receive its lines, so a non-member never sees guild
+  # chatter even on a shared bus. default_on false: a fresh character is NOT auto-subscribed (and could
+  # not hear it anyway). HOW TO GRANT THE FLAG: there is no in-game flag-grant verb (a real gap — see the
+  # report); the "guildmember" flag is set out-of-band on a character save (StateJSON `flags`), exactly as
+  # the "pvp" consent flag is. A test grants it directly via setFlag(e, "guildmember", true) — see
+  # TestChannelAccessDenied's pattern. This closes the "no restricted channel until 8.6" guardrail.
+  - ref: guild
+    name: Guild
+    words: [guild, gu]
+    format: "[$channel] $name: $t"
+    access:
+      require_flag: guildmember
+    default_on: false
+    history: 20
 
 zones:
   - ref: midgaard
@@ -364,14 +682,37 @@ zones:
         long: >-
           A broad plaza of worn flagstones stretches before the great temple. Pilgrims
           murmur in the shade of its columns.
+        # PARITY: the temple's name/long/exit-order MUST stay byte-identical (content_parity_test).
+        # New exits (west to the guild hall) are additive — the test asserts the north exit only.
         exits:
           north: midgaard:room:market
+          west: midgaard:room:guildhall
       - ref: midgaard:room:market
         name: Market Square
         long: Stalls crowd the square and merchants cry their wares over the din of haggling.
+        # PARITY: south+north exits MUST match the test's expected map exactly (it asserts both).
+        # Adding `east` to the smithy here would BREAK the parity exits DeepEqual — so the smithy is
+        # reached from the GUILD HALL instead, keeping market's exit map exactly {south, north}.
         exits:
           south: midgaard:room:temple
-          north: darkwood:room:grove   # cross-zone exit
+          north: darkwood:room:grove   # cross-zone exit (intra-shard transfer when co-hosted)
+      # --- richer-demo midgaard rooms (no floor placements that touch the parity-checked market/temple) ---
+      - ref: midgaard:room:guildhall
+        name: The Adventurers' Guild
+        long: >-
+          Banners of a dozen companies hang from the rafters of this vaulted hall. A
+          notched practice dummy stands in one corner, and a door east leads to the smithy.
+        exits:
+          east: midgaard:room:temple
+          north: midgaard:room:smithy
+          down: crypt:room:entrance     # cross-zone stair (intra-shard transfer when co-hosted)
+      - ref: midgaard:room:smithy
+        name: The Smithy
+        long: >-
+          Heat rolls off the forge in waves. Racks of weapons and armor line the soot-black
+          walls, and a hand-lettered sign reads: TAKE WHAT YOU NEED, ADVENTURER.
+        exits:
+          south: midgaard:room:guildhall
     item_prototypes:
       - ref: midgaard:obj:torch
         keywords: [torch, wooden]
@@ -397,14 +738,103 @@ zones:
         long: A heavy wooden chest sits here.
         physical: {weight: 40, material: oak}
         container: {capacity: 10, closed: true}
-    # Reset placements: instances spawned onto the market floor at zone boot, exactly as the
-    # old newDemoZone Move(z.spawn(...), marketEntity) calls did. None render in lookRoom, so
-    # the demo's room text is unchanged; count==5 torches exercises the flyweight herd.
+
+      # --- richer-demo gear (the smithy stock) ----------------------------------------------------
+      # NOTE (real gap, see report): worn/wielded gear does NOT currently contribute attribute
+      # modifiers — the equip path (cmdWear/cmdWield) is a STUB that sets the slot but adds NO
+      # modSource and fires NO OnEquip event (there is no such event kind). So an item CANNOT raise a
+      # stat / grant an affect / raise a resource max purely by being worn. The gear below carries the
+      # mechanics it CAN express today: a WEAPON's damage dice + type, which DO flow into combat (the
+      # combat profile's damage_bonus already adds strength_bonus + damroll on top). The armor/accessory
+      # stat-mods + the "max-raising buff on equip" + "resistance on equip" are authored as Wearable
+      # flavor PLUS an equivalent ABILITY/affect a player can invoke (fortify = the max-raiser; frost
+      # resist would be a soak attr a future equip-mod feeds). This is the one brief item the content
+      # shapes can't fully express — flagged, not hacked.
+
+      # warhammer: a heavy STR weapon — bigger dice (1d10) than the longsword; its extra punch comes
+      # from the combat profile's damage_bonus (strength_bonus + damroll), so a STR build swings harder.
+      - ref: midgaard:obj:warhammer
+        keywords: [warhammer, hammer, heavy]
+        short: a heavy warhammer
+        long: A heavy iron warhammer leans against the rack.
+        physical: {weight: 12, material: iron}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 1, dice_size: 10, damage_type: slash, class: mace, attack_verb: smash}
+      # frostbrand: a cold-damage sword (its swings deal COLD — a different damage type runs through the
+      # resist matrix + the target's soak_cold — the wraith's cold warding blunts it, others feel it).
+      - ref: midgaard:obj:frostbrand
+        keywords: [frostbrand, sword, icy]
+        short: an icy frostbrand sword
+        long: A longsword rimed with frost rests here, breathing cold.
+        physical: {weight: 5, material: steel}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 2, dice_size: 6, damage_type: cold, class: sword, attack_verb: freeze}
+      # leather armor across MULTIPLE wear slots. NOTE (real gap, see report): the wear-slot enum is a
+      # CLOSED engine set — only head/body/hands/feet/wield/hold exist (no legs/neck/finger/waist/arms).
+      # So "armor pieces across multiple wear slots" spans the THREE armor slots the engine has: body,
+      # hands, feet (+ head, already covered by the original helmet). An accessory `neck`/`finger` slot
+      # is NOT expressible. Stat-mods on equip are the separate equip-mod gap above.
+      - ref: midgaard:obj:leather-vest
+        keywords: [vest, leather, armor]
+        short: a studded leather vest
+        long: A studded leather vest hangs on a peg.
+        physical: {weight: 8, material: leather}
+        wearable: {locations: [body]}
+      - ref: midgaard:obj:leather-gloves
+        keywords: [gloves, leather]
+        short: a pair of leather gloves
+        long: A pair of supple leather gloves lies folded here.
+        physical: {weight: 2, material: leather}
+        wearable: {locations: [hands]}
+      - ref: midgaard:obj:leather-boots
+        keywords: [boots, leather]
+        short: a pair of leather boots
+        long: A pair of scuffed leather boots sits by the forge.
+        physical: {weight: 3, material: leather}
+        wearable: {locations: [feet]}
+      # iron shield: a HELD off-hand shield (the block-avoidance rung gates on a held shield via the
+      # combat profile; today block derives from a flat attr, but the shield is the wearable that a
+      # gear-gated block would key off — the slot mechanism is real).
+      - ref: midgaard:obj:shield
+        keywords: [shield, iron, round]
+        short: a round iron shield
+        long: A round iron shield is propped against the anvil.
+        physical: {weight: 10, material: iron}
+        wearable: {locations: [hold]}
+    mob_prototypes:
+      # quartermaster: a LUA GREETER mob (Phase 7.4c). on("greet") fires when a player enters its room;
+      # it greets the newcomer BY NAME (ev.actor:name()) and remembers via self.state so it greets each
+      # player only once. Pure content scripting + per-instance state. Stands in the guild hall.
+      - ref: midgaard:mob:quartermaster
+        keywords: [quartermaster, dwarf, smith]
+        short: the guild quartermaster
+        long: A broad-shouldered dwarf in a leather apron looks you over appraisingly.
+        lua: |
+          state.greeted = {}
+          on("greet", function(ev)
+            local id = ev.actor:id()
+            if not state.greeted[id] then
+              state.greeted[id] = true
+              self:say("Welcome, " .. ev.actor:name() .. "! Take what you need from the smithy north.")
+            end
+          end)
+    # Reset placements. PARITY: the market floor placements MUST stay EXACTLY the original 4 ops
+    # (torch x5 + helmet + sword + chest) and the temple MUST stay empty — the instance-placement
+    # parity test asserts both. New gear/mob placements go in the SMITHY / GUILD HALL only.
     resets:
       - {op: spawn_item, proto: midgaard:obj:torch,  room: midgaard:room:market, count: 5}
       - {op: spawn_item, proto: midgaard:obj:helmet, room: midgaard:room:market}
       - {op: spawn_item, proto: midgaard:obj:sword,  room: midgaard:room:market}
       - {op: spawn_item, proto: midgaard:obj:chest,  room: midgaard:room:market}
+      # the smithy stock — the new gear, on the smithy floor (look in the smithy to find it):
+      - {op: spawn_item, proto: midgaard:obj:warhammer,        room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:frostbrand,       room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:leather-vest,     room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:leather-gloves,   room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:leather-boots,    room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:shield,           room: midgaard:room:smithy, count: 1}
+      # the guild quartermaster greeter, in the guild hall:
+      - {op: spawn_mob, proto: midgaard:mob:quartermaster, room: midgaard:room:guildhall, count: 1}
 
   - ref: darkwood
     name: The Darkwood
@@ -428,8 +858,25 @@ zones:
       - ref: darkwood:room:lair
         name: A Reeking Lair
         long: Bones and gnawed scraps litter a foul den. The stench of goblin is overpowering.
+        # lair is NOT in the content-parity want-map, so adding an east exit here is parity-safe.
         exits:
           south: darkwood:room:hollow
+          east: darkwood:room:webtunnel
+      - ref: darkwood:room:webtunnel
+        name: A Web-Choked Tunnel
+        long: >-
+          Thick grey webbing drapes every surface of this cramped tunnel. Pale shapes
+          twitch in the strands overhead.
+        exits:
+          west: darkwood:room:lair
+          east: darkwood:room:sanctum
+      - ref: darkwood:room:sanctum
+        name: A Warded Sanctum
+        long: >-
+          Runes pulse faintly along the walls of this hidden chamber. The air thrums with
+          guarded, watchful magic.
+        exits:
+          west: darkwood:room:webtunnel
     item_prototypes:
       # The goblin's loot: a rusty knife it carries (armed via the reset `into` the mob). When the goblin
       # dies (Phase 6.3b) its inventory flows into its corpse, so `get all corpse` recovers the knife.
@@ -494,9 +941,226 @@ zones:
             soak_slash: 2
             aggressive: 1          # initiates combat on a player entering the room
             max_reactions: 1       # [G9] one reaction/round -> ONE opportunity attack on a fleeing foe
+
+      # --- richer-demo darkwood mobs ---------------------------------------------------------------
+
+      # cave spider: a LUA mob that conjures a ROOM-SCOPED web affect ([G13]) in its tunnel. on("enter")
+      # fires when anyone walks in; the spider (self) applies `web` — which opApplyAffect detects as
+      # room-scoped and routes to applyRoomAffect on the spider's OWN room, rooting/slowing the room's
+      # occupants (the per-occupant landing funnels the harm gate, so a non-consenting player is spared
+      # the root). This is how a place stays webbed in PLAYABLE content. It also fights (a weak combatant).
+      - ref: darkwood:mob:spider
+        keywords: [spider, cave, pale]
+        short: a pale cave spider
+        long: A pale, bristling cave spider crouches amid the webbing.
+        weapon: {dice_num: 1, dice_size: 4, damage_type: poison, class: bite, attack_verb: bite}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 10
+            constitution: 3        # max_hp = 3*10 + 1*5 = 35
+            level: 1
+            accuracy: 3
+            damroll: 0
+            attacks: 1
+            evasion: 8
+            dodge: 12
+            parry: 0
+            block: 0
+            soak_slash: 0
+        lua: |
+          on("enter", function(ev)
+            -- (re)web the room whenever something enters; self IS in the tunnel, so the room-scoped
+            -- web attaches to this room and snares its occupants.
+            self:apply_affect("web")
+          end)
+
+      # archmage: a COUNTERSPELL reactor (Phase 7.9). Its on_reaction_lua[BeforeCastCommit] fires when ANY
+      # creature in the room begins a cast; rx:cancel() VETOES the in-flight cast (the caster pays no cost,
+      # resolves no ops). State-gated to ONE counter per combat so it's not an unwinnable wall — after it
+      # spends its counter it lets casts through. This is the reaction-model "Counterspell" as playable
+      # content. (on_reaction_lua lives on a RESOURCE the mob has — here `mana` — so the handler gathers.)
+      - ref: darkwood:mob:archmage
+        keywords: [archmage, mage, robed]
+        short: a robed archmage
+        long: A robed archmage studies you with cold, calculating eyes.
+        weapon: {dice_num: 1, dice_size: 6, damage_type: fire, class: staff, attack_verb: blast}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 10
+            constitution: 5        # max_hp = 5*10 + 1*5 = 55
+            level: 1
+            accuracy: 4
+            damroll: 0
+            attacks: 1
+            evasion: 10
+            dodge: 8
+            parry: 0
+            block: 0
+            soak_slash: 0
+        lua: |
+          on("BeforeCastCommit", function(ev, rx)
+            -- counter the first hostile cast we witness, then rest (state-gated so it isn't a hard wall).
+            if not state.countered then
+              state.countered = true
+              rx:cancel()
+            end
+          end)
+
+      # warden: a SHIELD reactor (Phase 7.9). on_reaction_lua[ToHit] fires right before an incoming swing's
+      # to-hit roll; rx:modify("ac", +5) raises the warden's AC for the TRIGGERING swing only (it does not
+      # persist). State-gated to ONE shield per combat. The reaction-model "Shield" as playable content.
+      - ref: darkwood:mob:warden
+        keywords: [warden, guardian, armored]
+        short: an armored warden
+        long: An armored warden stands guard, shield raised and ready.
+        weapon: {dice_num: 1, dice_size: 8, damage_type: slash, class: sword, attack_verb: slash}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 14
+            constitution: 8        # max_hp = 8*10 + 1*5 = 85
+            level: 1
+            accuracy: 4
+            damroll: 1
+            attacks: 1
+            evasion: 10
+            dodge: 6
+            parry: 0
+            block: 0
+            soak_slash: 3
+            ac: 12
+        lua: |
+          on("ToHit", function(ev, rx)
+            if not state.shielded then
+              state.shielded = true
+              rx:modify("ac", 5)   -- +5 AC for this one swing (does not persist)
+            end
+          end)
+
+      # wraith: an UNDEAD mob that wards COLD (soak_cold 3) but has NO soak against HOLY — so `smite`
+      # (holy) cuts through while `frost` (cold) is blunted. A content-only "undead weak to holy" purely
+      # from which soak attributes it carries. Tough hp, a chilling touch. Aggressive so it engages on entry.
+      - ref: darkwood:mob:wraith
+        keywords: [wraith, undead, shade]
+        short: a hollow wraith
+        long: A hollow wraith drifts here, trailing tatters of cold shadow.
+        weapon: {dice_num: 1, dice_size: 8, damage_type: cold, class: touch, attack_verb: chill}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 13
+            constitution: 7        # max_hp = 7*10 + 1*5 = 75
+            level: 1
+            accuracy: 5
+            damroll: 1
+            attacks: 1
+            evasion: 11
+            dodge: 14
+            parry: 0
+            block: 0
+            soak_slash: 1
+            soak_cold: 3           # resists physical cold; smite (holy) bypasses it
+            aggressive: 1
     resets:
       - {op: spawn_mob, proto: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}
       # Arm the goblin with its rusty knife: the item spawns INTO the goblin's inventory (reset `into` a
       # mob, reset.go), so its corpse holds it. Script order matters — the goblin must spawn first.
       - {op: spawn_item, proto: darkwood:obj:rusty-knife, into: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}
       - {op: spawn_mob, proto: darkwood:mob:goblin-chief, room: darkwood:room:lair, count: 1}
+      # the cave spider that keeps the web tunnel webbed (room-affect demo):
+      - {op: spawn_mob, proto: darkwood:mob:spider, room: darkwood:room:webtunnel, count: 1}
+      # the warded sanctum's defenders: the Counterspell archmage, the Shield warden, and the holy-vuln wraith:
+      - {op: spawn_mob, proto: darkwood:mob:archmage, room: darkwood:room:sanctum, count: 1}
+      - {op: spawn_mob, proto: darkwood:mob:warden,   room: darkwood:room:sanctum, count: 1}
+      - {op: spawn_mob, proto: darkwood:mob:wraith,   room: darkwood:room:sanctum, count: 1}
+
+  # A THIRD zone (the crypt) — proves multi-zone-per-shard beyond the original two. It hangs off the
+  # midgaard guild hall via a `down` stair (crypt:room:entrance). When a shard hosts midgaard + crypt
+  # together the descent is an INTRA-SHARD transfer (transferIn, no handoff); when they live on
+  # different shards it is the cross-shard hop. Both paths are the SAME `down` exit — placement decides.
+  - ref: crypt
+    name: The Forgotten Crypt
+    start_room: crypt:room:entrance
+    reset_secs: 90
+    rooms:
+      - ref: crypt:room:entrance
+        name: A Crumbling Stair
+        long: >-
+          Worn steps descend into damp dark. The air is cold and still, and the way up
+          returns to the guild hall above.
+        exits:
+          up: midgaard:room:guildhall   # back to the guild hall (intra-shard transfer when co-hosted)
+          north: crypt:room:ossuary
+      - ref: crypt:room:ossuary
+        name: The Ossuary
+        long: >-
+          Skulls are stacked in niches from floor to ceiling. Something has been feeding
+          here recently.
+        exits:
+          south: crypt:room:entrance
+          north: crypt:room:tomb
+      - ref: crypt:room:tomb
+        name: A Sealed Tomb
+        long: >-
+          A great stone sarcophagus dominates this chamber. Faint holy runes ring its lid,
+          long since cracked.
+        exits:
+          south: crypt:room:ossuary
+    item_prototypes:
+      # the skeleton's loot — a tarnished blade it carries, recovered from its corpse on death.
+      - ref: crypt:obj:bone-blade
+        keywords: [blade, bone, tarnished]
+        short: a tarnished bone blade
+        long: A blade of yellowed bone lies here, edge still keen.
+        physical: {weight: 3, material: bone}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 1, dice_size: 8, damage_type: slash, class: sword, attack_verb: slash}
+    mob_prototypes:
+      # a skeletal guardian — a starter-to-mid combat mob in the ossuary (undead flavor, holy-vuln target).
+      - ref: crypt:mob:skeleton
+        keywords: [skeleton, bony, guardian]
+        short: a skeletal guardian
+        long: A skeletal guardian rattles upright, blade in bony fist.
+        weapon: {dice_num: 1, dice_size: 6, damage_type: slash, class: sword, attack_verb: slash}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 13
+            constitution: 4        # max_hp = 4*10 + 1*5 = 45
+            level: 1
+            accuracy: 3
+            damroll: 1
+            attacks: 1
+            evasion: 8
+            dodge: 8
+            parry: 0
+            block: 0
+            soak_slash: 1
+      # a tomb guardian — the crypt boss, aggressive, with one reaction (an opportunity attack on flee).
+      - ref: crypt:mob:tomb-guardian
+        keywords: [guardian, tomb, ancient]
+        short: an ancient tomb guardian
+        long: An ancient guardian of black iron looms over the sarcophagus, unmoving until disturbed.
+        weapon: {dice_num: 2, dice_size: 6, damage_type: slash, class: sword, attack_verb: cleave}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 17
+            constitution: 9        # max_hp = 9*10 + 1*5 = 95
+            level: 1
+            accuracy: 5
+            damroll: 3
+            attacks: 1
+            evasion: 9
+            dodge: 8
+            parry: 0
+            block: 0
+            soak_slash: 3
+            aggressive: 1
+            max_reactions: 1
+    resets:
+      - {op: spawn_mob, proto: crypt:mob:skeleton, room: crypt:room:ossuary, count: 1}
+      - {op: spawn_item, proto: crypt:obj:bone-blade, into: crypt:mob:skeleton, room: crypt:room:ossuary, count: 1}
+      - {op: spawn_mob, proto: crypt:mob:tomb-guardian, room: crypt:room:tomb, count: 1}

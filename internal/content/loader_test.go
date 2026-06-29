@@ -18,8 +18,11 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if lc.Empty() {
 		t.Fatal("demo pack loaded empty")
 	}
-	if len(lc.Zones) != 2 {
-		t.Fatalf("zones = %d, want 2 (midgaard + darkwood)", len(lc.Zones))
+	// The richer demo ships THREE zones: midgaard + darkwood (the original pair) + the crypt
+	// (the multi-zone-per-shard expansion). The empty-boot invariant is asserted separately
+	// (TestEmptyLoad): an empty pack still yields an empty world.
+	if len(lc.Zones) != 3 {
+		t.Fatalf("zones = %d, want 3 (midgaard + darkwood + crypt)", len(lc.Zones))
 	}
 
 	mid := lc.Zone("midgaard")
@@ -29,8 +32,14 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if mid.StartRoom != "midgaard:room:temple" {
 		t.Fatalf("midgaard start_room = %q", mid.StartRoom)
 	}
-	if len(mid.Rooms) != 2 || len(mid.Items) != 4 {
-		t.Fatalf("midgaard rooms=%d items=%d, want 2/4", len(mid.Rooms), len(mid.Items))
+	// midgaard expanded to 4 rooms (temple/market/guildhall/smithy) and 10 item prototypes
+	// (the original torch/helmet/sword/chest + the smithy gear: warhammer/frostbrand/vest/
+	// gloves/boots/shield). The crypt zone proves multi-zone-per-shard.
+	if len(mid.Rooms) != 4 || len(mid.Items) != 10 {
+		t.Fatalf("midgaard rooms=%d items=%d, want 4/10", len(mid.Rooms), len(mid.Items))
+	}
+	if crypt := lc.Zone("crypt"); crypt == nil {
+		t.Fatal("crypt zone missing (multi-zone-per-shard expansion)")
 	}
 
 	// The folded YAML scalar for the temple long desc must be a single joined line, no
@@ -64,9 +73,11 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 		t.Fatalf("market cross-zone north exit = %q", market.Exits["north"])
 	}
 
-	// Resets: 4 ops (torches count=5, helmet, sword, chest).
-	if len(mid.Resets) != 4 {
-		t.Fatalf("midgaard resets = %d, want 4", len(mid.Resets))
+	// Resets: the original 4 market/temple ops (torches count=5, helmet, sword, chest) are kept
+	// FIRST and byte-identical (the instance-placement parity test depends on them), followed by
+	// the new smithy gear placements + the guild quartermaster — 11 ops total.
+	if len(mid.Resets) != 11 {
+		t.Fatalf("midgaard resets = %d, want 11", len(mid.Resets))
 	}
 	if mid.Resets[0].Proto != "midgaard:obj:torch" || mid.Resets[0].Count != 5 {
 		t.Fatalf("first reset = %+v, want torch count 5", mid.Resets[0])
