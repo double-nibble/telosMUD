@@ -267,6 +267,77 @@ func TestCrossShardHandoffCarriesWornGear(t *testing.T) {
 	term.close(t)
 }
 
+// TestCrossShardHandoffCarriesInventoryAndContainer extends the worn-gear regression to the OTHER
+// state-carry shapes the full-snapshot fix must conserve: a LOOSE (un-equipped) inventory item, and —
+// the deepest case — a carried CONTAINER with NESTED CONTENTS. It pins that the StateJson snapshot
+// round-trips inventory and the COW container subtree, not just the Wearer slot map. Same two-shard
+// journey: stock up on shard A's market floor, cross the seam, and prove every carried thing arrived.
+//
+// On the destination it (a) drops the loose torch still in hand — darkwood's grove has no torch of its
+// own, so a success means the loose item crossed; (b) re-opens the chest (occurrence #2 of the open
+// line, defeating the cumulative-transcript false positive) to prove the container itself crossed; and
+// (c) retrieves the stashed torch FROM the chest — a get-from that can only succeed if the nested
+// content survived the snapshot. Deterministic (synced on the activation-look, no sleeps).
+func TestCrossShardHandoffCarriesInventoryAndContainer(t *testing.T) {
+	dir := twoShardDir(t)
+
+	h := newHarness(t)
+	h.addShard("darkwood", "addr-b", dir, nil)
+	peers := func(addr string) (handoffv1.HandoffClient, error) {
+		if addr != "addr-b" {
+			return nil, errUnknownShard(addr)
+		}
+		return h.dialHandoff("addr-b")
+	}
+	h.addShard("midgaard", "addr-a", dir, peers)
+	h.serveGate(homeZoneDir{redis: dir, zone: "midgaard"})
+
+	term := h.dial(t)
+	term.login(t, "Packrat")
+	term.expect(t, "Temple Square")
+	term.send(t, "north")
+	term.expect(t, "Market Square")
+
+	// A LOOSE inventory item: a torch carried in hand (never equipped).
+	term.send(t, "get torch")
+	term.expect(t, "You get a wooden torch.")
+
+	// A CONTAINER with NESTED CONTENTS: get the (closed) chest, open it, stash a second torch inside,
+	// then close it back up so the carried subtree is [chest{torch}].
+	term.send(t, "get chest")
+	term.expect(t, "You get a wooden chest.")
+	term.send(t, "open chest")
+	term.expect(t, "You open a wooden chest.") // occurrence #1
+	term.send(t, "get torch")                  // a 2nd torch off the floor (to stash)
+	term.expectCount(t, "You get a wooden torch.", 2)
+	term.send(t, "put torch in chest")
+	term.expect(t, "You put a wooden torch in a wooden chest.")
+	term.send(t, "close chest")
+	term.expect(t, "You close a wooden chest.")
+
+	// Cross the seam (market→north == darkwood:grove on shard-b).
+	term.send(t, "north")
+	term.expect(t, "Moonlit Grove") // live on B
+
+	// (a) The LOOSE item survived: drop the torch still in hand. The grove floor has none, so this can
+	// only succeed if it crossed. (The torch nested in the closed chest is NOT in inventory scope, so
+	// this unambiguously targets the loose one.)
+	term.send(t, "drop torch")
+	term.expect(t, "You drop a wooden torch.")
+
+	// (b) The CONTAINER survived: re-open it on B — occurrence #2 of the open line proves the chest
+	// itself crossed (count-to-2 defeats the stale pre-cross open in the cumulative transcript).
+	term.send(t, "open chest")
+	term.expectCount(t, "You open a wooden chest.", 2)
+
+	// (c) The NESTED CONTENT survived: retrieve the stashed torch FROM the chest. A get-from that
+	// resolves an item inside the carried container only succeeds if the COW subtree round-tripped.
+	term.send(t, "get torch from chest")
+	term.expect(t, "You get a wooden torch from a wooden chest.")
+
+	term.close(t)
+}
+
 // indexAfter returns the index of the first occurrence of sub in s at or after `from`, or -1.
 // Used to assert ORDERING of echoes in the accumulated transcript.
 func indexAfter(s, sub string, from int) int {
