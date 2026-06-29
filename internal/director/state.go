@@ -1,0 +1,127 @@
+package director
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+)
+
+// ErrCASLost is returned by Set when the optimistic-concurrency CAS lost — a concurrent writer (a stale
+// leader racing the promoted standby during failover) moved the key's version. The director has reloaded
+// the winning value into its cache; the caller should re-read and retry rather than force the write.
+var ErrCASLost = errors.New("director: scope-state CAS lost (concurrent writer)")
+
+// errCASLost is the internal alias the actor returns; exported as ErrCASLost.
+var errCASLost = ErrCASLost
+
+// state.go is the director's authoritative scope-state read/write, run on the actor goroutine (single
+// writer). Get reads the in-memory cache, lazily loading a key from the store on first miss. Set writes
+// through the optimistic-concurrency CAS to the store, then updates the cache + version — so the
+// in-memory copy and the durable row never drift. A CAS LOSS (a stale leader racing the promoted
+// standby during failover) reloads the key from the store rather than clobbering, and the write fails
+// back to the caller to retry against the fresh value.
+
+// getResult is a director read: the value bytes + whether the key is set.
+type getResult struct {
+	value json.RawMessage
+	found bool
+	err   error
+}
+
+type getMsg struct {
+	key   string
+	reply chan getResult
+}
+
+type setMsg struct {
+	key   string
+	value json.RawMessage
+	reply chan error
+}
+
+func (getMsg) directorMsg() {}
+func (setMsg) directorMsg() {}
+
+// Get returns the current value for key in this director's scope (nil + found=false when unset). It is a
+// synchronous round-trip onto the actor goroutine, so it never races a concurrent Set.
+func (d *Director) Get(ctx context.Context, key string) (json.RawMessage, bool, error) {
+	reply := make(chan getResult, 1)
+	d.post(getMsg{key: key, reply: reply})
+	select {
+	case r := <-reply:
+		return r.value, r.found, r.err
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
+// Set writes value for key in this director's scope (authoritative, persisted). Synchronous round-trip
+// onto the actor goroutine.
+func (d *Director) Set(ctx context.Context, key string, value json.RawMessage) error {
+	reply := make(chan error, 1)
+	d.post(setMsg{key: key, value: value, reply: reply})
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// get (actor goroutine) returns the cached value, loading from the store on a cache miss.
+func (d *Director) get(ctx context.Context, key string) getResult {
+	if v, ok := d.state[key]; ok {
+		return getResult{value: v, found: true}
+	}
+	val, ver, found, err := d.load(ctx, key)
+	if err != nil {
+		return getResult{err: err}
+	}
+	if found {
+		d.state[key] = val
+		d.versions[key] = ver
+		return getResult{value: val, found: true}
+	}
+	return getResult{found: false}
+}
+
+// set (actor goroutine) CASes value to the store on the key's known version, then updates the cache.
+// On a CAS loss it reloads the key (so the cache reflects the winning writer) and returns an error so
+// the caller can retry against the fresh value.
+func (d *Director) set(ctx context.Context, key string, value json.RawMessage) error {
+	newVer, ok, err := d.save(ctx, key, value, d.versions[key])
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// Lost the CAS — another writer moved the version. Reload so the cache is correct, then surface
+		// the conflict; the single-writer invariant means this only happens during a failover race.
+		val, ver, found, lerr := d.load(ctx, key)
+		if lerr != nil {
+			return lerr
+		}
+		if found {
+			d.state[key] = val
+			d.versions[key] = ver
+		}
+		return errCASLost
+	}
+	d.state[key] = value
+	d.versions[key] = newVer
+	return nil
+}
+
+// load / save dispatch to the world- or region-scoped store methods by this director's scope.
+func (d *Director) load(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	if d.regionID == "" {
+		return d.store.LoadWorldState(ctx, key)
+	}
+	return d.store.LoadRegionState(ctx, d.regionID, key)
+}
+
+func (d *Director) save(ctx context.Context, key string, value []byte, expectedVersion uint64) (uint64, bool, error) {
+	if d.regionID == "" {
+		return d.store.SaveWorldState(ctx, key, value, expectedVersion)
+	}
+	return d.store.SaveRegionState(ctx, d.regionID, key, value, expectedVersion)
+}

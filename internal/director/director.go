@@ -1,0 +1,121 @@
+// Package director is the orchestration tier (docs/WORLD-EVENTS.md §3, Phase 10): the supra-zone
+// actors that own region/world state and run cross-zone orchestration. A director is an ACTOR
+// internally — an inbox + a tick + (later) a sandboxed Lua VM, the SAME model as a zone — but hosted
+// out-of-band from the simulation shards in the telos-director service, so orchestration never competes
+// with zone ticks for CPU. Region and world state have a SINGLE owning writer (the director), so even
+// global state never has two writers: the actor model, one level up.
+//
+// This slice (10.1b) is the actor + its authoritative, persistence-backed STATE bag. Leader election
+// (one live owner per scope) is 10.1c; the scoped event bus (signal/broadcast) is 10.2+. The golden
+// rule (WORLD-EVENTS §intro) is enforced structurally: a director never reaches into a zone — it will
+// SIGNAL over the bus, and each zone applies the consequence locally on its own goroutine.
+package director
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"time"
+)
+
+// ScopeStore is the persistence seam for director scope state (the world_state / region_state tables).
+// *store.Pool satisfies it; tests inject an in-memory implementation. A Save is an optimistic CAS on
+// expectedVersion: ok=false means a concurrent writer (a stale leader racing the promoted standby during
+// failover) moved the version — the director reloads + reconciles rather than clobbering.
+type ScopeStore interface {
+	LoadWorldState(ctx context.Context, key string) (value []byte, version uint64, found bool, err error)
+	SaveWorldState(ctx context.Context, key string, value []byte, expectedVersion uint64) (newVersion uint64, ok bool, err error)
+	LoadRegionState(ctx context.Context, regionID, key string) (value []byte, version uint64, found bool, err error)
+	SaveRegionState(ctx context.Context, regionID, key string, value []byte, expectedVersion uint64) (newVersion uint64, ok bool, err error)
+}
+
+// DefaultTick is the director heartbeat. Director scripts schedule waves/phases against it (10.4+).
+const DefaultTick = time.Second
+
+// Director is one scope's owning actor: the WORLD director (regionID == "") or a REGION director
+// (regionID == the region_defs ref). It owns an in-memory, authoritative copy of its scope state plus
+// the per-key versions for the optimistic-concurrency CAS, and is the single serialization point for
+// every read and write of that scope — exactly like a zone is for its entities.
+type Director struct {
+	regionID string // "" => the world director; otherwise the region this director owns
+	store    ScopeStore
+	log      *slog.Logger
+	tick     time.Duration
+
+	inbox chan msg
+
+	// state / versions are the authoritative in-memory scope state and each key's persisted version.
+	// Touched ONLY by the actor goroutine (Run), so no lock is needed — the single-writer invariant.
+	state    map[string]json.RawMessage
+	versions map[string]uint64
+}
+
+// New builds a director for a scope. regionID "" makes the WORLD director; a non-empty ref makes that
+// region's director. The actor does not run until Run is called.
+func New(regionID string, store ScopeStore, log *slog.Logger) *Director {
+	return &Director{
+		regionID: regionID,
+		store:    store,
+		log:      log.With("component", "director", "scope", scopeLabel(regionID)),
+		tick:     DefaultTick,
+		inbox:    make(chan msg, 256),
+		state:    map[string]json.RawMessage{},
+		versions: map[string]uint64{},
+	}
+}
+
+// WithTick overrides the heartbeat (tests use a fast tick; production the default). Call before Run.
+func (d *Director) WithTick(t time.Duration) *Director {
+	if t > 0 {
+		d.tick = t
+	}
+	return d
+}
+
+func scopeLabel(regionID string) string {
+	if regionID == "" {
+		return "world"
+	}
+	return "region:" + regionID
+}
+
+// msg is the director inbox message (mirrors the zone's msg interface). The marker method keeps the
+// inbox typed to director messages only.
+type msg interface{ directorMsg() }
+
+// post enqueues a message onto the director's inbox — the ONLY ingress to its state, from any goroutine.
+func (d *Director) post(m msg) { d.inbox <- m }
+
+// Run is the director actor loop: it processes inbox messages and ticks on its heartbeat, all on this
+// one goroutine, so every scope-state read/write is single-writer. Returns when ctx is cancelled.
+func (d *Director) Run(ctx context.Context) {
+	d.log.Debug("director loop start")
+	ticker := time.NewTicker(d.tick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			d.log.Debug("director loop stop")
+			return
+		case m := <-d.inbox:
+			d.handle(ctx, m)
+		case <-ticker.C:
+			d.onTick(ctx)
+		}
+	}
+}
+
+// onTick is the heartbeat hook. A no-op until director scripts schedule against it (10.4+); kept so the
+// loop shape is final and adding the scheduler later perturbs nothing (the zone-pulse precedent).
+func (d *Director) onTick(context.Context) {}
+
+func (d *Director) handle(ctx context.Context, m msg) {
+	switch v := m.(type) {
+	case getMsg:
+		v.reply <- d.get(ctx, v.key)
+	case setMsg:
+		v.reply <- d.set(ctx, v.key, v.value)
+	default:
+		d.log.Warn("director: unknown inbox message", "type", v)
+	}
+}
