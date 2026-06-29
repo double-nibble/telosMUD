@@ -210,6 +210,38 @@ E=e2e, C=chaos, F=fuzz/property, S=stress/soak.
 
 ---
 
+## Program status (executed)
+
+All ten waves' high-value coverage landed. Highlights and the THREE real bugs the program caught:
+
+- **W5 ✅** gear-carry cross-shard regression (controlled-break-verified) + nested/inventory carry; the
+  effect-op core + boundary/error matrix (the uncovered restore/send/act ops; missing-arg guards; the
+  negative-heal anti-weaponization clamp; modify_resource floor-at-0).
+- **W6 ✅** 6 fuzz targets (textsan, parseTargetSpec, dispatch, luaCompile, StateJSON round-trip,
+  formulaEval) + a scheduled **nightly** active-fuzz tier (`make fuzz`). 🐛 **FuzzTextsan found a real
+  bug** in 15s: CleanLine returned ~3× MaxLineBytes on invalid-UTF-8+control input (cap applied before
+  the U+FFFD-expanding strip) — fixed (cap-after-strip), security-auditor-reviewed.
+- **W7 ✅** the gated real-NATS suite now RUNS in CI (a new `comms` job, NATS with `-js`). 🐛 Activating
+  it caught `TestJetStreamRealOfflineThenOnline` **latently broken against real NATS** (an invalid dotted
+  consumer name + a constant idempotency key the mem stand-in never validated) — fixed + rerun-robust.
+- **W8 ✅** comms/tell/presence failure-injection (flakyBus/failingRoster): zone-survives-bus-failure +
+  recovery, durable-tell NAK-before-cursor-advance ordering AND end-to-end recover-within-maxDeliver,
+  who-degrades-to-local on a roster read error. (Shard-drop, crash-restart-restore, handoff-interrupted,
+  CAS/zombie-writer were already covered.)
+- **W9 ✅** the stress/soak tier (`make soak`, nightly): churn + concurrent-load under `-race`, asserting
+  no wedge/panic/leak (residents + goroutines) over 100k cycles.
+- **W10 ✅** the formula-eval fuzz (the thin formula.go failure surface) + the capstone kill→loot→equip
+  milestone journey. The other thin-file failure paths (effect-ops, StateJSON, the comms/handoff failure
+  legs) are now covered by the W5/W6/W8 work above.
+
+🐛 **Also W6-adjacent:** the richer demo content surfaced a real persistence bug — the store dropped a
+prototype's Lua through the Postgres `protoBody` JSONB (the same class as the earlier dropped `Living`).
+
+Remaining work is incremental and tracked in docs/FOLLOW-UPS.md (the comms-chaos deepenings —
+MemJetStream park-at-maxDeliver vs NATS, the subscribe-side partition double, the AFK best-effort path —
+plus the per-file coverage-% long tail). The 3-tier CI is in place: per-commit hermetic + gated
+(Postgres `integration`, NATS `comms`), and the `nightly` workflow (active fuzz + deep soak).
+
 ## The wave plan (the program to execute — prioritized highest-confidence-per-effort first)
 
 Each wave is a coherent committable unit. **gated** = needs `make deps`/`make up` infra and runs
