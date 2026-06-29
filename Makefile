@@ -64,6 +64,26 @@ test-e2e: ## Run the GATED e2e tier against a live gate (needs `make up`; SKIPs 
 	@echo "Running e2e tier against gate $(TELOS_E2E_ADDR)"
 	TELOS_E2E_ADDR="$(TELOS_E2E_ADDR)" $(GO) test -tags e2e -count=1 ./tests/e2e/... -v
 
+# Active fuzzing. The seed corpus of every Fuzz* target runs in the normal hermetic `make test`
+# (a Fuzz function is also a unit test of its seeds), so per-commit CI already exercises the seeds.
+# This target runs the ACTIVE fuzzer (mutation search) for FUZZTIME PER TARGET — slow, so it lives in
+# the nightly CI tier, not per-commit. `-run '^$$'` suppresses the package's unit tests so only the
+# fuzzer runs. Go fuzzing drives ONE target per invocation, so each is listed explicitly; ADD A LINE
+# HERE when you add a Fuzz* function.
+FUZZTIME ?= 60s
+fuzz: ## Run each fuzz target's ACTIVE fuzzer for FUZZTIME (default 60s; nightly uses longer)
+	@set -e; \
+	for spec in \
+	  "internal/textsan FuzzTextsan" \
+	  "internal/world   FuzzParseTargetSpec" \
+	  "internal/world   FuzzDispatch" \
+	  "internal/world   FuzzLuaCompile" ; do \
+	  set -- $$spec; \
+	  echo ">> fuzzing $$2 ($(FUZZTIME))"; \
+	  $(GO) test ./$$1/ -run '^$$' -fuzz "^$$2$$" -fuzztime $(FUZZTIME) || exit 1; \
+	done
+	@echo ">> fuzz OK (no new crashers within the time budget)"
+
 smoke: ## Bring up the full docker stack and assert it is healthy + seed exits 0 + a player can look
 	./tests/smoke/smoke.sh
 

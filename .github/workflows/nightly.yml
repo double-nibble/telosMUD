@@ -1,0 +1,44 @@
+name: nightly
+
+# The SLOW test tier that does not belong on every push: long active fuzzing now, and the home for
+# the W9 stress/soak suite later. Runs on a daily schedule and on manual dispatch. Per-commit CI
+# (ci.yml) stays fast — it runs each fuzz target's SEED corpus (the Fuzz funcs are unit tests of their
+# seeds) but never the mutation search; this tier runs the active fuzzer for a real time budget.
+on:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "Active-fuzz budget PER target (Go duration, e.g. 300s, 10m)"
+        required: false
+        default: "300s"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Generated *.pb.go is gitignored; produce it before building (mirrors ci.yml).
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.71.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: buf generate
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      # Run every Fuzz* target's active fuzzer for the budget (default 300s/target; dispatch can
+      # override). A new crasher fails the job; the failing input is uploaded below for reproduction.
+      - name: active fuzz (each target)
+        run: make fuzz FUZZTIME=${{ github.event.inputs.fuzztime || '300s' }}
+      # On a finding, Go writes the minimized crasher under <pkg>/testdata/fuzz/<Target>/. Upload it so
+      # the failure is reproducible locally with `go test -run=<Target>/<id>` after downloading.
+      - name: upload fuzz crashers on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
