@@ -77,7 +77,8 @@ fuzz: ## Run each fuzz target's ACTIVE fuzzer for FUZZTIME (default 60s; nightly
 	  "internal/textsan FuzzTextsan" \
 	  "internal/world   FuzzParseTargetSpec" \
 	  "internal/world   FuzzDispatch" \
-	  "internal/world   FuzzLuaCompile" ; do \
+	  "internal/world   FuzzLuaCompile" \
+	  "internal/world   FuzzStateJSONRoundTrip" ; do \
 	  set -- $$spec; \
 	  echo ">> fuzzing $$2 ($(FUZZTIME))"; \
 	  $(GO) test ./$$1/ -run '^$$' -fuzz "^$$2$$" -fuzztime $(FUZZTIME) || exit 1; \
