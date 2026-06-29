@@ -66,6 +66,25 @@ func NewRedis(rdb *redis.Client, ns string) *Redis {
 func (r *Redis) zoneKey(zoneID string) string     { return r.ns + ":dir:zone:" + zoneID }
 func (r *Redis) shardKey(shardID string) string   { return r.ns + ":dir:shard:" + shardID }
 func (r *Redis) playerKey(playerID string) string { return r.ns + ":dir:player:" + playerID }
+func (r *Redis) leaseKey(leaseID string) string   { return r.ns + ":dir:lease:" + leaseID }
+
+// ClaimLease takes or RENEWS a generic exclusive lease (Phase 10.1c leader election): it succeeds when
+// the lease is free, EXPIRED, or already this owner's, then (re)sets the owner + a fresh TTL. It reuses
+// the same time-fenced CAS script as ClaimZone, so exactly one owner can hold a given leaseID at a time
+// — the director leader-election primitive (leaseID = the scope, owner = the director instance id).
+func (r *Redis) ClaimLease(ctx context.Context, leaseID, owner string, ttl time.Duration) (bool, error) {
+	res, err := claimZone.Run(ctx, r.rdb, []string{r.leaseKey(leaseID)}, owner, ttl.Milliseconds()).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
+}
+
+// ReleaseLease frees a lease this owner holds (a graceful director resign), so a standby can take over
+// immediately rather than waiting out the TTL. A no-op if owned by someone else (the CAS arbitrates).
+func (r *Redis) ReleaseLease(ctx context.Context, leaseID, owner string) error {
+	return releaseZone.Run(ctx, r.rdb, []string{r.leaseKey(leaseID)}, owner).Err()
+}
 
 // claimZone takes/renews an exclusive lease on a zone. It succeeds when the zone is
 // unowned, its lease has expired, or the caller is already the owner (a renewal);

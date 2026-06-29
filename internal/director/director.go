@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,6 +49,15 @@ type Director struct {
 	// Touched ONLY by the actor goroutine (Run), so no lock is needed — the single-writer invariant.
 	state    map[string]json.RawMessage
 	versions map[string]uint64
+
+	// Leader election (10.1c). When a claimer is wired, the director campaigns for an exclusive lease on
+	// its scope so exactly ONE live instance owns it (the others are warm standbys). leader is read from
+	// any goroutine (IsLeader) and written by the Run goroutine's campaign, so it is atomic.
+	claimer    LeaseClaimer
+	instanceID string
+	leaseID    string
+	leaseTTL   time.Duration
+	leader     atomic.Bool
 }
 
 // New builds a director for a scope. regionID "" makes the WORLD director; a non-empty ref makes that
@@ -92,15 +102,33 @@ func (d *Director) Run(ctx context.Context) {
 	d.log.Debug("director loop start")
 	ticker := time.NewTicker(d.tick)
 	defer ticker.Stop()
+
+	// Leader election (10.1c): with no claimer wired, this director is always the leader (single-process
+	// / hermetic tests). With a claimer, campaign for the scope lease immediately (so leadership is known
+	// at startup) and then renew/contest it on a sub-ticker faster than the TTL; a crash lets the TTL
+	// expire and a standby take over.
+	var campaignC <-chan time.Time
+	if d.claimer == nil {
+		d.leader.Store(true)
+	} else {
+		d.campaign(ctx)
+		ct := time.NewTicker(d.leaseTTL / 3)
+		defer ct.Stop()
+		campaignC = ct.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			d.log.Debug("director loop stop")
+			d.resign()
 			return
 		case m := <-d.inbox:
 			d.handle(ctx, m)
 		case <-ticker.C:
 			d.onTick(ctx)
+		case <-campaignC:
+			d.campaign(ctx)
 		}
 	}
 }
