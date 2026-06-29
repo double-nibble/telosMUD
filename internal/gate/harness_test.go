@@ -389,6 +389,33 @@ func (term *terminal) tryExpect(substr string, d time.Duration) bool {
 	}
 }
 
+// expectCount blocks until the cumulative transcript contains AT LEAST n non-overlapping occurrences
+// of substr, consuming bytes as they arrive (no sleep-and-hope). It exists for the cumulative-buffer
+// false-positive trap: when the SAME line is expected to appear a second time (e.g. an `equipment`
+// listing re-run after a cross-shard hop), a plain expect/Contains would be satisfied by the first,
+// stale occurrence. Counting to n proves the n-th occurrence actually arrived.
+func (term *terminal) expectCount(t *testing.T, substr string, n int) {
+	t.Helper()
+	if countOccurrences(term.acc.String(), substr) >= n {
+		return
+	}
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case b, ok := <-term.bytes:
+			if !ok {
+				t.Fatalf("socket closed waiting for %d×%q; got %d in %q", n, substr, countOccurrences(term.acc.String(), substr), term.acc.String())
+			}
+			term.acc.WriteByte(b)
+			if countOccurrences(term.acc.String(), substr) >= n {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d×%q; got %d in %q", n, substr, countOccurrences(term.acc.String(), substr), term.acc.String())
+		}
+	}
+}
+
 // expectClose asserts the gate closed the socket (the reader saw EOF) within a deadline
 // — the observable a player gets when the connection is dropped. It drains any trailing
 // bytes so a final message (e.g. a disconnect notice) still lands in acc for inspection.

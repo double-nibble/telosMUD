@@ -191,6 +191,82 @@ func TestHandoffInterruptedDestinationUnreachable(t *testing.T) {
 	term.close(t)
 }
 
+// TestCrossShardHandoffCarriesWornGear is the PLAYER-VISIBLE regression for the live bug the user hit:
+// pick up + equip gear, cross a shard boundary, and the gear is GONE on the far side (`equip` showed
+// "Nothing"). It reproduces that exact journey end-to-end through the gate — get/wear/wield on shard A,
+// walk north across the seam into shard B, and assert the worn items survived — pinning the
+// full-state-carry fix (handoff.go buildSnapshot StateJson → zone.go prepare). Before the fix
+// buildSnapshot carried only identity, so equipment/inventory were rebuilt EMPTY on the destination.
+//
+// The demo pack resets the helmet (head slot) and the steel longsword (wield slot) onto the MARKET
+// floor — one room north of the temple on shard A — and the market→north exit crosses into darkwood on
+// shard B, so the whole journey is on the natural path with no content scaffolding.
+//
+// FALSE-POSITIVE GUARD: the gate transcript (term.acc) is cumulative, so a pre-cross `equipment` listing
+// the worn items would trivially satisfy a post-cross Contains. We instead COUNT occurrences — the
+// baseline is occurrence #1, the post-cross listing must reach occurrence #2 — and add a FUNCTIONAL
+// clincher (remove + drop on B succeed, and darkwood's grove has no such floor items) so the test only
+// passes if the gear is genuinely present on the destination, not merely echoed once and lost.
+func TestCrossShardHandoffCarriesWornGear(t *testing.T) {
+	dir := twoShardDir(t)
+
+	h := newHarness(t)
+	h.addShard("darkwood", "addr-b", dir, nil) // destination up first so A can reach its Handoff service
+	peers := func(addr string) (handoffv1.HandoffClient, error) {
+		if addr != "addr-b" {
+			return nil, errUnknownShard(addr)
+		}
+		return h.dialHandoff("addr-b")
+	}
+	h.addShard("midgaard", "addr-a", dir, peers)
+	h.serveGate(homeZoneDir{redis: dir, zone: "midgaard"})
+
+	term := h.dial(t)
+	term.login(t, "Geared")
+	term.expect(t, "Temple Square")
+
+	// The helmet + longsword reset onto the MARKET floor, one room north on shard A.
+	term.send(t, "north")
+	term.expect(t, "Market Square")
+
+	// Pick up + equip a WORN (head) and a WIELDED item.
+	term.send(t, "get helmet")
+	term.expect(t, "You get an iron helmet.")
+	term.send(t, "wear helmet")
+	term.expect(t, "You wear an iron helmet on your head.")
+	term.send(t, "get sword")
+	term.expect(t, "You get a steel longsword.")
+	term.send(t, "wield sword")
+	term.expect(t, "You wield a steel longsword.")
+
+	// BASELINE (pre-cross): equipment lists both worn items — occurrence #1 of each.
+	term.send(t, "equipment")
+	term.expectCount(t, "<head> an iron helmet", 1)
+	term.expectCount(t, "<wielded> a steel longsword", 1)
+
+	// Cross the seam: market→north is darkwood:grove on shard-b → the cross-shard handoff fires and the
+	// gate self-re-dials B. The player just keeps typing.
+	term.send(t, "north")
+	term.expect(t, "Moonlit Grove") // activation look on B landed → we are LIVE on the destination
+
+	// REGRESSION: the worn gear MUST have crossed. equipment on B lists both AGAIN — occurrence #2.
+	// Before the full-state-carry fix this said "Nothing." Counting to 2 makes the stale pre-cross line
+	// in the cumulative transcript unable to satisfy this post-cross assertion.
+	term.send(t, "equipment")
+	term.expectCount(t, "<head> an iron helmet", 2)
+	term.expectCount(t, "<wielded> a steel longsword", 2)
+
+	// FUNCTIONAL clincher: the items are really HERE, not just re-echoed. remove unslots the helmet and
+	// drop puts the sword on darkwood's floor — both succeed ONLY if the gear actually transferred (the
+	// grove has no helmet/sword of its own to satisfy these).
+	term.send(t, "remove helmet")
+	term.expect(t, "You stop using an iron helmet.")
+	term.send(t, "drop sword")
+	term.expect(t, "You drop a steel longsword.")
+
+	term.close(t)
+}
+
 // indexAfter returns the index of the first occurrence of sub in s at or after `from`, or -1.
 // Used to assert ORDERING of echoes in the accumulated transcript.
 func indexAfter(s, sub string, from int) int {
