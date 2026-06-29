@@ -102,19 +102,22 @@ func (b *MemBus) Publish(_ context.Context, subj string, msg Message) error {
 		c.mu.Unlock()
 		return ErrBusClosed
 	}
-	targets := make([]*memSub, 0, len(c.subs))
+	// Deliver UNDER the lock. The send is non-blocking (select default), so holding c.mu during it
+	// cannot deadlock — and it closes a real race: Unsubscribe/Close remove a sub from c.subs under
+	// THIS lock and only then close s.ch, so a send (which only happens for a sub still in c.subs, while
+	// we hold the lock) can never race or hit a closed channel. Collecting targets and sending after
+	// unlocking left a window where a concurrent Unsubscribe closed s.ch between collect and send — a
+	// data race AND a latent send-on-closed-channel panic (the select `default` guards a full buffer,
+	// not a closed channel).
 	for s := range c.subs {
 		if wildcardMatches(s.pattern, subj) {
-			targets = append(targets, s)
+			select {
+			case s.ch <- msg:
+			default: // buffer full: drop (slow-consumer protection; transient at-most-once)
+			}
 		}
 	}
 	c.mu.Unlock()
-	for _, s := range targets {
-		select {
-		case s.ch <- msg:
-		default: // buffer full: drop (slow-consumer protection; transient at-most-once)
-		}
-	}
 	return nil
 }
 
