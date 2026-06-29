@@ -79,10 +79,25 @@ func (rt *luaRuntime) registerEntityScript(e *Entity, src string, keepState *lua
 		es.handlers.RawSetString(event, fn)
 		return 0
 	})
+	// on_world / on_region (Phase 10.4b): register a reaction to a director's REMOTE-EFFECT broadcast on
+	// the world / this zone's region scope. Stored in the SAME handler table under a namespaced key
+	// ("world:<event>" / "region:<event>") so the per-instance lifecycle (drop on despawn, rebuild on hot
+	// reload) is shared with ordinary triggers — fireScopeEvent (scope.go) fires them when a broadcast
+	// arrives. A region handler on a region-less zone simply never fires (no region broadcast reaches it).
+	onWorld := L.NewFunction(func(l *lua.LState) int {
+		es.handlers.RawSetString("world:"+l.CheckString(1), l.CheckFunction(2))
+		return 0
+	})
+	onRegion := L.NewFunction(func(l *lua.LState) int {
+		es.handlers.RawSetString("region:"+l.CheckString(1), l.CheckFunction(2))
+		return 0
+	})
 	binds := map[string]lua.LValue{
-		"on":    onFn,
-		"self":  self,
-		"state": es.state, // `state` global == self.state during registration + handlers
+		"on":        onFn,
+		"on_world":  onWorld,
+		"on_region": onRegion,
+		"self":      self,
+		"state":     es.state, // `state` global == self.state during registration + handlers
 	}
 	inv := &luaInvocation{actor: e} // clean root: registration acts as the entity, no cascade budget
 	if err := rt.invoke(ch, inv, binds); err != nil {

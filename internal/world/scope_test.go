@@ -278,6 +278,72 @@ func waitEvent(t *testing.T, ch <-chan scopebus.DurableEvent, what string) scope
 	}
 }
 
+// TestScopeRemoteEffectFiresHandler proves a director remote-effect broadcast fires a scripted entity's
+// on_world handler (Phase 10.4b): a mob registers on_world("spawn_wave", fn); firing the scope event runs
+// the handler with the payload as `ev`. This is the director-commands-a-zone-to-act path.
+func TestScopeRemoteEffectFiresHandler(t *testing.T) {
+	z, room, _ := scriptedZone(t)
+	mob := addScriptedMob(z, room, "captain", `
+		on_world("spawn_wave", function(ev)
+			state.spawned = ev.mob
+			state.count = ev.count
+		end)
+	`)
+	z.lua.ensureEntityScript(mob) // run the registration body (registers the on_world handler)
+
+	z.lua.fireScopeEvent("world", "spawn_wave", json.RawMessage(`{"mob":"raider","count":5}`))
+
+	es := z.lua.entityScripts[mob.rid]
+	if es == nil {
+		t.Fatal("mob has no entity script")
+	}
+	if got := es.state.RawGetString("spawned"); got.String() != "raider" {
+		t.Fatalf("on_world handler did not fire / wrong payload: state.spawned = %v, want raider", got)
+	}
+	if got := es.state.RawGetString("count"); got.String() != "5" {
+		t.Fatalf("on_world ev.count = %v, want 5", got)
+	}
+}
+
+// TestScopeRemoteEffectRouting proves the shard subscription routes a CUSTOM (non-state) director
+// broadcast as a scopeEventMsg to the addressed zones (world → all hosted), distinct from a state delta.
+func TestScopeRemoteEffectRouting(t *testing.T) {
+	regions, err := content.LoadDemoPack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewMultiShard([]string{"midgaard", "crypt"}, "midgaard", "", nil, nil)
+	bus := scopebus.New(commbus.NewMemBus())
+	s.WithScopeBus(bus, regions.Regions)
+	s.scopes.start()
+	defer s.scopes.stop()
+
+	// A custom world event (not EventStateSet) is a remote effect.
+	if err := bus.Signal(context.Background(), scopebus.World(), "spawn_wave", json.RawMessage(`{"mob":"raider"}`), "world-director"); err != nil {
+		t.Fatal(err)
+	}
+	for _, zid := range []string{"midgaard", "crypt"} {
+		if !drainScopeEvent(t, s.zones[zid], "spawn_wave") {
+			t.Fatalf("%s did not receive the remote-effect broadcast as a scopeEventMsg", zid)
+		}
+	}
+}
+
+// drainScopeEvent reports whether a scopeEventMsg with the given event landed on a (not-Run) zone's inbox.
+func drainScopeEvent(t *testing.T, z *Zone, event string) bool {
+	t.Helper()
+	for {
+		select {
+		case m := <-z.inbox:
+			if e, ok := m.(scopeEventMsg); ok && e.event == event {
+				return true
+			}
+		case <-time.After(time.Second):
+			return false
+		}
+	}
+}
+
 // drainScopeDeltas reads the scopeDeltaMsgs that landed on a (not-Run) zone's inbox within a short
 // window, reporting whether a world and a region delta arrived. Non-scope messages are ignored.
 func drainScopeDeltas(t *testing.T, z *Zone) (world, region bool) {

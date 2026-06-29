@@ -165,6 +165,49 @@ func (rt *luaRuntime) enqueueScopeSignal(l *lua.LState, scope scopebus.Scope) {
 	rt.zone.shard.scopes.enqueueSignal(scopeSignalJob{scope: scope, event: event, payload: payload})
 }
 
+// fireScopeEvent fires every scripted entity's on_world/on_region handler for a director remote-effect
+// broadcast (Phase 10.4b). kind is "world"/"region"; the handler was registered under the namespaced key
+// "<kind>:<event>" in es.handlers, so this reuses the per-instance trigger machinery (fireTrigger) — same
+// budget, breaker, and pcall isolation. The payload becomes the handler's `ev` table. Zone goroutine only.
+func (rt *luaRuntime) fireScopeEvent(kind, event string, payload json.RawMessage) {
+	if rt == nil || rt.zone == nil {
+		return
+	}
+	key := kind + ":" + event
+	ev := rt.scopeEvTable(payload)
+	// Iterate the live scripted entities; fire those that registered for this scope event. Broadcasts are
+	// low-rate, so a per-broadcast scan of the entity-script set is fine.
+	for rid, es := range rt.entityScripts {
+		if es == nil {
+			continue
+		}
+		if _, ok := es.handlers.RawGetString(key).(*lua.LFunction); !ok {
+			continue
+		}
+		e := rt.zone.entityByRID(rid)
+		if e == nil {
+			continue
+		}
+		rt.fireTrigger(e, key, rt.rootCtx(e), ev)
+	}
+}
+
+// scopeEvTable decodes a broadcast payload (a JSON object) into a fresh Lua table for the handler's `ev`
+// arg. A nil/empty or non-object payload yields an empty table (the handler still fires; ev is just bare).
+func (rt *luaRuntime) scopeEvTable(payload json.RawMessage) *lua.LTable {
+	if len(payload) == 0 {
+		return rt.L.NewTable()
+	}
+	var v any
+	if err := json.Unmarshal(payload, &v); err != nil {
+		return rt.L.NewTable()
+	}
+	if tbl, ok := rt.goToLua(v, 0).(*lua.LTable); ok {
+		return tbl
+	}
+	return rt.L.NewTable()
+}
+
 // jsonTruthy reports whether a stored scope value counts as a SET flag: present and not JSON false/null.
 // (A JSON 0 or "" is "set" — only an absent key or an explicit false/null is "off"; the director clears a
 // flag by deleting it or setting false.)

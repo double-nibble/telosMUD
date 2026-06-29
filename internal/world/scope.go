@@ -54,6 +54,27 @@ type scopeDeltaMsg struct {
 
 func (scopeDeltaMsg) zoneMsg() {}
 
+// scopeEventMsg is a director's REMOTE-EFFECT broadcast (a custom event, not a state set), posted to the
+// zone inbox so it fires the zone's on_world/on_region Lua handlers on the zone goroutine. kind is
+// "world" or "region".
+type scopeEventMsg struct {
+	kind    string
+	event   string
+	payload json.RawMessage
+}
+
+func (scopeEventMsg) zoneMsg() {}
+
+// fireScopeEvent fires the zone's on_world/on_region handlers for a director's remote-effect broadcast.
+// Runs on the zone goroutine (posted as scopeEventMsg). It delegates to the Lua runtime, which fires every
+// scripted entity that registered an on_world("<event>")/on_region("<event>") handler.
+func (z *Zone) fireScopeEvent(m scopeEventMsg) {
+	if z.lua == nil {
+		return
+	}
+	z.lua.fireScopeEvent(m.kind, m.event, m.payload)
+}
+
 // applyScopeDelta updates this zone's replica from a director broadcast. Runs on the zone goroutine. A
 // delta for a scope this zone does not track (a region delta on a region-less zone) is ignored — the
 // shard subscription only routes a region's deltas to its member zones, but this is a defensive backstop.
@@ -168,28 +189,37 @@ func (sr *scopeReplication) start() {
 	}
 }
 
-// onScopeEvent decodes a state-set broadcast and posts a scopeDeltaMsg to the affected zones. Runs OFF
-// the zone goroutines (a bus-owned goroutine), so it only ever POSTS — it never touches zone state.
+// onScopeEvent routes a director broadcast to the affected zones. Runs OFF the zone goroutines (a bus-
+// owned goroutine), so it only ever POSTS — it never touches zone state. The reserved EventStateSet is a
+// STATE delta (updates the read-replica); any OTHER event is a REMOTE EFFECT (10.4b) that fires the
+// zones' on_world/on_region Lua handlers.
 func (sr *scopeReplication) onScopeEvent(kind, regionID, event string, payload json.RawMessage) {
-	if event != scopebus.EventStateSet {
-		return // 10.3b handles state sets; richer director events (on_world/on_region hooks) are 10.4
+	var m msg
+	if event == scopebus.EventStateSet {
+		var p scopebus.StatePayload
+		if err := json.Unmarshal(payload, &p); err != nil || p.Key == "" {
+			sr.log.Debug("dropping malformed scope state delta", "kind", kind, "event", event)
+			return
+		}
+		m = scopeDeltaMsg{kind: kind, key: p.Key, value: p.Value}
+	} else {
+		m = scopeEventMsg{kind: kind, event: event, payload: payload}
 	}
-	var p scopebus.StatePayload
-	if err := json.Unmarshal(payload, &p); err != nil || p.Key == "" {
-		sr.log.Debug("dropping malformed scope state delta", "kind", kind, "event", event)
-		return
-	}
-	msg := scopeDeltaMsg{kind: kind, key: p.Key, value: p.Value}
+	sr.postToScopeZones(kind, regionID, m)
+}
+
+// postToScopeZones posts m to every zone the scope addresses: a world scope to all hosted zones, a region
+// scope only to that region's hosted member zones.
+func (sr *scopeReplication) postToScopeZones(kind, regionID string, m msg) {
 	if kind == "world" {
 		for _, z := range sr.shard.zones {
-			z.post(msg)
+			z.post(m)
 		}
 		return
 	}
-	// Region: post only to the member zones this shard hosts.
 	for zoneID, rgID := range sr.zoneRegion {
 		if rgID == regionID {
-			sr.shard.zones[zoneID].post(msg)
+			sr.shard.zones[zoneID].post(m)
 		}
 	}
 }
