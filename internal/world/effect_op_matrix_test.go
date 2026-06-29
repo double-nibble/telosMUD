@@ -88,7 +88,7 @@ func TestOpActRoutesByTo(t *testing.T) {
 	bystander := makePlayerTargetInRoom(z, caster.entity, "Bystander")
 	// caster, victim, bystander now share caster's room.
 
-	clear := func() { drainCombat(caster); drainCombat(victim); drainCombat(bystander) }
+	flushAll := func() { drainCombat(caster); drainCombat(victim); drainCombat(bystander) }
 	got := func(s *session) []string { return drainCombat(s) }
 	has := func(lines []string, sub string) bool {
 		for _, l := range lines {
@@ -100,7 +100,7 @@ func TestOpActRoutesByTo(t *testing.T) {
 	}
 
 	// to: actor — only the actor sees it.
-	clear()
+	flushAll()
 	opAct(seededCtx(z, caster.entity, victim.entity, dispHelpful), &effectOp{text: "ACTOR_ONLY_LINE", to: "actor"})
 	if !has(got(caster), "ACTOR_ONLY_LINE") {
 		t.Fatal("opAct to:actor did not reach the actor")
@@ -110,7 +110,7 @@ func TestOpActRoutesByTo(t *testing.T) {
 	}
 
 	// to: victim — only the bound target sees it.
-	clear()
+	flushAll()
 	opAct(seededCtx(z, caster.entity, victim.entity, dispHelpful), &effectOp{text: "VICTIM_ONLY_LINE", to: "victim"})
 	if !has(got(victim), "VICTIM_ONLY_LINE") {
 		t.Fatal("opAct to:victim did not reach the victim")
@@ -120,7 +120,7 @@ func TestOpActRoutesByTo(t *testing.T) {
 	}
 
 	// default (to: room) — every other room occupant sees it, the actor does not.
-	clear()
+	flushAll()
 	opAct(seededCtx(z, caster.entity, victim.entity, dispHelpful), &effectOp{text: "ROOM_LINE"})
 	if v, b := got(victim), got(bystander); !has(v, "ROOM_LINE") || !has(b, "ROOM_LINE") {
 		t.Fatal("opAct default to:room did not reach both other room occupants")
@@ -133,7 +133,7 @@ func TestOpActRoutesByTo(t *testing.T) {
 	// `$N` token in the text must render the bound target's name. Without this, swapping the obj/vict
 	// arg positions in the handler would pass every routing case above silently. A bystander sees the
 	// room line with the victim's name filled in.
-	clear()
+	flushAll()
 	opAct(seededCtx(z, caster.entity, victim.entity, dispHelpful), &effectOp{text: "$N is struck by the spell!"})
 	by := got(bystander)
 	if !has(by, "Victim") || !has(by, "is struck by the spell!") {
