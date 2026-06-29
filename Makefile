@@ -75,6 +75,7 @@ fuzz: ## Run each fuzz target's ACTIVE fuzzer for FUZZTIME (default 60s; nightly
 	@set -e; \
 	for spec in \
 	  "internal/textsan FuzzTextsan" \
+	  "internal/telnet  FuzzGMCPSubneg" \
 	  "internal/world   FuzzParseTargetSpec" \
 	  "internal/world   FuzzDispatch" \
 	  "internal/world   FuzzLuaCompile" \

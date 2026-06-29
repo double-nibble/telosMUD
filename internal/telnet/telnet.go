@@ -1,6 +1,8 @@
 // Package telnet provides a minimal line-oriented telnet codec for the gate:
-// it strips/answers IAC negotiation and yields clean lines. Full option support
-// (GMCP, MCCP, NAWS, TTYPE) lands in Phase 5 (docs/GMCP.md).
+// it strips/answers IAC negotiation and yields clean lines, and (Phase 9) speaks
+// GMCP — option 201, the one option it OFFERS and accepts (gmcp.go, docs/GMCP.md).
+// The remaining rich options (MCCP2, NAWS, TTYPE, CHARSET) are still skipped/refused
+// and land in later Phase 9 sub-slices.
 //
 // # What it does
 //
@@ -14,12 +16,14 @@
 //   - Write sends a string to the client, escaping any literal 0xFF so it is not
 //     mistaken for the start of a command.
 //
-// # Negotiation policy: refuse everything
+// # Negotiation policy: refuse everything except GMCP
 //
-// Phase 1 wants the client in plain line mode. We never *request* an option, and
-// we decline every option the client offers, so the connection stays in the
-// default NVT (network virtual terminal) line discipline. See refuse for why we
-// only answer DO/WILL and stay silent on DONT/WONT.
+// The client stays in plain line mode for input. We never *request* a client
+// option and decline every option the client offers (so the connection keeps the
+// default NVT line discipline), with ONE exception: we offer GMCP (IAC WILL 201)
+// and accept the client's IAC DO 201, so a rich client can receive structured
+// out-of-band data alongside the text stream (gmcp.go). See refuse for why we only
+// answer DO/WILL and stay silent on DONT/WONT.
 //
 // # Debug logging
 //
@@ -37,6 +41,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 )
@@ -65,6 +70,16 @@ const (
 	se   = 240
 )
 
+// optGMCP is telnet option 201 (0xC9), the Generic MUD Communication Protocol (docs/GMCP.md). Unlike
+// every other option (which `refuse` declines), the gate OFFERS GMCP (IAC WILL 201) and a capable
+// client accepts with IAC DO 201; thereafter structured messages ride IAC SB 201 <pkg> SP <json> IAC SE.
+const optGMCP = 201
+
+// maxGMCPInBytes caps an inbound GMCP subnegotiation payload (Core.Hello / Core.Supports are small; a
+// hostile client must not grow the read buffer without bound by withholding IAC SE). An over-cap
+// subneg is drained to its terminator and dropped (fail-closed), never delivered.
+const maxGMCPInBytes = 8192
+
 // Conn wraps a connection with telnet line decoding. Writes are mutex-guarded so
 // negotiation answers (emitted from the reader goroutine inside ReadLine) and
 // output (emitted from the gate's writer goroutine) don't interleave on the wire.
@@ -74,6 +89,14 @@ type Conn struct {
 	r  *bufio.Reader
 	w  io.Writer
 	mu sync.Mutex // guards w against concurrent reader-vs-writer writes
+
+	// GMCP (option 201, docs/GMCP.md). gmcpOn flips true when the client accepts our offer (IAC DO
+	// 201) and false on IAC DONT 201 — read by WriteGmcp on the writer goroutine, set by handleIAC on
+	// the reader goroutine, so it is atomic. onGmcp is the inbound sink for a parsed IAC SB 201 message;
+	// it is set ONCE by the gate during connection setup, before the read loop starts (so a plain field
+	// is race-free), and nil until then (a GMCP message that arrives before it is set is dropped).
+	gmcpOn atomic.Bool
+	onGmcp func(pkg string, json []byte)
 }
 
 // New wraps a bidirectional connection (the common case: a net.Conn straight
@@ -234,8 +257,24 @@ func (c *Conn) handleIAC(line *[]byte) error {
 		if err != nil {
 			return err
 		}
+		// GMCP (201) is the one option we WANT: the client's DO enables it, DONT disables it. We
+		// initiated with WILL, so no reply is owed. Every other option (and a stray WILL/WONT on 201)
+		// is refused as before.
+		if opt == optGMCP && (cmd == doo || cmd == dont) {
+			c.gmcpOn.Store(cmd == doo)
+			return nil
+		}
 		c.refuse(cmd, opt)
 	case sb:
+		opt, err := c.r.ReadByte()
+		if err != nil {
+			return err
+		}
+		if opt == optGMCP {
+			return c.readGMCPSubneg()
+		}
+		// Any other subnegotiation (NAWS, TTYPE, …) is still skipped wholesale to its IAC SE; the opt
+		// byte we just consumed is part of that skipped block.
 		return c.skipSubneg()
 	default:
 		// Other 2-byte commands (NOP, AYT, ...) — already consumed; ignore.
