@@ -23,6 +23,9 @@ type Room struct {
 	// sector classifies the terrain/environment (city, forest, water…) for movement
 	// cost and look flavour. Stub: unused in slice 1.
 	sector string
+	// coord is the room's [x,y,z] position within its zone for the GMCP Room.Info minimap (Phase 9.3b).
+	// nil when unauthored. Populated from the room DTO at build (content_map.go); immutable at runtime.
+	coord []int
 	// flags carries the legacy bitmask room flags (dark/indoor…). Stub: the visibility filter
 	// consults it once content supplies bit flags.
 	flags uint64 //nolint:unused // reserved data-model field; consulted once room bit-flags land.

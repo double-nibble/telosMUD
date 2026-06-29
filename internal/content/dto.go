@@ -379,11 +379,15 @@ type ZoneDTO struct {
 // name (decoupled from ref). exits maps a canonical direction to a destination room ref
 // (which may be a cross-zone ref, e.g. midgaard:room:market -> darkwood:room:grove).
 type RoomDTO struct {
-	Ref    string            `json:"ref" yaml:"ref"`
-	Name   string            `json:"name" yaml:"name"`
-	Long   string            `json:"long" yaml:"long"`
-	Sector string            `json:"sector" yaml:"sector"`
-	Exits  map[string]string `json:"exits" yaml:"exits"`
+	Ref    string `json:"ref" yaml:"ref"`
+	Name   string `json:"name" yaml:"name"`
+	Long   string `json:"long" yaml:"long"`
+	Sector string `json:"sector" yaml:"sector"`
+	// Coord is the room's [x,y,z] position within its zone for the GMCP Room.Info minimap (Phase 9.3b).
+	// Optional — nil when unauthored (a client falls back to topological layout from exits). It rides
+	// the dedicated rooms.coord JSONB column.
+	Coord []int             `json:"coord" yaml:"coord"`
+	Exits map[string]string `json:"exits" yaml:"exits"`
 	// Flags are open-set named room booleans (docs/ABILITIES.md §1): "safe" (no PvP harm lands here),
 	// "arena" (PvP forced on), etc. The PvP gate (world/pvp.go) reads them; the engine never invents a
 	// flag name. Empty for an unflagged room. Mapped onto Room.namedFlags (world/content_map.go).

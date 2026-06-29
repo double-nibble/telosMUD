@@ -681,6 +681,7 @@ zones:
     rooms:
       - ref: midgaard:room:temple
         name: The Temple Square
+        coord: [0, 0, 0]   # GMCP minimap [x,y,z] (Phase 9.3b); the grid origin
         long: >-
           A broad plaza of worn flagstones stretches before the great temple. Pilgrims
           murmur in the shade of its columns.
@@ -691,6 +692,7 @@ zones:
           west: midgaard:room:guildhall
       - ref: midgaard:room:market
         name: Market Square
+        coord: [0, 1, 0]   # north of the temple
         long: Stalls crowd the square and merchants cry their wares over the din of haggling.
         # PARITY: south+north exits MUST match the test's expected map exactly (it asserts both).
         # Adding `east` to the smithy here would BREAK the parity exits DeepEqual — so the smithy is
@@ -701,6 +703,7 @@ zones:
       # --- richer-demo midgaard rooms (no floor placements that touch the parity-checked market/temple) ---
       - ref: midgaard:room:guildhall
         name: The Adventurers' Guild
+        coord: [-1, 0, 0]  # west of the temple
         long: >-
           Banners of a dozen companies hang from the rafters of this vaulted hall. A
           notched practice dummy stands in one corner, and a door east leads to the smithy.
@@ -710,6 +713,7 @@ zones:
           down: crypt:room:entrance     # cross-zone stair (intra-shard transfer when co-hosted)
       - ref: midgaard:room:smithy
         name: The Smithy
+        coord: [-1, 1, 0]  # north of the guild hall
         long: >-
           Heat rolls off the forge in waves. Racks of weapons and armor line the soot-black
           walls, and a hand-lettered sign reads: TAKE WHAT YOU NEED, ADVENTURER.

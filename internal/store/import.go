@@ -117,9 +117,13 @@ func insertRooms(ctx context.Context, tx pgx.Tx, pack string, z content.ZoneDTO)
 			rb["flags"] = r.Flags
 		}
 		body, _ := json.Marshal(rb)
+		var coord []byte // the [x,y,z] minimap position rides the dedicated coord JSONB column (Phase 9.3b)
+		if len(r.Coord) > 0 {
+			coord, _ = json.Marshal(r.Coord)
+		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO rooms (ref, pack, zone_ref, name, sector, body) VALUES ($1,$2,$3,$4,$5,$6)`,
-			r.Ref, pack, z.Ref, r.Name, nullStr(r.Sector), body); err != nil {
+			`INSERT INTO rooms (ref, pack, zone_ref, name, sector, coord, body) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			r.Ref, pack, z.Ref, r.Name, nullStr(r.Sector), coord, body); err != nil {
 			return fmt.Errorf("store: insert room %s: %w", r.Ref, err)
 		}
 	}

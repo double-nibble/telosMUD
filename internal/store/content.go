@@ -237,7 +237,7 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 	rooms := map[string]*content.RoomDTO{}
 	rows, err := p.pool.Query(ctx,
 		`SELECT ref, zone_ref, name, COALESCE(sector, ''), COALESCE(body->>'long', ''),
-		        COALESCE(body->'flags', '[]'::jsonb)
+		        COALESCE(body->'flags', '[]'::jsonb), coord
 		   FROM rooms WHERE pack = ANY($1) ORDER BY zone_ref, ref`, enabled)
 	if err != nil {
 		return fmt.Errorf("store: query rooms: %w", err)
@@ -245,8 +245,8 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 	for rows.Next() {
 		var r content.RoomDTO
 		var zoneRef string
-		var flags []byte
-		if err := rows.Scan(&r.Ref, &zoneRef, &r.Name, &r.Sector, &r.Long, &flags); err != nil {
+		var flags, coord []byte
+		if err := rows.Scan(&r.Ref, &zoneRef, &r.Name, &r.Sector, &r.Long, &flags, &coord); err != nil {
 			rows.Close()
 			return fmt.Errorf("store: scan room: %w", err)
 		}
@@ -254,6 +254,12 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 			if err := json.Unmarshal(flags, &r.Flags); err != nil {
 				rows.Close()
 				return fmt.Errorf("store: room %s flags: %w", r.Ref, err)
+			}
+		}
+		if len(coord) > 0 {
+			if err := json.Unmarshal(coord, &r.Coord); err != nil {
+				rows.Close()
+				return fmt.Errorf("store: room %s coord: %w", r.Ref, err)
 			}
 		}
 		r.Exits = map[string]string{}

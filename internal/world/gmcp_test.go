@@ -54,10 +54,15 @@ func TestRoomInfoJSON(t *testing.T) {
 		Num   int            `json:"num"`
 		Name  string         `json:"name"`
 		Zone  string         `json:"zone"`
+		Coord []int          `json:"coord"`
 		Exits map[string]int `json:"exits"`
 	}
 	if err := json.Unmarshal(z.roomInfoJSON(temple), &info); err != nil {
 		t.Fatalf("Room.Info not valid JSON: %v", err)
+	}
+	// coord is [zone-id, x, y, z]; the demo temple is the grid origin [0,0,0].
+	if len(info.Coord) != 4 || info.Coord[1] != 0 || info.Coord[2] != 0 || info.Coord[3] != 0 {
+		t.Errorf("coord = %v, want [zone, 0, 0, 0]", info.Coord)
 	}
 	if info.Num != roomNum("midgaard:room:temple") {
 		t.Errorf("num = %d, want the stable hash %d", info.Num, roomNum("midgaard:room:temple"))

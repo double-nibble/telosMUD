@@ -94,6 +94,7 @@ func (z *Zone) roomInfoJSON(r *Entity) []byte {
 		Name        string         `json:"name"`
 		Zone        string         `json:"zone"`
 		Environment string         `json:"environment,omitempty"`
+		Coord       []int          `json:"coord,omitempty"`
 		Exits       map[string]int `json:"exits"`
 	}{
 		Num:   roomNum(r.proto),
@@ -105,6 +106,11 @@ func (z *Zone) roomInfoJSON(r *Entity) []byte {
 		info.Environment = r.room.sector
 		for dir, dst := range r.room.exits {
 			info.Exits[dir] = roomNum(dst)
+		}
+		// coord is [zone-id, x, y, z]: the content's [x,y,z] prefixed with a stable per-zone id so the
+		// client groups rooms by zone for layout. Omitted when the room has no authored coords.
+		if len(r.room.coord) == 3 {
+			info.Coord = append([]int{roomNum(ProtoRef(zoneName))}, r.room.coord...)
 		}
 	}
 	b, _ := json.Marshal(info)

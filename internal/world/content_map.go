@@ -27,7 +27,7 @@ func roomComponents(r content.RoomDTO) componentSet {
 	for dir, to := range r.Exits {
 		exits[dir] = ProtoRef(to)
 	}
-	room := &Room{exits: exits, sector: r.Sector}
+	room := &Room{exits: exits, sector: r.Sector, coord: r.Coord}
 	if len(r.Flags) > 0 {
 		room.namedFlags = make(map[string]bool, len(r.Flags))
 		for _, f := range r.Flags {
