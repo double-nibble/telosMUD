@@ -13,6 +13,10 @@ on:
         description: "Active-fuzz budget PER target (Go duration, e.g. 300s, 10m)"
         required: false
         default: "300s"
+      soak_cycles:
+        description: "Soak churn cycles (TELOS_SOAK_CYCLES)"
+        required: false
+        default: "100000"
 
 jobs:
   fuzz:
@@ -42,3 +46,21 @@ jobs:
           name: fuzz-crashers
           path: "**/testdata/fuzz/**"
           if-no-files-found: ignore
+
+  # W9 stress/soak: a deep churn + concurrent-load pass under -race (TELOS_SOAK gated; per-commit CI
+  # skips it). Catches lifecycle/leak/wedge bugs that only surface over thousands of cycles.
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.71.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: buf generate
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: soak (deep churn under -race)
+        run: make soak SOAK_CYCLES=${{ github.event.inputs.soak_cycles || '100000' }}

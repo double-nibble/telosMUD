@@ -86,6 +86,13 @@ fuzz: ## Run each fuzz target's ACTIVE fuzzer for FUZZTIME (default 60s; nightly
 	done
 	@echo ">> fuzz OK (no new crashers within the time budget)"
 
+# W9 stress/soak. Gated on TELOS_SOAK so the per-commit `go test` skips it; this target sets it and
+# cranks the volume. Runs under -race (the churn + concurrent-load burst is where a lifecycle/leak bug
+# under concurrency shows). SOAK_CYCLES tunes the churn depth; nightly runs a deep pass.
+SOAK_CYCLES ?= 20000
+soak: ## Run the W9 stress/soak tier under -race (TELOS_SOAK gated; SOAK_CYCLES tunes depth)
+	TELOS_SOAK=1 TELOS_SOAK_CYCLES=$(SOAK_CYCLES) $(GO) test -race -count=1 -run Soak ./internal/world/ -v
+
 smoke: ## Bring up the full docker stack and assert it is healthy + seed exits 0 + a player can look
 	./tests/smoke/smoke.sh
 
