@@ -140,3 +140,95 @@ func TestOpActRoutesByTo(t *testing.T) {
 		t.Fatalf("opAct $N did not render the bound target's name into the room line; bystander saw %v", by)
 	}
 }
+
+// TestEffectOpMissingArgsErrorNotPanic pins the BOUNDARY guards on the harmful/utility ops: a missing
+// target (deal_damage/heal/modify_resource) or a missing required field (heal's resource, apply_affect's
+// ref) returns a descriptive error and does NOT panic. runOps logs+skips an op error, so a content
+// op-list with a malformed op degrades to a no-op rather than crashing the zone goroutine — this is the
+// contract that keeps bad content from taking a shard down.
+func TestEffectOpMissingArgsErrorNotPanic(t *testing.T) {
+	z, caster := abilityTestZone(t)
+
+	// Missing TARGET → error (not panic) for every target-requiring op.
+	noTarget := seededCtx(z, caster.entity, nil, dispHarmful)
+	for name, fn := range map[string]func(*effectCtx, *effectOp) error{
+		"deal_damage":     opDealDamage,
+		"heal":            opHeal,
+		"restore":         opRestore,
+		"modify_resource": opModifyResource,
+	} {
+		if err := fn(noTarget, &effectOp{resource: "hp", amount: 5, dmgType: "fire"}); err == nil {
+			t.Fatalf("%s with a nil target should error, got nil", name)
+		}
+	}
+
+	// Missing RESOURCE on heal → error.
+	if err := opHeal(seededCtx(z, caster.entity, caster.entity, dispHelpful), &effectOp{amount: 5}); err == nil {
+		t.Fatal("heal with no resource should error, got nil")
+	}
+	// Missing AFFECT ref on apply_affect → error (even with a valid target).
+	if err := opApplyAffect(seededCtx(z, caster.entity, caster.entity, dispHelpful), &effectOp{}); err == nil {
+		t.Fatal("apply_affect with no affect ref should error, got nil")
+	}
+}
+
+// TestEffectOpAmountClamps pins the two amount-boundary clamps that are quietly security-relevant:
+//   - heal can NEVER lower a pool: a negative heal amount is clamped to 0 (so heal can't be weaponized
+//     into a cross-player drain — that path is modify_resource, which is gated). The pool is unchanged.
+//   - a resource write FLOORS at 0: a huge negative modify_resource on self drives the pool to exactly 0,
+//     never negative (setResourceCurrent clamp). modify_resource also does NOT route through the death
+//     funnel, so a vital pool floored this way sits at 0 without a death checkpoint (distinct from
+//     deal_damage) — pinning that the clamp, not death, is what happens here.
+func TestEffectOpAmountClamps(t *testing.T) {
+	z, caster := abilityTestZone(t)
+
+	// Negative heal is a no-op on the pool (clamped to 0 magnitude).
+	setResourceCurrent(caster.entity, "hp", 60)
+	if err := opHeal(seededCtx(z, caster.entity, caster.entity, dispHelpful), &effectOp{resource: "hp", amount: -50}); err != nil {
+		t.Fatalf("heal: %v", err)
+	}
+	if got := resourceCurrent(caster.entity, "hp"); got != 60 {
+		t.Fatalf("a negative heal changed the pool to %d, want 60 unchanged (heal must never drain)", got)
+	}
+
+	// A massive negative resource write floors at 0, never negative.
+	setResourceCurrent(caster.entity, "hp", 50)
+	if err := opModifyResource(seededCtx(z, caster.entity, caster.entity, dispHelpful), &effectOp{resource: "hp", amount: -1000}); err != nil {
+		t.Fatalf("modify_resource: %v", err)
+	}
+	if got := resourceCurrent(caster.entity, "hp"); got != 0 {
+		t.Fatalf("modify_resource underflow floored at %d, want exactly 0", got)
+	}
+}
+
+// TestOpIfResourceThresholdBranch covers opIf's RESOURCE-threshold condition (ifResource/ifResourceMin)
+// — the existing opIf test only exercises the has-affect condition. A pool at/above the threshold runs
+// `then`; below it runs `els`. The subject is the resolved ctx target. Asserted via the branch's send op
+// landing (or not) on the player session.
+func TestOpIfResourceThresholdBranch(t *testing.T) {
+	z, caster := abilityTestZone(t)
+
+	ifOp := &effectOp{
+		kind: "if", ifResource: "hp", ifResourceMin: 50,
+		then: []effectOp{{kind: "send", text: "THEN_BRANCH"}},
+		els:  []effectOp{{kind: "send", text: "ELS_BRANCH"}},
+	}
+
+	// hp at/above the threshold → `then`.
+	setResourceCurrent(caster.entity, "hp", 80)
+	if err := opIf(seededCtx(z, caster.entity, caster.entity, dispHelpful), ifOp); err != nil {
+		t.Fatalf("opIf (then): %v", err)
+	}
+	if !drainContains(t, caster, "THEN_BRANCH") {
+		t.Fatal("opIf with hp>=min did not run the `then` branch")
+	}
+
+	// hp below the threshold → `els`.
+	setResourceCurrent(caster.entity, "hp", 20)
+	if err := opIf(seededCtx(z, caster.entity, caster.entity, dispHelpful), ifOp); err != nil {
+		t.Fatalf("opIf (els): %v", err)
+	}
+	if !drainContains(t, caster, "ELS_BRANCH") {
+		t.Fatal("opIf with hp<min did not run the `els` branch")
+	}
+}
