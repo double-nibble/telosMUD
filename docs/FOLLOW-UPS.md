@@ -383,6 +383,10 @@ something an author would reasonably want to:
 ## 5. Housekeeping
 
 - Delete merged local branches as work lands (e.g. `test-standard-structure`).
+- **Flaky `gate.TestChannelLineRendersVerbatimNoTellPrefix` under CI -race load.** Timed out once at 10s
+  waiting for a channel line on a docs-only commit (no code change), passed on re-run + 5x locally under
+  -race. The 10s deadline is tight for channel delivery (comms bus → gate client) under a loaded `go -race`
+  job. De-flake: raise the per-line wait or settle the comms path before asserting. · *test/edge*
 
 ## 6. Phase 10 (orchestration) deferred work
 
