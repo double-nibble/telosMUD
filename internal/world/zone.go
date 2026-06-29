@@ -1007,7 +1007,7 @@ func (z *Zone) attach(m attachMsg) {
 		// sendPrompt to re-prime Char.Vitals/Status on reconnect (Phase 9.2) — otherwise a reconnect with
 		// unchanged vitals would leave the client's gauge blank/stale. The cross-shard handoff path gets
 		// this for free (Prepare rehydrates a fresh session with nil buffers).
-		s.lastVitals, s.lastStatus, s.lastStats = nil, nil, nil
+		s.lastVitals, s.lastStatus, s.lastStats, s.lastRoom = nil, nil, nil, nil
 		s.currentZone = curZone
 		if curZone != nil {
 			curZone.Store(z)

@@ -185,6 +185,26 @@ func TestGMCPCharVitalsReachesClient(t *testing.T) {
 	term.close(t)
 }
 
+// TestGMCPRoomInfoReachesClient is the minimap e2e: a client advertising "Room" receives Room.Info
+// (IAC SB 201 "Room.Info" …) on login, emitted by the world's look path and framed by the gate.
+func TestGMCPRoomInfoReachesClient(t *testing.T) {
+	h := newHarness(t)
+	const addr = "addr-a"
+	h.addShard("midgaard", addr, nil, nil)
+	h.serveGate(directory.Static{Addr: addr})
+
+	term := h.dial(t)
+	term.expectBytes(t, []byte{255, 251, 201})
+	if _, err := term.conn.Write([]byte{255, 253, 201}); err != nil { // IAC DO 201
+		t.Fatal(err)
+	}
+	term.sendGMCP(t, "Core.Supports.Set", `["Room 1"]`)
+
+	term.login(t, "Walker")
+	term.expectBytes(t, []byte{255, 250, 201, 'R', 'o', 'o', 'm', '.', 'I', 'n', 'f', 'o', ' '})
+	term.close(t)
+}
+
 // TestGMCPNotSentToUnsubscribedClient proves the default-deny filter end-to-end: a GMCP-enabled client
 // that advertised NOTHING (no Core.Supports) receives no Char.Vitals frame even though the world emits
 // it — and normal play still works.

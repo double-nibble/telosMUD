@@ -3,6 +3,8 @@ package world
 import (
 	"encoding/json"
 	"testing"
+
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
 
 // gmcp_test.go covers the world-side GMCP HUD (Phase 9.2): the content-driven Char.Vitals / Char.Status
@@ -38,6 +40,81 @@ func TestCharVitalsJSONContentDriven(t *testing.T) {
 		if m[k] != v {
 			t.Errorf("Char.Vitals[%q] = %d, want %d (full payload %v)", k, m[k], v, m)
 		}
+	}
+}
+
+func TestRoomInfoJSON(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	temple := z.rooms["midgaard:room:temple"]
+	if temple == nil {
+		t.Fatal("demo temple room not found")
+	}
+
+	var info struct {
+		Num   int            `json:"num"`
+		Name  string         `json:"name"`
+		Zone  string         `json:"zone"`
+		Exits map[string]int `json:"exits"`
+	}
+	if err := json.Unmarshal(z.roomInfoJSON(temple), &info); err != nil {
+		t.Fatalf("Room.Info not valid JSON: %v", err)
+	}
+	if info.Num != roomNum("midgaard:room:temple") {
+		t.Errorf("num = %d, want the stable hash %d", info.Num, roomNum("midgaard:room:temple"))
+	}
+	if info.Zone != "midgaard" {
+		t.Errorf("zone = %q, want midgaard", info.Zone)
+	}
+	if info.Name == "" {
+		t.Error("name is empty")
+	}
+	// The temple exits north→market; the exit target is the destination room's stable num.
+	if info.Exits["north"] != roomNum("midgaard:room:market") {
+		t.Errorf("exits[north] = %d, want market's num %d", info.Exits["north"], roomNum("midgaard:room:market"))
+	}
+}
+
+func TestRoomNumStable(t *testing.T) {
+	// Deterministic: same ref → same num across calls; distinct refs → distinct nums.
+	const ref ProtoRef = "midgaard:room:temple"
+	first, second := roomNum(ref), roomNum(ref)
+	if first != second {
+		t.Fatal("roomNum is not deterministic")
+	}
+	if first == roomNum("midgaard:room:market") {
+		t.Fatal("distinct rooms collided")
+	}
+}
+
+func TestLookRoomEmitsRoomInfoOnChangeOnly(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	src := &session{character: "Mapper", out: make(chan *playv1.ServerFrame, 64)}
+	e := z.newPlayerEntity(src, "Mapper")
+	Move(e, z.rooms["midgaard:room:temple"])
+
+	// First look in the temple → Room.Info emitted.
+	z.lookRoom(src)
+	if _, ok := drainGMCP(src)["Room.Info"]; !ok {
+		t.Fatal("lookRoom did not emit Room.Info on room entry")
+	}
+	// Re-look the SAME room → no re-emit (change-detected).
+	z.lookRoom(src)
+	if _, ok := drainGMCP(src)["Room.Info"]; ok {
+		t.Fatal("Room.Info re-emitted on a re-look of the same room")
+	}
+	// Move to a new room and look → Room.Info re-emitted with the new room.
+	Move(e, z.rooms["midgaard:room:market"])
+	z.lookRoom(src)
+	got, ok := drainGMCP(src)["Room.Info"]
+	if !ok {
+		t.Fatal("Room.Info not re-emitted after a room change")
+	}
+	var info struct {
+		Num int `json:"num"`
+	}
+	json.Unmarshal([]byte(got), &info)
+	if info.Num != roomNum("midgaard:room:market") {
+		t.Fatalf("Room.Info after move has num %d, want market %d", info.Num, roomNum("midgaard:room:market"))
 	}
 }
 

@@ -3,9 +3,21 @@ package world
 import (
 	"bytes"
 	"encoding/json"
+	"hash/fnv"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
+
+// roomNum maps a room's ProtoRef to the stable integer id GMCP Room.Info uses (`num`, and the exit
+// targets). A 32-bit FNV-1a hash is stateless and process-independent — the SAME ref always yields the
+// SAME num across shards and restarts, so a client's accreted minimap stays consistent — with a
+// negligible collision rate at MUD room counts. (A tool-minted DB-PK lookup table is the eventual
+// stronger form; see the room-identity note — this is the stateless v1.)
+func roomNum(ref ProtoRef) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(ref))
+	return int(h.Sum32())
+}
 
 // gmcp.go is the world-side GMCP emitter (Phase 9.2+): it builds the structured HUD payloads and emits
 // them as ServerFrame_Gmcp frames ALONGSIDE the text prompt, from the same dispatch point — so the HUD
@@ -68,6 +80,34 @@ func (z *Zone) charStatusJSON(e *Entity) []byte {
 		st.Target = e.living.fighting.Name()
 	}
 	b, _ := json.Marshal(st)
+	return b
+}
+
+// roomInfoJSON builds the GMCP Room.Info payload for the room entity r: the stable num, name, zone, the
+// environment (the room's content sector), and exits as direction→destination-num. The client accretes
+// a minimap from num + exits across rooms it has seen; zone groups them; environment picks terrain
+// coloring. (Coordinates — coord [zone,x,y,z] — are 9.3b, pending a content coord schema.)
+func (z *Zone) roomInfoJSON(r *Entity) []byte {
+	zoneName, _ := parseRef(r.proto)
+	info := struct {
+		Num         int            `json:"num"`
+		Name        string         `json:"name"`
+		Zone        string         `json:"zone"`
+		Environment string         `json:"environment,omitempty"`
+		Exits       map[string]int `json:"exits"`
+	}{
+		Num:   roomNum(r.proto),
+		Name:  r.Name(),
+		Zone:  zoneName,
+		Exits: map[string]int{},
+	}
+	if r.room != nil {
+		info.Environment = r.room.sector
+		for dir, dst := range r.room.exits {
+			info.Exits[dir] = roomNum(dst)
+		}
+	}
+	b, _ := json.Marshal(info)
 	return b
 }
 

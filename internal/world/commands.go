@@ -1,6 +1,7 @@
 package world
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"time"
@@ -240,6 +241,15 @@ func (z *Zone) lookRoom(s *session) {
 		}
 	}
 	s.send(textFrame(b.String()))
+
+	// GMCP Room.Info (Phase 9.3): emit the structured room data alongside the look text so a rich
+	// client can update its minimap. Change-detected — re-looking the SAME room doesn't re-emit; only a
+	// room CHANGE (movement) does. lookRoom is the single entry/look chokepoint, so this covers arrival,
+	// join/attach, and an explicit look.
+	if rm := z.roomInfoJSON(r); !bytes.Equal(rm, s.lastRoom) {
+		s.lastRoom = rm
+		s.send(gmcpFrame("Room.Info", rm))
+	}
 }
 
 // move walks the player through an exit: it validates the direction, detaches the

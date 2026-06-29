@@ -40,6 +40,7 @@ type session struct {
 	lastVitals []byte
 	lastStatus []byte
 	lastStats  []byte
+	lastRoom   []byte // last GMCP Room.Info payload (Phase 9.3); re-emitted only on a room change
 
 	// currentZone is the per-connection routing pointer the Play stream owns (server.go):
 	// it names the zone this player's input should be posted to right now. The zone that
