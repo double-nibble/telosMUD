@@ -177,6 +177,15 @@ func (c *Conn) ReadLine() (string, error) {
 // embedded tab; dropping it (rather than converting to a space) keeps targeting
 // keywords clean and avoids smuggling layout control into rendered output. The
 // common case — a line with no control runes — returns its bytes unchanged.
+//
+// SIZE NOTE: the slow path's WriteRune re-encodes each invalid-UTF-8 byte to the
+// 3-byte U+FFFD, so for an invalid-bytes-plus-control line the returned string can
+// be up to ~3× MaxLineBytes (the read loop bounds INPUT bytes, not output). This is
+// benign at the edge — the line is forwarded once over this one connection's Play
+// stream and is NOT fanned out per room occupant here; the world re-caps it with
+// textsan.CleanLine at its gRPC ingress (the post-fan-out byte bound lives THERE, by
+// the edge/world trust split). A future refactor that adds edge-side fan-out or trusts
+// the edge line length must re-cap here (see textsan.CleanLine's double-cap).
 func sanitizeLine(line []byte) string {
 	if !hasControl(line) {
 		return string(line)

@@ -32,8 +32,16 @@ const MaxLineBytes = 4096
 // This is the world-side mirror of the edge's telnet sanitizeLine, applied at the
 // gRPC ingress so a producer that skipped the edge cannot deliver an unbounded or
 // control-laden line. A clean, in-bounds line is returned unchanged.
+//
+// The cap is applied TWICE on purpose. The inner cap bounds the WORK (stripControl
+// never decodes more than MaxLineBytes of input). The outer cap bounds the OUTPUT:
+// stripControl's slow path range-decodes invalid UTF-8 to the 3-byte U+FFFD, so a
+// capped-but-hostile line of invalid bytes (e.g. a control rune followed by 4 KiB of
+// 0xDA) would otherwise EXPAND past MaxLineBytes — a fuzzer (FuzzTextsan) found this.
+// Re-capping after the strip restores the documented byte bound. Cost is nil on the
+// clean fast path (both caps and the strip are unallocated no-ops for in-bounds text).
 func CleanLine(s string) string {
-	return stripControl(capBytes(s, MaxLineBytes))
+	return capBytes(stripControl(capBytes(s, MaxLineBytes)), MaxLineBytes)
 }
 
 // CleanName makes an externally-sourced display name (e.g. a cross-shard handoff
@@ -61,8 +69,12 @@ func CleanName(s string, maxRunes int) string {
 // depth against an over-long broadcast fanning out per room occupant). Engine-generated text
 // is already safe and need not be re-cleaned — apply this ONLY to script-supplied args. A
 // clean, in-bounds string is returned unchanged and unallocated.
+//
+// The byte cap is applied twice for the same reason as CleanLine: the inner cap bounds the
+// strip's work, the outer cap bounds the output after stripControl's slow path expands invalid
+// UTF-8 to U+FFFD (so a hostile script arg of invalid bytes cannot exceed MaxLineBytes).
 func CleanMarkup(s string) string {
-	return stripControl(capBytes(s, MaxLineBytes))
+	return capBytes(stripControl(capBytes(s, MaxLineBytes)), MaxLineBytes)
 }
 
 // capBytes truncates s to at most max bytes, backing off to the nearest rune
