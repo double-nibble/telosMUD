@@ -21,7 +21,11 @@ import (
 // and failing on a LIVE wiring (the transient-broker-outage shape) without rebuilding the shard.
 type flakyBus struct {
 	inner commbus.Bus
-	fail  atomic.Bool
+	fail  atomic.Bool // hard-fail EVERY publish while set
+	// failTellN fails the next N publishes to a TELL subject (telos.comms.tell.*) then auto-recovers.
+	// This models a delivery-time broker blip scoped to tells, so a redelivery test can fail the first
+	// emit attempt and let the bounded-redelivery loop succeed on retry without racing a manual flag.
+	failTellN atomic.Int64
 }
 
 func (b *flakyBus) Role() commbus.Role { return b.inner.Role() }
@@ -29,6 +33,10 @@ func (b *flakyBus) Role() commbus.Role { return b.inner.Role() }
 func (b *flakyBus) Publish(ctx context.Context, subj string, msg commbus.Message) error {
 	if b.fail.Load() {
 		return errors.New("injected: comms bus publish failure")
+	}
+	if strings.HasPrefix(subj, commbus.TellPrefix) && b.failTellN.Load() > 0 {
+		b.failTellN.Add(-1)
+		return errors.New("injected: comms bus tell-emit failure")
 	}
 	return b.inner.Publish(ctx, subj, msg)
 }
@@ -152,4 +160,41 @@ func TestDurableTellNotLostOnEmitFailure(t *testing.T) {
 		t.Fatalf("recovered tell not rendered to the gate: %q", m.Body)
 	}
 	waitTellCursor(t, z, bob, "Alice", 1) // the cursor advanced exactly once, post-recovery
+}
+
+// TestDurableTellRedeliversWithinMaxDeliver is the END-TO-END never-lost pin the distsys review asked
+// for: it drives a real `tell` through the full durable path — PublishDurable → the target's live
+// Consume consumer → routeTellDeliver → deliverDrainedTell — with the FIRST emit attempt failing, and
+// asserts the bounded-redelivery loop (DefaultMaxDeliver=5) RETRIES and delivers the tell EXACTLY ONCE.
+// Unlike TestDurableTellNotLostOnEmitFailure (which re-presents the message directly), this exercises
+// the actual Consume/deliverBounded redelivery machinery — a NAK-then-recover within the window must
+// self-heal, never lose and never duplicate the tell.
+func TestDurableTellRedeliversWithinMaxDeliver(t *testing.T) {
+	core := commbus.NewMemBus()
+	t.Cleanup(func() { _ = core.Close() })
+	js := commbus.NewMemJetStream()
+	t.Cleanup(func() { _ = js.Close() })
+	dir := newFakeLocator("Alice", "Bob")
+
+	flaky := &flakyBus{inner: core.WorldHandle()}
+	z := tellShard(t, flaky, js, dir)
+	bobInbox := subscribeTell(t, core.GateHandle(), "Bob")
+
+	joinTellPlayer(t, z, "Alice")
+	bob := joinTellPlayer(t, z, "Bob")
+
+	// Fail exactly the FIRST tell emit; the bounded-redelivery loop must retry (attempt 2) and succeed —
+	// 1 < DefaultMaxDeliver (5), so the message redelivers rather than parks.
+	flaky.failTellN.Store(1)
+
+	z.post(inputMsg{id: "Alice", line: "tell Bob arrive once"})
+
+	if m := recvTell(t, bobInbox); !strings.Contains(m.Body, "arrive once") {
+		t.Fatalf("tell not delivered via the redelivery loop: %q", m.Body)
+	}
+	assertNoTell(t, bobInbox)             // EXACTLY once — the failed first attempt emitted nothing, no dup
+	waitTellCursor(t, z, bob, "Alice", 1) // cursor advanced once, after the successful retry
+	if n := flaky.failTellN.Load(); n != 0 {
+		t.Fatalf("the injected tell-emit failure was never consumed (%d left) — the redelivery path was not exercised", n)
+	}
 }

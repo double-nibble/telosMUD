@@ -282,12 +282,11 @@ something an author would reasonably want to:
 
 ### Comms chaos coverage follow-ups (W8, from the distsys review of comms_chaos_test.go)
 
-- **End-to-end durable-tell redelivery test (Consume-driven).** `TestDurableTellNotLostOnEmitFailure`
-  pins the cursor-after-emit ORDERING inside `deliverDrainedTell` but re-presents the message by a
-  direct `tellDeliverMsg` post — it bypasses the live `Consume`→`deliverBounded` bounded-retry loop. Add
-  a test that drives a durable tell through the real consumer with the bus failing the first 1–2 attempts
-  then recovering (within `maxDeliver`), asserting the tell renders exactly once + the cursor lands at 1
-  — the actual end-to-end never-lost guarantee. · *distsys/test*
+- ~~**End-to-end durable-tell redelivery test (Consume-driven).**~~ RESOLVED —
+  `TestDurableTellRedeliversWithinMaxDeliver` (comms_chaos_test.go) drives a real `tell` through the full
+  PublishDurable → Consume → deliverBounded path with the first tell emit failing (failTellN), asserting
+  the bounded-redelivery loop retries and delivers EXACTLY ONCE (cursor → 1, no dup). The actual
+  end-to-end never-lost guarantee is now pinned.
 - **MemJetStream park-at-maxDeliver DIVERGES from NATS (document + pin).** `deliverBounded`
   (`internal/commbus/jetstream.go`) re-runs the handler on the same in-memory msg up to `maxDeliver` (3)
   rapid attempts then PARKS (drops); the MemJetStream cursor (`memjs.go`) advances before delivery and
