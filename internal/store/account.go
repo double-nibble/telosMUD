@@ -2,12 +2,15 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/double-nibble/telosmud/internal/world"
 )
 
 // account.go — Phase-14 account/character store methods backing telos-account (docs/ACCOUNT.md). These are
@@ -82,6 +85,22 @@ func (p *Pool) CreateAccountCharacter(ctx context.Context, accountID, name, zone
 		return "", fmt.Errorf("store: create character %q for account %s: %w", name, accountID, err)
 	}
 	return id.String(), nil
+}
+
+// CreateCharacterWithChargen creates an account-owned character carrying a Phase-14.8 first-spawn chargen
+// marker (the chosen bundles + bought attribute values). It marshals the world-side ChargenResult into the
+// chargen column so the caller (telos-account) needs no knowledge of that serialization. An empty bundles+attrs
+// is allowed (a bare character with no build). Returns ErrNameTaken on a unique-name conflict.
+func (p *Pool) CreateCharacterWithChargen(ctx context.Context, accountID, name, zoneRef, roomRef string, bundles []string, attrs map[string]float64) (string, error) {
+	var marker []byte
+	if len(bundles) > 0 || len(attrs) > 0 {
+		b, err := json.Marshal(world.ChargenResult{Bundles: bundles, Attrs: attrs})
+		if err != nil {
+			return "", fmt.Errorf("store: marshal chargen marker for %q: %w", name, err)
+		}
+		marker = b
+	}
+	return p.CreateAccountCharacter(ctx, accountID, name, zoneRef, roomRef, nil, marker)
 }
 
 // isUniqueViolation reports whether err is a Postgres unique-constraint violation (SQLSTATE 23505).

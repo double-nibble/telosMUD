@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/store"
 )
 
@@ -28,10 +29,21 @@ type LinkCodeMinter interface {
 	Mint(ctx context.Context, accountID, characterID string, ttl time.Duration) (string, error)
 }
 
+// ChargenService renders + validates the content-driven character-generation flow (Phase 14.8). The account
+// Service satisfies it in-process; nil => the website hides chargen (no create-character flow).
+type ChargenService interface {
+	// ChargenFlow returns the content flow + selectable bundle options + whether chargen is configured.
+	ChargenFlow() (content.ChargenDTO, []content.ChargenBundleOption, bool)
+	// BuildCharacter validates the submission + creates the character, returning the new id, or a non-empty
+	// user-facing reason on a validation failure (err nil), or err on an internal failure.
+	BuildCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (id string, reason string, err error)
+}
+
 // Server is the website. Construct with New, then ServeHTTP / Handler().
 type Server struct {
 	store         Store
 	codes         LinkCodeMinter
+	chargen       ChargenService // Phase 14.8; nil => no create-character flow
 	provider      OAuthProvider
 	sign          signer
 	secureCookies bool
@@ -48,7 +60,8 @@ type Config struct {
 	SecureCookies bool   // set Secure on cookies (true when served over TLS)
 	LinkCodeTTL   time.Duration
 	GateHint      string
-	Dev           bool // dev instance: render the -dev logo variant so operators can tell it from prod
+	Dev           bool           // dev instance: render the -dev logo variant so operators can tell it from prod
+	Chargen       ChargenService // Phase 14.8 character-generation flow; nil => no create-character page
 	Log           *slog.Logger
 }
 
@@ -79,6 +92,7 @@ func New(st Store, codes LinkCodeMinter, cfg Config) *Server {
 	return &Server{
 		store:         st,
 		codes:         codes,
+		chargen:       cfg.Chargen,
 		provider:      cfg.Provider,
 		sign:          signer{key: cfg.SessionKey},
 		secureCookies: cfg.SecureCookies,
@@ -97,6 +111,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /login", s.handleLogin)
 	mux.HandleFunc("GET /auth/github/callback", s.handleCallback)
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
+	mux.HandleFunc("GET /chargen", s.handleChargenForm)
+	mux.HandleFunc("POST /chargen", s.handleChargenCreate)
 	mux.HandleFunc("POST /play", s.handlePlay)
 	mux.HandleFunc("POST /logout", s.handleLogout) // POST (not GET): logout is state-changing; a GET enables logout-CSRF
 	return mux
@@ -199,7 +215,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "dashboard", err)
 		return
 	}
-	s.render(w, "dashboard", map[string]any{"Name": name, "Characters": chars})
+	s.render(w, "dashboard", map[string]any{"Name": name, "Characters": chars, "CanCreate": s.chargen != nil})
 }
 
 // handlePlay mints a single-use link code for the account and shows the connect instructions.

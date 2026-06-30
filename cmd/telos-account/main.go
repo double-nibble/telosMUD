@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/account"
 	"github.com/double-nibble/telosmud/internal/assertion"
 	"github.com/double-nibble/telosmud/internal/config"
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/obs"
 	"github.com/double-nibble/telosmud/internal/store"
 	"github.com/double-nibble/telosmud/internal/web"
@@ -63,6 +65,16 @@ func main() {
 
 	// A freshly-created character starts in the demo pack's start room (Phase 14.8 may let content choose).
 	svc := account.New(pool, slog.Default(), "midgaard", "midgaard:room:temple")
+
+	// Chargen (Phase 14.8): load the pack's content once and hand the service the chargen flow + bundle
+	// options, so the website can render + validate the signup form. A content reload needs a restart to
+	// take effect here (the website's form is not hot-reloaded). No content => no create-character page.
+	if flow, options, ok := loadChargen(ctx, pool); ok {
+		svc.WithChargen(flow, options)
+		slog.Info("chargen flow loaded", "steps", len(flow.Steps), "bundle_options", len(options))
+	} else {
+		slog.Warn("no chargen flow in content: the website offers no create-character page")
+	}
 
 	// Link codes (Phase 14.2) live in Redis (cross-process + native TTL). Without Redis the service still
 	// boots, but Mint/RedeemLinkCode return Unavailable (the website's Play bridge needs a code store).
@@ -104,7 +116,7 @@ func main() {
 	// addr the website is off (the gRPC API still serves).
 	var webSrv *http.Server
 	if cfg.WebListen != "" && codes != nil {
-		web := newWebsite(cfg, pool, codes)
+		web := newWebsite(cfg, pool, codes, svc)
 		webSrv = &http.Server{Addr: cfg.WebListen, Handler: web.Handler(), ReadHeaderTimeout: 10 * time.Second}
 		go func() {
 			slog.Info("website listening", "addr", cfg.WebListen, "oauth", cfg.GithubClientID != "")
@@ -137,7 +149,7 @@ func main() {
 // newWebsite builds the Phase-14.7 website over the store + the link-code minter. The OAuth redirect defaults
 // to the dev callback; the session key is loaded from config or generated ephemeral (a restart then drops
 // existing web sessions — fine for dev, set TELOS_WEB_SESSION_KEY in prod).
-func newWebsite(cfg config.Config, pool *store.Pool, codes account.LinkCodeStore) *web.Server {
+func newWebsite(cfg config.Config, pool *store.Pool, codes account.LinkCodeStore, chargen web.ChargenService) *web.Server {
 	redirect := cfg.OAuthRedirectURL
 	if redirect == "" {
 		redirect = "http://localhost:8080/auth/github/callback"
@@ -148,8 +160,37 @@ func newWebsite(cfg config.Config, pool *store.Pool, codes account.LinkCodeStore
 		SecureCookies: cfg.WebSecureCookies, // secure-by-default (config); dev over plain http sets TELOS_WEB_SECURE_COOKIES=0
 		GateHint:      cfg.WebGateHint,
 		Dev:           cfg.Env == "dev", // renders the -dev logo badge
+		Chargen:       chargen,
 		Log:           slog.Default(),
 	})
+}
+
+// loadChargen loads the pack content and returns the chargen flow + the selectable bundle options (race/class/
+// …) the website renders. ok=false when content is absent or defines no chargen flow.
+func loadChargen(ctx context.Context, pool *store.Pool) (content.ChargenDTO, []content.ChargenBundleOption, bool) {
+	lc, err := content.Load(ctx, pool, []string{content.DemoPack})
+	if err != nil || lc == nil || len(lc.Chargens) == 0 {
+		return content.ChargenDTO{}, nil, false
+	}
+	flow := lc.Chargens[0] // one flow per pack by convention
+	options := make([]content.ChargenBundleOption, 0, len(lc.Bundles))
+	for _, b := range lc.Bundles {
+		// Only race/class/background-style bundles are chargen picks; a profession bundle is learned in-world.
+		if b.Kind == "profession" {
+			continue
+		}
+		options = append(options, content.ChargenBundleOption{Ref: b.Ref, Kind: b.Kind, Label: titleize(b.Ref)})
+	}
+	return flow, options, true
+}
+
+// titleize upper-cases the first letter of a bundle ref for a display label ("fighter" -> "Fighter"). A
+// content-supplied display name would be richer; the ref is a serviceable label until then.
+func titleize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 // webSessionKey decodes the configured base64 HMAC key, or generates an ephemeral one (with a warning).

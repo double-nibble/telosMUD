@@ -31,9 +31,31 @@ const pageTemplates = `
  <h2 style="font-size:1.2rem;margin-top:0">Your characters</h2>
  {{if .Characters}}<ul>{{range .Characters}}<li>{{.Name}}{{if .ZoneRef}} <span class="muted">({{.ZoneRef}})</span>{{end}}</li>{{end}}</ul>
  {{else}}<p class="muted">No characters yet.</p>{{end}}
+ {{if .CanCreate}}<p style="margin-top:1rem"><a class="btn" href="/chargen">Create a character</a></p>{{end}}
 </div>
 <form method="post" action="/play"><button type="submit">Play &rarr; get a link code</button></form>
 <form method="post" action="/logout" style="margin-top:2rem"><button class="muted" type="submit" style="background:none;color:#666;padding:0;border:0;text-decoration:underline">Sign out</button></form>
+{{template "foot"}}{{end}}
+
+{{define "chargen"}}{{template "head"}}
+<h1>Create a character</h1>
+{{if .Error}}<div class="card" style="border-color:#d33;color:#a00">{{.Error}}</div>{{end}}
+<form method="post" action="/chargen">
+ <div class="card">
+  <label>Name<br><input name="name" value="{{.Name}}" required autofocus style="font:inherit;padding:.4rem;width:16rem"></label>
+ </div>
+ {{range .Steps}}<div class="card">
+  <h2 style="font-size:1.1rem;margin-top:0">{{if .Prompt}}{{.Prompt}}{{else}}{{.ID}}{{end}}</h2>
+  {{if eq .Kind "bundle_choice"}}
+   {{$sid := .ID}}{{range $i, $o := .Options}}<label style="display:block;margin:.25rem 0"><input type="radio" name="{{$sid}}" value="{{$o.Ref}}"{{if eq $i 0}} checked{{end}}> {{$o.Label}}</label>{{end}}
+  {{else if eq .Kind "point_buy"}}
+   <p class="muted">{{.Points}} points · each {{.Min}}&ndash;{{.Max}}</p>
+   {{$step := .}}{{range .Attributes}}<label style="display:inline-block;margin:.25rem 1rem .25rem 0">{{.}}<br><input type="number" name="{{$step.ID}}_{{.}}" value="{{$step.Base}}" min="{{$step.Min}}" max="{{$step.Max}}" style="font:inherit;padding:.3rem;width:5rem"></label>{{end}}
+  {{end}}
+ </div>{{end}}
+ <button type="submit">Create</button>
+</form>
+<p style="margin-top:1.5rem"><a class="muted" href="/dashboard">&larr; Back to dashboard</a></p>
 {{template "foot"}}{{end}}
 
 {{define "play"}}{{template "head"}}

@@ -114,7 +114,9 @@ session cookie. Account dashboard + character management; the **Play** button mi
   **Deferred to the capstone:** pointing the gate at telos-account (`ACCOUNT_TARGET`) so a web-minted code
   redeems end-to-end over telnet — held back here so stub-login smoke/e2e stays green.
 
-### 14.8 — Content-driven chargen front-end
+### 14.8 — Content-driven chargen front-end ✅ DONE (2026-06-30)
+<!-- 14.8a (chargen_defs + world first-spawn apply) + 14.8b (validator + account BuildCharacter + web form) all landed. -->
+
 Chargen is content, not hardcoded (PRINCIPLES.md), and — per the user (2026-06-30) — **not boxed into one
 system**: content drives *how* generation works (roll-and-assign, point-buy, standard array, 1-stat-then-
 spend-XP, …). The abstraction is a **content `chargen` flow = ordered STEPS**, each a `kind`:

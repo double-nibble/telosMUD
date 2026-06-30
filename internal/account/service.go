@@ -16,6 +16,7 @@ import (
 
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
 	"github.com/double-nibble/telosmud/internal/assertion"
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/passphrase"
 	"github.com/double-nibble/telosmud/internal/store"
 )
@@ -30,6 +31,8 @@ type CharStore interface {
 	AccountCharacters(ctx context.Context, accountID string) ([]store.CharacterSummary, error)
 	NameAvailable(ctx context.Context, name string) (bool, error)
 	CreateAccountCharacter(ctx context.Context, accountID, name, zoneRef, roomRef string, state, chargen []byte) (string, error)
+	// CreateCharacterWithChargen (Phase 14.8) creates a character carrying the first-spawn chargen marker.
+	CreateCharacterWithChargen(ctx context.Context, accountID, name, zoneRef, roomRef string, bundles []string, attrs map[string]float64) (string, error)
 	// Phase 14.5 passphrase auth.
 	CharacterAccount(ctx context.Context, name string) (string, bool, error)
 	AccountAuth(ctx context.Context, accountID string) (store.PassphraseAuth, bool, error)
@@ -61,6 +64,12 @@ type Service struct {
 	// pack's start room). Config-supplied; later chargen (14.8) may let content choose a starting zone.
 	startZone string
 	startRoom string
+	// Chargen (Phase 14.8): the content flow + selectable bundle options the website renders + validates
+	// against. Empty (chargenOK=false) => the website falls back to a bare name-only create.
+	chargenFlow    content.ChargenDTO
+	chargenOptions []content.ChargenBundleOption
+	chargenKind    map[string]string // bundle ref -> kind (the bundle_choice legality check)
+	chargenOK      bool
 }
 
 // New builds the Account service over a character store.
@@ -74,6 +83,51 @@ func New(cs CharStore, log *slog.Logger, startZone, startRoom string) *Service {
 		ipThrottle: newIPThrottle(20, time.Minute), // 20 passphrase attempts/min per source IP
 		startZone:  startZone, startRoom: startRoom,
 	}
+}
+
+// WithChargen wires the content chargen flow + selectable bundle options (Phase 14.8). The website reads them
+// to render + validate the signup form. Without it, the website offers a bare name-only create.
+func (s *Service) WithChargen(flow content.ChargenDTO, options []content.ChargenBundleOption) *Service {
+	s.chargenFlow = flow
+	s.chargenOptions = options
+	s.chargenKind = make(map[string]string, len(options))
+	for _, o := range options {
+		s.chargenKind[o.Ref] = o.Kind
+	}
+	s.chargenOK = len(flow.Steps) > 0
+	return s
+}
+
+// ChargenFlow returns the content chargen flow + bundle options + whether chargen is configured (the website
+// renders the form from these).
+func (s *Service) ChargenFlow() (content.ChargenDTO, []content.ChargenBundleOption, bool) {
+	return s.chargenFlow, s.chargenOptions, s.chargenOK
+}
+
+// BuildCharacter validates a chargen submission (name + the flow's picks/allocations) and creates the
+// character with its first-spawn marker. It returns a non-empty user-facing reason for a validation failure
+// (err nil); err is reserved for an internal failure. The website calls it in-process (the gate has no
+// telnet chargen yet).
+func (s *Service) BuildCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (id string, reason string, err error) {
+	if accountID == "" {
+		return "", "", status.Error(codes.InvalidArgument, "account_id required")
+	}
+	if r, ok := ValidateCharacterName(name); !ok {
+		return "", r, nil
+	}
+	bundles, attrs, r := content.ValidateChargen(s.chargenFlow, picks, allocs, s.chargenKind)
+	if r != "" {
+		return "", r, nil
+	}
+	cid, err := s.store.CreateCharacterWithChargen(ctx, accountID, name, s.startZone, s.startRoom, bundles, attrs)
+	if err != nil {
+		if errors.Is(err, store.ErrNameTaken) {
+			return "", "That name is already taken.", nil
+		}
+		s.log.Error("BuildCharacter", "account", accountID, "name", name, "err", err)
+		return "", "", status.Error(codes.Internal, "create character failed")
+	}
+	return cid, "", nil
 }
 
 // WithLinkCodes wires the link-code store (Phase 14.2). Without it, Mint/RedeemLinkCode return Unavailable.

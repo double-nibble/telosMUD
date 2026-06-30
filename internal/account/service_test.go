@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/store"
 )
 
@@ -85,6 +86,10 @@ func (f *fakeStore) CreateAccountCharacter(_ context.Context, accountID, name, _
 	f.taken[name] = true
 	f.chars[accountID] = append(f.chars[accountID], store.CharacterSummary{ID: "id-" + name, Name: name})
 	return "id-" + name, nil
+}
+
+func (f *fakeStore) CreateCharacterWithChargen(ctx context.Context, accountID, name, zoneRef, roomRef string, _ []string, _ map[string]float64) (string, error) {
+	return f.CreateAccountCharacter(ctx, accountID, name, zoneRef, roomRef, nil, nil)
 }
 
 func newTestService(fs *fakeStore) *Service {
@@ -169,5 +174,42 @@ func TestValidateCharacterName(t *testing.T) {
 		if ok != tc.ok || reason != tc.reason {
 			t.Errorf("ValidateCharacterName(%q) = (%q,%v), want (%q,%v)", tc.name, reason, ok, tc.reason, tc.ok)
 		}
+	}
+}
+
+// TestBuildCharacter (Phase 14.8b) covers the chargen create path: a valid submission creates the character,
+// and validation failures (wrong-kind pick, bad name) return a user-facing reason without an error.
+func TestBuildCharacter(t *testing.T) {
+	svc := New(newFakeStore(), nil, "midgaard", "midgaard:room:temple")
+	pb := content.ChargenStepDTO{Kind: "point_buy", ID: "attrs", Attributes: []string{"strength"}, Points: 9, Base: 8, Min: 8, Max: 15, Cost: map[string]int{"8": 0, "15": 9}}
+	svc.WithChargen(content.ChargenDTO{Steps: []content.ChargenStepDTO{
+		{Kind: "bundle_choice", ID: "race", BundleKind: "race", Pick: 1},
+		pb,
+	}}, []content.ChargenBundleOption{{Ref: "elf", Kind: "race", Label: "Elf"}})
+	ctx := context.Background()
+
+	// Valid: creates the character.
+	id, reason, err := svc.BuildCharacter(ctx, "acct1", "Legolas",
+		map[string]string{"race": "elf"}, map[string]map[string]int{"attrs": {"strength": 15}})
+	if err != nil || reason != "" || id == "" {
+		t.Fatalf("valid build: id=%q reason=%q err=%v", id, reason, err)
+	}
+
+	// Wrong-kind pick: a user-facing reason, no error, no create.
+	if _, reason, err := svc.BuildCharacter(ctx, "acct1", "Bad",
+		map[string]string{"race": "nonexistent"}, map[string]map[string]int{"attrs": {"strength": 8}}); err != nil || reason == "" {
+		t.Fatalf("wrong-kind pick: want a reason, got reason=%q err=%v", reason, err)
+	}
+
+	// Empty name: rejected with a reason.
+	if _, reason, err := svc.BuildCharacter(ctx, "acct1", "",
+		map[string]string{"race": "elf"}, map[string]map[string]int{"attrs": {"strength": 15}}); err != nil || reason == "" {
+		t.Fatalf("empty name: want a reason, got reason=%q err=%v", reason, err)
+	}
+
+	// Duplicate name: ErrNameTaken mapped to a friendly reason.
+	if _, reason, _ := svc.BuildCharacter(ctx, "acct1", "Legolas",
+		map[string]string{"race": "elf"}, map[string]map[string]int{"attrs": {"strength": 15}}); reason == "" {
+		t.Fatal("duplicate name should return a 'name taken' reason")
 	}
 }
