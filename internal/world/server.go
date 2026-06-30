@@ -13,6 +13,7 @@ import (
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/assertion"
+	"github.com/double-nibble/telosmud/internal/sessionlock"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
@@ -192,6 +193,28 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	})
 	s.log.Debug("player stream ready", "character", character, "zone", zone.id)
 
+	// Phase 14.4 single-session lock: on a FRESH login (a handoff re-dial already holds the lock under the
+	// same character), ACQUIRE the cross-shard lock (takeover) and start a renewer. A session displaced by a
+	// newer login anywhere in the fleet sees its renew fail and self-kicks; the lock is released on teardown.
+	// A Redis hiccup at acquire degrades to unlocked (we never block login on the lock).
+	if token == "" && s.shard.sessionLock != nil {
+		lockToken := uuid.NewString()
+		key := sessionlock.Key(character)
+		actx, acancel := context.WithTimeout(ctx, 2*time.Second)
+		_, lerr := s.shard.sessionLock.Acquire(actx, key, lockToken, s.shard.lockTTL)
+		acancel()
+		if lerr != nil {
+			s.log.Warn("session lock acquire failed (continuing unlocked)", "character", character, "err", lerr)
+		} else {
+			go s.runSessionLockRenewer(ctx, character, lockToken, out)
+			defer func() {
+				rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = s.shard.sessionLock.Release(rctx, key, lockToken)
+				rcancel()
+			}()
+		}
+	}
+
 	// Reader loop: translate client frames into zone inbox messages, posting each to
 	// the player's CURRENT zone (which can change as they walk between this shard's
 	// zones). detach/leave likewise go to the current zone.
@@ -233,4 +256,34 @@ done:
 	}
 	s.log.Debug("stream closing", "character", character, "clean", cleanQuit)
 	return nil
+}
+
+// runSessionLockRenewer heartbeats this connection's single-session lock (Phase 14.4). On each tick it
+// renews the lock; if the renew reports the lock was LOST (a newer login took it over, anywhere in the
+// fleet), it kicks THIS connection (displacedKick -> the gate closes the socket -> the reader loop ends ->
+// the deferred Release runs). A transient renew error does NOT kick (one Redis blip shouldn't drop a live
+// player); only a definitive "not owned" does. Runs until the stream ctx is cancelled (the connection ended).
+func (s *playServer) runSessionLockRenewer(ctx context.Context, character, token string, out chan *playv1.ServerFrame) {
+	t := time.NewTicker(s.shard.lockRenew)
+	defer t.Stop()
+	key := sessionlock.Key(character)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			rctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			owned, err := s.shard.sessionLock.Renew(rctx, key, token, s.shard.lockTTL)
+			cancel()
+			if err != nil {
+				s.log.Warn("session lock renew failed (not kicking on a transient error)", "character", character, "err", err)
+				continue
+			}
+			if !owned {
+				s.log.Debug("session lock lost to a newer login; kicking this connection", "character", character)
+				displacedKick(out, 0)
+				return
+			}
+		}
+	}
 }

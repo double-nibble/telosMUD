@@ -35,6 +35,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
 	roster "github.com/double-nibble/telosmud/internal/presence"
+	"github.com/double-nibble/telosmud/internal/sessionlock"
 )
 
 // handoffRPCTimeout bounds the whole source-side handoff conversation (ShardForZone/
@@ -83,6 +84,15 @@ type Shard struct {
 	// session assertion against it OFFLINE on a fresh-login Attach (no per-connect RPC to account). nil =>
 	// assertions are NOT enforced (dev / pre-14.3 — the shard trusts the gate's asserted identity directly).
 	verifyKey ed25519.PublicKey
+
+	// sessionLock is the Phase-14.4 cross-shard single-session lock (sessionlock.Lock): on a fresh login the
+	// stream goroutine ACQUIRES it (takeover) and a renewer heartbeats it; a session displaced by a newer
+	// login (anywhere in the fleet) sees its renew fail and self-kicks. nil => not enforced (no Redis / dev).
+	// lockTTL is the key's expiry (a crashed connection self-clears after it); lockRenew is the heartbeat
+	// cadence (also how fast a takeover is noticed). Both default if zero (DefaultLockTTL/DefaultLockRenew).
+	sessionLock sessionlock.Lock
+	lockTTL     time.Duration
+	lockRenew   time.Duration
 
 	mu         sync.Mutex       // guards tokenIndex
 	tokenIndex map[string]*Zone // handoff token -> hosting zone (populated by Prepare)
@@ -277,6 +287,29 @@ func (s *Shard) WithComms(bus commbus.Bus) *Shard {
 // called before Run.
 func (s *Shard) WithVerifyKey(pub ed25519.PublicKey) *Shard {
 	s.verifyKey = pub
+	return s
+}
+
+// Default single-session lock timing (Phase 14.4): the key lives DefaultLockTTL (a crash self-clears after
+// it) and is heartbeated every DefaultLockRenew (also the takeover-detection latency).
+const (
+	DefaultLockTTL   = 30 * time.Second
+	DefaultLockRenew = 10 * time.Second
+)
+
+// WithSessionLock wires the cross-shard single-session lock (Phase 14.4). ttl/renew default when zero; tests
+// pass small values for a fast takeover. Without this the shard relies only on the within-shard takeover
+// (zone.go). Must be called before Run.
+func (s *Shard) WithSessionLock(lock sessionlock.Lock, ttl, renew time.Duration) *Shard {
+	s.sessionLock = lock
+	s.lockTTL = ttl
+	if s.lockTTL <= 0 {
+		s.lockTTL = DefaultLockTTL
+	}
+	s.lockRenew = renew
+	if s.lockRenew <= 0 {
+		s.lockRenew = DefaultLockRenew
+	}
 	return s
 }
 

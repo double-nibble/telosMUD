@@ -33,6 +33,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/placement"
 	"github.com/double-nibble/telosmud/internal/presence"
 	"github.com/double-nibble/telosmud/internal/scopebus"
+	"github.com/double-nibble/telosmud/internal/sessionlock"
 	"github.com/double-nibble/telosmud/internal/store"
 	"github.com/double-nibble/telosmud/internal/world"
 )
@@ -251,6 +252,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithHotReload(defSource, bus, enabledPacks).
 		WithComms(comms).
 		WithVerifyKey(verifyKey).
+		WithSessionLock(sessionlock.NewRedis(rdb), 0, 0). // Phase 14.4: cross-shard single-session lock (Redis)
 		WithScopeBus(scopeBus, lc.Regions).
 		WithPresence(roster, cfg.ShardID).
 		WithMail(mailStore).
