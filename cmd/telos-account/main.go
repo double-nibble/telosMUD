@@ -76,17 +76,18 @@ func main() {
 		slog.Warn("no chargen flow in content: the website offers no create-character page")
 	}
 
-	// Link codes (Phase 14.2) live in Redis (cross-process + native TTL). Without Redis the service still
-	// boots, but Mint/RedeemLinkCode return Unavailable (the website's Play bridge needs a code store).
-	var codes account.LinkCodeStore
+	// Redis backs both the legacy link codes (Phase 14.2) AND the Phase-15 device-auth sessions (the terminal
+	// OAuth bridge). Without Redis the auth bridges are unavailable (the gate's device login needs the store).
+	redisUp := false
 	if cfg.Redis.Addr != "" {
 		rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 		defer func() { _ = rdb.Close() }()
-		codes = account.NewRedisLinkCodes(rdb)
-		svc.WithLinkCodes(codes)
-		slog.Info("link codes enabled (redis)", "addr", cfg.Redis.Addr)
+		svc.WithLinkCodes(account.NewRedisLinkCodes(rdb))
+		svc.WithDeviceAuth(account.NewRedisDeviceAuth(rdb), cfg.WebPublicURL)
+		redisUp = true
+		slog.Info("auth bridges enabled (redis)", "addr", cfg.Redis.Addr, "public_url", cfg.WebPublicURL)
 	} else {
-		slog.Warn("no Redis configured: link codes disabled (Mint/RedeemLinkCode unavailable)")
+		slog.Warn("no Redis configured: link codes + device auth disabled")
 	}
 
 	// Session-assertion signing (Phase 14.3): load the Ed25519 private key if configured. Without it,
@@ -111,17 +112,17 @@ func main() {
 	gs := grpc.NewServer()
 	accountv1.RegisterAccountServer(gs, svc)
 
-	// Website + OAuth (Phase 14.7): served on cfg.WebListen when configured. It needs the link-code store
-	// (the Play button) and GitHub OAuth credentials (from the gitignored auth.local.env). Without a listen
-	// addr the website is off (the gRPC API still serves).
+	// OAuth broker (Phase 15): served on cfg.WebListen when configured. It needs the device-auth store (Redis)
+	// to mark sessions authed, plus GitHub OAuth credentials (from the gitignored auth.local.env). Without a
+	// listen addr or Redis the broker is off (the gRPC API still serves).
 	var webSrv *http.Server
-	if cfg.WebListen != "" && codes != nil {
-		web := newWebsite(cfg, pool, codes, svc)
-		webSrv = &http.Server{Addr: cfg.WebListen, Handler: web.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	if cfg.WebListen != "" && redisUp {
+		broker := newBroker(cfg, pool, svc)
+		webSrv = &http.Server{Addr: cfg.WebListen, Handler: broker.Handler(), ReadHeaderTimeout: 10 * time.Second}
 		go func() {
-			slog.Info("website listening", "addr", cfg.WebListen, "oauth", cfg.GithubClientID != "")
+			slog.Info("oauth broker listening", "addr", cfg.WebListen, "oauth", cfg.GithubClientID != "")
 			if err := webSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				slog.Error("website serve failed", "err", err)
+				slog.Error("broker serve failed", "err", err)
 			}
 		}()
 	}
@@ -146,21 +147,16 @@ func main() {
 	}
 }
 
-// newWebsite builds the Phase-14.7 website over the store + the link-code minter. The OAuth redirect defaults
-// to the dev callback; the session key is loaded from config or generated ephemeral (a restart then drops
-// existing web sessions — fine for dev, set TELOS_WEB_SESSION_KEY in prod).
-func newWebsite(cfg config.Config, pool *store.Pool, codes account.LinkCodeStore, chargen web.ChargenService) *web.Server {
-	redirect := cfg.OAuthRedirectURL
-	if redirect == "" {
-		redirect = "http://localhost:8080/auth/github/callback"
-	}
-	return web.New(pool, codes, web.Config{
-		Provider:      web.GitHubProvider(cfg.GithubClientID, cfg.GithubClientSecret, redirect),
+// newBroker builds the Phase-15 OAuth broker over the store (identity resolution) + the device authorizer (the
+// account Service, in-process). The OAuth callback derives from the broker's public URL; the session key signs
+// the OAuth-flow cookie (config or ephemeral — a restart only drops in-flight logins, which is fine).
+func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer) *web.Server {
+	return web.New(st, web.Config{
+		Provider:      web.GitHubProvider(cfg.GithubClientID, cfg.GithubClientSecret, cfg.WebPublicURL+"/auth/github/callback"),
+		Authorizer:    authorizer,
 		SessionKey:    webSessionKey(cfg.WebSessionKey),
 		SecureCookies: cfg.WebSecureCookies, // secure-by-default (config); dev over plain http sets TELOS_WEB_SECURE_COOKIES=0
-		GateHint:      cfg.WebGateHint,
-		Dev:           cfg.Env == "dev", // renders the -dev logo badge
-		Chargen:       chargen,
+		Dev:           cfg.Env == "dev",     // renders the -dev logo badge
 		Log:           slog.Default(),
 	})
 }

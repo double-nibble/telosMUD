@@ -6,82 +6,57 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
-
-	"github.com/double-nibble/telosmud/internal/content"
-	"github.com/double-nibble/telosmud/internal/store"
 )
 
-// server.go — the telos-account website (Phase 14.7): GitHub OAuth sign-in, the account dashboard, and the
-// Play bridge. Server-rendered html/template; sessions are signed cookies (session.go); the OAuth flow is
-// Authorization Code + PKCE (oauth.go). It depends on the store + a link-code minter through narrow
-// interfaces so the handler tests run with in-memory fakes + a stubbed OAuth provider (hermetic CI).
+// server.go — the telos-account OAUTH BROKER (Phase 15). It is no longer a website: it is a bare auth bridge
+// for the terminal-native device flow. The gate mints a device_code and shows the player a one-click link to
+// `/login/<device_code>`; the broker runs OAuth (Authorization Code + PKCE), resolves-or-creates the account,
+// and marks the device session AUTHED so the gate's poll proceeds. There is no dashboard, no form, no Play, no
+// persistent session — a device login is one-shot. Narrow interfaces keep the handler tests hermetic.
 
-// Store is the persistence surface the website needs.
+// Store is the persistence surface the broker needs: just the OAuth identity resolution.
 type Store interface {
 	FindIdentity(ctx context.Context, provider, providerUID string) (string, bool, error)
 	CreateAccountWithIdentity(ctx context.Context, provider, providerUID, email, displayName string) (string, error)
-	AccountDisplayName(ctx context.Context, accountID string) (string, bool, error)
-	AccountCharacters(ctx context.Context, accountID string) ([]store.CharacterSummary, error)
 }
 
-// LinkCodeMinter mints a link code for the Play button (account.LinkCodeStore satisfies this).
-type LinkCodeMinter interface {
-	Mint(ctx context.Context, accountID, characterID string, ttl time.Duration) (string, error)
+// DeviceAuthorizer flips a pending device session to authed once the browser completes OAuth (the account
+// Service satisfies it in-process). ok=false means the device code is unknown/expired (a stale/forged link).
+type DeviceAuthorizer interface {
+	AuthorizeDevice(ctx context.Context, deviceCode, accountID string) (bool, error)
 }
 
-// ChargenService renders + validates the content-driven character-generation flow (Phase 14.8). The account
-// Service satisfies it in-process; nil => the website hides chargen (no create-character flow).
-type ChargenService interface {
-	// ChargenFlow returns the content flow + selectable bundle options + whether chargen is configured.
-	ChargenFlow() (content.ChargenDTO, []content.ChargenBundleOption, bool)
-	// BuildCharacter validates the submission + creates the character, returning the new id, or a non-empty
-	// user-facing reason on a validation failure (err nil), or err on an internal failure.
-	BuildCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (id string, reason string, err error)
-}
-
-// Server is the website. Construct with New, then ServeHTTP / Handler().
+// Server is the broker. Construct with New, then Handler().
 type Server struct {
 	store         Store
-	codes         LinkCodeMinter
-	chargen       ChargenService // Phase 14.8; nil => no create-character flow
+	authorizer    DeviceAuthorizer
 	provider      OAuthProvider
 	sign          signer
 	secureCookies bool
-	linkCodeTTL   time.Duration
-	gateHint      string // shown on the Play page ("connect to <host> and type: connect <code>")
 	tmpl          *template.Template
 	log           *slog.Logger
 }
 
-// Config carries the website's wiring.
+// Config carries the broker's wiring.
 type Config struct {
 	Provider      OAuthProvider
-	SessionKey    []byte // HMAC key for signed cookies (a stable random key in prod)
-	SecureCookies bool   // set Secure on cookies (true when served over TLS)
-	LinkCodeTTL   time.Duration
-	GateHint      string
-	Dev           bool           // dev instance: render the -dev logo variant so operators can tell it from prod
-	Chargen       ChargenService // Phase 14.8 character-generation flow; nil => no create-character page
+	Authorizer    DeviceAuthorizer
+	SessionKey    []byte // HMAC key for the signed flow cookie (a stable random key in prod)
+	SecureCookies bool   // set Secure on the cookie (true when served over TLS)
+	Dev           bool   // dev instance: render the -dev logo variant
 	Log           *slog.Logger
 }
 
-// New builds the website Server. It PANICS on a SessionKey shorter than 16 bytes: that key is the sole secret
-// underwriting every signed cookie, and an empty/weak key makes session cookies universally forgeable (account
-// impersonation). Failing loud here is the guardrail against a caller misconfig (security audit F3).
-func New(st Store, codes LinkCodeMinter, cfg Config) *Server {
+// New builds the broker. It PANICS on a SessionKey shorter than 16 bytes — that key signs the OAuth-flow
+// cookie (the CSRF state + PKCE verifier + device_code), so a weak key makes the flow forgeable.
+func New(st Store, cfg Config) *Server {
 	if len(cfg.SessionKey) < 16 {
-		panic("web: SessionKey must be at least 16 bytes (it signs all session cookies)")
+		panic("web: SessionKey must be at least 16 bytes (it signs the OAuth flow cookie)")
 	}
 	log := cfg.Log
 	if log == nil {
 		log = slog.Default()
 	}
-	ttl := cfg.LinkCodeTTL
-	if ttl <= 0 {
-		ttl = 5 * time.Minute
-	}
-	// The logo URL is fixed at construction (by env), exposed to every template via the logoURL func so the
-	// shared {{template "head"}} can reference it without threading data through each page's pipeline.
 	logoURL := "/assets/telosmud-logo.svg"
 	if cfg.Dev {
 		logoURL = "/assets/telosmud-logo-dev.svg"
@@ -91,46 +66,41 @@ func New(st Store, codes LinkCodeMinter, cfg Config) *Server {
 		Parse(pageTemplates))
 	return &Server{
 		store:         st,
-		codes:         codes,
-		chargen:       cfg.Chargen,
+		authorizer:    cfg.Authorizer,
 		provider:      cfg.Provider,
 		sign:          signer{key: cfg.SessionKey},
 		secureCookies: cfg.SecureCookies,
-		linkCodeTTL:   ttl,
-		gateHint:      cfg.GateHint,
 		tmpl:          tmpl,
 		log:           log,
 	}
 }
 
-// Handler returns the website's HTTP handler (the route mux).
+// Handler returns the broker's HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /assets/", assetsHandler())
 	mux.HandleFunc("GET /", s.handleHome)
-	mux.HandleFunc("GET /login", s.handleLogin)
+	mux.HandleFunc("GET /login/{device}", s.handleDeviceLogin)
 	mux.HandleFunc("GET /auth/github/callback", s.handleCallback)
-	mux.HandleFunc("GET /dashboard", s.handleDashboard)
-	mux.HandleFunc("GET /chargen", s.handleChargenForm)
-	mux.HandleFunc("POST /chargen", s.handleChargenCreate)
-	mux.HandleFunc("POST /play", s.handlePlay)
-	mux.HandleFunc("POST /logout", s.handleLogout) // POST (not GET): logout is state-changing; a GET enables logout-CSRF
 	return mux
 }
 
-func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
-	if s.sessionAccount(r) != "" {
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-		return
-	}
+func (s *Server) handleHome(w http.ResponseWriter, _ *http.Request) {
 	s.render(w, "home", map[string]any{"Configured": s.provider.Configured()})
 }
 
-// handleLogin starts the OAuth flow: generate the CSRF state + PKCE verifier, stash them in a signed flow
-// cookie, and redirect to the provider's authorize URL.
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+// handleDeviceLogin starts the OAuth flow for a device_code: generate the CSRF state + PKCE verifier, stash
+// them + the device_code in a signed flow cookie, and redirect to the provider. The device_code is NOT
+// validated here (an unknown one simply fails at the callback's AuthorizeDevice) — the broker never reveals
+// whether a code is live.
+func (s *Server) handleDeviceLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.provider.Configured() {
-		http.Error(w, "sign-in is not configured", http.StatusServiceUnavailable)
+		s.page(w, "Sign-in is not configured on this server.")
+		return
+	}
+	device := r.PathValue("device")
+	if device == "" {
+		s.page(w, "That sign-in link is missing its code. Reconnect to get a fresh link.")
 		return
 	}
 	state, err := randB64(24)
@@ -143,31 +113,29 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "login", err)
 		return
 	}
-	s.setFlow(w, state, verifier)
+	s.setFlow(w, state, verifier, device)
 	http.Redirect(w, r, s.provider.AuthCodeURL(state, challengeFor(verifier)), http.StatusSeeOther)
 }
 
-// handleCallback completes the OAuth flow: verify state (CSRF), exchange the code (with the PKCE verifier),
-// fetch the identity, look up or create the account, and set the session cookie.
+// handleCallback completes OAuth: verify state (CSRF), exchange the code (with the PKCE verifier), fetch the
+// identity, resolve-or-create the account, and mark the device session authed so the gate's poll proceeds.
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
-	// Always burn the single-use flow cookie first, even on the provider-error path, so a repeated
-	// ?error= callback can't keep a live flow cookie around for its full TTL (security audit F9).
-	wantState, verifier, ok := s.takeFlow(w, r)
+	wantState, verifier, device, ok := s.takeFlow(w, r) // always burn the single-use flow cookie first
 	if e := r.URL.Query().Get("error"); e != "" {
-		http.Error(w, "sign-in was cancelled or denied", http.StatusBadRequest)
+		s.page(w, "Sign-in was cancelled. Reconnect and try again.")
 		return
 	}
 	if !ok {
-		http.Error(w, "the sign-in session expired; please try again", http.StatusBadRequest)
+		s.page(w, "The sign-in link expired. Reconnect to get a fresh one.")
 		return
 	}
 	if r.URL.Query().Get("state") != wantState {
-		http.Error(w, "invalid sign-in state", http.StatusBadRequest) // CSRF guard
+		s.page(w, "Invalid sign-in state.") // CSRF guard
 		return
 	}
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		http.Error(w, "missing authorization code", http.StatusBadRequest)
+		s.page(w, "Missing authorization code.")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -183,7 +151,6 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "callback identity", err)
 		return
 	}
-
 	account, found, err := s.store.FindIdentity(ctx, s.provider.Name, id.ProviderUID)
 	if err != nil {
 		s.fail(w, "callback find", err)
@@ -197,47 +164,17 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		s.log.Info("new account created via oauth", "provider", s.provider.Name, "login", id.Login)
 	}
-	s.setSession(w, account)
-	http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-}
 
-func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	account := s.sessionAccount(r)
-	if account == "" {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	name, _, _ := s.store.AccountDisplayName(ctx, account)
-	chars, err := s.store.AccountCharacters(ctx, account)
+	authed, err := s.authorizer.AuthorizeDevice(ctx, device, account)
 	if err != nil {
-		s.fail(w, "dashboard", err)
+		s.fail(w, "callback authorize", err)
 		return
 	}
-	s.render(w, "dashboard", map[string]any{"Name": name, "Characters": chars, "CanCreate": s.chargen != nil})
-}
-
-// handlePlay mints a single-use link code for the account and shows the connect instructions.
-func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
-	account := s.sessionAccount(r)
-	if account == "" {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+	if !authed {
+		s.page(w, "This sign-in link has expired. Reconnect to get a fresh one.")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	code, err := s.codes.Mint(ctx, account, r.FormValue("character_id"), s.linkCodeTTL)
-	if err != nil {
-		s.fail(w, "play", err)
-		return
-	}
-	s.render(w, "play", map[string]any{"Code": code, "GateHint": s.gateHint, "TTLMin": int(s.linkCodeTTL.Minutes())})
-}
-
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	s.clearSession(w)
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	s.render(w, "success", map[string]any{"Login": id.Login})
 }
 
 // render executes the named template into a full page.
@@ -248,7 +185,12 @@ func (s *Server) render(w http.ResponseWriter, name string, data any) {
 	}
 }
 
+// page renders a one-line message page (the broker's generic notice — expired link, cancelled, misconfig).
+func (s *Server) page(w http.ResponseWriter, msg string) {
+	s.render(w, "notice", map[string]any{"Message": msg})
+}
+
 func (s *Server) fail(w http.ResponseWriter, where string, err error) {
-	s.log.Error("web handler", "where", where, "err", err)
-	http.Error(w, "something went wrong; please try again", http.StatusInternalServerError)
+	s.log.Error("broker handler", "where", where, "err", err)
+	http.Error(w, "something went wrong; please reconnect and try again", http.StatusInternalServerError)
 }

@@ -186,11 +186,10 @@ services:
       TELOS_ENV: dev
       TELOS_ACCOUNT_LISTEN: ":9100"
       TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
-      TELOS_REDIS_ADDR: redis:6379 # link codes
+      TELOS_REDIS_ADDR: redis:6379 # link codes + device-auth sessions
       TELOS_WEB_LISTEN: ":8080"
+      TELOS_WEB_PUBLIC_URL: http://localhost:8080 # the broker's public base — the /login link + OAuth callback derive from it
       TELOS_WEB_SECURE_COOKIES: "0" # dev serves over plain http://localhost; prod (TLS) keeps the secure-by-default
-      TELOS_WEB_GATE_HINT: localhost:4000
-      TELOS_OAUTH_REDIRECT_URL: http://localhost:8080/auth/github/callback
       DEBUG: true
     ports:
       - "8080:8080" # website: open http://localhost:8080 to sign in

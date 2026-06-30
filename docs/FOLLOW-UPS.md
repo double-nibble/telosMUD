@@ -454,3 +454,9 @@ something an author would reasonably want to:
   Secure + Path=/ + no Domain) so a `telos_oauth` flow cookie can't be planted over http / from a sibling
   subdomain (the login-fixation chain); (F8) `/play` + `/logout` rely on SameSite=Lax alone — add an explicit
   CSRF token for defense-in-depth. `SecureCookies` is already config-driven (default true). · *web/auth/security*
+- **Flaky session-lock takeover test under -race CI (Phase 15.1 sighting).** `internal/gate`
+  `TestSessionLockTakeoverKicksDisplacedConnection` timed out (10s) waiting for "logged in from another
+  location" on the loaded `-race` CI runner (passed 5/5 locally; resolved by a job re-run). The takeover-kick
+  delivery is timing-sensitive. It rides the stub name-login path, which the Phase-15.3 gate OAuth rework
+  replaces — so when reworking gate login, rebuild this test on the new login (dev-autoauth seam) and give the
+  kick-message wait a generous/synchronized deadline rather than a fixed 10s. · *gate/test*

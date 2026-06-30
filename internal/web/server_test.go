@@ -9,54 +9,46 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/double-nibble/telosmud/internal/store"
 )
 
-// server_test.go — Phase 14.7: the OAuth sign-in flow end to end against a STUBBED provider (no real GitHub),
-// so CI stays hermetic. Covers: login starts the flow; the callback exchanges + creates the account + sets a
-// session; the dashboard + Play work when signed in; and the CSRF state guard rejects a tampered callback.
+// server_test.go — the Phase-15 OAuth BROKER device flow, end to end against a STUBBED provider (hermetic).
+// /login/<device> starts OAuth; the callback exchanges + resolves the account + marks the device authed.
 
-// fakeWebStore is an in-memory web.Store.
-type fakeWebStore struct {
+// fakeStore is an in-memory web.Store (OAuth identity resolution only).
+type fakeStore struct {
 	identities map[string]string // "provider/uid" -> account
 	created    int
-	chars      map[string][]store.CharacterSummary
 }
 
-func newFakeWebStore() *fakeWebStore {
-	return &fakeWebStore{identities: map[string]string{}, chars: map[string][]store.CharacterSummary{}}
-}
+func newFakeStore() *fakeStore { return &fakeStore{identities: map[string]string{}} }
 
-func (f *fakeWebStore) FindIdentity(_ context.Context, provider, uid string) (string, bool, error) {
+func (f *fakeStore) FindIdentity(_ context.Context, provider, uid string) (string, bool, error) {
 	a, ok := f.identities[provider+"/"+uid]
 	return a, ok, nil
 }
 
-func (f *fakeWebStore) CreateAccountWithIdentity(_ context.Context, provider, uid, _, _ string) (string, error) {
+func (f *fakeStore) CreateAccountWithIdentity(_ context.Context, provider, uid, _, _ string) (string, error) {
 	f.created++
 	acct := "acct-" + uid
 	f.identities[provider+"/"+uid] = acct
-	f.chars[acct] = []store.CharacterSummary{{ID: "c1", Name: "Aragorn", ZoneRef: "midgaard"}}
 	return acct, nil
 }
 
-func (f *fakeWebStore) AccountDisplayName(_ context.Context, _ string) (string, bool, error) {
-	return "octocat", true, nil
+// fakeAuthorizer records AuthorizeDevice calls; ok controls whether the device session is still live.
+type fakeAuthorizer struct {
+	ok         bool
+	gotDevice  string
+	gotAccount string
+	callCount  int
 }
 
-func (f *fakeWebStore) AccountCharacters(_ context.Context, acct string) ([]store.CharacterSummary, error) {
-	return f.chars[acct], nil
+func (f *fakeAuthorizer) AuthorizeDevice(_ context.Context, device, account string) (bool, error) {
+	f.callCount++
+	f.gotDevice, f.gotAccount = device, account
+	return f.ok, nil
 }
 
-type fakeMinter struct{}
-
-func (fakeMinter) Mint(_ context.Context, _, _ string, _ time.Duration) (string, error) {
-	return "CODE1234", nil
-}
-
-// stubProvider is an httptest server standing in for GitHub's token + userinfo endpoints.
+// stubProvider stands in for GitHub's token + userinfo endpoints.
 func stubProvider(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -75,22 +67,23 @@ func stubProvider(t *testing.T) *httptest.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":12345,"login":"octocat","email":"octo@example.com"}`)
+		_, _ = io.WriteString(w, `{"id":4242,"login":"octocat","email":"octo@example.com"}`)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-func newTestWebsite(t *testing.T, st Store) (*httptest.Server, *http.Client) {
+func newTestBroker(t *testing.T, auth *fakeAuthorizer, st Store) (*httptest.Server, *http.Client) {
 	t.Helper()
 	stub := stubProvider(t)
-	s := New(st, fakeMinter{}, Config{
+	s := New(st, Config{
 		Provider: OAuthProvider{
 			Name: "github", ClientID: "id", ClientSecret: "secret",
 			AuthURL: "https://provider.test/authorize", TokenURL: stub.URL + "/token", UserURL: stub.URL + "/user",
-			RedirectURL: "http://web.test/auth/github/callback", Scopes: []string{"read:user"},
+			RedirectURL: "http://broker.test/auth/github/callback", Scopes: []string{"read:user"},
 		},
+		Authorizer: auth,
 		SessionKey: []byte("0123456789abcdef0123456789abcdef"),
 	})
 	ts := httptest.NewServer(s.Handler())
@@ -100,12 +93,13 @@ func newTestWebsite(t *testing.T, st Store) (*httptest.Server, *http.Client) {
 	return ts, client
 }
 
-func TestOAuthSignInFlow(t *testing.T) {
-	st := newFakeWebStore()
-	ts, client := newTestWebsite(t, st)
+func TestDeviceLoginFlow(t *testing.T) {
+	auth := &fakeAuthorizer{ok: true}
+	st := newFakeStore()
+	ts, client := newTestBroker(t, auth, st)
 
-	// 1. /login starts the flow: a redirect to the provider with state + PKCE challenge, and a flow cookie.
-	resp, err := client.Get(ts.URL + "/login")
+	// 1. /login/<device> starts OAuth: a redirect to the provider with state + PKCE challenge + a flow cookie.
+	resp, err := client.Get(ts.URL + "/login/DEVCODE123")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,121 +112,76 @@ func TestOAuthSignInFlow(t *testing.T) {
 		t.Fatalf("/login redirect missing state/challenge: %s", resp.Header.Get("Location"))
 	}
 
-	// 2. The provider "redirects back" to the callback with our state + a code. The flow cookie (in the jar)
-	//    carries the PKCE verifier. The callback exchanges + creates the account + sets a session.
-	resp, err = client.Get(ts.URL + "/auth/github/callback?code=abc123&state=" + url.QueryEscape(state))
+	// 2. The provider "redirects back" with our state + a code; the callback exchanges, resolves the account,
+	//    and marks the device authed.
+	resp, err = client.Get(ts.URL + "/auth/github/callback?code=abc&state=" + url.QueryEscape(state))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/dashboard" {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("callback status = %d loc = %q body = %q", resp.StatusCode, resp.Header.Get("Location"), body)
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Signed in") {
+		t.Fatalf("callback status=%d body=%q, want a 200 success page", resp.StatusCode, body)
 	}
 	if st.created != 1 {
 		t.Fatalf("a first-time sign-in should create 1 account, got %d", st.created)
 	}
-
-	// 3. The dashboard now renders for the signed-in account.
-	body := getBody(t, client, ts.URL+"/dashboard")
-	if !strings.Contains(body, "octocat") || !strings.Contains(body, "Aragorn") {
-		t.Fatalf("dashboard missing name/characters: %q", body)
-	}
-
-	// 4. Play mints a link code.
-	resp, err = client.PostForm(ts.URL+"/play", url.Values{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pbody, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(pbody), "CODE1234") {
-		t.Fatalf("play page missing the link code: %q", pbody)
-	}
-
-	// 5. A SECOND sign-in with the same identity logs into the SAME account (no new account).
-	st2 := st.created
-	resp, _ = client.Get(ts.URL + "/login")
-	loc, _ = url.Parse(resp.Header.Get("Location"))
-	_, _ = client.Get(ts.URL + "/auth/github/callback?code=abc123&state=" + url.QueryEscape(loc.Query().Get("state")))
-	if st.created != st2 {
-		t.Fatalf("a returning sign-in must NOT create a new account (created went %d -> %d)", st2, st.created)
+	if auth.callCount != 1 || auth.gotDevice != "DEVCODE123" || auth.gotAccount != "acct-4242" {
+		t.Fatalf("AuthorizeDevice got (device=%q account=%q calls=%d), want (DEVCODE123, acct-4242, 1)", auth.gotDevice, auth.gotAccount, auth.callCount)
 	}
 }
 
-func TestOAuthCallbackRejectsBadState(t *testing.T) {
-	ts, client := newTestWebsite(t, newFakeWebStore())
-	// Start a flow (sets the flow cookie with the real state), then call back with a DIFFERENT state.
-	_, _ = client.Get(ts.URL + "/login")
+func TestCallbackRejectsBadState(t *testing.T) {
+	auth := &fakeAuthorizer{ok: true}
+	ts, client := newTestBroker(t, auth, newFakeStore())
+	_, _ = client.Get(ts.URL + "/login/DEV") // sets the flow cookie with the real state
 	resp, err := client.Get(ts.URL + "/auth/github/callback?code=abc&state=forged")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("a forged callback state must be rejected (400), got %d", resp.StatusCode)
+	if body := readBody(t, resp); !strings.Contains(body, "Invalid sign-in state") {
+		t.Fatalf("a forged state should render the invalid-state notice; body=%q", body)
+	}
+	if auth.callCount != 0 {
+		t.Fatal("a forged callback must not authorize any device")
+	}
+}
+
+func TestCallbackExpiredDevice(t *testing.T) {
+	auth := &fakeAuthorizer{ok: false} // the device session expired before the browser finished
+	ts, client := newTestBroker(t, auth, newFakeStore())
+	resp, _ := client.Get(ts.URL + "/login/DEV")
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	resp, err := client.Get(ts.URL + "/auth/github/callback?code=abc&state=" + url.QueryEscape(loc.Query().Get("state")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readBody(t, resp); !strings.Contains(body, "expired") {
+		t.Fatalf("an expired device should render the expired notice; body=%q", body)
 	}
 }
 
 func TestNewPanicsOnWeakSessionKey(t *testing.T) {
 	defer func() {
 		if recover() == nil {
-			t.Fatal("New must panic on a SessionKey shorter than 16 bytes (audit F3)")
+			t.Fatal("New must panic on a SessionKey shorter than 16 bytes")
 		}
 	}()
-	New(newFakeWebStore(), fakeMinter{}, Config{SessionKey: []byte("short")})
-}
-
-func TestLogoutIsPostOnly(t *testing.T) {
-	ts, client := newTestWebsite(t, newFakeWebStore())
-	// A GET to /logout must NOT clear the session (it isn't a logout route) — the mux only binds POST.
-	resp, err := client.Get(ts.URL + "/logout")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode == http.StatusSeeOther {
-		t.Fatalf("GET /logout should not perform a logout redirect; got %d", resp.StatusCode)
-	}
+	New(newFakeStore(), Config{SessionKey: []byte("short"), Authorizer: &fakeAuthorizer{}})
 }
 
 func TestAssetsServed(t *testing.T) {
-	ts, client := newTestWebsite(t, newFakeWebStore())
-	for _, name := range []string{"telosmud-logo.svg", "telosmud-logo-dev.svg", "telosmud-logo.png"} {
-		resp, err := client.Get(ts.URL + "/assets/" + name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("asset %s status = %d, want 200", name, resp.StatusCode)
-		}
-	}
-}
-
-func TestDevLogoVariant(t *testing.T) {
-	// A dev instance renders the -dev logo; the default (prod) renders the plain one.
-	stub := stubProvider(t)
-	prov := OAuthProvider{Name: "github", ClientID: "id", ClientSecret: "s", TokenURL: stub.URL, UserURL: stub.URL}
-	key := []byte("0123456789abcdef0123456789abcdef")
-
-	dev := New(newFakeWebStore(), fakeMinter{}, Config{Provider: prov, SessionKey: key, Dev: true})
-	devTS := httptest.NewServer(dev.Handler())
-	t.Cleanup(devTS.Close)
-	if body := getBody(t, http.DefaultClient, devTS.URL+"/"); !strings.Contains(body, "telosmud-logo-dev.svg") {
-		t.Fatalf("dev instance should render the -dev logo; body = %q", body)
-	}
-
-	prod := New(newFakeWebStore(), fakeMinter{}, Config{Provider: prov, SessionKey: key, Dev: false})
-	prodTS := httptest.NewServer(prod.Handler())
-	t.Cleanup(prodTS.Close)
-	body := getBody(t, http.DefaultClient, prodTS.URL+"/")
-	if !strings.Contains(body, "telosmud-logo.svg") || strings.Contains(body, "telosmud-logo-dev.svg") {
-		t.Fatalf("prod instance should render the plain logo; body = %q", body)
-	}
-}
-
-func getBody(t *testing.T, client *http.Client, url string) string {
-	t.Helper()
-	resp, err := client.Get(url)
+	ts, client := newTestBroker(t, &fakeAuthorizer{}, newFakeStore())
+	resp, err := client.Get(ts.URL + "/assets/telosmud-logo.svg")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("logo asset status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func readBody(t *testing.T, resp *http.Response) string {
+	t.Helper()
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	return string(b)

@@ -1,70 +1,40 @@
 package web
 
-// templates.go — the website's server-rendered pages (Phase 14.7). Minimal, dependency-free HTML; the
-// dynamic chargen form (14.8) extends the dashboard. html/template auto-escapes all interpolated values.
+// templates.go — the broker's pages (Phase 15). Minimal, dependency-free HTML: a landing page, the post-OAuth
+// "return to your terminal" success page, and a generic notice (expired/cancelled link). html/template
+// auto-escapes all interpolated values.
 
 const pageTemplates = `
 {{define "head"}}<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TelosMUD</title>
 <style>
- body{font:16px/1.5 system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a}
- a.btn,button{display:inline-block;background:#2d6cdf;color:#fff;border:0;border-radius:6px;padding:.6rem 1rem;font:inherit;text-decoration:none;cursor:pointer}
- a.muted{color:#666}
- code{background:#f2f2f2;padding:.15rem .4rem;border-radius:4px;font-size:1.1em}
- .card{border:1px solid #e2e2e2;border-radius:8px;padding:1rem 1.25rem;margin:1rem 0}
- h1{font-size:1.6rem}
- .logo{display:block;height:3.5rem;margin:0 0 1.5rem}
-</style></head><body><a href="/"><img class="logo" src="{{logoURL}}" alt="TelosMUD"></a>{{end}}
+ body{font:16px/1.6 system-ui,sans-serif;max-width:34rem;margin:4rem auto;padding:0 1rem;color:#1a1a1a;text-align:center}
+ .logo{display:block;height:3.5rem;margin:0 auto 2rem}
+ .card{border:1px solid #e2e2e2;border-radius:8px;padding:1.5rem;margin:1rem 0}
+ code{background:#f2f2f2;padding:.15rem .4rem;border-radius:4px}
+ h1{font-size:1.5rem}
+ .ok{color:#1a7f37;font-size:1.3rem}
+ .muted{color:#666}
+</style></head><body><img class="logo" src="{{logoURL}}" alt="TelosMUD">{{end}}
 {{define "foot"}}</body></html>{{end}}
 
 {{define "home"}}{{template "head"}}
 <h1>TelosMUD</h1>
-<p>A horizontally-scalable text MUD.</p>
-{{if .Configured}}<p><a class="btn" href="/login">Sign in with GitHub</a></p>
+<p class="muted">A horizontally-scalable text MUD.</p>
+{{if .Configured}}<p>Connect with a MUD client and follow the sign-in link it shows you.</p>
 {{else}}<p class="muted">Sign-in is not configured on this server.</p>{{end}}
 {{template "foot"}}{{end}}
 
-{{define "dashboard"}}{{template "head"}}
-<h1>Welcome{{if .Name}}, {{.Name}}{{end}}</h1>
+{{define "success"}}{{template "head"}}
 <div class="card">
- <h2 style="font-size:1.2rem;margin-top:0">Your characters</h2>
- {{if .Characters}}<ul>{{range .Characters}}<li>{{.Name}}{{if .ZoneRef}} <span class="muted">({{.ZoneRef}})</span>{{end}}</li>{{end}}</ul>
- {{else}}<p class="muted">No characters yet.</p>{{end}}
- {{if .CanCreate}}<p style="margin-top:1rem"><a class="btn" href="/chargen">Create a character</a></p>{{end}}
+ <p class="ok">&check; Signed in{{if .Login}} as {{.Login}}{{end}}.</p>
+ <p>Return to your terminal &mdash; you're being logged in now.</p>
 </div>
-<form method="post" action="/play"><button type="submit">Play &rarr; get a link code</button></form>
-<form method="post" action="/logout" style="margin-top:2rem"><button class="muted" type="submit" style="background:none;color:#666;padding:0;border:0;text-decoration:underline">Sign out</button></form>
+<p class="muted">You can close this tab.</p>
 {{template "foot"}}{{end}}
 
-{{define "chargen"}}{{template "head"}}
-<h1>Create a character</h1>
-{{if .Error}}<div class="card" style="border-color:#d33;color:#a00">{{.Error}}</div>{{end}}
-<form method="post" action="/chargen">
- <div class="card">
-  <label>Name<br><input name="name" value="{{.Name}}" required autofocus style="font:inherit;padding:.4rem;width:16rem"></label>
- </div>
- {{range .Steps}}<div class="card">
-  <h2 style="font-size:1.1rem;margin-top:0">{{if .Prompt}}{{.Prompt}}{{else}}{{.ID}}{{end}}</h2>
-  {{if eq .Kind "bundle_choice"}}
-   {{$sid := .ID}}{{range $i, $o := .Options}}<label style="display:block;margin:.25rem 0"><input type="radio" name="{{$sid}}" value="{{$o.Ref}}"{{if eq $i 0}} checked{{end}}> {{$o.Label}}</label>{{end}}
-  {{else if eq .Kind "point_buy"}}
-   <p class="muted">{{.Points}} points · each {{.Min}}&ndash;{{.Max}}</p>
-   {{$step := .}}{{range .Attributes}}<label style="display:inline-block;margin:.25rem 1rem .25rem 0">{{.}}<br><input type="number" name="{{$step.ID}}_{{.}}" value="{{$step.Base}}" min="{{$step.Min}}" max="{{$step.Max}}" style="font:inherit;padding:.3rem;width:5rem"></label>{{end}}
-  {{end}}
- </div>{{end}}
- <button type="submit">Create</button>
-</form>
-<p style="margin-top:1.5rem"><a class="muted" href="/dashboard">&larr; Back to dashboard</a></p>
-{{template "foot"}}{{end}}
-
-{{define "play"}}{{template "head"}}
-<h1>Ready to play</h1>
-<div class="card">
- <p>Connect{{if .GateHint}} to <code>{{.GateHint}}</code>{{end}} and enter:</p>
- <p><code>connect {{.Code}}</code></p>
- <p class="muted">This code is single-use and expires in {{.TTLMin}} minutes.</p>
-</div>
-<p><a class="muted" href="/dashboard">&larr; Back to dashboard</a></p>
+{{define "notice"}}{{template "head"}}
+<div class="card"><p>{{.Message}}</p></div>
 {{template "foot"}}{{end}}
 `

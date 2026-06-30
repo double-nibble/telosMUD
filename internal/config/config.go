@@ -44,12 +44,11 @@ type Config struct {
 	AccountSigningKey string `yaml:"account_signing_key"`
 	AccountVerifyKey  string `yaml:"account_verify_key"`
 
-	// Phase 14.7 website + OAuth (served by telos-account).
-	WebListen          string `yaml:"web_listen"`           // website listen, e.g. ":8080" ("" => website off)
-	WebSessionKey      string `yaml:"web_session_key"`      // base64 HMAC key for signed cookies (ephemeral if empty)
+	// Phase 14.7 / 15 OAuth broker (served by telos-account).
+	WebListen          string `yaml:"web_listen"`           // broker listen, e.g. ":8080" ("" => broker off)
+	WebPublicURL       string `yaml:"web_public_url"`       // the broker's externally-visible base URL (the /login/<code> link + OAuth callback derive from it)
+	WebSessionKey      string `yaml:"web_session_key"`      // base64 HMAC key for the signed OAuth-flow cookie (ephemeral if empty)
 	WebSecureCookies   bool   `yaml:"web_secure_cookies"`   // set Secure on cookies (default true; dev over plain http sets 0)
-	WebGateHint        string `yaml:"web_gate_hint"`        // host shown on the Play page ("connect to <hint>")
-	OAuthRedirectURL   string `yaml:"oauth_redirect_url"`   // GitHub callback URL
 	GithubClientID     string `yaml:"github_client_id"`     // GitHub OAuth app client id
 	GithubClientSecret string `yaml:"github_client_secret"` // GitHub OAuth app client secret (from a gitignored env file)
 
@@ -92,7 +91,8 @@ func Default() Config {
 		AccountListen: ":9100",
 		AccountTarget: "", // empty by default: the gate uses the stub login until an account service is wired
 
-		WebSecureCookies: true, // secure-by-default; dev over plain http opts out via TELOS_WEB_SECURE_COOKIES=0
+		WebSecureCookies: true,                    // secure-by-default; dev over plain http opts out via TELOS_WEB_SECURE_COOKIES=0
+		WebPublicURL:     "http://localhost:8080", // the broker's dev base URL (the /login link + OAuth callback derive from it)
 
 		ShardID:   "shard-1",
 		ShardAddr: "localhost:9090",
@@ -187,11 +187,8 @@ func (c *Config) applyEnv() {
 	if v, ok := os.LookupEnv("TELOS_WEB_SECURE_COOKIES"); ok {
 		c.WebSecureCookies = v != "0" && !strings.EqualFold(v, "false")
 	}
-	if v, ok := os.LookupEnv("TELOS_WEB_GATE_HINT"); ok {
-		c.WebGateHint = v
-	}
-	if v, ok := os.LookupEnv("TELOS_OAUTH_REDIRECT_URL"); ok {
-		c.OAuthRedirectURL = v
+	if v, ok := os.LookupEnv("TELOS_WEB_PUBLIC_URL"); ok {
+		c.WebPublicURL = v
 	}
 	if v, ok := os.LookupEnv("TELOS_GITHUB_CLIENT_ID"); ok {
 		c.GithubClientID = v
