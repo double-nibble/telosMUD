@@ -14,18 +14,6 @@ service Account {
   // CreateCharacter creates a character on an account from a content-driven chargen selection (Phase 14.8).
   rpc CreateCharacter(CreateCharacterRequest) returns (CreateCharacterResponse);
 
-  // --- auth backends, filled in by later slices (declared now so the contract is stable) ---
-
-  // MintLinkCode mints a single-use, short-TTL link code for the website's "Play" button (Phase 14.2).
-  rpc MintLinkCode(MintLinkCodeRequest) returns (MintLinkCodeResponse);
-  // RedeemLinkCode atomically consumes a link code at the gate, returning the account + a session assertion (14.2/14.3).
-  rpc RedeemLinkCode(RedeemLinkCodeRequest) returns (RedeemLinkCodeResponse);
-  // VerifyPassphrase checks a name+passphrase login with rate-limit/lockout state (Phase 14.5).
-  rpc VerifyPassphrase(VerifyPassphraseRequest) returns (VerifyPassphraseResponse);
-  // SetPassphrase sets (or clears) an account's MUD passphrase (Phase 14.5); called from the website.
-  rpc SetPassphrase(SetPassphraseRequest) returns (SetPassphraseResponse);
-  // ResolveSSHKey maps an SSH key fingerprint to an account for the gate's SSH server (Phase 14.6).
-  rpc ResolveSSHKey(ResolveSSHKeyRequest) returns (ResolveSSHKeyResponse);
   // IssueSessionAssertion mints a short-lived Ed25519-signed assertion binding {account, character, session}
   // (Phase 14.3). The gate calls it after login (once the character + session are known) and carries the
   // token in the Play Attach frame; the world verifies it offline against account's published public key.
@@ -142,51 +130,6 @@ message CreateCharacterRequest {
 }
 message CreateCharacterResponse {
   Character character = 1;
-}
-
-message MintLinkCodeRequest {
-  string account_id = 1;
-  string character_id = 2; // optional: pre-select a character
-}
-message MintLinkCodeResponse {
-  string code = 1;
-  uint64 ttl_ms = 2;
-}
-
-message RedeemLinkCodeRequest {
-  string code = 1;
-  string conn_info = 2; // remote addr / transport, for audit
-}
-message RedeemLinkCodeResponse {
-  string account_id = 1;
-  repeated Character characters = 2;
-  string session_assertion = 3; // signed {account,character,session,exp} (Phase 14.3)
-}
-
-message VerifyPassphraseRequest {
-  string name = 1; // a character name resolves to its account
-  string passphrase = 2;
-  string conn_info = 3;
-}
-message VerifyPassphraseResponse {
-  bool ok = 1;
-  string account_id = 2;
-  string reason = 3; // when !ok: "bad_credentials" | "locked"
-  uint64 retry_after_ms = 4; // when locked
-}
-
-message SetPassphraseRequest {
-  string account_id = 1;
-  string passphrase = 2; // empty clears the passphrase (disables passphrase login)
-}
-message SetPassphraseResponse {}
-
-message ResolveSSHKeyRequest {
-  string fingerprint = 1;
-}
-message ResolveSSHKeyResponse {
-  bool found = 1;
-  string account_id = 2;
 }
 
 message IssueSessionAssertionRequest {

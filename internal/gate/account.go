@@ -7,32 +7,23 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
 
-// account.go — the gate's seam to telos-account (Phase 14, docs/ACCOUNT.md). The gate calls the account
-// service to list an account's characters (the select menu) and — in later slices — redeem link codes,
-// verify passphrases, and resolve SSH keys. A stub backs it when no account service is configured, so the
-// pre-Phase-14 "type a name" login keeps working; a gRPC client backs it when cfg.AccountTarget is set.
+// account.go — the gate's seam to telos-account (docs/ACCOUNT.md). Auth is OAuth-only (Phase 15): the gate
+// runs the terminal device flow, then prompt-driven character select/create, and issues the session assertion
+// it carries in Attach. A stub backs it when no account service is configured (the bare dev "type a name"
+// login); a gRPC client backs it when cfg.AccountTarget is set.
 
-// AccountClient is the gate-side account API. It grows per slice (14.5 VerifyPassphrase, 14.6 ResolveSSHKey);
-// 14.1 landed ListCharacters, 14.2 adds RedeemLinkCode.
+// AccountClient is the gate-side account API (OAuth device flow + chargen + the session assertion).
 type AccountClient interface {
 	ListCharacters(ctx context.Context, accountID string) ([]CharacterInfo, error)
-	// RedeemLinkCode atomically consumes a link code, returning the account + its characters. found=false is
-	// the clean "invalid/expired/already-redeemed" case (not an error).
-	RedeemLinkCode(ctx context.Context, code, connInfo string) (accountID string, characters []CharacterInfo, found bool, err error)
 	// IssueSessionAssertion mints the signed assertion the gate carries in Attach (Phase 14.3). An empty
 	// string is returned (no error) when account has no signing key — the world then runs unverified.
 	IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (string, error)
-	// VerifyPassphrase checks a name+passphrase login (Phase 14.5). ok=false is a clean auth failure (bad
-	// credentials or locked out — reason carries which); the account id is returned on success.
-	VerifyPassphrase(ctx context.Context, name, pass, connInfo string) (ok bool, accountID, reason string, err error)
 	// StartDeviceAuth begins a browser OAuth login (Phase 15), returning the device_code, the one-click link
 	// to show the player, and the suggested poll interval.
 	StartDeviceAuth(ctx context.Context, connInfo string) (deviceCode, verificationURI string, interval time.Duration, err error)
@@ -77,20 +68,9 @@ func (stubAccountClient) ListCharacters(_ context.Context, accountID string) ([]
 	return []CharacterInfo{{ID: accountID, Name: accountID}}, nil
 }
 
-// RedeemLinkCode is never reached on the stub (the gate only enters the link-code flow when a REAL account
-// client is wired), but it satisfies the interface — and refuses cleanly if ever called.
-func (stubAccountClient) RedeemLinkCode(_ context.Context, _, _ string) (string, []CharacterInfo, bool, error) {
-	return "", nil, false, nil
-}
-
 // IssueSessionAssertion on the stub returns no token (the stub is the no-auth fallback).
 func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string) (string, error) {
 	return "", nil
-}
-
-// VerifyPassphrase on the stub always fails (the stub login is name-only).
-func (stubAccountClient) VerifyPassphrase(_ context.Context, _, _, _ string) (bool, string, string, error) {
-	return false, "", "bad_credentials", nil
 }
 
 // StartDeviceAuth/PollDeviceAuth are never reached on the stub (the gate only runs device login when a real
@@ -145,23 +125,6 @@ func (g *grpcAccountClient) ListCharacters(ctx context.Context, accountID string
 	return out, nil
 }
 
-func (g *grpcAccountClient) RedeemLinkCode(ctx context.Context, code, connInfo string) (string, []CharacterInfo, bool, error) {
-	resp, err := g.cli.RedeemLinkCode(ctx, &accountv1.RedeemLinkCodeRequest{Code: code, ConnInfo: connInfo})
-	if err != nil {
-		if status.Code(err) == codes.NotFound {
-			return "", nil, false, nil // invalid / expired / already redeemed — a clean miss, not an error
-		}
-		return "", nil, false, err
-	}
-	out := make([]CharacterInfo, 0, len(resp.GetCharacters()))
-	for _, c := range resp.GetCharacters() {
-		out = append(out, CharacterInfo{
-			ID: c.GetId(), Name: c.GetName(), ZoneRef: c.GetZoneRef(), RoomRef: c.GetRoomRef(),
-		})
-	}
-	return resp.GetAccountId(), out, true, nil
-}
-
 func (g *grpcAccountClient) IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (string, error) {
 	resp, err := g.cli.IssueSessionAssertion(ctx, &accountv1.IssueSessionAssertionRequest{
 		AccountId: accountID, CharacterId: characterID, SessionId: sessionID,
@@ -170,14 +133,6 @@ func (g *grpcAccountClient) IssueSessionAssertion(ctx context.Context, accountID
 		return "", err
 	}
 	return resp.GetAssertion(), nil
-}
-
-func (g *grpcAccountClient) VerifyPassphrase(ctx context.Context, name, pass, connInfo string) (bool, string, string, error) {
-	resp, err := g.cli.VerifyPassphrase(ctx, &accountv1.VerifyPassphraseRequest{Name: name, Passphrase: pass, ConnInfo: connInfo})
-	if err != nil {
-		return false, "", "", err
-	}
-	return resp.GetOk(), resp.GetAccountId(), resp.GetReason(), nil
 }
 
 func (g *grpcAccountClient) StartDeviceAuth(ctx context.Context, connInfo string) (string, string, time.Duration, error) {

@@ -78,18 +78,17 @@ func main() {
 		slog.Warn("no chargen flow in content: the gate offers no create-character flow")
 	}
 
-	// Redis backs both the legacy link codes (Phase 14.2) AND the Phase-15 device-auth sessions (the terminal
-	// OAuth bridge). Without Redis the auth bridges are unavailable (the gate's device login needs the store).
+	// Redis backs the Phase-15 device-auth sessions (the terminal OAuth bridge). Without Redis the device
+	// login + the broker are unavailable (the gate's OAuth login needs the store).
 	redisUp := false
 	if cfg.Redis.Addr != "" {
 		rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 		defer func() { _ = rdb.Close() }()
-		svc.WithLinkCodes(account.NewRedisLinkCodes(rdb))
 		svc.WithDeviceAuth(account.NewRedisDeviceAuth(rdb), cfg.WebPublicURL)
 		redisUp = true
-		slog.Info("auth bridges enabled (redis)", "addr", cfg.Redis.Addr, "public_url", cfg.WebPublicURL)
+		slog.Info("device auth enabled (redis)", "addr", cfg.Redis.Addr, "public_url", cfg.WebPublicURL)
 	} else {
-		slog.Warn("no Redis configured: link codes + device auth disabled")
+		slog.Warn("no Redis configured: device auth + broker disabled")
 	}
 
 	// Session-assertion signing (Phase 14.3): load the Ed25519 private key if configured. Without it,

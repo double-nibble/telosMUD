@@ -19,7 +19,6 @@ import (
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
 	"github.com/double-nibble/telosmud/internal/assertion"
 	"github.com/double-nibble/telosmud/internal/content"
-	"github.com/double-nibble/telosmud/internal/passphrase"
 	"github.com/double-nibble/telosmud/internal/store"
 )
 
@@ -35,33 +34,16 @@ type CharStore interface {
 	CreateAccountCharacter(ctx context.Context, accountID, name, zoneRef, roomRef string, state, chargen []byte) (string, error)
 	// CreateCharacterWithChargen (Phase 14.8) creates a character carrying the first-spawn chargen marker.
 	CreateCharacterWithChargen(ctx context.Context, accountID, name, zoneRef, roomRef string, bundles []string, attrs map[string]float64) (string, error)
-	// Phase 14.5 passphrase auth.
-	CharacterAccount(ctx context.Context, name string) (string, bool, error)
-	AccountAuth(ctx context.Context, accountID string) (store.PassphraseAuth, bool, error)
-	SetPassphraseHash(ctx context.Context, accountID, hash string) error
-	RecordAuthFailure(ctx context.Context, accountID string, lockAfter int, lockFor time.Duration) (int, error)
-	ResetAuthFailures(ctx context.Context, accountID string) error
-	// Phase 14.6 SSH key auth.
-	ResolveSSHKey(ctx context.Context, fingerprint string) (string, bool, error)
 }
 
-// Passphrase-auth tuning (Phase 14.5): lock an account after this many consecutive failures, for this long.
-const (
-	passphraseLockAfter = 5
-	passphraseLockFor   = 5 * time.Minute
-)
-
 // Service implements the Account gRPC server. It is transport-thin: validation + a store call + a mapping to
-// the proto types. The auth backends (Redis link codes, Argon2id, SSH) attach to it in later slices.
+// the proto types. Auth is OAuth-only (Phase 15): the browser device flow + signed session assertions.
 type Service struct {
 	accountv1.UnimplementedAccountServer
-	store      CharStore
-	codes      LinkCodeStore      // Phase 14.2 link codes; nil => Mint/RedeemLinkCode are Unavailable
-	signKey    ed25519.PrivateKey // Phase 14.3 assertion signing key; nil => IssueSessionAssertion returns ""
-	hashParams passphrase.Params  // Phase 14.5 Argon2id cost
-	ipThrottle *ipThrottle        // Phase 14.5 per-IP login throttle
-	now        func() time.Time   // injectable clock (assertion expiry, lockout); defaults to time.Now
-	log        *slog.Logger
+	store   CharStore
+	signKey ed25519.PrivateKey // Phase 14.3 assertion signing key; nil => IssueSessionAssertion returns ""
+	now     func() time.Time   // injectable clock (assertion expiry); defaults to time.Now
+	log     *slog.Logger
 	// startZone/startRoom are the default spawn location a freshly-created character lands in (the demo
 	// pack's start room). Config-supplied; later chargen (14.8) may let content choose a starting zone.
 	startZone string
@@ -90,9 +72,7 @@ func New(cs CharStore, log *slog.Logger, startZone, startRoom string) *Service {
 	}
 	return &Service{
 		store: cs, log: log, now: time.Now,
-		hashParams: passphrase.DefaultParams,
-		ipThrottle: newIPThrottle(20, time.Minute), // 20 passphrase attempts/min per source IP
-		startZone:  startZone, startRoom: startRoom,
+		startZone: startZone, startRoom: startRoom,
 		maxCharacters: defaultMaxCharacters,
 	}
 }
@@ -163,12 +143,6 @@ func capMessage(n int) string {
 func (s *Service) atCapacity(ctx context.Context, accountID string) bool {
 	existing, err := s.store.AccountCharacters(ctx, accountID)
 	return err == nil && len(existing) >= s.maxCharacters
-}
-
-// WithLinkCodes wires the link-code store (Phase 14.2). Without it, Mint/RedeemLinkCode return Unavailable.
-func (s *Service) WithLinkCodes(codes LinkCodeStore) *Service {
-	s.codes = codes
-	return s
 }
 
 // WithDeviceAuth wires the device-auth store + the verification base URL the gate's one-click link points at
@@ -363,56 +337,6 @@ func (s *Service) CreateCharacter(ctx context.Context, req *accountv1.CreateChar
 	return &accountv1.CreateCharacterResponse{Character: &accountv1.Character{
 		Id: id, Name: req.GetName(), ZoneRef: s.startZone, RoomRef: s.startRoom,
 	}}, nil
-}
-
-// MintLinkCode mints a single-use link code for an authenticated account (the website's "Play" button,
-// Phase 14.2). The code is consumed at the gate by RedeemLinkCode.
-func (s *Service) MintLinkCode(ctx context.Context, req *accountv1.MintLinkCodeRequest) (*accountv1.MintLinkCodeResponse, error) {
-	if s.codes == nil {
-		return nil, status.Error(codes.Unavailable, "link codes not configured")
-	}
-	if req.GetAccountId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "account_id required")
-	}
-	code, err := s.codes.Mint(ctx, req.GetAccountId(), req.GetCharacterId(), linkCodeTTL)
-	if err != nil {
-		s.log.Error("MintLinkCode", "account", req.GetAccountId(), "err", err)
-		return nil, status.Error(codes.Internal, "mint link code failed")
-	}
-	//nolint:gosec // linkCodeTTL is a positive constant (5 min); the ms value can't be negative
-	return &accountv1.MintLinkCodeResponse{Code: code, TtlMs: uint64(linkCodeTTL.Milliseconds())}, nil
-}
-
-// RedeemLinkCode atomically consumes a link code at the gate and returns the account + its characters. The
-// session assertion (signed proof the world verifies offline) is filled in by Phase 14.3; for now it is
-// empty (the gate trusts the account_id directly over the in-cluster link this slice). A bad/expired/already-
-// redeemed code is NotFound — the gate shows "invalid or expired code" without leaking which.
-func (s *Service) RedeemLinkCode(ctx context.Context, req *accountv1.RedeemLinkCodeRequest) (*accountv1.RedeemLinkCodeResponse, error) {
-	if s.codes == nil {
-		return nil, status.Error(codes.Unavailable, "link codes not configured")
-	}
-	if req.GetCode() == "" {
-		return nil, status.Error(codes.InvalidArgument, "code required")
-	}
-	accountID, _, found, err := s.codes.Redeem(ctx, req.GetCode())
-	if err != nil {
-		s.log.Error("RedeemLinkCode", "err", err)
-		return nil, status.Error(codes.Internal, "redeem failed")
-	}
-	if !found {
-		return nil, status.Error(codes.NotFound, "invalid or expired code")
-	}
-	chars, err := s.store.AccountCharacters(ctx, accountID)
-	if err != nil {
-		s.log.Error("RedeemLinkCode: list characters", "account", accountID, "err", err)
-		return nil, status.Error(codes.Internal, "load characters failed")
-	}
-	s.log.Info("link code redeemed", "account", accountID, "conn", req.GetConnInfo(), "characters", len(chars))
-	return &accountv1.RedeemLinkCodeResponse{
-		AccountId:  accountID,
-		Characters: toProtoChars(chars),
-		// SessionAssertion left empty until Phase 14.3 (signed assertions).
-	}, nil
 }
 
 // toProtoChars maps store summaries onto the proto Character list.
