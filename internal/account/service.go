@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -75,7 +76,12 @@ type Service struct {
 	// points at. nil store => StartDeviceAuth/PollDeviceAuth are Unavailable.
 	deviceAuth    DeviceAuthStore
 	verifyBaseURL string
+	// maxCharacters caps how many characters an account may own (Phase 15.4, configurable; default below).
+	maxCharacters int
 }
+
+// defaultMaxCharacters is the per-account character cap when none is configured.
+const defaultMaxCharacters = 3
 
 // New builds the Account service over a character store.
 func New(cs CharStore, log *slog.Logger, startZone, startRoom string) *Service {
@@ -87,7 +93,16 @@ func New(cs CharStore, log *slog.Logger, startZone, startRoom string) *Service {
 		hashParams: passphrase.DefaultParams,
 		ipThrottle: newIPThrottle(20, time.Minute), // 20 passphrase attempts/min per source IP
 		startZone:  startZone, startRoom: startRoom,
+		maxCharacters: defaultMaxCharacters,
 	}
+}
+
+// WithMaxCharacters sets the per-account character cap (Phase 15.4); a value <= 0 keeps the default.
+func (s *Service) WithMaxCharacters(n int) *Service {
+	if n > 0 {
+		s.maxCharacters = n
+	}
+	return s
 }
 
 // WithChargen wires the content chargen flow + selectable bundle options (Phase 14.8). The website reads them
@@ -119,6 +134,10 @@ func (s *Service) BuildCharacter(ctx context.Context, accountID, name string, pi
 	}
 	if r, ok := ValidateCharacterName(name); !ok {
 		return "", r, nil
+	}
+	// Enforce the per-account character cap (Phase 15.4).
+	if existing, err := s.store.AccountCharacters(ctx, accountID); err == nil && len(existing) >= s.maxCharacters {
+		return "", fmt.Sprintf("You've reached the limit of %d characters.", s.maxCharacters), nil
 	}
 	bundles, attrs, r := content.ValidateChargen(s.chargenFlow, picks, allocs, s.chargenKind)
 	if r != "" {
@@ -203,6 +222,44 @@ func (s *Service) PollDeviceAuth(ctx context.Context, req *accountv1.PollDeviceA
 		return nil, status.Error(codes.Internal, "list characters failed")
 	}
 	return &accountv1.PollDeviceAuthResponse{Status: "authed", AccountId: account, Characters: toProtoChars(chars)}, nil
+}
+
+// GetChargenFlow returns the content chargen flow + bundle options the gate renders as prompts (Phase 15.4).
+func (s *Service) GetChargenFlow(_ context.Context, _ *accountv1.GetChargenFlowRequest) (*accountv1.GetChargenFlowResponse, error) {
+	if !s.chargenOK {
+		return &accountv1.GetChargenFlowResponse{Configured: false}, nil
+	}
+	steps := make([]*accountv1.ChargenStep, 0, len(s.chargenFlow.Steps))
+	for _, st := range s.chargenFlow.Steps {
+		steps = append(steps, &accountv1.ChargenStep{
+			Kind: st.Kind, Id: st.ID, Prompt: st.Prompt, BundleKind: st.BundleKind,
+			Attributes: st.Attributes,
+			//nolint:gosec // chargen point-buy bounds are small content-authored ints; no overflow.
+			Points: int32(st.Points), Base: int32(st.Base), Min: int32(st.Min), Max: int32(st.Max),
+		})
+	}
+	opts := make([]*accountv1.ChargenBundleOption, 0, len(s.chargenOptions))
+	for _, o := range s.chargenOptions {
+		opts = append(opts, &accountv1.ChargenBundleOption{Ref: o.Ref, Kind: o.Kind, Label: o.Label})
+	}
+	return &accountv1.GetChargenFlowResponse{Configured: true, Steps: steps, Options: opts}, nil
+}
+
+// CreateChargenCharacter validates a prompt-driven chargen submission + creates the character (Phase 15.4).
+func (s *Service) CreateChargenCharacter(ctx context.Context, req *accountv1.CreateChargenCharacterRequest) (*accountv1.CreateChargenCharacterResponse, error) {
+	allocs := make(map[string]map[string]int, len(req.GetAllocs()))
+	for stepID, a := range req.GetAllocs() {
+		m := make(map[string]int, len(a.GetValues()))
+		for attr, v := range a.GetValues() {
+			m[attr] = int(v)
+		}
+		allocs[stepID] = m
+	}
+	id, reason, err := s.BuildCharacter(ctx, req.GetAccountId(), req.GetName(), req.GetPicks(), allocs)
+	if err != nil {
+		return nil, err
+	}
+	return &accountv1.CreateChargenCharacterResponse{CharacterId: id, Reason: reason}, nil
 }
 
 // WithSigningKey wires the Ed25519 assertion-signing key (Phase 14.3). Without it, IssueSessionAssertion

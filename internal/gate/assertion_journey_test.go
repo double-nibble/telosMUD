@@ -54,6 +54,8 @@ func TestSessionAssertionAcceptedByWorld(t *testing.T) {
 
 	term := h.dial(t)
 	term.expect(t, "To sign in, open this link")
+	term.expect(t, "Choose a character:")
+	term.send(t, "1")
 	term.expect(t, "The Temple Square") // the world verified the assertion + spawned the player
 	term.close(t)
 }
@@ -78,6 +80,8 @@ func TestSessionAssertionRejectedByWorld(t *testing.T) {
 
 	term := h.dial(t)
 	term.expect(t, "To sign in, open this link")
+	term.expect(t, "Choose a character:")
+	term.send(t, "1")
 
 	// The forged assertion is rejected at the world's Attach; the gate's stream fails and the connection
 	// closes WITHOUT the player ever reaching the world.

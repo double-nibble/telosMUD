@@ -40,6 +40,52 @@ service Account {
   // characters so the gate goes straight to character select. (The session assertion is issued separately,
   // after the character is chosen, via IssueSessionAssertion.)
   rpc PollDeviceAuth(PollDeviceAuthRequest) returns (PollDeviceAuthResponse);
+
+  // GetChargenFlow returns the content chargen flow (the steps the gate walks as prompts) + the selectable
+  // bundle options, so the gate can run prompt-driven character creation (Phase 15.4).
+  rpc GetChargenFlow(GetChargenFlowRequest) returns (GetChargenFlowResponse);
+  // CreateChargenCharacter validates a prompt-driven chargen submission (the picks + point-buy allocations)
+  // and creates the character. reason is a non-empty user-facing message on a validation failure.
+  rpc CreateChargenCharacter(CreateChargenCharacterRequest) returns (CreateChargenCharacterResponse);
+}
+
+// --- Phase 15.4 prompt-driven chargen messages ---
+message GetChargenFlowRequest {}
+message GetChargenFlowResponse {
+  bool configured = 1; // false => no chargen flow (the gate offers no create)
+  repeated ChargenStep steps = 2;
+  repeated ChargenBundleOption options = 3;
+}
+// ChargenStep is one step the gate renders (a tagged union over kind). The gate shows the choices; the account
+// VALIDATES the submission (the point-buy cost curve lives server-side, not on the wire).
+message ChargenStep {
+  string kind = 1; // "bundle_choice" | "point_buy"
+  string id = 2;
+  string prompt = 3;
+  string bundle_kind = 4; // bundle_choice: filter options by this kind
+  repeated string attributes = 5; // point_buy: the attributes to allocate
+  int32 points = 6;
+  int32 base = 7;
+  int32 min = 8;
+  int32 max = 9;
+}
+message ChargenBundleOption {
+  string ref = 1;
+  string kind = 2;
+  string label = 3;
+}
+message AttrAlloc {
+  map<string, int32> values = 1; // attribute -> chosen value
+}
+message CreateChargenCharacterRequest {
+  string account_id = 1;
+  string name = 2;
+  map<string, string> picks = 3; // bundle_choice step id -> chosen bundle ref
+  map<string, AttrAlloc> allocs = 4; // point_buy step id -> {attribute -> value}
+}
+message CreateChargenCharacterResponse {
+  string character_id = 1;
+  string reason = 2; // non-empty on a validation failure (name taken, over budget, …)
 }
 
 // --- Phase 15 device-auth messages ---

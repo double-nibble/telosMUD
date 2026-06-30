@@ -43,9 +43,25 @@ type AccountClient interface {
 	// PollDeviceAuth reports the device-login status ("pending" | "authed" | "expired"); on "authed" it
 	// returns the account + its characters.
 	PollDeviceAuth(ctx context.Context, deviceCode string) (status, accountID string, characters []CharacterInfo, err error)
+	// GetChargenFlow returns the content chargen flow the gate walks as prompts (Phase 15.4). configured=false
+	// => no chargen (the gate offers no create).
+	GetChargenFlow(ctx context.Context) (configured bool, steps []ChargenStep, options []ChargenBundleOption, err error)
+	// CreateChargenCharacter validates a prompt-driven submission + creates the character. reason is a
+	// non-empty user-facing message on a validation failure (name taken, over budget, at the cap, …).
+	CreateChargenCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (characterID, reason string, err error)
 	// Close releases any underlying connection (a no-op for the stub).
 	Close() error
 }
+
+// ChargenStep is the gate-side form of a content chargen step (a tagged union over Kind).
+type ChargenStep struct {
+	Kind, ID, Prompt, BundleKind string
+	Attributes                   []string
+	Points, Base, Min, Max       int
+}
+
+// ChargenBundleOption is a selectable bundle the gate lists for a bundle_choice step.
+type ChargenBundleOption struct{ Ref, Kind, Label string }
 
 // CharacterInfo is the gate-side summary of a character returned by the account service.
 type CharacterInfo struct {
@@ -93,6 +109,15 @@ func (stubAccountClient) StartDeviceAuth(_ context.Context, _ string) (string, s
 
 func (stubAccountClient) PollDeviceAuth(_ context.Context, _ string) (string, string, []CharacterInfo, error) {
 	return "expired", "", nil, nil
+}
+
+// GetChargenFlow/CreateChargenCharacter are never reached on the stub (no account service => no chargen).
+func (stubAccountClient) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, error) {
+	return false, nil, nil, nil
+}
+
+func (stubAccountClient) CreateChargenCharacter(context.Context, string, string, map[string]string, map[string]map[string]int) (string, string, error) {
+	return "", "character creation is unavailable", nil
 }
 
 func (stubAccountClient) Close() error { return nil }
@@ -191,6 +216,44 @@ func (g *grpcAccountClient) PollDeviceAuth(ctx context.Context, deviceCode strin
 	return resp.GetStatus(), resp.GetAccountId(), out, nil
 }
 
+func (g *grpcAccountClient) GetChargenFlow(ctx context.Context) (bool, []ChargenStep, []ChargenBundleOption, error) {
+	resp, err := g.cli.GetChargenFlow(ctx, &accountv1.GetChargenFlowRequest{})
+	if err != nil {
+		return false, nil, nil, err
+	}
+	steps := make([]ChargenStep, 0, len(resp.GetSteps()))
+	for _, s := range resp.GetSteps() {
+		steps = append(steps, ChargenStep{
+			Kind: s.GetKind(), ID: s.GetId(), Prompt: s.GetPrompt(), BundleKind: s.GetBundleKind(),
+			Attributes: s.GetAttributes(),
+			Points:     int(s.GetPoints()), Base: int(s.GetBase()), Min: int(s.GetMin()), Max: int(s.GetMax()),
+		})
+	}
+	opts := make([]ChargenBundleOption, 0, len(resp.GetOptions()))
+	for _, o := range resp.GetOptions() {
+		opts = append(opts, ChargenBundleOption{Ref: o.GetRef(), Kind: o.GetKind(), Label: o.GetLabel()})
+	}
+	return resp.GetConfigured(), steps, opts, nil
+}
+
+func (g *grpcAccountClient) CreateChargenCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (string, string, error) {
+	pa := make(map[string]*accountv1.AttrAlloc, len(allocs))
+	for stepID, m := range allocs {
+		vals := make(map[string]int32, len(m))
+		for attr, v := range m {
+			vals[attr] = int32(v) //nolint:gosec // chargen point-buy values are small content-bounded ints.
+		}
+		pa[stepID] = &accountv1.AttrAlloc{Values: vals}
+	}
+	resp, err := g.cli.CreateChargenCharacter(ctx, &accountv1.CreateChargenCharacterRequest{
+		AccountId: accountID, Name: name, Picks: picks, Allocs: pa,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return resp.GetCharacterId(), resp.GetReason(), nil
+}
+
 // Close releases the gRPC connection.
 func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 
@@ -257,7 +320,7 @@ func (s *Server) loginViaDevice(ctx context.Context, tc *telnet.Conn, log *slog.
 			}
 			switch st {
 			case "authed":
-				name, ok := selectCharacter(tc, chars)
+				name, ok := s.selectOrCreateCharacter(ctx, tc, log, account, chars)
 				if !ok {
 					return "", "", false
 				}

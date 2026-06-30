@@ -48,7 +48,11 @@ func TestDeviceLoginJourney(t *testing.T) {
 	term.expect(t, "To sign in, open this link")
 	term.expect(t, "/login/DEV123")
 
-	// Once the browser completes OAuth (the fake authes on the 2nd poll), the single character spawns in.
+	// Once the browser completes OAuth (the fake authes on the 2nd poll), the character menu appears; picking
+	// the existing character spawns it.
+	term.expect(t, "Choose a character:")
+	term.expect(t, "1) Wanderer")
+	term.send(t, "1")
 	term.expect(t, "The Temple Square")
 	term.expect(t, "A broad plaza of worn flagstones")
 

@@ -66,14 +66,16 @@ func main() {
 	// A freshly-created character starts in the demo pack's start room (Phase 14.8 may let content choose).
 	svc := account.New(pool, slog.Default(), "midgaard", "midgaard:room:temple")
 
-	// Chargen (Phase 14.8): load the pack's content once and hand the service the chargen flow + bundle
-	// options, so the website can render + validate the signup form. A content reload needs a restart to
-	// take effect here (the website's form is not hot-reloaded). No content => no create-character page.
+	svc.WithMaxCharacters(cfg.MaxCharacters)
+
+	// Chargen (Phase 14.8/15.4): load the pack's content once and hand the service the chargen flow + bundle
+	// options, so the gate can render + validate prompt-driven creation. A content reload needs a restart to
+	// take effect here. No content => no create-character flow.
 	if flow, options, ok := loadChargen(ctx, pool); ok {
 		svc.WithChargen(flow, options)
 		slog.Info("chargen flow loaded", "steps", len(flow.Steps), "bundle_options", len(options))
 	} else {
-		slog.Warn("no chargen flow in content: the website offers no create-character page")
+		slog.Warn("no chargen flow in content: the gate offers no create-character flow")
 	}
 
 	// Redis backs both the legacy link codes (Phase 14.2) AND the Phase-15 device-auth sessions (the terminal

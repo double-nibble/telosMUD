@@ -43,3 +43,11 @@ func (deviceAuthUnsupported) StartDeviceAuth(context.Context, string) (string, s
 func (deviceAuthUnsupported) PollDeviceAuth(context.Context, string) (string, string, []CharacterInfo, error) {
 	return "expired", "", nil, nil
 }
+
+func (deviceAuthUnsupported) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, error) {
+	return false, nil, nil, nil
+}
+
+func (deviceAuthUnsupported) CreateChargenCharacter(context.Context, string, string, map[string]string, map[string]map[string]int) (string, string, error) {
+	return "", "unavailable", nil
+}
