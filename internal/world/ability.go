@@ -335,6 +335,14 @@ func (z *Zone) checkRequires(s *session, def *abilityDef) bool {
 			return false
 		}
 	}
+	// Ability OWNERSHIP (Phase 11.4a): an ownership-gated ability (a class feature, a trained skill) is
+	// usable only by an actor it was GRANTED to. An un-gated ability (requires_grant false) stays
+	// universally usable — the gate is opt-in, so existing content is unchanged.
+	if def.requiresGrant && !hasGrantedAbility(actor, def.ref) {
+		z.log.Debug("ability lifecycle: blocked at step 3 (not granted)", "ability", def.ref, "actor", actor.short)
+		s.send(textFrame("You haven't learned how to do that."))
+		return false
+	}
 	return true
 }
 

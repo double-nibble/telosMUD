@@ -82,6 +82,11 @@ type Living struct {
 	// grants ran when the step was reached, so on a reload the step is restored (never re-run). nil until
 	// the first grant_track/advance_track. Persisted in the StateJSON `tracks` subtree.
 	tracks map[string]int
+	// granted is this entity's set of GRANTED ability refs (ability_grant.go, Phase 11.4a): the abilities
+	// a class/race bundle or a trainer handed it. An ability that opts into ownership (requires_grant)
+	// dispatches/casts only if its ref is here; an un-gated ability stays universally usable. nil until
+	// the first grant_ability. Persisted in the StateJSON `abilities` subtree.
+	granted map[string]bool
 	// attrs is the memoized derivation cache + dirty bit (attributes.go). Recomputed lazily after any
 	// base/mod change. NOT persisted (it is a pure function of bases + mods + defs) and NOT shared —
 	// each instance owns its own; cloneComponent gives a COW'd instance a fresh (empty) cache.

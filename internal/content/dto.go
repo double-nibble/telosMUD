@@ -67,6 +67,12 @@ type Pack struct {
 	// tracks raise. Same last-write-wins override-by-ref rule as the other pack globals.
 	Tracks []TrackDTO `json:"tracks" yaml:"tracks"`
 
+	// Bundles are pack-GLOBAL content bundles (Phase 11.4b, gap [G6c]): class/race/background/feat/talent
+	// templates — a kind discriminator + a grant op-list applied when the bundle is chosen (chargen) or a
+	// track step grants it. Pure CONTENT: the engine knows the KIND "bundle" (apply its grants), never
+	// "fighter". Same last-write-wins override-by-ref rule as the other pack globals.
+	Bundles []BundleDTO `json:"bundles" yaml:"bundles"`
+
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
@@ -111,6 +117,19 @@ type TrackDTO struct {
 	LevelAttr    string    `json:"level_attr,omitempty" yaml:"level_attr,omitempty"`
 	Thresholds   []float64 `json:"thresholds" yaml:"thresholds"`
 	Steps        []any     `json:"steps,omitempty" yaml:"steps,omitempty"` // grant op-list per step (index i => step i+1)
+}
+
+// BundleDTO is one content-defined template/bundle (Phase 11.4b, gap [G6c], docs/PHASE11-PLAN.md §11.4):
+// a class/race/background/feat/talent — a set of grants applied as a unit when chosen or reached. It is
+// pure DATA: Ref is the stable bundle id (an `apply_bundle` op / chargen names it); Kind is the template
+// kind ("class"/"race"/"background"/"feat"/"talent") — a discriminator for queries/chargen, the engine
+// just runs the grants; Grants is the grant op-list (modify_attribute_base / grant_ability / grant_track /
+// set_flag / …) applied to the entity. Entry prerequisites (a prestige class's stat floor) are expressed
+// by gating the apply behind a `check` in the calling content, not on the bundle itself.
+type BundleDTO struct {
+	Ref    string `json:"ref" yaml:"ref"`
+	Kind   string `json:"kind" yaml:"kind"`
+	Grants any    `json:"grants,omitempty" yaml:"grants,omitempty"` // a grant op-list (same shape as on_resolve)
 }
 
 // ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel
@@ -354,21 +373,22 @@ type AffectTickDTO struct {
 //   - on_resolve is the declarative op-list (this phase). on_resolve_lua is RESERVED (read-not-run,
 //     Phase 7). messages carries the actor/room emit templates (step 9).
 type AbilityDTO struct {
-	Ref          string             `json:"ref" yaml:"ref"`
-	Name         string             `json:"name" yaml:"name"`
-	Invocation   string             `json:"invocation" yaml:"invocation"` // 'command' | 'proc' | 'passive'
-	Words        []string           `json:"words" yaml:"words"`           // command verbs that invoke it (invocation=command)
-	Targeting    TargetingDTO       `json:"targeting" yaml:"targeting"`
-	Tags         []string           `json:"tags" yaml:"tags"`
-	Skill        string             `json:"skill" yaml:"skill"` // Phase 11.3: the skill/track this ability trains — using it fires OnSkillUse
-	Requires     RequiresDTO        `json:"requires" yaml:"requires"`
-	Costs        []ResourceCostDTO  `json:"costs" yaml:"costs"`
-	CastTime     int                `json:"cast_time" yaml:"cast_time"`
-	Lag          int                `json:"lag" yaml:"lag"`
-	Cooldown     int                `json:"cooldown" yaml:"cooldown"`
-	OnResolve    any                `json:"on_resolve" yaml:"on_resolve"`         // declarative op-list (Phase 5.3)
-	OnResolveLua string             `json:"on_resolve_lua" yaml:"on_resolve_lua"` // RESERVED, read-not-run (Phase 7)
-	Messages     AbilityMessagesDTO `json:"messages" yaml:"messages"`
+	Ref           string             `json:"ref" yaml:"ref"`
+	Name          string             `json:"name" yaml:"name"`
+	Invocation    string             `json:"invocation" yaml:"invocation"` // 'command' | 'proc' | 'passive'
+	Words         []string           `json:"words" yaml:"words"`           // command verbs that invoke it (invocation=command)
+	Targeting     TargetingDTO       `json:"targeting" yaml:"targeting"`
+	Tags          []string           `json:"tags" yaml:"tags"`
+	Skill         string             `json:"skill" yaml:"skill"`                   // Phase 11.3: the skill/track this ability trains — using it fires OnSkillUse
+	RequiresGrant bool               `json:"requires_grant" yaml:"requires_grant"` // Phase 11.4a: ownership-gated — usable only after grant_ability
+	Requires      RequiresDTO        `json:"requires" yaml:"requires"`
+	Costs         []ResourceCostDTO  `json:"costs" yaml:"costs"`
+	CastTime      int                `json:"cast_time" yaml:"cast_time"`
+	Lag           int                `json:"lag" yaml:"lag"`
+	Cooldown      int                `json:"cooldown" yaml:"cooldown"`
+	OnResolve     any                `json:"on_resolve" yaml:"on_resolve"`         // declarative op-list (Phase 5.3)
+	OnResolveLua  string             `json:"on_resolve_lua" yaml:"on_resolve_lua"` // RESERVED, read-not-run (Phase 7)
+	Messages      AbilityMessagesDTO `json:"messages" yaml:"messages"`
 	// OnEvent subscribes op-lists to in-zone engine events ([G3]) for a known/granted ability. Map of
 	// event-name -> op-list. Phase 6.2 (per-entity ability subscriptions await the Skilled component).
 	OnEvent map[string]any `json:"on_event" yaml:"on_event"`

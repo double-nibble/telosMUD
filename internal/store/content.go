@@ -446,6 +446,14 @@ type trackBody struct {
 	Steps        []any     `json:"steps,omitempty"`
 }
 
+// bundleBody is the JSONB-tail shape for a bundle_defs row (Phase 11.4b): everything that is not the
+// ref/pack PK. It mirrors content.BundleDTO minus its Ref, so the bundle SHAPE (its kind + grant op-list)
+// is content carried in the body — the engine names no bundle.
+type bundleBody struct {
+	Kind   string `json:"kind,omitempty"`
+	Grants any    `json:"grants,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -779,6 +787,38 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	trRows.Close()
+
+	// Bundles (Phase 11.4b): ref+pack first-class, the bundle SHAPE (kind + grant op-list) in the JSONB
+	// body. Decoded into the same BundleDTO the embedded YAML carries, so the world side registers them
+	// identically whether the pack came from YAML or Postgres.
+	bnRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM bundle_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query bundle_defs: %w", err)
+	}
+	for bnRows.Next() {
+		var bn content.BundleDTO
+		var pk string
+		var body []byte
+		if err := bnRows.Scan(&bn.Ref, &pk, &body); err != nil {
+			bnRows.Close()
+			return fmt.Errorf("store: scan bundle_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b bundleBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				bnRows.Close()
+				return fmt.Errorf("store: bundle_def %s body: %w", bn.Ref, err)
+			}
+			bn.Kind, bn.Grants = b.Kind, b.Grants
+		}
+		pp := pack(pk)
+		pp.Bundles = append(pp.Bundles, bn)
+	}
+	if err := bnRows.Err(); err != nil {
+		return err
+	}
+	bnRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

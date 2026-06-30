@@ -119,6 +119,21 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if len(tr.Steps) != 3 {
 		t.Fatalf("hero_advancement steps = %d, want 3 (one grant op-list per threshold)", len(tr.Steps))
 	}
+
+	// Bundles (Phase 11.4b): the demo defines a "fighter" class + an "elf" race, each a kind + a grant
+	// op-list. Pack globals, loaded onto lc.Bundles.
+	if len(lc.Bundles) != 2 {
+		t.Fatalf("bundles = %d, want 2 (fighter + elf)", len(lc.Bundles))
+	}
+	var fighter *BundleDTO
+	for i := range lc.Bundles {
+		if lc.Bundles[i].Ref == "fighter" {
+			fighter = &lc.Bundles[i]
+		}
+	}
+	if fighter == nil || fighter.Kind != "class" || fighter.Grants == nil {
+		t.Fatalf("fighter bundle = %+v, want kind=class with grants", fighter)
+	}
 }
 
 // TestRegionMergeLastWriteWins proves a later pack overrides an earlier region by ref (the same

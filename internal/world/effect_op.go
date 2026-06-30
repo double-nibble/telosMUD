@@ -101,6 +101,8 @@ type effectOp struct {
 	attr     string  // attribute ref (modify_attribute_base — Phase 11.1 grant op)
 	flag     string  // named flag (set_flag/clear_flag — Phase 11.1 grant op)
 	track    string  // track ref (grant_track/advance_track — Phase 11.2 progression op)
+	ability  string  // ability ref (grant_ability/revoke_ability — Phase 11.4a grant op)
+	bundle   string  // bundle ref (apply_bundle — Phase 11.4b)
 	amount   float64 // a flat amount (heal/damage/modify_resource delta; modify_attribute_base delta)
 	diceNum  int     // dice count (deal_damage <N>d<S>)
 	diceSize int     // dice size
@@ -177,6 +179,10 @@ func init() {
 		// Phase 11.2 progression ops: grant a track to an entity / feed progress and apply step grants.
 		"grant_track":   opGrantTrack,
 		"advance_track": opAdvanceTrack,
+		// Phase 11.4 ability ownership + bundles.
+		"grant_ability":  opGrantAbility,
+		"revoke_ability": opRevokeAbility,
+		"apply_bundle":   opApplyBundle,
 	}
 }
 

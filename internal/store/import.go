@@ -96,6 +96,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		// Tracks (Phase 11.2): stripped on re-seed, same strips-and-replaces idempotency. No FK into the
 		// zone tree (a track names attribute refs as data), so order-independent.
 		`DELETE FROM track_defs WHERE pack=$1`,
+		// Bundles (Phase 11.4b): same strips-and-replaces idempotency. No FK into the zone tree.
+		`DELETE FROM bundle_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -360,6 +362,20 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			`INSERT INTO track_defs (ref, pack, body) VALUES ($1,$2,$3)`,
 			tr.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert track %s: %w", tr.Ref, err)
+		}
+	}
+	// Bundles (Phase 11.4b): the bundle SHAPE (kind + grant op-list) rides the JSONB body (bundleBody).
+	// ref+pack is the per-kind PK. The loader reads it back into the same BundleDTO the embedded YAML
+	// produces, so YAML and Postgres packs define bundles identically.
+	for _, bn := range pk.Bundles {
+		body, err := json.Marshal(bundleBody{Kind: bn.Kind, Grants: bn.Grants})
+		if err != nil {
+			return fmt.Errorf("store: marshal bundle %s body: %w", bn.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO bundle_defs (ref, pack, body) VALUES ($1,$2,$3)`,
+			bn.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert bundle %s: %w", bn.Ref, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

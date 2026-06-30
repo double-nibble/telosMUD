@@ -151,6 +151,15 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		}
 		d.track.register(tr.Ref, def)
 	}
+	// Bundles (Phase 11.4b): parse each bundle's grant op-list into the runtime def and register it.
+	for _, bn := range lc.Bundles {
+		def, err := buildBundleDef(bn)
+		if err != nil {
+			slog.Error("content: bundle grant op-list parse failed; registering with parsed grants only",
+				"bundle", bn.Ref, "err", err)
+		}
+		d.bundle.register(bn.Ref, def)
+	}
 	d.defaultCombat = lc.DefaultCombat
 	// Custom Lua commands (7.4e): register each verb + its aliases into the per-shard custom-command
 	// table by EXACT word. Skips a word that collides with a BUILT-IN verb (a custom command may never

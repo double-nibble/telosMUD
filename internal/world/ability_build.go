@@ -33,21 +33,22 @@ import (
 // whatever ops parsed, so a partial bad list never aborts boot).
 func buildAbilityDef(a content.AbilityDTO) (*abilityDef, error) {
 	def := &abilityDef{
-		ref:          a.Ref,
-		name:         a.Name,
-		invocation:   a.Invocation,
-		words:        append([]string(nil), a.Words...),
-		mode:         parseTargetMode(a.Targeting.Mode),
-		disposition:  parseDisposition(a.Targeting.Disposition),
-		tags:         append([]string(nil), a.Tags...),
-		skill:        a.Skill, // Phase 11.3: a skill-tagged ability fires OnSkillUse on resolve
-		notPrevented: append([]string(nil), a.Requires.NotPrevented...),
-		castTime:     a.CastTime,
-		lag:          a.Lag,
-		cooldown:     a.Cooldown,
-		onResolveLua: a.OnResolveLua, // READ-NOT-RUN (Phase 7)
-		msgActor:     a.Messages.Actor,
-		msgRoom:      a.Messages.Room,
+		ref:           a.Ref,
+		name:          a.Name,
+		invocation:    a.Invocation,
+		words:         append([]string(nil), a.Words...),
+		mode:          parseTargetMode(a.Targeting.Mode),
+		disposition:   parseDisposition(a.Targeting.Disposition),
+		tags:          append([]string(nil), a.Tags...),
+		skill:         a.Skill,         // Phase 11.3: a skill-tagged ability fires OnSkillUse on resolve
+		requiresGrant: a.RequiresGrant, // Phase 11.4a: ownership-gated
+		notPrevented:  append([]string(nil), a.Requires.NotPrevented...),
+		castTime:      a.CastTime,
+		lag:           a.Lag,
+		cooldown:      a.Cooldown,
+		onResolveLua:  a.OnResolveLua, // READ-NOT-RUN (Phase 7)
+		msgActor:      a.Messages.Actor,
+		msgRoom:       a.Messages.Room,
 	}
 	if len(a.Requires.Attr) > 0 {
 		def.reqAttr = make(map[string]float64, len(a.Requires.Attr))
@@ -199,6 +200,8 @@ func parseOp(v any) (effectOp, error) {
 	op.attr = firstStr(m, "attr", "attribute") // Phase 11.1: modify_attribute_base target
 	op.flag = mapStr(m, "flag")                // Phase 11.1: set_flag/clear_flag name
 	op.track = mapStr(m, "track")              // Phase 11.2: grant_track/advance_track target
+	op.ability = mapStr(m, "ability")          // Phase 11.4a: grant_ability/revoke_ability target
+	op.bundle = mapStr(m, "bundle")            // Phase 11.4b: apply_bundle target
 	op.amount = mapFloat(m, "amount")
 	op.duration = int(mapFloat(m, "duration"))
 	op.magnitude = mapFloat(m, "magnitude")

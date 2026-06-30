@@ -696,6 +696,22 @@ tracks:
       - [ {op: modify_attribute_base, attr: level, amount: 1}, {op: modify_attribute_base, attr: constitution, amount: 1} ]
       - [ {op: modify_attribute_base, attr: level, amount: 1}, {op: modify_attribute_base, attr: strength, amount: 2} ]
 
+# bundles: content-defined class/race templates (Phase 11.4b). A bundle is a set of grants applied as a
+# unit — apply_bundle("fighter") raises stats, sets a flag, and grants the hero_advancement track. Chargen
+# (Phase 14) picks a class+race and applies their bundles; the engine knows only "apply the grants".
+bundles:
+  - ref: fighter
+    kind: class
+    grants:
+      - {op: modify_attribute_base, attr: strength, amount: 3}
+      - {op: set_flag, flag: martial}
+      - {op: grant_track, track: hero_advancement}
+  - ref: elf
+    kind: race
+    grants:
+      - {op: modify_attribute_base, attr: intellect, amount: 2}
+      - {op: set_flag, flag: darkvision}
+
 zones:
   - ref: midgaard
     name: The City of Midgaard

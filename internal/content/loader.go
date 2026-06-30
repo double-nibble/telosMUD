@@ -69,6 +69,10 @@ type LoadedContent struct {
 	// by ref. The world side parses each step's grant op-list and registers them into the per-shard track
 	// registry; an empty list => no tracks (the empty-boot invariant).
 	Tracks []TrackDTO
+	// Bundles are the pack-global class/race/feat/… bundles (Phase 11.4b), same last-write-wins override
+	// rule keyed by ref. The world side parses each bundle's grant op-list and registers them into the
+	// per-shard bundle registry; apply_bundle runs one's grants on an entity.
+	Bundles []BundleDTO
 	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
 	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
 	// by name).
@@ -118,6 +122,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	chanIdx := make(map[string]int)
 	regIdx := make(map[string]int)
 	trackIdx := make(map[string]int)
+	bundleIdx := make(map[string]int)
 	for _, p := range packs {
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
@@ -212,6 +217,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				trackIdx[tr.Ref] = len(lc.Tracks)
 				lc.Tracks = append(lc.Tracks, tr)
+			}
+		}
+		for _, bn := range p.Bundles {
+			if idx, ok := bundleIdx[bn.Ref]; ok {
+				lc.Bundles[idx] = bn
+			} else {
+				bundleIdx[bn.Ref] = len(lc.Bundles)
+				lc.Bundles = append(lc.Bundles, bn)
 			}
 		}
 	}

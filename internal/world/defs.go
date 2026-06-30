@@ -114,7 +114,8 @@ type defRegistries struct {
 	ability *defRegistry[*abilityDef]
 	combat  *defRegistry[*combatProfile]
 	channel *defRegistry[*channelDef]
-	track   *defRegistry[*trackDef] // Phase 11.2 advancement tracks
+	track   *defRegistry[*trackDef]  // Phase 11.2 advancement tracks
+	bundle  *defRegistry[*bundleDef] // Phase 11.4b class/race/feat bundles
 
 	// defaultCombat is the pack's player-default combat profile ref (Phase 6.3a): the profile a player
 	// entity fights with when its own (none — players aren't prototyped) declares none. newPlayerEntity
@@ -154,6 +155,7 @@ func newDefRegistries() *defRegistries {
 		combat:      newDefRegistry[*combatProfile](),
 		channel:     newDefRegistry[*channelDef](),
 		track:       newDefRegistry[*trackDef](),
+		bundle:      newDefRegistry[*bundleDef](),
 		abilityCmds: map[string]*abilityDef{},
 		customCmds:  map[string]string{},
 		formulas:    map[string]string{},
@@ -199,6 +201,12 @@ func (z *Zone) channelDefs() *defRegistry[*channelDef] {
 // Lock-free atomic.Load; a bare zone falls back to its own empty bundle (no tracks).
 func (z *Zone) trackDefs() *defRegistry[*trackDef] {
 	return z.defBundle().track
+}
+
+// bundleDefs is the zone-goroutine read accessor for the global class/race/feat bundle registry (Phase
+// 11.4b). Lock-free atomic.Load; a bare zone falls back to its own empty bundle (no bundles).
+func (z *Zone) bundleDefs() *defRegistry[*bundleDef] {
+	return z.defBundle().bundle
 }
 
 // channelForVerb returns the channel a verb emits on (lower-cased), or nil. The verb→channel mapping
@@ -519,10 +527,11 @@ type abilityDef struct {
 	// area ability (an area ability needs no explicit keyword target).
 	area string
 
-	tags         []string           // §6 CC tags this ability carries (an affect's prevents[] blocks them)
-	notPrevented []string           // requires.not_prevented: extra tags the actor must not be prevented from
-	reqAttr      map[string]float64 // requires.attr: per-attribute minimum thresholds
-	skill        string             // Phase 11.3: marks this ability as a SKILL — using it fires OnSkillUse (the use-based hook)
+	tags          []string           // §6 CC tags this ability carries (an affect's prevents[] blocks them)
+	notPrevented  []string           // requires.not_prevented: extra tags the actor must not be prevented from
+	reqAttr       map[string]float64 // requires.attr: per-attribute minimum thresholds
+	skill         string             // Phase 11.3: marks this ability as a SKILL — using it fires OnSkillUse (the use-based hook)
+	requiresGrant bool               // Phase 11.4a: when true, the actor must have been GRANTED this ability (a class/trained ability)
 
 	costs []resourceCost
 
