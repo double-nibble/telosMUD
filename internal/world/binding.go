@@ -15,6 +15,10 @@ type ItemMeta struct {
 	bindRule string // "bind_on_pickup" | "bind_on_equip" | "unbound"/"" (freely tradeable)
 	tier     string // a rarity_tier_def ref (Phase 12.1) — the component-binding threshold + recipe gating
 	tags     []string
+	// maxStack / matType mark a STACKABLE material (Phase 13.2): maxStack>0 makes the item a material whose
+	// instances merge up to maxStack; matType is a free-form category content groups by. 0 => not a material.
+	maxStack int
+	matType  string
 }
 
 func (*ItemMeta) componentKind() Kind { return KindItemMeta }
@@ -95,7 +99,9 @@ func dumpItemDelta(item *Entity) json.RawMessage {
 		d.Quality = &itemQualityJSON{Level: q.Level, Affixes: q.Affixes}
 	}
 	d.Bound = isBound(item)
-	// d.Stack is populated by Phase 13.2 (stackable materials).
+	if s, ok := Get[*Stack](item); ok {
+		d.Stack = s.count // Phase 13.2: a partially-used material stack survives a reload
+	}
 	if d.Quality == nil && !d.Bound && d.Stack == 0 {
 		return nil
 	}
@@ -122,5 +128,7 @@ func loadItemDelta(item *Entity, delta json.RawMessage) {
 	if d.Bound {
 		bindItem(item)
 	}
-	// d.Stack is applied by Phase 13.2 (stackable materials).
+	if d.Stack != 0 {
+		setItemStackCount(item, d.Stack) // Phase 13.2
+	}
 }

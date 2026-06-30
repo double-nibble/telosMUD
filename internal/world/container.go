@@ -1,6 +1,9 @@
 package world
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // Containers, inventory, and equipment commands (docs/MUDLIB.md §3, §4, §6, §7) — the
 // Phase-3 milestone: a player can get / drop / put / wear / wield / hold / remove items and
@@ -40,6 +43,7 @@ func containerCommands() []*Command {
 		{Name: "remove", Run: cmdRemove},
 		{Name: "open", Run: cmdOpen},
 		{Name: "close", Run: cmdClose},
+		{Name: "split", Run: cmdSplit},
 	}
 }
 
@@ -128,6 +132,11 @@ func cmdGet(c *Context) error {
 	Move(target, c.Actor)
 	c.z.act("You get $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n gets $p.", c.Actor, target, nil, "", "", ToRoom)
+	// Stackable materials merge into an existing stack on pickup (Phase 13.2); a fully-absorbed pickup is
+	// detached (its count folded into the stack already held).
+	if mergeStackInto(c.Actor, target) {
+		c.Actor.removeContent(target)
+	}
 	c.z.log.Debug("cmd get", "player", c.s.character, "item", target.proto)
 	return nil
 }
@@ -250,6 +259,38 @@ func cmdPut(c *Context) error {
 		c.z.act2("$n puts $p in $P.", c.Actor, m, box, nil, "", "", ToRoom)
 	}
 	c.z.log.Debug("cmd put", "player", c.s.character, "container", box.proto)
+	return nil
+}
+
+// cmdSplit divides a stack of a material with `split <count> <item>` (Phase 13.2): it peels `count` off
+// the named stack into a new stack in inventory. Refuses a non-material, a non-positive count, or a count
+// that is the whole stack (splitting the whole stack is a no-op).
+func cmdSplit(c *Context) error {
+	n, err := strconv.Atoi(c.Arg(0))
+	if err != nil || n < 1 {
+		c.Send("Split how many? (split <count> <item>)")
+		return nil
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(c.Rest(), c.Arg(0)))
+	if spec == "" {
+		c.Send("Split what?")
+		return nil
+	}
+	items := c.z.Resolve(c.Actor, parseTargetSpec(spec), ScopeInventory)
+	if len(items) == 0 {
+		c.Send("You aren't carrying that.")
+		return nil
+	}
+	item := items[0]
+	if !isMaterial(item) {
+		c.z.act("$p doesn't come in stacks.", c.Actor, item, nil, "", "", ToActor)
+		return nil
+	}
+	if c.z.splitStack(c.Actor, item, n) == nil {
+		c.Send("You can't split off that many.")
+		return nil
+	}
+	c.z.act("You split off part of $p.", c.Actor, item, nil, "", "", ToActor)
 	return nil
 }
 

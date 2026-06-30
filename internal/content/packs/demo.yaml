@@ -825,6 +825,15 @@ zones:
         bind: bind_on_pickup
         tier: rare
         tags: [magical]
+      # A stackable crafting material (Phase 13.2): leather scraps merge up to 20 per stack. Disenchant/
+      # salvage (13.4) produce these; recipes (13.5) consume them.
+      - ref: midgaard:obj:leather
+        keywords: [leather, scrap, scraps]
+        short: a pile of leather scraps
+        long: A pile of leather scraps lies here.
+        physical: {weight: 1, material: leather}
+        tags: [material]
+        material: {max_stack: 20, type: leather}
       - ref: midgaard:obj:chest
         keywords: [chest, oak, wooden]
         short: a wooden chest

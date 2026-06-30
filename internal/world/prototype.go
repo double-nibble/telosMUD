@@ -277,6 +277,9 @@ func (z *Zone) spawn(ref ProtoRef) *Entity {
 	}
 	// Debug events are emitted unconditionally; the slog handler filters them out unless
 	// DEBUG is set (internal/obs), matching every other z.log.Debug call in this package.
+	// A stackable material instance gets its own Stack{1} (Phase 13.2) — per-instance, never aliased to
+	// the proto, so two material drops never share a count.
+	ensureStack(e)
 	z.log.Debug("spawn", "ref", ref, "rid", e.rid)
 	return e
 }

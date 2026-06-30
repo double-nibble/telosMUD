@@ -74,12 +74,20 @@ func protoComponents(p content.ProtoDTO) componentSet {
 	if p.Lua != "" {
 		comps[reflect.TypeFor[*Scripted]()] = &Scripted{source: p.Lua} // 7.4c mob/item triggers
 	}
-	// Item crafting/economy metadata (Phase 13.1): bind rule + rarity tier + tags. Attached only when the
-	// prototype sets any of them, so a plain item carries no ItemMeta (the bare-engine default).
-	if p.Bind != "" || p.Tier != "" || len(p.Tags) > 0 {
-		comps[reflect.TypeFor[*ItemMeta]()] = &ItemMeta{
+	// Item crafting/economy metadata (Phase 13.1/13.2): bind rule + rarity tier + tags + the material/stack
+	// spec. Attached only when the prototype sets any of them, so a plain item carries no ItemMeta.
+	if p.Bind != "" || p.Tier != "" || len(p.Tags) > 0 || p.Material != nil {
+		meta := &ItemMeta{
 			bindRule: p.Bind, tier: p.Tier, tags: append([]string(nil), p.Tags...),
 		}
+		if m := p.Material; m != nil {
+			meta.maxStack = m.MaxStack
+			if meta.maxStack < 1 {
+				meta.maxStack = defaultMaxStack // a material with no cap stacks to a large default
+			}
+			meta.matType = m.Type
+		}
+		comps[reflect.TypeFor[*ItemMeta]()] = meta
 	}
 	return comps
 }
