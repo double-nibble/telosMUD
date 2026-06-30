@@ -2,9 +2,7 @@ package gate
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -35,8 +33,6 @@ type AccountClient interface {
 	// VerifyPassphrase checks a name+passphrase login (Phase 14.5). ok=false is a clean auth failure (bad
 	// credentials or locked out — reason carries which); the account id is returned on success.
 	VerifyPassphrase(ctx context.Context, name, pass, connInfo string) (ok bool, accountID, reason string, err error)
-	// ResolveSSHKey maps an SSH key fingerprint to an account (Phase 14.6). found=false for an unknown key.
-	ResolveSSHKey(ctx context.Context, fingerprint string) (found bool, accountID string, err error)
 	// StartDeviceAuth begins a browser OAuth login (Phase 15), returning the device_code, the one-click link
 	// to show the player, and the suggested poll interval.
 	StartDeviceAuth(ctx context.Context, connInfo string) (deviceCode, verificationURI string, interval time.Duration, err error)
@@ -95,11 +91,6 @@ func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string
 // VerifyPassphrase on the stub always fails (the stub login is name-only).
 func (stubAccountClient) VerifyPassphrase(_ context.Context, _, _, _ string) (bool, string, string, error) {
 	return false, "", "bad_credentials", nil
-}
-
-// ResolveSSHKey on the stub never resolves (no account service).
-func (stubAccountClient) ResolveSSHKey(_ context.Context, _ string) (bool, string, error) {
-	return false, "", nil
 }
 
 // StartDeviceAuth/PollDeviceAuth are never reached on the stub (the gate only runs device login when a real
@@ -189,14 +180,6 @@ func (g *grpcAccountClient) VerifyPassphrase(ctx context.Context, name, pass, co
 	return resp.GetOk(), resp.GetAccountId(), resp.GetReason(), nil
 }
 
-func (g *grpcAccountClient) ResolveSSHKey(ctx context.Context, fingerprint string) (bool, string, error) {
-	resp, err := g.cli.ResolveSSHKey(ctx, &accountv1.ResolveSSHKeyRequest{Fingerprint: fingerprint})
-	if err != nil {
-		return false, "", err
-	}
-	return resp.GetFound(), resp.GetAccountId(), nil
-}
-
 func (g *grpcAccountClient) StartDeviceAuth(ctx context.Context, connInfo string) (string, string, time.Duration, error) {
 	resp, err := g.cli.StartDeviceAuth(ctx, &accountv1.StartDeviceAuthRequest{ConnInfo: connInfo})
 	if err != nil {
@@ -261,20 +244,14 @@ func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 // --- login flow (Phase 14.2) ---------------------------------------------------------------------------
 
 // login resolves the character name + account id to enter the world with. When a real account service is
-// wired it runs the LINK-CODE bridge (ACCOUNT.md §4); otherwise it falls back to the legacy "type a name"
-// prompt so a bare dev gate (no account service) still works. The accountID is "" on the legacy path. Returns
-// ok=false when the connection drops or login aborts.
-func (s *Server) login(ctx context.Context, tc *telnet.Conn, log *slog.Logger, remote string, _ bool, preAuth string) (name, accountID string, ok bool) {
+// wired it runs the Phase-15 terminal-native OAuth device flow; otherwise it falls back to the bare "type a
+// name" login so a dev gate with no account service still works. The accountID is "" on the legacy path.
+// Returns ok=false when the connection drops or login aborts.
+func (s *Server) login(ctx context.Context, tc *telnet.Conn, log *slog.Logger, remote string, _ bool) (name, accountID string, ok bool) {
 	if !s.accountConfigured {
 		name, ok = loginByName(tc, log)
 		return name, "", ok
 	}
-	// Phase 14.6: an SSH key already authenticated the account — skip straight to character select. (SSH is
-	// removed in 15.5; until then this path stays.)
-	if preAuth != "" {
-		return s.loginPreAuthenticated(tc, log, preAuth)
-	}
-	// Phase 15: the terminal-native OAuth device flow — show a one-click link, poll until the browser auths.
 	return s.loginViaDevice(ctx, tc, log, remote)
 }
 
@@ -335,25 +312,6 @@ func (s *Server) loginViaDevice(ctx context.Context, tc *telnet.Conn, log *slog.
 	}
 }
 
-// loginPreAuthenticated handles an SSH-key login (the account is already proven by the key): list the
-// account's characters and select one — no code/passphrase prompt.
-func (s *Server) loginPreAuthenticated(tc *telnet.Conn, log *slog.Logger, account string) (string, string, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	chars, err := s.account.ListCharacters(ctx, account)
-	cancel()
-	if err != nil {
-		log.Warn("list characters (ssh) failed", "err", err)
-		_ = tc.Write("\r\nThe login service is unavailable right now. Goodbye.\r\n")
-		return "", "", false
-	}
-	name, ok := selectCharacter(tc, chars)
-	if !ok {
-		return "", "", false
-	}
-	log.Debug("login via ssh key", "account", account, "character", name)
-	return name, account, true
-}
-
 // loginByName is the pre-Phase-14 stand-in: read a name that is safe to render + safe as a targeting
 // keyword, re-prompting on a bad one. Used only when no account service is configured.
 func loginByName(tc *telnet.Conn, log *slog.Logger) (string, bool) {
@@ -371,35 +329,5 @@ func loginByName(tc *telnet.Conn, log *slog.Logger) (string, bool) {
 			continue
 		}
 		return candidate, true
-	}
-}
-
-// selectCharacter picks which character to play from the account's list: zero => a prompt to create one on
-// the website (chargen-over-telnet lands later) and ok=false; one => that character; many => a numbered menu.
-func selectCharacter(tc *telnet.Conn, chars []CharacterInfo) (string, bool) {
-	switch len(chars) {
-	case 0:
-		_ = tc.Write("\r\nThis account has no characters yet. Create one on the website, then reconnect.\r\n")
-		return "", false
-	case 1:
-		return chars[0].Name, true
-	default:
-		for {
-			_ = tc.Write("\r\nChoose a character:\r\n")
-			for i, c := range chars {
-				_ = tc.Write(fmt.Sprintf("  %d) %s\r\n", i+1, c.Name))
-			}
-			_ = tc.Write("> ")
-			line, err := tc.ReadLine()
-			if err != nil {
-				return "", false
-			}
-			n, err := strconv.Atoi(strings.TrimSpace(line))
-			if err != nil || n < 1 || n > len(chars) {
-				_ = tc.Write("\r\nPick a number from the list.\r\n")
-				continue
-			}
-			return chars[n-1].Name, true
-		}
 	}
 }

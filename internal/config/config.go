@@ -27,8 +27,6 @@ type Config struct {
 	GateTLSListen      string `yaml:"gate_tls_listen"`      // TLS telnet listen, e.g. ":4443" (needs cert+key)
 	GateTLSCert        string `yaml:"gate_tls_cert"`        // PEM cert file
 	GateTLSKey         string `yaml:"gate_tls_key"`         // PEM key file
-	GateSSHListen      string `yaml:"gate_ssh_listen"`      // SSH listen, e.g. ":2222"
-	GateSSHHostKey     string `yaml:"gate_ssh_host_key"`    // SSH host private key file (ephemeral if empty)
 
 	// Phase 1 service addresses.
 	GateListen  string `yaml:"gate_listen"`  // telnet listen, e.g. ":4000"
@@ -173,12 +171,6 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_GATE_TLS_KEY"); ok {
 		c.GateTLSKey = v
-	}
-	if v, ok := os.LookupEnv("TELOS_GATE_SSH_LISTEN"); ok {
-		c.GateSSHListen = v
-	}
-	if v, ok := os.LookupEnv("TELOS_GATE_SSH_HOST_KEY"); ok {
-		c.GateSSHHostKey = v
 	}
 	if v, ok := os.LookupEnv("TELOS_WEB_LISTEN"); ok {
 		c.WebListen = v

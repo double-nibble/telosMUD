@@ -82,10 +82,9 @@ func main() {
 	defer func() { _ = comms.Close() }()
 
 	srv := gate.New(cfg.GateListen, dir, comms)
-	// Phase 14.6 transports: TLS is the encrypted default; plain telnet is opt-in. The SSH transport (14.6b)
-	// is configured here too once it lands.
+	// Phase 14.6/15 transports: TLS telnet is the encrypted default; plain telnet is opt-in. (SSH was removed
+	// in Phase 15 — auth is OAuth-only.)
 	srv.WithTransports(cfg.GateAllowPlaintext, cfg.GateTLSListen, cfg.GateTLSCert, cfg.GateTLSKey)
-	srv.WithSSH(cfg.GateSSHListen, cfg.GateSSHHostKey)
 	// Phase 14: wire the real telos-account client when an account service is configured; otherwise the gate
 	// keeps the stub "type a name" login. The login flow that USES it lands in 14.2 (link codes).
 	if cfg.AccountTarget != "" {
