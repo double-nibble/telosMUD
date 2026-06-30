@@ -174,12 +174,37 @@ type LootRollDTO struct {
 }
 
 // LootEntryDTO is one weighted entry in a roll's pool: an item prototype ref, its rarity Tier (for the
-// quality_floor filter + rendering), and an optional Weight (0 => use the tier's default weight).
+// quality_floor filter + rendering), an optional Weight (0 => use the tier's default weight), and an
+// optional Quality spec (Phase 12.3) — when present, a dropped instance rolls a level + affixes into its
+// per-instance delta, so two drops of the same prototype vary while the prototype stays shared.
 type LootEntryDTO struct {
-	Item   string  `json:"item" yaml:"item"`
-	Tier   string  `json:"tier,omitempty" yaml:"tier,omitempty"`
-	Weight float64 `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Item    string          `json:"item" yaml:"item"`
+	Tier    string          `json:"tier,omitempty" yaml:"tier,omitempty"`
+	Weight  float64         `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Quality *QualitySpecDTO `json:"quality,omitempty" yaml:"quality,omitempty"`
 }
+
+// QualitySpecDTO is a loot entry's item-quality roll (Phase 12.3, docs/LOOT-AND-SPAWNS.md §3): on drop,
+// roll an item Level in [LevelMin, LevelMax] and Count affixes chosen from the Affixes pool, each rolled
+// to a value in its [Min, Max] range — written into the dropped item's per-instance delta. Coarse v1 (the
+// affix pool is inline here; a normalized affix_defs table is a follow-up). The within-tier "always good,
+// but it varies" layer; optional per entry.
+type QualitySpecDTO struct {
+	Affixes  []AffixRollDTO `json:"affixes" yaml:"affixes"`
+	Count    int            `json:"count" yaml:"count"`
+	LevelMin int            `json:"level_min,omitempty" yaml:"level_min,omitempty"`
+	LevelMax int            `json:"level_max,omitempty" yaml:"level_max,omitempty"`
+}
+
+// AffixRollDTO is one affix in a quality pool: the Attr it modifies and the [Min, Max] range its rolled
+// value falls in. A legendary's richer pool is just a longer Affixes list with a higher Count.
+type AffixRollDTO struct {
+	Attr string  `json:"attr" yaml:"attr"`
+	Min  float64 `json:"min" yaml:"min"`
+	Max  float64 `json:"max" yaml:"max"`
+}
+
+// ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel
 
 // LootPityDTO is a chance roll's bad-luck-protection spec (Phase 12.2): each miss nudges the effective
 // chance up by Step (to Cap); a hit resets the per-character counter keyed by Key.

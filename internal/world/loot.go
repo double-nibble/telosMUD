@@ -1,6 +1,7 @@
 package world
 
 import (
+	"encoding/json"
 	"math/rand"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -40,9 +41,24 @@ type lootRoll struct {
 }
 
 type lootEntry struct {
-	item   string
-	tier   string
-	weight float64
+	item    string
+	tier    string
+	weight  float64
+	quality *qualitySpec // Phase 12.3: roll a per-instance level + affixes onto the dropped item
+}
+
+// qualitySpec is the runtime item-quality roll (Phase 12.3): a level range + N affixes drawn from a pool,
+// each rolled to a value in its range.
+type qualitySpec struct {
+	affixes  []affixRoll
+	count    int
+	levelMin int
+	levelMax int
+}
+
+type affixRoll struct {
+	attr     string
+	min, max float64
 }
 
 type lootPity struct {
@@ -60,7 +76,15 @@ func buildLootTableDef(d content.LootTableDTO) *lootTableDef {
 	for _, r := range d.Rolls {
 		roll := lootRoll{kind: r.Kind, chance: r.Chance, n: r.N, qualityFloor: r.QualityFloor}
 		for _, e := range r.Pool {
-			roll.pool = append(roll.pool, lootEntry{item: e.Item, tier: e.Tier, weight: e.Weight})
+			entry := lootEntry{item: e.Item, tier: e.Tier, weight: e.Weight}
+			if e.Quality != nil {
+				qs := &qualitySpec{count: e.Quality.Count, levelMin: e.Quality.LevelMin, levelMax: e.Quality.LevelMax}
+				for _, a := range e.Quality.Affixes {
+					qs.affixes = append(qs.affixes, affixRoll{attr: a.Attr, min: a.Min, max: a.Max})
+				}
+				entry.quality = qs
+			}
+			roll.pool = append(roll.pool, entry)
 		}
 		if r.Pity != nil {
 			roll.pity = &lootPity{key: r.Pity.Key, step: r.Pity.Step, cap: r.Pity.Cap}
@@ -87,8 +111,8 @@ func (z *Zone) resolveLoot(victim *Entity, rng *rand.Rand) {
 	looters := z.eligibleLooters(victim)
 	for _, looter := range looters {
 		for i := range table.rolls {
-			for _, itemRef := range z.resolveRoll(looter, &table.rolls[i], rng) {
-				z.deliverLoot(looter, itemRef)
+			for _, entry := range z.resolveRoll(looter, &table.rolls[i], rng) {
+				z.deliverLoot(looter, entry, rng)
 			}
 		}
 	}
@@ -165,7 +189,7 @@ func (z *Zone) eligibleLooters(victim *Entity) []*Entity {
 // resolveRoll resolves one roll to a list of selected item prototype refs (0..N items) for `looter`.
 // guaranteed and the weighted kinds always pick from the pool; chance gates on its (pity-adjusted)
 // probability first. quality_floor filters the pool to entries at or above the floor tier's order.
-func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand) []string {
+func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand) []lootEntry {
 	pool := z.filterPoolByFloor(roll.pool, roll.qualityFloor)
 	if len(pool) == 0 {
 		return nil
@@ -173,7 +197,7 @@ func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand) []str
 	switch roll.kind {
 	case "guaranteed", "weighted_one":
 		if e := z.weightedPick(pool, rng); e != nil {
-			return []string{e.item}
+			return []lootEntry{*e}
 		}
 	case "chance":
 		hit := rng.Float64() < pityAdjustedChance(roll, looter)
@@ -188,7 +212,7 @@ func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand) []str
 		}
 		if hit {
 			if e := z.weightedPick(pool, rng); e != nil {
-				return []string{e.item}
+				return []lootEntry{*e}
 			}
 		}
 	case "weighted_n":
@@ -196,10 +220,10 @@ func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand) []str
 		if n < 1 {
 			n = 1
 		}
-		var out []string
+		var out []lootEntry
 		for i := 0; i < n; i++ {
 			if e := z.weightedPick(pool, rng); e != nil {
-				out = append(out, e.item)
+				out = append(out, *e)
 			}
 		}
 		return out
@@ -266,18 +290,94 @@ func (z *Zone) entryWeight(e lootEntry) float64 {
 	return 1
 }
 
-// deliverLoot spawns the item prototype and delivers it directly into the looter's inventory, with a
-// message. Personal loot: the item is the looter's, never placed in the contested corpse. A nil/unknown
-// prototype is a clean no-op (content-lint discipline).
-func (z *Zone) deliverLoot(looter *Entity, itemRef string) {
-	item := z.spawn(ProtoRef(itemRef))
+// deliverLoot spawns the entry's item, rolls its quality (Phase 12.3) onto the instance, and delivers it
+// directly into the looter's inventory with a message. Personal loot: the item is the looter's, never
+// placed in the contested corpse. A nil/unknown prototype is a clean no-op (content-lint discipline).
+func (z *Zone) deliverLoot(looter *Entity, entry lootEntry, rng *rand.Rand) {
+	item := z.spawn(ProtoRef(entry.item))
 	if item == nil {
 		return
+	}
+	if entry.quality != nil {
+		rollItemQuality(item, entry.quality, rng)
 	}
 	Move(item, looter)
 	if s, ok := sessionOf(looter); ok {
 		s.send(textFrame("You receive " + itemName(item) + "."))
 	}
+}
+
+// rollItemQuality rolls an item Level + Count affixes from the spec's pool onto the item's per-instance
+// Quality component (Phase 12.3) — the within-tier variance, written into the instance delta (the
+// prototype stays shared). Each affix value is rolled in its [min, max] range; a repeated attr takes the
+// last roll (a coarse v1 — no de-dup of the pool). Uses the supplied seeded rng for reproducibility.
+func rollItemQuality(item *Entity, spec *qualitySpec, rng *rand.Rand) {
+	q := &Quality{Affixes: map[string]float64{}}
+	if spec.levelMax > spec.levelMin {
+		q.Level = spec.levelMin + rng.Intn(spec.levelMax-spec.levelMin+1)
+	} else {
+		q.Level = spec.levelMin
+	}
+	count := spec.count
+	if count < 0 {
+		count = 0
+	}
+	for i := 0; i < count && len(spec.affixes) > 0; i++ {
+		a := spec.affixes[rng.Intn(len(spec.affixes))]
+		val := a.min
+		if a.max > a.min {
+			val = a.min + rng.Float64()*(a.max-a.min)
+		}
+		q.Affixes[a.attr] = val
+	}
+	Add(item, q)
+}
+
+// Quality is a dropped item's per-instance loot quality (Phase 12.3): a rolled item Level + a set of
+// rolled Affixes (attr -> value). It is the per-instance DELTA over the shared prototype — two drops of
+// the same item differ only here. Persisted in ItemJSON.Delta. The stat EFFECT of a worn affix (the
+// wearer's bonus) is a gear-modifier follow-up (the existing addModSource seam); v1 rolls + stores it.
+type Quality struct {
+	Level   int
+	Affixes map[string]float64
+}
+
+func (*Quality) componentKind() Kind { return KindQuality }
+
+// itemQualityJSON is the on-disk shape of a Quality component (the item's instance delta).
+type itemQualityJSON struct {
+	Level   int                `json:"level,omitempty"`
+	Affixes map[string]float64 `json:"affixes,omitempty"`
+}
+
+// dumpItemQuality marshals an item's Quality component to its ItemJSON.Delta bytes (an OWNED copy — never
+// aliasing live state, per the ItemJSON.Delta invariant). nil when the item has no rolled quality.
+func dumpItemQuality(item *Entity) json.RawMessage {
+	q, ok := Get[*Quality](item)
+	if !ok {
+		return nil
+	}
+	b, err := json.Marshal(itemQualityJSON{Level: q.Level, Affixes: q.Affixes})
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// loadItemQuality re-attaches a Quality component from an ItemJSON.Delta (the persistence round-trip). A
+// nil/empty/malformed delta is a clean no-op (the item is a plain prototype instance).
+func loadItemQuality(item *Entity, delta json.RawMessage) {
+	if len(delta) == 0 {
+		return
+	}
+	var q itemQualityJSON
+	if err := json.Unmarshal(delta, &q); err != nil {
+		return
+	}
+	if q.Level == 0 && len(q.Affixes) == 0 {
+		return
+	}
+	Add(item, &Quality{Level: q.Level, Affixes: q.Affixes})
 }
 
 // itemName renders an item entity's short name for a loot message (its short, else its proto ref).

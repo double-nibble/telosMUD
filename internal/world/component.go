@@ -35,6 +35,7 @@ const (
 	KindSkilled
 	KindAffected
 	KindScripted
+	KindQuality // Phase 12.3: a dropped item's rolled level + affixes (per-instance loot quality)
 )
 
 // Component is the capability a struct grants when added to an entity. The single

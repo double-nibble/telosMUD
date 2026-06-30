@@ -543,6 +543,7 @@ func dumpEquipment(e *Entity) map[string]ItemJSON {
 // present so the shape matches the proto and a later slice fills it without a format change.
 func dumpItem(item *Entity) ItemJSON {
 	out := ItemJSON{ProtoRef: string(item.proto)}
+	out.Delta = dumpItemQuality(item) // Phase 12.3: a rolled loot item carries its quality in the delta
 	for _, child := range item.contents {
 		if child.proto == "" {
 			continue
@@ -835,6 +836,7 @@ func loadItem(z *Zone, parent *Entity, it ItemJSON, depth int) (*Entity, int) {
 		z.log.Warn("character load: unknown item prototype, skipped", "proto", it.ProtoRef, "depth", depth)
 		return nil, 1
 	}
+	loadItemQuality(item, it.Delta) // Phase 12.3: re-attach a rolled loot item's quality from its delta
 	Move(item, parent)
 	dropped := 0
 	for _, child := range it.Contents {

@@ -730,7 +730,16 @@ loot_tables:
       - kind: chance
         chance: 0.25
         pool:
-          - {item: midgaard:obj:sword, tier: rare}
+          # the rare sword rolls a per-instance quality (Phase 12.3): an item level + 1 strength affix, so
+          # two dropped swords differ while the prototype stays shared.
+          - item: midgaard:obj:sword
+            tier: rare
+            quality:
+              count: 1
+              level_min: 1
+              level_max: 10
+              affixes:
+                - {attr: strength, min: 1, max: 5}
 
 zones:
   - ref: midgaard

@@ -188,6 +188,113 @@ func TestPitySurvivesReload(t *testing.T) {
 	}
 }
 
+// itemWithQuality returns the first item in e's contents that has a Quality component, or nil.
+func itemWithQuality(e *Entity) *Quality {
+	for _, it := range e.contents {
+		if q, ok := Get[*Quality](it); ok {
+			return q
+		}
+	}
+	return nil
+}
+
+// TestLootRollsQuality proves a loot entry with a quality spec rolls a level + affixes onto the dropped
+// instance, within the spec's ranges.
+func TestLootRollsQuality(t *testing.T) {
+	z := lootZone(t)
+	z.defs.loot.register("epic", &lootTableDef{ref: "epic", rolls: []lootRoll{
+		{kind: "guaranteed", pool: []lootEntry{{
+			item:    "midgaard:obj:sword",
+			quality: &qualitySpec{count: 2, levelMin: 5, levelMax: 10, affixes: []affixRoll{{attr: "strength", min: 1, max: 5}, {attr: "constitution", min: 1, max: 3}}},
+		}}},
+	}})
+	player := z.newPlayerEntity(&session{character: "Hero"}, "Hero")
+	z.resolveLoot(lootVictim(z, player, "epic"), rand.New(rand.NewSource(1)))
+
+	q := itemWithQuality(player)
+	if q == nil {
+		t.Fatal("the dropped item carries no rolled Quality")
+	}
+	if q.Level < 5 || q.Level > 10 {
+		t.Fatalf("rolled level = %d, want in [5,10]", q.Level)
+	}
+	if len(q.Affixes) == 0 {
+		t.Fatal("no affixes rolled")
+	}
+	for attr, v := range q.Affixes {
+		switch attr {
+		case "strength":
+			if v < 1 || v > 5 {
+				t.Fatalf("strength affix = %v, want in [1,5]", v)
+			}
+		case "constitution":
+			if v < 1 || v > 3 {
+				t.Fatalf("constitution affix = %v, want in [1,3]", v)
+			}
+		default:
+			t.Fatalf("unexpected affix attr %q", attr)
+		}
+	}
+}
+
+// TestLootQualityVaries proves two drops of the SAME prototype carry DIFFERENT rolled quality (the
+// prototype stays shared; only the per-instance delta varies). Driven by advancing the same rng.
+func TestLootQualityVaries(t *testing.T) {
+	z := lootZone(t)
+	z.defs.loot.register("epic", &lootTableDef{ref: "epic", rolls: []lootRoll{
+		{kind: "guaranteed", pool: []lootEntry{{
+			item:    "midgaard:obj:sword",
+			quality: &qualitySpec{count: 1, levelMin: 1, levelMax: 100, affixes: []affixRoll{{attr: "strength", min: 1, max: 100}}},
+		}}},
+	}})
+	rng := rand.New(rand.NewSource(42))
+	a := z.newPlayerEntity(&session{character: "Alice"}, "Alice")
+	b := z.newPlayerEntity(&session{character: "Bob"}, "Bob")
+
+	z.resolveLoot(lootVictim(z, a, "epic"), rng)
+	z.resolveLoot(lootVictim(z, b, "epic"), rng)
+	qa, qb := itemWithQuality(a), itemWithQuality(b)
+	if qa == nil || qb == nil {
+		t.Fatal("both drops should carry quality")
+	}
+	if qa.Level == qb.Level && qa.Affixes["strength"] == qb.Affixes["strength"] {
+		t.Fatalf("two drops rolled identical quality (lvl %d/str %v) — instances must vary", qa.Level, qa.Affixes["strength"])
+	}
+}
+
+// TestQualitySurvivesReload proves a rolled item's quality round-trips through the per-instance delta
+// (dumpItem -> ItemJSON.Delta -> loadItem).
+func TestQualitySurvivesReload(t *testing.T) {
+	z := lootZone(t)
+	z.defs.loot.register("epic", &lootTableDef{ref: "epic", rolls: []lootRoll{
+		{kind: "guaranteed", pool: []lootEntry{{
+			item:    "midgaard:obj:sword",
+			quality: &qualitySpec{count: 1, levelMin: 7, levelMax: 7, affixes: []affixRoll{{attr: "strength", min: 3, max: 3}}},
+		}}},
+	}})
+	src := &session{character: "Hero"}
+	player := z.newPlayerEntity(src, "Hero")
+	z.resolveLoot(lootVictim(z, player, "epic"), rand.New(rand.NewSource(1)))
+	want := itemWithQuality(player)
+	if want == nil {
+		t.Fatal("no quality rolled (precondition)")
+	}
+
+	snap := dumpCharacter(src)
+	dst := &session{character: "Hero"}
+	z.newPlayerEntity(dst, "Hero")
+	loadCharacter(z, dst, snap)
+
+	got := itemWithQuality(dst.entity)
+	if got == nil {
+		t.Fatal("rolled quality lost on reload")
+	}
+	if got.Level != want.Level || got.Affixes["strength"] != want.Affixes["strength"] {
+		t.Fatalf("reloaded quality = lvl %d str %v, want lvl %d str %v",
+			got.Level, got.Affixes["strength"], want.Level, want.Affixes["strength"])
+	}
+}
+
 func TestLootNoTableNoOp(t *testing.T) {
 	z := lootZone(t)
 	src := &session{character: "Hero"}
