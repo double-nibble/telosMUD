@@ -9,6 +9,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -70,6 +71,10 @@ type Service struct {
 	chargenOptions []content.ChargenBundleOption
 	chargenKind    map[string]string // bundle ref -> kind (the bundle_choice legality check)
 	chargenOK      bool
+	// Device auth (Phase 15): the device-session store + the verification base URL the gate's one-click link
+	// points at. nil store => StartDeviceAuth/PollDeviceAuth are Unavailable.
+	deviceAuth    DeviceAuthStore
+	verifyBaseURL string
 }
 
 // New builds the Account service over a character store.
@@ -134,6 +139,70 @@ func (s *Service) BuildCharacter(ctx context.Context, accountID, name string, pi
 func (s *Service) WithLinkCodes(codes LinkCodeStore) *Service {
 	s.codes = codes
 	return s
+}
+
+// WithDeviceAuth wires the device-auth store + the verification base URL the gate's one-click link points at
+// (Phase 15). Without it, StartDeviceAuth/PollDeviceAuth return Unavailable.
+func (s *Service) WithDeviceAuth(store DeviceAuthStore, verifyBaseURL string) *Service {
+	s.deviceAuth = store
+	s.verifyBaseURL = strings.TrimRight(verifyBaseURL, "/")
+	return s
+}
+
+// AuthorizeDevice is the BROKER-facing callback (in-process, called from the web auth bridge): once the
+// browser completes OAuth and the identity resolves to an account, it flips the pending device session to
+// authed so the gate's poll picks it up. ok=false means the device code is unknown/expired (stale/forged link).
+func (s *Service) AuthorizeDevice(ctx context.Context, deviceCode, accountID string) (bool, error) {
+	if s.deviceAuth == nil {
+		return false, status.Error(codes.Unavailable, "device auth not configured")
+	}
+	return s.deviceAuth.Authorize(ctx, deviceCode, accountID)
+}
+
+// StartDeviceAuth mints a device_code + the one-click verification link the gate shows the player (Phase 15).
+func (s *Service) StartDeviceAuth(ctx context.Context, _ *accountv1.StartDeviceAuthRequest) (*accountv1.StartDeviceAuthResponse, error) {
+	if s.deviceAuth == nil {
+		return nil, status.Error(codes.Unavailable, "device auth not configured")
+	}
+	code, err := s.deviceAuth.Start(ctx, deviceCodeTTL)
+	if err != nil {
+		s.log.Error("StartDeviceAuth", "err", err)
+		return nil, status.Error(codes.Internal, "start device auth failed")
+	}
+	return &accountv1.StartDeviceAuthResponse{
+		DeviceCode:      code,
+		VerificationUri: s.verifyBaseURL + "/login/" + code,
+		ExpiresIn:       int32(deviceCodeTTL.Seconds()),
+		Interval:        int32(devicePollInterval.Seconds()),
+	}, nil
+}
+
+// PollDeviceAuth reports whether the browser has completed OAuth for device_code; once authed it returns the
+// account + its characters (the gate then runs character select). status is "pending" | "authed" | "expired".
+func (s *Service) PollDeviceAuth(ctx context.Context, req *accountv1.PollDeviceAuthRequest) (*accountv1.PollDeviceAuthResponse, error) {
+	if s.deviceAuth == nil {
+		return nil, status.Error(codes.Unavailable, "device auth not configured")
+	}
+	if req.GetDeviceCode() == "" {
+		return nil, status.Error(codes.InvalidArgument, "device_code required")
+	}
+	st, account, found, err := s.deviceAuth.Poll(ctx, req.GetDeviceCode())
+	if err != nil {
+		s.log.Error("PollDeviceAuth", "err", err)
+		return nil, status.Error(codes.Internal, "poll device auth failed")
+	}
+	if !found {
+		return &accountv1.PollDeviceAuthResponse{Status: "expired"}, nil
+	}
+	if st != DeviceAuthed {
+		return &accountv1.PollDeviceAuthResponse{Status: "pending"}, nil
+	}
+	chars, err := s.store.AccountCharacters(ctx, account)
+	if err != nil {
+		s.log.Error("PollDeviceAuth: list characters", "account", account, "err", err)
+		return nil, status.Error(codes.Internal, "list characters failed")
+	}
+	return &accountv1.PollDeviceAuthResponse{Status: "authed", AccountId: account, Characters: toProtoChars(chars)}, nil
 }
 
 // WithSigningKey wires the Ed25519 assertion-signing key (Phase 14.3). Without it, IssueSessionAssertion

@@ -213,3 +213,51 @@ func TestBuildCharacter(t *testing.T) {
 		t.Fatal("duplicate name should return a 'name taken' reason")
 	}
 }
+
+// TestDeviceAuthService (Phase 15) covers the gate-facing StartDeviceAuth/PollDeviceAuth + the broker-facing
+// AuthorizeDevice over the in-memory device store.
+func TestDeviceAuthService(t *testing.T) {
+	fs := newFakeStore()
+	fs.chars["acct-1"] = []store.CharacterSummary{{ID: "c1", Name: "Aragorn"}}
+	svc := New(fs, nil, "midgaard", "midgaard:room:temple").WithDeviceAuth(NewMemDeviceAuth(), "http://localhost:8080/")
+	ctx := context.Background()
+
+	start, err := svc.StartDeviceAuth(ctx, &accountv1.StartDeviceAuthRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start.GetDeviceCode() == "" || start.GetExpiresIn() <= 0 || start.GetInterval() <= 0 {
+		t.Fatalf("StartDeviceAuth response incomplete: %+v", start)
+	}
+	if want := "http://localhost:8080/login/" + start.GetDeviceCode(); start.GetVerificationUri() != want {
+		t.Fatalf("verification_uri = %q, want %q", start.GetVerificationUri(), want)
+	}
+
+	// Pending until the broker authorizes.
+	if p, _ := svc.PollDeviceAuth(ctx, &accountv1.PollDeviceAuthRequest{DeviceCode: start.GetDeviceCode()}); p.GetStatus() != "pending" {
+		t.Fatalf("poll before auth status = %q, want pending", p.GetStatus())
+	}
+
+	// Broker callback authorizes; the next poll returns authed + the account's characters.
+	if ok, err := svc.AuthorizeDevice(ctx, start.GetDeviceCode(), "acct-1"); err != nil || !ok {
+		t.Fatalf("AuthorizeDevice: ok=%v err=%v", ok, err)
+	}
+	p, err := svc.PollDeviceAuth(ctx, &accountv1.PollDeviceAuthRequest{DeviceCode: start.GetDeviceCode()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.GetStatus() != "authed" || p.GetAccountId() != "acct-1" || len(p.GetCharacters()) != 1 || p.GetCharacters()[0].GetName() != "Aragorn" {
+		t.Fatalf("authed poll = %+v, want authed/acct-1/[Aragorn]", p)
+	}
+
+	// An unknown device code polls as expired.
+	if p, _ := svc.PollDeviceAuth(ctx, &accountv1.PollDeviceAuthRequest{DeviceCode: "nope"}); p.GetStatus() != "expired" {
+		t.Fatalf("unknown device poll status = %q, want expired", p.GetStatus())
+	}
+
+	// With no device store wired, the RPCs are Unavailable.
+	bare := New(newFakeStore(), nil, "midgaard", "midgaard:room:temple")
+	if _, err := bare.StartDeviceAuth(ctx, &accountv1.StartDeviceAuthRequest{}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("StartDeviceAuth without a store should be Unavailable, got %v", err)
+	}
+}

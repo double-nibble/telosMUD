@@ -30,6 +30,35 @@ service Account {
   // (Phase 14.3). The gate calls it after login (once the character + session are known) and carries the
   // token in the Play Attach frame; the world verifies it offline against account's published public key.
   rpc IssueSessionAssertion(IssueSessionAssertionRequest) returns (IssueSessionAssertionResponse);
+
+  // --- Phase 15 terminal-native OAuth (the brokered device flow) ---
+
+  // StartDeviceAuth begins a brokered OAuth login: it mints a device_code + the verification URL the gate
+  // shows the player (a one-click link), then the gate polls PollDeviceAuth until the browser completes OAuth.
+  rpc StartDeviceAuth(StartDeviceAuthRequest) returns (StartDeviceAuthResponse);
+  // PollDeviceAuth reports whether the device login has completed; once authed it returns the account + its
+  // characters so the gate goes straight to character select. (The session assertion is issued separately,
+  // after the character is chosen, via IssueSessionAssertion.)
+  rpc PollDeviceAuth(PollDeviceAuthRequest) returns (PollDeviceAuthResponse);
+}
+
+// --- Phase 15 device-auth messages ---
+message StartDeviceAuthRequest {
+  string conn_info = 1; // remote addr / transport, for logging + abuse limits
+}
+message StartDeviceAuthResponse {
+  string device_code = 1; // the gate polls with this
+  string verification_uri = 2; // the one-click link the gate shows the player (http://<broker>/login/<device_code>)
+  int32 expires_in = 3; // seconds until the device_code expires
+  int32 interval = 4; // suggested poll interval (seconds)
+}
+message PollDeviceAuthRequest {
+  string device_code = 1;
+}
+message PollDeviceAuthResponse {
+  string status = 1; // "pending" (keep polling) | "authed" (done) | "expired" (restart)
+  string account_id = 2; // when authed
+  repeated Character characters = 3; // when authed: the account's characters, for the select menu
 }
 
 // Character is the account-facing summary of a character (the select menu / dashboard list).
