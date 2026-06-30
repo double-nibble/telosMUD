@@ -26,18 +26,53 @@ func (chargenFakeAccount) PollDeviceAuth(context.Context, string) (string, strin
 	return "authed", "acct-1", nil, nil // authed, but no characters yet
 }
 
-func (chargenFakeAccount) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, error) {
+func (chargenFakeAccount) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, int, error) {
 	return true,
 		[]ChargenStep{
 			{Kind: "bundle_choice", ID: "race", Prompt: "Choose your race", BundleKind: "race"},
 			{Kind: "point_buy", ID: "attrs", Prompt: "Allocate your attributes", Attributes: []string{"strength"}, Points: 9, Base: 8, Min: 8, Max: 15},
 		},
 		[]ChargenBundleOption{{Ref: "elf", Kind: "race", Label: "Elf"}, {Ref: "dwarf", Kind: "race", Label: "Dwarf"}},
+		3, // max characters
 		nil
 }
 
-func (chargenFakeAccount) CreateChargenCharacter(_ context.Context, _, name string, _ map[string]string, _ map[string]map[string]int) (string, string, error) {
-	return "id-" + name, "", nil
+func (chargenFakeAccount) CreateChargenCharacter(_ context.Context, _, name string, _ map[string]string, _ map[string]map[string]int) (string, string, bool, error) {
+	return "id-" + name, "", false, nil
+}
+
+// atCapFakeAccount authes to an account already holding the max (2) characters, with a 2-character cap.
+type atCapFakeAccount struct {
+	chargenFakeAccount
+}
+
+func (atCapFakeAccount) PollDeviceAuth(context.Context, string) (string, string, []CharacterInfo, error) {
+	return "authed", "acct-1", []CharacterInfo{{ID: "c1", Name: "Anya"}, {ID: "c2", Name: "Byron"}}, nil
+}
+
+func (atCapFakeAccount) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, int, error) {
+	configured, steps, options, _, err := chargenFakeAccount{}.GetChargenFlow(context.Background())
+	return configured, steps, options, 2, err // cap == 2, already full
+}
+
+// TestChargenAtCapacityStaysOnSelect: a full account is NOT offered "create" — it sees only its characters and
+// the limit note, so it stays at the selection menu (the user-reported fix).
+func TestChargenAtCapacityStaysOnSelect(t *testing.T) {
+	const addr = "addr-a"
+	h := newHarness(t)
+	h.addShard("midgaard", addr, nil, nil)
+	h.serveGate(directory.Static{Addr: addr})
+	h.srv.WithAccountClient(&atCapFakeAccount{})
+
+	term := h.dial(t)
+	term.expect(t, "To sign in, open this link")
+	term.expect(t, "Choose a character:")
+	term.expect(t, "1) Anya")
+	term.expect(t, "2) Byron")
+	term.expect(t, "limit") // the at-limit note; NO "Create a new character" option
+	term.send(t, "2")
+	term.expect(t, "The Temple Square") // picking an existing character still works
+	term.close(t)
 }
 
 func TestChargenCreateJourney(t *testing.T) {

@@ -137,7 +137,7 @@ func (s *Service) BuildCharacter(ctx context.Context, accountID, name string, pi
 	}
 	// Enforce the per-account character cap (Phase 15.4).
 	if existing, err := s.store.AccountCharacters(ctx, accountID); err == nil && len(existing) >= s.maxCharacters {
-		return "", fmt.Sprintf("You've reached the limit of %d characters.", s.maxCharacters), nil
+		return "", capMessage(s.maxCharacters), nil
 	}
 	bundles, attrs, r := content.ValidateChargen(s.chargenFlow, picks, allocs, s.chargenKind)
 	if r != "" {
@@ -152,6 +152,17 @@ func (s *Service) BuildCharacter(ctx context.Context, accountID, name string, pi
 		return "", "", status.Error(codes.Internal, "create character failed")
 	}
 	return cid, "", nil
+}
+
+// capMessage is the user-facing "you're at the character limit" message.
+func capMessage(n int) string {
+	return fmt.Sprintf("You've reached the limit of %d characters.", n)
+}
+
+// atCapacity reports whether the account already holds the maximum number of characters.
+func (s *Service) atCapacity(ctx context.Context, accountID string) bool {
+	existing, err := s.store.AccountCharacters(ctx, accountID)
+	return err == nil && len(existing) >= s.maxCharacters
 }
 
 // WithLinkCodes wires the link-code store (Phase 14.2). Without it, Mint/RedeemLinkCode return Unavailable.
@@ -242,11 +253,18 @@ func (s *Service) GetChargenFlow(_ context.Context, _ *accountv1.GetChargenFlowR
 	for _, o := range s.chargenOptions {
 		opts = append(opts, &accountv1.ChargenBundleOption{Ref: o.Ref, Kind: o.Kind, Label: o.Label})
 	}
-	return &accountv1.GetChargenFlowResponse{Configured: true, Steps: steps, Options: opts}, nil
+	return &accountv1.GetChargenFlowResponse{
+		Configured: true, Steps: steps, Options: opts,
+		MaxCharacters: int32(s.maxCharacters), //nolint:gosec // a small content-bounded cap.
+	}, nil
 }
 
 // CreateChargenCharacter validates a prompt-driven chargen submission + creates the character (Phase 15.4).
 func (s *Service) CreateChargenCharacter(ctx context.Context, req *accountv1.CreateChargenCharacterRequest) (*accountv1.CreateChargenCharacterResponse, error) {
+	// At-capacity is a distinct signal so the gate returns to character SELECT rather than re-running chargen.
+	if s.atCapacity(ctx, req.GetAccountId()) {
+		return &accountv1.CreateChargenCharacterResponse{Reason: capMessage(s.maxCharacters), AtCapacity: true}, nil
+	}
 	allocs := make(map[string]map[string]int, len(req.GetAllocs()))
 	for stepID, a := range req.GetAllocs() {
 		m := make(map[string]int, len(a.GetValues()))

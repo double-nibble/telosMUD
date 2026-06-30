@@ -19,48 +19,70 @@ import (
 const chargenCallTimeout = 5 * time.Minute // per network call to account during select/create
 
 // selectOrCreateCharacter runs character select/create after a successful login. It returns the chosen (or
-// freshly created) character name, or ok=false if the player disconnects/aborts.
+// freshly created) character name, or ok=false if the player disconnects/aborts. It fetches the chargen flow
+// up front so it can hide "create" once the account is at its character cap — a full account simply stays on
+// the selection menu (never walks chargen only to be bounced).
 func (s *Server) selectOrCreateCharacter(ctx context.Context, tc *telnet.Conn, log *slog.Logger, account string, chars []CharacterInfo) (string, bool) {
-	if len(chars) == 0 {
-		_ = tc.Write("\r\nYou have no characters yet. Let's create one.\r\n")
-		return s.runChargen(ctx, tc, log, account)
+	fctx, cancel := context.WithTimeout(ctx, chargenCallTimeout)
+	configured, steps, options, maxChars, err := s.account.GetChargenFlow(fctx)
+	cancel()
+	if err != nil {
+		log.Warn("GetChargenFlow failed", "err", err)
+		configured = false
 	}
+	canCreate := configured && len(chars) < maxChars
+
+	// No characters: go straight to creation (an account always has room for its first character).
+	if len(chars) == 0 {
+		if !canCreate {
+			_ = tc.Write("\r\nCharacter creation isn't available right now.\r\n")
+			return "", false
+		}
+		_ = tc.Write("\r\nYou have no characters yet. Let's create one.\r\n")
+		return s.runChargen(ctx, tc, log, account, steps, options)
+	}
+
 	for {
 		_ = tc.Write("\r\nChoose a character:\r\n")
 		for i, c := range chars {
 			_ = tc.Write(fmt.Sprintf("  %d) %s\r\n", i+1, c.Name))
 		}
-		createOpt := len(chars) + 1
-		_ = tc.Write(fmt.Sprintf("  %d) Create a new character\r\n> ", createOpt))
+		createOpt := 0
+		if canCreate {
+			createOpt = len(chars) + 1
+			_ = tc.Write(fmt.Sprintf("  %d) Create a new character\r\n", createOpt))
+		} else if configured {
+			// chargen exists but the account is full — say so, rather than silently dropping the option.
+			_ = tc.Write(fmt.Sprintf("(You're at the %d-character limit — pick one above.)\r\n", maxChars))
+		}
+		_ = tc.Write("> ")
 		line, err := tc.ReadLine()
 		if err != nil {
 			return "", false
 		}
 		n, err := strconv.Atoi(strings.TrimSpace(line))
-		if err != nil || n < 1 || n > createOpt {
+		hi := len(chars)
+		if canCreate {
+			hi = createOpt
+		}
+		if err != nil || n < 1 || n > hi {
 			_ = tc.Write("\r\nPick a number from the list.\r\n")
 			continue
 		}
-		if n == createOpt {
-			if name, ok := s.runChargen(ctx, tc, log, account); ok {
+		if canCreate && n == createOpt {
+			if name, ok := s.runChargen(ctx, tc, log, account, steps, options); ok {
 				return name, true
 			}
-			continue // creation aborted: back to the menu
+			continue // creation aborted / at-capacity: back to the menu
 		}
 		return chars[n-1].Name, true
 	}
 }
 
-// runChargen walks the content chargen flow as prompts and creates the character. The whole flow re-runs on a
-// create rejection (a name taken / over-budget allocation / at the cap) so the player can correct any choice.
-func (s *Server) runChargen(ctx context.Context, tc *telnet.Conn, log *slog.Logger, account string) (string, bool) {
-	fctx, cancel := context.WithTimeout(ctx, chargenCallTimeout)
-	configured, steps, options, err := s.account.GetChargenFlow(fctx)
-	cancel()
-	if err != nil || !configured {
-		_ = tc.Write("\r\nCharacter creation isn't available right now.\r\n")
-		return "", false
-	}
+// runChargen walks the pre-fetched content chargen flow as prompts and creates the character. The whole flow
+// re-runs on a correctable rejection (a name taken / over-budget allocation); an at-capacity result returns to
+// the caller's selection menu instead.
+func (s *Server) runChargen(ctx context.Context, tc *telnet.Conn, log *slog.Logger, account string, steps []ChargenStep, options []ChargenBundleOption) (string, bool) {
 	for {
 		picks := map[string]string{}
 		allocs := map[string]map[string]int{}
@@ -72,11 +94,16 @@ func (s *Server) runChargen(ctx context.Context, tc *telnet.Conn, log *slog.Logg
 			return "", false
 		}
 		cctx, c := context.WithTimeout(ctx, chargenCallTimeout)
-		_, reason, err := s.account.CreateChargenCharacter(cctx, account, name, picks, allocs)
+		_, reason, atCapacity, err := s.account.CreateChargenCharacter(cctx, account, name, picks, allocs)
 		c()
 		if err != nil {
 			log.Warn("CreateChargenCharacter failed", "err", err)
 			_ = tc.Write("\r\nCharacter creation is unavailable right now.\r\n")
+			return "", false
+		}
+		if atCapacity {
+			// The account filled up (e.g. another session). Don't re-run chargen — back to selection.
+			_ = tc.Write("\r\n" + reason + "\r\n")
 			return "", false
 		}
 		if reason != "" {

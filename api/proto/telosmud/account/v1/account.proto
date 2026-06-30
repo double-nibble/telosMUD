@@ -55,6 +55,7 @@ message GetChargenFlowResponse {
   bool configured = 1; // false => no chargen flow (the gate offers no create)
   repeated ChargenStep steps = 2;
   repeated ChargenBundleOption options = 3;
+  int32 max_characters = 4; // the per-account cap, so the gate hides "create" once the account is full
 }
 // ChargenStep is one step the gate renders (a tagged union over kind). The gate shows the choices; the account
 // VALIDATES the submission (the point-buy cost curve lives server-side, not on the wire).
@@ -86,6 +87,7 @@ message CreateChargenCharacterRequest {
 message CreateChargenCharacterResponse {
   string character_id = 1;
   string reason = 2; // non-empty on a validation failure (name taken, over budget, …)
+  bool at_capacity = 3; // true => the account is at its character cap; the gate returns to character SELECT
 }
 
 // --- Phase 15 device-auth messages ---

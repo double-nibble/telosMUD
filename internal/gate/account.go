@@ -43,12 +43,13 @@ type AccountClient interface {
 	// PollDeviceAuth reports the device-login status ("pending" | "authed" | "expired"); on "authed" it
 	// returns the account + its characters.
 	PollDeviceAuth(ctx context.Context, deviceCode string) (status, accountID string, characters []CharacterInfo, err error)
-	// GetChargenFlow returns the content chargen flow the gate walks as prompts (Phase 15.4). configured=false
-	// => no chargen (the gate offers no create).
-	GetChargenFlow(ctx context.Context) (configured bool, steps []ChargenStep, options []ChargenBundleOption, err error)
+	// GetChargenFlow returns the content chargen flow the gate walks as prompts + the per-account character cap
+	// (Phase 15.4). configured=false => no chargen (the gate offers no create).
+	GetChargenFlow(ctx context.Context) (configured bool, steps []ChargenStep, options []ChargenBundleOption, maxCharacters int, err error)
 	// CreateChargenCharacter validates a prompt-driven submission + creates the character. reason is a
-	// non-empty user-facing message on a validation failure (name taken, over budget, at the cap, …).
-	CreateChargenCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (characterID, reason string, err error)
+	// non-empty user-facing message on a validation failure; atCapacity=true means the account is full (the
+	// gate returns to character SELECT rather than re-running chargen).
+	CreateChargenCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (characterID, reason string, atCapacity bool, err error)
 	// Close releases any underlying connection (a no-op for the stub).
 	Close() error
 }
@@ -112,12 +113,12 @@ func (stubAccountClient) PollDeviceAuth(_ context.Context, _ string) (string, st
 }
 
 // GetChargenFlow/CreateChargenCharacter are never reached on the stub (no account service => no chargen).
-func (stubAccountClient) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, error) {
-	return false, nil, nil, nil
+func (stubAccountClient) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, int, error) {
+	return false, nil, nil, 0, nil
 }
 
-func (stubAccountClient) CreateChargenCharacter(context.Context, string, string, map[string]string, map[string]map[string]int) (string, string, error) {
-	return "", "character creation is unavailable", nil
+func (stubAccountClient) CreateChargenCharacter(context.Context, string, string, map[string]string, map[string]map[string]int) (string, string, bool, error) {
+	return "", "character creation is unavailable", false, nil
 }
 
 func (stubAccountClient) Close() error { return nil }
@@ -216,10 +217,10 @@ func (g *grpcAccountClient) PollDeviceAuth(ctx context.Context, deviceCode strin
 	return resp.GetStatus(), resp.GetAccountId(), out, nil
 }
 
-func (g *grpcAccountClient) GetChargenFlow(ctx context.Context) (bool, []ChargenStep, []ChargenBundleOption, error) {
+func (g *grpcAccountClient) GetChargenFlow(ctx context.Context) (bool, []ChargenStep, []ChargenBundleOption, int, error) {
 	resp, err := g.cli.GetChargenFlow(ctx, &accountv1.GetChargenFlowRequest{})
 	if err != nil {
-		return false, nil, nil, err
+		return false, nil, nil, 0, err
 	}
 	steps := make([]ChargenStep, 0, len(resp.GetSteps()))
 	for _, s := range resp.GetSteps() {
@@ -233,10 +234,10 @@ func (g *grpcAccountClient) GetChargenFlow(ctx context.Context) (bool, []Chargen
 	for _, o := range resp.GetOptions() {
 		opts = append(opts, ChargenBundleOption{Ref: o.GetRef(), Kind: o.GetKind(), Label: o.GetLabel()})
 	}
-	return resp.GetConfigured(), steps, opts, nil
+	return resp.GetConfigured(), steps, opts, int(resp.GetMaxCharacters()), nil
 }
 
-func (g *grpcAccountClient) CreateChargenCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (string, string, error) {
+func (g *grpcAccountClient) CreateChargenCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (string, string, bool, error) {
 	pa := make(map[string]*accountv1.AttrAlloc, len(allocs))
 	for stepID, m := range allocs {
 		vals := make(map[string]int32, len(m))
@@ -249,9 +250,9 @@ func (g *grpcAccountClient) CreateChargenCharacter(ctx context.Context, accountI
 		AccountId: accountID, Name: name, Picks: picks, Allocs: pa,
 	})
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
-	return resp.GetCharacterId(), resp.GetReason(), nil
+	return resp.GetCharacterId(), resp.GetReason(), resp.GetAtCapacity(), nil
 }
 
 // Close releases the gRPC connection.

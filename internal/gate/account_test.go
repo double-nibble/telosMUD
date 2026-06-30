@@ -44,10 +44,10 @@ func (deviceAuthUnsupported) PollDeviceAuth(context.Context, string) (string, st
 	return "expired", "", nil, nil
 }
 
-func (deviceAuthUnsupported) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, error) {
-	return false, nil, nil, nil
+func (deviceAuthUnsupported) GetChargenFlow(context.Context) (bool, []ChargenStep, []ChargenBundleOption, int, error) {
+	return false, nil, nil, 0, nil
 }
 
-func (deviceAuthUnsupported) CreateChargenCharacter(context.Context, string, string, map[string]string, map[string]map[string]int) (string, string, error) {
-	return "", "unavailable", nil
+func (deviceAuthUnsupported) CreateChargenCharacter(context.Context, string, string, map[string]string, map[string]map[string]int) (string, string, bool, error) {
+	return "", "unavailable", false, nil
 }
