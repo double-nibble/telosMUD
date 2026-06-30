@@ -4,7 +4,7 @@ The opener of **Track D** (progression & economy) and the largest single content
 surfaced ([GAME-SYSTEMS-GAP-ANALYSIS.md](GAME-SYSTEMS-GAP-ANALYSIS.md) §5, gap **[G6]**). It depends only
 on the Phase-6 event bus + Phase-7 Lua (both done) — nothing in Track C blocks it.
 
-Status: **plan LOCKED (scope confirmed 2026-06-29).** Building 11.1 → 11.5 + capstone.
+Status: **COMPLETE (11.1–11.5 + capstone landed, CI green).** Chargen (11.6) deferred to Phase 14 as planned.
 
 **Settled scope (the 5 forks, confirmed):**
 1. **Core progression: 11.1–11.5 + the capstone. Chargen (11.6) is DEFERRED to pair with Phase 14**
