@@ -183,7 +183,10 @@ forward. ([GAME-SYSTEMS-GAP-ANALYSIS.md](GAME-SYSTEMS-GAP-ANALYSIS.md) §5)
 **Done when:** a character is created from a class+race bundle, gains XP on kills (auto-leveling one
 track), trains a skill through use on another, and the build survives a restart — all content.
 
-### Phase 12 — Loot & scheduled spawns
+### Phase 12 — Loot & scheduled spawns ✅
+> Done (12.1–12.4 + capstone). Loot resolver + pity + per-instance quality + director-owned weekly
+> spawns. Deferred: a worn affix's stat effect (the gear-modifier seam), an `on_roll` Lua hatch, a
+> normalized `affix_defs` table, per-mob xp-value cap (see FOLLOW-UPS.md).
 ([LOOT-AND-SPAWNS.md](LOOT-AND-SPAWNS.md))
 - Loot resolver on death: roll kinds, rarity tiers, personal loot, pity counters.
 - Item quality/affix rolls into instance deltas (coarse v1; deep affixes deferred).

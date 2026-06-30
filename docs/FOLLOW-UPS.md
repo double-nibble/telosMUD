@@ -410,3 +410,23 @@ something an author would reasonably want to:
 - **Load/locality-aware placement balance (Phase 10.6).** `placement.Plan` balances by zone COUNT; a newbie
   town ≫ an empty wilderness. Move to load-aware (player count / tick time) and locality-aware (keep adjacent
   zones colocated so common moves stay in-process) balancing, with rebalance cooldowns (PLACEMENT.md §7). · *orchestration*
+
+## 7. Phase 12 (loot & spawns) deferred work
+
+- **Worn-affix stat effect (Phase 12.3).** A rolled item's `Quality` affixes are stored + persisted but do
+  NOT yet modify the wearer's stats. Wire the gear-modifier seam: on equip, register the affixes as a
+  `modSource` (attributes.go `addModSource`, the existing stub) on the wearer; unregister on remove. Then a
+  "+5 strength" sword actually grants +5 when worn. · *progression/combat*
+- **Normalized `affix_defs` table (Phase 12.3).** The affix pool is inline in a loot entry's `quality` spec
+  (coarse v1). A shared `affix_defs` content table (named affixes referenced by ref) would de-duplicate
+  pools across items + allow a richer legendary pool by reference. · *progression*
+- **`on_roll(ctx)` Lua loot hatch (Phase 12.1).** The resolver is fully declarative. Add the Lua escape
+  hatch for conditional drops the declarative form can't express ("the Sunsword only drops while the realm
+  is at war", "guarantee it on a first-ever kill") — declarative for the 80%, Lua for the rest (LOOT §5). · *progression/scripting*
+- **Per-mob XP value / kill-magnitude cap (Phase 11.3/12).** death.go fires OnKill with `mag` = the victim's
+  raw max-hp (builder-influenceable — a high-max-hp mob is an XP/loot farm). Read a content `xp_value`
+  attribute or cap/normalize the magnitude before it feeds XP or loot luck. · *combat/progression*
+- **Scheduled-spawn zone reaction (Phase 12.4).** The director broadcasts `spawn.boss` DOWN; the actual
+  spawn needs a content `on_world("spawn.boss")` handler that matches the zone + runs `mud.spawn` (and the
+  boss's death must `signal_world("boss.died", {ref})`). The capstone proves the loot half; ship demo
+  spawn/death handler content to close the live loop end-to-end. · *orchestration/scripting*

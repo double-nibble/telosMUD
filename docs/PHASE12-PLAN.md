@@ -5,7 +5,14 @@ boss" experience — *kill the weekly boss for months chasing the legendary swor
 system** (always-good drops with a rare legendary + bad-luck protection) and **long-timer scheduled
 spawns** (a weekly world boss). Design: [LOOT-AND-SPAWNS.md](LOOT-AND-SPAWNS.md).
 
-Status: **plan — awaiting scope confirmation.** No code yet.
+Status: **COMPLETE (12.1–12.4 + capstone landed, CI green).**
+
+**Settled forks (confirmed):** (1) FULL scope (12.1–12.4 + capstone), 12.3 deliberately coarse (item level
++ a few affixes). (2) Eligibility v1 = "dealt any damage" via the existing damage/threat record + a content
+tag hook. (3) Delivery = personal-direct to each looter (corpse holds only the body). (4) Scheduled-spawn
+command path = a 10.4 remote-effect broadcast (zone reacts by spawning), no new transport. (5) Rare+ drops
+persist, common ages out (ephemeral). (6) The `on_roll(ctx)` Lua escape hatch is DEFERRED — ship the
+declarative resolver first.
 
 ## Why now (what it builds on — all in place)
 
