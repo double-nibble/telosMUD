@@ -29,7 +29,7 @@ const assertionTTL = 5 * time.Minute
 type CharStore interface {
 	AccountCharacters(ctx context.Context, accountID string) ([]store.CharacterSummary, error)
 	NameAvailable(ctx context.Context, name string) (bool, error)
-	CreateAccountCharacter(ctx context.Context, accountID, name, zoneRef, roomRef string, state []byte) (string, error)
+	CreateAccountCharacter(ctx context.Context, accountID, name, zoneRef, roomRef string, state, chargen []byte) (string, error)
 	// Phase 14.5 passphrase auth.
 	CharacterAccount(ctx context.Context, name string) (string, bool, error)
 	AccountAuth(ctx context.Context, accountID string) (store.PassphraseAuth, bool, error)
@@ -152,9 +152,9 @@ func (s *Service) CreateCharacter(ctx context.Context, req *accountv1.CreateChar
 	if reason, ok := ValidateCharacterName(req.GetName()); !ok {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid name: %s", reason)
 	}
-	// Phase 14.8 will marshal the chosen bundles' applied grants into the initial state; for now a new
-	// character starts with empty content state (the established backward-compat default).
-	id, err := s.store.CreateAccountCharacter(ctx, req.GetAccountId(), req.GetName(), s.startZone, s.startRoom, nil)
+	// Phase 14.8b wires the validated chargen marker (chosen bundles + bought attributes) here; until then a
+	// new character starts with empty state + no pending chargen (the established backward-compat default).
+	id, err := s.store.CreateAccountCharacter(ctx, req.GetAccountId(), req.GetName(), s.startZone, s.startRoom, nil, nil)
 	if err != nil {
 		if errors.Is(err, store.ErrNameTaken) {
 			return nil, status.Error(codes.AlreadyExists, "name taken")

@@ -1079,6 +1079,11 @@ func (z *Zone) attach(m attachMsg) {
 func (z *Zone) loginRoom(s *session, m attachMsg) ProtoRef {
 	if m.loadedOK {
 		loadCharacter(z, s, m.loaded)
+		// First spawn of a content-built character (Phase 14.8): apply the recorded chargen result (point-buy
+		// bases + the chosen bundles' grants) on the zone goroutine. The next save clears the chargen column.
+		if m.loaded.PendingChargen != nil {
+			applyPendingChargen(z, s, m.loaded.PendingChargen)
+		}
 		if m.loaded.RoomRef != "" {
 			return ProtoRef(m.loaded.RoomRef)
 		}

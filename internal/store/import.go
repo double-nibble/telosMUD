@@ -474,3 +474,12 @@ func nullStr(s string) any {
 	}
 	return s
 }
+
+// nullBytes maps an empty byte slice to a SQL NULL so an optional JSONB column stays null rather than
+// erroring on an empty value.
+func nullBytes(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}

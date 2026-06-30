@@ -62,12 +62,13 @@ func (p *Pool) LoadCharacter(ctx context.Context, name string) (world.CharSnapsh
 		roomRef      *string
 		stateVersion int64
 		stateJSON    []byte
+		chargenJSON  []byte
 	)
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, zone_ref, room_ref, state_version, state
+		`SELECT id, zone_ref, room_ref, state_version, state, chargen
 		   FROM characters
 		  WHERE name = $1 AND deleted_at IS NULL`, name).
-		Scan(&id, &zoneRef, &roomRef, &stateVersion, &stateJSON)
+		Scan(&id, &zoneRef, &roomRef, &stateVersion, &stateJSON, &chargenJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return world.CharSnapshot{}, false, nil
 	}
@@ -85,6 +86,15 @@ func (p *Pool) LoadCharacter(ctx context.Context, name string) (world.CharSnapsh
 		if err := json.Unmarshal(stateJSON, &snap.State); err != nil {
 			return world.CharSnapshot{}, false, fmt.Errorf("store: unmarshal character %q state: %w", name, err)
 		}
+	}
+	// Pending chargen (Phase 14.8): a not-yet-spawned content-built character carries its chosen bundles +
+	// bought attributes here; the world applies them on first spawn and the next save nulls the column.
+	if len(chargenJSON) > 0 {
+		var cg world.ChargenResult
+		if err := json.Unmarshal(chargenJSON, &cg); err != nil {
+			return world.CharSnapshot{}, false, fmt.Errorf("store: unmarshal character %q chargen: %w", name, err)
+		}
+		snap.PendingChargen = &cg
 	}
 	return snap, true, nil
 }
@@ -127,11 +137,15 @@ func (p *Pool) SaveCharacter(ctx context.Context, snap world.CharSnapshot) (uint
 	}
 	var newVersion int64
 	err = p.pool.QueryRow(ctx,
+		// chargen = NULL clears the Phase-14.8 first-spawn marker in the SAME write that persists the built
+		// state — so application + clear are atomic from the DB's view: a crash before this save re-applies
+		// from the still-empty state (the additive racial mods never double-apply).
 		`UPDATE characters
 		    SET state = $1,
 		        zone_ref = $2,
 		        room_ref = $3,
 		        state_version = state_version + 1,
+		        chargen = NULL,
 		        last_saved_at = now()
 		  WHERE id = $4 AND state_version = $5
 		 RETURNING state_version`,

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -9,6 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/double-nibble/telosmud/internal/world"
 )
 
 // account_test.go is the gated (TELOS_TEST_DSN) Postgres test for the Phase-14 account/character store
@@ -40,7 +43,7 @@ func TestAccountCharactersAndCreate(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, free)
 
-	id, err := p.CreateAccountCharacter(ctx, acct, name, "midgaard", "midgaard:room:temple", nil)
+	id, err := p.CreateAccountCharacter(ctx, acct, name, "midgaard", "midgaard:room:temple", nil, nil)
 	require.NoError(t, err)
 	assert.NotEmpty(t, id)
 
@@ -56,7 +59,7 @@ func TestAccountCharactersAndCreate(t *testing.T) {
 	assert.False(t, free)
 
 	// A duplicate create loses the unique-name guard with the typed error.
-	_, err = p.CreateAccountCharacter(ctx, acct, name, "midgaard", "midgaard:room:temple", nil)
+	_, err = p.CreateAccountCharacter(ctx, acct, name, "midgaard", "midgaard:room:temple", nil, nil)
 	assert.True(t, errors.Is(err, ErrNameTaken), "duplicate name should return ErrNameTaken, got %v", err)
 }
 
@@ -68,7 +71,7 @@ func TestAccountAuthPassphraseAndLockout(t *testing.T) {
 	_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status) VALUES ($1, 'active')`, acct)
 	require.NoError(t, err)
 	name := "GatedAuthChar-" + time.Now().Format("150405.000000")
-	_, err = p.CreateAccountCharacter(ctx, acct, name, "midgaard", "midgaard:room:temple", nil)
+	_, err = p.CreateAccountCharacter(ctx, acct, name, "midgaard", "midgaard:room:temple", nil, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_auth WHERE account_id = $1`, acct)
@@ -152,6 +155,46 @@ func TestOAuthIdentityRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, "octocat", name)
+}
+
+// TestPendingChargenRoundTrip (Phase 14.8) proves the first-spawn chargen marker survives create -> load, and
+// that the FIRST save clears it (chargen = NULL) — so the world applies the build exactly once.
+func TestPendingChargenRoundTrip(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+	acct := uuid.NewString()
+	_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status) VALUES ($1, 'active')`, acct)
+	require.NoError(t, err)
+	name := "GatedChargen-" + time.Now().Format("150405.000000")
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM characters WHERE account_id = $1`, acct)
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, acct)
+	})
+
+	marker, err := json.Marshal(world.ChargenResult{
+		Bundles: []string{"elf", "fighter"},
+		Attrs:   map[string]float64{"strength": 15, "constitution": 13},
+	})
+	require.NoError(t, err)
+	_, err = p.CreateAccountCharacter(ctx, acct, name, "midgaard", "midgaard:room:temple", nil, marker)
+	require.NoError(t, err)
+
+	// Load: the pending chargen comes back populated.
+	snap, found, err := p.LoadCharacter(ctx, name)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotNil(t, snap.PendingChargen, "a freshly-created character must carry its pending chargen")
+	assert.Equal(t, []string{"elf", "fighter"}, snap.PendingChargen.Bundles)
+	assert.Equal(t, 15.0, snap.PendingChargen.Attrs["strength"])
+
+	// The first save (after the world applies + persists the built state) clears the marker.
+	_, ok, err := p.SaveCharacter(ctx, snap)
+	require.NoError(t, err)
+	require.True(t, ok)
+	snap2, found, err := p.LoadCharacter(ctx, name)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Nil(t, snap2.PendingChargen, "the first save must clear the chargen marker (one-time application)")
 }
 
 func TestSSHKeyResolve(t *testing.T) {

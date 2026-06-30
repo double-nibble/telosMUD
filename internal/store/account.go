@@ -61,18 +61,20 @@ func (p *Pool) NameAvailable(ctx context.Context, name string) (bool, error) {
 // race lost between the NameAvailable pre-check and the commit).
 var ErrNameTaken = errors.New("store: character name already taken")
 
-// CreateAccountCharacter creates a character OWNED by an account with the given starting location + initial
-// state JSON (the chargen result). It returns ErrNameTaken on a unique-name conflict so the caller can
-// surface "that name was just taken" rather than a generic error.
-func (p *Pool) CreateAccountCharacter(ctx context.Context, accountID, name, zoneRef, roomRef string, state []byte) (string, error) {
+// CreateAccountCharacter creates a character OWNED by an account with the given starting location. state is
+// the initial content state JSON (normally empty `{}` — the world builds the character on first spawn); chargen
+// is the Phase-14.8 pending-chargen marker (the chosen bundles + bought attributes the world applies on first
+// spawn), or nil/empty for a character that needs no build. It returns ErrNameTaken on a unique-name conflict
+// so the caller can surface "that name was just taken" rather than a generic error.
+func (p *Pool) CreateAccountCharacter(ctx context.Context, accountID, name, zoneRef, roomRef string, state, chargen []byte) (string, error) {
 	if len(state) == 0 {
 		state = []byte("{}")
 	}
 	id := uuid.New()
 	_, err := p.pool.Exec(ctx,
-		`INSERT INTO characters (id, account_id, name, zone_ref, room_ref, state_version, state, last_login_at)
-		 VALUES ($1, $2, $3, $4, $5, 0, $6, now())`,
-		id, accountID, name, nullStr(zoneRef), nullStr(roomRef), state)
+		`INSERT INTO characters (id, account_id, name, zone_ref, room_ref, state_version, state, chargen, last_login_at)
+		 VALUES ($1, $2, $3, $4, $5, 0, $6, $7, now())`,
+		id, accountID, name, nullStr(zoneRef), nullStr(roomRef), state, nullBytes(chargen))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return "", ErrNameTaken

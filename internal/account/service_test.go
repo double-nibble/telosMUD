@@ -78,7 +78,7 @@ func (f *fakeStore) NameAvailable(_ context.Context, name string) (bool, error) 
 	return !f.taken[name], nil
 }
 
-func (f *fakeStore) CreateAccountCharacter(_ context.Context, accountID, name, _, _ string, _ []byte) (string, error) {
+func (f *fakeStore) CreateAccountCharacter(_ context.Context, accountID, name, _, _ string, _, _ []byte) (string, error) {
 	if f.taken[name] {
 		return "", store.ErrNameTaken
 	}

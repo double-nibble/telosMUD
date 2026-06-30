@@ -32,6 +32,22 @@ type CharSnapshot struct {
 	RoomRef      string    // characters.room_ref: which room within it
 	StateVersion uint64    // characters.state_version: the value this snapshot was dumped AT
 	State        StateJSON // the characters.state JSONB content subtree
+
+	// PendingChargen is the not-yet-applied character-generation RESULT (Phase 14.8, Model A): set by the
+	// store from the characters.chargen column when a freshly content-built character logs in for the FIRST
+	// time. The world applies it on first spawn (applyPendingChargen: set the point-buy attribute bases, then
+	// run each chosen bundle's grants), and the next save clears the column. nil for every returning
+	// character (the common case). It is NOT part of State (so it never rides the handoff snapshot).
+	PendingChargen *ChargenResult
+}
+
+// ChargenResult is the output of a content chargen flow that telos-account recorded for a new character: the
+// chosen bundle refs (race/class/…) + the chosen attribute base values (point-buy). The world applies it once,
+// on first spawn. It is a small, account-owned shape (NOT the world's StateJSON), kept in its own
+// characters.chargen column so telos-account never has to know the PlayerSnapshot serialization.
+type ChargenResult struct {
+	Bundles []string           `json:"bundles,omitempty"`
+	Attrs   map[string]float64 `json:"attrs,omitempty"`
 }
 
 // StateJSON is the content-defined `state` subtree (docs/PERSISTENCE.md §3). For the demo a
