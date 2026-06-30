@@ -82,7 +82,7 @@ services:
       TELOS_ENV: dev
       TELOS_WORLD_LISTEN: ":9090"
       TELOS_SHARD_ADDR: world:9090
-      TELOS_ZONES: midgaard,darkwood # <-- both zones on one process (home = midgaard)
+      TELOS_ZONES: midgaard,darkwood,crypt # <-- (home = midgard)
       TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
       TELOS_REDIS_ADDR: redis:6379
       DEBUG: true

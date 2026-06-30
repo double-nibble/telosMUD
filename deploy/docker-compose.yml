@@ -136,6 +136,37 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  world-crypt:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-world
+    environment:
+      TELOS_SERVICE: telos-world
+      TELOS_ENV: dev
+      TELOS_WORLD_LISTEN: ":9090"
+      TELOS_SHARD_ADDR: world-crypt:9090
+      TELOS_SHARD_ID: shard-c # MUST be unique per world process (ARCHITECTURE.md §4)
+      TELOS_ZONES: crypt
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
+      TELOS_REDIS_ADDR: redis:6379
+      TELOS_NATS_URL: nats://nats:4222
+      DEBUG: true
+    expose:
+      - "9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+
   gate:
     build:
       context: ..
