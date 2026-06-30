@@ -141,6 +141,16 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, ch := range lc.Channels {
 		d.channel.register(ch.Ref, buildChannelDef(ch))
 	}
+	// Tracks (Phase 11.2): parse each track's per-step grant op-lists into the runtime def and register it.
+	// A malformed step op-list is logged and the track registers with whatever parsed (content-lint gate).
+	for _, tr := range lc.Tracks {
+		def, err := buildTrackDef(tr)
+		if err != nil {
+			slog.Error("content: track step op-list parse failed; registering with parsed steps only",
+				"track", tr.Ref, "err", err)
+		}
+		d.track.register(tr.Ref, def)
+	}
 	d.defaultCombat = lc.DefaultCombat
 	// Custom Lua commands (7.4e): register each verb + its aliases into the per-shard custom-command
 	// table by EXACT word. Skips a word that collides with a BUILT-IN verb (a custom command may never

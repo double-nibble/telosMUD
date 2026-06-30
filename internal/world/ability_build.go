@@ -197,6 +197,7 @@ func parseOp(v any) (effectOp, error) {
 	op.dmgType = firstStr(m, "type", "damage_type")
 	op.attr = firstStr(m, "attr", "attribute") // Phase 11.1: modify_attribute_base target
 	op.flag = mapStr(m, "flag")                // Phase 11.1: set_flag/clear_flag name
+	op.track = mapStr(m, "track")              // Phase 11.2: grant_track/advance_track target
 	op.amount = mapFloat(m, "amount")
 	op.duration = int(mapFloat(m, "duration"))
 	op.magnitude = mapFloat(m, "magnitude")

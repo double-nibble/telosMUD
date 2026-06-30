@@ -60,6 +60,13 @@ type Pack struct {
 	// world scope exists), the empty-boot invariant.
 	Regions []RegionDTO `json:"regions" yaml:"regions"`
 
+	// Tracks are pack-GLOBAL advancement tracks (Phase 11.2, gap [G6a]): a content-defined progression
+	// track (XP/level, a use-based skill, a guild rank) — a progress attribute, the thresholds that mark
+	// each step, and the grant op-list run when a step is reached. Pure CONTENT: the engine knows the KIND
+	// (track_defs + the threshold machinery), not which tracks exist; `level` is just an attribute some
+	// tracks raise. Same last-write-wins override-by-ref rule as the other pack globals.
+	Tracks []TrackDTO `json:"tracks" yaml:"tracks"`
+
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
@@ -82,6 +89,28 @@ type RegionDTO struct {
 	Ref   string   `json:"ref" yaml:"ref"`
 	Name  string   `json:"name" yaml:"name"`
 	Zones []string `json:"zones" yaml:"zones"`
+}
+
+// TrackDTO is one content-defined advancement track (Phase 11.2, gap [G6a], docs/PHASE11-PLAN.md §11.2).
+// A track is the union abstraction for ALL advancement modes — XP-threshold auto-level, train-at-trainer,
+// point-buy, and use-based — differing only in WHICH event feeds the progress attribute. It is pure DATA:
+//
+//   - Ref is the stable track id (a `grant_track`/`advance_track` op names it; an entity's per-track
+//     current step is keyed by it in state).
+//   - ProgressAttr is the attribute whose value advances the track (`xp`, `mining_skill`, `warrior_xp`) —
+//     just an ordinary attribute; `advance_track` raises it and re-evaluates the thresholds.
+//   - LevelAttr, if set, is the attribute a step is expected to raise (the track's "level"); it marks the
+//     track as a LEVEL track so the machinery can fire OnLevel (vs OnTrackStep) — empty for a use-based,
+//     level-less track. The engine grows NO level concept; this just names which attr (if any) is the level.
+//   - Thresholds is the ascending progress values that mark each step: crossing Thresholds[i] reaches step
+//     i+1 (so len(Thresholds) is the max step). Steps[i] is the grant op-list run when step i+1 is reached
+//     (same op-list shape as an ability's on_resolve — modify_attribute_base / set_flag / grant_* / …).
+type TrackDTO struct {
+	Ref          string    `json:"ref" yaml:"ref"`
+	ProgressAttr string    `json:"progress_attr" yaml:"progress_attr"`
+	LevelAttr    string    `json:"level_attr,omitempty" yaml:"level_attr,omitempty"`
+	Thresholds   []float64 `json:"thresholds" yaml:"thresholds"`
+	Steps        []any     `json:"steps,omitempty" yaml:"steps,omitempty"` // grant op-list per step (index i => step i+1)
 }
 
 // ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel

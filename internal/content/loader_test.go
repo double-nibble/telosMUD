@@ -103,6 +103,22 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if len(hl.Zones) != 2 || hl.Zones[0] != "midgaard" || hl.Zones[1] != "darkwood" {
 		t.Fatalf("heartlands zones = %v, want [midgaard darkwood]", hl.Zones)
 	}
+
+	// Tracks (Phase 11.2): the demo defines one XP→level track "hero_advancement" with 3 thresholds + a
+	// grant op-list per step. The track is a pack global (not under a zone), so it loads onto lc.Tracks.
+	if len(lc.Tracks) != 1 {
+		t.Fatalf("tracks = %d, want 1 (hero_advancement)", len(lc.Tracks))
+	}
+	tr := lc.Tracks[0]
+	if tr.Ref != "hero_advancement" || tr.ProgressAttr != "xp" || tr.LevelAttr != "level" {
+		t.Fatalf("track[0] = %+v, want hero_advancement/xp/level", tr)
+	}
+	if len(tr.Thresholds) != 3 || tr.Thresholds[0] != 100 {
+		t.Fatalf("hero_advancement thresholds = %v, want [100 250 500]", tr.Thresholds)
+	}
+	if len(tr.Steps) != 3 {
+		t.Fatalf("hero_advancement steps = %d, want 3 (one grant op-list per threshold)", len(tr.Steps))
+	}
 }
 
 // TestRegionMergeLastWriteWins proves a later pack overrides an earlier region by ref (the same

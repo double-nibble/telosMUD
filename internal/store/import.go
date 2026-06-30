@@ -93,6 +93,9 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		// Regions (Phase 10.3): stripped on re-seed, same strips-and-replaces idempotency. No FK into the
 		// zone tree (a region just NAMES member zone refs as data), so order-independent.
 		`DELETE FROM region_defs WHERE pack=$1`,
+		// Tracks (Phase 11.2): stripped on re-seed, same strips-and-replaces idempotency. No FK into the
+		// zone tree (a track names attribute refs as data), so order-independent.
+		`DELETE FROM track_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -340,6 +343,23 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			`INSERT INTO region_defs (ref, pack, body) VALUES ($1,$2,$3)`,
 			rg.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert region %s: %w", rg.Ref, err)
+		}
+	}
+	// Tracks (Phase 11.2): the track SHAPE (progress/level attrs, thresholds, per-step grant op-lists)
+	// rides the JSONB body (trackBody). ref+pack is the per-kind PK. The loader reads it back into the same
+	// TrackDTO the embedded YAML produces, so YAML and Postgres packs define tracks identically.
+	for _, tr := range pk.Tracks {
+		body, err := json.Marshal(trackBody{
+			ProgressAttr: tr.ProgressAttr, LevelAttr: tr.LevelAttr,
+			Thresholds: tr.Thresholds, Steps: tr.Steps,
+		})
+		if err != nil {
+			return fmt.Errorf("store: marshal track %s body: %w", tr.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO track_defs (ref, pack, body) VALUES ($1,$2,$3)`,
+			tr.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert track %s: %w", tr.Ref, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

@@ -436,6 +436,16 @@ type regionBody struct {
 	Zones []string `json:"zones,omitempty"`
 }
 
+// trackBody is the JSONB-tail shape for a track_defs row (Phase 11.2): everything that is not the ref/pack
+// PK. It mirrors content.TrackDTO minus its Ref, so the whole track SHAPE (progress attr, level attr,
+// thresholds, per-step grant op-lists) is content carried in the body — the engine names no track.
+type trackBody struct {
+	ProgressAttr string    `json:"progress_attr,omitempty"`
+	LevelAttr    string    `json:"level_attr,omitempty"`
+	Thresholds   []float64 `json:"thresholds,omitempty"`
+	Steps        []any     `json:"steps,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -737,6 +747,38 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	rgRows.Close()
+
+	// Tracks (Phase 11.2): ref+pack first-class, the track SHAPE (progress/level attrs, thresholds, per-
+	// step grant op-lists) in the JSONB body. Decoded into the same TrackDTO the embedded YAML carries, so
+	// the world side registers them identically whether the pack came from YAML or Postgres.
+	trRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM track_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query track_defs: %w", err)
+	}
+	for trRows.Next() {
+		var tr content.TrackDTO
+		var pk string
+		var body []byte
+		if err := trRows.Scan(&tr.Ref, &pk, &body); err != nil {
+			trRows.Close()
+			return fmt.Errorf("store: scan track_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b trackBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				trRows.Close()
+				return fmt.Errorf("store: track_def %s body: %w", tr.Ref, err)
+			}
+			tr.ProgressAttr, tr.LevelAttr, tr.Thresholds, tr.Steps = b.ProgressAttr, b.LevelAttr, b.Thresholds, b.Steps
+		}
+		pp := pack(pk)
+		pp.Tracks = append(pp.Tracks, tr)
+	}
+	if err := trRows.Err(); err != nil {
+		return err
+	}
+	trRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

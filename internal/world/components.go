@@ -77,6 +77,11 @@ type Living struct {
 	// consent flag the PvP gate reads. nil until the first setFlag. Persisted in the StateJSON `flags`
 	// subtree. Instance state, zone-goroutine-owned; a COW'd instance starts with no flags.
 	flags map[string]bool
+	// tracks holds this entity's per-advancement-track CURRENT STEP (track.go, Phase 11.2), keyed by
+	// track ref. The high-water of how far the entity has progressed on each granted track; a step's
+	// grants ran when the step was reached, so on a reload the step is restored (never re-run). nil until
+	// the first grant_track/advance_track. Persisted in the StateJSON `tracks` subtree.
+	tracks map[string]int
 	// attrs is the memoized derivation cache + dirty bit (attributes.go). Recomputed lazily after any
 	// base/mod change. NOT persisted (it is a pure function of bases + mods + defs) and NOT shared —
 	// each instance owns its own; cloneComponent gives a COW'd instance a fresh (empty) cache.

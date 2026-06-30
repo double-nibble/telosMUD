@@ -114,6 +114,7 @@ type defRegistries struct {
 	ability *defRegistry[*abilityDef]
 	combat  *defRegistry[*combatProfile]
 	channel *defRegistry[*channelDef]
+	track   *defRegistry[*trackDef] // Phase 11.2 advancement tracks
 
 	// defaultCombat is the pack's player-default combat profile ref (Phase 6.3a): the profile a player
 	// entity fights with when its own (none — players aren't prototyped) declares none. newPlayerEntity
@@ -152,6 +153,7 @@ func newDefRegistries() *defRegistries {
 		ability:     newDefRegistry[*abilityDef](),
 		combat:      newDefRegistry[*combatProfile](),
 		channel:     newDefRegistry[*channelDef](),
+		track:       newDefRegistry[*trackDef](),
 		abilityCmds: map[string]*abilityDef{},
 		customCmds:  map[string]string{},
 		formulas:    map[string]string{},
@@ -191,6 +193,12 @@ func (z *Zone) combatProfiles() *defRegistry[*combatProfile] {
 // free atomic.Load; a bare zone falls back to its own empty bundle (no channels => no channel verbs).
 func (z *Zone) channelDefs() *defRegistry[*channelDef] {
 	return z.defBundle().channel
+}
+
+// trackDefs is the zone-goroutine read accessor for the global advancement-track registry (Phase 11.2).
+// Lock-free atomic.Load; a bare zone falls back to its own empty bundle (no tracks).
+func (z *Zone) trackDefs() *defRegistry[*trackDef] {
+	return z.defBundle().track
 }
 
 // channelForVerb returns the channel a verb emits on (lower-cased), or nil. The verb→channel mapping

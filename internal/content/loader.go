@@ -65,6 +65,10 @@ type LoadedContent struct {
 	// keyed by ref. A region groups member zones a director owns the supra-zone state of; an empty list
 	// => no regions (only the world scope). The director/zone wiring consumes these in 10.3b/c.
 	Regions []RegionDTO
+	// Tracks are the pack-global advancement tracks (Phase 11.2), same last-write-wins override rule keyed
+	// by ref. The world side parses each step's grant op-list and registers them into the per-shard track
+	// registry; an empty list => no tracks (the empty-boot invariant).
+	Tracks []TrackDTO
 	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
 	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
 	// by name).
@@ -113,6 +117,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	cpIdx := make(map[string]int)
 	chanIdx := make(map[string]int)
 	regIdx := make(map[string]int)
+	trackIdx := make(map[string]int)
 	for _, p := range packs {
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
@@ -199,6 +204,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				regIdx[rg.Ref] = len(lc.Regions)
 				lc.Regions = append(lc.Regions, rg)
+			}
+		}
+		for _, tr := range p.Tracks {
+			if idx, ok := trackIdx[tr.Ref]; ok {
+				lc.Tracks[idx] = tr
+			} else {
+				trackIdx[tr.Ref] = len(lc.Tracks)
+				lc.Tracks = append(lc.Tracks, tr)
 			}
 		}
 	}

@@ -100,6 +100,7 @@ type effectOp struct {
 	dmgType  string  // damage type ref (deal_damage)
 	attr     string  // attribute ref (modify_attribute_base — Phase 11.1 grant op)
 	flag     string  // named flag (set_flag/clear_flag — Phase 11.1 grant op)
+	track    string  // track ref (grant_track/advance_track — Phase 11.2 progression op)
 	amount   float64 // a flat amount (heal/damage/modify_resource delta; modify_attribute_base delta)
 	diceNum  int     // dice count (deal_damage <N>d<S>)
 	diceSize int     // dice size
@@ -173,6 +174,9 @@ func init() {
 		"modify_attribute_base": opModifyAttributeBase,
 		"set_flag":              opSetFlag,
 		"clear_flag":            opClearFlag,
+		// Phase 11.2 progression ops: grant a track to an entity / feed progress and apply step grants.
+		"grant_track":   opGrantTrack,
+		"advance_track": opAdvanceTrack,
 	}
 }
 

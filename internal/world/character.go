@@ -68,6 +68,13 @@ type StateJSON struct {
 	// "pvp" consent flag the PvP gate reads. Stored as the set of SET flag names. loadCharacter
 	// re-installs each. A pre-5.3 save (no flags) loads with none (the safe default — no PvP consent).
 	Flags []string `json:"flags,omitempty"`
+	// Tracks is the entity's per-advancement-track CURRENT STEP (Phase 11.2, track.go), keyed by track
+	// ref. It is the high-water of progression: a step's grant op-list ran when the step was reached and
+	// wrote its results into the OTHER persisted subtrees (Attributes base overrides, Flags, …), so a
+	// reload restores both the step AND its already-applied grants — the grant is never re-run (the
+	// exactly-once-across-reload guarantee). A pre-11.2 save (no tracks) loads with none. DATA ONLY
+	// (ref->int).
+	Tracks map[string]int `json:"tracks,omitempty"`
 	// Cooldowns is each armed ability cooldown's REMAINING pulses at dump time ([G8] / P6-D8, Phase
 	// 6.3a), keyed by ability ref. loadCharacter re-arms each via pulse.after(remaining) on the
 	// DESTINATION zone goroutine (never a cross-goroutine timer write — the Phase 5.2 lesson). A logout
@@ -290,9 +297,23 @@ func dumpStateComponents(e *Entity) StateJSON {
 		Resources:  dumpResources(e),
 		Affects:    dumpAffects(e),
 		Flags:      dumpFlags(e),
+		Tracks:     dumpTracks(e), // Phase 11.2 — per-track current step
 		Cooldowns:  dumpCooldowns(e),
 		Script:     dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
 	}
+}
+
+// dumpTracks renders the entity's per-advancement-track current step as a fresh map (a copy, so the
+// snapshot never aliases live instance state). nil when no track has been granted.
+func dumpTracks(e *Entity) map[string]int {
+	if e == nil || e.living == nil || len(e.living.tracks) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(e.living.tracks))
+	for ref, step := range e.living.tracks {
+		out[ref] = step
+	}
+	return out
 }
 
 // dumpStateJSON marshals the cross-shard handoff state carry (the full-state-carry fix) to the
@@ -329,7 +350,7 @@ func dumpStateJSON(s *session) string {
 func (st StateJSON) empty() bool {
 	return len(st.Inventory) == 0 && len(st.Equipment) == 0 && len(st.Attributes) == 0 &&
 		len(st.Resources) == 0 && len(st.Affects) == 0 && len(st.Flags) == 0 &&
-		len(st.Cooldowns) == 0 && len(st.Script) == 0
+		len(st.Tracks) == 0 && len(st.Cooldowns) == 0 && len(st.Script) == 0
 }
 
 // dumpAttributes renders the entity's per-attribute BASE OVERRIDES (Living.attrBase) — bases only,
@@ -657,6 +678,12 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 		// Re-install the entity's named flags (Phase 5.3, flags.go) — e.g. a player's "pvp" consent.
 		for _, name := range st.Flags {
 			setFlag(e, name, true)
+		}
+		// Re-install the entity's advancement-track steps (Phase 11.2, track.go). The step is the high-
+		// water — its grants already wrote into the attribute/flag/resource subtrees restored above, so we
+		// restore the STEP only and never re-run a grant (the exactly-once-across-reload guarantee).
+		for ref, step := range st.Tracks {
+			setTrackStep(e, ref, step)
 		}
 		// Re-arm ability cooldowns ([G8] / P6-D8, Phase 6.3a) from their REMAINING pulses — on THIS
 		// (destination) zone goroutine, so the re-armed clear callback is registered on the zone that
