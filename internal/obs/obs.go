@@ -25,6 +25,12 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 // ShutdownFunc flushes any observability exporters on process exit.
@@ -44,9 +50,34 @@ func Init(service, level string) ShutdownFunc {
 	if DebugEnabled() {
 		slog.Debug("debug logging enabled (DEBUG env set)")
 	}
-	// TODO(phase0): initialize an OTel TracerProvider/MeterProvider here and
-	// return its Shutdown so traces/metrics flush on exit.
-	return func(context.Context) error { return nil }
+	return initMetrics(service)
+}
+
+// initMetrics installs the global OpenTelemetry MeterProvider (Phase 16.1). It exports over OTLP/gRPC when
+// OTEL_EXPORTER_OTLP_ENDPOINT (or the metrics-specific variant) is set; otherwise the provider has no reader,
+// so instrument records are negligible no-ops (metrics off). Returns the provider's Shutdown so a periodic
+// reader flushes on exit.
+func initMetrics(service string) ShutdownFunc {
+	ctx := context.Background()
+	res, err := resource.New(ctx, resource.WithAttributes(semconv.ServiceName(service)))
+	if err != nil {
+		res = resource.Default()
+	}
+	opts := []sdkmetric.Option{sdkmetric.WithResource(res)}
+
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" || os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") != "" {
+		exp, err := otlpmetricgrpc.New(ctx) // endpoint + insecure flag come from the standard OTEL_* env
+		if err != nil {
+			slog.Warn("otlp metric exporter init failed; metrics disabled", "err", err)
+		} else {
+			opts = append(opts, sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp)))
+			slog.Info("otel metrics exporting via OTLP")
+		}
+	}
+
+	mp := sdkmetric.NewMeterProvider(opts...)
+	otel.SetMeterProvider(mp)
+	return mp.Shutdown
 }
 
 // DebugEnabled reports whether the DEBUG env flag is truthy. Cheap slog.Debug

@@ -1,10 +1,12 @@
 package world
 
 import (
+	"context"
 	"log/slog"
 	"sync/atomic"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/metrics"
 )
 
 // session is a connected character's connection/handoff state — the Phase-2 exactly-once
@@ -189,5 +191,6 @@ func (s *session) send(f *playv1.ServerFrame) {
 	case s.out <- f:
 	default:
 		slog.Debug("frame dropped: session out buffer full", "player", s.character)
+		metrics.FrameDropped(context.Background()) // Phase 16.1: slow-client drop rate
 	}
 }

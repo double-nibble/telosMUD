@@ -15,6 +15,7 @@ import (
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/metrics"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
@@ -530,6 +531,7 @@ func (z *Zone) Run(ctx context.Context) {
 	// touched it (gopher-lua is not goroutine-safe). After this no script can run; the zone is
 	// stopping anyway.
 	defer z.lua.close()
+	lastTick := time.Now() // Phase 16.1: tick-lag = how far past the budget each heartbeat fires.
 	for {
 		select {
 		case <-ctx.Done():
@@ -538,6 +540,14 @@ func (z *Zone) Run(ctx context.Context) {
 		case m := <-z.inbox:
 			z.handle(m)
 		case <-ticker.C:
+			// tick-lag: the gap since the previous tick MINUS the budget. ~0 on a healthy zone; it grows
+			// when the single-writer goroutine can't keep up (saturated by inbox + pulse work) — the headline
+			// scale signal. The Go ticker coalesces missed ticks, so a slow zone shows a widening gap here.
+			now := time.Now()
+			if lag := now.Sub(lastTick) - pulseInterval; lag > 0 {
+				metrics.RecordTickLag(ctx, z.id, float64(lag.Microseconds())/1000.0)
+			}
+			lastTick = now
 			z.pulses.tick()
 		}
 	}
@@ -727,6 +737,7 @@ func (z *Zone) join(s *session, room ProtoRef) {
 	// entity + the loaded comms state. A disabled bus is a clean no-op.
 	z.publishCommsConfig(s)
 	z.log.Debug("player joined", "player", s.character, "room", r.proto, "population", len(z.players))
+	metrics.SetOccupancy(context.Background(), z.id, int64(len(z.players)))
 }
 
 // resolveRoom returns the room entity for the given ProtoRef, falling back to the start
@@ -797,6 +808,7 @@ func (z *Zone) leave(id string) {
 	// the durable stream for their next host to drain (never delivered to a gone socket) (8.5).
 	z.stopTellConsumer(id)
 	z.log.Debug("player left", "player", id, "population", len(z.players))
+	metrics.SetOccupancy(context.Background(), z.id, int64(len(z.players)))
 }
 
 // transferIn receives a player handed over from a sibling zone on the same shard (the

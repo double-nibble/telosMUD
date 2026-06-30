@@ -1,0 +1,90 @@
+// Package metrics holds TelosMUD's OpenTelemetry instruments (Phase 16.1). Call sites record through the
+// thin helpers here; obs.Init installs the global MeterProvider (OTLP when configured, else a no-op), so a
+// record is negligible when no exporter is wired. Instruments are created from the GLOBAL meter — OTel's
+// global delegation re-wires them onto the real provider when obs.Init (or a test) calls SetMeterProvider,
+// so import order does not matter.
+package metrics
+
+import (
+	"context"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// scope is the instrumentation scope name (the module path), shown as otel_scope_name on exported series.
+const scope = "github.com/double-nibble/telosmud"
+
+var meter = otel.Meter(scope)
+
+var (
+	tickLag       metric.Float64Histogram
+	occupancy     metric.Int64Gauge
+	framesDropped metric.Int64Counter
+	gateConns     metric.Int64UpDownCounter
+	busLag        metric.Float64Histogram
+)
+
+func init() {
+	// Instrument-creation errors are ignored: a nil instrument's record methods are safe no-ops, so a failed
+	// instrument degrades to "this metric is off", never a crash.
+	tickLag, _ = meter.Float64Histogram("telos.zone.tick_lag_ms",
+		metric.WithDescription("Zone heartbeat overrun: how long a pulse's callbacks ran past the 250ms budget"),
+		metric.WithUnit("ms"))
+	occupancy, _ = meter.Int64Gauge("telos.zone.occupancy",
+		metric.WithDescription("Live players in a zone"))
+	framesDropped, _ = meter.Int64Counter("telos.gate.frames_dropped_total",
+		metric.WithDescription("Server frames dropped because a player's outbound buffer was full (slow client)"))
+	gateConns, _ = meter.Int64UpDownCounter("telos.gate.connections",
+		metric.WithDescription("Live gate connections"))
+	busLag, _ = meter.Float64Histogram("telos.bus.deliver_lag_ms",
+		metric.WithDescription("Scoped-event-bus publish->deliver latency"),
+		metric.WithUnit("ms"))
+}
+
+func zoneAttr(zone string) metric.RecordOption {
+	return metric.WithAttributes(attribute.String("zone", zone))
+}
+
+// RecordTickLag records a zone heartbeat's overrun (ms past the pulse budget) for the named zone.
+func RecordTickLag(ctx context.Context, zone string, ms float64) {
+	if tickLag != nil {
+		tickLag.Record(ctx, ms, zoneAttr(zone))
+	}
+}
+
+// SetOccupancy reports the current live-player count for a zone.
+func SetOccupancy(ctx context.Context, zone string, n int64) {
+	if occupancy != nil {
+		occupancy.Record(ctx, n, metric.WithAttributes(attribute.String("zone", zone)))
+	}
+}
+
+// FrameDropped counts one dropped outbound frame for a slow client (the zone never blocks; it drops). It is
+// deliberately label-free — a per-player label would explode cardinality, and the headline signal is the
+// shard-wide drop rate.
+func FrameDropped(ctx context.Context) {
+	if framesDropped != nil {
+		framesDropped.Add(ctx, 1)
+	}
+}
+
+// ConnOpened increments the live gate connection count.
+func ConnOpened(ctx context.Context) { add(ctx, gateConns, 1) }
+
+// ConnClosed decrements the live gate connection count.
+func ConnClosed(ctx context.Context) { add(ctx, gateConns, -1) }
+
+func add(ctx context.Context, c metric.Int64UpDownCounter, n int64) {
+	if c != nil {
+		c.Add(ctx, n)
+	}
+}
+
+// RecordBusLag records a scoped-event publish->deliver latency (ms).
+func RecordBusLag(ctx context.Context, ms float64) {
+	if busLag != nil {
+		busLag.Record(ctx, ms)
+	}
+}

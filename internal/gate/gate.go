@@ -69,6 +69,7 @@ import (
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/directory"
+	"github.com/double-nibble/telosmud/internal/metrics"
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
 
@@ -236,6 +237,8 @@ func (s *Server) serveListener(ctx context.Context, ln net.Listener, encrypted b
 // writer goroutine's Recv.
 func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 	defer func() { _ = nc.Close() }()
+	metrics.ConnOpened(ctx) // Phase 16.1: live gate connections
+	defer metrics.ConnClosed(ctx)
 	remote := nc.RemoteAddr().String()
 	log := s.log.With("remote", remote)
 	log.Debug("connection accepted")
