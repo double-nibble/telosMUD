@@ -93,3 +93,7 @@ func TestSessionAssertionRejectedByWorld(t *testing.T) {
 		t.Fatalf("expected the connection to close on a rejected assertion; got %q", term.acc.String())
 	}
 }
+
+func (f *signingFakeAccount) VerifyPassphrase(_ context.Context, _, _, _ string) (bool, string, string, error) {
+	return false, "", "bad_credentials", nil
+}

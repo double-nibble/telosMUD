@@ -32,6 +32,9 @@ type AccountClient interface {
 	// IssueSessionAssertion mints the signed assertion the gate carries in Attach (Phase 14.3). An empty
 	// string is returned (no error) when account has no signing key — the world then runs unverified.
 	IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (string, error)
+	// VerifyPassphrase checks a name+passphrase login (Phase 14.5). ok=false is a clean auth failure (bad
+	// credentials or locked out — reason carries which); the account id is returned on success.
+	VerifyPassphrase(ctx context.Context, name, pass, connInfo string) (ok bool, accountID, reason string, err error)
 	// Close releases any underlying connection (a no-op for the stub).
 	Close() error
 }
@@ -62,6 +65,11 @@ func (stubAccountClient) RedeemLinkCode(_ context.Context, _, _ string) (string,
 // IssueSessionAssertion on the stub returns no token (the stub is the no-auth fallback).
 func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string) (string, error) {
 	return "", nil
+}
+
+// VerifyPassphrase on the stub always fails (the stub login is name-only).
+func (stubAccountClient) VerifyPassphrase(_ context.Context, _, _, _ string) (bool, string, string, error) {
+	return false, "", "bad_credentials", nil
 }
 
 func (stubAccountClient) Close() error { return nil }
@@ -124,6 +132,14 @@ func (g *grpcAccountClient) IssueSessionAssertion(ctx context.Context, accountID
 	return resp.GetAssertion(), nil
 }
 
+func (g *grpcAccountClient) VerifyPassphrase(ctx context.Context, name, pass, connInfo string) (bool, string, string, error) {
+	resp, err := g.cli.VerifyPassphrase(ctx, &accountv1.VerifyPassphraseRequest{Name: name, Passphrase: pass, ConnInfo: connInfo})
+	if err != nil {
+		return false, "", "", err
+	}
+	return resp.GetOk(), resp.GetAccountId(), resp.GetReason(), nil
+}
+
 // Close releases the gRPC connection.
 func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 
@@ -138,7 +154,7 @@ func (s *Server) login(tc *telnet.Conn, log *slog.Logger, remote string) (name, 
 		name, ok = loginByName(tc, log)
 		return name, "", ok
 	}
-	return s.loginByLinkCode(tc, log, remote)
+	return s.loginAuthenticated(tc, log, remote)
 }
 
 // loginByName is the pre-Phase-14 stand-in: read a name that is safe to render + safe as a targeting
@@ -161,41 +177,88 @@ func loginByName(tc *telnet.Conn, log *slog.Logger) (string, bool) {
 	}
 }
 
-// loginByLinkCode prompts for a link code (accepting a bare code or "connect <code>"), redeems it against the
-// account service, and selects a character. A bad/expired code re-prompts; an account-service error re-prompts
-// with a transient message; a dropped connection returns ok=false.
-func (s *Server) loginByLinkCode(tc *telnet.Conn, log *slog.Logger, remote string) (string, string, bool) {
+// loginAuthenticated prompts for a LINK CODE (bare or "connect <code>") or a PASSPHRASE login
+// ("connect <name> <passphrase>"), and dispatches to the right backend. A failed attempt re-prompts; a
+// dropped connection returns ok=false.
+func (s *Server) loginAuthenticated(tc *telnet.Conn, log *slog.Logger, remote string) (string, string, bool) {
 	for {
-		_ = tc.Write("Enter your link code (from the website's Play button): ")
+		_ = tc.Write("Enter your link code, or 'connect <name> <passphrase>': ")
 		line, err := tc.ReadLine()
 		if err != nil {
 			log.Debug("connection closed before login", "err", err)
 			return "", "", false
 		}
-		code := strings.ToUpper(strings.TrimSpace(line))
-		code = strings.TrimSpace(strings.TrimPrefix(code, "CONNECT "))
-		if code == "" {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		accountID, chars, found, err := s.account.RedeemLinkCode(ctx, code, remote)
-		cancel()
-		if err != nil {
-			log.Warn("redeem link code failed", "err", err)
-			_ = tc.Write("\r\nThe login service is unavailable right now. Please try again shortly.\r\n")
+		// Passphrase login: connect <name> <passphrase>.
+		if strings.EqualFold(fields[0], "connect") && len(fields) == 3 {
+			if name, account, ok := s.loginByPassphrase(tc, log, remote, fields[1], fields[2]); ok {
+				return name, account, true
+			}
 			continue
 		}
-		if !found {
-			_ = tc.Write("\r\nThat code is invalid or has expired. Get a fresh one from the website.\r\n")
-			continue
+		// Otherwise a link code — the LAST token (covers bare "<code>" and "connect <code>").
+		code := strings.ToUpper(fields[len(fields)-1])
+		if name, account, ok := s.loginByCode(tc, log, remote, code); ok {
+			return name, account, true
 		}
-		name, ok := selectCharacter(tc, chars)
-		if !ok {
-			return "", "", false
-		}
-		log.Debug("login via link code", "account", accountID, "character", name)
-		return name, accountID, true
+		// loginByCode wrote the reason; loop to re-prompt. A dropped connection is caught by the next
+		// ReadLine at the top of the loop, which returns ok=false.
 	}
+}
+
+// loginByCode redeems a link code + selects a character. ok=false on a bad code (a reason was written) or a
+// dropped connection.
+func (s *Server) loginByCode(tc *telnet.Conn, log *slog.Logger, remote, code string) (string, string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	accountID, chars, found, err := s.account.RedeemLinkCode(ctx, code, remote)
+	cancel()
+	if err != nil {
+		log.Warn("redeem link code failed", "err", err)
+		_ = tc.Write("\r\nThe login service is unavailable right now. Please try again shortly.\r\n")
+		return "", "", false
+	}
+	if !found {
+		_ = tc.Write("\r\nThat code is invalid or has expired. Get a fresh one from the website.\r\n")
+		return "", "", false
+	}
+	name, ok := selectCharacter(tc, chars)
+	if !ok {
+		return "", "", false
+	}
+	log.Debug("login via link code", "account", accountID, "character", name)
+	return name, accountID, true
+}
+
+// loginByPassphrase authenticates `connect <name> <passphrase>`: the named character must exist + the
+// passphrase verify. On success the player plays that character. A cleartext warning is shown (the passphrase
+// just crossed a possibly-unencrypted wire); the transport-aware version lands with TLS/SSH (Phase 14.6).
+func (s *Server) loginByPassphrase(tc *telnet.Conn, log *slog.Logger, remote, name, pass string) (string, string, bool) {
+	if reason, ok := validateName(name); !ok {
+		_ = tc.Write("\r\nThat name won't do: " + reason + "\r\n")
+		return "", "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	authOK, account, reason, err := s.account.VerifyPassphrase(ctx, name, pass, remote)
+	cancel()
+	if err != nil {
+		log.Warn("verify passphrase failed", "err", err)
+		_ = tc.Write("\r\nThe login service is unavailable right now. Please try again shortly.\r\n")
+		return "", "", false
+	}
+	if !authOK {
+		if reason == "locked" {
+			_ = tc.Write("\r\nToo many failed attempts. Please wait and try again later.\r\n")
+		} else {
+			_ = tc.Write("\r\nIncorrect name or passphrase.\r\n")
+		}
+		return "", "", false
+	}
+	_ = tc.Write("\r\n(Note: a passphrase is visible on an unencrypted connection — prefer a link code, TLS, or SSH.)\r\n")
+	log.Debug("login via passphrase", "account", account, "character", name)
+	return name, account, true
 }
 
 // selectCharacter picks which character to play from the account's list: zero => a prompt to create one on

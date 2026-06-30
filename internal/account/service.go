@@ -16,6 +16,7 @@ import (
 
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
 	"github.com/double-nibble/telosmud/internal/assertion"
+	"github.com/double-nibble/telosmud/internal/passphrase"
 	"github.com/double-nibble/telosmud/internal/store"
 )
 
@@ -29,17 +30,31 @@ type CharStore interface {
 	AccountCharacters(ctx context.Context, accountID string) ([]store.CharacterSummary, error)
 	NameAvailable(ctx context.Context, name string) (bool, error)
 	CreateAccountCharacter(ctx context.Context, accountID, name, zoneRef, roomRef string, state []byte) (string, error)
+	// Phase 14.5 passphrase auth.
+	CharacterAccount(ctx context.Context, name string) (string, bool, error)
+	AccountAuth(ctx context.Context, accountID string) (store.PassphraseAuth, bool, error)
+	SetPassphraseHash(ctx context.Context, accountID, hash string) error
+	RecordAuthFailure(ctx context.Context, accountID string, lockAfter int, lockFor time.Duration) (int, error)
+	ResetAuthFailures(ctx context.Context, accountID string) error
 }
+
+// Passphrase-auth tuning (Phase 14.5): lock an account after this many consecutive failures, for this long.
+const (
+	passphraseLockAfter = 5
+	passphraseLockFor   = 5 * time.Minute
+)
 
 // Service implements the Account gRPC server. It is transport-thin: validation + a store call + a mapping to
 // the proto types. The auth backends (Redis link codes, Argon2id, SSH) attach to it in later slices.
 type Service struct {
 	accountv1.UnimplementedAccountServer
-	store   CharStore
-	codes   LinkCodeStore      // Phase 14.2 link codes; nil => Mint/RedeemLinkCode are Unavailable
-	signKey ed25519.PrivateKey // Phase 14.3 assertion signing key; nil => IssueSessionAssertion returns ""
-	now     func() time.Time   // injectable clock (assertion expiry); defaults to time.Now
-	log     *slog.Logger
+	store      CharStore
+	codes      LinkCodeStore      // Phase 14.2 link codes; nil => Mint/RedeemLinkCode are Unavailable
+	signKey    ed25519.PrivateKey // Phase 14.3 assertion signing key; nil => IssueSessionAssertion returns ""
+	hashParams passphrase.Params  // Phase 14.5 Argon2id cost
+	ipThrottle *ipThrottle        // Phase 14.5 per-IP login throttle
+	now        func() time.Time   // injectable clock (assertion expiry, lockout); defaults to time.Now
+	log        *slog.Logger
 	// startZone/startRoom are the default spawn location a freshly-created character lands in (the demo
 	// pack's start room). Config-supplied; later chargen (14.8) may let content choose a starting zone.
 	startZone string
@@ -51,7 +66,12 @@ func New(cs CharStore, log *slog.Logger, startZone, startRoom string) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Service{store: cs, log: log, now: time.Now, startZone: startZone, startRoom: startRoom}
+	return &Service{
+		store: cs, log: log, now: time.Now,
+		hashParams: passphrase.DefaultParams,
+		ipThrottle: newIPThrottle(20, time.Minute), // 20 passphrase attempts/min per source IP
+		startZone:  startZone, startRoom: startRoom,
+	}
 }
 
 // WithLinkCodes wires the link-code store (Phase 14.2). Without it, Mint/RedeemLinkCode return Unavailable.

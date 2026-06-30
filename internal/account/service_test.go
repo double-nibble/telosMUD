@@ -3,6 +3,7 @@ package account
 import (
 	"context"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -15,12 +16,51 @@ import (
 
 // fakeStore is an in-memory CharStore for the service tests.
 type fakeStore struct {
-	chars map[string][]store.CharacterSummary
-	taken map[string]bool
+	chars       map[string][]store.CharacterSummary
+	taken       map[string]bool
+	nameAccount map[string]string               // character name -> account id (Phase 14.5)
+	auth        map[string]store.PassphraseAuth // account id -> auth row (Phase 14.5)
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{chars: map[string][]store.CharacterSummary{}, taken: map[string]bool{}}
+	return &fakeStore{
+		chars:       map[string][]store.CharacterSummary{},
+		taken:       map[string]bool{},
+		nameAccount: map[string]string{},
+		auth:        map[string]store.PassphraseAuth{},
+	}
+}
+
+func (f *fakeStore) CharacterAccount(_ context.Context, name string) (string, bool, error) {
+	acct, ok := f.nameAccount[name]
+	return acct, ok, nil
+}
+
+func (f *fakeStore) AccountAuth(_ context.Context, accountID string) (store.PassphraseAuth, bool, error) {
+	a, ok := f.auth[accountID]
+	return a, ok, nil
+}
+
+func (f *fakeStore) SetPassphraseHash(_ context.Context, accountID, hash string) error {
+	f.auth[accountID] = store.PassphraseAuth{Hash: hash}
+	return nil
+}
+
+func (f *fakeStore) RecordAuthFailure(_ context.Context, accountID string, lockAfter int, lockFor time.Duration) (int, error) {
+	a := f.auth[accountID]
+	a.FailedAttempts++
+	if a.FailedAttempts >= lockAfter {
+		a.LockedUntil = time.Now().Add(lockFor)
+	}
+	f.auth[accountID] = a
+	return a.FailedAttempts, nil
+}
+
+func (f *fakeStore) ResetAuthFailures(_ context.Context, accountID string) error {
+	a := f.auth[accountID]
+	a.FailedAttempts, a.LockedUntil = 0, time.Time{}
+	f.auth[accountID] = a
+	return nil
 }
 
 func (f *fakeStore) AccountCharacters(_ context.Context, accountID string) ([]store.CharacterSummary, error) {

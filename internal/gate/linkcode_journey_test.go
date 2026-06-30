@@ -88,3 +88,7 @@ func TestLinkCodeCharacterSelectMenu(t *testing.T) {
 
 	term.close(t)
 }
+
+func (f *fakeGateAccount) VerifyPassphrase(_ context.Context, _, _, _ string) (bool, string, string, error) {
+	return false, "", "bad_credentials", nil
+}

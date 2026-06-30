@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // account.go — Phase-14 account/character store methods backing telos-account (docs/ACCOUNT.md). These are
@@ -84,4 +86,102 @@ func (p *Pool) CreateAccountCharacter(ctx context.Context, accountID, name, zone
 func isUniqueViolation(err error) bool {
 	var pgErr interface{ SQLState() string }
 	return errors.As(err, &pgErr) && pgErr.SQLState() == "23505"
+}
+
+// --- Phase 14.5 passphrase auth (account_auth) -----------------------------------------------------------
+
+// CharacterAccount resolves a character name to its owning account id. found=false when the name is unknown
+// or the character has no account (a pre-14 stub character). The gate's passphrase login resolves the
+// account this way (a player logs in by character name, not account id).
+func (p *Pool) CharacterAccount(ctx context.Context, name string) (string, bool, error) {
+	var acct *string
+	err := p.pool.QueryRow(ctx,
+		`SELECT account_id FROM characters WHERE name = $1 AND deleted_at IS NULL`, name).Scan(&acct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: resolve account for %q: %w", name, err)
+	}
+	if acct == nil {
+		return "", false, nil // a character with no account (pre-14 stub)
+	}
+	return *acct, true, nil
+}
+
+// PassphraseAuth is the account_auth row: the Argon2id hash (empty if unset), the consecutive-failure count,
+// and the lockout deadline (zero if not locked). found=false when no row exists yet (no passphrase ever set).
+type PassphraseAuth struct {
+	Hash           string
+	FailedAttempts int
+	LockedUntil    time.Time
+}
+
+// AccountAuth reads an account's auth row. found=false => no passphrase configured.
+func (p *Pool) AccountAuth(ctx context.Context, accountID string) (PassphraseAuth, bool, error) {
+	var a PassphraseAuth
+	var hash *string
+	var locked *time.Time
+	err := p.pool.QueryRow(ctx,
+		`SELECT passphrase_hash, failed_attempts, locked_until FROM account_auth WHERE account_id = $1`,
+		accountID).Scan(&hash, &a.FailedAttempts, &locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PassphraseAuth{}, false, nil
+	}
+	if err != nil {
+		return PassphraseAuth{}, false, fmt.Errorf("store: read account_auth %s: %w", accountID, err)
+	}
+	if hash != nil {
+		a.Hash = *hash
+	}
+	if locked != nil {
+		a.LockedUntil = *locked
+	}
+	return a, true, nil
+}
+
+// SetPassphraseHash upserts an account's passphrase hash, resetting the failure/lockout state (setting a new
+// passphrase clears any prior lockout).
+func (p *Pool) SetPassphraseHash(ctx context.Context, accountID, hash string) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO account_auth (account_id, passphrase_hash, failed_attempts, locked_until, updated_at)
+		 VALUES ($1, $2, 0, NULL, now())
+		 ON CONFLICT (account_id) DO UPDATE
+		   SET passphrase_hash = EXCLUDED.passphrase_hash, failed_attempts = 0, locked_until = NULL, updated_at = now()`,
+		accountID, hash)
+	if err != nil {
+		return fmt.Errorf("store: set passphrase %s: %w", accountID, err)
+	}
+	return nil
+}
+
+// RecordAuthFailure increments the consecutive-failure count and, when it reaches lockAfter, sets a lockout
+// until now+lockFor. It returns the new failure count. A row is created if absent (a failure before any
+// passphrase row — defensive; in practice AccountAuth already created reasoning).
+func (p *Pool) RecordAuthFailure(ctx context.Context, accountID string, lockAfter int, lockFor time.Duration) (int, error) {
+	var failed int
+	err := p.pool.QueryRow(ctx,
+		`INSERT INTO account_auth (account_id, failed_attempts, updated_at)
+		 VALUES ($1, 1, now())
+		 ON CONFLICT (account_id) DO UPDATE
+		   SET failed_attempts = account_auth.failed_attempts + 1,
+		       locked_until = CASE WHEN account_auth.failed_attempts + 1 >= $2 THEN now() + $3::interval ELSE account_auth.locked_until END,
+		       updated_at = now()
+		 RETURNING failed_attempts`,
+		accountID, lockAfter, fmt.Sprintf("%d milliseconds", lockFor.Milliseconds())).Scan(&failed)
+	if err != nil {
+		return 0, fmt.Errorf("store: record auth failure %s: %w", accountID, err)
+	}
+	return failed, nil
+}
+
+// ResetAuthFailures clears the failure count + lockout after a successful login.
+func (p *Pool) ResetAuthFailures(ctx context.Context, accountID string) error {
+	_, err := p.pool.Exec(ctx,
+		`UPDATE account_auth SET failed_attempts = 0, locked_until = NULL, updated_at = now() WHERE account_id = $1`,
+		accountID)
+	if err != nil {
+		return fmt.Errorf("store: reset auth failures %s: %w", accountID, err)
+	}
+	return nil
 }
