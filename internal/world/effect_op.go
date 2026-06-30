@@ -98,7 +98,9 @@ type effectOp struct {
 	resource string  // resource ref (heal/restore/modify_resource)
 	affect   string  // affect ref (apply_affect/remove_affect)
 	dmgType  string  // damage type ref (deal_damage)
-	amount   float64 // a flat amount (heal/damage/modify_resource delta)
+	attr     string  // attribute ref (modify_attribute_base — Phase 11.1 grant op)
+	flag     string  // named flag (set_flag/clear_flag — Phase 11.1 grant op)
+	amount   float64 // a flat amount (heal/damage/modify_resource delta; modify_attribute_base delta)
 	diceNum  int     // dice count (deal_damage <N>d<S>)
 	diceSize int     // dice size
 	// bonus and diceCount are the [G-A] FORMULA-damage extension: a scoped formula over $actor/$target/
@@ -167,6 +169,10 @@ func init() {
 		"if":              opIf,
 		"chance":          opChance,
 		"check":           opCheck,
+		// Phase 11.1 grant ops (the progression foundation). Additive, persisted-by-construction.
+		"modify_attribute_base": opModifyAttributeBase,
+		"set_flag":              opSetFlag,
+		"clear_flag":            opClearFlag,
 	}
 }
 

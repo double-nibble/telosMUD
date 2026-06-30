@@ -56,14 +56,18 @@ features mean new tests of every tier.
 ## Slices
 
 ### 11.1 — Grant ops [G6b] (the foundation)
-The additive effect ops a level-up / bundle / chargen runs. All reuse the effect-op interpreter + the
-op-list machinery; each is idempotent-safe where it matters (a re-applied grant on a reload must not
-double-apply — the persisted grant set is the guard).
-- `modify_attribute_base` (raise a stat's per-entity base — the constraint explicitly names this),
-  `grant_ability`, `grant_track` (add a track to the entity at runtime — multiclass / join-guild),
-  `grant_resource` (unlock a pool + set its max), `grant_flag`, and the `revoke_*` inverses.
-- **Done when:** an op-list run on an entity raises its `strength` base, grants it a new ability verb it
-  can then use, unlocks a resource pool, and the changes survive a save/reload.
+The additive effect ops a level-up / bundle / chargen runs, reusing the effect-op interpreter + op-list
+machinery. These two wrap EXISTING persisted seams (`setAttrBase`, `setFlag`) so they survive a reload by
+construction (the state subtree is restored, not the grant re-run):
+- `modify_attribute_base` (raise/lower a stat's per-entity base — the constraint explicitly names this),
+  `set_flag`/`clear_flag` (the open-set named-flag grant).
+- The other grant ops are coupled to mechanisms built in later slices and land there: **`grant_track`** with
+  the track machinery (11.2); **`grant_ability`** with the per-entity ability-ownership model + the
+  invocation gate (11.4 — content abilities currently dispatch globally, so the ownership gate is a real
+  mechanism, not a thin op); **`grant_resource`** (= `modify_attribute_base` on the pool's max attr +
+  set-current) folded into 11.2/11.4.
+- **Done when:** an op-list raises an entity's `strength` base and sets a named flag, and both survive a
+  save/reload.
 
 ### 11.2 — `track_defs` + the track machinery [G6a]
 A track = `{ progress_attr, thresholds[], grants_per_step }` (`progress_attr` is just an attribute —
