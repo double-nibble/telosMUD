@@ -31,7 +31,8 @@ const pageTemplates = `
  <p class="ok">&check; Signed in{{if .Login}} as {{.Login}}{{end}}.</p>
  <p>Return to your terminal &mdash; you're being logged in now.</p>
 </div>
-<p class="muted">You can close this tab.</p>
+<p class="muted">This page should close automatically after 5 seconds.</p>
+<script>setTimeout(()=>{window.close()},5000)</script>
 {{template "foot"}}{{end}}
 
 {{define "notice"}}{{template "head"}}
