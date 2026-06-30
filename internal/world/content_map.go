@@ -144,7 +144,7 @@ func protoLiving(d *content.LivingDTO) *Living {
 	if d == nil {
 		return nil
 	}
-	l := &Living{combatRef: d.CombatProfile}
+	l := &Living{combatRef: d.CombatProfile, lootTable: d.LootTable}
 	if len(d.Attributes) > 0 {
 		l.attrBase = make(map[string]float64, len(d.Attributes))
 		for k, v := range d.Attributes {

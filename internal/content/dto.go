@@ -73,6 +73,14 @@ type Pack struct {
 	// "fighter". Same last-write-wins override-by-ref rule as the other pack globals.
 	Bundles []BundleDTO `json:"bundles" yaml:"bundles"`
 
+	// RarityTiers are pack-GLOBAL rarity tiers (Phase 12.1, gap loot): ordered named tiers
+	// (common→…→legendary) the loot resolver uses for weighting + quality_floor filtering. Pure CONTENT;
+	// same last-write-wins override-by-ref rule. Empty => no tiers (a loot pool then has no floor filter).
+	RarityTiers []RarityTierDTO `json:"rarity_tiers" yaml:"rarity_tiers"`
+	// LootTables are pack-GLOBAL loot tables (Phase 12.1): a list of independent rolls a mob drops from on
+	// death. A mob prototype references one by ref (LivingDTO.LootTable). Same last-write-wins rule.
+	LootTables []LootTableDTO `json:"loot_tables" yaml:"loot_tables"`
+
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
@@ -130,6 +138,55 @@ type BundleDTO struct {
 	Ref    string `json:"ref" yaml:"ref"`
 	Kind   string `json:"kind" yaml:"kind"`
 	Grants any    `json:"grants,omitempty" yaml:"grants,omitempty"` // a grant op-list (same shape as on_resolve)
+}
+
+// RarityTierDTO is one content-defined rarity tier (Phase 12.1, docs/LOOT-AND-SPAWNS.md §2): an ordered,
+// named tier in the rarity ladder. Order is the ordinal (common=0 … legendary=N) the resolver compares
+// for a roll's quality_floor; Weight is the tier's default pool weight (a loot entry may override it);
+// Color is a markup token for rendering the item name. Pure DATA.
+type RarityTierDTO struct {
+	Ref    string  `json:"ref" yaml:"ref"`
+	Order  int     `json:"order" yaml:"order"`
+	Weight float64 `json:"weight" yaml:"weight"`
+	Color  string  `json:"color,omitempty" yaml:"color,omitempty"`
+}
+
+// LootTableDTO is one content-defined loot table (Phase 12.1): a list of INDEPENDENT rolls a mob drops
+// from on death. Each roll resolves on its own (not mutually exclusive), so a boss table can carry a
+// guaranteed rare+ roll AND an independent legendary chance. Referenced by a mob prototype's loot_table.
+type LootTableDTO struct {
+	Ref   string        `json:"ref" yaml:"ref"`
+	Rolls []LootRollDTO `json:"rolls" yaml:"rolls"`
+}
+
+// LootRollDTO is one roll within a loot table. Kind is "guaranteed" (always yields), "chance" (an
+// independent probability), "weighted_one" (pick 1 from the weighted pool), or "weighted_n" (pick N).
+// Chance is the probability for kind=chance; N the count for weighted_n; QualityFloor (a rarity tier ref)
+// filters the pool to a minimum tier; Pool is the weighted item pool. Pity (Phase 12.2) is the optional
+// bad-luck-protection spec on a chance roll — carried now, applied in 12.2.
+type LootRollDTO struct {
+	Kind         string         `json:"kind" yaml:"kind"`
+	Chance       float64        `json:"chance,omitempty" yaml:"chance,omitempty"`
+	N            int            `json:"n,omitempty" yaml:"n,omitempty"`
+	QualityFloor string         `json:"quality_floor,omitempty" yaml:"quality_floor,omitempty"`
+	Pool         []LootEntryDTO `json:"pool,omitempty" yaml:"pool,omitempty"`
+	Pity         *LootPityDTO   `json:"pity,omitempty" yaml:"pity,omitempty"`
+}
+
+// LootEntryDTO is one weighted entry in a roll's pool: an item prototype ref, its rarity Tier (for the
+// quality_floor filter + rendering), and an optional Weight (0 => use the tier's default weight).
+type LootEntryDTO struct {
+	Item   string  `json:"item" yaml:"item"`
+	Tier   string  `json:"tier,omitempty" yaml:"tier,omitempty"`
+	Weight float64 `json:"weight,omitempty" yaml:"weight,omitempty"`
+}
+
+// LootPityDTO is a chance roll's bad-luck-protection spec (Phase 12.2): each miss nudges the effective
+// chance up by Step (to Cap); a hit resets the per-character counter keyed by Key.
+type LootPityDTO struct {
+	Key  string  `json:"key" yaml:"key"`
+	Step float64 `json:"step" yaml:"step"`
+	Cap  float64 `json:"cap" yaml:"cap"`
 }
 
 // ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel
@@ -506,6 +563,10 @@ type ProtoDTO struct {
 type LivingDTO struct {
 	Attributes    map[string]float64 `json:"attributes" yaml:"attributes"`
 	CombatProfile string             `json:"combat_profile" yaml:"combat_profile"`
+	// LootTable names the pack-global loot_table_def this mob drops from on death (Phase 12.1). Empty =>
+	// the mob drops only its carried inventory (the pre-12 behavior). The resolver runs the table per
+	// eligible looter on death (loot.go).
+	LootTable string `json:"loot_table" yaml:"loot_table"`
 }
 
 // PhysicalDTO mirrors the world.Physical component template (mass/size/material).

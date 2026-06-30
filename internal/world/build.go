@@ -160,6 +160,13 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		}
 		d.bundle.register(bn.Ref, def)
 	}
+	// Loot (Phase 12.1): rarity tiers + loot tables into the per-shard registries.
+	for _, rt := range lc.RarityTiers {
+		d.rarity.register(rt.Ref, buildRarityTierDef(rt))
+	}
+	for _, lt := range lc.LootTables {
+		d.loot.register(lt.Ref, buildLootTableDef(lt))
+	}
 	d.defaultCombat = lc.DefaultCombat
 	// Custom Lua commands (7.4e): register each verb + its aliases into the per-shard custom-command
 	// table by EXACT word. Skips a word that collides with a BUILT-IN verb (a custom command may never

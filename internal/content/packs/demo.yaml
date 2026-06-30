@@ -712,6 +712,26 @@ bundles:
       - {op: modify_attribute_base, attr: intellect, amount: 2}
       - {op: set_flag, flag: darkvision}
 
+# rarity_tiers: the ordered rarity ladder the loot resolver weights + filters by (Phase 12.1). order is
+# the ordinal a roll's quality_floor compares; weight is the tier's default pool weight; color renders it.
+rarity_tiers:
+  - {ref: common,   order: 0, weight: 100, color: white}
+  - {ref: uncommon, order: 1, weight: 30,  color: green}
+  - {ref: rare,     order: 2, weight: 5,   color: blue}
+
+# loot_tables: independent rolls a mob drops from on death (Phase 12.1). goblin_loot gives a guaranteed
+# common torch to every eligible looter plus an independent 25% chance at a rare sword (personal loot).
+loot_tables:
+  - ref: goblin_loot
+    rolls:
+      - kind: guaranteed
+        pool:
+          - {item: midgaard:obj:torch, tier: common}
+      - kind: chance
+        chance: 0.25
+        pool:
+          - {item: midgaard:obj:sword, tier: rare}
+
 zones:
   - ref: midgaard
     name: The City of Midgaard
@@ -948,6 +968,7 @@ zones:
         weapon: {dice_num: 1, dice_size: 6, damage_type: slash, class: knife, attack_verb: stab}
         living:
           combat_profile: melee
+          loot_table: goblin_loot   # Phase 12.1: drops a guaranteed torch + a 25% rare sword on death
           attributes:
             # A STARTER mob (the hollow goblin): tuned so a FRESH, unarmed player kills it in ~4-8 rounds
             # without dying. Low hp (constitution 1 => max_hp 15), no soak, low evasion/dodge so a bare-

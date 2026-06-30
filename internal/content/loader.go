@@ -73,6 +73,11 @@ type LoadedContent struct {
 	// rule keyed by ref. The world side parses each bundle's grant op-list and registers them into the
 	// per-shard bundle registry; apply_bundle runs one's grants on an entity.
 	Bundles []BundleDTO
+	// RarityTiers + LootTables are the pack-global loot definitions (Phase 12.1), same last-write-wins
+	// override rule keyed by ref. The world side registers them into the per-shard loot registries; the
+	// resolver runs a loot table per eligible looter on death.
+	RarityTiers []RarityTierDTO
+	LootTables  []LootTableDTO
 	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
 	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
 	// by name).
@@ -123,6 +128,8 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	regIdx := make(map[string]int)
 	trackIdx := make(map[string]int)
 	bundleIdx := make(map[string]int)
+	rarityIdx := make(map[string]int)
+	lootIdx := make(map[string]int)
 	for _, p := range packs {
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
@@ -225,6 +232,22 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				bundleIdx[bn.Ref] = len(lc.Bundles)
 				lc.Bundles = append(lc.Bundles, bn)
+			}
+		}
+		for _, rt := range p.RarityTiers {
+			if idx, ok := rarityIdx[rt.Ref]; ok {
+				lc.RarityTiers[idx] = rt
+			} else {
+				rarityIdx[rt.Ref] = len(lc.RarityTiers)
+				lc.RarityTiers = append(lc.RarityTiers, rt)
+			}
+		}
+		for _, lt := range p.LootTables {
+			if idx, ok := lootIdx[lt.Ref]; ok {
+				lc.LootTables[idx] = lt
+			} else {
+				lootIdx[lt.Ref] = len(lc.LootTables)
+				lc.LootTables = append(lc.LootTables, lt)
 			}
 		}
 	}

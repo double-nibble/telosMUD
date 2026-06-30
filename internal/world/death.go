@@ -160,6 +160,16 @@ func (z *Zone) die(victim, killer *Entity, parent *effectCtx) {
 		z.fireEvent(parent, evOnKill, killer, victim, mag)
 	}
 
+	// --- Loot (Phase 12.1): run the victim's loot table per eligible looter BEFORE the threat table is
+	// scrubbed (it is the eligibility source — who dealt damage). Personal loot delivers directly to each
+	// player; the corpse (below) holds only the body. A mob with no loot table is a clean no-op. The roll
+	// source is the cascade's rng (deterministic in a test) else the zone's seeded Lua rng. -----------
+	lootRNG := z.lua.rng
+	if parent != nil && parent.rng != nil {
+		lootRNG = parent.rng
+	}
+	z.resolveLoot(victim, lootRNG)
+
 	// --- Drop ALL combat pointers to/from the victim (the no-stale-pointer invariant). disengage drops
 	// every opponent in the room whose `fighting` points at the victim AND the victim's own fighting/
 	// position — reusing the exact 6.3a discipline so no dangling pointer survives. A surviving attacker

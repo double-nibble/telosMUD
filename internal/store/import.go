@@ -98,6 +98,9 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM track_defs WHERE pack=$1`,
 		// Bundles (Phase 11.4b): same strips-and-replaces idempotency. No FK into the zone tree.
 		`DELETE FROM bundle_defs WHERE pack=$1`,
+		// Loot (Phase 12.1): rarity tiers + loot tables, same strips-and-replaces idempotency.
+		`DELETE FROM rarity_tier_defs WHERE pack=$1`,
+		`DELETE FROM loot_table_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -376,6 +379,28 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			`INSERT INTO bundle_defs (ref, pack, body) VALUES ($1,$2,$3)`,
 			bn.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert bundle %s: %w", bn.Ref, err)
+		}
+	}
+	// Rarity tiers + loot tables (Phase 12.1): ref+pack PK, the shape in the JSONB body. Round-trip into
+	// the same DTOs the embedded YAML produces.
+	for _, rt := range pk.RarityTiers {
+		body, err := json.Marshal(rarityTierBody{Order: rt.Order, Weight: rt.Weight, Color: rt.Color})
+		if err != nil {
+			return fmt.Errorf("store: marshal rarity_tier %s body: %w", rt.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO rarity_tier_defs (ref, pack, body) VALUES ($1,$2,$3)`, rt.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert rarity_tier %s: %w", rt.Ref, err)
+		}
+	}
+	for _, lt := range pk.LootTables {
+		body, err := json.Marshal(lootTableBody{Rolls: lt.Rolls})
+		if err != nil {
+			return fmt.Errorf("store: marshal loot_table %s body: %w", lt.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO loot_table_defs (ref, pack, body) VALUES ($1,$2,$3)`, lt.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert loot_table %s: %w", lt.Ref, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

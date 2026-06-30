@@ -113,6 +113,11 @@ type Living struct {
 	// combat profile (the bare-engine case: a `kill` auto-hits, weapon-only damage). A mob carries its
 	// prototype's ref; a player carries the pack DefaultCombat ref (set at entity creation).
 	combatRef string
+	// lootTable names the pack-global loot_table_def this mob drops from on death (Phase 12.1, loot.go).
+	// "" => the mob drops only its carried inventory. Set from the prototype (proto-aliased on a flyweight
+	// mob; never mutated at runtime, so it needs no COW). Resolved by ref through the per-shard loot
+	// registry on death.
+	lootTable string
 	// cooldowns maps an ability ref to the pulse number its cooldown ELAPSES on ([G8], combat.go). The
 	// ability lifecycle step-3 gate refuses an ability still cooling down. Transient instance state
 	// (zone-goroutine-owned); serialized as REMAINING pulses into StateJSON.Cooldowns (P6-D8). nil until

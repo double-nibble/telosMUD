@@ -229,6 +229,8 @@ func TestStorePackRoundTrip(t *testing.T) {
 		{"regions", fromDB.Regions, fromYAML.Regions},
 		{"tracks", fromDB.Tracks, fromYAML.Tracks},
 		{"bundles", fromDB.Bundles, fromYAML.Bundles},
+		{"rarity_tiers", fromDB.RarityTiers, fromYAML.RarityTiers},
+		{"loot_tables", fromDB.LootTables, fromYAML.LootTables},
 	}
 	for _, tc := range defCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -307,6 +309,7 @@ func TestImportPackIdempotent(t *testing.T) {
 		{"region heartlands (Phase 10.3)", regionRefs(lc), "heartlands"},
 		{"track hero_advancement (Phase 11.2)", trackRefs(lc), "hero_advancement"},
 		{"bundle fighter (Phase 11.4)", bundleRefs(lc), "fighter"},
+		{"loot table goblin_loot (Phase 12.1)", lootTableRefs(lc), "goblin_loot"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -366,6 +369,14 @@ func bundleRefs(lc *content.LoadedContent) []string {
 	out := make([]string, 0, len(lc.Bundles))
 	for _, bn := range lc.Bundles {
 		out = append(out, bn.Ref)
+	}
+	return out
+}
+
+func lootTableRefs(lc *content.LoadedContent) []string {
+	out := make([]string, 0, len(lc.LootTables))
+	for _, lt := range lc.LootTables {
+		out = append(out, lt.Ref)
 	}
 	return out
 }

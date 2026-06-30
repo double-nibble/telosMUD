@@ -114,8 +114,10 @@ type defRegistries struct {
 	ability *defRegistry[*abilityDef]
 	combat  *defRegistry[*combatProfile]
 	channel *defRegistry[*channelDef]
-	track   *defRegistry[*trackDef]  // Phase 11.2 advancement tracks
-	bundle  *defRegistry[*bundleDef] // Phase 11.4b class/race/feat bundles
+	track   *defRegistry[*trackDef]      // Phase 11.2 advancement tracks
+	bundle  *defRegistry[*bundleDef]     // Phase 11.4b class/race/feat bundles
+	rarity  *defRegistry[*rarityTierDef] // Phase 12.1 rarity tiers
+	loot    *defRegistry[*lootTableDef]  // Phase 12.1 loot tables
 
 	// defaultCombat is the pack's player-default combat profile ref (Phase 6.3a): the profile a player
 	// entity fights with when its own (none — players aren't prototyped) declares none. newPlayerEntity
@@ -156,6 +158,8 @@ func newDefRegistries() *defRegistries {
 		channel:     newDefRegistry[*channelDef](),
 		track:       newDefRegistry[*trackDef](),
 		bundle:      newDefRegistry[*bundleDef](),
+		rarity:      newDefRegistry[*rarityTierDef](),
+		loot:        newDefRegistry[*lootTableDef](),
 		abilityCmds: map[string]*abilityDef{},
 		customCmds:  map[string]string{},
 		formulas:    map[string]string{},
@@ -208,6 +212,11 @@ func (z *Zone) trackDefs() *defRegistry[*trackDef] {
 func (z *Zone) bundleDefs() *defRegistry[*bundleDef] {
 	return z.defBundle().bundle
 }
+
+// rarityTierDefs / lootTableDefs are the zone-goroutine read accessors for the loot registries (Phase
+// 12.1). Lock-free atomic.Load; a bare zone falls back to its own empty bundle (no loot).
+func (z *Zone) rarityTierDefs() *defRegistry[*rarityTierDef] { return z.defBundle().rarity }
+func (z *Zone) lootTableDefs() *defRegistry[*lootTableDef]   { return z.defBundle().loot }
 
 // channelForVerb returns the channel a verb emits on (lower-cased), or nil. The verb→channel mapping
 // is DERIVED from the channel registry on each lookup (the table is small) rather than cached in a

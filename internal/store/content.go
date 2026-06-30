@@ -454,6 +454,19 @@ type bundleBody struct {
 	Grants any    `json:"grants,omitempty"`
 }
 
+// rarityTierBody / lootTableBody are the JSONB-tail shapes for the loot def rows (Phase 12.1), each
+// mirroring its DTO minus the Ref — the whole shape (tier order/weight/color; the loot rolls) is content
+// in the body. The engine names no tier or table.
+type rarityTierBody struct {
+	Order  int     `json:"order,omitempty"`
+	Weight float64 `json:"weight,omitempty"`
+	Color  string  `json:"color,omitempty"`
+}
+
+type lootTableBody struct {
+	Rolls []content.LootRollDTO `json:"rolls,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -819,6 +832,64 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	bnRows.Close()
+
+	// Rarity tiers (Phase 12.1): ref+pack first-class, the tier shape (order/weight/color) in the body.
+	rtRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM rarity_tier_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query rarity_tier_defs: %w", err)
+	}
+	for rtRows.Next() {
+		var rt content.RarityTierDTO
+		var pk string
+		var body []byte
+		if err := rtRows.Scan(&rt.Ref, &pk, &body); err != nil {
+			rtRows.Close()
+			return fmt.Errorf("store: scan rarity_tier_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b rarityTierBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				rtRows.Close()
+				return fmt.Errorf("store: rarity_tier_def %s body: %w", rt.Ref, err)
+			}
+			rt.Order, rt.Weight, rt.Color = b.Order, b.Weight, b.Color
+		}
+		pack(pk).RarityTiers = append(pack(pk).RarityTiers, rt)
+	}
+	if err := rtRows.Err(); err != nil {
+		return err
+	}
+	rtRows.Close()
+
+	// Loot tables (Phase 12.1): ref+pack first-class, the rolls in the JSONB body.
+	ltRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM loot_table_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query loot_table_defs: %w", err)
+	}
+	for ltRows.Next() {
+		var lt content.LootTableDTO
+		var pk string
+		var body []byte
+		if err := ltRows.Scan(&lt.Ref, &pk, &body); err != nil {
+			ltRows.Close()
+			return fmt.Errorf("store: scan loot_table_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b lootTableBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				ltRows.Close()
+				return fmt.Errorf("store: loot_table_def %s body: %w", lt.Ref, err)
+			}
+			lt.Rolls = b.Rolls
+		}
+		pack(pk).LootTables = append(pack(pk).LootTables, lt)
+	}
+	if err := ltRows.Err(); err != nil {
+		return err
+	}
+	ltRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

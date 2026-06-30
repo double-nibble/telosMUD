@@ -134,6 +134,19 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if fighter == nil || fighter.Kind != "class" || fighter.Grants == nil {
 		t.Fatalf("fighter bundle = %+v, want kind=class with grants", fighter)
 	}
+
+	// Loot (Phase 12.1): the demo ships 3 rarity tiers + a goblin_loot table (a guaranteed + a chance
+	// roll). Pack globals, loaded onto lc.RarityTiers / lc.LootTables.
+	if len(lc.RarityTiers) != 3 {
+		t.Fatalf("rarity_tiers = %d, want 3 (common/uncommon/rare)", len(lc.RarityTiers))
+	}
+	if len(lc.LootTables) != 1 {
+		t.Fatalf("loot_tables = %d, want 1 (goblin_loot)", len(lc.LootTables))
+	}
+	gl := lc.LootTables[0]
+	if gl.Ref != "goblin_loot" || len(gl.Rolls) != 2 {
+		t.Fatalf("goblin_loot = %+v, want ref goblin_loot with 2 rolls", gl)
+	}
 }
 
 // TestRegionMergeLastWriteWins proves a later pack overrides an earlier region by ref (the same
