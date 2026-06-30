@@ -145,11 +145,25 @@ POST validate + create).
   connect the bundle grants + bought attributes are applied (and survive a restart); a newly-content-added
   race appears in the form with no code change.
 
-### 14.x — Capstone (the done-when)
+### 14.x — Capstone (the done-when) ✅ DONE (2026-06-30)
 The full front door, end to end: **create an account on the web (GitHub OAuth), build a character from
 content-driven chargen, get a link code, `connect` over TLS (or SSH), enter the world** — the session
 assertion verifies offline at the shard, the single-session lock holds (a second login takes over), and the
 account+character survive a restart. Tests (hermetic stubs for OAuth/providers) + the milestone.
+
+**Landed (additive, smoke/e2e stay green):**
+- **`gate-auth`** compose service — the account-backed front door (`TELOS_ACCOUNT_TARGET`, port 4001) that
+  completes the web→telnet loop (sign in → Play → `connect <code>`). The plain `gate` stays name-only so the
+  `connect <Name>` smoke/e2e suite is unaffected; flipping the primary gate + migrating those tests is a
+  Phase-15 hardening call.
+- **Capstone tests:** `TestChargenBuildSurvivesReloadNoReapply` (hermetic, internal/world) — a chargen-built
+  character dumped + reloaded keeps its stats EXACTLY, no double-application; `TestChargenAccountJourneyCapstone`
+  (gated, real PG) — the account Service validates a submission against the REAL demo flow and the world's load
+  path reads back the exact first-spawn marker. The connect→spawn path is the existing `linkcode_journey`
+  tests; OAuth sign-in is the `internal/web` flow test. The loop is covered across the suite.
+- Deferred to Phase 15: the §F2/F4/F8 web-auth hardening (docs/FOLLOW-UPS.md); pointing the PRIMARY gate at
+  account + migrating smoke to an account login; a content-supplied bundle display name (the form labels off
+  the ref today).
 
 ---
 

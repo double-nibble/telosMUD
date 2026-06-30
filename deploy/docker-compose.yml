@@ -228,3 +228,35 @@ services:
       world-darkwood:
         condition: service_started
     restart: unless-stopped
+
+  # gate-auth: the ACCOUNT-BACKED front door (Phase 14 capstone). Identical to `gate` but pointed at
+  # telos-account (TELOS_ACCOUNT_TARGET), so it prompts for a LINK CODE / passphrase instead of a bare name —
+  # this is the endpoint that completes the web->telnet loop (sign in on the website -> Play -> get a code ->
+  # `connect <code>` here). It is ADDITIVE: the plain `gate` stays name-only so the smoke/e2e suite (which
+  # does `connect <Name>`) is unaffected. Telnet to localhost:4001.
+  gate-auth:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-gate
+    environment:
+      TELOS_SERVICE: telos-gate
+      TELOS_ENV: dev
+      TELOS_GATE_LISTEN: ":4001"
+      TELOS_GATE_ALLOW_PLAINTEXT: "1" # dev: plain telnet so you can test the link-code login by hand
+      TELOS_ACCOUNT_TARGET: account:9100 # account-backed login (link code / passphrase)
+      TELOS_WORLD_TARGET: world:9090
+      TELOS_REDIS_ADDR: redis:6379
+      TELOS_ZONES: midgaard
+      DEBUG: true
+    ports:
+      - "4001:4001" # telnet: connect with `telnet localhost 4001`, then enter your link code
+    depends_on:
+      world:
+        condition: service_started
+      world-darkwood:
+        condition: service_started
+      account:
+        condition: service_started
+    restart: unless-stopped
