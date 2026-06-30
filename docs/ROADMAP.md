@@ -195,7 +195,12 @@ track), trains a skill through use on another, and the build survives a restart 
 **Done when:** a weekly boss spawns on schedule and drops personal loot with a working pity
 timer.
 
-### Phase 13 — Crafting & economy
+### Phase 13 — Crafting & economy ✅
+> Done (13.1–13.5 + capstone). Binding/transfer gate, stackable materials, professions (= a bundle + a
+> track + a membership set, no new def table), salvage/disenchant (tier-bound components, owner may
+> deconstruct bound gear), `recipe_defs` (station = a room flag) + the §9 material loop. Deferred: generic
+> `disenchant <item>`/`craft <recipe>` verbs, profession-cap content-config, augment affix depth
+> (FOLLOW-UPS.md).
 ([CRAFTING.md](CRAFTING.md))
 - Rarity/binding (BoP rules, tier-dependent component binding) + the transfer/bind gate.
 - Professions, recipes, stackable items, deconstruction (salvage yields = weighted rolls).
