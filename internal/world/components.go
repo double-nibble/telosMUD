@@ -87,6 +87,12 @@ type Living struct {
 	// dispatches/casts only if its ref is here; an un-gated ability stays universally usable. nil until
 	// the first grant_ability. Persisted in the StateJSON `abilities` subtree.
 	granted map[string]bool
+	// professions is this entity's set of LEARNED profession refs (profession.go, Phase 13.3): the trades
+	// it has enrolled in (membership for the D2 cap + the crafting-ability requires.profession gate). A
+	// profession is a Phase-11.4 bundle whose grants hand out the verbs+skill; THIS set is the only new
+	// per-entity state a profession adds. nil until the first learn_profession. Persisted in the StateJSON
+	// `professions` subtree (the granted-abilities precedent). COW-safe.
+	professions map[string]bool
 	// lootPity is this entity's per-pity-key CONSECUTIVE-MISS count (loot.go, Phase 12.2): bad-luck
 	// protection — each loot roll that misses an item nudges its effective chance up; a hit resets the
 	// counter. Keyed by the loot roll's pity key. nil until the first pity miss. Persisted in the

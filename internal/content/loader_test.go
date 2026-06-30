@@ -106,8 +106,8 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 
 	// Tracks (Phase 11.2): the demo defines one XP→level track "hero_advancement" with 3 thresholds + a
 	// grant op-list per step. The track is a pack global (not under a zone), so it loads onto lc.Tracks.
-	if len(lc.Tracks) != 1 {
-		t.Fatalf("tracks = %d, want 1 (hero_advancement)", len(lc.Tracks))
+	if len(lc.Tracks) != 2 {
+		t.Fatalf("tracks = %d, want 2 (hero_advancement + leatherworking_skill)", len(lc.Tracks))
 	}
 	tr := lc.Tracks[0]
 	if tr.Ref != "hero_advancement" || tr.ProgressAttr != "xp" || tr.LevelAttr != "level" {
@@ -122,8 +122,8 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 
 	// Bundles (Phase 11.4b): the demo defines a "fighter" class + an "elf" race, each a kind + a grant
 	// op-list. Pack globals, loaded onto lc.Bundles.
-	if len(lc.Bundles) != 2 {
-		t.Fatalf("bundles = %d, want 2 (fighter + elf)", len(lc.Bundles))
+	if len(lc.Bundles) != 3 {
+		t.Fatalf("bundles = %d, want 3 (fighter + elf + leatherworking)", len(lc.Bundles))
 	}
 	var fighter *BundleDTO
 	for i := range lc.Bundles {

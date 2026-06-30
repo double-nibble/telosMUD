@@ -177,6 +177,12 @@ func cloneComponent(c Component) Component {
 				cp.granted[k] = val
 			}
 		}
+		if v.professions != nil {
+			cp.professions = make(map[string]bool, len(v.professions))
+			for k, val := range v.professions {
+				cp.professions[k] = val
+			}
+		}
 		if v.lootPity != nil {
 			cp.lootPity = make(map[string]int, len(v.lootPity))
 			for k, val := range v.lootPity {

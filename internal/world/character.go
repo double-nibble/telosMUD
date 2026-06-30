@@ -80,6 +80,12 @@ type StateJSON struct {
 	// ability stays usable across a relogin. A pre-11.4 save (no abilities) loads with none — an entity
 	// keeps whatever un-gated abilities content makes universal. DATA ONLY (a list of refs).
 	Abilities []string `json:"abilities,omitempty"`
+	// Professions is the entity's set of LEARNED profession refs (Phase 13.3, profession.go): the trades it
+	// has enrolled in, re-installed on load so the crafting-ability requires.profession gate + the D2 cap
+	// survive a relogin. A pre-13.3 save (no professions) loads with none. DATA ONLY (a list of refs) — the
+	// abilities-subtree precedent; the verbs+skill a profession granted ride the EXISTING abilities/tracks
+	// subtrees, so a profession needs only this thin membership list persisted.
+	Professions []string `json:"professions,omitempty"`
 	// LootPity is the per-pity-key consecutive-miss count (Phase 12.2, loot.go): bad-luck protection for
 	// loot chance rolls, riding the durability ladder so a player's "I'm due a drop" progress survives a
 	// relogin. A pre-12.2 save (no loot_pity) loads with none. DATA ONLY (key->int).
@@ -300,17 +306,18 @@ func dumpCharacter(s *session) CharSnapshot {
 // aliases live entity state (the character.go:196-201 owned-bytes invariant).
 func dumpStateComponents(e *Entity) StateJSON {
 	return StateJSON{
-		Inventory:  dumpInventory(e),
-		Equipment:  dumpEquipment(e),
-		Attributes: dumpAttributes(e),
-		Resources:  dumpResources(e),
-		Affects:    dumpAffects(e),
-		Flags:      dumpFlags(e),
-		Tracks:     dumpTracks(e),           // Phase 11.2 — per-track current step
-		Abilities:  dumpGrantedAbilities(e), // Phase 11.4a — granted ability refs
-		LootPity:   dumpLootPity(e),         // Phase 12.2 — per-key consecutive-miss counts
-		Cooldowns:  dumpCooldowns(e),
-		Script:     dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
+		Inventory:   dumpInventory(e),
+		Equipment:   dumpEquipment(e),
+		Attributes:  dumpAttributes(e),
+		Resources:   dumpResources(e),
+		Affects:     dumpAffects(e),
+		Flags:       dumpFlags(e),
+		Tracks:      dumpTracks(e),           // Phase 11.2 — per-track current step
+		Abilities:   dumpGrantedAbilities(e), // Phase 11.4a — granted ability refs
+		Professions: dumpProfessions(e),      // Phase 13.3 — learned profession refs
+		LootPity:    dumpLootPity(e),         // Phase 12.2 — per-key consecutive-miss counts
+		Cooldowns:   dumpCooldowns(e),
+		Script:      dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
 	}
 }
 
@@ -702,6 +709,17 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 		// usable across a relogin.
 		for _, ref := range st.Abilities {
 			grantAbility(e, ref)
+		}
+		// Re-install learned professions (Phase 13.3) so the requires.profession gate + the D2 cap survive a
+		// relogin. learnProfession enforces the cap, but a saved set already passed it; restore directly into
+		// the membership map so a later cap reduction never silently drops an already-earned trade on load.
+		for _, ref := range st.Professions {
+			if l := mutableLiving(e); l != nil {
+				if l.professions == nil {
+					l.professions = map[string]bool{}
+				}
+				l.professions[ref] = true
+			}
 		}
 		// Re-install the entity's loot-pity counters (Phase 12.2) so bad-luck protection survives a relogin.
 		for key, misses := range st.LootPity {

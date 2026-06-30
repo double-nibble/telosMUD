@@ -430,3 +430,12 @@ something an author would reasonably want to:
   spawn needs a content `on_world("spawn.boss")` handler that matches the zone + runs `mud.spawn` (and the
   boss's death must `signal_world("boss.died", {ref})`). The capstone proves the loot half; ship demo
   spawn/death handler content to close the live loop end-to-end. · *orchestration/scripting*
+- **Profession cap: content-config + kind split (Phase 13.3, D2).** `craftProfessionCap` (profession.go) is a
+  uniform constant (2). D2 wants it CONTENT-configurable and only applied to *crafting* professions —
+  gathering/utility professions unlimited. Needs a profession "kind" (a bundle field, or read the bundle's
+  `kind`) + a pack-global cap setting. · *progression*
+- **Round-trip test only covers DEMO-exercised fields (Phase 13.3 lesson).** TestStorePackRoundTrip caught the
+  ability `requires_grant`/`skill` field-drop ONLY because the 13.3 craft verb was the first demo ability to
+  set them — the gap shipped silently in 11.3/11.4a. Add a store-layer test that asserts EVERY DTO field
+  round-trips (e.g. a reflect-walk over a fully-populated synthetic pack), so a new field can't be dropped on
+  the store path just because no demo content uses it yet. · *persistence/test*

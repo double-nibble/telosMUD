@@ -284,6 +284,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 		messages, _ := json.Marshal(abilityMessages{
 			AbilityMessagesDTO: ab.Messages, Words: ab.Words,
+			RequiresGrant: ab.RequiresGrant, Skill: ab.Skill, // Phase 11.4a/11.3 fields ride the messages JSONB (no column)
 		})
 		tags := ab.Tags
 		if tags == nil {

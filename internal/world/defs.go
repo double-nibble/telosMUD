@@ -536,11 +536,12 @@ type abilityDef struct {
 	// area ability (an area ability needs no explicit keyword target).
 	area string
 
-	tags          []string           // §6 CC tags this ability carries (an affect's prevents[] blocks them)
-	notPrevented  []string           // requires.not_prevented: extra tags the actor must not be prevented from
-	reqAttr       map[string]float64 // requires.attr: per-attribute minimum thresholds
-	skill         string             // Phase 11.3: marks this ability as a SKILL — using it fires OnSkillUse (the use-based hook)
-	requiresGrant bool               // Phase 11.4a: when true, the actor must have been GRANTED this ability (a class/trained ability)
+	tags               []string           // §6 CC tags this ability carries (an affect's prevents[] blocks them)
+	notPrevented       []string           // requires.not_prevented: extra tags the actor must not be prevented from
+	reqAttr            map[string]float64 // requires.attr: per-attribute minimum thresholds
+	skill              string             // Phase 11.3: marks this ability as a SKILL — using it fires OnSkillUse (the use-based hook)
+	requiresGrant      bool               // Phase 11.4a: when true, the actor must have been GRANTED this ability (a class/trained ability)
+	requiresProfession string             // Phase 13.3: when set, the actor must have LEARNED this profession (a crafting verb)
 
 	costs []resourceCost
 

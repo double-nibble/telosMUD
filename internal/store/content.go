@@ -682,6 +682,8 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		}
 		ab.Messages = mb.AbilityMessagesDTO
 		ab.Words = mb.Words
+		ab.RequiresGrant = mb.RequiresGrant // Phase 11.4a ownership flag, ridden in the messages JSONB
+		ab.Skill = mb.Skill                 // Phase 11.3 skill-track tag, ridden in the messages JSONB
 		// on_resolve is a raw op-list (or null); carry it as the decoded generic form the world-side
 		// op-list parser consumes, exactly like the affect tick op-list.
 		if len(onResolve) > 0 {
@@ -977,6 +979,13 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 type abilityMessages struct {
 	content.AbilityMessagesDTO
 	Words []string `json:"words,omitempty"`
+	// RequiresGrant (Phase 11.4a) + Skill (Phase 11.3) are top-level AbilityDTO fields with no column of
+	// their own; they ride THIS messages JSONB wrapper exactly like Words, so a DB round-trip preserves them
+	// without a schema migration. The store path dropped both until the first demo ability set them (the
+	// Phase-13.3 craft verb) — the gap TestStorePackRoundTrip then caught. Empty/false for an ability that
+	// sets neither (omitempty keeps every existing ability's body byte-identical).
+	RequiresGrant bool   `json:"requires_grant,omitempty"`
+	Skill         string `json:"skill,omitempty"`
 }
 
 // decodeBaseSpec unmarshals an attribute's default_base JSONB into a content.BaseSpecDTO. A JSON

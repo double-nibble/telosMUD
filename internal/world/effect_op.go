@@ -95,17 +95,20 @@ type effectOp struct {
 
 	// Common argument fields (a flat bag — different ops read different fields, exactly like the
 	// reset op's Op/Proto/Room/Max). Decoded from the op map at parse time.
-	resource string  // resource ref (heal/restore/modify_resource)
-	affect   string  // affect ref (apply_affect/remove_affect)
-	dmgType  string  // damage type ref (deal_damage)
-	attr     string  // attribute ref (modify_attribute_base — Phase 11.1 grant op)
-	flag     string  // named flag (set_flag/clear_flag — Phase 11.1 grant op)
-	track    string  // track ref (grant_track/advance_track — Phase 11.2 progression op)
-	ability  string  // ability ref (grant_ability/revoke_ability — Phase 11.4a grant op)
-	bundle   string  // bundle ref (apply_bundle — Phase 11.4b)
-	amount   float64 // a flat amount (heal/damage/modify_resource delta; modify_attribute_base delta)
-	diceNum  int     // dice count (deal_damage <N>d<S>)
-	diceSize int     // dice size
+	resource   string  // resource ref (heal/restore/modify_resource)
+	affect     string  // affect ref (apply_affect/remove_affect)
+	dmgType    string  // damage type ref (deal_damage)
+	attr       string  // attribute ref (modify_attribute_base — Phase 11.1 grant op)
+	flag       string  // named flag (set_flag/clear_flag — Phase 11.1 grant op)
+	track      string  // track ref (grant_track/advance_track — Phase 11.2 progression op)
+	ability    string  // ability ref (grant_ability/revoke_ability — Phase 11.4a grant op)
+	bundle     string  // bundle ref (apply_bundle — Phase 11.4b)
+	item       string  // item prototype ref (consume_item/produce_item/augment_item — Phase 13.3 crafting ops)
+	bind       string  // produce_item bind override ("bound" forces the produced item bound) — Phase 13.3
+	profession string  // profession ref (learn_profession — Phase 13.3 trade membership)
+	amount     float64 // a flat amount (heal/damage/modify_resource delta; modify_attribute_base delta)
+	diceNum    int     // dice count (deal_damage <N>d<S>)
+	diceSize   int     // dice size
 	// bonus and diceCount are the [G-A] FORMULA-damage extension: a scoped formula over $actor/$target/
 	// $source attributes added to deal_damage's raw amount (a weapon's `+ $actor.damroll + str_bonus`),
 	// and an optional scoped formula for the DICE COUNT (a level-scaled rider like `ceil(level/2)d6`).
@@ -183,6 +186,12 @@ func init() {
 		"grant_ability":  opGrantAbility,
 		"revoke_ability": opRevokeAbility,
 		"apply_bundle":   opApplyBundle,
+		// Phase 13.3 crafting ops: consume an input / produce an output / augment an item.
+		"consume_item": opConsumeItem,
+		"produce_item": opProduceItem,
+		"augment_item": opAugmentItem,
+		// Phase 13.3 professions: enroll an entity in a trade (membership for the cap + the requires gate).
+		"learn_profession": opLearnProfession,
 	}
 }
 

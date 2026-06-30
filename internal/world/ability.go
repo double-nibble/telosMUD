@@ -343,6 +343,14 @@ func (z *Zone) checkRequires(s *session, def *abilityDef) bool {
 		s.send(textFrame("You haven't learned how to do that."))
 		return false
 	}
+	// Profession membership (Phase 13.3): a crafting verb (requires.profession) is usable only by an actor
+	// that has LEARNED the trade. Like requiresGrant this is opt-in — "" leaves the ability ungated.
+	if def.requiresProfession != "" && !hasProfession(actor, def.requiresProfession) {
+		z.log.Debug("ability lifecycle: blocked at step 3 (profession)",
+			"ability", def.ref, "profession", def.requiresProfession, "actor", actor.short)
+		s.send(textFrame("You lack the training for that craft."))
+		return false
+	}
 	return true
 }
 

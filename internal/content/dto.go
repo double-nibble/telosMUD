@@ -517,6 +517,10 @@ type TargetingDTO struct {
 type RequiresDTO struct {
 	NotPrevented []string           `json:"not_prevented" yaml:"not_prevented"`
 	Attr         map[string]float64 `json:"attr" yaml:"attr"`
+	// Profession (Phase 13.3) gates a crafting ability on trade MEMBERSHIP: the actor must have LEARNED
+	// this profession (state.professions, profession.go) to use the verb. "" => no profession gate (the
+	// established opt-in default; every existing ability is unchanged).
+	Profession string `json:"profession" yaml:"profession"`
 }
 
 // ResourceCostDTO is one resource an ability spends (docs/ABILITIES.md §2). Reserved on cast,
