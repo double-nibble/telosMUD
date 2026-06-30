@@ -459,4 +459,7 @@ something an author would reasonably want to:
   location" on the loaded `-race` CI runner (passed 5/5 locally; resolved by a job re-run). The takeover-kick
   delivery is timing-sensitive. It rides the stub name-login path, which the Phase-15.3 gate OAuth rework
   replaces — so when reworking gate login, rebuild this test on the new login (dev-autoauth seam) and give the
-  kick-message wait a generous/synchronized deadline rather than a fixed 10s. · *gate/test*
+  kick-message wait a generous/synchronized deadline rather than a fixed 10s. · *gate/test*- **Instanced zones (deferred from Phase 16, 2026-06-30).** Multiple runtime instances of a zone on the
+  Phase-10.6 dynamic-placement substrate: the director mints/reaps zone instances and routes a party to its
+  own copy (a dungeon instance). Deferred out of Phase 16 (hardening/scale) as a world/content feature; fold
+  into a later content phase. The placement coordinator + the scoped event bus are the substrate. · *world/orchestration*
