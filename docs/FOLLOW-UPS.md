@@ -463,3 +463,18 @@ something an author would reasonably want to:
   Phase-10.6 dynamic-placement substrate: the director mints/reaps zone instances and routes a party to its
   own copy (a dungeon instance). Deferred out of Phase 16 (hardening/scale) as a world/content feature; fold
   into a later content phase. The placement coordinator + the scoped event bus are the substrate. · *world/orchestration*
+- **Bus deliver-lag metric unwired (Phase 16.1/16.2).** `metrics.RecordBusLag` +
+  the `telos.bus.deliver_lag_ms` instrument exist but have no production call site:
+  scoped-bus event envelopes carry no publish timestamp, so deliver-lag can't be
+  computed without adding one to the wire format. When the scopebus envelope next
+  changes, stamp publish time and record (publish->deliver) at the deliver path.
+  `internal/metrics/metrics.go:86`, `internal/scopebus/scopebus.go` · *orchestration/obs*
+- **Bot-swarm sync token + load realism (Phase 16.2).** The load bot keys each
+  command's round-trip on the literal `"> "` prompt (`internal/botswarm/botswarm.go:39`).
+  Safe today (prompts are per-session not room-broadcast, GMCP is off for the bot, and
+  demo prose never contains `"> "`), but brittle against content that emits `"> "` in
+  prose (a tell/quote) — a false match would smear latencies. If the mix ever drives
+  output that can contain the token, switch to a unique per-command sentinel the server
+  echoes. Also: the mix is single-zone (midgaard) read-only movement — it never exercises
+  writes (combat/items) or the cross-shard handoff (the riskiest concurrency path). Broaden
+  the mix when load-testing handoff at scale. · *test/distributed*

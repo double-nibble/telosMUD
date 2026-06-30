@@ -12,8 +12,13 @@ TELOS_TEST_DSN ?= postgres://telos:telos@localhost:5432/telosmud?sslmode=disable
 # The e2e tests SKIP cleanly when this gate is not reachable.
 TELOS_E2E_ADDR ?= localhost:4000
 
+# `make loadtest` defaults: synthetic players + how long they drive traffic. Override on the command line,
+# e.g. `make loadtest BOTS=1500 LOADTEST_DURATION=2m`.
+BOTS ?= 500
+LOADTEST_DURATION ?= 30s
+
 .DEFAULT_GOAL := help
-.PHONY: help up deps down logs test test-race test-integration test-e2e smoke smoke-twice vet lint build tidy proto migrate migrate-status seed verify verify-full
+.PHONY: help up deps down logs test test-race test-integration test-e2e smoke smoke-twice vet lint build tidy proto migrate migrate-status seed verify verify-full loadtest
 
 help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | \
@@ -94,6 +99,9 @@ fuzz: ## Run each fuzz target's ACTIVE fuzzer for FUZZTIME (default 60s; nightly
 SOAK_CYCLES ?= 20000
 soak: ## Run the W9 stress/soak tier under -race (TELOS_SOAK gated; SOAK_CYCLES tunes depth)
 	TELOS_SOAK=1 TELOS_SOAK_CYCLES=$(SOAK_CYCLES) $(GO) test -race -count=1 -run Soak ./internal/world/ -v
+
+loadtest: ## Drive a synthetic-client load run at a gate (override BOTS / LOADTEST_DURATION / TELOS_E2E_ADDR)
+	$(GO) run ./cmd/telos-botswarm -addr $(TELOS_E2E_ADDR) -n $(BOTS) -duration $(LOADTEST_DURATION)
 
 smoke: ## Bring up the full docker stack and assert it is healthy + seed exits 0 + a player can look
 	./tests/smoke/smoke.sh

@@ -1,0 +1,27 @@
+# OpenTelemetry Collector config for the dev stack (Phase 16.1/16.2). Receives OTLP metrics from the services
+# and re-exposes them on a Prometheus endpoint you can scrape (curl localhost:8889/metrics) while the bot swarm
+# runs. `debug` echoes a summary to the collector logs so you can see metrics arriving.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: normal
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, prometheus]

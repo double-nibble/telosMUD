@@ -3,6 +3,13 @@ name: telosmud-dev
 # Local development dependencies. Data lives under deploy/data/ (gitignored).
 #   make up   -> start    make down -> stop    make logs -> tail
 
+# Phase 16: services export OTLP metrics to the otel-collector (merge *otel into a service's environment).
+# The 5s export interval (default is 60s) keeps the :8889 scrape fresh during sub-minute load runs.
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  OTEL_METRIC_EXPORT_INTERVAL: "5000"
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -44,6 +51,19 @@ services:
       timeout: 3s
       retries: 10
 
+  # OpenTelemetry Collector (Phase 16): the worlds + gates push OTLP metrics here (see *otel-env). It re-exposes
+  # them on a Prometheus endpoint — `curl localhost:8889/metrics` while a load run is in flight to watch the tick
+  # lag / occupancy / drop counters. `docker compose logs otel-collector` shows a metric summary too.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.110.0
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC ingest
+      - "8889:8889" # Prometheus scrape endpoint
+    restart: unless-stopped
+
   # One-shot: apply the embedded goose migrations (the schema), then exit. Runs before any
   # world boots so the shards never race migrations (the migration is advisory-locked too).
   migrate:
@@ -81,6 +101,7 @@ services:
       args:
         SERVICE: telos-world
     environment:
+      <<: *otel-env
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
       TELOS_WORLD_LISTEN: ":9090"
@@ -113,6 +134,7 @@ services:
       args:
         SERVICE: telos-world
     environment:
+      <<: *otel-env
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
       TELOS_WORLD_LISTEN: ":9090"
@@ -143,6 +165,7 @@ services:
       args:
         SERVICE: telos-world
     environment:
+      <<: *otel-env
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
       TELOS_WORLD_LISTEN: ":9090"
@@ -211,6 +234,7 @@ services:
       args:
         SERVICE: telos-gate
     environment:
+      <<: *otel-env
       TELOS_SERVICE: telos-gate
       TELOS_ENV: dev
       TELOS_GATE_LISTEN: ":4000"
@@ -242,6 +266,7 @@ services:
       args:
         SERVICE: telos-gate
     environment:
+      <<: *otel-env
       TELOS_SERVICE: telos-gate
       TELOS_ENV: dev
       TELOS_GATE_LISTEN: ":4001"
