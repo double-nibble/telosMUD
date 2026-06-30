@@ -206,6 +206,7 @@ func parseOp(v any) (effectOp, error) {
 	op.item = firstStr(m, "item", "proto")     // Phase 13.3: consume_item/produce_item/augment_item prototype ref
 	op.bind = mapStr(m, "bind")                // Phase 13.3: produce_item bind override
 	op.profession = mapStr(m, "profession")    // Phase 13.3: learn_profession target
+	op.table = mapStr(m, "table")              // Phase 13.4: salvage_item loot/salvage table
 	op.amount = mapFloat(m, "amount")
 	op.duration = int(mapFloat(m, "duration"))
 	op.magnitude = mapFloat(m, "magnitude")

@@ -474,6 +474,7 @@ type rarityTierBody struct {
 	Order  int     `json:"order,omitempty"`
 	Weight float64 `json:"weight,omitempty"`
 	Color  string  `json:"color,omitempty"`
+	Binds  bool    `json:"binds,omitempty"` // Phase 13.4 (D1): a binds tier's items bind on creation (the no-trade sink)
 }
 
 type lootTableBody struct {
@@ -879,7 +880,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				rtRows.Close()
 				return fmt.Errorf("store: rarity_tier_def %s body: %w", rt.Ref, err)
 			}
-			rt.Order, rt.Weight, rt.Color = b.Order, b.Weight, b.Color
+			rt.Order, rt.Weight, rt.Color, rt.Binds = b.Order, b.Weight, b.Color, b.Binds
 		}
 		pack(pk).RarityTiers = append(pack(pk).RarityTiers, rt)
 	}

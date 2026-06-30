@@ -23,6 +23,7 @@ type rarityTierDef struct {
 	order  int
 	weight float64
 	color  string
+	binds  bool // Phase 13.4 (D1): items of this tier bind on creation (the top-tier no-trade sink)
 }
 
 type lootTableDef struct {
@@ -67,7 +68,7 @@ type lootPity struct {
 }
 
 func buildRarityTierDef(d content.RarityTierDTO) *rarityTierDef {
-	return &rarityTierDef{ref: d.Ref, order: d.Order, weight: d.Weight, color: d.Color}
+	return &rarityTierDef{ref: d.Ref, order: d.Order, weight: d.Weight, color: d.Color, binds: d.Binds}
 }
 
 func buildLootTableDef(d content.LootTableDTO) *lootTableDef {

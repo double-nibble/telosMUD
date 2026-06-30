@@ -547,6 +547,24 @@ abilities:
       - {op: consume_item, item: midgaard:obj:leather, amount: 2}
       - {op: produce_item, item: midgaard:obj:leather-gloves, bind: bound}
 
+  # disenchant: a SALVAGE verb (Phase 13.4). Gated on requires.profession (leatherworking) — a non-member is
+  # refused at step-3. On resolve it salvage_item's a held steel longsword: the source is CONSUMED even when
+  # BOUND (owner deconstruction, §1) and the disenchant_arms table yields a tradeable leather component
+  # (uncommon, unbound) + a bound arcane essence (the epic tier binds, D1). No requires_grant — learning the
+  # profession alone unlocks the verb.
+  - ref: disenchant
+    name: Disenchant
+    invocation: command
+    words: [disenchant]
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    requires:
+      profession: leatherworking
+    messages:
+      actor: "You unravel the weave binding the blade and draw out its essence."
+      room: "$n unravels a blade into glittering motes of light."
+    on_resolve:
+      - {op: salvage_item, item: midgaard:obj:sword, table: disenchant_arms}
+
   # mute: a DEBUFF/CC — applies `silence` (prevents the verbal tag) to an enemy. Harmful disposition, so
   # the PvP harm gate guards it vs a non-consenting player (the harm-gate exercise the brief asks for).
   - ref: mute
@@ -764,6 +782,10 @@ rarity_tiers:
   - {ref: common,   order: 0, weight: 100, color: white}
   - {ref: uncommon, order: 1, weight: 30,  color: green}
   - {ref: rare,     order: 2, weight: 5,   color: blue}
+  # epic is the TOP tier + the Phase-13.4 bind threshold (D1, binds: true): a salvage component of this tier
+  # is bound on creation — the legendary-essence sink that keeps the top end un-buyable. Lower tiers stay
+  # tradeable (binds defaults false), feeding the component market.
+  - {ref: epic,     order: 3, weight: 1,   color: purple, binds: true}
 
 # loot_tables: independent rolls a mob drops from on death (Phase 12.1). goblin_loot gives a guaranteed
 # common torch to every eligible looter plus an independent 25% chance at a rare sword (personal loot).
@@ -786,6 +808,18 @@ loot_tables:
               level_max: 10
               affixes:
                 - {attr: strength, min: 1, max: 5}
+  # disenchant_arms: a SALVAGE table (Phase 13.4) — the salvage_item op rolls it after consuming a source
+  # weapon. Two guaranteed rolls: a tradeable mid-tier leather component (uncommon, unbound — feeds the
+  # market) + a top-tier arcane essence (epic, which binds on creation via the tier's binds flag — the
+  # no-trade sink). Reuses the Phase-12 loot resolver; deterministic under a seeded roll.
+  - ref: disenchant_arms
+    rolls:
+      - kind: guaranteed
+        pool:
+          - {item: midgaard:obj:leather, tier: uncommon}
+      - kind: guaranteed
+        pool:
+          - {item: midgaard:obj:essence, tier: epic}
 
 # spawn_schedules: long-timer bosses the director spawns on a schedule (Phase 12.4), distinct from per-zone
 # resets. The Warden respawns a week after it dies; if its window passed while the director was down, it
@@ -880,6 +914,17 @@ zones:
         physical: {weight: 1, material: leather}
         tags: [material]
         material: {max_stack: 20, type: leather}
+      # essence: the Phase-13.4 top-tier salvage component (an arcane essence). A stackable material like
+      # leather, but the disenchant_arms table rolls it at the `epic` tier, whose binds flag makes each
+      # essence bind on creation — the no-trade legendary sink (D1). The item proto carries no bind rule of
+      # its own; the binding comes from the salvage tier.
+      - ref: midgaard:obj:essence
+        keywords: [essence, arcane, mote]
+        short: a mote of arcane essence
+        long: A faintly glowing mote of arcane essence hovers here.
+        physical: {weight: 0, material: aether}
+        tags: [material, essence]
+        material: {max_stack: 50, type: essence}
       - ref: midgaard:obj:chest
         keywords: [chest, oak, wooden]
         short: a wooden chest

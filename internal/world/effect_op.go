@@ -106,6 +106,7 @@ type effectOp struct {
 	item       string  // item prototype ref (consume_item/produce_item/augment_item — Phase 13.3 crafting ops)
 	bind       string  // produce_item bind override ("bound" forces the produced item bound) — Phase 13.3
 	profession string  // profession ref (learn_profession — Phase 13.3 trade membership)
+	table      string  // loot/salvage table ref (salvage_item — Phase 13.4 deconstruction)
 	amount     float64 // a flat amount (heal/damage/modify_resource delta; modify_attribute_base delta)
 	diceNum    int     // dice count (deal_damage <N>d<S>)
 	diceSize   int     // dice size
@@ -192,6 +193,8 @@ func init() {
 		"augment_item": opAugmentItem,
 		// Phase 13.3 professions: enroll an entity in a trade (membership for the cap + the requires gate).
 		"learn_profession": opLearnProfession,
+		// Phase 13.4 deconstruction: consume an item + roll a salvage table into tier-bound components.
+		"salvage_item": opSalvageItem,
 	}
 }
 

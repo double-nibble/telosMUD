@@ -43,8 +43,8 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	// midgaard expanded to 4 rooms (temple/market/guildhall/smithy) and 10 item prototypes
 	// (the original torch/helmet/sword/chest + the smithy gear: warhammer/frostbrand/vest/
 	// gloves/boots/shield). The crypt zone proves multi-zone-per-shard.
-	if len(mid.Rooms) != 4 || len(mid.Items) != 11 {
-		t.Fatalf("midgaard rooms=%d items=%d, want 4/11", len(mid.Rooms), len(mid.Items))
+	if len(mid.Rooms) != 4 || len(mid.Items) != 12 {
+		t.Fatalf("midgaard rooms=%d items=%d, want 4/12", len(mid.Rooms), len(mid.Items))
 	}
 	if crypt := lc.Zone("crypt"); crypt == nil {
 		t.Fatal("crypt zone missing (multi-zone-per-shard expansion)")
@@ -137,11 +137,11 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 
 	// Loot (Phase 12.1): the demo ships 3 rarity tiers + a goblin_loot table (a guaranteed + a chance
 	// roll). Pack globals, loaded onto lc.RarityTiers / lc.LootTables.
-	if len(lc.RarityTiers) != 3 {
-		t.Fatalf("rarity_tiers = %d, want 3 (common/uncommon/rare)", len(lc.RarityTiers))
+	if len(lc.RarityTiers) != 4 {
+		t.Fatalf("rarity_tiers = %d, want 4 (common/uncommon/rare/epic)", len(lc.RarityTiers))
 	}
-	if len(lc.LootTables) != 1 {
-		t.Fatalf("loot_tables = %d, want 1 (goblin_loot)", len(lc.LootTables))
+	if len(lc.LootTables) != 2 {
+		t.Fatalf("loot_tables = %d, want 2 (goblin_loot + disenchant_arms)", len(lc.LootTables))
 	}
 	gl := lc.LootTables[0]
 	if gl.Ref != "goblin_loot" || len(gl.Rolls) != 2 {

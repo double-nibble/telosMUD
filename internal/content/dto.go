@@ -153,6 +153,11 @@ type RarityTierDTO struct {
 	Order  int     `json:"order" yaml:"order"`
 	Weight float64 `json:"weight" yaml:"weight"`
 	Color  string  `json:"color,omitempty" yaml:"color,omitempty"`
+	// Binds (Phase 13.4, D1) marks a tier whose items BIND on creation — the top-tier no-trade sink: a
+	// salvage/loot component of a binds tier is bound when produced (the legendary essence that can't be
+	// bought), while low/mid tiers stay tradeable to feed the market. false (the default) for every
+	// tradeable tier; existing tiers are unchanged.
+	Binds bool `json:"binds,omitempty" yaml:"binds,omitempty"`
 }
 
 // LootTableDTO is one content-defined loot table (Phase 12.1): a list of INDEPENDENT rolls a mob drops
