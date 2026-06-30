@@ -119,6 +119,75 @@ func TestLootIsPersonalPerLooter(t *testing.T) {
 	}
 }
 
+// TestPityAdjustedChance pins the pity curve: base + misses*step, clamped to the cap.
+func TestPityAdjustedChance(t *testing.T) {
+	z := lootZone(t)
+	player := z.newPlayerEntity(&session{character: "Hero"}, "Hero")
+	roll := &lootRoll{kind: "chance", chance: 0.1, pity: &lootPity{key: "sunsword", step: 0.05, cap: 0.3}}
+
+	if got := pityAdjustedChance(roll, player); got != 0.1 {
+		t.Fatalf("0 misses: chance = %v, want 0.1 (base)", got)
+	}
+	setLootPityMisses(player, "sunsword", 2)
+	if got := pityAdjustedChance(roll, player); got != 0.2 {
+		t.Fatalf("2 misses: chance = %v, want 0.2 (0.1 + 2*0.05)", got)
+	}
+	setLootPityMisses(player, "sunsword", 100)
+	if got := pityAdjustedChance(roll, player); got != 0.3 {
+		t.Fatalf("many misses: chance = %v, want 0.3 (capped)", got)
+	}
+}
+
+// TestPityAccumulatesAndResets proves the resolver raises a looter's miss counter on a miss and resets it
+// on a hit — deterministic with a chance of 0 (always miss until pity forces it to 1.0, then hit).
+func TestPityAccumulatesAndResets(t *testing.T) {
+	z := lootZone(t)
+	z.defs.loot.register("pity_table", &lootTableDef{ref: "pity_table", rolls: []lootRoll{
+		{
+			kind: "chance", chance: 0.0, pity: &lootPity{key: "sunsword", step: 1.0, cap: 1.0},
+			pool: []lootEntry{{item: "midgaard:obj:sword"}},
+		},
+	}})
+	player := z.newPlayerEntity(&session{character: "Hero"}, "Hero")
+
+	// Kill 1: base chance 0 -> miss -> counter 1, no drop.
+	z.resolveLoot(lootVictim(z, player, "pity_table"), rand.New(rand.NewSource(1)))
+	if lootPityMisses(player, "sunsword") != 1 {
+		t.Fatalf("after a miss: pity = %d, want 1", lootPityMisses(player, "sunsword"))
+	}
+	if countItems(player, "midgaard:obj:sword") != 0 {
+		t.Fatal("a zero-base-chance roll dropped on the first kill")
+	}
+	// Kill 2: chance = 0 + 1*1.0 = 1.0 -> guaranteed hit -> drop + reset.
+	z.resolveLoot(lootVictim(z, player, "pity_table"), rand.New(rand.NewSource(1)))
+	if countItems(player, "midgaard:obj:sword") != 1 {
+		t.Fatal("pity did not force the drop once it reached the cap")
+	}
+	if lootPityMisses(player, "sunsword") != 0 {
+		t.Fatalf("after a hit: pity = %d, want 0 (reset)", lootPityMisses(player, "sunsword"))
+	}
+}
+
+// TestPitySurvivesReload proves a looter's accumulated pity counter round-trips through dumpCharacter/
+// loadCharacter — "I'm due a drop" progress is not lost on a relogin.
+func TestPitySurvivesReload(t *testing.T) {
+	z := lootZone(t)
+	src := &session{character: "Hero"}
+	e := z.newPlayerEntity(src, "Hero")
+	setLootPityMisses(e, "sunsword", 7)
+
+	snap := dumpCharacter(src)
+	if snap.State.LootPity["sunsword"] != 7 {
+		t.Fatalf("dumped loot_pity = %v, want sunsword:7", snap.State.LootPity)
+	}
+	dst := &session{character: "Hero"}
+	z.newPlayerEntity(dst, "Hero")
+	loadCharacter(z, dst, snap)
+	if lootPityMisses(dst.entity, "sunsword") != 7 {
+		t.Fatalf("reloaded pity = %d, want 7 (bad-luck protection must survive a relogin)", lootPityMisses(dst.entity, "sunsword"))
+	}
+}
+
 func TestLootNoTableNoOp(t *testing.T) {
 	z := lootZone(t)
 	src := &session{character: "Hero"}

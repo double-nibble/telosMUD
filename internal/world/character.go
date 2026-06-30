@@ -80,6 +80,10 @@ type StateJSON struct {
 	// ability stays usable across a relogin. A pre-11.4 save (no abilities) loads with none — an entity
 	// keeps whatever un-gated abilities content makes universal. DATA ONLY (a list of refs).
 	Abilities []string `json:"abilities,omitempty"`
+	// LootPity is the per-pity-key consecutive-miss count (Phase 12.2, loot.go): bad-luck protection for
+	// loot chance rolls, riding the durability ladder so a player's "I'm due a drop" progress survives a
+	// relogin. A pre-12.2 save (no loot_pity) loads with none. DATA ONLY (key->int).
+	LootPity map[string]int `json:"loot_pity,omitempty"`
 	// Cooldowns is each armed ability cooldown's REMAINING pulses at dump time ([G8] / P6-D8, Phase
 	// 6.3a), keyed by ability ref. loadCharacter re-arms each via pulse.after(remaining) on the
 	// DESTINATION zone goroutine (never a cross-goroutine timer write — the Phase 5.2 lesson). A logout
@@ -304,6 +308,7 @@ func dumpStateComponents(e *Entity) StateJSON {
 		Flags:      dumpFlags(e),
 		Tracks:     dumpTracks(e),           // Phase 11.2 — per-track current step
 		Abilities:  dumpGrantedAbilities(e), // Phase 11.4a — granted ability refs
+		LootPity:   dumpLootPity(e),         // Phase 12.2 — per-key consecutive-miss counts
 		Cooldowns:  dumpCooldowns(e),
 		Script:     dumpScriptState(e), // Phase 7.6 — the player's data-only self.state subtree
 	}
@@ -356,7 +361,8 @@ func dumpStateJSON(s *session) string {
 func (st StateJSON) empty() bool {
 	return len(st.Inventory) == 0 && len(st.Equipment) == 0 && len(st.Attributes) == 0 &&
 		len(st.Resources) == 0 && len(st.Affects) == 0 && len(st.Flags) == 0 &&
-		len(st.Tracks) == 0 && len(st.Abilities) == 0 && len(st.Cooldowns) == 0 && len(st.Script) == 0
+		len(st.Tracks) == 0 && len(st.Abilities) == 0 && len(st.LootPity) == 0 &&
+		len(st.Cooldowns) == 0 && len(st.Script) == 0
 }
 
 // dumpAttributes renders the entity's per-attribute BASE OVERRIDES (Living.attrBase) — bases only,
@@ -695,6 +701,10 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 		// usable across a relogin.
 		for _, ref := range st.Abilities {
 			grantAbility(e, ref)
+		}
+		// Re-install the entity's loot-pity counters (Phase 12.2) so bad-luck protection survives a relogin.
+		for key, misses := range st.LootPity {
+			setLootPityMisses(e, key, misses)
 		}
 		// Re-arm ability cooldowns ([G8] / P6-D8, Phase 6.3a) from their REMAINING pulses — on THIS
 		// (destination) zone goroutine, so the re-armed clear callback is registered on the zone that

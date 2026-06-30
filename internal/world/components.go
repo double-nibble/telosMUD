@@ -87,6 +87,12 @@ type Living struct {
 	// dispatches/casts only if its ref is here; an un-gated ability stays universally usable. nil until
 	// the first grant_ability. Persisted in the StateJSON `abilities` subtree.
 	granted map[string]bool
+	// lootPity is this entity's per-pity-key CONSECUTIVE-MISS count (loot.go, Phase 12.2): bad-luck
+	// protection — each loot roll that misses an item nudges its effective chance up; a hit resets the
+	// counter. Keyed by the loot roll's pity key. nil until the first pity miss. Persisted in the
+	// StateJSON `loot_pity` subtree (rides the durability ladder). COW-safe (a mob never loots, but the
+	// field rides Living uniformly).
+	lootPity map[string]int
 	// attrs is the memoized derivation cache + dirty bit (attributes.go). Recomputed lazily after any
 	// base/mod change. NOT persisted (it is a pure function of bases + mods + defs) and NOT shared —
 	// each instance owns its own; cloneComponent gives a COW'd instance a fresh (empty) cache.

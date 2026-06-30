@@ -87,11 +87,63 @@ func (z *Zone) resolveLoot(victim *Entity, rng *rand.Rand) {
 	looters := z.eligibleLooters(victim)
 	for _, looter := range looters {
 		for i := range table.rolls {
-			for _, itemRef := range z.resolveRoll(&table.rolls[i], rng) {
+			for _, itemRef := range z.resolveRoll(looter, &table.rolls[i], rng) {
 				z.deliverLoot(looter, itemRef)
 			}
 		}
 	}
+}
+
+// --- pity (bad-luck protection, Phase 12.2) ----------------------------------------------------
+
+// lootPityMisses returns the looter's consecutive-miss count for a pity key (0 if none). Zone read.
+func lootPityMisses(e *Entity, key string) int {
+	if e == nil || e.living == nil || e.living.lootPity == nil {
+		return 0
+	}
+	return e.living.lootPity[key]
+}
+
+// setLootPityMisses records the looter's miss count for a pity key (COW-safe). 0 removes the entry (a
+// hit resets, keeping the persisted subtree small). Zone goroutine only.
+func setLootPityMisses(e *Entity, key string, n int) {
+	l := mutableLiving(e)
+	if l == nil {
+		return
+	}
+	if n <= 0 {
+		delete(l.lootPity, key)
+		return
+	}
+	if l.lootPity == nil {
+		l.lootPity = map[string]int{}
+	}
+	l.lootPity[key] = n
+}
+
+// pityAdjustedChance returns the effective drop chance for a chance roll given the looter's accumulated
+// misses: base + misses*step, raised TO (clamped at) the cap. No pity spec => the bare base chance.
+func pityAdjustedChance(roll *lootRoll, looter *Entity) float64 {
+	if roll.pity == nil {
+		return roll.chance
+	}
+	eff := roll.chance + float64(lootPityMisses(looter, roll.pity.key))*roll.pity.step
+	if roll.pity.cap > 0 && eff > roll.pity.cap {
+		eff = roll.pity.cap
+	}
+	return eff
+}
+
+// dumpLootPity renders the looter's per-key miss counts as a fresh map (a copy). nil when none.
+func dumpLootPity(e *Entity) map[string]int {
+	if e == nil || e.living == nil || len(e.living.lootPity) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(e.living.lootPity))
+	for k, v := range e.living.lootPity {
+		out[k] = v
+	}
+	return out
 }
 
 // eligibleLooters returns the PLAYERS who dealt damage to the victim (the v1 "dealt any damage" rule):
@@ -110,10 +162,10 @@ func (z *Zone) eligibleLooters(victim *Entity) []*Entity {
 	return out
 }
 
-// resolveRoll resolves one roll to a list of selected item prototype refs (0..N items). guaranteed and
-// the weighted kinds always pick from the pool; chance gates on its probability first. quality_floor
-// filters the pool to entries at or above the floor tier's order.
-func (z *Zone) resolveRoll(roll *lootRoll, rng *rand.Rand) []string {
+// resolveRoll resolves one roll to a list of selected item prototype refs (0..N items) for `looter`.
+// guaranteed and the weighted kinds always pick from the pool; chance gates on its (pity-adjusted)
+// probability first. quality_floor filters the pool to entries at or above the floor tier's order.
+func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand) []string {
 	pool := z.filterPoolByFloor(roll.pool, roll.qualityFloor)
 	if len(pool) == 0 {
 		return nil
@@ -124,7 +176,17 @@ func (z *Zone) resolveRoll(roll *lootRoll, rng *rand.Rand) []string {
 			return []string{e.item}
 		}
 	case "chance":
-		if rng.Float64() < roll.chance {
+		hit := rng.Float64() < pityAdjustedChance(roll, looter)
+		// Bad-luck protection (Phase 12.2): a miss raises this looter's counter (and so their next
+		// chance); a hit resets it. Per-looter, per pity key, persisted.
+		if roll.pity != nil {
+			if hit {
+				setLootPityMisses(looter, roll.pity.key, 0)
+			} else {
+				setLootPityMisses(looter, roll.pity.key, lootPityMisses(looter, roll.pity.key)+1)
+			}
+		}
+		if hit {
 			if e := z.weightedPick(pool, rng); e != nil {
 				return []string{e.item}
 			}
