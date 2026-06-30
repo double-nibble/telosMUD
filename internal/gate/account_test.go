@@ -3,6 +3,7 @@ package gate
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // account_test.go — Phase 14.1: the gate's account seam. The stub backs the gate until a real account
@@ -29,4 +30,16 @@ func TestNewServerDefaultsToStubAccount(t *testing.T) {
 	if _, ok := s.account.(stubAccountClient); !ok {
 		t.Fatal("WithAccountClient(nil) should keep the stub")
 	}
+}
+
+// deviceAuthUnsupported gives the pre-Phase-15 journey fakes the device-auth methods as no-ops — those tests
+// exercise the link-code/passphrase/SSH paths, not the OAuth device flow (which has its own fake).
+type deviceAuthUnsupported struct{}
+
+func (deviceAuthUnsupported) StartDeviceAuth(context.Context, string) (string, string, time.Duration, error) {
+	return "", "", 0, nil
+}
+
+func (deviceAuthUnsupported) PollDeviceAuth(context.Context, string) (string, string, []CharacterInfo, error) {
+	return "expired", "", nil, nil
 }

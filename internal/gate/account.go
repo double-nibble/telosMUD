@@ -37,6 +37,12 @@ type AccountClient interface {
 	VerifyPassphrase(ctx context.Context, name, pass, connInfo string) (ok bool, accountID, reason string, err error)
 	// ResolveSSHKey maps an SSH key fingerprint to an account (Phase 14.6). found=false for an unknown key.
 	ResolveSSHKey(ctx context.Context, fingerprint string) (found bool, accountID string, err error)
+	// StartDeviceAuth begins a browser OAuth login (Phase 15), returning the device_code, the one-click link
+	// to show the player, and the suggested poll interval.
+	StartDeviceAuth(ctx context.Context, connInfo string) (deviceCode, verificationURI string, interval time.Duration, err error)
+	// PollDeviceAuth reports the device-login status ("pending" | "authed" | "expired"); on "authed" it
+	// returns the account + its characters.
+	PollDeviceAuth(ctx context.Context, deviceCode string) (status, accountID string, characters []CharacterInfo, err error)
 	// Close releases any underlying connection (a no-op for the stub).
 	Close() error
 }
@@ -77,6 +83,16 @@ func (stubAccountClient) VerifyPassphrase(_ context.Context, _, _, _ string) (bo
 // ResolveSSHKey on the stub never resolves (no account service).
 func (stubAccountClient) ResolveSSHKey(_ context.Context, _ string) (bool, string, error) {
 	return false, "", nil
+}
+
+// StartDeviceAuth/PollDeviceAuth are never reached on the stub (the gate only runs device login when a real
+// account client is wired); they satisfy the interface.
+func (stubAccountClient) StartDeviceAuth(_ context.Context, _ string) (string, string, time.Duration, error) {
+	return "", "", 0, nil
+}
+
+func (stubAccountClient) PollDeviceAuth(_ context.Context, _ string) (string, string, []CharacterInfo, error) {
+	return "expired", "", nil, nil
 }
 
 func (stubAccountClient) Close() error { return nil }
@@ -155,6 +171,26 @@ func (g *grpcAccountClient) ResolveSSHKey(ctx context.Context, fingerprint strin
 	return resp.GetFound(), resp.GetAccountId(), nil
 }
 
+func (g *grpcAccountClient) StartDeviceAuth(ctx context.Context, connInfo string) (string, string, time.Duration, error) {
+	resp, err := g.cli.StartDeviceAuth(ctx, &accountv1.StartDeviceAuthRequest{ConnInfo: connInfo})
+	if err != nil {
+		return "", "", 0, err
+	}
+	return resp.GetDeviceCode(), resp.GetVerificationUri(), time.Duration(resp.GetInterval()) * time.Second, nil
+}
+
+func (g *grpcAccountClient) PollDeviceAuth(ctx context.Context, deviceCode string) (string, string, []CharacterInfo, error) {
+	resp, err := g.cli.PollDeviceAuth(ctx, &accountv1.PollDeviceAuthRequest{DeviceCode: deviceCode})
+	if err != nil {
+		return "", "", nil, err
+	}
+	out := make([]CharacterInfo, 0, len(resp.GetCharacters()))
+	for _, c := range resp.GetCharacters() {
+		out = append(out, CharacterInfo{ID: c.GetId(), Name: c.GetName(), ZoneRef: c.GetZoneRef(), RoomRef: c.GetRoomRef()})
+	}
+	return resp.GetStatus(), resp.GetAccountId(), out, nil
+}
+
 // Close releases the gRPC connection.
 func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 
@@ -164,16 +200,75 @@ func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 // wired it runs the LINK-CODE bridge (ACCOUNT.md §4); otherwise it falls back to the legacy "type a name"
 // prompt so a bare dev gate (no account service) still works. The accountID is "" on the legacy path. Returns
 // ok=false when the connection drops or login aborts.
-func (s *Server) login(tc *telnet.Conn, log *slog.Logger, remote string, encrypted bool, preAuth string) (name, accountID string, ok bool) {
+func (s *Server) login(ctx context.Context, tc *telnet.Conn, log *slog.Logger, remote string, _ bool, preAuth string) (name, accountID string, ok bool) {
 	if !s.accountConfigured {
 		name, ok = loginByName(tc, log)
 		return name, "", ok
 	}
-	// Phase 14.6: an SSH key already authenticated the account — skip straight to character select.
+	// Phase 14.6: an SSH key already authenticated the account — skip straight to character select. (SSH is
+	// removed in 15.5; until then this path stays.)
 	if preAuth != "" {
 		return s.loginPreAuthenticated(tc, log, preAuth)
 	}
-	return s.loginAuthenticated(tc, log, remote, encrypted)
+	// Phase 15: the terminal-native OAuth device flow — show a one-click link, poll until the browser auths.
+	return s.loginViaDevice(ctx, tc, log, remote)
+}
+
+// deviceLoginTimeout bounds how long the gate waits for the player to complete the browser sign-in before
+// giving up (matched to the device_code TTL).
+const deviceLoginTimeout = 10 * time.Minute
+
+// loginViaDevice runs the Phase-15 terminal OAuth flow: ask account for a device_code + a one-click link,
+// show it, and poll until the browser completes OAuth (or the link expires / the player disconnects). On
+// success it returns the account + the selected character. The connection ctx cancels the poll on disconnect.
+func (s *Server) loginViaDevice(ctx context.Context, tc *telnet.Conn, log *slog.Logger, remote string) (string, string, bool) {
+	ctx, cancel := context.WithTimeout(ctx, deviceLoginTimeout)
+	defer cancel()
+
+	startCtx, c := context.WithTimeout(ctx, 5*time.Second)
+	device, uri, interval, err := s.account.StartDeviceAuth(startCtx, remote)
+	c()
+	if err != nil {
+		log.Warn("StartDeviceAuth failed", "err", err)
+		_ = tc.Write("\r\nThe login service is unavailable right now. Please try again later.\r\n")
+		return "", "", false
+	}
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	// A bare URL on its own line: copy-pasteable everywhere, and auto-clickable in modern terminals that
+	// linkify URLs. (OSC-8 hyperlinks are deferred — too many MUD clients render the escapes as junk.)
+	_ = tc.Write("\r\nTo sign in, open this link in your browser:\r\n\r\n    " + uri + "\r\n\r\nWaiting for you to sign in (this page will tell you when to return)...\r\n")
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			_ = tc.Write("\r\nThe sign-in link expired. Please reconnect to get a new one.\r\n")
+			return "", "", false
+		case <-ticker.C:
+			pollCtx, pc := context.WithTimeout(ctx, 5*time.Second)
+			st, account, chars, err := s.account.PollDeviceAuth(pollCtx, device)
+			pc()
+			if err != nil {
+				log.Debug("poll device auth (transient)", "err", err)
+				continue // keep polling — a transient blip shouldn't drop the login
+			}
+			switch st {
+			case "authed":
+				name, ok := selectCharacter(tc, chars)
+				if !ok {
+					return "", "", false
+				}
+				return name, account, true
+			case "expired":
+				_ = tc.Write("\r\nThe sign-in link expired. Please reconnect to get a new one.\r\n")
+				return "", "", false
+			}
+			// "pending": keep waiting.
+		}
+	}
 }
 
 // loginPreAuthenticated handles an SSH-key login (the account is already proven by the key): list the
@@ -213,92 +308,6 @@ func loginByName(tc *telnet.Conn, log *slog.Logger) (string, bool) {
 		}
 		return candidate, true
 	}
-}
-
-// loginAuthenticated prompts for a LINK CODE (bare or "connect <code>") or a PASSPHRASE login
-// ("connect <name> <passphrase>"), and dispatches to the right backend. A failed attempt re-prompts; a
-// dropped connection returns ok=false.
-func (s *Server) loginAuthenticated(tc *telnet.Conn, log *slog.Logger, remote string, encrypted bool) (string, string, bool) {
-	for {
-		_ = tc.Write("Enter your link code, or 'connect <name> <passphrase>': ")
-		line, err := tc.ReadLine()
-		if err != nil {
-			log.Debug("connection closed before login", "err", err)
-			return "", "", false
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		// Passphrase login: connect <name> <passphrase>.
-		if strings.EqualFold(fields[0], "connect") && len(fields) == 3 {
-			if name, account, ok := s.loginByPassphrase(tc, log, remote, fields[1], fields[2], encrypted); ok {
-				return name, account, true
-			}
-			continue
-		}
-		// Otherwise a link code — the LAST token (covers bare "<code>" and "connect <code>").
-		code := strings.ToUpper(fields[len(fields)-1])
-		if name, account, ok := s.loginByCode(tc, log, remote, code); ok {
-			return name, account, true
-		}
-		// loginByCode wrote the reason; loop to re-prompt. A dropped connection is caught by the next
-		// ReadLine at the top of the loop, which returns ok=false.
-	}
-}
-
-// loginByCode redeems a link code + selects a character. ok=false on a bad code (a reason was written) or a
-// dropped connection.
-func (s *Server) loginByCode(tc *telnet.Conn, log *slog.Logger, remote, code string) (string, string, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	accountID, chars, found, err := s.account.RedeemLinkCode(ctx, code, remote)
-	cancel()
-	if err != nil {
-		log.Warn("redeem link code failed", "err", err)
-		_ = tc.Write("\r\nThe login service is unavailable right now. Please try again shortly.\r\n")
-		return "", "", false
-	}
-	if !found {
-		_ = tc.Write("\r\nThat code is invalid or has expired. Get a fresh one from the website.\r\n")
-		return "", "", false
-	}
-	name, ok := selectCharacter(tc, chars)
-	if !ok {
-		return "", "", false
-	}
-	log.Debug("login via link code", "account", accountID, "character", name)
-	return name, accountID, true
-}
-
-// loginByPassphrase authenticates `connect <name> <passphrase>`: the named character must exist + the
-// passphrase verify. On success the player plays that character. A cleartext warning is shown (the passphrase
-// just crossed a possibly-unencrypted wire); the transport-aware version lands with TLS/SSH (Phase 14.6).
-func (s *Server) loginByPassphrase(tc *telnet.Conn, log *slog.Logger, remote, name, pass string, encrypted bool) (string, string, bool) {
-	if reason, ok := validateName(name); !ok {
-		_ = tc.Write("\r\nThat name won't do: " + reason + "\r\n")
-		return "", "", false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	authOK, account, reason, err := s.account.VerifyPassphrase(ctx, name, pass, remote)
-	cancel()
-	if err != nil {
-		log.Warn("verify passphrase failed", "err", err)
-		_ = tc.Write("\r\nThe login service is unavailable right now. Please try again shortly.\r\n")
-		return "", "", false
-	}
-	if !authOK {
-		if reason == "locked" {
-			_ = tc.Write("\r\nToo many failed attempts. Please wait and try again later.\r\n")
-		} else {
-			_ = tc.Write("\r\nIncorrect name or passphrase.\r\n")
-		}
-		return "", "", false
-	}
-	if !encrypted {
-		_ = tc.Write("\r\n(Note: a passphrase is visible on this UNENCRYPTED connection — prefer a link code, TLS, or SSH.)\r\n")
-	}
-	log.Debug("login via passphrase", "account", account, "character", name, "encrypted", encrypted)
-	return name, account, true
 }
 
 // selectCharacter picks which character to play from the account's list: zero => a prompt to create one on

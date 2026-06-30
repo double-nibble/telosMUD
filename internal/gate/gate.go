@@ -272,7 +272,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool, preAut
 
 	// --- login: a link code (Phase 14.2, when an account service is wired) or the legacy name prompt. ---
 	_ = tc.Write("\r\nWelcome to TelosMUD.\r\n")
-	name, account, ok := s.login(tc, log, remote, encrypted, preAuth)
+	name, account, ok := s.login(ctx, tc, log, remote, encrypted, preAuth)
 	if !ok {
 		return // connection closed / aborted during login
 	}

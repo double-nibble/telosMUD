@@ -15,22 +15,20 @@ import (
 // login and carries it in Attach; a world shard configured with the matching public key verifies it OFFLINE
 // and accepts (or rejects a token signed by the wrong key). This drives the whole chain through the harness.
 
-// signingFakeAccount redeems one code and issues REAL Ed25519-signed assertions with priv.
+// signingFakeAccount authes a device login and issues REAL Ed25519-signed assertions with priv. (The session
+// assertion is issued after login regardless of the login method, so it now rides the device flow.)
 type signingFakeAccount struct {
-	good string
+	stubAccountClient
 	char string
 	priv ed25519.PrivateKey
 }
 
-func (f *signingFakeAccount) ListCharacters(context.Context, string) ([]CharacterInfo, error) {
-	return nil, nil
+func (f *signingFakeAccount) StartDeviceAuth(context.Context, string) (string, string, time.Duration, error) {
+	return "DEV", "http://localhost:8080/login/DEV", 5 * time.Millisecond, nil
 }
 
-func (f *signingFakeAccount) RedeemLinkCode(_ context.Context, code, _ string) (string, []CharacterInfo, bool, error) {
-	if code == f.good {
-		return "acct-1", []CharacterInfo{{ID: "c1", Name: f.char}}, true, nil
-	}
-	return "", nil, false, nil
+func (f *signingFakeAccount) PollDeviceAuth(context.Context, string) (string, string, []CharacterInfo, error) {
+	return "authed", "acct-1", []CharacterInfo{{ID: "c1", Name: f.char}}, nil
 }
 
 func (f *signingFakeAccount) IssueSessionAssertion(_ context.Context, account, character, session string) (string, error) {
@@ -39,8 +37,6 @@ func (f *signingFakeAccount) IssueSessionAssertion(_ context.Context, account, c
 		Expires: time.Now().Add(time.Minute).Unix(),
 	})
 }
-
-func (f *signingFakeAccount) Close() error { return nil }
 
 // TestSessionAssertionAcceptedByWorld: a valid signed assertion is verified by the shard and the player
 // spawns — the full gate-issues / world-verifies chain with auth ON.
@@ -54,11 +50,10 @@ func TestSessionAssertionAcceptedByWorld(t *testing.T) {
 	sh := world.NewShard("midgaard", addr, nil, nil).WithVerifyKey(pub) // the shard ENFORCES assertions
 	h.serveShard(addr, sh)
 	h.serveGate(directory.Static{Addr: addr})
-	h.srv.WithAccountClient(&signingFakeAccount{good: "GOODCODE", char: "Verified", priv: priv})
+	h.srv.WithAccountClient(&signingFakeAccount{char: "Verified", priv: priv})
 
 	term := h.dial(t)
-	term.expect(t, "Enter your link code")
-	term.send(t, "GOODCODE")
+	term.expect(t, "To sign in, open this link")
 	term.expect(t, "The Temple Square") // the world verified the assertion + spawned the player
 	term.close(t)
 }
@@ -79,11 +74,10 @@ func TestSessionAssertionRejectedByWorld(t *testing.T) {
 	sh := world.NewShard("midgaard", addr, nil, nil).WithVerifyKey(pub)
 	h.serveShard(addr, sh)
 	h.serveGate(directory.Static{Addr: addr})
-	h.srv.WithAccountClient(&signingFakeAccount{good: "GOODCODE", char: "Forger", priv: wrongPriv})
+	h.srv.WithAccountClient(&signingFakeAccount{char: "Forger", priv: wrongPriv})
 
 	term := h.dial(t)
-	term.expect(t, "Enter your link code")
-	term.send(t, "GOODCODE")
+	term.expect(t, "To sign in, open this link")
 
 	// The forged assertion is rejected at the world's Attach; the gate's stream fails and the connection
 	// closes WITHOUT the player ever reaching the world.
@@ -92,12 +86,4 @@ func TestSessionAssertionRejectedByWorld(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("expected the connection to close on a rejected assertion; got %q", term.acc.String())
 	}
-}
-
-func (f *signingFakeAccount) VerifyPassphrase(_ context.Context, _, _, _ string) (bool, string, string, error) {
-	return false, "", "bad_credentials", nil
-}
-
-func (f *signingFakeAccount) ResolveSSHKey(context.Context, string) (bool, string, error) {
-	return false, "", nil
 }

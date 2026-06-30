@@ -21,6 +21,7 @@ import (
 
 // sshFakeAccount resolves one fingerprint to an account; ListCharacters returns `chars` for that account.
 type sshFakeAccount struct {
+	deviceAuthUnsupported
 	fingerprint string
 	account     string
 	chars       []CharacterInfo
@@ -148,9 +149,9 @@ func TestSSHUnknownKeyFallsBackToInteractive(t *testing.T) {
 	signer, _ := sshClientKey(t) // its fingerprint is NOT the one the fake knows
 	stdout := dialSSHShell(t, signer, sshFakeAccount{fingerprint: "SHA256:bogus", account: "acct-1"})
 
-	got := readUntil(t, stdout, "Enter your link code", 8*time.Second)
-	if !strings.Contains(got, "Enter your link code") {
-		t.Fatalf("an unknown SSH key should fall back to the interactive login prompt; got %q", got)
+	got := readUntil(t, stdout, "To sign in, open this link", 8*time.Second)
+	if !strings.Contains(got, "To sign in, open this link") {
+		t.Fatalf("an unknown SSH key should fall back to the interactive (device OAuth) login; got %q", got)
 	}
 }
 
