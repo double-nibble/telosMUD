@@ -5,7 +5,14 @@ into components and **craft/augment** new ones, the modern-MMO material loop. De
 [CRAFTING.md](CRAFTING.md). It answers "does personal loot (Phase 12) kill the economy?" — *no, because
 bound gear re-enters the economy as components.*
 
-Status: **plan — awaiting scope confirmation.** No code yet.
+Status: **plan LOCKED (scope confirmed 2026-06-29).** Building 13.1 → 13.5 + capstone.
+
+**Settled forks (confirmed):** (1) FULL scope (13.1–13.5 + capstone), `augment_item` kept to a flat-stat-
+bump stub (the rich affix/socket catalog stays §10-deferred). (2) Professions reuse the Phase-11.2 track
+system for skill levels + a thin `state.professions` set for membership/the D2 cap. (3) The `bound` state +
+stack count ride the item-instance delta (Phase 12.3 round-trip). (4) Stations = a ROOM flag (`forge`) for
+v1, with a furniture-upgrade hook. (5) Stacking = coarse v1 (merge identical materials on pickup + `split`);
+broader auto-stacking is a follow-up.
 
 ## The binding shape (settled — do not re-litigate)
 
