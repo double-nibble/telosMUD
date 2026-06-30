@@ -24,6 +24,10 @@ service Account {
   rpc VerifyPassphrase(VerifyPassphraseRequest) returns (VerifyPassphraseResponse);
   // ResolveSSHKey maps an SSH key fingerprint to an account for the gate's SSH server (Phase 14.6).
   rpc ResolveSSHKey(ResolveSSHKeyRequest) returns (ResolveSSHKeyResponse);
+  // IssueSessionAssertion mints a short-lived Ed25519-signed assertion binding {account, character, session}
+  // (Phase 14.3). The gate calls it after login (once the character + session are known) and carries the
+  // token in the Play Attach frame; the world verifies it offline against account's published public key.
+  rpc IssueSessionAssertion(IssueSessionAssertionRequest) returns (IssueSessionAssertionResponse);
 }
 
 // Character is the account-facing summary of a character (the select menu / dashboard list).
@@ -98,4 +102,13 @@ message ResolveSSHKeyRequest {
 message ResolveSSHKeyResponse {
   bool found = 1;
   string account_id = 2;
+}
+
+message IssueSessionAssertionRequest {
+  string account_id = 1;
+  string character_id = 2; // the selected character (name/id)
+  string session_id = 3; // the gate session id
+}
+message IssueSessionAssertionResponse {
+  string assertion = 1; // the signed token, or "" when signing is not configured
 }

@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"log/slog"
 	"net"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/double-nibble/telosmud/db"
+	"github.com/double-nibble/telosmud/internal/assertion"
 	"github.com/double-nibble/telosmud/internal/checkpoint"
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/config"
@@ -99,6 +101,20 @@ func main() {
 // home (the spawn zone for fresh logins) is the first configured zone.
 func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []string) *world.Shard {
 	home := zones[0]
+
+	// Session-assertion verify key (Phase 14.3): account's Ed25519 PUBLIC key, if configured. The shard then
+	// verifies the gate's assertion offline on a fresh-login Attach. An invalid key is fatal (a
+	// misconfiguration that would silently disable auth); an absent key means assertions are NOT enforced.
+	var verifyKey ed25519.PublicKey
+	if cfg.AccountVerifyKey != "" {
+		pk, err := assertion.ParsePublicKey(cfg.AccountVerifyKey)
+		if err != nil {
+			slog.Error("invalid account verify key", "err", err)
+			os.Exit(1)
+		}
+		verifyKey = pk
+		slog.Info("session-assertion verification enabled (ed25519)")
+	}
 
 	// Load content BEFORE building any zone (docs/PHASE4-PLAN.md §3). This is synchronous boot
 	// I/O on the construction goroutine — never on a zone goroutine — so blocking is fine. If
@@ -179,6 +195,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithPersistence(charStore, nil).
 			WithHotReload(defSource, bus, enabledPacks).
 			WithComms(comms).
+			WithVerifyKey(verifyKey).
 			WithScopeBus(scopeBus, lc.Regions).
 			WithMail(mailStore).
 			WithTells(tellJS)
@@ -233,6 +250,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithPersistence(charStore, ckpt).
 		WithHotReload(defSource, bus, enabledPacks).
 		WithComms(comms).
+		WithVerifyKey(verifyKey).
 		WithScopeBus(scopeBus, lc.Regions).
 		WithPresence(roster, cfg.ShardID).
 		WithMail(mailStore).

@@ -21,6 +21,7 @@ package world
 
 import (
 	"context"
+	"crypto/ed25519"
 	"log/slog"
 	"reflect"
 	"sync"
@@ -77,6 +78,11 @@ type Shard struct {
 	addr  string           // this shard's public address ("" in single-shard tests)
 	dir   Locator          // directory for cross-shard routing; nil seals cross-shard exits
 	peers HandoffDialer    // dials peer shards' Handoff service
+
+	// verifyKey is account's Ed25519 PUBLIC key (Phase 14.3, ACCOUNT.md §9): the shard verifies the gate's
+	// session assertion against it OFFLINE on a fresh-login Attach (no per-connect RPC to account). nil =>
+	// assertions are NOT enforced (dev / pre-14.3 — the shard trusts the gate's asserted identity directly).
+	verifyKey ed25519.PublicKey
 
 	mu         sync.Mutex       // guards tokenIndex
 	tokenIndex map[string]*Zone // handoff token -> hosting zone (populated by Prepare)
@@ -263,6 +269,14 @@ func (s *Shard) WithComms(bus commbus.Bus) *Shard {
 	if bus != nil {
 		s.comms.bus = bus
 	}
+	return s
+}
+
+// WithVerifyKey wires account's Ed25519 public key so the shard ENFORCES session assertions on fresh logins
+// (Phase 14.3). Without it the shard trusts the gate's asserted identity directly (dev / pre-14.3). Must be
+// called before Run.
+func (s *Shard) WithVerifyKey(pub ed25519.PublicKey) *Shard {
+	s.verifyKey = pub
 	return s
 }
 

@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/assertion"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
@@ -82,6 +83,25 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	}
 	token := attach.GetHandoffToken()
 	s.log.Debug("attach parsed", "character", character)
+
+	// Phase 14.3: on a FRESH login (no handoff token) verify the gate's signed session assertion against
+	// account's public key — OFFLINE, no per-connect RPC. A handoff re-dial is trusted via its handoff token
+	// (and the short assertion TTL would falsely reject a late cross-shard walk), so it is NOT re-verified.
+	// When no verify key is configured the shard trusts the gate's asserted identity directly (dev/pre-14.3).
+	if token == "" && s.shard.verifyKey != nil {
+		claims, err := assertion.Verify(s.shard.verifyKey, attach.GetSessionAssertion(), time.Now())
+		if err != nil {
+			s.log.Warn("session assertion rejected", "err", err, "character", character)
+			return status.Error(codes.Unauthenticated, "invalid session assertion")
+		}
+		// The token must match THIS connection: the session it was issued for + the character it names. This
+		// is what stops a compromised gate replaying one account's assertion to attach as a different identity.
+		if claims.Session != attach.GetSessionId() || claims.Character != attach.GetCharacterId() {
+			s.log.Warn("session assertion identity mismatch",
+				"claim_session", claims.Session, "claim_character", claims.Character)
+			return status.Error(codes.Unauthenticated, "session assertion mismatch")
+		}
+	}
 
 	// Decide which hosted zone this connection starts in: a handoff re-dial binds to
 	// whichever zone holds the matching pending player; everything else (fresh login,

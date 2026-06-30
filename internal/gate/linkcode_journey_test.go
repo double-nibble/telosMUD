@@ -30,6 +30,10 @@ func (f *fakeGateAccount) RedeemLinkCode(_ context.Context, code, _ string) (str
 	return "", nil, false, nil
 }
 
+func (f *fakeGateAccount) IssueSessionAssertion(context.Context, string, string, string) (string, error) {
+	return "", nil // the journey tests run with auth off (no verify key on the shard)
+}
+
 func (f *fakeGateAccount) Close() error { return nil }
 
 // TestLinkCodeOnboardingJourney: with an account service wired, the gate prompts for a link code; a bad code

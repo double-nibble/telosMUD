@@ -32,6 +32,11 @@ message Attach {
   ClientInfo client = 4;
   string handoff_token = 5; // set ONLY when re-dialing after a Redirect
   uint64 input_seq = 6; // next input seq the gate will send (resume point)
+  // session_assertion is the Ed25519-signed {account,character,session,exp} token telos-account issued at
+  // login (Phase 14.3, ACCOUNT.md §9). The world verifies it OFFLINE against account's published public key
+  // to trust the asserted identity without a per-connect RPC. Empty when auth is not configured (the world
+  // then trusts the gate directly — dev / pre-14.3 behavior).
+  string session_assertion = 7;
 }
 
 message ClientInfo {

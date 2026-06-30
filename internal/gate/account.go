@@ -29,6 +29,9 @@ type AccountClient interface {
 	// RedeemLinkCode atomically consumes a link code, returning the account + its characters. found=false is
 	// the clean "invalid/expired/already-redeemed" case (not an error).
 	RedeemLinkCode(ctx context.Context, code, connInfo string) (accountID string, characters []CharacterInfo, found bool, err error)
+	// IssueSessionAssertion mints the signed assertion the gate carries in Attach (Phase 14.3). An empty
+	// string is returned (no error) when account has no signing key — the world then runs unverified.
+	IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (string, error)
 	// Close releases any underlying connection (a no-op for the stub).
 	Close() error
 }
@@ -54,6 +57,11 @@ func (stubAccountClient) ListCharacters(_ context.Context, accountID string) ([]
 // client is wired), but it satisfies the interface — and refuses cleanly if ever called.
 func (stubAccountClient) RedeemLinkCode(_ context.Context, _, _ string) (string, []CharacterInfo, bool, error) {
 	return "", nil, false, nil
+}
+
+// IssueSessionAssertion on the stub returns no token (the stub is the no-auth fallback).
+func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string) (string, error) {
+	return "", nil
 }
 
 func (stubAccountClient) Close() error { return nil }
@@ -106,17 +114,29 @@ func (g *grpcAccountClient) RedeemLinkCode(ctx context.Context, code, connInfo s
 	return resp.GetAccountId(), out, true, nil
 }
 
+func (g *grpcAccountClient) IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (string, error) {
+	resp, err := g.cli.IssueSessionAssertion(ctx, &accountv1.IssueSessionAssertionRequest{
+		AccountId: accountID, CharacterId: characterID, SessionId: sessionID,
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.GetAssertion(), nil
+}
+
 // Close releases the gRPC connection.
 func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 
 // --- login flow (Phase 14.2) ---------------------------------------------------------------------------
 
-// login resolves the character name to enter the world with. When a real account service is wired it runs
-// the LINK-CODE bridge (ACCOUNT.md §4); otherwise it falls back to the legacy "type a name" prompt so a bare
-// dev gate (no account service) still works. Returns ok=false when the connection drops or login aborts.
-func (s *Server) login(tc *telnet.Conn, log *slog.Logger, remote string) (string, bool) {
+// login resolves the character name + account id to enter the world with. When a real account service is
+// wired it runs the LINK-CODE bridge (ACCOUNT.md §4); otherwise it falls back to the legacy "type a name"
+// prompt so a bare dev gate (no account service) still works. The accountID is "" on the legacy path. Returns
+// ok=false when the connection drops or login aborts.
+func (s *Server) login(tc *telnet.Conn, log *slog.Logger, remote string) (name, accountID string, ok bool) {
 	if !s.accountConfigured {
-		return loginByName(tc, log)
+		name, ok = loginByName(tc, log)
+		return name, "", ok
 	}
 	return s.loginByLinkCode(tc, log, remote)
 }
@@ -144,13 +164,13 @@ func loginByName(tc *telnet.Conn, log *slog.Logger) (string, bool) {
 // loginByLinkCode prompts for a link code (accepting a bare code or "connect <code>"), redeems it against the
 // account service, and selects a character. A bad/expired code re-prompts; an account-service error re-prompts
 // with a transient message; a dropped connection returns ok=false.
-func (s *Server) loginByLinkCode(tc *telnet.Conn, log *slog.Logger, remote string) (string, bool) {
+func (s *Server) loginByLinkCode(tc *telnet.Conn, log *slog.Logger, remote string) (string, string, bool) {
 	for {
 		_ = tc.Write("Enter your link code (from the website's Play button): ")
 		line, err := tc.ReadLine()
 		if err != nil {
 			log.Debug("connection closed before login", "err", err)
-			return "", false
+			return "", "", false
 		}
 		code := strings.ToUpper(strings.TrimSpace(line))
 		code = strings.TrimSpace(strings.TrimPrefix(code, "CONNECT "))
@@ -171,10 +191,10 @@ func (s *Server) loginByLinkCode(tc *telnet.Conn, log *slog.Logger, remote strin
 		}
 		name, ok := selectCharacter(tc, chars)
 		if !ok {
-			return "", false
+			return "", "", false
 		}
 		log.Debug("login via link code", "account", accountID, "character", name)
-		return name, true
+		return name, accountID, true
 	}
 }
 

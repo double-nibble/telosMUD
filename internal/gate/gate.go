@@ -58,6 +58,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -182,7 +183,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 
 	// --- login: a link code (Phase 14.2, when an account service is wired) or the legacy name prompt. ---
 	_ = tc.Write("\r\nWelcome to TelosMUD.\r\n")
-	name, ok := s.login(tc, log, remote)
+	name, account, ok := s.login(tc, log, remote)
 	if !ok {
 		return // connection closed / aborted during login
 	}
@@ -192,6 +193,23 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 	sess := newSession(uuid.NewString())
 	log = log.With("session", sess.id, "character", name)
 	log.Debug("session minted")
+
+	// --- session assertion (Phase 14.3): account signs {account,character,session,exp}; the gate carries it
+	// in every Attach and the world verifies it offline. Empty when auth is not configured (the stub returns
+	// "" and the world skips verification — dev / pre-14.3). Issued ONCE here so a re-dial reuses the same
+	// token (stable like the session id), within its short TTL.
+	var assertion string
+	if s.accountConfigured {
+		actx, acancel := context.WithTimeout(ctx, 5*time.Second)
+		tok, err := s.account.IssueSessionAssertion(actx, account, name, sess.id)
+		acancel()
+		if err != nil {
+			log.Warn("issue session assertion failed", "err", err)
+			_ = tc.Write("\r\nThe login service is unavailable right now. Goodbye.\r\n")
+			return
+		}
+		assertion = tok
+	}
 
 	// --- open the connection's comms client (Phase 8, P8-D1-B: the gate is the SINK).
 	// This is established at CONNECTION scope — after login (the playerId is now known) and
@@ -239,13 +257,15 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 	// far it has applied on its Attached frame (ack_input_seq), which drives replay (see
 	// runStream / doReplay).
 	conn := &connState{
-		log:   log,
-		tc:    tc,
-		nc:    nc,
-		sess:  sess,
-		name:  name,
-		lines: lines,
-		gmcp:  gmcp,
+		log:       log,
+		tc:        tc,
+		nc:        nc,
+		sess:      sess,
+		name:      name,
+		account:   account,
+		assertion: assertion,
+		lines:     lines,
+		gmcp:      gmcp,
 	}
 	var token string
 	for {
@@ -265,13 +285,15 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 // (input buffer + stable id), the character name carried into each Attach, and the
 // connection-scoped line channel fed by the pump goroutine.
 type connState struct {
-	log   *slog.Logger
-	tc    *telnet.Conn
-	nc    net.Conn
-	sess  *session
-	name  string
-	lines <-chan string
-	gmcp  *gmcpState // per-connection GMCP negotiation state (Phase 9.1); never nil
+	log       *slog.Logger
+	tc        *telnet.Conn
+	nc        net.Conn
+	sess      *session
+	name      string
+	account   string // Phase 14.3: the authenticated account id (carried in Attach); "" on the legacy path
+	assertion string // Phase 14.3: the signed session assertion (carried in every Attach); "" when auth off
+	lines     <-chan string
+	gmcp      *gmcpState // per-connection GMCP negotiation state (Phase 9.1); never nil
 }
 
 // redirectTarget is what a finished bridge reports when the world asked the gate to
@@ -316,10 +338,12 @@ func (s *Server) runStream(ctx context.Context, c *connState, addr, token string
 	// Attach MUST be the first frame (docs/PROTOCOL.md §1). On a re-dial it carries the
 	// handoff token; input_seq is the next seq the gate will send (the resume point).
 	attach := &playv1.Attach{
-		SessionId:    c.sess.id,
-		CharacterId:  c.name,
-		HandoffToken: token,
-		InputSeq:     c.sess.nextSeqValue(),
+		SessionId:        c.sess.id,
+		AccountId:        c.account,
+		CharacterId:      c.name,
+		HandoffToken:     token,
+		InputSeq:         c.sess.nextSeqValue(),
+		SessionAssertion: c.assertion, // Phase 14.3: the world verifies this offline
 	}
 	if err := stream.Send(&playv1.ClientFrame{Payload: &playv1.ClientFrame_Attach{Attach: attach}}); err != nil {
 		log.Debug("attach send failed", "err", err)

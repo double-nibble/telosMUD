@@ -22,6 +22,7 @@ import (
 
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
 	"github.com/double-nibble/telosmud/internal/account"
+	"github.com/double-nibble/telosmud/internal/assertion"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/obs"
 	"github.com/double-nibble/telosmud/internal/store"
@@ -68,6 +69,20 @@ func main() {
 		slog.Info("link codes enabled (redis)", "addr", cfg.Redis.Addr)
 	} else {
 		slog.Warn("no Redis configured: link codes disabled (Mint/RedeemLinkCode unavailable)")
+	}
+
+	// Session-assertion signing (Phase 14.3): load the Ed25519 private key if configured. Without it,
+	// IssueSessionAssertion returns an empty token and the world runs unverified (dev / pre-14.3).
+	if cfg.AccountSigningKey != "" {
+		priv, err := assertion.ParsePrivateKey(cfg.AccountSigningKey)
+		if err != nil {
+			slog.Error("invalid account signing key", "err", err)
+			os.Exit(1)
+		}
+		svc.WithSigningKey(priv)
+		slog.Info("session-assertion signing enabled (ed25519)")
+	} else {
+		slog.Warn("no signing key configured: session assertions disabled (world runs unverified)")
 	}
 
 	lis, err := net.Listen("tcp", cfg.AccountListen)

@@ -6,15 +6,22 @@ package account
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
+	"github.com/double-nibble/telosmud/internal/assertion"
 	"github.com/double-nibble/telosmud/internal/store"
 )
+
+// assertionTTL is how long an issued session assertion is valid (short-lived, ACCOUNT.md §9). It only needs
+// to cover the connect handshake (gate -> world Attach), so a few minutes is generous.
+const assertionTTL = 5 * time.Minute
 
 // CharStore is the persistence surface the service needs (the subset of store.Pool it calls). An interface
 // so tests can drive the service with an in-memory fake — no Postgres required for the RPC-shape tests.
@@ -28,9 +35,11 @@ type CharStore interface {
 // the proto types. The auth backends (Redis link codes, Argon2id, SSH) attach to it in later slices.
 type Service struct {
 	accountv1.UnimplementedAccountServer
-	store CharStore
-	codes LinkCodeStore // Phase 14.2 link codes; nil => Mint/RedeemLinkCode are Unavailable
-	log   *slog.Logger
+	store   CharStore
+	codes   LinkCodeStore      // Phase 14.2 link codes; nil => Mint/RedeemLinkCode are Unavailable
+	signKey ed25519.PrivateKey // Phase 14.3 assertion signing key; nil => IssueSessionAssertion returns ""
+	now     func() time.Time   // injectable clock (assertion expiry); defaults to time.Now
+	log     *slog.Logger
 	// startZone/startRoom are the default spawn location a freshly-created character lands in (the demo
 	// pack's start room). Config-supplied; later chargen (14.8) may let content choose a starting zone.
 	startZone string
@@ -42,13 +51,43 @@ func New(cs CharStore, log *slog.Logger, startZone, startRoom string) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Service{store: cs, log: log, startZone: startZone, startRoom: startRoom}
+	return &Service{store: cs, log: log, now: time.Now, startZone: startZone, startRoom: startRoom}
 }
 
 // WithLinkCodes wires the link-code store (Phase 14.2). Without it, Mint/RedeemLinkCode return Unavailable.
 func (s *Service) WithLinkCodes(codes LinkCodeStore) *Service {
 	s.codes = codes
 	return s
+}
+
+// WithSigningKey wires the Ed25519 assertion-signing key (Phase 14.3). Without it, IssueSessionAssertion
+// returns an empty assertion (the world then runs unverified — dev / pre-14.3).
+func (s *Service) WithSigningKey(priv ed25519.PrivateKey) *Service {
+	s.signKey = priv
+	return s
+}
+
+// IssueSessionAssertion mints a short-lived signed assertion binding {account, character, session} (Phase
+// 14.3). The gate calls it after login; the world verifies it offline on Attach. With no signing key the
+// assertion is empty (auth disabled) — the response is still OK so the gate's flow is unconditional.
+func (s *Service) IssueSessionAssertion(_ context.Context, req *accountv1.IssueSessionAssertionRequest) (*accountv1.IssueSessionAssertionResponse, error) {
+	if req.GetAccountId() == "" || req.GetSessionId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "account_id and session_id required")
+	}
+	if s.signKey == nil {
+		return &accountv1.IssueSessionAssertionResponse{}, nil // assertions disabled
+	}
+	tok, err := assertion.Sign(s.signKey, assertion.Claims{
+		Account:   req.GetAccountId(),
+		Character: req.GetCharacterId(),
+		Session:   req.GetSessionId(),
+		Expires:   s.now().Add(assertionTTL).Unix(),
+	})
+	if err != nil {
+		s.log.Error("IssueSessionAssertion: sign", "account", req.GetAccountId(), "err", err)
+		return nil, status.Error(codes.Internal, "sign failed")
+	}
+	return &accountv1.IssueSessionAssertionResponse{Assertion: tok}, nil
 }
 
 // ListCharacters returns the characters owned by an account (the select menu).

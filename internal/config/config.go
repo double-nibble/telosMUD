@@ -28,6 +28,12 @@ type Config struct {
 	// Phase 14 auth service (telos-account).
 	AccountListen string `yaml:"account_listen"` // account gRPC listen, e.g. ":9100"
 	AccountTarget string `yaml:"account_target"` // the gate dials telos-account here ("" => no account service, stub login)
+	// Session-assertion keys (Phase 14.3, ACCOUNT.md §9). AccountSigningKey is account's Ed25519 PRIVATE key
+	// (base64; the 64-byte key or the 32-byte seed) used to SIGN assertions; AccountVerifyKey is the matching
+	// PUBLIC key (base64) the WORLD verifies with offline. Both empty => assertions are off (the gate trusts
+	// the account_id directly, the world skips verification — dev / pre-14.3 behavior).
+	AccountSigningKey string `yaml:"account_signing_key"`
+	AccountVerifyKey  string `yaml:"account_verify_key"`
 
 	// Phase 2 shard identity (multi-shard + handoff).
 	ShardID   string   `yaml:"shard_id"`   // this shard's id, e.g. "shard-a"
@@ -127,6 +133,12 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_ACCOUNT_TARGET"); ok {
 		c.AccountTarget = v
+	}
+	if v, ok := os.LookupEnv("TELOS_ACCOUNT_SIGNING_KEY"); ok {
+		c.AccountSigningKey = v
+	}
+	if v, ok := os.LookupEnv("TELOS_ACCOUNT_VERIFY_KEY"); ok {
+		c.AccountVerifyKey = v
 	}
 	if v, ok := os.LookupEnv("TELOS_WORLD_TARGET"); ok {
 		c.WorldTarget = v
