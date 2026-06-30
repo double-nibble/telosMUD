@@ -28,9 +28,9 @@ service Account {
 
 // Character is the account-facing summary of a character (the select menu / dashboard list).
 message Character {
-  string id = 1;        // characters.id (the PersistID)
-  string name = 2;      // the unique CITEXT name
-  string zone_ref = 3;  // last location (for "continue where you left off")
+  string id = 1; // characters.id (the PersistID)
+  string name = 2; // the unique CITEXT name
+  string zone_ref = 3; // last location (for "continue where you left off")
   string room_ref = 4;
 }
 
@@ -81,15 +81,15 @@ message RedeemLinkCodeResponse {
 }
 
 message VerifyPassphraseRequest {
-  string name = 1;       // a character name resolves to its account
+  string name = 1; // a character name resolves to its account
   string passphrase = 2;
   string conn_info = 3;
 }
 message VerifyPassphraseResponse {
   bool ok = 1;
   string account_id = 2;
-  string reason = 3;           // when !ok: "bad_credentials" | "locked"
-  uint64 retry_after_ms = 4;   // when locked
+  string reason = 3; // when !ok: "bad_credentials" | "locked"
+  uint64 retry_after_ms = 4; // when locked
 }
 
 message ResolveSSHKeyRequest {
