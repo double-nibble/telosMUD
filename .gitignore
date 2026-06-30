@@ -1,6 +1,12 @@
 # Binaries & build output
 /bin/
 /dist/
+# stray root-level cmd builds (`go build ./cmd/telos-*` with no -o lands here)
+/telos-director
+/telos-gate
+/telos-migrate
+/telos-seed
+/telos-world
 *.exe
 *.test
 *.out

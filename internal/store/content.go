@@ -45,6 +45,17 @@ type protoBody struct {
 	// Postgres) — the gap the richer demo's first Lua mobs caught, exactly like the Living gap before
 	// it. Empty for every pure-data prototype (omitempty keeps their body unchanged).
 	Lua string `json:"lua,omitempty"`
+	// Bind/Tier/Tags/Material are the item-economy fields (Phase 13.1/13.2): the binding rule
+	// (bind_on_pickup/equip), the rarity tier (the no-trade threshold), the free-form tags, and the
+	// stackable-material spec. They ride the SAME body JSONB as the other component templates. Without
+	// them a DB round-trip dropped the sword's bind/tier/tags and a material's max_stack (a bound rare
+	// became an inert tradeable through Postgres) — the gap TestStorePackRoundTrip caught, exactly like
+	// the Living/Lua gaps before. Empty/nil for every prototype that declares none (omitempty keeps
+	// their body unchanged).
+	Bind     string               `json:"bind,omitempty"`
+	Tier     string               `json:"tier,omitempty"`
+	Tags     []string             `json:"tags,omitempty"`
+	Material *content.MaterialDTO `json:"material,omitempty"`
 }
 
 // LoadPacks implements content.Source: it reads every loaded definition for the enabled packs
@@ -202,6 +213,7 @@ func (p *Pool) loadProtoDefinition(ctx context.Context, table, kind, ref, pack s
 		d.Physical, d.Wearable, d.Weapon, d.Container = b.Physical, b.Wearable, b.Weapon, b.Container
 		d.Living = b.Living
 		d.Lua = b.Lua
+		d.Bind, d.Tier, d.Tags, d.Material = b.Bind, b.Tier, b.Tags, b.Material
 	}
 	return content.Definition{Kind: kind, Ref: ref, Found: true, Proto: d}, nil
 }
@@ -330,6 +342,7 @@ func (p *Pool) loadPrototypes(ctx context.Context, enabled []string, zones map[s
 				d.Physical, d.Wearable, d.Weapon, d.Container = b.Physical, b.Wearable, b.Weapon, b.Container
 				d.Living = b.Living
 				d.Lua = b.Lua
+				d.Bind, d.Tier, d.Tags, d.Material = b.Bind, b.Tier, b.Tags, b.Material
 			}
 			z := zones[zoneRef]
 			if z == nil {
