@@ -103,6 +103,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM loot_table_defs WHERE pack=$1`,
 		// Spawn schedules (Phase 12.4): same strips-and-replaces idempotency.
 		`DELETE FROM spawn_schedule_defs WHERE pack=$1`,
+		// Recipes (Phase 13.5): same strips-and-replaces idempotency.
+		`DELETE FROM recipe_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -420,6 +422,20 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO spawn_schedule_defs (ref, pack, body) VALUES ($1,$2,$3)`, sc.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert spawn_schedule %s: %w", sc.Ref, err)
+		}
+	}
+	// Recipes (Phase 13.5): ref+pack PK, the recipe shape in the JSONB body.
+	for _, rc := range pk.Recipes {
+		body, err := json.Marshal(recipeBody{
+			Profession: rc.Profession, Skill: rc.Skill, MinSkill: rc.MinSkill, Station: rc.Station,
+			Inputs: rc.Inputs, Output: rc.Output, QualityBase: rc.QualityBase,
+		})
+		if err != nil {
+			return fmt.Errorf("store: marshal recipe %s body: %w", rc.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO recipe_defs (ref, pack, body) VALUES ($1,$2,$3)`, rc.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert recipe %s: %w", rc.Ref, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

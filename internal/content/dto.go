@@ -84,6 +84,9 @@ type Pack struct {
 	// SpawnSchedules are pack-GLOBAL scheduled spawns (Phase 12.4): long-timer boss spawns the DIRECTOR
 	// owns (a weekly world boss), distinct from per-zone resets. Pure CONTENT; same last-write-wins rule.
 	SpawnSchedules []SpawnScheduleDTO `json:"spawn_schedules" yaml:"spawn_schedules"`
+	// Recipes are pack-GLOBAL crafting recipes (Phase 13.5): a profession+skill (+ optional station room
+	// flag) gating the consume-inputs/produce-output a `craft` ability runs. Pure CONTENT; same rule.
+	Recipes []RecipeDTO `json:"recipes" yaml:"recipes"`
 
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
@@ -236,6 +239,36 @@ type SpawnScheduleDTO struct {
 	IntervalAfterDeathSec int    `json:"interval_after_death_sec" yaml:"interval_after_death_sec"`
 	OnMissed              string `json:"on_missed,omitempty" yaml:"on_missed,omitempty"`
 	Announce              string `json:"announce,omitempty" yaml:"announce,omitempty"`
+}
+
+// RecipeDTO is one content-defined crafting recipe (Phase 13.5, docs/CRAFTING.md): the data the craft op
+// (craft_recipe) runs. Profession + Skill/MinSkill gate it (the actor must have learned the trade and reached
+// the skill level); Station is an optional REQUIRED ROOM FLAG (D3 — a `forge`; "" crafts anywhere); Inputs are
+// the components consumed; Output is the produced item. QualityBase is the coarse output-quality band base —
+// the crafted item's level is QualityBase + the actor's skill level (the rich affix roll stays §10-deferred).
+type RecipeDTO struct {
+	Ref         string           `json:"ref" yaml:"ref"`
+	Profession  string           `json:"profession,omitempty" yaml:"profession,omitempty"`
+	Skill       string           `json:"skill,omitempty" yaml:"skill,omitempty"`         // the skill LEVEL attribute gating + scaling
+	MinSkill    int              `json:"min_skill,omitempty" yaml:"min_skill,omitempty"` // minimum skill level required
+	Station     string           `json:"station,omitempty" yaml:"station,omitempty"`     // required room flag (D3); "" = craft anywhere
+	Inputs      []RecipeInputDTO `json:"inputs" yaml:"inputs"`                           // components consumed
+	Output      RecipeOutputDTO  `json:"output" yaml:"output"`                           // the produced item
+	QualityBase int              `json:"quality_base,omitempty" yaml:"quality_base,omitempty"`
+}
+
+// RecipeInputDTO is one consumed component of a recipe: a prototype ref + a quantity (default 1).
+type RecipeInputDTO struct {
+	Item string `json:"item" yaml:"item"`
+	Qty  int    `json:"qty,omitempty" yaml:"qty,omitempty"`
+}
+
+// RecipeOutputDTO is a recipe's produced item: a prototype ref + a quantity (default 1) + an optional bind
+// override ("bound" => the crafted item is soulbound on creation).
+type RecipeOutputDTO struct {
+	Item string `json:"item" yaml:"item"`
+	Qty  int    `json:"qty,omitempty" yaml:"qty,omitempty"`
+	Bind string `json:"bind,omitempty" yaml:"bind,omitempty"`
 }
 
 // ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel

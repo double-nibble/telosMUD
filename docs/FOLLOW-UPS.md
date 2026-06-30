@@ -439,3 +439,10 @@ something an author would reasonably want to:
   set them — the gap shipped silently in 11.3/11.4a. Add a store-layer test that asserts EVERY DTO field
   round-trips (e.g. a reflect-walk over a fully-populated synthetic pack), so a new field can't be dropped on
   the store path just because no demo content uses it yet. · *persistence/test*
+- **Generic salvage/craft verbs (Phase 13.4/13.5).** Each salvage/craft is one verb bound to a FIXED source
+  proto / recipe ref in its on_resolve (disenchant→sword, forge→craft:leather_vest). A real client wants
+  `disenchant <item>` (object-targeted, gated on an item TAG) and `craft <recipe>` (recipe chosen by
+  argument). Needs object-target resolution into the op + a recipe-name arg lane. · *progression/parser*
+- **Recipe skill gate uses the level ATTR, not the track (Phase 13.5).** RecipeDTO.Skill names the skill
+  LEVEL attribute (e.g. leatherworking) + min_skill; it does not resolve the track's level_attr. Fine while
+  the convention holds (track level_attr == the named attr) but brittle if they diverge. · *progression*

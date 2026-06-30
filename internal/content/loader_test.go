@@ -156,6 +156,18 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if ws.Ref != "boss:warden" || ws.Zone != "darkwood" || ws.IntervalAfterDeathSec != 604800 {
 		t.Fatalf("boss:warden schedule = %+v, want darkwood weekly", ws)
 	}
+
+	// Recipes (Phase 13.5): the demo ships one leatherworking recipe crafted at the forge station.
+	if len(lc.Recipes) != 1 {
+		t.Fatalf("recipes = %d, want 1 (craft:leather_vest)", len(lc.Recipes))
+	}
+	rc := lc.Recipes[0]
+	if rc.Ref != "craft:leather_vest" || rc.Profession != "leatherworking" || rc.Station != "forge" {
+		t.Fatalf("recipe[0] = %+v, want craft:leather_vest/leatherworking/forge", rc)
+	}
+	if len(rc.Inputs) != 2 || rc.Output.Item != "midgaard:obj:leather-vest" || rc.Output.Bind != "bound" {
+		t.Fatalf("recipe inputs/output = %+v / %+v, want 2 inputs -> bound leather-vest", rc.Inputs, rc.Output)
+	}
 }
 
 // TestRegionMergeLastWriteWins proves a later pack overrides an earlier region by ref (the same

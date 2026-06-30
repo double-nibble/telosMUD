@@ -79,6 +79,9 @@ type LoadedContent struct {
 	RarityTiers    []RarityTierDTO
 	LootTables     []LootTableDTO
 	SpawnSchedules []SpawnScheduleDTO
+	// Recipes are the pack-global crafting recipes (Phase 13.5), same last-write-wins by ref. The world side
+	// registers them into the per-shard recipe registry; the craft op reads one by ref.
+	Recipes []RecipeDTO
 	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
 	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
 	// by name).
@@ -132,6 +135,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	rarityIdx := make(map[string]int)
 	lootIdx := make(map[string]int)
 	schedIdx := make(map[string]int)
+	recipeIdx := make(map[string]int)
 	for _, p := range packs {
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
@@ -258,6 +262,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				schedIdx[sc.Ref] = len(lc.SpawnSchedules)
 				lc.SpawnSchedules = append(lc.SpawnSchedules, sc)
+			}
+		}
+		for _, rc := range p.Recipes {
+			if idx, ok := recipeIdx[rc.Ref]; ok {
+				lc.Recipes[idx] = rc
+			} else {
+				recipeIdx[rc.Ref] = len(lc.Recipes)
+				lc.Recipes = append(lc.Recipes, rc)
 			}
 		}
 	}

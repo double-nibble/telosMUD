@@ -492,6 +492,18 @@ type spawnScheduleBody struct {
 	Announce              string `json:"announce,omitempty"`
 }
 
+// recipeBody is the JSONB-tail shape for a recipe_defs row (Phase 13.5): everything but the ref/pack PK —
+// the recipe's profession/skill gate, station flag, inputs, output, and quality band, all content.
+type recipeBody struct {
+	Profession  string                   `json:"profession,omitempty"`
+	Skill       string                   `json:"skill,omitempty"`
+	MinSkill    int                      `json:"min_skill,omitempty"`
+	Station     string                   `json:"station,omitempty"`
+	Inputs      []content.RecipeInputDTO `json:"inputs,omitempty"`
+	Output      content.RecipeOutputDTO  `json:"output,omitempty"`
+	QualityBase int                      `json:"quality_base,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -947,6 +959,36 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	scRows.Close()
+
+	// Recipes (Phase 13.5): ref+pack first-class, the recipe shape in the JSONB body.
+	rcRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM recipe_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query recipe_defs: %w", err)
+	}
+	for rcRows.Next() {
+		var rc content.RecipeDTO
+		var pk string
+		var body []byte
+		if err := rcRows.Scan(&rc.Ref, &pk, &body); err != nil {
+			rcRows.Close()
+			return fmt.Errorf("store: scan recipe_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b recipeBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				rcRows.Close()
+				return fmt.Errorf("store: recipe_def %s body: %w", rc.Ref, err)
+			}
+			rc.Profession, rc.Skill, rc.MinSkill, rc.Station = b.Profession, b.Skill, b.MinSkill, b.Station
+			rc.Inputs, rc.Output, rc.QualityBase = b.Inputs, b.Output, b.QualityBase
+		}
+		pack(pk).Recipes = append(pack(pk).Recipes, rc)
+	}
+	if err := rcRows.Err(); err != nil {
+		return err
+	}
+	rcRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

@@ -565,6 +565,23 @@ abilities:
     on_resolve:
       - {op: salvage_item, item: midgaard:obj:sword, table: disenchant_arms}
 
+  # forge_vest: a RECIPE-DRIVEN craft verb (Phase 13.5). Gated on requires.profession (leatherworking) at the
+  # verb level; its on_resolve runs craft_recipe(craft:leather_vest), which re-checks the recipe's own gates
+  # (profession + skill + the forge STATION room flag, D3), consumes 3 leather + 1 essence, and produces a
+  # bound leather vest. Crafting away from the forge — or without the components — is refused by the op.
+  - ref: forge_vest
+    name: Forge Vest
+    invocation: command
+    words: [forge]
+    requires:
+      profession: leatherworking
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    messages:
+      actor: "You work leather and essence over the forge into a fine vest."
+      room: "$n hammers and stitches at the forge."
+    on_resolve:
+      - {op: craft_recipe, recipe: "craft:leather_vest"}
+
   # mute: a DEBUFF/CC — applies `silence` (prevents the verbal tag) to an enemy. Harmful disposition, so
   # the PvP harm gate guards it vs a non-consenting player (the harm-gate exercise the brief asks for).
   - ref: mute
@@ -831,6 +848,23 @@ spawn_schedules:
     zone: darkwood
     interval_after_death_sec: 604800
     on_missed: spawn_if_overdue
+
+# recipes: content-defined crafting recipes (Phase 13.5). craft:leather_vest is a leatherworking recipe
+# made at the smithy FORGE station (D3 — the smithy room's `forge` flag): it consumes 3 leather scraps + 1
+# arcane essence and produces a BOUND leather vest, its quality scaling with the crafter's leatherworking
+# skill (quality_base + skill level). This closes the §9 loop with disenchant — the bound essence a player
+# salvaged from an epic feeds straight into this recipe.
+recipes:
+  - ref: craft:leather_vest
+    profession: leatherworking
+    skill: leatherworking
+    min_skill: 0
+    station: forge
+    quality_base: 5
+    inputs:
+      - {item: midgaard:obj:leather, qty: 3}
+      - {item: midgaard:obj:essence, qty: 1}
+    output: {item: midgaard:obj:leather-vest, bind: bound}
     announce: "A great roar echoes across the land — the Warden has returned!"
 
 zones:
@@ -877,6 +911,9 @@ zones:
       - ref: midgaard:room:smithy
         name: The Smithy
         coord: [-1, 1, 0]  # north of the guild hall
+        # flags: forge — the Phase-13.5 crafting STATION (D3: a station is a room flag). A recipe with
+        # station: forge can only be crafted while standing here; recipes with no station craft anywhere.
+        flags: [forge]
         long: >-
           Heat rolls off the forge in waves. Racks of weapons and armor line the soot-black
           walls, and a hand-lettered sign reads: TAKE WHAT YOU NEED, ADVENTURER.

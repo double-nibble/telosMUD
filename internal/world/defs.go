@@ -118,6 +118,7 @@ type defRegistries struct {
 	bundle  *defRegistry[*bundleDef]     // Phase 11.4b class/race/feat bundles
 	rarity  *defRegistry[*rarityTierDef] // Phase 12.1 rarity tiers
 	loot    *defRegistry[*lootTableDef]  // Phase 12.1 loot tables
+	recipe  *defRegistry[*recipeDef]     // Phase 13.5 crafting recipes
 
 	// defaultCombat is the pack's player-default combat profile ref (Phase 6.3a): the profile a player
 	// entity fights with when its own (none — players aren't prototyped) declares none. newPlayerEntity
@@ -160,6 +161,7 @@ func newDefRegistries() *defRegistries {
 		bundle:      newDefRegistry[*bundleDef](),
 		rarity:      newDefRegistry[*rarityTierDef](),
 		loot:        newDefRegistry[*lootTableDef](),
+		recipe:      newDefRegistry[*recipeDef](),
 		abilityCmds: map[string]*abilityDef{},
 		customCmds:  map[string]string{},
 		formulas:    map[string]string{},
@@ -217,6 +219,7 @@ func (z *Zone) bundleDefs() *defRegistry[*bundleDef] {
 // 12.1). Lock-free atomic.Load; a bare zone falls back to its own empty bundle (no loot).
 func (z *Zone) rarityTierDefs() *defRegistry[*rarityTierDef] { return z.defBundle().rarity }
 func (z *Zone) lootTableDefs() *defRegistry[*lootTableDef]   { return z.defBundle().loot }
+func (z *Zone) recipeDefs() *defRegistry[*recipeDef]         { return z.defBundle().recipe }
 
 // channelForVerb returns the channel a verb emits on (lower-cased), or nil. The verb→channel mapping
 // is DERIVED from the channel registry on each lookup (the table is small) rather than cached in a

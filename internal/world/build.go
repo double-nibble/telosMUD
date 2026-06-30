@@ -167,6 +167,10 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, lt := range lc.LootTables {
 		d.loot.register(lt.Ref, buildLootTableDef(lt))
 	}
+	// Recipes (Phase 13.5): crafting recipes into the per-shard registry.
+	for _, rc := range lc.Recipes {
+		d.recipe.register(rc.Ref, buildRecipeDef(rc))
+	}
 	d.defaultCombat = lc.DefaultCombat
 	// Custom Lua commands (7.4e): register each verb + its aliases into the per-shard custom-command
 	// table by EXACT word. Skips a word that collides with a BUILT-IN verb (a custom command may never

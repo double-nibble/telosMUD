@@ -107,6 +107,7 @@ type effectOp struct {
 	bind       string  // produce_item bind override ("bound" forces the produced item bound) — Phase 13.3
 	profession string  // profession ref (learn_profession — Phase 13.3 trade membership)
 	table      string  // loot/salvage table ref (salvage_item — Phase 13.4 deconstruction)
+	recipe     string  // recipe ref (craft_recipe — Phase 13.5 recipe-driven crafting)
 	amount     float64 // a flat amount (heal/damage/modify_resource delta; modify_attribute_base delta)
 	diceNum    int     // dice count (deal_damage <N>d<S>)
 	diceSize   int     // dice size
@@ -195,6 +196,8 @@ func init() {
 		"learn_profession": opLearnProfession,
 		// Phase 13.4 deconstruction: consume an item + roll a salvage table into tier-bound components.
 		"salvage_item": opSalvageItem,
+		// Phase 13.5 recipes: run a content recipe (profession/skill/station gates + consume inputs/produce output).
+		"craft_recipe": opCraftRecipe,
 	}
 }
 
