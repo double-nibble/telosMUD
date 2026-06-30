@@ -741,6 +741,18 @@ loot_tables:
               affixes:
                 - {attr: strength, min: 1, max: 5}
 
+# spawn_schedules: long-timer bosses the director spawns on a schedule (Phase 12.4), distinct from per-zone
+# resets. The Warden respawns a week after it dies; if its window passed while the director was down, it
+# spawns on the director's next startup (spawn_if_overdue). The director broadcasts the spawn DOWN to the
+# zone; a zone script reacting to on_world("spawn.boss") does the actual mud.spawn (capstone content).
+spawn_schedules:
+  - ref: boss:warden
+    proto: darkwood:mob:goblin-chief
+    zone: darkwood
+    interval_after_death_sec: 604800
+    on_missed: spawn_if_overdue
+    announce: "A great roar echoes across the land — the Warden has returned!"
+
 zones:
   - ref: midgaard
     name: The City of Midgaard

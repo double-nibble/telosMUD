@@ -76,8 +76,9 @@ type LoadedContent struct {
 	// RarityTiers + LootTables are the pack-global loot definitions (Phase 12.1), same last-write-wins
 	// override rule keyed by ref. The world side registers them into the per-shard loot registries; the
 	// resolver runs a loot table per eligible looter on death.
-	RarityTiers []RarityTierDTO
-	LootTables  []LootTableDTO
+	RarityTiers    []RarityTierDTO
+	LootTables     []LootTableDTO
+	SpawnSchedules []SpawnScheduleDTO
 	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
 	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
 	// by name).
@@ -130,6 +131,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	bundleIdx := make(map[string]int)
 	rarityIdx := make(map[string]int)
 	lootIdx := make(map[string]int)
+	schedIdx := make(map[string]int)
 	for _, p := range packs {
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
@@ -248,6 +250,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				lootIdx[lt.Ref] = len(lc.LootTables)
 				lc.LootTables = append(lc.LootTables, lt)
+			}
+		}
+		for _, sc := range p.SpawnSchedules {
+			if idx, ok := schedIdx[sc.Ref]; ok {
+				lc.SpawnSchedules[idx] = sc
+			} else {
+				schedIdx[sc.Ref] = len(lc.SpawnSchedules)
+				lc.SpawnSchedules = append(lc.SpawnSchedules, sc)
 			}
 		}
 	}

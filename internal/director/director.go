@@ -72,6 +72,13 @@ type Director struct {
 	handler  SignalHandler
 	applied  map[string]uint64
 	consumer commbus.Consumer
+
+	// Scheduled spawns (Phase 12.4). schedules are the loaded boss schedules this director owns; the tick
+	// drives them (spawn-when-due, broadcast DOWN) and the boss.died signal reschedules. now is the clock
+	// seam (time.Now in prod; a test injects a fixed/advancing clock to drive the schedule deterministically).
+	schedules    []Schedule
+	now          func() time.Time
+	scheduleInit bool // the startup on_missed pass has run this session
 }
 
 // New builds a director for a scope. regionID "" makes the WORLD director; a non-empty ref makes that
@@ -86,6 +93,7 @@ func New(regionID string, store ScopeStore, log *slog.Logger) *Director {
 		state:    map[string]json.RawMessage{},
 		versions: map[string]uint64{},
 		applied:  map[string]uint64{},
+		now:      time.Now,
 	}
 }
 
@@ -93,6 +101,15 @@ func New(regionID string, store ScopeStore, log *slog.Logger) *Director {
 func (d *Director) WithTick(t time.Duration) *Director {
 	if t > 0 {
 		d.tick = t
+	}
+	return d
+}
+
+// WithNow overrides the scheduler clock (tests inject a fixed/advancing clock to drive scheduled spawns
+// deterministically). Call before Run.
+func (d *Director) WithNow(now func() time.Time) *Director {
+	if now != nil {
+		d.now = now
 	}
 	return d
 }
@@ -154,9 +171,14 @@ func (d *Director) Run(ctx context.Context) {
 	}
 }
 
-// onTick is the heartbeat hook. A no-op until director scripts schedule against it (10.4+); kept so the
-// loop shape is final and adding the scheduler later perturbs nothing (the zone-pulse precedent).
-func (d *Director) onTick(context.Context) {}
+// onTick is the heartbeat hook: it drives the scheduled-spawn scheduler (Phase 12.4) when this director is
+// the leader (a standby must not spawn). Runs on the actor goroutine, so it reads/writes scope state
+// single-writer.
+func (d *Director) onTick(ctx context.Context) {
+	if len(d.schedules) > 0 && d.leader.Load() {
+		d.runSchedules(ctx)
+	}
+}
 
 func (d *Director) handle(ctx context.Context, m msg) {
 	switch v := m.(type) {

@@ -147,6 +147,15 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if gl.Ref != "goblin_loot" || len(gl.Rolls) != 2 {
 		t.Fatalf("goblin_loot = %+v, want ref goblin_loot with 2 rolls", gl)
 	}
+
+	// Spawn schedules (Phase 12.4): the demo ships one weekly boss schedule.
+	if len(lc.SpawnSchedules) != 1 {
+		t.Fatalf("spawn_schedules = %d, want 1 (boss:warden)", len(lc.SpawnSchedules))
+	}
+	ws := lc.SpawnSchedules[0]
+	if ws.Ref != "boss:warden" || ws.Zone != "darkwood" || ws.IntervalAfterDeathSec != 604800 {
+		t.Fatalf("boss:warden schedule = %+v, want darkwood weekly", ws)
+	}
 }
 
 // TestRegionMergeLastWriteWins proves a later pack overrides an earlier region by ref (the same

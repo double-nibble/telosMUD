@@ -81,6 +81,10 @@ type Pack struct {
 	// death. A mob prototype references one by ref (LivingDTO.LootTable). Same last-write-wins rule.
 	LootTables []LootTableDTO `json:"loot_tables" yaml:"loot_tables"`
 
+	// SpawnSchedules are pack-GLOBAL scheduled spawns (Phase 12.4): long-timer boss spawns the DIRECTOR
+	// owns (a weekly world boss), distinct from per-zone resets. Pure CONTENT; same last-write-wins rule.
+	SpawnSchedules []SpawnScheduleDTO `json:"spawn_schedules" yaml:"spawn_schedules"`
+
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
@@ -204,14 +208,29 @@ type AffixRollDTO struct {
 	Max  float64 `json:"max" yaml:"max"`
 }
 
-// ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel
-
 // LootPityDTO is a chance roll's bad-luck-protection spec (Phase 12.2): each miss nudges the effective
 // chance up by Step (to Cap); a hit resets the per-character counter keyed by Key.
 type LootPityDTO struct {
 	Key  string  `json:"key" yaml:"key"`
 	Step float64 `json:"step" yaml:"step"`
 	Cap  float64 `json:"cap" yaml:"cap"`
+}
+
+// SpawnScheduleDTO is one content-defined scheduled spawn (Phase 12.4, docs/LOOT-AND-SPAWNS.md §1): a
+// long-timer boss the DIRECTOR spawns on a schedule (a weekly world boss), restart-safe via persisted
+// scope state. Ref is the schedule id; Proto the mob prototype to spawn; Zone the hosting zone (the
+// director broadcasts the spawn command to it) and Room an optional room within it; IntervalAfterDeathSec
+// is how long after the boss DIES it respawns (a weekly boss = 604800); OnMissed is the downtime policy
+// ("spawn_if_overdue" spawns immediately if the window passed during downtime, "skip_to_next" waits for
+// the next window); Announce is the spawn announcement broadcast to the zone.
+type SpawnScheduleDTO struct {
+	Ref                   string `json:"ref" yaml:"ref"`
+	Proto                 string `json:"proto" yaml:"proto"`
+	Zone                  string `json:"zone" yaml:"zone"`
+	Room                  string `json:"room,omitempty" yaml:"room,omitempty"`
+	IntervalAfterDeathSec int    `json:"interval_after_death_sec" yaml:"interval_after_death_sec"`
+	OnMissed              string `json:"on_missed,omitempty" yaml:"on_missed,omitempty"`
+	Announce              string `json:"announce,omitempty" yaml:"announce,omitempty"`
 }
 
 // ChannelDTO is one content-defined comms channel (Phase 8.3, docs/PHASE8-PLAN.md P8-D3). A channel

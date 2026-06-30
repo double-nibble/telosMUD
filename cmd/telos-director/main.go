@@ -25,6 +25,7 @@ import (
 
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/config"
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/director"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
@@ -94,13 +95,30 @@ func main() {
 	})
 	scopeBus := scopebus.New(scopeComms).WithDurable(scopeJS, instanceID)
 
+	// Load the scheduled-spawn definitions (Phase 12.4): the director owns the long-timer boss schedules
+	// (a weekly world boss). It loads them from content (Postgres) at boot and drives them on its tick,
+	// persisting each schedule's next-spawn time in scope state (restart-safe). An empty/unreachable load
+	// yields no schedules — the director simply has no scheduled bosses.
+	var schedules []director.Schedule
+	if lc, err := content.Load(ctx, pool, []string{content.DemoPack}); err == nil {
+		for _, sc := range lc.SpawnSchedules {
+			schedules = append(schedules, director.BuildSchedule(sc))
+		}
+		if len(schedules) > 0 {
+			slog.Info("loaded spawn schedules", "count", len(schedules))
+		}
+	} else {
+		slog.Warn("could not load spawn schedules (none scheduled)", "err", err)
+	}
+
 	// Build + run the WORLD director. Region directors (one per region_defs) join here once region
 	// content lands (10.3+); for now the world scope is the deployable. The signal HANDLER (the
 	// orchestration "director script") is content-defined — not yet authored — so the director currently
 	// drains + acks signals (the write/broadcast machinery is live via the API; the built-in logic plugs
-	// in here when director-script content lands).
+	// in here when director-script content lands). WithSchedules wires the Phase-12.4 boss scheduler.
 	world := director.New("", pool, slog.Default()).
-		WithScopeBus(scopeBus, instanceID)
+		WithScopeBus(scopeBus, instanceID).
+		WithSchedules(schedules)
 	if claimer != nil {
 		world.WithElection(claimer, instanceID)
 	}

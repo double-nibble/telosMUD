@@ -101,6 +101,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		// Loot (Phase 12.1): rarity tiers + loot tables, same strips-and-replaces idempotency.
 		`DELETE FROM rarity_tier_defs WHERE pack=$1`,
 		`DELETE FROM loot_table_defs WHERE pack=$1`,
+		// Spawn schedules (Phase 12.4): same strips-and-replaces idempotency.
+		`DELETE FROM spawn_schedule_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -401,6 +403,20 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO loot_table_defs (ref, pack, body) VALUES ($1,$2,$3)`, lt.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert loot_table %s: %w", lt.Ref, err)
+		}
+	}
+	// Spawn schedules (Phase 12.4): ref+pack PK, the schedule shape in the JSONB body.
+	for _, sc := range pk.SpawnSchedules {
+		body, err := json.Marshal(spawnScheduleBody{
+			Proto: sc.Proto, Zone: sc.Zone, Room: sc.Room,
+			IntervalAfterDeathSec: sc.IntervalAfterDeathSec, OnMissed: sc.OnMissed, Announce: sc.Announce,
+		})
+		if err != nil {
+			return fmt.Errorf("store: marshal spawn_schedule %s body: %w", sc.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO spawn_schedule_defs (ref, pack, body) VALUES ($1,$2,$3)`, sc.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert spawn_schedule %s: %w", sc.Ref, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

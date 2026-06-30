@@ -467,6 +467,17 @@ type lootTableBody struct {
 	Rolls []content.LootRollDTO `json:"rolls,omitempty"`
 }
 
+// spawnScheduleBody is the JSONB-tail shape for a spawn_schedule_defs row (Phase 12.4): everything but the
+// ref/pack PK — the schedule SHAPE (proto/zone/room/interval/on_missed/announce).
+type spawnScheduleBody struct {
+	Proto                 string `json:"proto,omitempty"`
+	Zone                  string `json:"zone,omitempty"`
+	Room                  string `json:"room,omitempty"`
+	IntervalAfterDeathSec int    `json:"interval_after_death_sec,omitempty"`
+	OnMissed              string `json:"on_missed,omitempty"`
+	Announce              string `json:"announce,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -890,6 +901,36 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	ltRows.Close()
+
+	// Spawn schedules (Phase 12.4): ref+pack first-class, the schedule shape in the JSONB body.
+	scRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM spawn_schedule_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query spawn_schedule_defs: %w", err)
+	}
+	for scRows.Next() {
+		var sc content.SpawnScheduleDTO
+		var pk string
+		var body []byte
+		if err := scRows.Scan(&sc.Ref, &pk, &body); err != nil {
+			scRows.Close()
+			return fmt.Errorf("store: scan spawn_schedule_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b spawnScheduleBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				scRows.Close()
+				return fmt.Errorf("store: spawn_schedule_def %s body: %w", sc.Ref, err)
+			}
+			sc.Proto, sc.Zone, sc.Room = b.Proto, b.Zone, b.Room
+			sc.IntervalAfterDeathSec, sc.OnMissed, sc.Announce = b.IntervalAfterDeathSec, b.OnMissed, b.Announce
+		}
+		pack(pk).SpawnSchedules = append(pack(pk).SpawnSchedules, sc)
+	}
+	if err := scRows.Err(); err != nil {
+		return err
+	}
+	scRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).
