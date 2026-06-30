@@ -97,3 +97,7 @@ func TestSessionAssertionRejectedByWorld(t *testing.T) {
 func (f *signingFakeAccount) VerifyPassphrase(_ context.Context, _, _, _ string) (bool, string, string, error) {
 	return false, "", "bad_credentials", nil
 }
+
+func (f *signingFakeAccount) ResolveSSHKey(context.Context, string) (bool, string, error) {
+	return false, "", nil
+}

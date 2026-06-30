@@ -65,6 +65,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/ssh"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/commbus"
@@ -97,8 +98,22 @@ type Server struct {
 	tlsListen      string
 	tlsCert        string
 	tlsKey         string
+	// SSH transport (14.6b): listen addr + host-key path; sshSigner is the loaded host key (set in
+	// ListenAndServe). Empty sshListen => SSH off.
+	sshListen      string
+	sshHostKeyPath string
+	sshSigner      ssh.Signer
 
 	log *slog.Logger // scoped logger, tagged component=gate
+}
+
+// WithSSH configures the Phase-14.6b SSH listener: an SSH server on `listen`, authenticating clients by
+// public key. hostKeyPath is the host private key file (an ephemeral key is generated with a warning when
+// empty). Empty `listen` leaves SSH off. Returns the Server for chaining.
+func (s *Server) WithSSH(listen, hostKeyPath string) *Server {
+	s.sshListen = listen
+	s.sshHostKeyPath = hostKeyPath
+	return s
 }
 
 // WithTransports configures the Phase-14.6 listeners: plain telnet is enabled only when allowPlaintext is
@@ -190,8 +205,25 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		started++
 	}
 
+	// SSH (pubkey -> account; encrypted).
+	if s.sshListen != "" {
+		signer, err := sshHostKey(s.sshHostKeyPath, s.log)
+		if err != nil {
+			return err
+		}
+		s.sshSigner = signer
+		ln, err := net.Listen("tcp", s.sshListen)
+		if err != nil {
+			return err
+		}
+		slog.Info("gate listening (SSH)", "addr", s.sshListen)
+		wg.Add(1)
+		go func() { defer wg.Done(); s.serveSSH(ctx, ln) }()
+		started++
+	}
+
 	if started == 0 {
-		return fmt.Errorf("gate: no transport enabled — configure TLS (cert+key) or set TELOS_GATE_ALLOW_PLAINTEXT=1")
+		return fmt.Errorf("gate: no transport enabled — configure TLS (cert+key) or SSH, or set TELOS_GATE_ALLOW_PLAINTEXT=1")
 	}
 	<-ctx.Done()
 	wg.Wait()
@@ -214,7 +246,7 @@ func (s *Server) serveListener(ctx context.Context, ln net.Listener, encrypted b
 				return
 			}
 		}
-		go s.handle(ctx, conn, encrypted)
+		go s.handle(ctx, conn, encrypted, "") // plain/TLS carry no SSH pre-auth
 	}
 }
 
@@ -223,7 +255,7 @@ func (s *Server) serveListener(ctx context.Context, ln net.Listener, encrypted b
 // socket drops or the world disconnects. The deferred Close is the teardown
 // backstop: when handle returns, the socket closes, which unblocks any in-flight
 // writer goroutine's Recv.
-func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
+func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool, preAuth string) {
 	defer func() { _ = nc.Close() }()
 	remote := nc.RemoteAddr().String()
 	log := s.log.With("remote", remote)
@@ -240,7 +272,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 
 	// --- login: a link code (Phase 14.2, when an account service is wired) or the legacy name prompt. ---
 	_ = tc.Write("\r\nWelcome to TelosMUD.\r\n")
-	name, account, ok := s.login(tc, log, remote, encrypted)
+	name, account, ok := s.login(tc, log, remote, encrypted, preAuth)
 	if !ok {
 		return // connection closed / aborted during login
 	}

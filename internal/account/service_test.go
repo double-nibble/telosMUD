@@ -20,6 +20,7 @@ type fakeStore struct {
 	taken       map[string]bool
 	nameAccount map[string]string               // character name -> account id (Phase 14.5)
 	auth        map[string]store.PassphraseAuth // account id -> auth row (Phase 14.5)
+	sshKeys     map[string]string               // fingerprint -> account id (Phase 14.6)
 }
 
 func newFakeStore() *fakeStore {
@@ -28,7 +29,13 @@ func newFakeStore() *fakeStore {
 		taken:       map[string]bool{},
 		nameAccount: map[string]string{},
 		auth:        map[string]store.PassphraseAuth{},
+		sshKeys:     map[string]string{},
 	}
+}
+
+func (f *fakeStore) ResolveSSHKey(_ context.Context, fingerprint string) (string, bool, error) {
+	acct, ok := f.sshKeys[fingerprint]
+	return acct, ok, nil
 }
 
 func (f *fakeStore) CharacterAccount(_ context.Context, name string) (string, bool, error) {

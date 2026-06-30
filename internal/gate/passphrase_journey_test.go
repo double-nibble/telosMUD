@@ -58,3 +58,7 @@ func TestPassphraseLoginJourney(t *testing.T) {
 
 	term.close(t)
 }
+
+func (passphraseFakeAccount) ResolveSSHKey(context.Context, string) (bool, string, error) {
+	return false, "", nil
+}

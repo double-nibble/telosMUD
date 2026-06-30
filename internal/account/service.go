@@ -36,6 +36,8 @@ type CharStore interface {
 	SetPassphraseHash(ctx context.Context, accountID, hash string) error
 	RecordAuthFailure(ctx context.Context, accountID string, lockAfter int, lockFor time.Duration) (int, error)
 	ResetAuthFailures(ctx context.Context, accountID string) error
+	// Phase 14.6 SSH key auth.
+	ResolveSSHKey(ctx context.Context, fingerprint string) (string, bool, error)
 }
 
 // Passphrase-auth tuning (Phase 14.5): lock an account after this many consecutive failures, for this long.

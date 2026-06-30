@@ -185,3 +185,32 @@ func (p *Pool) ResetAuthFailures(ctx context.Context, accountID string) error {
 	}
 	return nil
 }
+
+// --- Phase 14.6 SSH public-key auth (ssh_keys) -----------------------------------------------------------
+
+// ResolveSSHKey maps an SSH key fingerprint (SHA256) to its owning account. found=false for an unknown key.
+func (p *Pool) ResolveSSHKey(ctx context.Context, fingerprint string) (string, bool, error) {
+	var acct string
+	err := p.pool.QueryRow(ctx, `SELECT account_id FROM ssh_keys WHERE fingerprint = $1`, fingerprint).Scan(&acct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: resolve ssh key: %w", err)
+	}
+	return acct, true, nil
+}
+
+// AddSSHKey registers an SSH public key for an account (the website key-management path). Idempotent on the
+// fingerprint PK (re-adding the same key updates its label/owner).
+func (p *Pool) AddSSHKey(ctx context.Context, accountID, fingerprint, pubkey, label string) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO ssh_keys (fingerprint, account_id, pubkey, label, added_at)
+		 VALUES ($1, $2, $3, $4, now())
+		 ON CONFLICT (fingerprint) DO UPDATE SET account_id = EXCLUDED.account_id, pubkey = EXCLUDED.pubkey, label = EXCLUDED.label`,
+		fingerprint, accountID, pubkey, nullStr(label))
+	if err != nil {
+		return fmt.Errorf("store: add ssh key: %w", err)
+	}
+	return nil
+}

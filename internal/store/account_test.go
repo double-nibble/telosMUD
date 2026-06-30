@@ -115,3 +115,29 @@ func TestAccountAuthPassphraseAndLockout(t *testing.T) {
 	assert.Equal(t, 0, a.FailedAttempts)
 	assert.True(t, a.LockedUntil.IsZero())
 }
+
+func TestSSHKeyResolve(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+	acct := uuid.NewString()
+	_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status) VALUES ($1, 'active')`, acct)
+	require.NoError(t, err)
+	fp := "SHA256:gated-test-" + time.Now().Format("150405.000000")
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM ssh_keys WHERE account_id = $1`, acct)
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, acct)
+	})
+
+	// Unknown key -> not found.
+	_, found, err := p.ResolveSSHKey(ctx, fp)
+	require.NoError(t, err)
+	assert.False(t, found)
+
+	// Add it, then it resolves to the account; re-adding (same fingerprint) is idempotent.
+	require.NoError(t, p.AddSSHKey(ctx, acct, fp, "ssh-ed25519 AAAA...", "laptop"))
+	got, found, err := p.ResolveSSHKey(ctx, fp)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, acct, got)
+	require.NoError(t, p.AddSSHKey(ctx, acct, fp, "ssh-ed25519 AAAA...", "laptop-renamed"))
+}

@@ -100,6 +100,21 @@ func (s *Service) VerifyPassphrase(ctx context.Context, req *accountv1.VerifyPas
 	return &accountv1.VerifyPassphraseResponse{Ok: true, AccountId: accountID}, nil
 }
 
+// ResolveSSHKey maps an SSH key fingerprint to its account (Phase 14.6, the gate's SSH server calls this
+// after the SSH layer has authenticated the key). found=false for an unknown key — the gate then falls back
+// to interactive login over the encrypted channel.
+func (s *Service) ResolveSSHKey(ctx context.Context, req *accountv1.ResolveSSHKeyRequest) (*accountv1.ResolveSSHKeyResponse, error) {
+	if req.GetFingerprint() == "" {
+		return nil, status.Error(codes.InvalidArgument, "fingerprint required")
+	}
+	accountID, found, err := s.store.ResolveSSHKey(ctx, req.GetFingerprint())
+	if err != nil {
+		s.log.Error("ResolveSSHKey", "err", err)
+		return nil, status.Error(codes.Internal, "resolve failed")
+	}
+	return &accountv1.ResolveSSHKeyResponse{Found: found, AccountId: accountID}, nil
+}
+
 // SetPassphrase sets an account's passphrase (Argon2id-hashed). Called from the website. An empty passphrase
 // is rejected here (clearing/disabling is a separate flow); a set resets any prior lockout (SetPassphraseHash).
 func (s *Service) SetPassphrase(ctx context.Context, req *accountv1.SetPassphraseRequest) (*accountv1.SetPassphraseResponse, error) {
