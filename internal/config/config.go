@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -28,6 +29,10 @@ type Config struct {
 	GateTLSCert        string `yaml:"gate_tls_cert"`        // PEM cert file
 	GateTLSKey         string `yaml:"gate_tls_key"`         // PEM key file
 	DevAutoAuth        bool   `yaml:"dev_auto_auth"`        // Phase 15.6: bypass OAuth with the bare name login (DEV/TEST ONLY)
+
+	// GateWriteTimeout (Phase 16.3) bounds a single outbound write to a telnet client; a wedged client that
+	// blocks a write past this is disconnected so it can't pin a writer goroutine / hold its slot. 0 disables.
+	GateWriteTimeout time.Duration `yaml:"gate_write_timeout"`
 
 	// Phase 1 service addresses.
 	GateListen  string `yaml:"gate_listen"`  // telnet listen, e.g. ":4000"
@@ -85,9 +90,10 @@ func Default() Config {
 		Redis:    RedisConfig{Addr: "localhost:6379"},
 		NATS:     NATSConfig{URL: "nats://localhost:4222"},
 
-		GateListen:  ":4000",
-		WorldListen: ":9090",
-		WorldTarget: "localhost:9090",
+		GateListen:       ":4000",
+		WorldListen:      ":9090",
+		WorldTarget:      "localhost:9090",
+		GateWriteTimeout: 30 * time.Second, // Phase 16.3: a wedged client is reclaimed after 30s of a blocked write
 
 		AccountListen: ":9100",
 		AccountTarget: "", // empty by default: the gate uses the stub login until an account service is wired
@@ -166,6 +172,11 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_DEV_AUTOAUTH"); ok {
 		c.DevAutoAuth = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v, ok := os.LookupEnv("TELOS_GATE_WRITE_TIMEOUT"); ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.GateWriteTimeout = d
+		}
 	}
 	if v, ok := os.LookupEnv("TELOS_GATE_TLS_LISTEN"); ok {
 		c.GateTLSListen = v

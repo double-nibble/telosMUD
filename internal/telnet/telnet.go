@@ -42,6 +42,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -97,7 +98,20 @@ type Conn struct {
 	// is race-free), and nil until then (a GMCP message that arrives before it is set is dropped).
 	gmcpOn atomic.Bool
 	onGmcp func(pkg string, json []byte)
+
+	// writeTimeout bounds how long a single outbound write may block on a slow/wedged client before it
+	// errors (Phase 16.3 backpressure). 0 (the default) means no deadline — writes block indefinitely, the
+	// pre-16.3 behavior. Set ONCE by the gate at connection setup, before the read/write goroutines start, so
+	// a plain field is race-free (like onGmcp). Only effective when the underlying writer is a net.Conn
+	// (exposes SetWriteDeadline); a plain io.Writer (tests) silently ignores it.
+	writeTimeout time.Duration
 }
+
+// SetWriteTimeout bounds how long a single Write may block on a slow/wedged client before returning a
+// deadline error, so a wedged socket can't pin the gate's writer goroutine indefinitely (Phase 16.3). The
+// gate closes the connection on such an error, reclaiming the slot. 0 disables the deadline. Call before the
+// read loop starts (connection setup); not safe to change concurrently with writes.
+func (c *Conn) SetWriteTimeout(d time.Duration) { c.writeTimeout = d }
 
 // New wraps a bidirectional connection (the common case: a net.Conn straight
 // from Accept). Reads are buffered; writes go to the same underlying stream.
@@ -398,6 +412,15 @@ func sanitizeOutput(s string) string {
 func (c *Conn) writeRaw(b []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Phase 16.3: bound a single write so a wedged client (TCP recv window full, never draining) can't pin
+	// this write — and thus the gate's writer goroutine — indefinitely. The deadline is per-write: set fresh,
+	// cleared after, so it never leaks onto a later write. Only a net.Conn-backed writer honors it.
+	if c.writeTimeout > 0 {
+		if d, ok := c.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = d.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+			defer func() { _ = d.SetWriteDeadline(time.Time{}) }()
+		}
+	}
 	_, err := c.w.Write(b)
 	return err
 }

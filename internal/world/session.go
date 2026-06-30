@@ -9,6 +9,15 @@ import (
 	"github.com/double-nibble/telosmud/internal/metrics"
 )
 
+// sessionOutBuffer is the depth of a session's outbound frame channel (server.go binds it). It absorbs a
+// burst of output while the client's writer goroutine drains it; once full, send drops (the zone never
+// blocks). slowClientWedgedDrops — a full buffer's worth of CONSECUTIVE drops — is the "this client has
+// drained nothing" threshold at which the zone logs the client as wedged (Phase 16.3).
+const (
+	sessionOutBuffer      = 256
+	slowClientWedgedDrops = sessionOutBuffer
+)
+
 // session is a connected character's connection/handoff state — the Phase-2 exactly-once
 // substrate (docs/PROTOCOL.md §5), lifted verbatim out of the old player struct
 // (docs/PHASE3-PLAN.md §2). It is the value the zone's players map holds, keyed by
@@ -145,6 +154,15 @@ type session struct {
 	pending bool
 	token   string
 
+	// framesDropped / consecutiveDrops track slow-client backpressure (Phase 16.3). The zone never blocks on
+	// a player's out channel (send drops when it's full); these count how often. consecutiveDrops resets on
+	// any successful enqueue, so it only climbs while the client drains NOTHING — a full buffer's worth of
+	// consecutive drops means the client is wedged. The zone does not tear the connection down itself (the
+	// golden rule: no I/O on the zone goroutine); it relies on the gate's write-deadline to reclaim a wedged
+	// socket. These are zone-owned (send runs on the zone goroutine), so they need no lock.
+	framesDropped    uint64
+	consecutiveDrops int
+
 	// pendingNotice is a one-line system message queued while the session is PENDING (the
 	// destination side of a cross-shard handoff, before the gate re-dials and s.out is bound).
 	// A pending session has no out channel yet, so a notice raised during prepare (e.g. "some
@@ -189,8 +207,24 @@ func (s *session) send(f *playv1.ServerFrame) {
 	f.AckInputSeq = s.appliedSeq
 	select {
 	case s.out <- f:
+		s.consecutiveDrops = 0 // the writer drained the buffer; the client is keeping up again
 	default:
-		slog.Debug("frame dropped: session out buffer full", "player", s.character)
-		metrics.FrameDropped(context.Background()) // Phase 16.1: slow-client drop rate
+		s.framesDropped++
+		s.consecutiveDrops++
+		slog.Debug("frame dropped: session out buffer full", "player", s.character,
+			"consecutive", s.consecutiveDrops, "total", s.framesDropped)
+		metrics.FrameDropped(context.Background()) // Phase 16.1: slow-client drop rate (shard-wide, label-free)
+		// Phase 16.3: a client that hasn't drained a SINGLE frame for a full buffer's worth of sends is
+		// FULLY wedged (dead/stalled TCP). The zone keeps running (this drop is why it never blocks); the
+		// gate's write-deadline is what actually reclaims the socket+stream. Warn ONCE at the threshold so
+		// ops get a per-player "reclaim incoming" line without one per dropped frame. NOTE: consecutiveDrops
+		// resets on ANY successful enqueue, so this catches only the fully-stalled client — a LIMPING client
+		// (drains a little, drops most) never trips it. That case is covered by the shard-wide FrameDropped
+		// metric above; a windowed per-player drop-rate warn is a deferred refinement (docs/FOLLOW-UPS.md).
+		if s.consecutiveDrops == slowClientWedgedDrops {
+			slog.Warn("slow client wedged: outbound buffer full for a full buffer of frames; "+
+				"gate write-deadline will reclaim the connection",
+				"player", s.character, "drops", s.framesDropped)
+		}
 	}
 }

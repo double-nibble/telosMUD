@@ -478,3 +478,18 @@ something an author would reasonably want to:
   echoes. Also: the mix is single-zone (midgaard) read-only movement — it never exercises
   writes (combat/items) or the cross-shard handoff (the riskiest concurrency path). Broaden
   the mix when load-testing handoff at scale. · *test/distributed*
+- **Slow-client backpressure refinements (Phase 16.3 review).** Three deferred items the 16.3 reviews
+  flagged, none blocking: (1) the per-player "wedged" Warn (`internal/world/session.go`) only catches a
+  FULLY-stalled client because `consecutiveDrops` resets on any successful enqueue — a LIMPING client
+  (drops most, drains a little) never trips it; reframe the human signal off a windowed drop-RATE (EWMA or
+  drops/(drops+sends) over a sliding window) while keeping consecutiveDrops as the "definitely dead"
+  sub-signal. The shard-wide `telos.gate.frames_dropped_total` metric already covers the limping case, so
+  this is observability polish. (2) No WORLD-side reclaim backstop: a client dialing the shard Play gRPC
+  DIRECTLY (bypassing the gate) and never reading pins the slot + writer goroutine + out buffer
+  indefinitely — reclaim depends entirely on the gate's write-deadline. Prod is protected by the Attach
+  signed-assertion check (`internal/world/server.go`), so it's in-trust-domain, but add a `stream.Recv`
+  idle deadline or a max-blocked-`Send` bound as defense-in-depth so reclaim doesn't DEPEND on gate
+  correctness. (3) Honest reclaim latency for the 16.4 capstone: a wedged telnet client is reclaimed after
+  ~30s (write deadline) + the link-death grace, not 30s — and a wedged client caught MID-DRAIN is
+  deadline-dropped by design, so "zero-drop" graceful drain (16.4) must be scoped to HEALTHY connections
+  and separately count deadline-reclaimed ones. · *world/gate/distributed*

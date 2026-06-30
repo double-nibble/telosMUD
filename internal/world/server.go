@@ -160,7 +160,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	ctx := stream.Context()
 	// out is this stream's outbound channel; the zone binds it to the character's
 	// player. The writer goroutine below is the ONLY caller of stream.Send.
-	out := make(chan *playv1.ServerFrame, 256)
+	out := make(chan *playv1.ServerFrame, sessionOutBuffer)
 	go func() {
 		for {
 			select {

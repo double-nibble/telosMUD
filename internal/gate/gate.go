@@ -102,7 +102,19 @@ type Server struct {
 	tlsCert        string
 	tlsKey         string
 
+	// writeTimeout (Phase 16.3) bounds a single outbound telnet write; a wedged client that blocks a write
+	// past this is disconnected (the writer goroutine sees the error and closes the socket), reclaiming the
+	// slot. 0 disables the deadline (the pre-16.3 unbounded behavior, which tests using a plain pipe rely on).
+	writeTimeout time.Duration
+
 	log *slog.Logger // scoped logger, tagged component=gate
+}
+
+// WithWriteTimeout sets the Phase-16.3 per-write deadline applied to every telnet connection (slow-client
+// backpressure). 0 disables it. Returns the Server for chaining at construction.
+func (s *Server) WithWriteTimeout(d time.Duration) *Server {
+	s.writeTimeout = d
+	return s
 }
 
 // WithTransports configures the Phase-14.6 listeners: plain telnet is enabled only when allowPlaintext is
@@ -244,6 +256,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 	log.Debug("connection accepted")
 
 	tc := telnet.New(nc)
+	tc.SetWriteTimeout(s.writeTimeout) // Phase 16.3: bound writes so a wedged client is reclaimed, not pinned
 
 	// --- GMCP: offer option 201 immediately and install the inbound Core.* handler, BEFORE the login
 	// prompt, so a rich client (Mudlet) that negotiates + sends Core.Hello/Supports at connect is handled.
@@ -546,7 +559,14 @@ func (b *bridge) runWriter() {
 			return
 		}
 
-		b.srv.renderFrame(b.log, b.conn, f)
+		if err := b.srv.renderFrame(b.log, b.conn, f); err != nil {
+			// A write error here is almost always the Phase-16.3 write-deadline firing on a wedged client
+			// (or a dead socket). Either way the connection is unusable: close it so the reader's ReadLine
+			// errors, the stream tears down, and the world reclaims the player's slot.
+			b.log.Debug("frame write failed; closing socket (slow/dead client)", "err", err)
+			_ = b.conn.nc.Close()
+			return
+		}
 
 		if f.GetDisconnect() != nil {
 			b.log.Debug("disconnect frame received, closing socket")
@@ -679,21 +699,20 @@ func (b *bridge) result() (redirectTarget, bool) {
 // PromptUpdate / Disconnect / Attached) and the gate decides how it lands on the
 // wire. Redirect is handled in runWriter, not here. The frame kind is logged at Debug
 // so DEBUG=1 shows what the world sent.
-func (s *Server) renderFrame(log *slog.Logger, c *connState, f *playv1.ServerFrame) {
+func (s *Server) renderFrame(log *slog.Logger, c *connState, f *playv1.ServerFrame) error {
 	tc := c.tc
 	switch pl := f.Payload.(type) {
 	case *playv1.ServerFrame_Output:
 		// Text to show; append a newline unless the frame opts out (no_newline).
 		log.Debug("frame rendered", "frame", "output", "no_newline", pl.Output.GetNoNewline())
 		if pl.Output.GetNoNewline() {
-			_ = tc.Write(pl.Output.GetMarkup())
-		} else {
-			_ = tc.Write(pl.Output.GetMarkup() + "\r\n")
+			return tc.Write(pl.Output.GetMarkup())
 		}
+		return tc.Write(pl.Output.GetMarkup() + "\r\n")
 	case *playv1.ServerFrame_Prompt:
 		// Prompts are emitted without a trailing newline (partial line).
 		log.Debug("frame rendered", "frame", "prompt")
-		_ = tc.Write(pl.Prompt.GetMarkup())
+		return tc.Write(pl.Prompt.GetMarkup())
 	case *playv1.ServerFrame_Gmcp:
 		// Structured GMCP (Phase 9): emit only if the client advertised the package (or an ancestor) via
 		// Core.Supports; the codec's WriteGMCP is itself a no-op until the client enabled GMCP. The
@@ -708,17 +727,18 @@ func (s *Server) renderFrame(log *slog.Logger, c *connState, f *playv1.ServerFra
 			log.Debug("gmcp frame dropped: invalid package name from world", "len", len(pkg))
 		case c.gmcp.supported(pkg):
 			log.Debug("frame rendered", "frame", "gmcp", "pkg", pkg)
-			_ = tc.WriteGMCP(pkg, pl.Gmcp.GetJson())
+			return tc.WriteGMCP(pkg, pl.Gmcp.GetJson())
 		default:
 			log.Debug("gmcp frame dropped: package not advertised", "pkg", pkg)
 		}
 	case *playv1.ServerFrame_Disconnect:
 		log.Debug("frame rendered", "frame", "disconnect", "reason", pl.Disconnect.GetReason())
-		_ = tc.Write("\r\n" + pl.Disconnect.GetReason() + "\r\n")
+		return tc.Write("\r\n" + pl.Disconnect.GetReason() + "\r\n")
 	case *playv1.ServerFrame_Attached:
 		// Ack only; nothing to show. The piggybacked ack_input_seq is the resume point.
 		log.Debug("frame rendered", "frame", "attached")
 	}
+	return nil
 }
 
 // validateName checks a login name is safe to render and to use as an in-world
