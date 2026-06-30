@@ -77,6 +77,13 @@ const (
 	evOnApplyAffect     eventKind = "OnApplyAffect"     // an affect attached — reserved
 	evOnAffectTick      eventKind = "OnAffectTick"      // an affect ticked — reserved
 	evOnAffectExpire    eventKind = "OnAffectExpire"    // an affect expired — reserved
+
+	// Phase 11.3 progression events. The engine FIRES these (the track machinery + skill use); content
+	// subscribes to react with flavor/unlocks. They keep `level` out of the engine — a track raises a
+	// level attribute and the machinery fires OnLevel, but the engine never reads "level" itself.
+	evOnTrackStep eventKind = "OnTrackStep" // a track reached a new step (advance_track) — mag = the new step
+	evOnLevel     eventKind = "OnLevel"     // a LEVEL track (level_attr set) reached a new step — mag = the step
+	evOnSkillUse  eventKind = "OnSkillUse"  // a skill-tagged ability was used (ability.go) — the use-based hook
 )
 
 const (
@@ -98,7 +105,8 @@ var knownEventKinds = map[eventKind]bool{
 	evOnCheck: true, evOnAbilityResolved: true, evOnHit: true, evOnDamageTaken: true,
 	evOnKill: true, evOnLeaveRoom: true, evBeforeCastCommit: true, evOnRest: true,
 	evOnApplyAffect: true, evOnAffectTick: true, evOnAffectExpire: true, evOnEnter: true,
-	evToHit: true,
+	evToHit:       true,
+	evOnTrackStep: true, evOnLevel: true, evOnSkillUse: true, // Phase 11.3 progression events
 }
 
 // customEventSep is the namespace separator that makes a custom (content-defined) event kind

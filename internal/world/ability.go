@@ -264,6 +264,12 @@ func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, rng *r
 	// Synchronous, single-writer, depth-guarded (event.go). The target rides as the event `other`.
 	// OnHit fires from the combat swing pipeline (6.3); OnApplyAffect from the affect runtime (later).
 	z.fireEvent(c, evOnAbilityResolved, actor, target, 1)
+	// Phase 11.3: a SKILL ability also fires OnSkillUse about the user, so a use-based track can advance on
+	// use ("advance-through-use" — LP/Discworld/BRP) decoupled from the skill's primary effect. The skill
+	// improvement (a chance to gain) is a content handler on OnSkillUse; the engine only fires the hook.
+	if def.skill != "" {
+		z.fireEvent(c, evOnSkillUse, actor, target, 1)
+	}
 }
 
 // resolveAbilityTarget resolves the ability's target per its mode (step 2). self/none target the actor

@@ -522,6 +522,7 @@ type abilityDef struct {
 	tags         []string           // §6 CC tags this ability carries (an affect's prevents[] blocks them)
 	notPrevented []string           // requires.not_prevented: extra tags the actor must not be prevented from
 	reqAttr      map[string]float64 // requires.attr: per-attribute minimum thresholds
+	skill        string             // Phase 11.3: marks this ability as a SKILL — using it fires OnSkillUse (the use-based hook)
 
 	costs []resourceCost
 

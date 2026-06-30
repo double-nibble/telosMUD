@@ -360,6 +360,7 @@ type AbilityDTO struct {
 	Words        []string           `json:"words" yaml:"words"`           // command verbs that invoke it (invocation=command)
 	Targeting    TargetingDTO       `json:"targeting" yaml:"targeting"`
 	Tags         []string           `json:"tags" yaml:"tags"`
+	Skill        string             `json:"skill" yaml:"skill"` // Phase 11.3: the skill/track this ability trains — using it fires OnSkillUse
 	Requires     RequiresDTO        `json:"requires" yaml:"requires"`
 	Costs        []ResourceCostDTO  `json:"costs" yaml:"costs"`
 	CastTime     int                `json:"cast_time" yaml:"cast_time"`

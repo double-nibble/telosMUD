@@ -133,10 +133,18 @@ func opAdvanceTrack(c *effectCtx, op *effectOp) error {
 	// included; for a plain xp attribute that is the base). The stored step is the high-water.
 	progress := attr(c.target, def.progressAttr)
 	step := trackStep(c.target, op.track)
+	subject := c.target
 	for step < len(def.thresholds) && progress >= def.thresholds[step] {
 		step++
 		if grants := def.steps[step-1]; len(grants) > 0 {
 			runOps(c, grants) // the step grant op-list runs on the same ctx (c.target = the advancing entity)
+		}
+		// Fire the progression events about the advancing entity (Phase 11.3), threading this cascade's
+		// budget. Content reacts with flavor/unlocks; the engine itself reads no "level". OnLevel fires
+		// only for a LEVEL track (level_attr set); every track fires OnTrackStep.
+		c.z.fireEvent(c, evOnTrackStep, subject, nil, float64(step))
+		if def.levelAttr != "" {
+			c.z.fireEvent(c, evOnLevel, subject, nil, float64(step))
 		}
 	}
 	setTrackStep(c.target, op.track, step)

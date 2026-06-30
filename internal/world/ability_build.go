@@ -40,6 +40,7 @@ func buildAbilityDef(a content.AbilityDTO) (*abilityDef, error) {
 		mode:         parseTargetMode(a.Targeting.Mode),
 		disposition:  parseDisposition(a.Targeting.Disposition),
 		tags:         append([]string(nil), a.Tags...),
+		skill:        a.Skill, // Phase 11.3: a skill-tagged ability fires OnSkillUse on resolve
 		notPrevented: append([]string(nil), a.Requires.NotPrevented...),
 		castTime:     a.CastTime,
 		lag:          a.Lag,
