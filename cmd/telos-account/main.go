@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
@@ -57,6 +58,17 @@ func main() {
 
 	// A freshly-created character starts in the demo pack's start room (Phase 14.8 may let content choose).
 	svc := account.New(pool, slog.Default(), "midgaard", "midgaard:room:temple")
+
+	// Link codes (Phase 14.2) live in Redis (cross-process + native TTL). Without Redis the service still
+	// boots, but Mint/RedeemLinkCode return Unavailable (the website's Play bridge needs a code store).
+	if cfg.Redis.Addr != "" {
+		rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
+		defer func() { _ = rdb.Close() }()
+		svc.WithLinkCodes(account.NewRedisLinkCodes(rdb))
+		slog.Info("link codes enabled (redis)", "addr", cfg.Redis.Addr)
+	} else {
+		slog.Warn("no Redis configured: link codes disabled (Mint/RedeemLinkCode unavailable)")
+	}
 
 	lis, err := net.Listen("tcp", cfg.AccountListen)
 	if err != nil {

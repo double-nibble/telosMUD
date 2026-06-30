@@ -85,7 +85,10 @@ type Server struct {
 	pool    *pool
 	comms   commbus.Bus   // RoleGate comms handle; never nil (Disabled when NATS is down)
 	account AccountClient // Phase 14 seam to telos-account; a stub when no account service is configured
-	log     *slog.Logger  // scoped logger, tagged component=gate
+	// accountConfigured is true once a REAL account client is wired (WithAccountClient). It switches the
+	// login flow from the legacy "type a name" prompt to the link-code bridge (Phase 14.2).
+	accountConfigured bool
+	log               *slog.Logger // scoped logger, tagged component=gate
 }
 
 // WithAccountClient wires a real telos-account client (Phase 14); without it the Server keeps the stub set in
@@ -93,6 +96,7 @@ type Server struct {
 func (s *Server) WithAccountClient(a AccountClient) *Server {
 	if a != nil {
 		s.account = a
+		s.accountConfigured = true
 	}
 	return s
 }
@@ -176,31 +180,13 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 	_ = tc.OfferGMCP()
 	tc.SetGMCPHandler(gmcpHandler(gmcp, tc, log))
 
-	// --- minimal login: read a name (stand-in for real auth) ---
-	// Loop until we get a name that is safe to render and safe to use as a
-	// targeting keyword; an unsafe name re-prompts rather than dropping the
-	// connection. ReadLine already strips control chars and caps length, but the
-	// keyword-grammar rules (no leading '.'/digit, no embedded '.') are gate
-	// policy and enforced here.
+	// --- login: a link code (Phase 14.2, when an account service is wired) or the legacy name prompt. ---
 	_ = tc.Write("\r\nWelcome to TelosMUD.\r\n")
-	var name string
-	for {
-		_ = tc.Write("By what name shall you be known? ")
-		line, err := tc.ReadLine()
-		if err != nil {
-			log.Debug("connection closed before login", "err", err)
-			return
-		}
-		candidate := strings.TrimSpace(line)
-		if reason, ok := validateName(candidate); !ok {
-			log.Debug("login name rejected", "reason", reason)
-			_ = tc.Write("\r\nThat name won't do: " + reason + "\r\n")
-			continue
-		}
-		name = candidate
-		break
+	name, ok := s.login(tc, log, remote)
+	if !ok {
+		return // connection closed / aborted during login
 	}
-	log.Debug("login name received", "character", name)
+	log.Debug("login complete", "character", name)
 
 	// --- mint the session ONCE: stable across every re-dial (docs/PROTOCOL.md §5).
 	sess := newSession(uuid.NewString())

@@ -29,6 +29,7 @@ type CharStore interface {
 type Service struct {
 	accountv1.UnimplementedAccountServer
 	store CharStore
+	codes LinkCodeStore // Phase 14.2 link codes; nil => Mint/RedeemLinkCode are Unavailable
 	log   *slog.Logger
 	// startZone/startRoom are the default spawn location a freshly-created character lands in (the demo
 	// pack's start room). Config-supplied; later chargen (14.8) may let content choose a starting zone.
@@ -42,6 +43,12 @@ func New(cs CharStore, log *slog.Logger, startZone, startRoom string) *Service {
 		log = slog.Default()
 	}
 	return &Service{store: cs, log: log, startZone: startZone, startRoom: startRoom}
+}
+
+// WithLinkCodes wires the link-code store (Phase 14.2). Without it, Mint/RedeemLinkCode return Unavailable.
+func (s *Service) WithLinkCodes(codes LinkCodeStore) *Service {
+	s.codes = codes
+	return s
 }
 
 // ListCharacters returns the characters owned by an account (the select menu).
@@ -97,6 +104,56 @@ func (s *Service) CreateCharacter(ctx context.Context, req *accountv1.CreateChar
 	return &accountv1.CreateCharacterResponse{Character: &accountv1.Character{
 		Id: id, Name: req.GetName(), ZoneRef: s.startZone, RoomRef: s.startRoom,
 	}}, nil
+}
+
+// MintLinkCode mints a single-use link code for an authenticated account (the website's "Play" button,
+// Phase 14.2). The code is consumed at the gate by RedeemLinkCode.
+func (s *Service) MintLinkCode(ctx context.Context, req *accountv1.MintLinkCodeRequest) (*accountv1.MintLinkCodeResponse, error) {
+	if s.codes == nil {
+		return nil, status.Error(codes.Unavailable, "link codes not configured")
+	}
+	if req.GetAccountId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "account_id required")
+	}
+	code, err := s.codes.Mint(ctx, req.GetAccountId(), req.GetCharacterId(), linkCodeTTL)
+	if err != nil {
+		s.log.Error("MintLinkCode", "account", req.GetAccountId(), "err", err)
+		return nil, status.Error(codes.Internal, "mint link code failed")
+	}
+	//nolint:gosec // linkCodeTTL is a positive constant (5 min); the ms value can't be negative
+	return &accountv1.MintLinkCodeResponse{Code: code, TtlMs: uint64(linkCodeTTL.Milliseconds())}, nil
+}
+
+// RedeemLinkCode atomically consumes a link code at the gate and returns the account + its characters. The
+// session assertion (signed proof the world verifies offline) is filled in by Phase 14.3; for now it is
+// empty (the gate trusts the account_id directly over the in-cluster link this slice). A bad/expired/already-
+// redeemed code is NotFound — the gate shows "invalid or expired code" without leaking which.
+func (s *Service) RedeemLinkCode(ctx context.Context, req *accountv1.RedeemLinkCodeRequest) (*accountv1.RedeemLinkCodeResponse, error) {
+	if s.codes == nil {
+		return nil, status.Error(codes.Unavailable, "link codes not configured")
+	}
+	if req.GetCode() == "" {
+		return nil, status.Error(codes.InvalidArgument, "code required")
+	}
+	accountID, _, found, err := s.codes.Redeem(ctx, req.GetCode())
+	if err != nil {
+		s.log.Error("RedeemLinkCode", "err", err)
+		return nil, status.Error(codes.Internal, "redeem failed")
+	}
+	if !found {
+		return nil, status.Error(codes.NotFound, "invalid or expired code")
+	}
+	chars, err := s.store.AccountCharacters(ctx, accountID)
+	if err != nil {
+		s.log.Error("RedeemLinkCode: list characters", "account", accountID, "err", err)
+		return nil, status.Error(codes.Internal, "load characters failed")
+	}
+	s.log.Info("link code redeemed", "account", accountID, "conn", req.GetConnInfo(), "characters", len(chars))
+	return &accountv1.RedeemLinkCodeResponse{
+		AccountId:  accountID,
+		Characters: toProtoChars(chars),
+		// SessionAssertion left empty until Phase 14.3 (signed assertions).
+	}, nil
 }
 
 // toProtoChars maps store summaries onto the proto Character list.
