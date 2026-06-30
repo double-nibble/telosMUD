@@ -215,12 +215,14 @@ services:
       TELOS_ENV: dev
       TELOS_GATE_LISTEN: ":4000"
       TELOS_GATE_ALLOW_PLAINTEXT: "1" # dev: the smoke/e2e telnet tests use the plain :4000 listener (prod defaults to TLS-only)
+      TELOS_ACCOUNT_TARGET: account:9100 # account-backed (Phase 15): OAuth-only in prod
+      TELOS_DEV_AUTOAUTH: "1" # DEV/TEST ONLY: bypass the browser OAuth with the bare name login so smoke/e2e stay headless
       TELOS_WORLD_TARGET: world:9090 # fallback if the directory is unreachable
       TELOS_REDIS_ADDR: redis:6379 # directory: resolve the home shard on login
       TELOS_ZONES: midgaard # players spawn in midgaard
       DEBUG: true
     ports:
-      - "4000:4000" # telnet: connect with `telnet localhost 4000`
+      - "4000:4000" # telnet: connect with `telnet localhost 4000` (dev-autoauth: just type a name)
     depends_on:
       world:
         condition: service_started

@@ -27,6 +27,7 @@ type Config struct {
 	GateTLSListen      string `yaml:"gate_tls_listen"`      // TLS telnet listen, e.g. ":4443" (needs cert+key)
 	GateTLSCert        string `yaml:"gate_tls_cert"`        // PEM cert file
 	GateTLSKey         string `yaml:"gate_tls_key"`         // PEM key file
+	DevAutoAuth        bool   `yaml:"dev_auto_auth"`        // Phase 15.6: bypass OAuth with the bare name login (DEV/TEST ONLY)
 
 	// Phase 1 service addresses.
 	GateListen  string `yaml:"gate_listen"`  // telnet listen, e.g. ":4000"
@@ -162,6 +163,9 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_GATE_ALLOW_PLAINTEXT"); ok {
 		c.GateAllowPlaintext = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v, ok := os.LookupEnv("TELOS_DEV_AUTOAUTH"); ok {
+		c.DevAutoAuth = v == "1" || strings.EqualFold(v, "true")
 	}
 	if v, ok := os.LookupEnv("TELOS_GATE_TLS_LISTEN"); ok {
 		c.GateTLSListen = v

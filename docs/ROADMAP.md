@@ -220,7 +220,7 @@ station.
 
 **Done when:** create an account on the web, get a link code, `connect` over TLS/SSH.
 
-### Phase 15 — Terminal-native OAuth (login rework)
+### Phase 15 — Terminal-native OAuth (login rework) ✅
 ([PHASE15-PLAN.md](PHASE15-PLAN.md)) Reworks Phase 14's front-end: the website + passphrase + SSH logins
 are replaced by a single **terminal-native OAuth device flow** — no passwords, auth externalized.
 - `connect` → a one-click link → the browser does OAuth (brokered, PKCE) → the telnet session is authed.

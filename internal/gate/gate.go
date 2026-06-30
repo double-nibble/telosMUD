@@ -89,8 +89,11 @@ type Server struct {
 	comms   commbus.Bus   // RoleGate comms handle; never nil (Disabled when NATS is down)
 	account AccountClient // Phase 14 seam to telos-account; a stub when no account service is configured
 	// accountConfigured is true once a REAL account client is wired (WithAccountClient). It switches the
-	// login flow from the legacy "type a name" prompt to the link-code bridge (Phase 14.2).
+	// login flow from the bare "type a name" prompt to the OAuth device flow (Phase 15).
 	accountConfigured bool
+	// devAutoAuth (Phase 15.6, TELOS_DEV_AUTOAUTH) bypasses the browser OAuth flow with the bare name login —
+	// for HEADLESS smoke/e2e + local dev against an account-backed gate. INSECURE: never enable in prod.
+	devAutoAuth bool
 
 	// Phase 14.6 transport posture: TLS is the encrypted default; plain telnet is OFF unless allowPlaintext.
 	allowPlaintext bool
@@ -109,6 +112,14 @@ func (s *Server) WithTransports(allowPlaintext bool, tlsListen, tlsCert, tlsKey 
 	s.tlsListen = tlsListen
 	s.tlsCert = tlsCert
 	s.tlsKey = tlsKey
+	return s
+}
+
+// WithDevAutoAuth enables the Phase-15.6 dev/test bypass: an account-backed gate accepts the bare name login
+// instead of the browser OAuth flow, so headless smoke/e2e (and local dev) work without a browser. INSECURE —
+// gate it behind TELOS_DEV_AUTOAUTH and never enable in production. Returns the Server for chaining.
+func (s *Server) WithDevAutoAuth(on bool) *Server {
+	s.devAutoAuth = on
 	return s
 }
 
@@ -256,7 +267,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 	// "" and the world skips verification — dev / pre-14.3). Issued ONCE here so a re-dial reuses the same
 	// token (stable like the session id), within its short TTL.
 	var assertion string
-	if s.accountConfigured {
+	if s.accountConfigured && account != "" { // account=="" is the stub / dev-autoauth path: no assertion
 		actx, acancel := context.WithTimeout(ctx, 5*time.Second)
 		tok, err := s.account.IssueSessionAssertion(actx, account, name, sess.id)
 		acancel()
