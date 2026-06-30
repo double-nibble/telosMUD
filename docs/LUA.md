@@ -5,7 +5,7 @@ composes the engine's [effect-op vocabulary](ABILITIES.md) through a **curated, 
 API** — never raw Go internals. Lua runs *inside* the owning zone's goroutine, so scripts see
 a consistent, single-threaded world.
 
-Runtime: `gopher-lua` (a minimal in-tree fork — `third_party/gopher-lua`, see its `FORK.md`).
+Runtime: `gopher-lua` (a minimal fork — [github.com/double-nibble/gopher-lua](https://github.com/double-nibble/gopher-lua), pulled in via a go.mod `replace`; the fork keeps the `github.com/yuin/gopher-lua` module path).
 Status: design baseline; **[PHASE7-PLAN.md](PHASE7-PLAN.md) is the implementation source of
 truth** (it orders this into slices, resolves the three open forks §10 flagged, and supersedes
 §5's mechanism claims — see the §5 note below).
@@ -133,7 +133,7 @@ allowlisting makes an unsafe capability *absent*, not *hidden*):
   the clock can stop).
 - **CPU quota — three layers** (P7-D6): **(1)** a **vendored gopher-lua fork** adds a
   deterministic per-call **instruction-count abort** in `mainLoopWithContext`
-  (`third_party/gopher-lua`, see its `FORK.md`) — v1.1.1 has no `SetHook`/`MaskCount`/
+  (the [double-nibble/gopher-lua](https://github.com/double-nibble/gopher-lua) fork) — v1.1.1 has no `SetHook`/`MaskCount`/
   debug-hook, so the count cannot come from a hook; **(2)** the `LState` **context deadline**
   (`SetContext` + `context.WithTimeout`) bounds wall-clock between ops; **(3)** the capped
   amplifier builtins above catch the single-op bomb the other two miss. All three abort *that

@@ -13,12 +13,9 @@ FROM golang:1.25-alpine AS build
 WORKDIR /src
 ENV GOWORK=off CGO_ENABLED=0
 COPY go.mod go.sum ./
-# The root go.mod `replace`s github.com/yuin/gopher-lua with the in-tree vendored fork
-# (./third_party/gopher-lua), so `go mod download` must see the fork's go.mod — copy it
-# (the whole tree; it's small + changes rarely, so the dep layer still caches well) BEFORE
-# the download. Without this the build fails: "reading third_party/gopher-lua/go.mod: no
-# such file or directory" (the fork was vendored in slice 7.1).
-COPY third_party ./third_party
+# The root go.mod `replace`s github.com/yuin/gopher-lua with our remote fork
+# (github.com/double-nibble/gopher-lua), so `go mod download` fetches it from the module proxy
+# like any other dependency — no in-tree vendoring to COPY anymore.
 RUN go mod download
 COPY . .
 COPY --from=proto /work/api/gen ./api/gen

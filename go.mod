@@ -17,11 +17,11 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-// TELOSMUD FORK (docs/PHASE7-PLAN.md P7-D6, third_party/gopher-lua/FORK.md): the Lua
-// runtime is a minimal in-tree fork of gopher-lua v1.1.1 adding a per-call VM
-// instruction-count abort (mainLoopWithContext) — upstream has no SetHook/MaskCount.
-// The module path is unchanged so imports stay `github.com/yuin/gopher-lua`.
-replace github.com/yuin/gopher-lua => ./third_party/gopher-lua
+// TELOSMUD FORK (docs/PHASE7-PLAN.md P7-D6): the Lua runtime is our fork of gopher-lua v1.1.1 —
+// github.com/double-nibble/gopher-lua — adding a per-call VM instruction-count abort
+// (mainLoopWithContext); upstream has no SetHook/MaskCount. The fork KEEPS the module path
+// `github.com/yuin/gopher-lua`, so imports are unchanged and this is a pure source swap via replace.
+replace github.com/yuin/gopher-lua => github.com/double-nibble/gopher-lua v0.0.0-20260630140553-87185f489027
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

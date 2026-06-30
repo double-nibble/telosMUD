@@ -38,7 +38,7 @@ logs: ## Tail dev dependency logs
 # shaped milestone (it also exercises the Docker smoke/e2e surface that `go test` cannot).
 verify: ## Run the hermetic CI matrix locally (gofmt + buf + vet + build + race tests + lint) — the pre-commit gate
 	@echo ">> gofmt (CI-strict: no file may be unformatted)"
-	@test -z "$$(gofmt -l . 2>/dev/null | grep -v '^third_party/')" || { echo "gofmt needed:"; gofmt -l . | grep -v '^third_party/'; exit 1; }
+	@test -z "$$(gofmt -l . 2>/dev/null)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
 	@command -v buf >/dev/null 2>&1 && { echo ">> buf lint + format (the CI proto job)"; buf lint && buf format --exit-code; } || echo ">> buf not installed — skipping proto checks (CI still runs them)"
 	@echo ">> go vet" && $(GO) vet ./...
 	@echo ">> go build" && $(GO) build ./...
