@@ -585,6 +585,21 @@ type ProtoDTO struct {
 	Weapon    *WeaponDTO    `json:"weapon" yaml:"weapon"`
 	Container *ContainerDTO `json:"container" yaml:"container"`
 
+	// Bind is the item's binding rule (Phase 13.1, docs/CRAFTING.md §1): "bind_on_pickup" (binds when
+	// looted — BoP), "bind_on_equip" (binds when worn — BoE), or "" / "unbound" (freely tradeable). A
+	// bound item cannot be given/dropped-for-others/traded, but can still be equipped, destroyed, and
+	// deconstructed by its owner. Binding is a TRADE restriction the engine enforces uniformly.
+	Bind string `json:"bind,omitempty" yaml:"bind,omitempty"`
+	// Tier is the item's rarity tier ref (a rarity_tier_def, Phase 12.1), used for the tier-dependent
+	// component-binding threshold (D1) + recipe/salvage gating. "" => untiered (common).
+	Tier string `json:"tier,omitempty" yaml:"tier,omitempty"`
+	// Tags are open-set item tags (Phase 13.1): "material", "magical", a profession tag — content rules
+	// (recipe inputs, salvage requirements) match on them. The engine names no tag.
+	Tags []string `json:"tags,omitempty" yaml:"tags,omitempty"`
+	// Material, when present, makes this item a STACKABLE material (Phase 13.2): identical stacks merge on
+	// pickup, bounded by MaxStack. nil => a normal (non-stacking) item.
+	Material *MaterialDTO `json:"material,omitempty" yaml:"material,omitempty"`
+
 	// Living, when present, makes this prototype a LIVING entity (a mob): it carries the per-entity
 	// attribute BASE overrides (the mob's str/con/accuracy/evasion/...) and the combat profile ref the
 	// swing pipeline uses (Phase 6.3a). A nil Living means an inert item (no stats, no combat) — every
@@ -611,6 +626,14 @@ type LivingDTO struct {
 	// the mob drops only its carried inventory (the pre-12 behavior). The resolver runs the table per
 	// eligible looter on death (loot.go).
 	LootTable string `json:"loot_table" yaml:"loot_table"`
+}
+
+// MaterialDTO marks a stackable crafting material (Phase 13.2, docs/CRAFTING.md §5): MaxStack is the
+// largest stack size (identical material instances merge up to it); Type is a free-form material category
+// ("leather", "essence") content groups by. A material with MaxStack < 1 defaults to a large cap.
+type MaterialDTO struct {
+	MaxStack int    `json:"max_stack,omitempty" yaml:"max_stack,omitempty"`
+	Type     string `json:"type,omitempty" yaml:"type,omitempty"`
 }
 
 // PhysicalDTO mirrors the world.Physical component template (mass/size/material).

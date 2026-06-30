@@ -177,6 +177,11 @@ func cmdDrop(c *Context) error {
 		c.Send("You aren't carrying that.")
 		return nil
 	}
+	// Binding gate (Phase 13.1): a bound item cannot be dropped (the ground is shared — dropping is a
+	// transfer-to-others). Equip/destroy/deconstruct stay allowed; only transfer is gated.
+	if transferBlocked(c, target) {
+		return nil
+	}
 	// Clear any worn slot the item occupies before it leaves inventory (so the slot map
 	// never points at an item that is no longer carried).
 	if wr, ok := Get[*Wearer](c.Actor); ok {
@@ -223,6 +228,11 @@ func cmdPut(c *Context) error {
 	for _, m := range items {
 		if m == box {
 			c.Send("You can't put something inside itself.")
+			continue
+		}
+		// Binding gate (Phase 13.1): a bound item cannot be stowed in a container others could open (a
+		// transfer path). Skipped per-item so the rest of a multi-item put still proceeds.
+		if transferBlocked(c, m) {
 			continue
 		}
 		if !cc.hasRoom(len(box.contents)) {
@@ -273,6 +283,7 @@ func cmdWear(c *Context) error {
 			continue
 		}
 		wr.worn[loc] = target
+		bindOnEquip(target) // Phase 13.1: a bind_on_equip item binds when worn
 		c.z.act("You wear $p on your $t.", c.Actor, target, nil, wearLocName[loc], "", ToActor)
 		c.z.act("$n wears $p.", c.Actor, target, nil, "", "", ToRoom)
 		c.z.log.Debug("cmd wear", "player", c.s.character, "item", target.proto, "slot", wearLocName[loc])
@@ -306,6 +317,7 @@ func cmdWield(c *Context) error {
 		return nil
 	}
 	wr.worn[WearLocWield] = target
+	bindOnEquip(target) // Phase 13.1: a bind_on_equip weapon binds when wielded
 	c.z.act("You wield $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n wields $p.", c.Actor, target, nil, "", "", ToRoom)
 	c.z.log.Debug("cmd wield", "player", c.s.character, "item", target.proto)

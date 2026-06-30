@@ -1,7 +1,6 @@
 package world
 
 import (
-	"encoding/json"
 	"math/rand"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -301,6 +300,7 @@ func (z *Zone) deliverLoot(looter *Entity, entry lootEntry, rng *rand.Rand) {
 	if entry.quality != nil {
 		rollItemQuality(item, entry.quality, rng)
 	}
+	bindOnPickup(item) // Phase 13.1: a bind_on_pickup item binds to its looter on personal-loot delivery
 	Move(item, looter)
 	if s, ok := sessionOf(looter); ok {
 		s.send(textFrame("You receive " + itemName(item) + "."))
@@ -344,40 +344,11 @@ type Quality struct {
 
 func (*Quality) componentKind() Kind { return KindQuality }
 
-// itemQualityJSON is the on-disk shape of a Quality component (the item's instance delta).
+// itemQualityJSON is the on-disk shape of a Quality component (part of the item instance delta —
+// binding.go's itemDeltaJSON wraps it alongside the bound state + stack count).
 type itemQualityJSON struct {
 	Level   int                `json:"level,omitempty"`
 	Affixes map[string]float64 `json:"affixes,omitempty"`
-}
-
-// dumpItemQuality marshals an item's Quality component to its ItemJSON.Delta bytes (an OWNED copy — never
-// aliasing live state, per the ItemJSON.Delta invariant). nil when the item has no rolled quality.
-func dumpItemQuality(item *Entity) json.RawMessage {
-	q, ok := Get[*Quality](item)
-	if !ok {
-		return nil
-	}
-	b, err := json.Marshal(itemQualityJSON{Level: q.Level, Affixes: q.Affixes})
-	if err != nil {
-		return nil
-	}
-	return b
-}
-
-// loadItemQuality re-attaches a Quality component from an ItemJSON.Delta (the persistence round-trip). A
-// nil/empty/malformed delta is a clean no-op (the item is a plain prototype instance).
-func loadItemQuality(item *Entity, delta json.RawMessage) {
-	if len(delta) == 0 {
-		return
-	}
-	var q itemQualityJSON
-	if err := json.Unmarshal(delta, &q); err != nil {
-		return
-	}
-	if q.Level == 0 && len(q.Affixes) == 0 {
-		return
-	}
-	Add(item, &Quality{Level: q.Level, Affixes: q.Affixes})
 }
 
 // itemName renders an item entity's short name for a loot message (its short, else its proto ref).

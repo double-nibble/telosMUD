@@ -74,6 +74,13 @@ func protoComponents(p content.ProtoDTO) componentSet {
 	if p.Lua != "" {
 		comps[reflect.TypeFor[*Scripted]()] = &Scripted{source: p.Lua} // 7.4c mob/item triggers
 	}
+	// Item crafting/economy metadata (Phase 13.1): bind rule + rarity tier + tags. Attached only when the
+	// prototype sets any of them, so a plain item carries no ItemMeta (the bare-engine default).
+	if p.Bind != "" || p.Tier != "" || len(p.Tags) > 0 {
+		comps[reflect.TypeFor[*ItemMeta]()] = &ItemMeta{
+			bindRule: p.Bind, tier: p.Tier, tags: append([]string(nil), p.Tags...),
+		}
+	}
 	return comps
 }
 

@@ -36,6 +36,7 @@ func TestDemoPackPrototypeParity(t *testing.T) {
 	wearT := reflect.TypeFor[*Wearable]()
 	wpnT := reflect.TypeFor[*Weapon]()
 	contT := reflect.TypeFor[*Container]()
+	metaT := reflect.TypeFor[*ItemMeta]() // Phase 13.1: the sword now carries bind/tier/tag metadata
 
 	want := map[ProtoRef]wantProto{
 		"midgaard:room:temple": {
@@ -82,7 +83,7 @@ func TestDemoPackPrototypeParity(t *testing.T) {
 			keywords: []string{"sword", "steel", "long"},
 			short:    "a steel longsword",
 			long:     "A steel longsword lies here.",
-			comps:    []reflect.Type{physT, wearT, wpnT},
+			comps:    []reflect.Type{physT, wearT, wpnT, metaT},
 		},
 		"midgaard:obj:chest": {
 			keywords: []string{"chest", "oak", "wooden"},

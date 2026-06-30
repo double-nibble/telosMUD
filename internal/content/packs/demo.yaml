@@ -821,6 +821,10 @@ zones:
         physical: {weight: 5, material: steel}
         wearable: {locations: [wield]}
         weapon: {dice_num: 2, dice_size: 6, damage_type: slash, class: sword, attack_verb: slash}
+        # Phase 13.1: the rare loot sword binds to its looter (BoP) + is tagged magical for disenchant (13.4).
+        bind: bind_on_pickup
+        tier: rare
+        tags: [magical]
       - ref: midgaard:obj:chest
         keywords: [chest, oak, wooden]
         short: a wooden chest
