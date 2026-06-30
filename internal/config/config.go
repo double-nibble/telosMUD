@@ -20,6 +20,13 @@ type Config struct {
 	Redis    RedisConfig    `yaml:"redis"`
 	NATS     NATSConfig     `yaml:"nats"`
 
+	// Phase 14.6 transport posture: TLS + SSH are the encrypted defaults; PLAIN telnet is OFF unless
+	// explicitly enabled (credentials/play would otherwise cross the wire in cleartext).
+	GateAllowPlaintext bool   `yaml:"gate_allow_plaintext"` // enable the unencrypted telnet listener (default false)
+	GateTLSListen      string `yaml:"gate_tls_listen"`      // TLS telnet listen, e.g. ":4443" (needs cert+key)
+	GateTLSCert        string `yaml:"gate_tls_cert"`        // PEM cert file
+	GateTLSKey         string `yaml:"gate_tls_key"`         // PEM key file
+
 	// Phase 1 service addresses.
 	GateListen  string `yaml:"gate_listen"`  // telnet listen, e.g. ":4000"
 	WorldListen string `yaml:"world_listen"` // gRPC Play listen, e.g. ":9090"
@@ -139,6 +146,18 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_ACCOUNT_VERIFY_KEY"); ok {
 		c.AccountVerifyKey = v
+	}
+	if v, ok := os.LookupEnv("TELOS_GATE_ALLOW_PLAINTEXT"); ok {
+		c.GateAllowPlaintext = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v, ok := os.LookupEnv("TELOS_GATE_TLS_LISTEN"); ok {
+		c.GateTLSListen = v
+	}
+	if v, ok := os.LookupEnv("TELOS_GATE_TLS_CERT"); ok {
+		c.GateTLSCert = v
+	}
+	if v, ok := os.LookupEnv("TELOS_GATE_TLS_KEY"); ok {
+		c.GateTLSKey = v
 	}
 	if v, ok := os.LookupEnv("TELOS_WORLD_TARGET"); ok {
 		c.WorldTarget = v

@@ -177,6 +177,7 @@ services:
       TELOS_SERVICE: telos-gate
       TELOS_ENV: dev
       TELOS_GATE_LISTEN: ":4000"
+      TELOS_GATE_ALLOW_PLAINTEXT: "1" # dev: the smoke/e2e telnet tests use the plain :4000 listener (prod defaults to TLS-only)
       TELOS_WORLD_TARGET: world:9090 # fallback if the directory is unreachable
       TELOS_REDIS_ADDR: redis:6379 # directory: resolve the home shard on login
       TELOS_ZONES: midgaard # players spawn in midgaard

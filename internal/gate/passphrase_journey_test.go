@@ -53,7 +53,7 @@ func TestPassphraseLoginJourney(t *testing.T) {
 
 	// The correct passphrase logs in as that character and spawns into the world.
 	term.send(t, "connect Mage secret")
-	term.expect(t, "passphrase is visible on an unencrypted connection") // the cleartext warning
+	term.expect(t, "visible on this UNENCRYPTED connection") // the cleartext warning (harness conn is unencrypted)
 	term.expect(t, "The Temple Square")
 
 	term.close(t)

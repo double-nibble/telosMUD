@@ -54,6 +54,8 @@ package gate
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -89,7 +91,25 @@ type Server struct {
 	// accountConfigured is true once a REAL account client is wired (WithAccountClient). It switches the
 	// login flow from the legacy "type a name" prompt to the link-code bridge (Phase 14.2).
 	accountConfigured bool
-	log               *slog.Logger // scoped logger, tagged component=gate
+
+	// Phase 14.6 transport posture: TLS is the encrypted default; plain telnet is OFF unless allowPlaintext.
+	allowPlaintext bool
+	tlsListen      string
+	tlsCert        string
+	tlsKey         string
+
+	log *slog.Logger // scoped logger, tagged component=gate
+}
+
+// WithTransports configures the Phase-14.6 listeners: plain telnet is enabled only when allowPlaintext is
+// true (default off); TLS telnet is enabled when tlsListen + a cert/key are given. Returns the Server for
+// chaining at construction.
+func (s *Server) WithTransports(allowPlaintext bool, tlsListen, tlsCert, tlsKey string) *Server {
+	s.allowPlaintext = allowPlaintext
+	s.tlsListen = tlsListen
+	s.tlsCert = tlsCert
+	s.tlsKey = tlsKey
+	return s
 }
 
 // WithAccountClient wires a real telos-account client (Phase 14); without it the Server keeps the stub set in
@@ -133,31 +153,68 @@ func newServer(listen string, dir directory.Directory, p *pool, comms commbus.Bu
 	}
 }
 
-// ListenAndServe accepts connections until ctx is cancelled. Each accepted
-// connection is handed to its own goroutine (handle); cancelling ctx closes the
-// listener, which makes Accept fail and returns cleanly.
+// ListenAndServe starts the configured transport listeners and serves until ctx is cancelled (Phase 14.6).
+// PLAIN telnet runs only when explicitly enabled (allowPlaintext); TLS telnet runs when a listen addr +
+// cert/key are configured. At least one transport must be enabled. The SSH transport (14.6b) joins here.
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.listen)
-	if err != nil {
-		return err
-	}
-	slog.Info("gate listening", "addr", s.listen)
-	// Closing the listener on ctx cancellation unblocks Accept below.
-	go func() { <-ctx.Done(); _ = ln.Close() }()
+	var wg sync.WaitGroup
+	started := 0
 
+	// Plain telnet — OFF by default; credentials cross the wire in cleartext when enabled.
+	if s.allowPlaintext {
+		ln, err := net.Listen("tcp", s.listen)
+		if err != nil {
+			return err
+		}
+		slog.Warn("PLAIN telnet enabled — credentials cross the wire UNENCRYPTED", "addr", s.listen)
+		wg.Add(1)
+		go func() { defer wg.Done(); s.serveListener(ctx, ln, false) }()
+		started++
+	} else {
+		slog.Info("plain telnet disabled (set TELOS_GATE_ALLOW_PLAINTEXT=1 to enable)", "addr", s.listen)
+	}
+
+	// TLS telnet (the recommended default encrypted transport).
+	if s.tlsListen != "" && s.tlsCert != "" && s.tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(s.tlsCert, s.tlsKey)
+		if err != nil {
+			return fmt.Errorf("gate: load TLS cert/key: %w", err)
+		}
+		ln, err := tls.Listen("tcp", s.tlsListen, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+		if err != nil {
+			return err
+		}
+		slog.Info("gate listening (TLS)", "addr", s.tlsListen)
+		wg.Add(1)
+		go func() { defer wg.Done(); s.serveListener(ctx, ln, true) }()
+		started++
+	}
+
+	if started == 0 {
+		return fmt.Errorf("gate: no transport enabled — configure TLS (cert+key) or set TELOS_GATE_ALLOW_PLAINTEXT=1")
+	}
+	<-ctx.Done()
+	wg.Wait()
+	return nil
+}
+
+// serveListener runs one transport's accept loop, handing each connection to its own goroutine. `encrypted`
+// records whether the transport is encrypted (TLS/SSH) so the login flow can skip the cleartext-credential
+// warning. Closing the listener on ctx cancellation unblocks Accept.
+func (s *Server) serveListener(ctx context.Context, ln net.Listener, encrypted bool) {
+	go func() { <-ctx.Done(); _ = ln.Close() }()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Distinguish a clean shutdown (ctx cancelled -> listener closed) from
-			// a real accept error.
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			default:
-				return err
+				s.log.Warn("accept error", "err", err)
+				return
 			}
 		}
-		go s.handle(ctx, conn)
+		go s.handle(ctx, conn, encrypted)
 	}
 }
 
@@ -166,7 +223,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // socket drops or the world disconnects. The deferred Close is the teardown
 // backstop: when handle returns, the socket closes, which unblocks any in-flight
 // writer goroutine's Recv.
-func (s *Server) handle(ctx context.Context, nc net.Conn) {
+func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 	defer func() { _ = nc.Close() }()
 	remote := nc.RemoteAddr().String()
 	log := s.log.With("remote", remote)
@@ -183,7 +240,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn) {
 
 	// --- login: a link code (Phase 14.2, when an account service is wired) or the legacy name prompt. ---
 	_ = tc.Write("\r\nWelcome to TelosMUD.\r\n")
-	name, account, ok := s.login(tc, log, remote)
+	name, account, ok := s.login(tc, log, remote, encrypted)
 	if !ok {
 		return // connection closed / aborted during login
 	}

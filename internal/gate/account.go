@@ -149,12 +149,12 @@ func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 // wired it runs the LINK-CODE bridge (ACCOUNT.md §4); otherwise it falls back to the legacy "type a name"
 // prompt so a bare dev gate (no account service) still works. The accountID is "" on the legacy path. Returns
 // ok=false when the connection drops or login aborts.
-func (s *Server) login(tc *telnet.Conn, log *slog.Logger, remote string) (name, accountID string, ok bool) {
+func (s *Server) login(tc *telnet.Conn, log *slog.Logger, remote string, encrypted bool) (name, accountID string, ok bool) {
 	if !s.accountConfigured {
 		name, ok = loginByName(tc, log)
 		return name, "", ok
 	}
-	return s.loginAuthenticated(tc, log, remote)
+	return s.loginAuthenticated(tc, log, remote, encrypted)
 }
 
 // loginByName is the pre-Phase-14 stand-in: read a name that is safe to render + safe as a targeting
@@ -180,7 +180,7 @@ func loginByName(tc *telnet.Conn, log *slog.Logger) (string, bool) {
 // loginAuthenticated prompts for a LINK CODE (bare or "connect <code>") or a PASSPHRASE login
 // ("connect <name> <passphrase>"), and dispatches to the right backend. A failed attempt re-prompts; a
 // dropped connection returns ok=false.
-func (s *Server) loginAuthenticated(tc *telnet.Conn, log *slog.Logger, remote string) (string, string, bool) {
+func (s *Server) loginAuthenticated(tc *telnet.Conn, log *slog.Logger, remote string, encrypted bool) (string, string, bool) {
 	for {
 		_ = tc.Write("Enter your link code, or 'connect <name> <passphrase>': ")
 		line, err := tc.ReadLine()
@@ -194,7 +194,7 @@ func (s *Server) loginAuthenticated(tc *telnet.Conn, log *slog.Logger, remote st
 		}
 		// Passphrase login: connect <name> <passphrase>.
 		if strings.EqualFold(fields[0], "connect") && len(fields) == 3 {
-			if name, account, ok := s.loginByPassphrase(tc, log, remote, fields[1], fields[2]); ok {
+			if name, account, ok := s.loginByPassphrase(tc, log, remote, fields[1], fields[2], encrypted); ok {
 				return name, account, true
 			}
 			continue
@@ -235,7 +235,7 @@ func (s *Server) loginByCode(tc *telnet.Conn, log *slog.Logger, remote, code str
 // loginByPassphrase authenticates `connect <name> <passphrase>`: the named character must exist + the
 // passphrase verify. On success the player plays that character. A cleartext warning is shown (the passphrase
 // just crossed a possibly-unencrypted wire); the transport-aware version lands with TLS/SSH (Phase 14.6).
-func (s *Server) loginByPassphrase(tc *telnet.Conn, log *slog.Logger, remote, name, pass string) (string, string, bool) {
+func (s *Server) loginByPassphrase(tc *telnet.Conn, log *slog.Logger, remote, name, pass string, encrypted bool) (string, string, bool) {
 	if reason, ok := validateName(name); !ok {
 		_ = tc.Write("\r\nThat name won't do: " + reason + "\r\n")
 		return "", "", false
@@ -256,8 +256,10 @@ func (s *Server) loginByPassphrase(tc *telnet.Conn, log *slog.Logger, remote, na
 		}
 		return "", "", false
 	}
-	_ = tc.Write("\r\n(Note: a passphrase is visible on an unencrypted connection — prefer a link code, TLS, or SSH.)\r\n")
-	log.Debug("login via passphrase", "account", account, "character", name)
+	if !encrypted {
+		_ = tc.Write("\r\n(Note: a passphrase is visible on this UNENCRYPTED connection — prefer a link code, TLS, or SSH.)\r\n")
+	}
+	log.Debug("login via passphrase", "account", account, "character", name, "encrypted", encrypted)
 	return name, account, true
 }
 

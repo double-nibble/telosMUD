@@ -232,7 +232,7 @@ func (h *harness) dial(t *testing.T) *terminal {
 	t.Cleanup(cancel)
 	done := make(chan struct{})
 	go func() {
-		h.srv.handle(hctx, server)
+		h.srv.handle(hctx, server, false)
 		close(done)
 	}()
 
