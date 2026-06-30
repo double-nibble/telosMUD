@@ -139,15 +139,17 @@ Phase 6 (the event bus) + Phase 7 (Lua) are the prerequisites for the progressio
 
 **Done when:** two players on different shards chat and see each other in `who`.
 
-### Phase 9 — GMCP
+### Phase 9 — GMCP ✅
 Rich-client data. ([GMCP.md](GMCP.md)) (`Room.Info` can be pulled forward to Phase 3.)
 - Negotiation (option 201), `Core.Supports` filtering, MCCP2, NAWS.
 - `Char.Vitals/Stats/Status`, `Room.Info`, `Char.Items.*`, `Comm.Channel.Text`, `Mud.*`.
 
 **Done when:** Mudlet shows a live vitals gauge and a minimap that updates as you walk.
 
-### Phase 10 — Orchestration (directors, scopes, event bus)
+### Phase 10 — Orchestration (directors, scopes, event bus) ✅
 Supra-zone state and cross-zone consequences. ([WORLD-EVENTS.md](WORLD-EVENTS.md))
+> Done. Dynamic-placement core landed (claim-from-pool + the coordinator's decision engine); the live
+> rebalance-drain executor + runtime zone-add are documented follow-ups (FOLLOW-UPS.md §6).
 - `telos-director` tier with leader election; region/world state (single-writer).
 - **Cross-zone** scoped event bus: `transient` (NATS core) + `durable` (JetStream, idempotent,
   ordered) — extends the Phase 6 *in-zone, synchronous* bus to region/world scopes across shards.
@@ -162,7 +164,9 @@ shards, and survives a director restart.
 
 ## Track D — Progression & economy
 
-### Phase 11 — Character progression & chargen
+### Phase 11 — Character progression & chargen ✅
+> Done (11.1–11.5 + capstone). The grant/track/bundle machinery + all four advancement modes landed; the
+> interactive **chargen front end is deferred to Phase 14** (account/login), which the bundles feed.
 The largest content area the gap analysis surfaced ([G6]); needs the event bus (Phase 6) + Lua
 (Phase 7), which is why it lands here — though it depends on *nothing* in Track C and may be pulled
 forward. ([GAME-SYSTEMS-GAP-ANALYSIS.md](GAME-SYSTEMS-GAP-ANALYSIS.md) §5)
