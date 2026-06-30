@@ -5,7 +5,10 @@ shall you be known?", `account_id` nullable since Phase 1) with real accounts, O
 and a content-driven chargen website. Design: [ACCOUNT.md](ACCOUNT.md). Owned by a new `telos-account`
 service; consumed by `telos-gate`; the world trusts it via signed assertions, never a hot-path RPC.
 
-Status: **DRAFT for review (2026-06-30).** Slice breakdown + settled forks below; lock after sign-off.
+Status: **LOCKED (2026-06-30).** Building 14.1 → 14.8 + capstone. All four sub-forks (D-A server-rendered Go
+templates + htmx · D-B Ed25519 assertions · D-C GitHub OAuth first · D-D OWASP Argon2id) confirmed. OAuth
+provider credentials are configured by the user at 14.7 (a GitHub OAuth app — client id/secret + redirect
+URI); 14.1–14.6 build + CI-verify against stubs with no external setup.
 
 ---
 
