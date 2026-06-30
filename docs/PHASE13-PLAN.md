@@ -5,7 +5,10 @@ into components and **craft/augment** new ones, the modern-MMO material loop. De
 [CRAFTING.md](CRAFTING.md). It answers "does personal loot (Phase 12) kill the economy?" — *no, because
 bound gear re-enters the economy as components.*
 
-Status: **plan LOCKED (scope confirmed 2026-06-29).** Building 13.1 → 13.5 + capstone.
+Status: **COMPLETE (2026-06-30).** All slices landed + CI-green: 13.1 binding/transfer gate · 13.2 stackable
+materials · 13.3 crafting ops + professions · 13.4 deconstruction (salvage/disenchant) · 13.5 crafting &
+recipes · capstone (disenchant a bound epic → mats → craft at a station, survives restart). Deferred items
+in docs/FOLLOW-UPS.md (generic salvage/craft verbs; profession-cap content-config; augment affix depth).
 
 **Settled forks (confirmed):** (1) FULL scope (13.1–13.5 + capstone), `augment_item` kept to a flat-stat-
 bump stub (the rich affix/socket catalog stays §10-deferred). (2) Professions reuse the Phase-11.2 track
