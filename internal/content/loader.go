@@ -82,6 +82,9 @@ type LoadedContent struct {
 	// Recipes are the pack-global crafting recipes (Phase 13.5), same last-write-wins by ref. The world side
 	// registers them into the per-shard recipe registry; the craft op reads one by ref.
 	Recipes []RecipeDTO
+	// Chargens are the pack-global character-generation flows (Phase 14.8), same last-write-wins by ref.
+	// telos-account reads them (not the world) to render + validate the signup form.
+	Chargens []ChargenDTO
 	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
 	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
 	// by name).
@@ -136,6 +139,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	lootIdx := make(map[string]int)
 	schedIdx := make(map[string]int)
 	recipeIdx := make(map[string]int)
+	chargenIdx := make(map[string]int)
 	for _, p := range packs {
 		if p.DefaultCombat != "" {
 			lc.DefaultCombat = p.DefaultCombat // last non-empty pack wins
@@ -270,6 +274,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				recipeIdx[rc.Ref] = len(lc.Recipes)
 				lc.Recipes = append(lc.Recipes, rc)
+			}
+		}
+		for _, cg := range p.Chargens {
+			if idx, ok := chargenIdx[cg.Ref]; ok {
+				lc.Chargens[idx] = cg
+			} else {
+				chargenIdx[cg.Ref] = len(lc.Chargens)
+				lc.Chargens = append(lc.Chargens, cg)
 			}
 		}
 	}

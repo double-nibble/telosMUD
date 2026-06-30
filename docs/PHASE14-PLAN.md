@@ -115,14 +115,33 @@ session cookie. Account dashboard + character management; the **Play** button mi
   redeems end-to-end over telnet — held back here so stub-login smoke/e2e stays green.
 
 ### 14.8 — Content-driven chargen front-end
-Chargen is content, not hardcoded (PRINCIPLES.md): the website reads `race_defs`/`class_defs`/`attribute_defs`
-(the Phase-11 bundles) to present choices + starting allocations; creating a character reserves the unique
-`name` (CITEXT) and writes the initial `state` (applying the chosen bundles' grants). Adding a race is a
-content write — the signup page updates with no code change.
-- The chargen flow (web): choose race+class → allocate per the point-buy/standard-array the content defines →
-  name → reserve + create. Reuses the Phase-11 `apply_bundle` grant path server-side.
-- **Done when:** create a character on the web from the demo class+race, its bundle grants applied; a
-  newly-content-added race appears in the form with no code change.
+Chargen is content, not hardcoded (PRINCIPLES.md), and — per the user (2026-06-30) — **not boxed into one
+system**: content drives *how* generation works (roll-and-assign, point-buy, standard array, 1-stat-then-
+spend-XP, …). The abstraction is a **content `chargen` flow = ordered STEPS**, each a `kind`:
+- `bundle_choice` — pick N bundles of a `bundle_kind` (race, class, background) → resolves to the chosen refs.
+- `point_buy` — allocate a `points` budget across `attributes` under a per-target `cost` curve + min/max →
+  resolves to the chosen attribute values. (Implemented now.)
+- (future kinds — `array_assign`, `roll` — are a content write + a small step-kind handler, not a rewrite.)
+
+Storage/flow:
+- **`chargen_defs`** — the 8th def-table (ref+pack+JSONB body, the full def-table precedent: DTO + loader +
+  store read/write/strip/migration + gated round-trip + world/registry). One flow per pack by convention.
+- **Apply on FIRST SPAWN (Model A).** Chargen's OUTPUT (chosen bundle refs + chosen attribute values) is
+  recorded into the new character's INITIAL STATE as a pending-chargen marker. `CreateAccountCharacter`
+  already takes the `state []byte`. The **world**, on first spawn of a brand-new character, reads the marker,
+  SETS the point-buy attribute bases, then runs the existing `apply_bundle` grant path for each chosen bundle
+  (single-writer, authoritative), clears the marker, and persists (restart-safe). No grant interpreter in
+  telos-account.
+- **telos-account** only READS content rows (the pack's `chargen` flow + `bundle_defs`, from Postgres) to
+  render the form + VALIDATE the submission server-side (bundle kinds match, point-buy within budget/bounds),
+  then writes the marker. Adding a race is a content write — the form updates with no code change.
+
+Sub-slices: **14.8a** content schema (`chargen_defs`) + loader + store + migration + world first-spawn
+application + account-side validation/create; **14.8b** the web chargen flow (read flow → render steps →
+POST validate + create).
+- **Done when:** create a character on the web from the demo class+race + a point-buy allocation; on first
+  connect the bundle grants + bought attributes are applied (and survive a restart); a newly-content-added
+  race appears in the form with no code change.
 
 ### 14.x — Capstone (the done-when)
 The full front door, end to end: **create an account on the web (GitHub OAuth), build a character from

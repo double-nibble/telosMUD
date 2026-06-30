@@ -782,6 +782,19 @@ bundles:
     grants:
       - {op: modify_attribute_base, attr: intellect, amount: 2}
       - {op: set_flag, flag: darkvision}
+  # dwarf + mage give the chargen picker (Phase 14.8) a real choice — a second race + class — so the form
+  # demonstrates content-driven selection (adding one is a content write, no code change).
+  - ref: dwarf
+    kind: race
+    grants:
+      - {op: modify_attribute_base, attr: constitution, amount: 2}
+      - {op: set_flag, flag: stout}
+  - ref: mage
+    kind: class
+    grants:
+      - {op: modify_attribute_base, attr: intellect, amount: 3}
+      - {op: set_flag, flag: arcane}
+      - {op: grant_track, track: hero_advancement}
   # leatherworking: a PROFESSION bundle (Phase 13.3, fork #2 — a profession is just a bundle, not a new def
   # table). Learning it grants the craft verb (grant_ability), the use-based skill track (grant_track), and
   # enrolls the entity in the trade (learn_profession — the membership the requires.profession gate + the D2
@@ -792,6 +805,27 @@ bundles:
       - {op: grant_ability, ability: craft_gloves}
       - {op: grant_track, track: leatherworking_skill}
       - {op: learn_profession, profession: leatherworking}
+
+# chargen: the content-defined character-generation flow (Phase 14.8). An ordered list of STEPS the website
+# walks — content drives HOW generation works, the engine knows only the step KINDS. This demo flow is 5e-style:
+# pick a race, pick a class, then a 27-point point-buy over the three stats. A roll-stats or standard-array MUD
+# would ship a different step list with NO code change. telos-account reads this to render + validate the form;
+# the WORLD applies the result (chosen bundles + bought stats) on the character's first spawn.
+chargens:
+  - ref: demo:chargen
+    steps:
+      - {kind: bundle_choice, id: race,  prompt: "Choose your race",  bundle_kind: race,  pick: 1}
+      - {kind: bundle_choice, id: class, prompt: "Choose your class", bundle_kind: class, pick: 1}
+      - kind: point_buy
+        id: attributes
+        prompt: "Allocate your attributes (27 points)"
+        attributes: [strength, intellect, constitution]
+        points: 27
+        base: 8
+        min: 8
+        max: 15
+        # cost: cumulative points to raise a stat to the target value from base (the 5e point-buy curve).
+        cost: {"8": 0, "9": 1, "10": 2, "11": 3, "12": 4, "13": 5, "14": 7, "15": 9}
 
 # rarity_tiers: the ordered rarity ladder the loot resolver weights + filters by (Phase 12.1). order is
 # the ordinal a roll's quality_floor compares; weight is the tier's default pool weight; color renders it.

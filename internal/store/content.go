@@ -504,6 +504,12 @@ type recipeBody struct {
 	QualityBase int                      `json:"quality_base,omitempty"`
 }
 
+// chargenBody is the JSONB-tail shape for a chargen_defs row (Phase 14.8): the ordered step list, everything
+// but the ref/pack PK. The steps are pure content the website renders + validates.
+type chargenBody struct {
+	Steps []content.ChargenStepDTO `json:"steps,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -989,6 +995,35 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	rcRows.Close()
+
+	// Chargens (Phase 14.8): ref+pack first-class, the step list in the JSONB body.
+	cgRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM chargen_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query chargen_defs: %w", err)
+	}
+	for cgRows.Next() {
+		var cg content.ChargenDTO
+		var pk string
+		var body []byte
+		if err := cgRows.Scan(&cg.Ref, &pk, &body); err != nil {
+			cgRows.Close()
+			return fmt.Errorf("store: scan chargen_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b chargenBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				cgRows.Close()
+				return fmt.Errorf("store: chargen_def %s body: %w", cg.Ref, err)
+			}
+			cg.Steps = b.Steps
+		}
+		pack(pk).Chargens = append(pack(pk).Chargens, cg)
+	}
+	if err := cgRows.Err(); err != nil {
+		return err
+	}
+	cgRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

@@ -105,6 +105,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM spawn_schedule_defs WHERE pack=$1`,
 		// Recipes (Phase 13.5): same strips-and-replaces idempotency.
 		`DELETE FROM recipe_defs WHERE pack=$1`,
+		// Chargens (Phase 14.8): same strips-and-replaces idempotency.
+		`DELETE FROM chargen_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -436,6 +438,17 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO recipe_defs (ref, pack, body) VALUES ($1,$2,$3)`, rc.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert recipe %s: %w", rc.Ref, err)
+		}
+	}
+	// Chargens (Phase 14.8): ref+pack PK, the step list in the JSONB body.
+	for _, cg := range pk.Chargens {
+		body, err := json.Marshal(chargenBody{Steps: cg.Steps})
+		if err != nil {
+			return fmt.Errorf("store: marshal chargen %s body: %w", cg.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO chargen_defs (ref, pack, body) VALUES ($1,$2,$3)`, cg.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert chargen %s: %w", cg.Ref, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

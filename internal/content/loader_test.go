@@ -120,10 +120,11 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 		t.Fatalf("hero_advancement steps = %d, want 3 (one grant op-list per threshold)", len(tr.Steps))
 	}
 
-	// Bundles (Phase 11.4b): the demo defines a "fighter" class + an "elf" race, each a kind + a grant
-	// op-list. Pack globals, loaded onto lc.Bundles.
-	if len(lc.Bundles) != 3 {
-		t.Fatalf("bundles = %d, want 3 (fighter + elf + leatherworking)", len(lc.Bundles))
+	// Bundles (Phase 11.4b): classes fighter+mage, races elf+dwarf, and the leatherworking profession —
+	// each a kind + a grant op-list. Pack globals, loaded onto lc.Bundles. (mage+dwarf were added in 14.8
+	// to give the chargen picker a real choice.)
+	if len(lc.Bundles) != 5 {
+		t.Fatalf("bundles = %d, want 5 (fighter + mage + elf + dwarf + leatherworking)", len(lc.Bundles))
 	}
 	var fighter *BundleDTO
 	for i := range lc.Bundles {
@@ -133,6 +134,21 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	}
 	if fighter == nil || fighter.Kind != "class" || fighter.Grants == nil {
 		t.Fatalf("fighter bundle = %+v, want kind=class with grants", fighter)
+	}
+
+	// Chargen (Phase 14.8): the demo ships one flow (race pick → class pick → 27-pt point-buy).
+	if len(lc.Chargens) != 1 {
+		t.Fatalf("chargens = %d, want 1 (demo:chargen)", len(lc.Chargens))
+	}
+	cg := lc.Chargens[0]
+	if cg.Ref != "demo:chargen" || len(cg.Steps) != 3 {
+		t.Fatalf("demo chargen = %+v, want ref demo:chargen with 3 steps", cg)
+	}
+	if cg.Steps[0].Kind != "bundle_choice" || cg.Steps[0].BundleKind != "race" {
+		t.Fatalf("chargen step 0 = %+v, want bundle_choice/race", cg.Steps[0])
+	}
+	if pb := cg.Steps[2]; pb.Kind != "point_buy" || pb.Points != 27 || len(pb.Attributes) != 3 {
+		t.Fatalf("chargen step 2 = %+v, want point_buy 27pts over 3 attrs", pb)
 	}
 
 	// Loot (Phase 12.1): the demo ships 3 rarity tiers + a goblin_loot table (a guaranteed + a chance

@@ -233,6 +233,7 @@ func TestStorePackRoundTrip(t *testing.T) {
 		{"loot_tables", fromDB.LootTables, fromYAML.LootTables},
 		{"spawn_schedules", fromDB.SpawnSchedules, fromYAML.SpawnSchedules},
 		{"recipes", fromDB.Recipes, fromYAML.Recipes},
+		{"chargens", fromDB.Chargens, fromYAML.Chargens},
 	}
 	for _, tc := range defCases {
 		t.Run(tc.name, func(t *testing.T) {

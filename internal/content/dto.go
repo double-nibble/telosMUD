@@ -88,6 +88,12 @@ type Pack struct {
 	// flag) gating the consume-inputs/produce-output a `craft` ability runs. Pure CONTENT; same rule.
 	Recipes []RecipeDTO `json:"recipes" yaml:"recipes"`
 
+	// Chargens are pack-GLOBAL character-generation flows (Phase 14.8): an ordered list of chargen STEPS the
+	// website walks (pick a race/class bundle, allocate attributes by point-buy, …). Pure CONTENT — content
+	// drives HOW generation works, the engine knows only the step KINDS. One flow per pack by convention;
+	// same last-write-wins override-by-ref rule.
+	Chargens []ChargenDTO `json:"chargens" yaml:"chargens"`
+
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
@@ -145,6 +151,43 @@ type BundleDTO struct {
 	Ref    string `json:"ref" yaml:"ref"`
 	Kind   string `json:"kind" yaml:"kind"`
 	Grants any    `json:"grants,omitempty" yaml:"grants,omitempty"` // a grant op-list (same shape as on_resolve)
+}
+
+// ChargenDTO is one content-defined character-generation flow (Phase 14.8, docs/ACCOUNT.md §14.8). It is pure
+// DATA: Ref is the stable flow id (one flow per pack by convention, e.g. "demo:chargen"); Steps is the ordered
+// list the website walks. Content drives HOW generation works — the website knows the step KINDS, never a
+// ruleset — so the same engine renders 5e point-buy, a standard-array game, or a roll-and-assign MUD from data.
+type ChargenDTO struct {
+	Ref   string           `json:"ref" yaml:"ref"`
+	Steps []ChargenStepDTO `json:"steps" yaml:"steps"`
+}
+
+// ChargenStepDTO is one chargen step — a tagged union over Kind. Common fields (Kind/ID/Prompt) plus the
+// fields the kind reads:
+//
+//   - kind "bundle_choice": pick exactly Pick (default 1) bundles whose BundleKind matches (race/class/…).
+//     The website lists the pack's bundles of that kind; the result is the chosen bundle ref(s).
+//   - kind "point_buy": allocate Points across Attributes; each attribute starts at Base, costs Cost[target]
+//     (cumulative points to reach the target value from Base) and is bounded to [Min, Max]. The result is the
+//     chosen value per attribute, applied as the attribute BASE on first spawn (racial bundle mods add on top).
+//
+// Future kinds (array_assign, roll) add fields here + a handler; existing flows are untouched.
+type ChargenStepDTO struct {
+	Kind   string `json:"kind" yaml:"kind"`
+	ID     string `json:"id" yaml:"id"`
+	Prompt string `json:"prompt,omitempty" yaml:"prompt,omitempty"`
+
+	// bundle_choice
+	BundleKind string `json:"bundle_kind,omitempty" yaml:"bundle_kind,omitempty"`
+	Pick       int    `json:"pick,omitempty" yaml:"pick,omitempty"`
+
+	// point_buy
+	Attributes []string       `json:"attributes,omitempty" yaml:"attributes,omitempty"`
+	Points     int            `json:"points,omitempty" yaml:"points,omitempty"`
+	Base       int            `json:"base,omitempty" yaml:"base,omitempty"`
+	Min        int            `json:"min,omitempty" yaml:"min,omitempty"`
+	Max        int            `json:"max,omitempty" yaml:"max,omitempty"`
+	Cost       map[string]int `json:"cost,omitempty" yaml:"cost,omitempty"` // target value (as string) -> cumulative cost from Base
 }
 
 // RarityTierDTO is one content-defined rarity tier (Phase 12.1, docs/LOOT-AND-SPAWNS.md §2): an ordered,
