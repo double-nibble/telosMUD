@@ -116,6 +116,44 @@ func TestAccountAuthPassphraseAndLockout(t *testing.T) {
 	assert.True(t, a.LockedUntil.IsZero())
 }
 
+func TestOAuthIdentityRoundTrip(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	provider := "github"
+	uid := "uid-" + time.Now().Format("150405.000000")
+	t.Cleanup(func() {
+		// Identity rows cascade from the account; find the account first, then drop it.
+		acct, found, _ := p.FindIdentity(context.Background(), provider, uid)
+		if found {
+			_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_identities WHERE account_id = $1`, acct)
+			_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, acct)
+		}
+	})
+
+	// An unknown identity is a miss (the website then creates an account).
+	_, found, err := p.FindIdentity(ctx, provider, uid)
+	require.NoError(t, err)
+	require.False(t, found)
+
+	// First-time sign-in: create the account + identity. email is informational, login is the display name.
+	acct, err := p.CreateAccountWithIdentity(ctx, provider, uid, "octo@example.com", "octocat")
+	require.NoError(t, err)
+	require.NotEmpty(t, acct)
+
+	// The same identity now resolves to that account (a returning sign-in — no new account).
+	got, found, err := p.FindIdentity(ctx, provider, uid)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, acct, got)
+
+	// The display name persisted.
+	name, found, err := p.AccountDisplayName(ctx, acct)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "octocat", name)
+}
+
 func TestSSHKeyResolve(t *testing.T) {
 	p := testPool(t)
 	ctx := context.Background()

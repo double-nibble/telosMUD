@@ -10,8 +10,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,6 +29,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/obs"
 	"github.com/double-nibble/telosmud/internal/store"
+	"github.com/double-nibble/telosmud/internal/web"
 )
 
 func main() {
@@ -62,10 +66,12 @@ func main() {
 
 	// Link codes (Phase 14.2) live in Redis (cross-process + native TTL). Without Redis the service still
 	// boots, but Mint/RedeemLinkCode return Unavailable (the website's Play bridge needs a code store).
+	var codes account.LinkCodeStore
 	if cfg.Redis.Addr != "" {
 		rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 		defer func() { _ = rdb.Close() }()
-		svc.WithLinkCodes(account.NewRedisLinkCodes(rdb))
+		codes = account.NewRedisLinkCodes(rdb)
+		svc.WithLinkCodes(codes)
 		slog.Info("link codes enabled (redis)", "addr", cfg.Redis.Addr)
 	} else {
 		slog.Warn("no Redis configured: link codes disabled (Mint/RedeemLinkCode unavailable)")
@@ -93,9 +99,29 @@ func main() {
 	gs := grpc.NewServer()
 	accountv1.RegisterAccountServer(gs, svc)
 
+	// Website + OAuth (Phase 14.7): served on cfg.WebListen when configured. It needs the link-code store
+	// (the Play button) and GitHub OAuth credentials (from the gitignored auth.local.env). Without a listen
+	// addr the website is off (the gRPC API still serves).
+	var webSrv *http.Server
+	if cfg.WebListen != "" && codes != nil {
+		web := newWebsite(cfg, pool, codes)
+		webSrv = &http.Server{Addr: cfg.WebListen, Handler: web.Handler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			slog.Info("website listening", "addr", cfg.WebListen, "oauth", cfg.GithubClientID != "")
+			if err := webSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("website serve failed", "err", err)
+			}
+		}()
+	}
+
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down")
+		if webSrv != nil {
+			sctx, c := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = webSrv.Shutdown(sctx)
+			c()
+		}
 		gs.GracefulStop()
 	}()
 
@@ -106,4 +132,36 @@ func main() {
 	if err := shutdown(context.Background()); err != nil {
 		slog.Error("shutdown error", "err", err)
 	}
+}
+
+// newWebsite builds the Phase-14.7 website over the store + the link-code minter. The OAuth redirect defaults
+// to the dev callback; the session key is loaded from config or generated ephemeral (a restart then drops
+// existing web sessions — fine for dev, set TELOS_WEB_SESSION_KEY in prod).
+func newWebsite(cfg config.Config, pool *store.Pool, codes account.LinkCodeStore) *web.Server {
+	redirect := cfg.OAuthRedirectURL
+	if redirect == "" {
+		redirect = "http://localhost:8080/auth/github/callback"
+	}
+	return web.New(pool, codes, web.Config{
+		Provider:      web.GitHubProvider(cfg.GithubClientID, cfg.GithubClientSecret, redirect),
+		SessionKey:    webSessionKey(cfg.WebSessionKey),
+		SecureCookies: cfg.WebSecureCookies, // secure-by-default (config); dev over plain http sets TELOS_WEB_SECURE_COOKIES=0
+		GateHint:      cfg.WebGateHint,
+		Log:           slog.Default(),
+	})
+}
+
+// webSessionKey decodes the configured base64 HMAC key, or generates an ephemeral one (with a warning).
+func webSessionKey(b64 string) []byte {
+	if b64 != "" {
+		if k, err := base64.StdEncoding.DecodeString(b64); err == nil && len(k) >= 16 {
+			return k
+		}
+		slog.Warn("invalid TELOS_WEB_SESSION_KEY (need >=16 bytes base64); using an ephemeral key")
+	} else {
+		slog.Warn("no web session key configured: using an EPHEMERAL key (web sessions drop on restart)")
+	}
+	k := make([]byte, 32)
+	_, _ = rand.Read(k)
+	return k
 }

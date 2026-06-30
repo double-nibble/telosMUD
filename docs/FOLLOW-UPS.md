@@ -446,3 +446,11 @@ something an author would reasonably want to:
 - **Recipe skill gate uses the level ATTR, not the track (Phase 13.5).** RecipeDTO.Skill names the skill
   LEVEL attribute (e.g. leatherworking) + min_skill; it does not resolve the track's level_attr. Fine while
   the convention holds (track level_attr == the named attr) but brittle if they diverge. · *progression*
+- **Web auth hardening — deferred from the 14.7 security audit (Phase 15).** Three deployment-time gaps the
+  audit flagged but that aren't blocking the dev/feature surface: (F2) the SESSION cookie is a stateless
+  bearer token with no server-side revocation — add a per-account session `version` (bumped on
+  "sign out everywhere") and check it in `sessionAccount`, so logout/leak is revocable without rotating the
+  HMAC key; (F4) once the website is served over TLS, give both cookies the `__Host-` prefix (requires
+  Secure + Path=/ + no Domain) so a `telos_oauth` flow cookie can't be planted over http / from a sibling
+  subdomain (the login-fixation chain); (F8) `/play` + `/logout` rely on SameSite=Lax alone — add an explicit
+  CSRF token for defense-in-depth. `SecureCookies` is already config-driven (default true). · *web/auth/security*

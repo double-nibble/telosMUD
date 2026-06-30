@@ -98,7 +98,7 @@ only when explicitly enabled.
 - **Done when:** a client connects over TLS and over SSH (pubkey); plain telnet is refused unless the flag is
   set; the same GMCP/MCCP handshake runs on all three.
 
-### 14.7 — OAuth + account website core
+### 14.7 — OAuth + account website core ✅ DONE (2026-06-30)
 The browser front door (D-A: server-rendered Go templates + htmx; D-C: GitHub first). OAuth 2.0 / OIDC
 Authorization Code + PKCE: provider sign-in → `account_identities` lookup (found→login, not-found→create) →
 session cookie. Account dashboard + character management; the **Play** button mints a link code (→ 14.2).
@@ -106,6 +106,13 @@ session cookie. Account dashboard + character management; the **Play** button mi
   auto-merge by email). Dashboard: characters, linked providers, passphrase set, SSH keys.
 - **Done when:** sign in with GitHub on the website, land on a dashboard, click Play → get a link code that
   redeems at the gate.
+- **Landed:** `internal/web` (oauth.go PKCE+exchange+identity, session.go signed cookies, server.go routes,
+  templates.go pages); store `FindIdentity`/`CreateAccountWithIdentity`/`AccountDisplayName`; config
+  `Web*`/`Github*`/`OAuthRedirectURL` + env; wired into `cmd/telos-account` (serves :8080 when `WEB_LISTEN`
+  set); `account` service in docker-compose (`env_file: auth.local.env` required:false; GITHUB creds gitignored).
+  Hermetic flow test stubs the provider via httptest; gated PG round-trip for the identity methods.
+  **Deferred to the capstone:** pointing the gate at telos-account (`ACCOUNT_TARGET`) so a web-minted code
+  redeems end-to-end over telnet — held back here so stub-login smoke/e2e stays green.
 
 ### 14.8 — Content-driven chargen front-end
 Chargen is content, not hardcoded (PRINCIPLES.md): the website reads `race_defs`/`class_defs`/`attribute_defs`

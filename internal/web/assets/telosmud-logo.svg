@@ -1,0 +1,13 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="TelosMUD">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1a1a"/>
+      <stop offset="1" stop-color="#000000"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" rx="112" ry="112" fill="url(#bg)"/>
+  <g fill="none" stroke="#33ff33" stroke-width="40" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="168,168 256,256 168,344"/>
+    <line x1="296" y1="344" x2="384" y2="344"/>
+  </g>
+</svg>

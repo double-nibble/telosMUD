@@ -214,3 +214,63 @@ func (p *Pool) AddSSHKey(ctx context.Context, accountID, fingerprint, pubkey, la
 	}
 	return nil
 }
+
+// --- Phase 14.7 OAuth identities (account_identities) -----------------------------------------------------
+
+// FindIdentity resolves an OAuth (provider, provider_uid) to its account. found=false for a new identity.
+func (p *Pool) FindIdentity(ctx context.Context, provider, providerUID string) (string, bool, error) {
+	var acct string
+	err := p.pool.QueryRow(ctx,
+		`SELECT account_id FROM account_identities WHERE provider = $1 AND provider_uid = $2`,
+		provider, providerUID).Scan(&acct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: find identity %s/%s: %w", provider, providerUID, err)
+	}
+	return acct, true, nil
+}
+
+// CreateAccountWithIdentity creates a NEW account + its first OAuth identity in one transaction (a first-time
+// sign-in). email is informational only — never an identity key (no auto-merge by email). Returns the new
+// account id.
+func (p *Pool) CreateAccountWithIdentity(ctx context.Context, provider, providerUID, email, displayName string) (string, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	acct := uuid.New()
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO accounts (id, status, display_name) VALUES ($1, 'active', $2)`,
+		acct, nullStr(displayName)); err != nil {
+		return "", fmt.Errorf("store: create account: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO account_identities (provider, provider_uid, account_id, email) VALUES ($1, $2, $3, $4)`,
+		provider, providerUID, acct, nullStr(email)); err != nil {
+		return "", fmt.Errorf("store: create identity: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("store: commit: %w", err)
+	}
+	return acct.String(), nil
+}
+
+// AccountDisplayName returns an account's display name (may be empty). found=false for an unknown account.
+func (p *Pool) AccountDisplayName(ctx context.Context, accountID string) (string, bool, error) {
+	var name *string
+	err := p.pool.QueryRow(ctx, `SELECT display_name FROM accounts WHERE id = $1`, accountID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: account %s: %w", accountID, err)
+	}
+	if name == nil {
+		return "", true, nil
+	}
+	return *name, true, nil
+}

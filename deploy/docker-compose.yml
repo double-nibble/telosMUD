@@ -167,6 +167,44 @@ services:
     restart: unless-stopped
 
 
+  # telos-account: the accounts/auth gRPC API + the OAuth website (Phase 14). The website (:8080) is the
+  # GitHub sign-in + dashboard + "Play" link-code bridge. GitHub OAuth credentials come from the GITIGNORED
+  # deploy/auth.local.env (required:false so CI — which has no such file — still parses; the site then just
+  # shows "sign-in not configured"). The gate is intentionally NOT pointed here yet (it keeps stub login), so
+  # the smoke/e2e telnet path is unchanged; full gate<->account login is the Phase 14 capstone.
+  account:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: telos-account
+    env_file:
+      - path: ./auth.local.env
+        required: false
+    environment:
+      TELOS_SERVICE: telos-account
+      TELOS_ENV: dev
+      TELOS_ACCOUNT_LISTEN: ":9100"
+      TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
+      TELOS_REDIS_ADDR: redis:6379 # link codes
+      TELOS_WEB_LISTEN: ":8080"
+      TELOS_WEB_SECURE_COOKIES: "0" # dev serves over plain http://localhost; prod (TLS) keeps the secure-by-default
+      TELOS_WEB_GATE_HINT: localhost:4000
+      TELOS_OAUTH_REDIRECT_URL: http://localhost:8080/auth/github/callback
+      DEBUG: true
+    ports:
+      - "8080:8080" # website: open http://localhost:8080 to sign in
+    expose:
+      - "9100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   gate:
     build:
       context: ..
