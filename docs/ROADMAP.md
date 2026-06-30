@@ -220,7 +220,17 @@ station.
 
 **Done when:** create an account on the web, get a link code, `connect` over TLS/SSH.
 
-### Phase 15 — Hardening & scale
+### Phase 15 — Terminal-native OAuth (login rework)
+([PHASE15-PLAN.md](PHASE15-PLAN.md)) Reworks Phase 14's front-end: the website + passphrase + SSH logins
+are replaced by a single **terminal-native OAuth device flow** — no passwords, auth externalized.
+- `connect` → a one-click link → the browser does OAuth (brokered, PKCE) → the telnet session is authed.
+- Prompt-driven character select + chargen (the content-driven chargen *engine* from 14.8 is reused).
+- OAuth-only: passphrase + SSH pubkey auth removed; plain telnet + TLS `telnets://` are the only transports.
+
+**Done when:** `connect` over TLS → click the link → OAuth in the browser → create a character via prompts →
+play → reconnect (survives restart). No password/key path exists in prod.
+
+### Phase 16 — Hardening & scale
 - Bot-swarm load tester (synthetic telnet + GMCP); tick-lag, occupancy, NATS-lag metrics.
 - Backpressure on slow clients; graceful shard drain for rolling redeploys; instanced zones.
 
