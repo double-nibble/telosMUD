@@ -48,6 +48,7 @@ type Config struct {
 	SecureCookies bool   // set Secure on cookies (true when served over TLS)
 	LinkCodeTTL   time.Duration
 	GateHint      string
+	Dev           bool // dev instance: render the -dev logo variant so operators can tell it from prod
 	Log           *slog.Logger
 }
 
@@ -66,6 +67,15 @@ func New(st Store, codes LinkCodeMinter, cfg Config) *Server {
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
+	// The logo URL is fixed at construction (by env), exposed to every template via the logoURL func so the
+	// shared {{template "head"}} can reference it without threading data through each page's pipeline.
+	logoURL := "/assets/telosmud-logo.svg"
+	if cfg.Dev {
+		logoURL = "/assets/telosmud-logo-dev.svg"
+	}
+	tmpl := template.Must(template.New("web").
+		Funcs(template.FuncMap{"logoURL": func() string { return logoURL }}).
+		Parse(pageTemplates))
 	return &Server{
 		store:         st,
 		codes:         codes,
@@ -74,7 +84,7 @@ func New(st Store, codes LinkCodeMinter, cfg Config) *Server {
 		secureCookies: cfg.SecureCookies,
 		linkCodeTTL:   ttl,
 		gateHint:      cfg.GateHint,
-		tmpl:          template.Must(template.New("web").Parse(pageTemplates)),
+		tmpl:          tmpl,
 		log:           log,
 	}
 }

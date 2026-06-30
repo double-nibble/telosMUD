@@ -194,15 +194,36 @@ func TestLogoutIsPostOnly(t *testing.T) {
 
 func TestAssetsServed(t *testing.T) {
 	ts, client := newTestWebsite(t, newFakeWebStore())
-	resp, err := client.Get(ts.URL + "/assets/telosmud-logo.svg")
-	if err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"telosmud-logo.svg", "telosmud-logo-dev.svg", "telosmud-logo.png"} {
+		resp, err := client.Get(ts.URL + "/assets/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("asset %s status = %d, want 200", name, resp.StatusCode)
+		}
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("logo asset status = %d, want 200", resp.StatusCode)
+}
+
+func TestDevLogoVariant(t *testing.T) {
+	// A dev instance renders the -dev logo; the default (prod) renders the plain one.
+	stub := stubProvider(t)
+	prov := OAuthProvider{Name: "github", ClientID: "id", ClientSecret: "s", TokenURL: stub.URL, UserURL: stub.URL}
+	key := []byte("0123456789abcdef0123456789abcdef")
+
+	dev := New(newFakeWebStore(), fakeMinter{}, Config{Provider: prov, SessionKey: key, Dev: true})
+	devTS := httptest.NewServer(dev.Handler())
+	t.Cleanup(devTS.Close)
+	if body := getBody(t, http.DefaultClient, devTS.URL+"/"); !strings.Contains(body, "telosmud-logo-dev.svg") {
+		t.Fatalf("dev instance should render the -dev logo; body = %q", body)
 	}
-	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "svg") {
-		t.Fatalf("logo content-type = %q, want svg", ct)
+
+	prod := New(newFakeWebStore(), fakeMinter{}, Config{Provider: prov, SessionKey: key, Dev: false})
+	prodTS := httptest.NewServer(prod.Handler())
+	t.Cleanup(prodTS.Close)
+	body := getBody(t, http.DefaultClient, prodTS.URL+"/")
+	if !strings.Contains(body, "telosmud-logo.svg") || strings.Contains(body, "telosmud-logo-dev.svg") {
+		t.Fatalf("prod instance should render the plain logo; body = %q", body)
 	}
 }
 

@@ -147,6 +147,7 @@ func newWebsite(cfg config.Config, pool *store.Pool, codes account.LinkCodeStore
 		SessionKey:    webSessionKey(cfg.WebSessionKey),
 		SecureCookies: cfg.WebSecureCookies, // secure-by-default (config); dev over plain http sets TELOS_WEB_SECURE_COOKIES=0
 		GateHint:      cfg.WebGateHint,
+		Dev:           cfg.Env == "dev", // renders the -dev logo badge
 		Log:           slog.Default(),
 	})
 }

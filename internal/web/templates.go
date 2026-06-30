@@ -15,7 +15,7 @@ const pageTemplates = `
  .card{border:1px solid #e2e2e2;border-radius:8px;padding:1rem 1.25rem;margin:1rem 0}
  h1{font-size:1.6rem}
  .logo{display:block;height:3.5rem;margin:0 0 1.5rem}
-</style></head><body><a href="/"><img class="logo" src="/assets/telosmud-logo.svg" alt="TelosMUD"></a>{{end}}
+</style></head><body><a href="/"><img class="logo" src="{{logoURL}}" alt="TelosMUD"></a>{{end}}
 {{define "foot"}}</body></html>{{end}}
 
 {{define "home"}}{{template "head"}}
