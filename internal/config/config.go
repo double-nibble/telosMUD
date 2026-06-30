@@ -25,6 +25,10 @@ type Config struct {
 	WorldListen string `yaml:"world_listen"` // gRPC Play listen, e.g. ":9090"
 	WorldTarget string `yaml:"world_target"` // the gate dials this world shard
 
+	// Phase 14 auth service (telos-account).
+	AccountListen string `yaml:"account_listen"` // account gRPC listen, e.g. ":9100"
+	AccountTarget string `yaml:"account_target"` // the gate dials telos-account here ("" => no account service, stub login)
+
 	// Phase 2 shard identity (multi-shard + handoff).
 	ShardID   string   `yaml:"shard_id"`   // this shard's id, e.g. "shard-a"
 	ShardAddr string   `yaml:"shard_addr"` // public address others dial (gate + peer handoff)
@@ -60,6 +64,9 @@ func Default() Config {
 		GateListen:  ":4000",
 		WorldListen: ":9090",
 		WorldTarget: "localhost:9090",
+
+		AccountListen: ":9100",
+		AccountTarget: "", // empty by default: the gate uses the stub login until an account service is wired
 
 		ShardID:   "shard-1",
 		ShardAddr: "localhost:9090",
@@ -114,6 +121,12 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_WORLD_LISTEN"); ok {
 		c.WorldListen = v
+	}
+	if v, ok := os.LookupEnv("TELOS_ACCOUNT_LISTEN"); ok {
+		c.AccountListen = v
+	}
+	if v, ok := os.LookupEnv("TELOS_ACCOUNT_TARGET"); ok {
+		c.AccountTarget = v
 	}
 	if v, ok := os.LookupEnv("TELOS_WORLD_TARGET"); ok {
 		c.WorldTarget = v

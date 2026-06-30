@@ -80,11 +80,21 @@ const maxNameLen = 20
 // Phase-8 comms bus (the gate is a comms SINK — RoleGate, subscribe-only on
 // chan/tell; docs/PHASE8-PLAN §1, P8-D1-B).
 type Server struct {
-	listen string
-	dir    directory.Directory
-	pool   *pool
-	comms  commbus.Bus  // RoleGate comms handle; never nil (Disabled when NATS is down)
-	log    *slog.Logger // scoped logger, tagged component=gate
+	listen  string
+	dir     directory.Directory
+	pool    *pool
+	comms   commbus.Bus   // RoleGate comms handle; never nil (Disabled when NATS is down)
+	account AccountClient // Phase 14 seam to telos-account; a stub when no account service is configured
+	log     *slog.Logger  // scoped logger, tagged component=gate
+}
+
+// WithAccountClient wires a real telos-account client (Phase 14); without it the Server keeps the stub set in
+// newServer (the legacy "type a name" login). Returns the Server for chaining at construction.
+func (s *Server) WithAccountClient(a AccountClient) *Server {
+	if a != nil {
+		s.account = a
+	}
+	return s
 }
 
 // New builds a gate over a real (insecure) client pool. dir resolves the initial
@@ -109,11 +119,12 @@ func newServer(listen string, dir directory.Directory, p *pool, comms commbus.Bu
 		comms = commbus.Disabled(commbus.RoleGate)
 	}
 	return &Server{
-		listen: listen,
-		dir:    dir,
-		pool:   p,
-		comms:  comms,
-		log:    slog.With("component", "gate"),
+		listen:  listen,
+		dir:     dir,
+		pool:    p,
+		comms:   comms,
+		account: stubAccountClient{}, // legacy "type a name" login until a real account service is wired
+		log:     slog.With("component", "gate"),
 	}
 }
 

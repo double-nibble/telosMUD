@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package telosmud.account.v1;
+
+// telos-account: the accounts/auth service (docs/ACCOUNT.md). The ONLY service that touches OAuth providers
+// and credentials; the gate calls this gRPC API to redeem link codes, verify passphrases, resolve SSH keys,
+// and list/create characters. The world never calls it on the hot path — it trusts the signed session
+// assertion (§9) instead. Phase 14.1 establishes the contract; later slices fill the auth backends in.
+service Account {
+  // ListCharacters returns the characters owned by an authenticated account (the character-select menu).
+  rpc ListCharacters(ListCharactersRequest) returns (ListCharactersResponse);
+  // ReserveName checks + reserves a unique character name (CITEXT) before creation.
+  rpc ReserveName(ReserveNameRequest) returns (ReserveNameResponse);
+  // CreateCharacter creates a character on an account from a content-driven chargen selection (Phase 14.8).
+  rpc CreateCharacter(CreateCharacterRequest) returns (CreateCharacterResponse);
+
+  // --- auth backends, filled in by later slices (declared now so the contract is stable) ---
+
+  // MintLinkCode mints a single-use, short-TTL link code for the website's "Play" button (Phase 14.2).
+  rpc MintLinkCode(MintLinkCodeRequest) returns (MintLinkCodeResponse);
+  // RedeemLinkCode atomically consumes a link code at the gate, returning the account + a session assertion (14.2/14.3).
+  rpc RedeemLinkCode(RedeemLinkCodeRequest) returns (RedeemLinkCodeResponse);
+  // VerifyPassphrase checks a name+passphrase login with rate-limit/lockout state (Phase 14.5).
+  rpc VerifyPassphrase(VerifyPassphraseRequest) returns (VerifyPassphraseResponse);
+  // ResolveSSHKey maps an SSH key fingerprint to an account for the gate's SSH server (Phase 14.6).
+  rpc ResolveSSHKey(ResolveSSHKeyRequest) returns (ResolveSSHKeyResponse);
+}
+
+// Character is the account-facing summary of a character (the select menu / dashboard list).
+message Character {
+  string id = 1;        // characters.id (the PersistID)
+  string name = 2;      // the unique CITEXT name
+  string zone_ref = 3;  // last location (for "continue where you left off")
+  string room_ref = 4;
+}
+
+message ListCharactersRequest {
+  string account_id = 1;
+}
+message ListCharactersResponse {
+  repeated Character characters = 1;
+}
+
+message ReserveNameRequest {
+  string account_id = 1;
+  string name = 2;
+}
+message ReserveNameResponse {
+  bool ok = 1;
+  string reason = 2; // when !ok: "taken" | "invalid" | …
+}
+
+message CreateCharacterRequest {
+  string account_id = 1;
+  string name = 2;
+  // bundles are the content refs (race/class/background) chosen in chargen; the server applies their grants
+  // into the new character's initial state (Phase 14.8 wires the apply path).
+  repeated string bundles = 3;
+}
+message CreateCharacterResponse {
+  Character character = 1;
+}
+
+message MintLinkCodeRequest {
+  string account_id = 1;
+  string character_id = 2; // optional: pre-select a character
+}
+message MintLinkCodeResponse {
+  string code = 1;
+  uint64 ttl_ms = 2;
+}
+
+message RedeemLinkCodeRequest {
+  string code = 1;
+  string conn_info = 2; // remote addr / transport, for audit
+}
+message RedeemLinkCodeResponse {
+  string account_id = 1;
+  repeated Character characters = 2;
+  string session_assertion = 3; // signed {account,character,session,exp} (Phase 14.3)
+}
+
+message VerifyPassphraseRequest {
+  string name = 1;       // a character name resolves to its account
+  string passphrase = 2;
+  string conn_info = 3;
+}
+message VerifyPassphraseResponse {
+  bool ok = 1;
+  string account_id = 2;
+  string reason = 3;           // when !ok: "bad_credentials" | "locked"
+  uint64 retry_after_ms = 4;   // when locked
+}
+
+message ResolveSSHKeyRequest {
+  string fingerprint = 1;
+}
+message ResolveSSHKeyResponse {
+  bool found = 1;
+  string account_id = 2;
+}

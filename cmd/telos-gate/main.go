@@ -82,6 +82,18 @@ func main() {
 	defer func() { _ = comms.Close() }()
 
 	srv := gate.New(cfg.GateListen, dir, comms)
+	// Phase 14: wire the real telos-account client when an account service is configured; otherwise the gate
+	// keeps the stub "type a name" login. The login flow that USES it lands in 14.2 (link codes).
+	if cfg.AccountTarget != "" {
+		ac, err := gate.DialAccount(cfg.AccountTarget)
+		if err != nil {
+			slog.Error("account dial failed", "target", cfg.AccountTarget, "err", err)
+			os.Exit(1)
+		}
+		defer func() { _ = ac.Close() }()
+		srv.WithAccountClient(ac)
+		slog.Info("account service wired", "target", cfg.AccountTarget)
+	}
 	slog.Info("starting", "env", cfg.Env, "listen", cfg.GateListen,
 		"home_zone", homeZone, "fallback", cfg.WorldTarget)
 	if err := srv.ListenAndServe(ctx); err != nil {
