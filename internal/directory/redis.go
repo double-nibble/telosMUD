@@ -148,6 +148,37 @@ end
 return 1
 `)
 
+// HandoverZone atomically flips a zone's live lease from one shard to another (Phase 16.4b graceful
+// drain). It is a FENCED single-op CAS: the flip happens only if fromShard is STILL the live owner, and it
+// sets toShard as owner with a FRESH ttl in the same script — so there is never a not-found window a peer
+// could observe (unlike release-then-claim, where the destination's HostZone build would leave the zone
+// ownerless for tens–hundreds of ms). Returns false (no error) when fromShard is not the current live owner
+// (it already lost/expired the lease, or a newer owner took over) — the caller must then abort the handover
+// rather than assume the flip happened. The destination must ALREADY host the zone (HostZone before the
+// flip) so a player redirected the instant ShardForZone resolves to it can be Prepared.
+func (r *Redis) HandoverZone(ctx context.Context, zoneID, fromShard, toShard string, ttl time.Duration) (bool, error) {
+	res, err := handoverZone.Run(ctx, r.rdb, []string{r.zoneKey(zoneID)}, fromShard, toShard, ttl.Milliseconds()).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
+}
+
+// handoverZone flips owner from ARGV[1] to ARGV[2] only if ARGV[1] is the current LIVE owner, setting a
+// fresh ARGV[3]-ms lease. Atomic, so ShardForZone never observes an ownerless gap during the flip. Same
+// redis.call('TIME') clock as claimZone. KEYS[1]=zone key  ARGV[1]=from  ARGV[2]=to  ARGV[3]=ttl_ms
+var handoverZone = redis.NewScript(`
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local owner = redis.call('HGET', KEYS[1], 'owner')
+local exp = redis.call('HGET', KEYS[1], 'expires')
+if owner ~= ARGV[1] then return 0 end
+if not exp or tonumber(exp) <= now then return 0 end
+redis.call('HSET', KEYS[1], 'owner', ARGV[2], 'expires', now + tonumber(ARGV[3]))
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]) * 3)
+return 1
+`)
+
 // zoneOwner returns the current owner only if its lease is still live (judged
 // against redis.call('TIME'), the same clock the claim uses), else "".
 var zoneOwner = redis.NewScript(`
