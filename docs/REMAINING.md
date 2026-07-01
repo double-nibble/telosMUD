@@ -77,15 +77,31 @@ cookie prefix, mid-session hear-access republish, and the durable `characters.st
 *Burned down (see COMPLETED.md → "Launch-hardening burn-down round 2"): the `heal`/restorative dice+bonus
 form, the formula NaN/±Inf fail-closed guard (found in the heal-dice review), the OnKill kill-magnitude cap
 (`xp_value` + fallback cap — also §8 death-mag), the reserved-affect-event-kinds reconciliation (those hooks
-already fire; only OnRest is dark, pending a rest mechanic), the recipe skill-gate `track` resolution, and
-the content-configurable profession cap + uncapped kind.*
+already fire; only OnRest is dark, pending a rest mechanic), the recipe skill-gate `track` resolution, the
+content-configurable profession cap + uncapped kind, and the `rollOpAmount` dedupe (extracted the shared
+`amount + dice + bonus` roll from opDealDamage/opHeal).*
 
-- **Dedupe the op amount roll (optional, low priority).** opDealDamage and opHeal now duplicate the
-  `amount + dice(diceNum/diceCount) + bonus` block; extract a `rollOpAmount(c, op)` helper so they can't drift
-  (abilities-engineer advisory during the heal-dice review). · *abilities/world*
-- **Generic object-targeted salvage/craft verbs (13.4/13.5).** Each salvage/craft is one verb bound to a
-  FIXED source proto / recipe ref. A real client wants `disenchant <item>` (object-targeted, item-TAG gated)
-  and `craft <recipe>` (recipe chosen by argument).
+- **[LARGE] Cross-content alias / keyword targeting system (+ discovery listings).** Promoted from the old
+  "generic object-targeted salvage/craft verbs" item once the design intent came clear: a builder should be
+  able to declare SHORT aliases on ANY content object, and the parser resolves a player's partial phrase to
+  it — the same mechanism for items, mobs, recipes, and abilities. E.g. `weapon:heavy_wooden_sword` →
+  "heavy sword"/"wooden sword"/"wood sword"/"sword" (`get sword` / `get wood sword` both work);
+  `enemy:big_scary_skeletal_guard` → "guard"/"skeletal guard"/"skeleton"/"big skeleton" (`attack skeleton`);
+  recipes → `craft <name>` by a builder-declared alias. The pillar is DISCOVERABILITY: it pairs with listing
+  commands (e.g. "what can I craft?") that print exactly the names a player then types. This touches the
+  targeting/`Resolve` layer for ALL content types + the parser + per-content authoring, so it wants a design
+  pass before slices (recipes-first is a reasonable first slice, then generalize to items/mobs). Subsumes the
+  `craft <recipe>` half of the old item. · *mudlib/content/edge*
+- **[LARGE] MMO-style salvaging subsystem (disenchant, 13.4).** Promoted from the old item: `disenchant <item>`
+  is object-targeted (resolve a held item by keyword) + item-TAG gated, and the YIELD works like modern-MMO
+  salvage. Spec: (1) yield DERIVES from the item's rarity TIER + item LEVEL (trash→trash, high-level rare→rare
+  mats, epic→epic mats) via a tier+level → table mapping; (2) a per-item `salvage_table` OVERRIDE beats the
+  derived one; (3) a per-item un-salvageable BLOCK flag refuses the verb (a super-rare-metal item); (4) a
+  salvaging SKILL requirement scaled by the item's level/rarity — below it you can't salvage at all; (5) an
+  OVER-SKILL BONUS (far exceeding the requirement yields bonus materials). Today `salvage_item(item, table)`
+  takes a FIXED source proto + fixed table, no tag gate, no tier/level derivation, no skill gate. Build in
+  board-reviewed slices (object-target + tag gate + per-item override/block first; then derived tables + skill
+  gate + over-skill bonus). · *progression/content*
 - **Content-lint: `learn_profession.profession` must name a `kind: profession` bundle (found in the cap review).**
   The uncapped/capped resolution keys off `bundleDefs().get(profession_ref)` (ref == bundle ref by convention);
   a content-lint rule asserting every `learn_profession.profession` names a matching `kind: profession` bundle
