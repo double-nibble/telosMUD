@@ -295,7 +295,7 @@ func (z *Zone) move(s *session, dir string) bool {
 	// bump, no directory change, no gate re-dial. The session keeps the same out channel
 	// and appliedSeq. transferOut hands the session+entity to dest, so we release ownership.
 	if destZone != "" && destZone != z.id && z.shard != nil {
-		if dest := z.shard.zones[destZone]; dest != nil {
+		if dest := z.shard.zoneByID(destZone); dest != nil {
 			z.transferOut(s, dest, destRoom, dir, from)
 			return true
 		}

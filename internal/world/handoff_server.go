@@ -37,7 +37,7 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 	if snap == nil || snap.GetCharacterId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "missing snapshot")
 	}
-	z := h.shard.zones[req.GetTargetZoneId()]
+	z := h.shard.zoneByID(req.GetTargetZoneId())
 	if z == nil {
 		return nil, status.Errorf(codes.NotFound, "zone %q not hosted on this shard", req.GetTargetZoneId())
 	}
@@ -87,7 +87,7 @@ func (h *handoffServer) Abort(_ context.Context, req *handoffv1.AbortRequest) (*
 	if z := h.shard.zoneForToken(token); z != nil {
 		z.post(abortPendingMsg{token: token})
 	} else {
-		for _, z := range h.shard.zones {
+		for _, z := range h.shard.zonesList() { // mu-guarded: safe against a runtime HostZone (16.4a)
 			z.post(abortPendingMsg{token: token})
 		}
 	}

@@ -22,6 +22,7 @@ package world
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"sync"
@@ -94,8 +95,24 @@ type Shard struct {
 	lockTTL     time.Duration
 	lockRenew   time.Duration
 
-	mu         sync.Mutex       // guards tokenIndex
+	mu         sync.Mutex       // guards tokenIndex, zones, and runCtx/runWG/draining (16.4a runtime zone-add)
 	tokenIndex map[string]*Zone // handoff token -> hosting zone (populated by Prepare)
+
+	// content is the full loaded content — every pack's prototypes are already in protos (defineContent
+	// fills from ALL loaded zones, not just the hosted set). Retained so HostZone (Phase 16.4a runtime
+	// zone-add) can build a zone this shard did NOT host at boot: a standby re-claiming a draining peer's
+	// zone. nil on a demo/test shard built without a LoadedContent (its zones are pre-built) — HostZone then
+	// errors. Set by NewShardFromContent.
+	content *content.LoadedContent
+
+	// runCtx / runWG are captured by Run so HostZone can launch a runtime-added zone's actor on the shard's
+	// lifetime ctx and have Run's Wait() cover it. closed flips true (under mu) once Run has observed ctx
+	// cancel and is about to wg.Wait(): HostZone refuses after that, so its wg.Add can never race the Wait
+	// (every successful Add is mu-ordered before closed=true, hence before Wait). Guarded by mu.
+	// (BeginDrain adds a separate draining flag in 16.4b.)
+	runCtx context.Context
+	runWG  *sync.WaitGroup
+	closed bool
 
 	// saver is the shard's async character writer (saver.go): one per shard, shared by every
 	// hosted zone, drained by a single background goroutine started in Run. It does all the
@@ -211,6 +228,7 @@ func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDia
 // production path; the demo lives only in the YAML/DB.
 func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr string, dir Locator, peers HandoffDialer) *Shard {
 	s := newBareShard(home, addr, dir, peers)
+	s.content = lc // retained for HostZone (16.4a): a standby builds a not-yet-hosted zone from this
 	protos := newProtoCache()
 	s.protos = protos
 	defineContent(protos, lc) // fill the cache once from all loaded zones, before any zone runs
@@ -381,8 +399,17 @@ func (s *Shard) WithHotReload(src content.DefinitionSource, bus contentbus.Bus, 
 }
 
 // adopt registers a built zone on the shard and wires its cross-shard handoff hook + the shared
-// async saver.
+// async saver. Locks mu: safe at construction (single-threaded) and at runtime (HostZone), where
+// Play/handoff/move routing may read s.zones concurrently.
 func (s *Shard) adopt(id string, z *Zone) {
+	s.mu.Lock()
+	s.adoptLocked(id, z)
+	s.mu.Unlock()
+}
+
+// adoptLocked is adopt's body assuming the caller holds mu — HostZone uses it so the map-write and the
+// runWG.Add happen atomically under one lock hold (the closed-vs-Add ordering the shutdown guard needs).
+func (s *Shard) adoptLocked(id string, z *Zone) {
 	z.shard = s
 	z.handoff = s.beginHandoff
 	z.saver = s.saver
@@ -393,6 +420,85 @@ func (s *Shard) adopt(id string, z *Zone) {
 		z.defs = s.defs
 	}
 	s.zones[id] = z
+}
+
+// zoneByID returns the hosted zone with the given id (nil if not hosted), under mu so it is safe
+// against a concurrent HostZone (16.4a). The routing hot paths (Play attach, Handoff.Prepare,
+// intra-shard move) read through here.
+func (s *Shard) zoneByID(id string) *Zone {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.zones[id]
+}
+
+// zonesList snapshots the currently-hosted zones under mu, so an iterator (Run launch, Drain,
+// BeginDrain) is safe against a concurrent HostZone and never ranges the live map.
+func (s *Shard) zonesList() []*Zone {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*Zone, 0, len(s.zones))
+	for _, z := range s.zones {
+		out = append(out, z)
+	}
+	return out
+}
+
+// HostZone builds and starts a zone this shard did NOT host at boot — the runtime zone-add primitive
+// (Phase 16.4a) a standby uses to re-claim a draining peer's zone. It is idempotent (a re-host returns
+// the existing zone) and in-process only: it builds the zone from the retained content, adopts it (so
+// Play/handoff/move routing finds it), and launches its actor on the shard's run ctx. The DIRECTORY
+// lease + placement flip that makes peers RESOLVE this shard as the zone's owner is the caller's job
+// (the drain coordinator, 16.4b) — HostZone just makes the zone live locally so a Handoff.Prepare into
+// it succeeds. Errors if the shard isn't running yet (no run ctx) or has no retained content.
+func (s *Shard) HostZone(id string) (*Zone, error) {
+	// First pass: cheap guards + the idempotent hit, without holding mu across the (slower) zone build.
+	s.mu.Lock()
+	if z := s.zones[id]; z != nil {
+		s.mu.Unlock()
+		return z, nil // already hosting it — idempotent
+	}
+	if s.runCtx == nil || s.runWG == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("HostZone %q: shard not running", id)
+	}
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("HostZone %q: shard shutting down", id)
+	}
+	if s.content == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("HostZone %q: shard has no retained content to build from", id)
+	}
+	s.mu.Unlock()
+
+	// Build OUTSIDE mu: buildZone spawns room singletons + runs resets, which shouldn't block routing reads.
+	z := newZone(id)
+	z.protos = s.protos
+	z.buildZone(s.content)
+
+	// Register + launch atomically under mu, re-checking the guards a concurrent build/shutdown may have
+	// tripped. Doing runWG.Add here under mu (gated on !closed) is what makes it impossible for the Add to
+	// race Run's wg.Wait: Run sets closed=true under mu before Wait, so every surviving Add happens-before it.
+	s.mu.Lock()
+	if existing := s.zones[id]; existing != nil {
+		s.mu.Unlock()
+		return existing, nil // lost a concurrent HostZone race; discard our freshly-built (never-run) zone
+	}
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("HostZone %q: shard shutting down", id)
+	}
+	s.adoptLocked(id, z) // registers in s.zones + wires handoff/saver/defs
+	runCtx := s.runCtx
+	s.runWG.Add(1)
+	s.mu.Unlock()
+
+	go func() {
+		defer s.runWG.Done()
+		z.Run(runCtx)
+	}()
+	slog.Info("hosting zone at runtime", "zone", id, "shard", s.addr)
+	return z, nil
 }
 
 // indexToken records that zone z holds a pending player bound by token, so a Play
@@ -438,10 +544,10 @@ func GRPCDialer() HandoffDialer {
 }
 
 // Zone returns the shard's home zone. Convenience for single-zone callers/tests.
-func (s *Shard) Zone() *Zone { return s.zones[s.home] }
+func (s *Shard) Zone() *Zone { return s.zoneByID(s.home) }
 
 // ZoneByID returns the hosted zone with the given id, or nil.
-func (s *Shard) ZoneByID(id string) *Zone { return s.zones[id] }
+func (s *Shard) ZoneByID(id string) *Zone { return s.zoneByID(id) }
 
 // Run starts every hosted zone's actor loop on its own goroutine and the shard's single async
 // saver drainer, then blocks until ctx is cancelled. One goroutine per zone preserves
@@ -466,13 +572,35 @@ func (s *Shard) Run(ctx context.Context) {
 		go s.scopes.signalLoop(ctx) // off-zone-goroutine signal-up publisher (durable; 10.3c)
 	}
 	var wg sync.WaitGroup
+	// Capture the run ctx + wg so HostZone (16.4a) can launch a runtime-added zone onto this same
+	// lifetime and have the Wait below cover it. Snapshot the boot zones under the same lock so a
+	// HostZone racing startup is either in the snapshot or adds itself after runWG is visible.
+	s.mu.Lock()
+	s.runCtx = ctx
+	s.runWG = &wg
+	boot := make([]*Zone, 0, len(s.zones))
 	for _, z := range s.zones {
+		boot = append(boot, z)
+	}
+	s.mu.Unlock()
+	for _, z := range boot {
 		wg.Add(1)
 		go func(z *Zone) {
 			defer wg.Done()
 			z.Run(ctx)
 		}(z)
 	}
+	// Block on the shard's lifetime, THEN wait for every zone (incl. runtime-added ones) to finish.
+	// A standby that won no zones has an empty wg; without the ctx wait it would exit Run immediately
+	// and never be able to host a drained peer's zone. Each z.Run returns only on ctx cancel, so the
+	// old wg.Wait()-only form is equivalent for a shard that booted with zones.
+	<-ctx.Done()
+	// Close the door under mu BEFORE Wait: a HostZone that already did its wg.Add under mu is ordered
+	// ahead of us (its zone is in the wg and Wait covers it); any later HostZone sees closed and refuses,
+	// so no Add can race this Wait even when the counter has just reached zero.
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 	wg.Wait()
 }
 
@@ -486,7 +614,7 @@ func (s *Shard) Drain() {
 	if s.saver == nil || !s.saver.enabled() {
 		return
 	}
-	for _, z := range s.zones {
+	for _, z := range s.zonesList() {
 		z.post(drainFlushMsg{})
 	}
 }

@@ -51,9 +51,34 @@ real hardware.
   count drops per connection, and DISCONNECT a persistently-slow client (sustained overflow) so it can't hold
   a slot/stream; a bounded gate-side writer mirrors it. A chaos test proves one wedged client never stalls the
   others or the heartbeat.
-- **16.4 — Graceful shard drain.** Wire `Shard.Drain` on SIGTERM: stop accepting new attaches → hand every
-  live player off to a peer shard (director-coordinated, reusing the handoff) → flush → exit. The gate's
-  redirect handling keeps each socket open across the move (zero dropped connections).
+- **16.4 — Graceful shard drain (FULL zero-drop, approved 2026-06-30).** The user chose the full version over
+  the narrower "clean-save + reconnect" fallback, which un-defers two Phase-10.6 pieces (runtime zone-add +
+  the rebalance drain executor). Players keep playing the SAME zone across a rolling redeploy. Built as four
+  sub-slices, each verify+review+green:
+  - **16.4a — Runtime zone-add (world).** `Shard.HostZone(id)`: the standby already has every zone's room
+    prototypes (`defineContent` fills the cache from ALL loaded zones, not just the won set), so hosting a new
+    zone at runtime is: build the zone from the retained `LoadedContent`, `adopt` it, launch `z.Run` on the
+    shard's run ctx, and claim its directory lease + start renewal. Makes `s.zones` runtime-mutable — guard it
+    with the existing `s.mu` behind `zoneByID`/`zonesList` accessors (per-attach/move reads, not per-tick, so a
+    mutex is fine). The standby model already exists (a shard that wins no zones from its pool runs as a
+    standby, registered + heartbeating); this gives it the "live re-claim" its own boot comment promised.
+  - **16.4b — Drain choreography (world + director).** `Shard.BeginDrain(ctx)`: (1) set a `draining` flag that
+    REJECTS new fresh-login attaches (a re-dial/handoff bind is still accepted so an in-flight move completes);
+    (2) resolve a target shard for each hosted zone — the director assigns the drained zones to a standby via
+    `HostZone` + a lease handover (release-then-claim so `ShardForZone` flips to the standby); (3) fan
+    `beginHandoff` over every live player to the new owner (reusing the exact cross-shard handoff — the gate
+    holds the socket open across the Redirect); (4) wait until every zone is empty or a deadline, then `Drain`
+    (flush) + return. Correctness: single-owner lease handover, the both-serve window, epoch monotonicity, and
+    in-flight handoffs started before the drain flag — reviewed by the distributed-systems architect before it
+    lands.
+  - **16.4c — SIGTERM wiring (cmd/telos-world).** Replace the post-cancel `GracefulStop` (best-effort flush
+    only) with: on signal → `BeginDrain(ctx-with-timeout)` while the zone+saver goroutines stay ALIVE → wait
+    for drain-complete or timeout → then cancel + `GracefulStop` + exit. The drain runs BEFORE the zone loops
+    stop, which is the whole point (§6 said the flush must precede ctx cancel).
+  - **16.4d — Capstone test.** A hermetic 2-process (+standby) topology: players on shard S under load,
+    SIGTERM S, players migrate to the standby now hosting the same zone and keep issuing commands with zero
+    dropped connections; S exits clean. Honest scope (per the 16.3 review): "zero-drop" covers HEALTHY
+    connections — a client wedged mid-drain is deadline-reclaimed and counted separately.
 - **Capstone.** The bot swarm sustains the target tick rate at the agreed scale (16.1 confirms p99 tick-lag),
   AND a rolling redeploy drains a shard with zero dropped connections (the load test keeps running across it).
 

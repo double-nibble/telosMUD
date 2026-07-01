@@ -231,7 +231,7 @@ func (r *reloader) notifyZones(kind, ref string) {
 	if r == nil || r.shard == nil {
 		return
 	}
-	for _, z := range r.shard.zones {
+	for _, z := range r.shard.zonesList() { // mu-guarded: safe against a runtime HostZone (16.4a)
 		z.post(reloadLuaMsg{kind: kind, ref: ref})
 	}
 }

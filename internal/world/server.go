@@ -109,7 +109,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// link-dead reconnect) routes to the shard's home zone. currentZone is this
 	// connection's routing pointer — the zone Stores itself into it on attach, and the
 	// reader loop Loads it for every input so a later intra-shard move follows the player.
-	zone := s.shard.zones[s.shard.home]
+	zone := s.shard.zoneByID(s.shard.home)
 	if token != "" {
 		if z := s.shard.zoneForToken(token); z != nil {
 			zone = z

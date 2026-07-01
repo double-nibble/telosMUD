@@ -212,14 +212,16 @@ func (sr *scopeReplication) onScopeEvent(kind, regionID, event string, payload j
 // scope only to that region's hosted member zones.
 func (sr *scopeReplication) postToScopeZones(kind, regionID string, m msg) {
 	if kind == "world" {
-		for _, z := range sr.shard.zones {
+		for _, z := range sr.shard.zonesList() {
 			z.post(m)
 		}
 		return
 	}
 	for zoneID, rgID := range sr.zoneRegion {
 		if rgID == regionID {
-			sr.shard.zones[zoneID].post(m)
+			if z := sr.shard.zoneByID(zoneID); z != nil {
+				z.post(m)
+			}
 		}
 	}
 }
