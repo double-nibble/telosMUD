@@ -88,6 +88,11 @@ hardening fix — call them out for dedicated planning rather than a quick slice
 - **Per-mob `xp_value` / kill-magnitude cap (11.3/12).** `death.go` fires OnKill with `mag` = the victim's raw
   max-hp (builder-influenceable — a high-max-hp mob is an XP/loot farm). Read a content `xp_value` or
   cap/normalize the magnitude before it feeds XP or loot.
+- **Reserved-but-unfired affect event kinds.** `OnRest`, `OnApplyAffect`, `OnAffectTick`, `OnAffectExpire`
+  are named in `internal/world/event.go`'s known-kinds map (a content handler for them parses), but the
+  engine never FIRES them — so a builder subscribing to an affect-lifecycle hook gets no callback. Light the
+  hooks at the affect apply/tick/expire + rest sites (the combat/movement/progression/custom kinds all fire;
+  only these are dark). · *abilities/world*
 - **Shared-def hot reload (7.7 scope).** `reload.go buildPrototype` handles only Room/Item/Mob; a `(kind,ref)`
   invalidation for a SHARED def (ability/affect/formula/`pvp_allowed` policy) is skipped and `z.defs` is
   boot-immutable — no live edit path to a pvp policy / formula. When a slice swaps `z.defs` at runtime, hook
@@ -183,7 +188,15 @@ A privilege layer above player — its own project (much like documentation).
   generous/synchronized kick-message deadline (the "rebuild on OAuth login" note is moot). (2)
   `gate.TestChannelLineRendersVerbatimNoTellPrefix` — raise the per-line wait / settle the comms path under a
   loaded `-race` job.
-- **Doc: top-level `state.x = …` re-runs on hot reload.** A reloaded script's non-handler body re-executes
-  against the PRESERVED `self.state`, so `state.x = 0` clobbers a live value; idiomatic content guards it
-  (`state.x = state.x or 0`). One-liner for `docs/PERSISTENCE.md` + the builder guide.
+- **Orphaned `account_auth` / `ssh_keys` tables (dead schema).** Migration `00015_accounts.sql` still creates
+  the passphrase (`account_auth`) and `ssh_keys` tables, but Phase 15 removed every code path that reads or
+  writes them (auth is OAuth-only). Add a follow-up migration to drop them (or a comment marking them
+  intentionally retained). `db/migrations/`.
+- **Stale doc-comment in `internal/web/oauth.go`.** Its header still describes "the account dashboard, and
+  the 'Play' bridge," which `internal/web/server.go` says no longer exists ("no longer a website: it is a
+  bare auth bridge"). A one-line code-comment cleanup.
+- **Builder-guide note: top-level `state.x = …` re-runs on hot reload.** A reloaded script's non-handler body
+  re-executes against the PRESERVED `self.state`, so `state.x = 0` clobbers a live value; idiomatic content
+  guards it (`state.x = state.x or 0`). The PERSISTENCE.md note is added; this remains for the builder guide
+  (the docs/wiki project).
 - **Delete merged local branches as work lands.**

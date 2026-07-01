@@ -5,8 +5,6 @@ Two data domains with opposite access patterns, plus an operational tier. The
 hardcoded column.** Adding an attribute, resource, or affect is *content*, never a schema
 migration.
 
-Status: **proposal** — three choices flagged in §10.
-
 | Domain        | Store              | Pattern                | Examples                                  |
 |---------------|--------------------|------------------------|-------------------------------------------|
 | Content/defs  | Postgres (cached)  | read-mostly, bulk-load | attributes, abilities, affects, prototypes, rooms, resets, Lua |
@@ -22,7 +20,7 @@ abilities, classes, races, mob/item prototypes, rooms, zone resets — is **cont
 into shard memory at boot and cached. The engine boots with *none* of it (the bare-engine
 invariant from [ABILITIES.md](ABILITIES.md) §10).
 
-Storage shape (D2): **one table per definition *kind*** the engine models. The table is the
+Storage shape: **one table per definition *kind*** the engine models. The table is the
 *kind*; each **row is an instance** (content). This stays on-pillar — `ability_defs` never
 hardcodes `fireball`; `fireball` is a row — while buying real FK integrity for the world graph.
 
@@ -215,7 +213,7 @@ Two layers keep "one writer" honest:
 ## 8. Content loading & hot reload
 
 - Shards bulk-load `definitions` into memory at boot (filtered by enabled `pack`s).
-- On content change (OLC edit or deploy), the writer publishes an invalidation keyed by
+- On content change (a re-import / deploy), the writer publishes an invalidation keyed by
   `(kind, ref, pack)` on **NATS** (`content.invalidate`); shards reload just the affected rows
   (Lua included — ties to the per-zone VM hot-reload in ARCHITECTURE.md §3).
 - Because game-design changes are JSONB/Lua, they need **no schema migration** — the whole
@@ -235,17 +233,21 @@ Two layers keep "one writer" honest:
   every zone goroutine (one atomic `Load`), and a reload publishes a **new** table (a copy with
   the one entry replaced) via a single atomic `Store`. Readers see the whole old or whole new
   table, never a half-applied map. The old `*Prototype` stays alive while any live instance
-  aliases it (Go GC). This is `PHASE4-PLAN.md` §5 option 1 (whole-table swap), chosen over option
-  2 (per-zone reload message) because the cache is **per-shard, shared by every zone** — applying
-  a swap "on each zone goroutine" would still have N goroutines mutating one shared map. The only
-  runtime writer is the bus subscription goroutine (serial per subscription).
+  aliases it (Go GC). The whole-table swap is used rather than a per-zone reload message because
+  the cache is **per-shard, shared by every zone** — applying a swap "on each zone goroutine"
+  would still have N goroutines mutating one shared map. The only runtime writer is the bus
+  subscription goroutine (serial per subscription).
 - **Live instances are NOT retroactively changed** by a reload: an instance spawned before the
   edit keeps the prototype it spawned from; only later spawns see the new data. This is the
   documented MUD semantics (an existing mob keeps its stats; the next repop uses the edit), not a
   bug — it also avoids corrupting in-flight COW deltas. A deleted definition removes the cache
   entry (later spawns return nil/unknown) rather than serving a stale prototype.
 - **Trigger:** `make seed` (the re-import) publishes an invalidation for every ref in the pack
-  after the write commits (`contentbus.PublishPack`); a future OLC save publishes the same.
+  after the write commits (`contentbus.PublishPack`).
+- **Author caveat — `self.state` survives a script reload:** a reloaded entity script's non-handler
+  (top-level) body RE-EXECUTES against the PRESERVED `self.state` table, so a bare `state.x = 0` at
+  the top level clobbers a live value on any unrelated edit. Idiomatic content guards it with
+  `state.x = state.x or 0` (initialize-once).
 
 ## 9. Migrations
 

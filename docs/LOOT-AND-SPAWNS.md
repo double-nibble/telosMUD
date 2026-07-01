@@ -7,8 +7,6 @@ target experience: *kill the weekly boss for months chasing the legendary sword.
 Both stay on-pillar — every table, tier, affix, and schedule is content — and inside the actor
 model — scheduling lives in the director, resolution in the zone goroutine.
 
-Status: **proposal** — three choices flagged in §7.
-
 ---
 
 ## 1. Scheduled spawns vs. zone resets
@@ -87,7 +85,8 @@ resolver rolls an **instance quality**: item level + a set of **affixes** from `
 weighted by the item's tier, written into the item's flyweight **delta** ([MUDLIB.md](MUDLIB.md)
 §5). So two `warden_blade`s differ in stats/affixes; the prototype stays shared, only the delta
 varies. A legendary additionally rolls from a richer affix pool. This layer is optional per
-item (`quality_spec`), and is the §8 D3 decision.
+item (`quality_spec`). The affix pool is authored **inline** in each loot entry's `quality`
+spec (`internal/content/packs/demo.yaml`).
 
 ## 4. Bad-luck protection (pity)
 
@@ -95,7 +94,7 @@ The bounded version of "grind for months." A `chance` roll may carry a **pity** 
 that *doesn't* drop the item nudges the chance up by `step` (to a `cap`); a successful drop
 resets it. Counters are **per character**, stored in `state.loot_pity` (PERSISTENCE §3), read
 and updated by the resolver. Pure RNG (no pity) is just a roll with no pity spec — content's
-choice per entry (§8 D2).
+choice per entry.
 
 ## 5. The resolver (engine, on death)
 
@@ -106,16 +105,14 @@ Runs in the dying mob's zone goroutine, using the deterministic per-zone RNG (LU
 2  per looter    — each eligible player rolls independently (personal loot)
 3  for each roll — apply pity + luck modifiers → resolve (guaranteed / chance / weighted)
 4  select item(s)
-5  roll quality + affixes → write instance delta                                 [§8 D3]
+5  roll quality + affixes → write instance delta
 6  deliver       — each player's drops bind/deliver to them; the mob's corpse holds
                    only its body, never the rolled loot (no contested pickups)
 7  update pity   — increment misses / reset on the legendary; emit GMCP + messages
 ```
 
-**Lua escape hatch:** a loot table may supply an `on_roll(ctx)` Lua function for conditional
-drops the declarative form can't express — *"the Sunsword only drops while the realm is at
-war," "guarantee it on a player's first-ever kill,"* etc. Declarative for the 80%, Lua for the
-rest (consistent with ABILITIES.md D1).
+The resolver is **fully declarative**: a loot table is composed entirely of the roll kinds of
+§2 plus pity and quality specs, with no per-table Lua hook.
 
 **Modifiers:** drop chances can be scaled by content-defined factors — a `luck` attribute,
 difficulty, group size, a first-kill bonus — all just multipliers the resolver applies before
@@ -126,8 +123,9 @@ the roll.
 - **Schedules / next-spawn times** → director-owned `world_state` / `region_state`
   (WORLD-EVENTS §7), versioned, restart-safe.
 - **Pity counters** → character `state.loot_pity` JSONB, riding the normal durability ladder.
-- **Definitions** → `loot_table_defs`, `rarity_tier_defs`, `affix_defs`, `spawn_schedule_defs`
-  — the same per-type-table + JSONB-tail + `pack` pattern as everything else (PERSISTENCE §1).
+- **Definitions** → `loot_table_defs`, `rarity_tier_defs`, `spawn_schedule_defs` — the same
+  per-type-table + JSONB-tail + `pack` pattern as everything else (PERSISTENCE §1). Affix pools
+  ride inline in each loot entry's `quality` spec rather than a separate table.
 - A dropped legendary is a **persistent** item instance (PERSISTENCE §4); a common drop left on
   the ground is ephemeral.
 

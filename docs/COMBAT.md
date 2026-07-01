@@ -1,7 +1,7 @@
 # Combat model
 
-Decided flavor: **round-based (Diku/ROM-derived), layered avoidance + soak resolution,
-medium-depth affliction layer.** "ROM, refined." The engine provides the combat *framework*
+**Round-based (Diku/ROM-derived), layered avoidance + soak resolution, medium-depth affliction
+layer.** "ROM, refined." The engine provides the combat *framework*
 (round driver, resolution pipeline, event emission, hook points); the *numbers and rules*
 (to-hit curves, soak, skill and affliction tables) are data/Lua so designers tune without
 recompiling.
@@ -95,7 +95,7 @@ flag, application resist check, and an optional periodic tick.
   slow (fewer attacks / longer lag), blind (accuracy penalty).
 - **Buffs/debuffs** — stat and resist modifiers, sanctuary, haste, weaken, curse.
 - **Curing** — dispels, cure spells, and natural decay. *Not* the full IRE herb/salve meta —
-  that's a deliberate v1 boundary, leaving room to deepen later.
+  a deliberate scope boundary.
 
 Hooks: `OnApplyAffect`, `OnAffectTick`, `OnAffectExpire`, `OnDispel`.
 
@@ -138,28 +138,32 @@ OnDeath(victim, killer)
 OnApplyAffect / OnAffectTick / OnAffectExpire
 ```
 
-**Named interruptible checkpoints ([G9], Phase 6.4b).** The swing/cast/movement pipelines fire in-zone
+**Named interruptible checkpoints.** The swing/cast/movement pipelines fire in-zone
 events at named checkpoints content subscribes to via `on_event` (the event bus, event.go). The lit set:
 `OnHit`/`OnDamageTaken` (a swing landed / a target took damage), `OnKill` (a target died), `OnLeaveRoom`
 (an engaged foe is LEAVING a room — fired about each engaged reactor, the leaver bound as `other`, BEFORE
 the leaver detaches so the harm gate sees live in-room entities), and `BeforeCastCommit` (an ability is
-about to commit). v1 reactions are **declarative**: a handler may run a granted op-list + spend a
+about to commit). **Declarative** reactions: a handler may run a granted op-list + spend a
 **per-round reaction resource** (`per_round: true`) — e.g. a mob's `OnLeaveRoom` opportunity attack on a
 fleeing player, bounded to one/round so a second flee the same round provokes nothing. Reactions that
-**alter the in-flight action** (Counterspell cancelling a cast, Shield adding AC after the roll) are the
-Phase-7 Lua hatch: it only adds handlers at these same checkpoints — no pipeline surgery.
+**alter the in-flight action** (Counterspell cancelling a cast, Shield adding AC after the roll) use the
+Lua hatch: it only adds handlers at these same checkpoints — no pipeline surgery.
 
 Formulas (to-hit, soak curve, attacks/round, crit) live in a tunable ruleset table so balance
 changes don't require a recompile. Combat runs entirely inside the zone goroutine, so scripts
 and procs see a consistent single-threaded fight.
 
-## 10. Open / deferred
+## 10. Tuning & related mechanics
 
-- Exact to-hit and soak **curves** (linear vs diminishing-returns) — tune during content work.
-- PvP rules (consent, flagging, safe zones) — separate design pass. NOTE (Phase 7.4f): a pack
-  `pvp_allowed` Lua policy **SUPERSEDES** the engine's arena-forcing + both-must-consent default
-  (it does not augment them) — when a custom policy is defined, only it + the always-applied
-  safe-room veto decide PvP; the policy is fail-closed (a missing/erroring policy denies harm).
-  See docs/ABILITIES.md §7.
-- Whether casting uses the same lag model or a cast-time/interrupt model — leaning shared lag
-  for v1; revisit if spellcasting needs interrupts.
+- **To-hit and soak curves are content.** The engine fixes the pipeline *order* (gates → to-hit
+  → avoidance ladder → damage → soak → apply → OnHit); the shape of each check (linear,
+  diminishing-returns) is a content-authored check spec, so a pack tunes the curve without a
+  recompile (`internal/world/combat.go`).
+- **Casting uses a cast-time / interrupt model.** An ability with `cast_time = 0` goes straight
+  to commit; `cast_time > 0` schedules a lockout that is interruptible, refunding costs on
+  interrupt (`internal/world/ability.go`), alongside the shared skill-lag model of §5.
+- **PvP** is governed by the content-defined `pvp_allowed` policy — a pack `pvp_allowed` Lua
+  policy **SUPERSEDES** the engine's arena-forcing + both-must-consent default (it does not
+  augment them); when a custom policy is defined, only it + the always-applied safe-room veto
+  decide PvP, and the policy is fail-closed (a missing/erroring policy denies harm). See
+  [ABILITIES.md](ABILITIES.md) §7.

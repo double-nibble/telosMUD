@@ -31,41 +31,38 @@ IAC SB 201  <package-message-name> SP <json-payload>  IAC SE
 - GMCP emitters subscribe to the **same per-zone event bus** as text output: when an entity's
   vitals change, both the prompt and `Char.Vitals` are emitted from one event.
 
-## Supported packages (v1)
+## Implemented packages
 
 ### Core (client housekeeping)
 | Message            | Dir | Purpose                                  |
 |--------------------|-----|------------------------------------------|
 | `Core.Hello`       | C->S | client name/version                      |
 | `Core.Supports.Set/Add/Remove` | C->S | advertise package support   |
-| `Core.Ping`/`Core.Ping`        | <->   | latency measurement          |
-| `Core.Goodbye`     | S->C | reason on disconnect                     |
+| `Core.Ping`        | <->   | latency measurement                    |
 
 ### Char (the HUD)
-| Message            | Dir | Payload (example)                                            |
-|--------------------|-----|-------------------------------------------------------------|
-| `Char.Login`       | C->S | `{"name":"kurt","password":"..."}` (client-driven auth)     |
-| `Char.Vitals`      | S->C | `{"hp":120,"maxhp":150,"mp":40,"maxmp":60,"mv":200,"maxmv":250}` |
-| `Char.Stats`       | S->C | `{"str":18,"dex":14,"int":12,"level":23,"xp":45123,"tnl":9877}` |
-| `Char.Status`      | S->C | `{"state":"fighting","target":"a goblin","enemies":2}`      |
-| `Char.StatusVars`  | S->C | declares labels for Status keys (lets clients render generically) |
+| Message            | Dir | Payload                                                       |
+|--------------------|-----|--------------------------------------------------------------|
+| `Char.Vitals`      | S->C | every **content-defined** resource pool: `"<ref>"` current + `"max<ref>"` max — a pack with hp/mana/move yields all three; the engine names none |
+| `Char.Stats`       | S->C | every attribute a pack flagged `stat: true` → its resolved value; derived/internal attributes stay out of the panel |
+| `Char.Status`      | S->C | `{"state":"fighting","target":"a goblin"}` — position state + (when fighting) the target name |
 
-### Char.Items (inventory/equipment panels)
+`Char.Vitals` and `Char.Stats` carry **no engine-named keys** — which resources and which
+attributes appear is entirely content's choice, honoring the "engine = mechanism, content =
+flavor" pillar. Both are change-detected (map marshal sorts keys) and re-emitted only on change.
+
+### Char.Items (inventory/equipment panel)
 | Message              | Dir | Purpose                                            |
 |----------------------|-----|----------------------------------------------------|
-| `Char.Items.Inv`     | S->C | full inventory list                                |
-| `Char.Items.Contents`| S->C | contents of a container the player opened          |
-| `Char.Items.Room`    | S->C | items on the ground in the current room            |
-| `Char.Items.Add/Remove/Update` | S->C | incremental deltas to any of the above   |
+| `Char.Items.List`    | S->C | a `{location, items}` list, re-sent on change      |
 
-Item entry: `{"id":"i4821","name":"a steel longsword","icon":"sword","attrib":"wWtl"}`.
+Item entry: `{"id":"i4821","name":"a steel longsword","attrib":"wWc"}` — `attrib` is
+single-char flags (`w`=wearable, `c`=container, `W`=currently worn/wielded).
 
 ### Room (the minimap)
 | Message            | Dir | Purpose                                                       |
 |--------------------|-----|---------------------------------------------------------------|
-| `Room.Info`        | S->C | the key one — see below                                       |
-| `Room.WrongDir`    | S->C | player tried a non-exit (client can flash the map)            |
-| `Room.Players`     | S->C | who else is in the room                                       |
+| `Room.Info`        | S->C | the structured room data — see below; re-emitted only on a room change |
 
 `Room.Info` payload (drives the minimap):
 ```json
@@ -74,36 +71,24 @@ Item entry: `{"id":"i4821","name":"a steel longsword","icon":"sword","attrib":"w
   "name": "The Temple Square",
   "zone": "midgaard",
   "environment": "city",
-  "coord": [3001, 12, 8, 0],          // [zone-ref, x, y, z] for map layout
-  "exits": { "n": 3002, "e": 3014, "d": 3500 },
-  "doors": { "e": "closed" },
-  "details": ["fountain", "shop"]
+  "coord": [17, 12, 8, 0],            // [zone-id, x, y, z]; omitted when the room has no authored coords
+  "exits": { "n": 3002, "e": 3014, "d": 3500 }
 }
 ```
 The client builds the minimap from `coord` + `exits` across rooms it has seen; `zone`
-groups rooms; `environment` picks terrain coloring.
+groups rooms; `environment` (the room's content sector) picks terrain coloring. `num` and the
+exit destinations are stable per-room integer ids mapped from the room's `ProtoRef`.
 
 ### Comm (chat routing)
 | Message              | Dir | Purpose                                          |
 |----------------------|-----|--------------------------------------------------|
-| `Comm.Channel.Text`  | S->C | `{"channel":"gossip","talker":"kurt","text":"hi"}` — client can route to a tab |
-| `Comm.Channel.List`  | S->C | available channels                               |
-| `Comm.Channel.Players`| S->C| who's on a channel                               |
+| `Comm.Channel.Text`  | S->C | `{"channel":"gossip","talker":"kurt","text":"hi"}` — mirrors a channel line so a client can route it to a per-channel tab (same hear-set filter as the text line) |
 
-## Our own namespace
+## The `Mud.*` namespace
 
-Custom features (quest tracker, group/party frames, map overview, cooldowns) live under a
-branded package, e.g. **`Mud.*`**:
-
-- `Mud.Quest.List` / `Mud.Quest.Update` — quest log + objective progress
-- `Mud.Group` — party member vitals (for party frames)
-- `Mud.Cooldowns` — ability cooldown timers (for action-bar HUDs)
-- `Mud.Map` — full zone map blob (rooms + coords) on zone entry, so clients render the whole
-  area at once instead of accreting room-by-room
-
-Keeping custom data in `Mud.*` (vs. overloading `Char.*`) means standard clients ignore what
-they don't understand, and our web client can opt into the richer set.
+Custom features live under a branded **`Mud.*`** namespace (rather than overloading `Char.*`),
+so standard clients ignore what they don't understand.
 
 ## Testing
 Mudlet is the reference client (built-in GMCP debugger). The bot-swarm load tool also speaks
-GMCP so we can assert that vitals/room/inventory deltas are correct under load.
+GMCP, so vitals/room/inventory correctness can be asserted under load.

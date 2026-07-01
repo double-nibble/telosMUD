@@ -4,8 +4,6 @@ The content-agnostic engine: how the world is represented (identity, entities, c
 containment) and how player input becomes action (command parser, targeting, messaging).
 Everything else — skills, persistence, Lua API — references these shapes.
 
-Status: **settled** — structural choices recorded in §8.
-
 ---
 
 ## 1. Identity
@@ -112,7 +110,7 @@ as an event — a command handler must never block the zone loop.
 ## 5. Prototypes & instancing
 
 Content authors define **prototypes** (templates keyed by `ProtoRef`); the world spawns
-**instances**. Proposed model (see §8 D1):
+**instances**. The model:
 
 - **Immutable prototype** loaded once from the content DB and cached per shard: base
   descriptions, base stats, component template.
@@ -121,8 +119,7 @@ Content authors define **prototypes** (templates keyed by `ProtoRef`); the world
   actually change on the instance (current hp, durability, enchants, contents) are stored
   locally. Copy-on-write when an instance first mutates a shared field.
 
-This keeps a room full of 40 identical kobolds cheap, which matters at the stated scale. The
-simpler alternative — deep-copy every field on spawn — is the §8 fork.
+This keeps a room full of 40 identical kobolds cheap, which matters at the stated scale.
 
 ## 6. Command parser
 

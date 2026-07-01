@@ -6,9 +6,8 @@ API** — never raw Go internals. Lua runs *inside* the owning zone's goroutine,
 a consistent, single-threaded world.
 
 Runtime: `gopher-lua` (a minimal fork — [github.com/double-nibble/gopher-lua](https://github.com/double-nibble/gopher-lua), pulled in via a go.mod `replace`; the fork keeps the `github.com/yuin/gopher-lua` module path).
-Status: design baseline; **[Phase 7 in COMPLETED.md](COMPLETED.md#phase-7) is the implementation source of
-truth** (it orders this into slices, resolves the three open forks §10 flagged, and supersedes
-§5's mechanism claims — see the §5 note below).
+The sandbox mechanism and defaults below are as built; [Phase 7 in COMPLETED.md](COMPLETED.md#phase-7)
+records the implementation history.
 
 ---
 
@@ -106,13 +105,9 @@ This buys three things:
 
 ## 5. The sandbox
 
-> **Superseded by [Phase 7 in COMPLETED.md](COMPLETED.md#phase-7) (§1.1, §2 threat rows T3/T4/T13/T14,
-> §2.1 the allowlist).** The original draft of this section cited `SetMaxStackSize` and
-> "instruction budget via the LState context" — **both are wrong for gopher-lua v1.1.1**
-> (verified against the real runtime): `SetMaxStackSize` does not exist, and the `LState`
-> context bounds wall-clock **between** ops only, never instruction count and never inside a
-> Go builtin. This section is corrected to match what slice 7.1 actually builds; the plan is
-> the source of truth for the mechanism and defaults.
+> **gopher-lua v1.1.1 constraints this section works within:** `SetMaxStackSize` does not
+> exist, and the `LState` context bounds wall-clock **between** ops only — never instruction
+> count and never inside a Go builtin. The mechanisms below are built to those limits.
 
 The VM is built (per zone, at zone build) with a **restricted global table assembled from an
 allowlist** — the kept base functions are registered **individually**, *not* via
@@ -122,8 +117,7 @@ allowlisting makes an unsafe capability *absent*, not *hidden*):
 - **Dropped (never registered):** `load`/`loadstring`/`dofile`/`loadfile`/`require`/`module`/
   `package`, `getmetatable`/`setmetatable`/`rawget`/`rawset`/`rawequal`/`rawlen`/`next`/`_G`/
   `setfenv`/`getfenv`/`newproxy`/`collectgarbage`, `os`/`io`/`debug`, `coroutine`/`channel`,
-  `string.dump`. No filesystem, network, process, code-loading, metatable, or FFI reach
-  (PHASE7-PLAN.md §2.1).
+  `string.dump`. No filesystem, network, process, code-loading, metatable, or FFI reach.
 - **Kept:** `string`, `table`, `math` (with `math.random` rebound to the per-zone engine RNG
   and `math.randomseed` a no-op, §9); `assert`/`error`/`pcall`/`xpcall`/`select`/`type`/
   `tostring`/`tonumber`/`pairs`/`ipairs`/`unpack`; `print` redirected to `mud.log`. The
@@ -131,7 +125,7 @@ allowlisting makes an unsafe capability *absent*, not *hidden*):
   only as **size-capped wrappers**, never the raw stdlib versions (T13 — a single-op alloc
   bomb like `string.rep("A", 2e9)` allocates GB in one instruction that neither the count nor
   the clock can stop).
-- **CPU quota — three layers** (P7-D6): **(1)** a **vendored gopher-lua fork** adds a
+- **CPU quota — three layers:** **(1)** a **vendored gopher-lua fork** adds a
   deterministic per-call **instruction-count abort** in `mainLoopWithContext`
   (the [double-nibble/gopher-lua](https://github.com/double-nibble/gopher-lua) fork) — v1.1.1 has no `SetHook`/`MaskCount`/
   debug-hook, so the count cannot come from a hook; **(2)** the `LState` **context deadline**

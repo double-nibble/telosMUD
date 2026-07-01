@@ -96,22 +96,23 @@ builders can't define and fire their own events — the bus is incomplete.
 
 5. **Comprehensive, not curated-to-taste.** The engine's job is to emit an event at
    *every* action and transition, not to guess which ones builders will want. A
-   missing hook is an *engine bug*, not a content limitation. (The current
-   `eventKind` taxonomy in [WORLD-EVENTS.md](WORLD-EVENTS.md) is partial — several
-   kinds are reserved-but-unlit; filling it out is ongoing engine work.)
+   missing hook is an *engine bug*, not a content limitation. (A few `eventKind`s in
+   [WORLD-EVENTS.md](WORLD-EVENTS.md) are named-and-reserved but not yet fired — the
+   affect-lifecycle hooks; a subscription authored against them parses now.)
 6. **Builders define their own events.** A system the engine never imagined needs
-   builder-named events content *fires* and *subscribes to* — the bus must not be
-   limited to the engine's enumerated kinds. *(Open: today's closed `eventKinds`
-   validation map needs a content-namespaced custom-event lane — Phase 7.)*
+   builder-named events content *fires* and *subscribes to* — the bus is not limited to
+   the engine's enumerated kinds. Content-namespaced custom events ride the `<pack>:Name`
+   lane (e.g. `sailing:OnShipDock`), namespaced by pack so two packs' same-named events
+   never collide, and validated distinctly from the engine's closed bare-name set.
 7. **Hooks are bounded and gated.** Universal hookability is universal attack
    surface, so every hook runs under the shared depth/width budget (a recursive hook
-   *terminates*, never overflows — the 6.5 death-seam lesson) and any harmful op
-   inside re-funnels the PvP/hostility gate. Phase 7 Lua hooks additionally run in
-   the sandbox (instruction budget, curated API). Power, without a foot-gun.
+   *terminates*, never overflows) and any harmful op inside re-funnels the PvP/hostility
+   gate. Lua hooks additionally run in the sandbox (instruction budget, curated API).
+   Power, without a foot-gun.
 8. **Hooks are the glue between systems.** Loot, crafting, progression, and quests
    get no bespoke engine wiring — they are content subscribing to the same events
    combat, movement, and abilities already emit. Events are the integration layer.
 
 Realized by the in-zone event bus ([internal/world/event.go](../internal/world/event.go),
-[WORLD-EVENTS.md](WORLD-EVENTS.md)) and the ability/affect `on_event` hooks; Phase 7
-(Lua) makes the hook *bodies* arbitrary content.
+[WORLD-EVENTS.md](WORLD-EVENTS.md)) and the ability/affect `on_event` hooks; the Lua
+runtime makes the hook *bodies* arbitrary content.

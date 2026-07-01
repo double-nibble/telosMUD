@@ -2,16 +2,16 @@
 
 How zones are assigned to world servers so the fleet can scale in/out and survive
 server failure without operator intervention. This is the **policy** layer on top of
-the directory **mechanism** (zone leases) that already exists.
+the directory **mechanism** (zone leases).
 
-Status: **Phase 10.6 — claim-from-pool + the coordinator brain landed.** `internal/placement` holds the
-two pure cores (`ClaimFromPool` for decentralized liveness, `Plan` for the balance decision), wired into
-`telos-world` (a server now CLAIMS its zones from the pool at boot and runs as a STANDBY if it wins none)
-and `telos-director` (the leader observes the live fleet via `directory.ListShards` + `Plan`s the desired
-rebalancing, logging the recommended moves). **Remaining (the documented next mile):** EXECUTING a planned
-rebalance move — draining a zone's live players to the new owner via the cross-shard handoff fanned over
-the zone (`Shard.Drain`) — and a standby spinning up a re-claimed orphan at runtime (live zone-add). The
-boot-time claim + the optimizer's decision are done; the live multi-player drain is the heavy follow-on.
+`internal/placement` holds the two pure cores: `ClaimFromPool` for decentralized
+liveness and `Plan` / `PlanWeighted` for the balance decision. A `telos-world` server
+CLAIMS its zones from the pool at boot and runs as a STANDBY if it wins none;
+`telos-director` (the leader) observes the live fleet via `directory.ListShards` and
+`Plan`s the desired rebalancing. The graceful zone drain executes over the cross-shard
+handoff fanned across the whole zone (`Shard.BeginDrain` → `drainZone` → the destination's
+`AdoptZone`), so a rolling redeploy or planned move migrates every live player in a zone
+with the socket held open (zero drop).
 
 Prior art: this is **Akka Cluster Sharding** (a singleton `ShardCoordinator` allocates
 shards to nodes and rebalances; nodes host the entities; entities recover from
@@ -109,48 +109,45 @@ answers:
 
 1. **Graceful move** (rebalance, planned scale-down): the source is **alive**, so it does
    an orderly **zone drain** — freeze every player in the zone, snapshot each, hand them
-   off to the new owner, gate re-dials. This is the per-player cross-shard handoff we
-   already built, **fanned out over a whole zone**. Seamless to players.
+   off to the new owner, gate re-dials. This is the per-player cross-shard handoff,
+   **fanned out over a whole zone** (`Shard.BeginDrain`). Seamless to players.
 
 2. **Crash** (source is **dead**): there is no source to snapshot from, so the zone's
    in-memory state is lost **unless it was persisted**. The new owner **rehydrates each
-   player from their last checkpoint** (Postgres/Redis — the Phase 4 durability ladder);
+   player from their last checkpoint** (Postgres/Redis — the durability ladder);
    players lose only the last few seconds of un-checkpointed transient state, and their
    gate stream breaks so they reconnect (the directory now points at the new owner). This
    is textbook actor recovery (Akka Persistence / Orleans reactivation from storage).
 
 **Consequence:** crash-failover of live players is **not fully solvable without
-persistence**. This is why placement is a Phase 10 concern built on Phase 4 — see §6.
+persistence** — the graceful path (§5.1) needs only the handoff, but the crash path (§5.2)
+needs the durability ladder to reconstruct a player the new owner never saw.
 
 ---
 
-## 6. Dependency on Phase 4 (persistence)
+## 6. The persistence dependency
 
-The graceful path (§5.1) needs only the handoff (have it). The crash path (§5.2) needs
-the **durability ladder** (memory → Redis checkpoint → Postgres) and `state_version`
-(PERSISTENCE.md) so a *new* owner can reconstruct a player it never saw. Therefore:
-
-- **Phase 4 (persistence)** is a hard prerequisite for crash-failover.
-- **Phase 10 (director)** hosts the coordinator and the rebalancing/drain logic.
-
-Until both exist, static `TELOS_ZONES` is correct, and the directory abstraction means
-the eventual switch touches no gate/handoff code.
+The graceful path (§5.1) rides the handoff alone. The crash path (§5.2) rides the
+**durability ladder** (memory → Redis checkpoint → Postgres) and `state_version`
+(PERSISTENCE.md) so a *new* owner can reconstruct a player it never saw. The directory
+abstraction keeps placement decoupled from gate/handoff code: a zone moves by rewriting one
+lease, and no gate or peer names a shard address.
 
 ---
 
-## 7. Sharp edges (for when we build it)
+## 7. Sharp edges
 
 - **Balance by *load*, not zone count.** `Z/S` assumes zones are equal-cost, but a newbie
-  town ≫ an empty wilderness. Count-based is a fine v1; load-aware (player count / tick
-  time) is the real target.
+  town ≫ an empty wilderness. The planner (`PlanWeighted`) balances by per-zone weight; the
+  live occupancy signal that supplies those weights is the remaining piece.
 - **Locality vs. balance tension.** ARCHITECTURE.md §4 wants *adjacent* zones colocated so
   common room-to-room movement is an in-process channel send, not a network handoff. A
   naive even-count balancer splits neighbors across servers and turns cheap moves into
   handoffs. The balancer must be locality-aware — which fights perfect balance. A real
   trade-off, not a bug.
-- **Rebalance hysteresis.** Moving a zone is expensive (it drains players). Only rebalance
-  past an imbalance threshold, with cooldowns, or the fleet thrashes. (Akka exposes exactly
-  these knobs.)
+- **Rebalance hysteresis.** Moving a zone is expensive (it drains players). Rebalancing
+  past an imbalance threshold, with cooldowns, keeps the fleet from thrashing. (Akka exposes
+  exactly these knobs.)
 - **Claim storm on failure.** When a lease expires, jittered/randomized claim retries plus
   the CAS (one winner) prevent a thundering herd; the director can also arbitrate by
   directing the claim to a chosen standby.
@@ -159,8 +156,8 @@ the eventual switch touches no gate/handoff code.
 
 ## 8. Summary
 
-Director-as-shard-coordinator (control plane) + the existing directory leases (truth) +
+Director-as-shard-coordinator (control plane) + the directory leases (truth) +
 decentralized lease-claim for liveness (so availability never depends on the director),
 with graceful drains for planned moves and persistence-backed rehydration for crashes.
-It reuses everything built through Phase 3, degrades gracefully under every failure mode,
-and is the Akka Cluster Sharding pattern adapted to TelosMUD.
+It reuses the directory, the handoff, and the durability ladder, degrades gracefully under
+every failure mode, and is the Akka Cluster Sharding pattern adapted to TelosMUD.

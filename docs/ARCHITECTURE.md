@@ -9,11 +9,11 @@
 ```
                          ┌──────────────┐
    Browser ── OAuth ───▶ │ telos-account│  (Google/Discord/GitHub)
-                         │  + website   │  issues accounts, characters, link codes
+                         │  OAuth broker │  issues accounts, characters
                          └──────┬───────┘
-                                │ gRPC/REST (auth, link-code verify)
+                                │ gRPC (device-code auth)
                                 ▼
- telnet/SSH        ┌────────────────────────┐        per-player gRPC bidi stream
+ telnet            ┌────────────────────────┐        per-player gRPC bidi stream
  clients ─────────▶│      telos-gate (N)     │──────────────┐
  (Mudlet, etc.)    │  protocol edge, GMCP    │              │
                    └────────────┬───────────-┘              ▼
@@ -133,11 +133,9 @@ logged + metered (lag pulse) for capacity planning.
      the target zone and ACKs.
   3. Directory updated (`player -> newShard`); gate notified to re-dial; old session torn
      down after the gate's new stream is live (brief double-buffer to avoid lost input).
-- **Instanced zones** (dungeons, player housing) are spun up on demand on the least-loaded
-  shard and torn down when empty.
 - **Hot zones** (newbie areas, town square) are the real scaling limit — one zone = one
-  goroutine = one core. Mitigations: occupancy caps, sharding a "town" into sub-zones, or
-  instancing. Documented as a known constraint, not hand-waved.
+  goroutine = one core. Mitigations: occupancy caps and sharding a "town" into sub-zones.
+  Documented as a known constraint, not hand-waved.
 
 ## 5. Coordination plane
 
@@ -169,65 +167,62 @@ The gate implements the telnet option dance and normalizes everything to `Player
   `IAC SB 201 <"Package.Message" + space + JSON> IAC SE`. See [GMCP.md](GMCP.md).
 - **Line discipline** — telnet edit, IAC escaping, partial-line prompts (`>` without
   newline), and ANSI/xterm-256 color passthrough.
-- **SSH (later)** — `golang.org/x/crypto/ssh`; clean public-key auth (register pubkey on the
-  website -> no password on the wire). GMCP has no SSH equivalent, so rich data rides a
-  parallel channel or an in-band escape for SSH clients.
 
 Each connection uses two goroutines (read/write) over a buffered framer. With tuned socket
 buffers a single gate handles ~50---100k connections; millions = dozens of gates per region.
 
 ## 7. Authentication (OAuth <-> telnet)
 
-Telnet can't speak OAuth, so we bridge:
+Telnet can't speak OAuth, so the gate bridges via a device-code flow. Auth is **OAuth-only** —
+there are no passwords, passphrases, or link codes on the wire.
 
-1. User signs in on the website via OAuth (Google/Discord/GitHub) -> account + character(s)
-   created in `telos-account`.
-2. Website offers either a short-lived **link code** (6---8 chars, Redis TTL, one-shot) or a
-   user-set **MUD passphrase** (Argon2id hashed).
-3. Telnet: `connect <character> <code|passphrase>`. The gate verifies via `telos-account`,
-   acquires the single-session lock in Redis, and binds the connection to the character.
-4. GMCP clients may submit credentials via `Char.Login` instead of typed commands.
-5. **SSH (later):** register an SSH public key on the website; the gate authenticates by key
-   and maps it straight to the account — no secrets typed in the world.
+1. Telnet: the player types `connect`. The gate mints a short-lived device code and hands the
+   player a one-click browser link to the **`telos-account` OAuth broker**.
+2. In the browser, the player completes OAuth (Google/Discord/GitHub); the broker resolves-or-
+   creates the account and flips the pending device session to authed.
+3. The gate polls the broker, resolves the connection to the account, acquires the single-
+   session lock in Redis, and drives prompt-based character selection / chargen.
+4. On a dev deployment, `TELOS_DEV_AUTOAUTH` bypasses the broker for smoke testing.
 
 ## 8. Repository layout
 
-Monorepo, Go workspace (`go.work`). The **mudlib is `internal/mudlib`** — pure engine,
-depends only on interfaces (no concrete transport/DB), so it stays testable and content-
-agnostic.
+Monorepo, Go workspace (`go.work`). The engine lives in `internal/world` (the simulation:
+entities, components, zones, command parser, act() messaging, combat, tick, event bus,
+affects, comms, the Lua runtime, GMCP) — pure engine, content-agnostic. It depends on
+persistence/transport only through interfaces (`internal/store`, `internal/directory`,
+the bus packages), so it stays testable and headless.
 
 ```
 telosmud/
   go.work
-  api/proto/                 # protobuf: gate<->world, account, handoff
+  api/proto/                 # protobuf: play (gate<->world), account, handoff
   cmd/
-    telos-gate/              # telnet/SSH edge
+    telos-gate/              # telnet edge
     telos-world/             # world shard
-    telos-account/           # OAuth + account/character API
-    telos-admin/             # ops CLI (rebalance zones, broadcast, drain)
+    telos-account/           # OAuth broker + account/character API
+    telos-director/          # region/world director (orchestration tier)
+    telos-migrate/           # schema migrations
+    telos-seed/              # content-pack importer
+    telos-botswarm/          # synthetic-telnet load generator
   internal/
-    mudlib/                  # ── THE ENGINE ──  (content-agnostic)
-      entity/               #   ECS-lite: id + components
-      world/                #   zone / room / exits
-      command/              #   parser, verb registry, targeting ("get 2.sword")
-      act/                  #   act()-style perspective messaging ("$n gets $p")
-      combat/               #   pluggable combat rules
-      tick/                 #   heartbeat scheduler
-      event/                #   in-zone typed event bus
-      affect/               #   timed buffs/effects
-      comm/                 #   channels, tells, says
-      script/               #   Lua runtime + exposed API, sandbox, hot reload
-      gmcp/                 #   GMCP registry, packages, per-conn encoder
-      persist/              #   save/load interfaces (impl lives in store/)
+    world/                   # ── THE ENGINE ── entities, components, zones, command
+                             #   parser + targeting, act(), combat, tick, event bus,
+                             #   affects, comms, Lua runtime + sandbox + hot reload,
+                             #   GMCP; cross-shard handoff (content-agnostic)
+    content/                 # content packs + the DTO->prototype loader, chargen
+    account/                 # account/character service, device-code auth
+    web/                     # the telos-account OAuth broker (device-code bridge)
+    assertion/               # signed account assertions
     telnet/                  # option negotiation, MCCP, NAWS, GMCP framing
-    ssh/                     # (later)
-    transport/               # gRPC client/server glue, PlayerIn/Out framing
-    bus/                     # NATS wrappers (chat, presence, handoff)
-    store/                   # Postgres + Redis repositories (implements persist)
-    directory/               # zone->shard / player->shard locator
-    session/                 # connection/session lifecycle, linkdeath
-  content/                   # (LATER) world data + Lua — NOT engine code
-  deploy/                    # docker-compose, k8s, pg/redis/nats config
+    gate/                    # edge session lifecycle, linkdeath, stream to world
+    store/                   # Postgres + Redis repositories, mail
+    directory/               # zone->shard / player->shard locator, leases
+    placement/               # claim-from-pool + the rebalance planner
+    director/                # director actor: scopes, scoped bus, leader election
+    scopebus/ contentbus/ commbus/ presence/   # NATS-backed buses
+    sessionlock/ checkpoint/ config/ metrics/ obs/ textsan/
+    botswarm/                # load-tester internals
+  deploy/                    # docker-compose, pg/redis/nats config
   docs/
 ```
 
@@ -256,7 +251,7 @@ telosmud/
 | Layer     | Scales by                         | Bottleneck / mitigation                              |
 |-----------|-----------------------------------|------------------------------------------------------|
 | Gate      | add instances behind L4 LB        | fd limits, buffers; ~50---100k conns/instance          |
-| World     | add shards, rebalance zones       | hot single zone = 1 core -> caps / sub-zones / instances |
+| World     | add shards, rebalance zones       | hot single zone = 1 core -> caps / sub-zones          |
 | NATS      | clustering, subject partitioning  | fan-out on huge global channels -> shard channels     |
 | Postgres  | read replicas, partitioning       | player write rate -> Redis write-back + batching      |
 | Redis     | cluster mode                      | hot keys (presence) -> local TTL caches on shards     |

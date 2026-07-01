@@ -6,8 +6,6 @@ docs gave us per-zone events ([ARCHITECTURE.md](ARCHITECTURE.md) §3) and NATS t
 doc adds the **scope hierarchy**, the **director actors**, and the **scoped event bus** that
 turn those into first-class, builder-usable mechanisms.
 
-Status: **proposal** — three choices flagged in §10.
-
 > **The golden rule:** cross-scope effects are *message-passing, never shared mutation*. A
 > script never reaches into another zone (the [LUA.md](LUA.md) §4 invariant stands). It
 > *signals*; the engine routes the signal; each affected zone applies the consequence locally
@@ -80,7 +78,7 @@ world.<event>            region.<id>.<event>            zone.<id>.<event>
   handler runs single-threaded and mutates only local entities.
 
 ### Reliability tiers
-Events declare a tier (see §10 D3):
+Events declare a tier:
 
 - **`transient`** — cosmetic, fire-and-forget over NATS core (e.g. "distant horns sound"). Lost
   if a shard is momentarily down; no harm.
@@ -89,30 +87,28 @@ Events declare a tier (see §10 D3):
   **ordering** (the director is the sequencer). The invasion's start/phase/end events are
   durable; a shard that was down catches up on reconnect.
 
-## 5. Lua API additions
+## 5. The zone-side Lua API
 
-Extends the [LUA.md](LUA.md) surface. Zone scripts get read + signal; director scripts get the
-authoritative write API.
+Extends the [LUA.md](LUA.md) surface. Zone scripts get the **read + signal** surface — cached
+reads of region/world state and the write-up channel to the director. They never write
+region/world state directly.
 
 ```lua
 -- in any zone script (read replica + signal up):
 world.flag("invasion_active")            -- cached read
 region:get("mood")                       -- cached read
 signal_region("boss_slain", {by = killer:id()})   -- command up to the region director
+signal_world("gate_opened", {})          -- command up to the world director
 on_region("city_liberated", function(ev) ... end) -- react to a broadcast, locally
 on_world("invasion.phase", function(ev) ... end)
-
--- in a director script (owns the scope, single writer):
-world.set("invasion_active", true)       -- authoritative write
-region:set("mood", "liberated")
-broadcast_region("city_liberated", {hero = ev.by})        -- fan out to member zones
-spawn_in("duskwall:gate", "mob:raider")  -- remote effect → delivered as a command to that zone
-mud.after(300, next_wave)                -- director heartbeat scheduling
 ```
 
-**Remote effect ops:** a director acting "at a distance" (spawning a mob in a specific room of
-a zone it doesn't own) does not mutate that zone — `spawn_in` compiles to a **command** placed
-on the target zone's inbox and applied there locally. Same single-writer guarantee.
+The **authoritative write side** — setting scope state and broadcasting consequences down to
+member zones — is owned by the director (§3), which runs single-threaded on the director
+goroutine. Its handler API sets state (persist + broadcast the delta down) and broadcasts
+remote-effect events down; a director "acting at a distance" (e.g. spawning a mob in a room of
+a zone it doesn't own) does not mutate that zone — the broadcast lands on the target zone's
+inbox and is applied there locally. Same single-writer guarantee.
 
 ## 6. Worked examples — the three cases
 
@@ -120,25 +116,25 @@ on the target zone's inbox and applied there locally. Same single-writer guarant
 1. Boss dies in room R (zone A). Its `on("death")` runs in A's goroutine.
 2. Script: `signal_region("boss_slain", {by = killer:id()})` (durable).
 3. The Duskwall **region director** receives it, sets `region.mood = "liberated"`, and
-   `broadcast_region("city_liberated", …)`.
+   broadcasts `city_liberated` down to member zones.
 4. Every member zone (A, B, …, across shards) gets it in its inbox; subscribed room/mob scripts
    react locally — guards leave, gates open, vendors restock, ambient text changes.
 
 **(b) A quest changes how other rooms behave** — two distinct flavors:
 - **Per-player** (the world looks different *to you*): a room script checks
-  `actor:has_flag("amulet_done")`. Purely local, already supported, no new scaffolding.
+  `actor:has_flag("amulet_done")`. Purely local, no scoped state needed.
 - **World-altering** (the change is permanent for everyone): quest completion does
-  `signal_world("gate_opened", …)` → the world director sets the flag and broadcasts; rooms
-  everywhere react and the change persists. Uses the scaffolding here.
+  `signal_world("gate_opened", …)` → the world director sets the flag and broadcasts it down;
+  rooms everywhere react and the change persists.
 
-**(c) A MUD-wide invasion** — a world-director script:
-1. Triggered (timer/admin/threshold) → `world.set("invasion_active", true)`,
-   `broadcast_world("invasion.start")` (durable).
-2. On its heartbeat, sends `spawn_in(...)` waves to target zones; zones report kills via
+**(c) A MUD-wide invasion** — driven by the world director:
+1. Triggered (timer/admin/threshold) → the director sets `invasion_active` and broadcasts
+   `invasion.start` down (durable).
+2. On its heartbeat it sends spawn waves down to target zones; zones report kills up via
    `signal_world("raider_killed", …)`.
-3. Director tallies, advances phases (`broadcast_world("invasion.phase", {n=2})`), and on
-   completion broadcasts the outcome + triggers rewards. All orchestration in one actor; all
-   consequences applied locally by zones.
+3. The director tallies, advances phases (broadcasting `invasion.phase`), and on completion
+   broadcasts the outcome + triggers rewards. All orchestration in one actor; all consequences
+   applied locally by zones.
 
 ## 7. Persistence
 
@@ -156,9 +152,8 @@ on the target zone's inbox and applied there locally. Same single-writer guarant
   and JetStream replays in-flight durable events (idempotency prevents double-apply).
 - **Member shard down during a broadcast** → durable events are redelivered on reconnect; the
   zone catches up. Transient events are simply missed (acceptable by tier).
-- **Signal storm** (a thousand mobs die at once) → directors coalesce/debounce where the script
-  opts in (`signal_region(..., {coalesce = true})`), and the durable stream provides
-  backpressure rather than overrunning a director.
+- **Signal storm** (a thousand mobs die at once) → the durable stream provides backpressure
+  rather than overrunning a director.
 
 ## 9. What this does *not* change
 

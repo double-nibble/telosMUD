@@ -3,8 +3,8 @@
 This is the breadth reference for TelosMUD's content-model design: open / SRD-licensed
 tabletop RPG systems used as the **acceptance target** for "engine = mechanism, content =
 flavor." If the engine can express these as pure content (packs + Lua, no engine changes
-for flavor), the extensibility thesis holds. The `rpg-systems-designer` agent owns the gap
-analysis driven by this list.
+for flavor), the extensibility thesis holds. The gap analysis this list drove is archived in
+[COMPLETED.md](COMPLETED.md).
 
 The list deliberately spans design philosophies — d20 (5e/Pathfinder/13th Age/OSR), d100
 (BRP/OpenQuest/Delta Green/Legend), dice-pool & narrative (FATE/PbtA/Blades/Year Zero/

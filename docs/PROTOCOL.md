@@ -101,7 +101,8 @@ message Ping         { uint64 nonce = 1; }
 message Redirect {
   string target_shard_addr = 1;  // gate dials here
   string handoff_token     = 2;  // gate presents this in the new Attach
-  uint64 resume_input_seq  = 3;  // replay client input from here
+  // the replay point rides on the destination's Attached frame (ServerFrame.ack_input_seq),
+  // not the redirect — the gate replays from what the new shard has actually consumed.
 }
 message Disconnect { string reason = 1; bool reconnectable = 2; }
 ```
@@ -172,13 +173,18 @@ message PlayerSnapshot {
   repeated Affect     affects       = 8;   // buffs/debuffs with remaining duration
   repeated SkillState skills        = 9;
   map<string,string>  flags         = 10;  // volatile flags not worth a column
-  uint64              state_version = 11;   // optimistic-concurrency guard vs the DB
+  uint64              state_version = 11;  // optimistic-concurrency guard vs the DB
+  uint64              applied_seq   = 12;  // highest input seq applied at freeze (§5)
+  string              persist_id    = 13;  // characters.id, so the destination CASes the same row
+  string              comms_state   = 14;  // per-channel toggles / ignore list / AFK (JSON)
+  string              state_json    = 15;  // remaining content state subtree (the full carry)
 }
 ```
 
-(`Item`, `Equipped`, `Affect`, `SkillState`, `CoreStats`, `Vitals` defined in
-`common.proto`.) Position/combat target are intentionally absent — **you cannot change zones
-while in combat** (classic MUD rule), so there is no fight to transfer.
+(`Item`, `Equipped`, `Affect`, `SkillState`, `CoreStats`, `Vitals` are defined in
+`common.proto`; `PlayerSnapshot` itself lives in `handoff.proto`.) Position/combat target are
+intentionally absent — **you cannot change zones while in combat** (classic MUD rule), so
+there is no fight to transfer.
 
 ---
 
@@ -192,9 +198,10 @@ while in combat** (classic MUD rule), so there is no fight to transfer.
    `handoff_token` + its dial address.
 4. A updates the **directory** (`player -> B`, new epoch) — broadcast on NATS for cache
    invalidation.
-5. A sends `Redirect{B addr, token, resume_seq}` down the player's stream to the gate.
+5. A sends `Redirect{B addr, token}` down the player's stream to the gate.
 6. The gate stops sending to A, dials B's `Play.Connect`, and sends `Attach{handoff_token,
-   input_seq}`. B binds the stream to the pending entity and replays any un-acked input.
+   input_seq}`. B replies `Attached` with the input seq it has already consumed; the gate
+   replays from there, then resumes live forwarding.
 7. B (or A on B's signal) calls `Commit`; B activates the player, A drops the frozen copy and
    closes the old stream.
 
@@ -223,23 +230,18 @@ while in combat** (classic MUD rule), so there is no fight to transfer.
 
 ---
 
-## 5. Handoff implementation decisions (Phase 2 pressure-test)
+## 5. Handoff exactly-once invariants
 
-A pre-implementation pressure-test found the exactly-once invariants below were asserted but
-**unwired** in the Phase 1 code, plus several gaps. These are the resolutions the Phase 2
-implementation follows.
+The exactly-once and single-writer guarantees rest on the invariants below. The redirect/
+replay substrate — stable per-session input seq, a gate-side input buffer pruned on ack,
+world-side dedup by seq, and `Attached.ack_input_seq` — is the foundation the cross-shard exit
+is layered on; it works the same way for a re-dial to the same shard as across shards.
 
-- **Build order — substrate first.** The redirect/replay substrate (stable per-session input
-  seq, a gate-side input buffer pruned on ack, world-side dedup by seq, and
-  `Attached.ack_input_seq`) is built and tested on a *single shard* — simulating a re-dial to
-  the same shard — before any cross-shard exit exists. Exactly-once is proven in isolation,
-  then distribution is layered on.
-
-- **`applied_seq` is the linchpin.** `PrepareRequest.applied_seq` carries the highest input
-  seq the source had applied at freeze. `Redirect.resume_input_seq == applied_seq`; the
-  destination initializes its dedup high-water mark from it and drops any replayed line with
-  `seq <= applied_seq`. Freeze + snapshot + read-`applied_seq` happen atomically in a single
-  zone-inbox handler.
+- **`applied_seq` is the linchpin.** `PlayerSnapshot.applied_seq` carries the highest input
+  seq the source had applied at freeze. The destination initializes its dedup high-water mark
+  from it and drops any replayed line with `seq <= applied_seq`; the gate replays from the
+  destination's `Attached.ack_input_seq`. Freeze + snapshot + read-`applied_seq` happen
+  atomically in a single zone-inbox handler.
 
 - **The gate owns the input buffer.** `session_id` and the input seq are **session-scoped**
   (generated once at login, stable across re-dials), not per-stream. The gate holds un-acked

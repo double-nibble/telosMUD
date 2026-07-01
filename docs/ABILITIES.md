@@ -5,8 +5,6 @@ lifecycle* and a vocabulary of *effect ops*; every actual skill, spell, social-w
 mob special is **content** (data + Lua) that composes those ops. The engine has never heard of
 `fireball`.
 
-Status: **proposal** — three choices flagged in §9.
-
 ---
 
 ## 1. The generic substrate
@@ -30,7 +28,7 @@ Before abilities, the things they manipulate — all content-defined, engine onl
 
 ## 2. Anatomy of an Ability
 
-An ability definition is data with Lua hooks. Shape (concrete syntax TBD in §9 D1):
+An ability definition is data with Lua hooks. Shape:
 
 ```
 ability "fireball" {
@@ -42,7 +40,7 @@ ability "fireball" {
   timing      = { cast_time = 0, lag = 12, cooldown = 0 }
   messages    = { actor = "You hurl a roaring fireball at $N!",
                   room  = "$n hurls a roaring fireball at $N!" }
-  on_resolve  = <effect script>      -- declarative ops and/or Lua (§3, §9 D1)
+  on_resolve  = <effect script>      -- declarative ops and/or Lua (§3)
 }
 ```
 
@@ -66,26 +64,32 @@ The fixed set of verbs `on_resolve` (and affect ticks, procs) compose. Each op t
 routes through the shared mitigation pipeline and the hostility gate (§7), so a spell and a
 sword obey the same armor/resist/PvP rules.
 
+The registered declarative op set (`internal/world/effect_op*.go`):
+
 | Category    | Ops                                                                            |
 |-------------|--------------------------------------------------------------------------------|
-| Damage      | `deal_damage(target, {amount, type, can_avoid, scaling})` -> runs combat soak/resist |
+| Damage      | `deal_damage(target, {amount, type, can_avoid, scaling})` -> runs the combat soak/resist pipeline; an `area`/`room_and_adjacent` scope loops it per target with a per-target save |
 | Restore     | `heal(target, resource, amount)`, `restore(target, resource, amount)`           |
-| Resource    | `modify_resource(target, resource, delta)`, `drain(target, resource, amount, to)` |
+| Resource    | `modify_resource(target, resource, delta)`                                       |
 | Affects     | `apply_affect(target, id, {duration, magnitude, stacks, source})`, `remove_affect`, `dispel(target, {category, count})` |
-| Attributes  | (via affects) `modify_attribute` — transient buffs/debuffs as affects            |
-| Movement    | `move(target, dir)`, `teleport(target, room)`, `pull/push(target, n)`, `recall(target)` |
-| Perception  | `scan(room) -> entities`, `reveal(target/room, what)`, `detect(target, category)`, `identify(item)` |
-| World       | `spawn(proto, room)`, `summon(target)`, `transform(target, proto)`, `open/close/lock`           |
-| Comms       | `act(template, actor, obj, vict, to)`, `send(target, markup)`, `gmcp(target, pkg, data)`        |
-| Flow        | `if(cond, then, else)`, `for_each(list, fn)`, `chance(p, fn)`, `delay(pulses, fn)`              |
+| Attributes  | `modify_attribute_base(target, attr, delta)` (a persisted grant); transient buffs/debuffs are affects |
+| Progression | `grant_ability`/`revoke_ability`, `grant_track`/`advance_track`, `apply_bundle`, `learn_profession` |
+| Flags       | `set_flag(target, flag)`, `clear_flag(target, flag)`                             |
+| Economy     | `craft_recipe`, `salvage_item`, `augment_item`, `produce_item`, `consume_item` (§ CRAFTING.md) |
+| Flow        | `if(cond, then, else)`, `chance(p, fn)`, `check(...)` (the check/save primitive) |
+
+Every op that can harm routes through the shared mitigation pipeline + the hostility gate (§7).
 
 Queries available to Lua/conditions: `attr`, `resource`, `has_affect`, `affect_magnitude`,
-`has_flag`, `los`, `distance`, `is_enemy`, `pvp_allowed`, `room_contents`, `group_members`,
-`level`, `random`.
+`has_flag`, `is_enemy`, `pvp_allowed`, and the room/target scans on the Lua surface below.
 
-**This vocabulary is the entire contract.** New skills are new *compositions*; they never need
-new engine ops unless a genuinely new *kind* of interaction appears (rare, and a deliberate
-engine change).
+Entity relocation (`h:move`/`h:teleport`/`h:recall`) and world manipulation (`mud.spawn`,
+`mud.scan`) live on the **Lua handle / `mud.*` surface** (see [LUA.md](LUA.md)), not as declarative
+ops; `mud.summon` and `mud.transform` are reserved stubs. Perception conveniences
+(`reveal`/`detect`/`identify`) and world interactions (`open`/`close`/`lock`) are not built.
+
+New skills are new *compositions* of the ops above; they need a new engine op only when a
+genuinely new *kind* of interaction appears (rare, and a deliberate engine change).
 
 ## 4. Execution lifecycle (engine, fixed)
 
@@ -160,8 +164,8 @@ first-class so content can't forget it:
   scripted ability can't damage/debuff a player where PvP is disallowed. Against mobs the gate
   is a no-op.
 - Lua can also call `pvp_allowed` directly for custom branching.
-- **A pack `pvp_allowed` Lua policy SUPERSEDES (does not augment) the engine default** (Phase
-  7.4f). When a pack defines `pvp_lua`, the policy's boolean return is the player-vs-player
+- **A pack `pvp_allowed` Lua policy SUPERSEDES (does not augment) the engine default.**
+  When a pack defines `pvp_lua`, the policy's boolean return is the player-vs-player
   decision — the engine's *arena-forcing* and *both-must-consent* default **no longer run**; the
   policy is responsible for whatever consent/arena logic it wants. Two invariants the engine keeps
   regardless: **(1) the safe-room veto always still applies** — a content policy can never open a
@@ -200,26 +204,39 @@ GMCP deltas (`Char.Vitals`, `Char.Afflictions`, `Mud.Cooldowns`, `Mud.Target`) a
 the engine from these same events, so a content-defined affect automatically shows up as a
 debuff timer on rich clients with no extra wiring.
 
-## 9. Decisions (settled)
+## 9. Design invariants
 
-| # | Decision | Resolution | Rationale |
-|---|----------|------------|-----------|
-| D1 | **Effect authoring model** | Declarative op-list for the common case **+ Lua-function escape hatch** for complex logic; both usable within one ability's `on_resolve`. | Safe, toolable data for the 80%; full Lua power without a ceiling for the rest. |
-| D2 | **PvP / hostility enforcement** | **Automatic** engine gate at the ability lifecycle *and* inside every harmful effect op, driven by a content-defined `pvp_allowed` policy. | Content cannot harm a player where PvP is disallowed — even via custom Lua. Can't-forget, defense in depth. |
-| D3 | **Reference content pack** | Ship a replaceable "stdlib" pack of sample attributes/ruleset/affects/abilities **— cleanly strippable so the engine ships bare** (see §10). | Authors get a runnable starting point; deployments that want pure mechanism drop one module and the engine still boots. |
+Three properties the framework holds, each explaining the *why* behind the mechanism above:
+
+- **Effect authoring is dual-mode.** `on_resolve` accepts a declarative op-list for the common
+  case **and** a Lua-function escape hatch for complex logic; both are usable within one
+  ability. Safe, toolable data for the 80%; full Lua power without a ceiling for the rest.
+- **PvP / hostility enforcement is automatic.** The engine gate runs at the ability lifecycle
+  *and* inside every harmful effect op, driven by a content-defined `pvp_allowed` policy (§7),
+  so content cannot harm a player where PvP is disallowed — even via custom Lua. Can't-forget,
+  defense in depth.
+- **The reference content pack is strippable.** A replaceable "stdlib" pack of sample
+  attributes/ruleset/affects/abilities ships alongside the engine but is cleanly strippable so
+  the engine runs bare (§10). Authors get a runnable starting point; a deployment that wants
+  pure mechanism drops one module and the engine still boots.
 
 ## 10. Stdlib packaging — bare-engine guarantee
 
-The stdlib pack is **ordinary content with zero special privileges**, and the engine must run
+A sample content pack is **ordinary content with zero special privileges**, and the engine runs
 to a live world with it entirely absent. Concretely:
 
-- The pack lives in its own module/directory (e.g. `content/stdlib/`) loaded *only* through the
-  normal content-loading path — no Go import from `internal/` into it, ever.
+- A pack is loaded *only* through the normal content-loading path (by pack name, from Postgres
+  in production or the embedded `packs/*.yaml` in a bare dev run — `internal/content/demo.go`) —
+  no Go import from `internal/` into it, ever. The shipped sample is the **`demo`** pack, kept
+  deliberately separate from any curated standard library so the strip story and the demo are
+  independent.
 - **Boot-with-nothing:** the engine starts with zero attributes/resources/abilities defined.
   Loading content registers them; loading *no* content yields a bare but running server (you
-  can connect, you just can't fight until content defines how). This is an engine invariant
-  with a test that boots empty.
-- **Strip = delete a directory** (or omit it from the content manifest). No code edits, no
-  build tags required — though a build tag to exclude it from a binary is also offered.
-- A `content-lint` step validates a pack references only the published effect-op vocabulary and
-  registered names, so the stdlib stays honest about not reaching into engine internals.
+  can connect, you just can't fight until content defines how). Enabling a pack the binary
+  doesn't carry simply contributes nothing rather than erroring, preserving the bare boot.
+- **Strip = don't enable the pack** (or `DELETE WHERE pack=…` from the definition tables). No
+  code edits required.
+- **Content-lint discipline:** the effect-op dispatch, reset, and grant paths log-and-skip an
+  unknown op / unknown prototype rather than aborting — content is validated against the
+  published effect-op vocabulary and registered names, so a pack stays honest about not reaching
+  into engine internals (see the `content-lint` notes throughout `internal/world`).
