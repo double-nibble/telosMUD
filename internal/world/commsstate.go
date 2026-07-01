@@ -33,11 +33,11 @@ import (
 // (handoff.go CommsState) so a cross-shard walk does not reset toggles; the destination re-publishes the
 // effective config on arrival (it has the entity + ITS channel_defs, which may differ), keeping the
 // hear-set correct for the destination's content. A LOGIN, a HANDOFF arrival, and a TOGGLE re-publish.
-// NOTE: a mid-session hear-ACCESS change that is NOT one of those (an affect/attribute change crossing a
-// channel's `min_attr` floor) does NOT currently re-publish, so a player who drops below a restricted
-// channel's threshold keeps hearing it until their next toggle/handoff/relog — a bounded hear-only
-// staleness window (speaking is gated live per-send). Tracked in FOLLOW-UPS; re-publish on the
-// affect/attribute-recompute hook to close it (only matters once a `min_attr`-gated channel ships).
+// A mid-session hear-ACCESS change (an affect apply/expire crossing a channel's `min_attr` floor or a
+// require-flag) ALSO re-publishes, via republishCommsOnAccessChange hooked at the affect apply/expire sites
+// (affect_runtime.go), so a player who drops below a restricted channel's threshold stops hearing it at
+// once rather than at their next toggle/handoff/relog. That hook is cheap-guarded (a no-op unless some
+// channel actually gates hearing), so a world with no access-gated channels pays nothing.
 
 // commsState is the in-memory form of a player's CommsStateJSON (character.go), owned by the zone
 // goroutine that owns the session (single-writer, like tellCursor) — no locks. nil on a session until
@@ -168,6 +168,38 @@ func (z *Zone) effectiveHearSet(s *session) []string {
 	}
 	sort.Strings(refs) // deterministic for tests + stable wire order
 	return refs
+}
+
+// anyChannelGatesHearing reports whether ANY loaded channel gates HEARING behind an access predicate (a
+// require-flag or a min-attr floor). It is the cheap guard for republishCommsOnAccessChange: a world with
+// no access-gated channels (the common case) pays only this immutable-registry scan and never republishes.
+func (z *Zone) anyChannelGatesHearing() bool {
+	for _, def := range z.channelDefs().table() {
+		if def.access.requireFlag != "" || def.access.minAttrName != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// republishCommsOnAccessChange re-publishes a player's comms config after a mid-session change that could
+// cross a channel's hear-access predicate — an affect apply/expire that moved an attribute across a
+// channel's min_attr floor, or set/cleared a require-flag — so the gate's receiver HEAR-filter stops (or
+// starts) matching a restricted channel WITHOUT waiting for the player's next toggle/handoff/relog
+// (docs/REMAINING.md §1). A no-op unless the entity is a live player and at least one channel actually
+// gates hearing. Zone goroutine (a pure read handed to the bus, like publishCommsConfig).
+func (z *Zone) republishCommsOnAccessChange(e *Entity) {
+	if e == nil {
+		return
+	}
+	s, ok := sessionOf(e)
+	if !ok || s == nil {
+		return
+	}
+	if !z.anyChannelGatesHearing() {
+		return
+	}
+	z.publishCommsConfig(s)
 }
 
 // ignoreList returns the player's ignore list as a sorted slice for the config payload. Zone goroutine.

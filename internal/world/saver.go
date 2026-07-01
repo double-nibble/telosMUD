@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 )
@@ -197,6 +198,13 @@ func (sv *saver) handle(ctx context.Context, req saveRequest) {
 
 	// Postgres tier: optimistic CAS on state_version.
 	snap := req.snap
+	// Durable state-size guard (docs/REMAINING.md §1, symmetric with the handoff carry cap). Off the zone
+	// goroutine, so measuring the marshalled state here never slows a tick. Log-only: the state is the
+	// player's own, so we still persist it — a loud WARN surfaces unbounded growth without losing the save.
+	if b, err := json.Marshal(snap.State); err == nil && len(b) > maxDurableStateBytes {
+		sv.log.Warn("durable character state exceeds soft cap; persisting anyway (investigate unbounded growth)",
+			"player", req.id, "bytes", len(b), "cap", maxDurableStateBytes)
+	}
 	newVersion, ok, err := sv.store.SaveCharacter(ioCtx, snap)
 	if err != nil {
 		sv.log.Debug("postgres flush failed (non-fatal; next cadence retries)", "player", req.id, "err", err)

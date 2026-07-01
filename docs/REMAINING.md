@@ -12,30 +12,17 @@ hardening fix — call them out for dedicated planning rather than a quick slice
 
 ## 1. Security
 
-- **Cross-shard handoff snapshot AUTHENTICATION (MEDIUM).** `Handoff.Prepare` is unauthenticated (token =
-  `sha256(character/epoch)[:16]`, no secret). A reachable inter-shard port + a character name + a small epoch
-  lets a forged `Prepare` carry an arbitrary `state_json`; the pack-set audit only rejects *unknown*
-  prototypes, so a forged carry can INJECT any *known* prototype (item dupe / econ break). The size caps +
-  pack-set audit harden availability, not integrity. Fix: sign the snapshot (Ed25519, reuse the account
-  assertion key seam) or inter-shard mTLS, verified at Prepare. `internal/world/handoff_server.go`.
-- **Corpse owner keyed by character NAME, not PID (low, latent).** Safe while names are unique + immutable;
-  if renaming / delete-recreate ever lands, a stale 60s window keyed by a freed name could match a new claim.
-  Prefer a PersistID key if the PID is reliably set at kill time. `internal/world/death.go`.
-- **Mail retention sweep + dead-letter reap (smaller).** The inbox cap bounds growth, but a read-mail
-  retention sweep (evict-oldest-READ so a full inbox doesn't wedge on spam) and reaping the directory-error
-  dead-letter rows are still open. `internal/store/mail.go`.
-- **Web auth F4 — `__Host-` prefix on the broker flow cookie under TLS.** The only surviving bit of the 14.7
-  audit after Phase 15 deleted the website (F2/F8 moot): give the OAuth `flowCookie` the `__Host-` prefix
-  (Secure + Path=/ + no Domain) so it can't be planted over http / from a sibling subdomain.
-  `internal/web/session.go`.
-- **Mid-session hear-access staleness (low, bounded).** The gate's channel hear-set isn't re-published on a
-  mid-session hear-ACCESS change (an affect crossing a channel's `min_attr` floor), so a player keeps hearing
-  a restricted channel until their next toggle/handoff/relog. Only matters once a `min_attr`-gated channel
-  ships. Fix: call `publishCommsConfig` from the affect-apply/expire hook. `internal/world/commsstate.go`.
+*Burned down (see COMPLETED.md → "Launch-hardening burn-down round 2"): handoff snapshot Ed25519
+authentication, corpse-owner PersistID keying, mail evict-oldest-READ retention sweep, the `__Host-` broker
+cookie prefix, mid-session hear-access republish, and the durable `characters.state` byte cap.*
+
+- **Mail dead-letter reap (background job).** The evict-oldest-READ sweep landed; still open is a PERIODIC
+  reaper for undeliverable/orphaned mail (rows to a name that never logs in) — a maintenance job needing a
+  scheduler tick (director-owned, like the weekly spawn scheduler), not a per-send store fix.
+  `internal/store/mail.go`.
 - **`config.<player>` comms subject under future NATS authz (note, no code).** When subject-level NATS authz
-  lands, put `telos.comms.config.*` under world-publish-only alongside `chan`/`tell`.
-- **Durable `characters.state` byte cap.** The handoff carry now has `maxCarryStateBytes`; add a matching cap
-  on the durable state write for symmetry. `internal/world/character.go`.
+  lands, put `telos.comms.config.*` under world-publish-only alongside `chan`/`tell`. Nothing to build until
+  NATS subject authz ships.
 
 ## 2. Scale / performance
 

@@ -47,9 +47,48 @@ func (p *Pool) SendMail(ctx context.Context, to, from, subject, body string) (st
 		return "", fmt.Errorf("store: send mail to %q: %w", to, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return "", world.ErrMailboxFull
+		// Inbox at cap. Retention sweep (docs/REMAINING.md §1): evict the OLDEST READ message to make room,
+		// so a full inbox of already-read mail can't wedge new delivery on spam. Only READ mail is evicted —
+		// an unread message is never silently dropped — so an inbox full of UNREAD mail still refuses (the
+		// sender is told it's full). The insert re-runs its own count-guard, so the two statements can't
+		// overshoot the cap even under concurrency.
+		if evicted, derr := p.evictOldestRead(ctx, to); derr != nil {
+			return "", derr
+		} else if !evicted {
+			return "", world.ErrMailboxFull // full of unread mail: nothing to reclaim
+		}
+		tag, err = p.pool.Exec(ctx,
+			`INSERT INTO mail (id, to_player, from_player, subject, body)
+			 SELECT $1, $2, $3, $4, $5
+			  WHERE (SELECT count(*) FROM mail WHERE to_player = $2) < $6`,
+			id, to, from, subject, body, world.MailInboxCap)
+		if err != nil {
+			return "", fmt.Errorf("store: send mail to %q (after sweep): %w", to, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return "", world.ErrMailboxFull // a concurrent sender re-filled the freed slot; caller may retry
+		}
 	}
 	return id.String(), nil
+}
+
+// evictOldestRead deletes the single oldest READ message in `player`'s inbox, returning whether a row was
+// removed. It is the retention sweep's reclaim step: it never touches UNREAD mail, so it can only reclaim
+// slots the recipient has already seen. Oldest-first (`sent_at ASC, id ASC`) mirrors the newest-first inbox
+// order so the message evicted is the one at the BOTTOM of the reader's list.
+func (p *Pool) evictOldestRead(ctx context.Context, player string) (bool, error) {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM mail
+		  WHERE id = (
+		          SELECT id FROM mail
+		           WHERE to_player = $1 AND read_at IS NOT NULL
+		           ORDER BY sent_at ASC, id ASC
+		           LIMIT 1
+		        )`, player)
+	if err != nil {
+		return false, fmt.Errorf("store: evict oldest read mail for %q: %w", player, err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // ListMail returns `player`'s inbox newest-first, scoped to to_player = player (CITEXT, case-insensitive).

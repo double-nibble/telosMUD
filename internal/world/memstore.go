@@ -146,7 +146,11 @@ func (m *MemStore) SendMail(_ context.Context, to, from, subject, body string) (
 	defer m.mu.Unlock()
 	// Mirror the pgx inbox cap so the hermetic path enforces the same ceiling (security hardening).
 	if len(m.inboxLocked(to)) >= MailInboxCap {
-		return "", ErrMailboxFull
+		// Retention sweep parity with the pgx store (docs/REMAINING.md §1): evict the oldest READ message
+		// so a full-of-read inbox doesn't wedge on spam; an inbox full of UNREAD mail still refuses.
+		if !m.evictOldestReadLocked(to) {
+			return "", ErrMailboxFull
+		}
 	}
 	m.nextMailID++
 	id := "mem-mail-" + strconv.Itoa(m.nextMailID)
@@ -160,6 +164,27 @@ func (m *MemStore) SendMail(_ context.Context, to, from, subject, body string) (
 		Read:    false,
 	})
 	return id, nil
+}
+
+// evictOldestReadLocked removes the single oldest READ message in `player`'s inbox from m.mail, returning
+// whether one was removed. It mirrors the pgx evictOldestRead: only READ mail is reclaimable, and oldest
+// (earliest SentAt, insertion order tie-break) is evicted first. Caller holds mu.
+func (m *MemStore) evictOldestReadLocked(player string) bool {
+	key := memKey(player)
+	oldest := -1
+	for i, e := range m.mail {
+		if memKey(e.To) != key || !e.Read {
+			continue
+		}
+		if oldest == -1 || m.mail[i].SentAt.Before(m.mail[oldest].SentAt) {
+			oldest = i
+		}
+	}
+	if oldest == -1 {
+		return false
+	}
+	m.mail = append(m.mail[:oldest], m.mail[oldest+1:]...)
+	return true
 }
 
 // inboxLocked returns `player`'s messages newest-first (the same order the pgx ORDER BY produces). Caller

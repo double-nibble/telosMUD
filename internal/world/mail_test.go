@@ -35,6 +35,40 @@ func TestMailInboxCap(t *testing.T) {
 	}
 }
 
+// TestMailInboxCapEvictsOldestRead pins the retention sweep (docs/REMAINING.md §1): a FULL inbox that holds
+// at least one READ message accepts new mail by evicting the oldest read one, so spam can't wedge delivery;
+// but an inbox full of UNREAD mail still refuses (no unread message is ever silently dropped).
+func TestMailInboxCapEvictsOldestRead(t *testing.T) {
+	ms := NewMemStore()
+	ctx := context.Background()
+	for i := 0; i < MailInboxCap; i++ {
+		if _, err := ms.SendMail(ctx, "Victim", "Sender", "s", "b"); err != nil {
+			t.Fatalf("fill %d failed: %v", i, err)
+		}
+	}
+	// All unread => the sweep finds nothing to reclaim => still refuses.
+	if _, err := ms.SendMail(ctx, "Victim", "Sender", "s", "b"); !errors.Is(err, ErrMailboxFull) {
+		t.Fatalf("full-of-unread send: err = %v, want ErrMailboxFull", err)
+	}
+	// Read the OLDEST message (bottom of the newest-first inbox), then a new send must succeed by evicting it.
+	if _, ok, err := ms.ReadMail(ctx, "Victim", MailInboxCap); err != nil || !ok {
+		t.Fatalf("mark oldest read: ok=%v err=%v", ok, err)
+	}
+	if _, err := ms.SendMail(ctx, "Victim", "Sender", "fresh", "b"); err != nil {
+		t.Fatalf("send after a read message exists should evict + succeed: %v", err)
+	}
+	inbox, err := ms.ListMail(ctx, "Victim")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(inbox) != MailInboxCap {
+		t.Fatalf("inbox size after evict+send = %d, want %d (stayed at cap)", len(inbox), MailInboxCap)
+	}
+	if inbox[0].Subject != "fresh" {
+		t.Fatalf("newest message subject = %q, want the freshly delivered one", inbox[0].Subject)
+	}
+}
+
 // mail_test.go is the hermetic Phase-8.7 mail journey (docs/PHASE8-PLAN.md 8.7): send/list/read/delete
 // round-trip, offline-mail-on-login, the new-mail notify to an online recipient, the read/delete
 // access-control scoping (security), from-player engine-set (security), and the storeless degrade — all

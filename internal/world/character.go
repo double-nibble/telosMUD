@@ -862,6 +862,13 @@ const maxCarryItemNodes = 512
 // limit is far too loose to protect the zone goroutine.
 const maxCarryStateBytes = 256 * 1024
 
+// maxDurableStateBytes mirrors maxCarryStateBytes on the DURABLE save path (docs/REMAINING.md §1, symmetry).
+// Unlike the handoff carry — which arrives over the network and is REJECTED past the cap — the durable state
+// is the player's OWN engine-produced state, so exceeding this is a loud operator WARN (an unbounded-growth
+// bug, e.g. a builder self.state that accumulates), NOT a dropped save: losing a legitimate save is worse
+// than persisting a large row. Checked off the zone goroutine in the saver.
+const maxDurableStateBytes = maxCarryStateBytes
+
 // carryItemAudit walks a carried inventory tree (inventory + worn + nested contents) ONCE and returns both
 // the prototype refs this shard cannot spawn (missing — a pack mismatch) and the total item-node count (for
 // the width cap). A cross-shard Prepare rejects on either, before committing. A uniform-pack fleet with a

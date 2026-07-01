@@ -165,7 +165,7 @@ func (z *Zone) getFrom(c *Context, item, cont string) error {
 	// a lapsed window / your own kill => no gate. NOTE: this gate is COMMAND-scoped, not enforced at the
 	// Move() chokepoint — a future item-extraction path (autoloot, a Lua give/take, summon) MUST re-check
 	// CorpseOwner or it bypasses this window (security-review "can't-forget" note).
-	if co, ok := Get[*CorpseOwner](box); ok && co.owner != "" && co.owner != c.s.character && time.Now().Before(co.until) {
+	if co, ok := Get[*CorpseOwner](box); ok && co.owned() && !co.looterIsOwner(c.s) && time.Now().Before(co.until) {
 		c.z.act("$p is not yours to loot yet.", c.Actor, box, nil, "", "", ToActor)
 		return nil
 	}

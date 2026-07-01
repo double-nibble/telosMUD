@@ -10,15 +10,31 @@ import (
 // killed by another mob (no player killer) has no owner and is free-for-all from the start.
 const corpseLootWindow = 60 * time.Second
 
-// CorpseOwner marks a corpse with a killer loot-ownership window (security: anti-ninja-loot). owner is the
-// killer's character id; until is when the window lapses. A corpse with no CorpseOwner (or a lapsed one) is
-// lootable by anyone. Checked at the get-from-container gate (container.go). Zone-goroutine-owned.
+// CorpseOwner marks a corpse with a killer loot-ownership window (security: anti-ninja-loot). until is when
+// the window lapses. ownerPID is the killer's durable PersistID when it was set at kill time — the STABLE
+// key that survives a name being freed + reclaimed by a different character inside the window (docs/
+// REMAINING.md §1); owner is the killer's character name, the fallback key used when either side lacks a
+// PID (the async-create window, or a mob kill). A corpse with no CorpseOwner (or a lapsed one) is lootable
+// by anyone. Checked at the get-from-container gate (container.go). Zone-goroutine-owned.
 type CorpseOwner struct {
-	owner string
-	until time.Time
+	owner    string
+	ownerPID string
+	until    time.Time
 }
 
 func (*CorpseOwner) componentKind() Kind { return KindCorpseOwner }
+
+// owned reports whether the corpse actually has a loot owner (so an empty marker never gates everyone out).
+func (co *CorpseOwner) owned() bool { return co.owner != "" || co.ownerPID != "" }
+
+// looterIsOwner reports whether s is the killer who owns this corpse. It prefers the durable PersistID
+// (immune to name reuse within the window) and falls back to the character name when either side has no PID.
+func (co *CorpseOwner) looterIsOwner(s *session) bool {
+	if co.ownerPID != "" && s.entity != nil && s.entity.pid != nil {
+		return co.ownerPID == string(*s.entity.pid)
+	}
+	return co.owner != "" && co.owner == s.character
+}
 
 // death.go is the DEATH -> CORPSE -> OnKill machinery + the THREAT list and AGGRO initiation
 // (docs/COMBAT.md §7, docs/PHASE6-PLAN.md §1.3 / §1.3.1 [G-D]). Everything here runs ON the zone
@@ -236,7 +252,11 @@ func (z *Zone) makeCorpse(victim, killer *Entity) {
 	// until the window lapses. A mob-on-mob kill (no player killer) leaves it a free-for-all from the start.
 	if killer != nil {
 		if ks, ok := sessionOf(killer); ok && ks.character != "" {
-			Add(corpse, &CorpseOwner{owner: ks.character, until: time.Now().Add(corpseLootWindow)})
+			co := &CorpseOwner{owner: ks.character, until: time.Now().Add(corpseLootWindow)}
+			if killer.pid != nil {
+				co.ownerPID = string(*killer.pid) // stable key; survives the name being reclaimed in-window
+			}
+			Add(corpse, co)
 		}
 	}
 

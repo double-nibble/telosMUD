@@ -5120,3 +5120,37 @@ should confirm before the phases are designed:
   loot/affix) follow the per-kind-table + JSONB-tail + `pack` pattern with no schema strain.
 - **mudlib-engineer:** confirm [G16] in-game OLC scope and that the TinyMUD/Diku/LP baselines (§16) hold
   against the mudlib core as built (containment, command table, act(), the `Scripted` component for LP).
+
+---
+
+# Launch-hardening burn-down round 2 (2026-07-01)
+
+Post-roadmap security/hardening items burned down from `docs/REMAINING.md`, each verified (`make verify`) and
+committed green. Kept here for posterity; the live TODO no longer lists them.
+
+## §1 Security
+
+- **Cross-shard handoff snapshot authentication (was MEDIUM).** `Handoff.Prepare` was unauthenticated (its
+  token was a bare `sha256(character/epoch)` idempotency hash), so a forged Prepare on a reachable inter-shard
+  port could inject an arbitrary `state_json` (item dupe / econ break) past the pack-set audit. Closed by
+  signing the integrity-critical Prepare fields with Ed25519: a shared cluster keypair (config
+  `handoff_signing_key`/`handoff_verify_key`, env `TELOS_HANDOFF_{SIGNING,VERIFY}_KEY`), source signs, the
+  destination verifies at Prepare (PermissionDenied before any zone/state work), enforced only when a verify
+  key is configured (keyless dev/test unaffected — mirrors the session-assertion seam). The digest is a
+  length-prefixed SHA-256 over a domain separator + routing tuple + carried state
+  (`internal/world/handoffsig.go`); a security-auditor pass confirmed it covers 100% of the rehydrate-consumed
+  fields and the cheap-reject ordering is right. A startup WARN fires if only one half of the keypair is set.
+- **Corpse-owner PersistID keying.** `CorpseOwner` now carries the killer's PersistID and the loot gate
+  prefers it (name fallback when either side lacks a PID), so a freed+reclaimed name can't match a stale 60s
+  loot window. `internal/world/death.go`, `container.go`.
+- **Mail evict-oldest-READ retention sweep.** A full inbox holding any READ mail now evicts the oldest read
+  message to accept new mail (an all-UNREAD inbox still refuses); parity across the pgx + mem stores.
+  `internal/store/mail.go`, `internal/world/memstore.go`.
+- **`__Host-` broker cookie prefix.** The OAuth flow cookie is named `__Host-telos_oauth` under TLS
+  (Secure + Path=/ + no Domain), unprefixed in dev-over-http. `internal/web/session.go`.
+- **Mid-session hear-access republish.** `republishCommsOnAccessChange` (hooked at the affect apply/expire
+  sites, cheap-guarded to a no-op unless a channel actually gates hearing) re-publishes the comms hear-set
+  when an affect crosses a channel's `min_attr` floor / require-flag. `internal/world/commsstate.go`,
+  `affect_runtime.go`.
+- **Durable `characters.state` byte cap.** A log-only soft cap (`maxDurableStateBytes`, mirrors the handoff
+  carry cap) warns on unbounded state growth at the saver, off the zone goroutine. `internal/world/saver.go`.

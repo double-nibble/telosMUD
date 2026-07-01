@@ -6,10 +6,12 @@ import (
 	"time"
 )
 
-// MailInboxCap bounds a recipient's TOTAL inbox (security hardening): SendMail refuses a message once the
-// recipient already holds this many, so N senders — or one attacker's several characters — can't grow a
-// victim's inbox (or the DB) without bound. The per-sender rate limit throttles the fill; this caps the
-// ceiling. A candidate for content-config later; a const is the minimal guard.
+// MailInboxCap bounds a recipient's TOTAL inbox (security hardening): once the recipient holds this many,
+// SendMail evicts the oldest READ message to make room and, only if the inbox is entirely UNREAD, refuses
+// (ErrMailboxFull). So N senders — or one attacker's several characters — can't grow a victim's inbox (or
+// the DB) without bound, and a full-of-read inbox never wedges legitimate new mail on spam. The per-sender
+// rate limit throttles the fill; this caps the ceiling. A candidate for content-config later; a const is
+// the minimal guard.
 const MailInboxCap = 100
 
 // ErrMailboxFull is returned by SendMail when the recipient is at MailInboxCap. It is a POLICY rejection,

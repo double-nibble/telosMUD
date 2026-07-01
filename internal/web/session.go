@@ -16,9 +16,22 @@ import (
 // hop. Tamper-evident (payload + HMAC-SHA256), single-use (cleared on read).
 
 const (
-	flowCookie = "telos_oauth"
-	flowTTL    = 10 * time.Minute
+	flowCookie     = "telos_oauth"
+	flowCookieHost = "__Host-telos_oauth" // the __Host- prefixed name used under TLS (see flowCookieName)
+	flowTTL        = 10 * time.Minute
 )
+
+// flowCookieName is the OAuth-flow cookie name. Under TLS it carries the `__Host-` prefix, which browsers
+// enforce as Secure + Path=/ + no Domain — so the cookie cannot be planted over plain http or set from a
+// sibling subdomain (docs/REMAINING.md §1, audit F4). The prefix REQUIRES Secure, so in dev over plain http
+// (s.secureCookies == false, where Secure is off) we fall back to the unprefixed name — otherwise the
+// browser would silently reject the Set-Cookie and the login would break on localhost.
+func (s *Server) flowCookieName() string {
+	if s.secureCookies {
+		return flowCookieHost
+	}
+	return flowCookie
+}
 
 // signer signs + verifies cookie payloads with an HMAC key.
 type signer struct{ key []byte }
@@ -63,17 +76,17 @@ type flowData struct {
 // setFlow stashes the OAuth CSRF state + PKCE verifier + device_code in a short-lived signed cookie.
 func (s *Server) setFlow(w http.ResponseWriter, state, verifier, deviceCode string) {
 	payload, _ := json.Marshal(flowData{State: state, Verifier: verifier, Device: deviceCode, Exp: time.Now().Add(flowTTL).Unix()})
-	http.SetCookie(w, s.cookie(flowCookie, s.sign.sign(payload), int(flowTTL.Seconds())))
+	http.SetCookie(w, s.cookie(s.flowCookieName(), s.sign.sign(payload), int(flowTTL.Seconds())))
 }
 
 // takeFlow reads + clears the OAuth-flow cookie, returning its state + verifier + device_code (ok=false if
 // missing/expired/tampered).
 func (s *Server) takeFlow(w http.ResponseWriter, r *http.Request) (state, verifier, deviceCode string, ok bool) {
-	c, err := r.Cookie(flowCookie)
+	c, err := r.Cookie(s.flowCookieName())
 	if err != nil {
 		return "", "", "", false
 	}
-	http.SetCookie(w, s.cookie(flowCookie, "", -1)) // single-use: clear it
+	http.SetCookie(w, s.cookie(s.flowCookieName(), "", -1)) // single-use: clear it
 	payload, valid := s.sign.verify(c.Value)
 	if !valid {
 		return "", "", "", false

@@ -115,7 +115,8 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 	a.recomputeMods()
 	markAttrsDirty(e)
 	a.ensureTick(e)
-	fireOnApplyAffect(e, inst, parent) // RESERVED hook + OnApplyAffect bus fire (threads the cascade)
+	e.zone.republishCommsOnAccessChange(e) // hear-access may have crossed a channel floor (docs/REMAINING.md §1)
+	fireOnApplyAffect(e, inst, parent)     // RESERVED hook + OnApplyAffect bus fire (threads the cascade)
 	e.zone.log.Debug("affect attached", "ref", ref, "rid", e.rid,
 		"remaining", inst.remaining, "stacks", inst.stacks, "stacking", def.stacking)
 	return inst
@@ -140,7 +141,8 @@ func (a *Affected) expire(e *Entity, inst *affectInstance, parent *effectCtx) {
 	delete(a.byKey, keyFor(inst.def, inst.source))
 	a.recomputeMods()
 	markAttrsDirty(e)
-	fireOnAffectExpire(e, inst, parent) // RESERVED hook + OnAffectExpire bus fire (threads the cascade)
+	e.zone.republishCommsOnAccessChange(e) // hear-access may have crossed a channel floor (docs/REMAINING.md §1)
+	fireOnAffectExpire(e, inst, parent)    // RESERVED hook + OnAffectExpire bus fire (threads the cascade)
 	e.zone.log.Debug("affect expired", "ref", inst.def.ref, "rid", e.rid)
 }
 
