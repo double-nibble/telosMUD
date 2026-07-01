@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestReadLineStripsNegotiationAndCRLF(t *testing.T) {
@@ -77,6 +78,89 @@ func TestReadLinePreservesMultibyteUTF8(t *testing.T) {
 	}
 	if l != want {
 		t.Fatalf("line = %q; want %q (multibyte runes must pass through)", l, want)
+	}
+}
+
+// TestWritePreservesMultibyteUTF8: the OUTPUT path (Write -> sanitizeOutput -> IAC-escape) must pass a
+// multibyte line BYTE-INTACT — the rune-level control-strip must never corrupt, split, or REORDER a UTF-8
+// sequence (the docs/REMAINING.md Track-0 UTF-8 guarantee). Covers RTL Arabic (with a 0-width combining
+// tanwin), implicit-bidi LTR-in-RTL (English + a URL embedded in Arabic), CJK-wide, a decomposed
+// base+combining grapheme, ZWJ/regional-indicator/skin-tone grapheme CLUSTERS, and a zero-width space. None
+// contain 0xFF or a control rune, so Write is a pure pass-through and byte-identical output is the correct
+// expectation. Combining/joiner runes are built from explicit code points so the source encoding can't mask
+// a bug. (The adjacent strip-loop path is covered by TestWriteStripsControlKeepsAdjacentMultibyte.)
+func TestWritePreservesMultibyteUTF8(t *testing.T) {
+	rtl := "مرحبا" + string(rune(0x064B)) + " يا عالم"                      // Arabic "Hello world" + a combining tanwin
+	bidi := "قال hello world http://example.com/x للعالم"                   // LTR (English + URL) embedded in RTL — implicit bidi
+	decomposed := "cafe" + string(rune(0x0301))                             // base + COMBINING ACUTE ACCENT
+	family := "👨" + string(rune(0x200D)) + "👩" + string(rune(0x200D)) + "👧" // ZWJ grapheme cluster (family)
+	flag := "🇸🇦"                                                            // regional-indicator pair (a flag grapheme cluster)
+	skin := "👋" + string(rune(0x1F3FD))                                     // emoji + skin-tone modifier (grapheme cluster)
+	zwsp := "a" + string(rune(0x200B)) + "b"                                // zero-width space between letters
+	line := "You say, '" + rtl + " | " + bidi + " | 世界 | " + decomposed + " | " + family + " " + flag + " " + skin + " " + zwsp + "'"
+
+	var out bytes.Buffer
+	c := NewReadWriter(&bytes.Buffer{}, &out)
+	if err := c.Write(line); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	// None of the payload contains 0xFF or a control rune, so Write is a pure pass-through: byte-identical
+	// output is the correct expectation, and it proves no strip/split/reorder happened. The server transmits
+	// LOGICAL order — implicit bidi reordering is the terminal's job, never the server's.
+	if got != line {
+		t.Fatalf("Write mangled multibyte output:\n got  %q\n want %q", got, line)
+	}
+	// Belt-and-braces: valid UTF-8 (no rune split), and the zero-width grapheme glue survived (a cluster is
+	// intact only if its ZWJ / regional-indicators are not dropped).
+	if !utf8.ValidString(got) {
+		t.Fatalf("Write produced invalid UTF-8 (a rune was split): % x", out.Bytes())
+	}
+	if !strings.ContainsRune(got, 0x200D) {
+		t.Fatalf("Write dropped the ZWJ grapheme glue (family cluster broken): %q", got)
+	}
+	if !strings.Contains(got, flag) || !strings.Contains(got, skin) {
+		t.Fatalf("Write broke a flag/skin-tone grapheme cluster: %q", got)
+	}
+}
+
+// TestWriteStripsControlKeepsAdjacentMultibyte forces sanitizeOutput's STRIP-LOOP (not the clean
+// short-circuit that TestWritePreservesMultibyteUTF8 hits) against a SPLITTABLE sequence: a control char
+// placed BETWEEN a base and its combining mark, and again inside a ZWJ emoji cluster. The control must be
+// removed while the combining mark, the ZWJ grapheme glue, and every multibyte rune survive WHOLE and the
+// output stays valid UTF-8 — proving the rune-level strip never tears a multibyte boundary or breaks a
+// grapheme cluster (the docs/REMAINING.md Track-0 "must not corrupt or split multibyte" guarantee).
+func TestWriteStripsControlKeepsAdjacentMultibyte(t *testing.T) {
+	bel := string(rune(0x0007))   // C0 control
+	nel := string(rune(0x0085))   // C1 control — its UTF-8 tail byte 0x85 collides with continuation bytes,
+	acute := string(rune(0x0301)) // so a BYTE-wise (vs rune-wise) strip would corrupt an adjacent multibyte rune
+	zwj := string(rune(0x200D))
+	in := "cafe" + bel + acute + " 👨" + zwj + bel + "👩" + " 世" + nel + "界"
+	want := "cafe" + acute + " 👨" + zwj + "👩" + " 世界" // BEL + NEL stripped; combining/ZWJ/emoji/CJK intact
+
+	var out bytes.Buffer
+	c := NewReadWriter(&bytes.Buffer{}, &out)
+	if err := c.Write(in); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if got != want {
+		t.Fatalf("strip-loop mangled an adjacent multibyte sequence:\n got  %q\n want %q", got, want)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("strip-loop split a rune: % x", out.Bytes())
+	}
+	if strings.ContainsRune(got, 0x0007) {
+		t.Fatalf("BEL control not stripped: %q", got)
+	}
+	if strings.ContainsRune(got, 0x0085) {
+		t.Fatalf("C1 NEL control not stripped (or corrupted an adjacent CJK rune): %q", got)
+	}
+	if !strings.ContainsRune(got, 0x0301) {
+		t.Fatalf("combining mark torn off by the strip: %q", got)
+	}
+	if !strings.ContainsRune(got, 0x200D) {
+		t.Fatalf("ZWJ grapheme glue stripped (it is Cf, not Cc — must survive the control strip): %q", got)
 	}
 }
 

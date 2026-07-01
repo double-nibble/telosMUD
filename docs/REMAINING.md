@@ -58,12 +58,26 @@ seam are independent and can run in parallel — the constraints that matter are
   `ImportPack`/`Load` — no INSERT/DELETE/SELECT in `internal/store/import.go`/`content.go`. A DB-SEEDED pack
   silently loses them (they survive only via the embedded-YAML load path). Decide whether that's intentional
   (embedded-only) or a gap to close with a store path (a def table or pack_meta columns) + reflect-net coverage. · *persistence*
-- **UTF-8 rendering tests + a display-width helper.** Assert multibyte content (`Hello, 世界`, emoji, combining
-  marks, RTL) survives the full edge render path — `Write`/`sanitizeOutput` (the ESC control-strip must not
-  corrupt/split multibyte), `act()`, `lookRoom`/item shorts, GMCP JSON, mail/tell bodies — and never split a
-  rune across a chunk/flush. Establish a DISPLAY-width measure (not byte length) here; it's the helper `score`'s
-  column framing and any ANSI-aware framing must use. Fix any gap found; the deliverable is the regression tests
-  either way. **Prereq for:** Track 1 `score` framing + ANSI ESC-strip safety. · *edge/tests*
+- *DONE — display-width helper (`internal/textwidth`) + UTF-8/bidi/grapheme render-path tests. The helper
+  measures terminal CELLS (Mn/Me/Cf → 0, wide/fullwidth → 2, ambiguous → 1); `Width`/`Truncate`/`Pad` give
+  `score` framing a cell-accurate measure (delegates the wide table to x/text/width). Render-path coverage:
+  `internal/telnet` output-path (`TestWritePreservesMultibyteUTF8` byte-intact + the strip-loop
+  `TestWriteStripsControlKeepsAdjacentMultibyte` proving a control between base+combining, and inside a ZWJ
+  cluster, is stripped without tearing the multibyte / breaking the cluster), plus a LIVE e2e say-echo
+  (`tests/e2e/utf8_render_test.go`) round-tripping RTL Arabic + implicit-bidi LTR-in-RTL + CJK + decomposed +
+  a ZWJ emoji cluster through the full edge. Verified live: `You say, 'مرحباً يا عالم 世界'` renders. Vertical
+  text intentionally unsupported (telnet).*
+- **UTF-8 coverage gaps NOT yet closed by the render-path tests (found in review).** The say-echo + output
+  sanitize cover the `$t` verbatim + strip seams; still UNVERIFIED for multibyte: (1) **GMCP JSON payloads**
+  — highest value, they BYPASS `sanitizeOutput` entirely (Room.Info names, Comm.Channel bodies) and have only
+  JSON-escaping as a backstop; (2) `act()` `$n`/`$N` NAME substitution through `nameFor` + `CleanName`/
+  `stripNonGraphic`; (3) `lookRoom` / item-short render path; (4) mail/tell `capRunes` — a rune-count cap can
+  cut a grapheme cluster mid-sequence. · *edge/tests*
+- **Bidi-override spoofing at the trust boundary (security follow-up).** Legitimate Arabic+English needs only
+  IMPLICIT bidi (no control chars), but explicit bidi OVERRIDE/embedding controls (RLO U+202E, LRO, isolates)
+  enable "Trojan Source"-style display spoofing of names/text. The edge preserves them today (they're Cf, not
+  Cc, so `sanitizeOutput` keeps them; `textwidth` measures them 0). Decide whether to strip/neutralize the
+  override subset at ingress — a security-auditor call, weighed against not breaking legitimate bidi. · *security/edge*
 
 ## Track 1 — Plain-telnet render path  ·  seam: `act()` / `lookRoom` / item-listing / `sanitizeOutput`
 

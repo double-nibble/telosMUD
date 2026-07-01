@@ -16,6 +16,25 @@ const (
 	cpDevaSignAA = rune(0x093E) // DEVANAGARI VOWEL SIGN AA (Mc, SPACING) — 1 cell (must NOT be forced to 0)
 	cpMeem       = rune(0x0645) // ARABIC LETTER MEEM (base) — 1 cell
 	cpPrecompE   = rune(0x00E9) // é precomposed — 1 cell
+
+	// Zero-width FORMAT chars (Cf) — must measure 0 (the user requirement for grapheme/bidi handling).
+	cpZWJ        = rune(0x200D) // ZERO WIDTH JOINER (grapheme-cluster glue for emoji sequences)
+	cpZWNJ       = rune(0x200C) // ZERO WIDTH NON-JOINER
+	cpZWSP       = rune(0x200B) // ZERO WIDTH SPACE
+	cpLRM        = rune(0x200E) // LEFT-TO-RIGHT MARK (implicit-bidi hint)
+	cpRLM        = rune(0x200F) // RIGHT-TO-LEFT MARK
+	cpWordJoiner = rune(0x2060) // WORD JOINER
+	cpBOM        = rune(0xFEFF) // ZERO WIDTH NO-BREAK SPACE / BOM
+	cpVS16       = rune(0xFE0F) // VARIATION SELECTOR-16 (Mn) — 0 cells
+
+	// Wide / East Asian.
+	cpFullwidthA = rune(0xFF21) // FULLWIDTH LATIN CAPITAL A — 2 cells
+	cpHalfKana   = rune(0xFF71) // HALFWIDTH KATAKANA A — 1 cell
+
+	// Emoji grapheme-cluster parts (each a wide rune; the cluster is rune-summed, not glyph-measured).
+	cpManEmoji   = rune(0x1F468) // 👨 — 2 cells
+	cpWomanEmoji = rune(0x1F469) // 👩 — 2 cells
+	cpGirlEmoji  = rune(0x1F467) // 👧 — 2 cells
 )
 
 func TestRuneWidth(t *testing.T) {
@@ -39,6 +58,19 @@ func TestRuneWidth(t *testing.T) {
 		{"C0 control BEL U+0007", rune(0x0007), 0},
 		{"C1 control NEL U+0085", rune(0x0085), 0},
 		{"DEL U+007F", rune(0x007F), 0},
+		// Zero-width format chars (Cf) — the user's zero-width-modifier requirement.
+		{"ZWJ U+200D (0 cells)", cpZWJ, 0},
+		{"ZWNJ U+200C (0 cells)", cpZWNJ, 0},
+		{"ZWSP U+200B (0 cells)", cpZWSP, 0},
+		{"LRM U+200E bidi mark (0 cells)", cpLRM, 0},
+		{"RLM U+200F bidi mark (0 cells)", cpRLM, 0},
+		{"word joiner U+2060 (0 cells)", cpWordJoiner, 0},
+		{"BOM/ZWNBSP U+FEFF (0 cells)", cpBOM, 0},
+		{"variation selector-16 U+FE0F (0 cells)", cpVS16, 0},
+		// Fullwidth vs halfwidth (CJK).
+		{"fullwidth latin A U+FF21 (2 cells)", cpFullwidthA, 2},
+		{"halfwidth katakana U+FF71 (1 cell)", cpHalfKana, 1},
+		{"astral emoji U+1F468 (wide, 2 cells)", cpManEmoji, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,6 +118,38 @@ func TestWidth(t *testing.T) {
 		if Width(s) == len(s) {
 			t.Fatalf("Width must measure cells, not bytes: %q Width=%d, bytes=%d", s, Width(s), len(s))
 		}
+	}
+}
+
+// TestGraphemeClusterAndBidiWidth pins the two behaviors the user called out: a ZWJ grapheme cluster is
+// measured as the RUNE-SUM (documented limitation — not a single composed glyph), and bidirectional text is
+// measured in LOGICAL order so width is order-independent (however the terminal visually reorders LTR runs
+// inside RTL, the cell count is the same).
+func TestGraphemeClusterAndBidiWidth(t *testing.T) {
+	// Family ZWJ sequence 👨‍👩‍👧 = man ZWJ woman ZWJ girl. Rune-sum = 2+0+2+0+2 = 6 (a terminal that composes
+	// the glyph shows 2; rune-sum is the pragmatic, portable measure and this test pins that intent).
+	family := string([]rune{cpManEmoji, cpZWJ, cpWomanEmoji, cpZWJ, cpGirlEmoji})
+	if got := Width(family); got != 6 {
+		t.Fatalf("ZWJ family cluster width = %d, want 6 (rune-sum: 2+0+2+0+2)", got)
+	}
+	// The ZWJ itself contributes nothing: the same base runes WITHOUT the joiners have the same width.
+	if got := Width(string([]rune{cpManEmoji, cpWomanEmoji, cpGirlEmoji})); got != 6 {
+		t.Fatalf("three wide emoji without ZWJ = %d, want 6 (ZWJ is 0-width)", got)
+	}
+
+	// Bidi: English/URL embedded in Arabic. Width is order-independent — reversing the rune order (a crude
+	// stand-in for the terminal's visual bidi reordering) yields the SAME cell count.
+	bidi := "قال hello world " + "http://example.com/x " + "للعالم"
+	rev := []rune(bidi)
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	if Width(bidi) != Width(string(rev)) {
+		t.Fatalf("bidi width must be order-independent: logical=%d reversed=%d", Width(bidi), Width(string(rev)))
+	}
+	// And an LTR run embedded in RTL adds exactly its own cells (the embedded ASCII "hello" = 5).
+	if a, b := Width("قال hello"), Width("قال")+Width(" hello"); a != b {
+		t.Fatalf("embedded LTR run width mismatch: whole=%d parts=%d", a, b)
 	}
 }
 
