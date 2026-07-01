@@ -29,9 +29,25 @@ func TestSessionLockTakeoverKicksDisplacedConnection(t *testing.T) {
 	term.login(t, "Solo") // legacy name login (no account service wired in this harness)
 	term.expect(t, "The Temple Square")
 
-	// A login ELSEWHERE (another shard) takes over the lock for the same character.
-	if _, err := lock.Acquire(context.Background(), sessionlock.Key("Solo"), "elsewhere-token", time.Minute); err != nil {
-		t.Fatal(err)
+	// A login ELSEWHERE (another shard) takes over the lock for the same character. Poll-acquire until the
+	// login connection's OWN lock is actually present first: "The Temple Square" is emitted as the player
+	// enters the world, which can slightly precede the renewer's initial Acquire. If our takeover landed in
+	// that window the login's Acquire would clobber it and never self-kick (the flake). Acquire returns the
+	// PREVIOUS holder, so we know we've truly taken over from the login once prev is its (non-empty,
+	// non-ours) token — a synchronized takeover instead of a hopeful one.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		prev, err := lock.Acquire(context.Background(), sessionlock.Key("Solo"), "elsewhere-token", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if prev != "" && prev != "elsewhere-token" {
+			break // the login connection held the lock; we have now displaced it
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("login connection never acquired its session lock")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// This connection's renewer notices the lock was lost and kicks it with the takeover notice, then the
