@@ -34,6 +34,32 @@ func randIntn(n int) int {
 	return rand.Intn(n) //nolint:gosec // seeded for gameplay determinism, not security
 }
 
+// rollOpAmount evaluates the shared `amount + dice + bonus`, magnitude-scaled amount used by both the
+// harmful (deal_damage) and helpful (heal/restore) ops, so the two can't drift. The amount is a flat
+// `amount` plus rolled dice (a literal diceNum, or a content-formula dice COUNT — [G-A], a level-scaled
+// rider — that overrides it; rollDice caps the count at maxDice so a runaway formula can't spin the zone
+// goroutine) plus a scoped `bonus` formula (`+ $actor.damroll + str_bonus`, defaulting to the ACTOR
+// scope — what lets a sword add STR, a heal read WIS, a combo-finisher read combo_points, all as CONTENT
+// not Lua), all multiplied by the ctx magnitude (a DoT's stacks). Callers apply their own sign/clamp
+// policy (heal clamps non-negative) after this.
+func rollOpAmount(c *effectCtx, op *effectOp) float64 {
+	amt := op.amount
+	num := op.diceNum
+	if op.diceCount != nil {
+		num = int(evalCheckFormula(c, op.diceCount, c.actor))
+	}
+	if num > 0 && op.diceSize > 0 {
+		amt += float64(rollDice(c, num, op.diceSize))
+	}
+	if op.bonus != nil {
+		amt += evalCheckFormula(c, op.bonus, c.actor)
+	}
+	if c.mag > 0 {
+		amt *= c.mag
+	}
+	return amt
+}
+
 // opDealDamage: deal_damage(target, {amount|<N>d<S>, type}). Routes through the SHARED mitigation
 // pipeline (dealDamage -> guardHarmful + resist/soak). The amount is either a flat `amount` or rolled
 // dice, scaled by the ctx magnitude (a DoT's stacks). A blocked harmful op (PvP) is a clean no-op.
@@ -41,26 +67,7 @@ func opDealDamage(c *effectCtx, op *effectOp) error {
 	if c.target == nil {
 		return fmt.Errorf("deal_damage: no target")
 	}
-	raw := op.amount
-	// Dice: a content-formula dice COUNT ([G-A], a level-scaled rider) overrides the literal diceNum;
-	// rollDice defensively caps the count at maxDice so a runaway formula can't spin the zone goroutine.
-	num := op.diceNum
-	if op.diceCount != nil {
-		num = int(evalCheckFormula(c, op.diceCount, c.actor))
-	}
-	if num > 0 && op.diceSize > 0 {
-		raw += float64(rollDice(c, num, op.diceSize))
-	}
-	// [G-A] scoped attribute bonus: `+ $actor.damroll + str_bonus` etc., over the actor/target/source
-	// attributes (default scope = the actor dealing the damage). This is what lets a sword add STR, a
-	// crit scale, and a combo-finisher read combo_points — all as CONTENT, not Lua.
-	if op.bonus != nil {
-		raw += evalCheckFormula(c, op.bonus, c.actor)
-	}
-	if c.mag > 0 {
-		raw *= c.mag
-	}
-	dealDamage(c, c.target, raw, op.dmgType)
+	dealDamage(c, c.target, rollOpAmount(c, op), op.dmgType)
 	return nil
 }
 
@@ -79,25 +86,11 @@ func opHeal(c *effectCtx, op *effectOp) error {
 		return fmt.Errorf("heal: no resource")
 	}
 	// Amount: flat `amount` + rolled dice (literal diceNum/diceSize, or a diceCount formula) + a scoped
-	// `bonus` formula — mirroring opDealDamage so a restorative op can roll `2d8 + $actor.wis_bonus` exactly
-	// like a strike rolls `1d8 + $actor.str_bonus` (docs/REMAINING.md §4; the dice evaluator already exists,
-	// the op-builder already parses these fields for every op — heal just wasn't reading them). Dice/bonus
-	// are scoped to the ACTOR (the healer), so `+WIS` reads the caster's wisdom. restore delegates here, so
-	// it inherits the same dice form.
-	amt := op.amount
-	num := op.diceNum
-	if op.diceCount != nil {
-		num = int(evalCheckFormula(c, op.diceCount, c.actor))
-	}
-	if num > 0 && op.diceSize > 0 {
-		amt += float64(rollDice(c, num, op.diceSize))
-	}
-	if op.bonus != nil {
-		amt += evalCheckFormula(c, op.bonus, c.actor)
-	}
-	if c.mag > 0 {
-		amt *= c.mag
-	}
+	// `bonus` formula via the SHARED rollOpAmount — mirroring opDealDamage so a restorative op can roll
+	// `2d8 + $actor.wis_bonus` exactly like a strike rolls `1d8 + $actor.str_bonus` (docs/REMAINING.md §4).
+	// Dice/bonus are scoped to the ACTOR (the healer), so `+WIS` reads the caster's wisdom. restore
+	// delegates here, so it inherits the same dice form.
+	amt := rollOpAmount(c, op)
 	// heal only ever RAISES a pool: a negative amount cannot weaponize it into a cross-player drain
 	// (that path is modify_resource, which is gated). Clamp the magnitude non-negative.
 	if amt < 0 {
