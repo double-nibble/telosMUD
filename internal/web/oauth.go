@@ -1,7 +1,8 @@
-// Package web is telos-account's website + OAuth front door (docs/ACCOUNT.md §2/§3, Phase 14.7): server-
-// rendered sign-in (GitHub OAuth, Authorization Code + PKCE), the account dashboard, and the "Play" bridge
-// that mints a link code. It runs IN the telos-account process (alongside the gRPC API), so it talks to the
-// store + the account service in-process — no provider tokens ever reach the gate or world.
+// Package web is telos-account's OAUTH BROKER (docs/ACCOUNT.md §2, Phase 15). It is not a website: it is a
+// bare auth bridge that runs the device/broker OAuth flow (GitHub, Authorization Code + PKCE) to authenticate
+// a waiting telnet session — no dashboard, no forms, no "Play" bridge (see server.go). It runs IN the
+// telos-account process (alongside the gRPC API), so it talks to the store + the account service in-process
+// — no provider tokens ever reach the gate or world.
 package web
 
 import (
