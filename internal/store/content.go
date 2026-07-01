@@ -479,7 +479,8 @@ type rarityTierBody struct {
 }
 
 type lootTableBody struct {
-	Rolls []content.LootRollDTO `json:"rolls,omitempty"`
+	Rolls  []content.LootRollDTO `json:"rolls,omitempty"`
+	OnRoll string                `json:"on_roll,omitempty"` // Phase 12.1 conditional-drop Lua hatch
 }
 
 // spawnScheduleBody is the JSONB-tail shape for a spawn_schedule_defs row (Phase 12.4): everything but the
@@ -930,6 +931,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				return fmt.Errorf("store: loot_table_def %s body: %w", lt.Ref, err)
 			}
 			lt.Rolls = b.Rolls
+			lt.OnRoll = b.OnRoll
 		}
 		pack(pk).LootTables = append(pack(pk).LootTables, lt)
 	}

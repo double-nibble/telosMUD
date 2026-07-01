@@ -216,6 +216,12 @@ type RarityTierDTO struct {
 type LootTableDTO struct {
 	Ref   string        `json:"ref" yaml:"ref"`
 	Rolls []LootRollDTO `json:"rolls" yaml:"rolls"`
+	// OnRoll is an optional Lua escape hatch (Phase 12.1, docs/REMAINING.md §4): a body run once per
+	// eligible looter AFTER the declarative rolls resolve, returning a list of item prototype refs to
+	// additionally drop. It expresses CONDITIONAL drops the declarative form can't (branch on looter/victim
+	// state). Each returned ref is delivered through the same loot pipeline (quality/binding/merge). "" =
+	// no hatch (the fully-declarative path, unchanged).
+	OnRoll string `json:"on_roll,omitempty" yaml:"on_roll,omitempty"`
 }
 
 // LootRollDTO is one roll within a loot table. Kind is "guaranteed" (always yields), "chance" (an

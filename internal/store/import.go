@@ -403,7 +403,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 	}
 	for _, lt := range pk.LootTables {
-		body, err := json.Marshal(lootTableBody{Rolls: lt.Rolls})
+		body, err := json.Marshal(lootTableBody{Rolls: lt.Rolls, OnRoll: lt.OnRoll})
 		if err != nil {
 			return fmt.Errorf("store: marshal loot_table %s body: %w", lt.Ref, err)
 		}

@@ -66,6 +66,43 @@ func (z *Zone) runAffectHookLua(e *Entity, inst *affectInstance, hookName, src s
 	_ = rt.invokeFromCtx(ch, c, e, nil)
 }
 
+// --- loot on_roll hatch (Phase 12.1, docs/REMAINING.md §4) --------------------------------
+
+// runLootOnRollLua runs a loot table's on_roll(ctx) body for one looter and returns the list of ADDITIONAL
+// item prototype refs it wants dropped (conditional drops the declarative rolls can't express). It is a
+// READ-ONLY decision hatch: the body inspects ctx and returns refs; the caller (resolveLoot) delivers each
+// through the normal loot pipeline (quality/binding/merge), so the hatch can neither bypass delivery nor
+// attribute a drop to a spoofed source. `ctx.looter` is the receiving player, `ctx.source` the slain victim,
+// both validated handles. A clean ROOT invocation (a loot event, not inside a cascade); the looter is the
+// invocation actor. Fail-closed: no body / compile failure / runtime error / non-list return => no drops.
+func (z *Zone) runLootOnRollLua(looter, victim *Entity, table *lootTableDef) []string {
+	if table == nil || table.onRoll == "" || z.lua == nil || looter == nil {
+		return nil
+	}
+	rt := z.lua
+	ch := rt.chunkFor("loot:"+table.ref+":on_roll", table.onRoll)
+	if ch == nil {
+		return nil // no body / compile failed (inert)
+	}
+	ctx := rt.L.NewTable()
+	ctx.RawSetString("looter", rt.newHandle(looter))
+	ctx.RawSetString("source", rt.newHandle(victim))
+	refs := rt.invokeForStringList(ch, &luaInvocation{actor: looter}, map[string]lua.LValue{"ctx": ctx})
+	// Defensive bound (both reviewers): the Lua budget bounds EXECUTION, not the returned array size, so a
+	// runaway/buggy body could flood the looter with spawns. Cap the delivered count and log the truncation
+	// so a builder sees the runaway. A legitimate conditional-bonus hatch returns a handful.
+	if len(refs) > maxLootOnRollDrops {
+		rt.log.Warn("loot on_roll returned an over-long list; truncating",
+			"table", table.ref, "returned", len(refs), "cap", maxLootOnRollDrops)
+		refs = refs[:maxLootOnRollDrops]
+	}
+	return refs
+}
+
+// maxLootOnRollDrops caps how many items a single on_roll body may drop for one looter (a defensive bound
+// on a runaway/buggy hatch; the Lua instruction budget bounds execution, not the returned list length).
+const maxLootOnRollDrops = 64
+
 // --- 7.4f: pvp_allowed policy + ruleset formulas ------------------------------------------
 
 // consultedLuaFormulas is the set of ruleset-formula names the engine ACTUALLY consults from the

@@ -313,3 +313,21 @@ func TestBundleBodyUncappedRoundTrips(t *testing.T) {
 		t.Fatalf("bundle uncapped flag dropped in body round-trip: %+v", out)
 	}
 }
+
+// TestLootTableBodyOnRollRoundTrips pins that the loot on_roll Lua hatch survives the loot_table_defs JSONB
+// body round-trip (docs/REMAINING.md §4) — the store field-drop class. Import (marshal) + export (unmarshal)
+// share this lootTableBody, so pinning its round-trip catches a mistyped/missing json tag on the new field.
+func TestLootTableBodyOnRollRoundTrips(t *testing.T) {
+	in := lootTableBody{OnRoll: `return {"x:item"}`}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out lootTableBody
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.OnRoll != in.OnRoll {
+		t.Fatalf("loot on_roll dropped in body round-trip: got %q", out.OnRoll)
+	}
+}

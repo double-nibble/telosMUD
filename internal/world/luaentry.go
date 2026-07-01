@@ -251,3 +251,48 @@ func (rt *luaRuntime) invokeForBool(ch *compiledChunk, inv *luaInvocation, binds
 	// silently open the gate.
 	return ret == lua.LTrue
 }
+
+// invokeForStringList runs a compiled chunk and returns the array part of its first return value as a
+// []string (each element coerced: a string is taken verbatim; a non-string element is skipped). A
+// compile-absent chunk, a runtime error, a non-table return, or an empty return yields nil — the caller
+// then adds no drops (fail-closed: a broken hatch never fabricates loot). pcall-isolated like invoke. Used
+// by the loot on_roll hatch (a body returning `{ "item:ref", ... }`).
+func (rt *luaRuntime) invokeForStringList(ch *compiledChunk, inv *luaInvocation, binds map[string]lua.LValue) []string {
+	if rt == nil || rt.L == nil || ch == nil || ch.proto == nil {
+		return nil
+	}
+	key := rt.breakerKeyFor(inv, ch.origin)
+	if rt.breakerDisabled(key) {
+		return nil // quarantined: no drops
+	}
+	L := rt.L
+	env := rt.freshCallEnv(binds)
+	fn := L.NewFunctionFromProto(ch.proto)
+	L.SetFEnv(fn, env)
+
+	prev := rt.inv
+	rt.inv = inv
+	defer func() { rt.inv = prev }()
+
+	top := L.GetTop()
+	if err := rt.runGuardedFn(key, ch.origin, fn, 0, 1); err != nil {
+		rt.log.Warn("lua string-list hatch error (isolated; no drops added)", "origin", ch.origin, "err", err.Error())
+		L.SetTop(top)
+		return nil
+	}
+	ret := L.Get(-1)
+	L.SetTop(top)
+	tbl, ok := ret.(*lua.LTable)
+	if !ok {
+		return nil
+	}
+	// Iterate the ARRAY part by index (1..Len) so the drop order is deterministic (a seeded loot test can
+	// pin it); a non-string element is skipped, a nil stops the array. The hash part is ignored.
+	var out []string
+	for i := 1; i <= tbl.Len(); i++ {
+		if s, isStr := tbl.RawGetInt(i).(lua.LString); isStr {
+			out = append(out, string(s))
+		}
+	}
+	return out
+}

@@ -27,8 +27,9 @@ type rarityTierDef struct {
 }
 
 type lootTableDef struct {
-	ref   string
-	rolls []lootRoll
+	ref    string
+	rolls  []lootRoll
+	onRoll string // Phase 12.1 conditional-drop Lua hatch (docs/REMAINING.md §4); "" = declarative only
 }
 
 type lootRoll struct {
@@ -72,7 +73,7 @@ func buildRarityTierDef(d content.RarityTierDTO) *rarityTierDef {
 }
 
 func buildLootTableDef(d content.LootTableDTO) *lootTableDef {
-	def := &lootTableDef{ref: d.Ref}
+	def := &lootTableDef{ref: d.Ref, onRoll: d.OnRoll}
 	for _, r := range d.Rolls {
 		roll := lootRoll{kind: r.Kind, chance: r.Chance, n: r.N, qualityFloor: r.QualityFloor}
 		for _, e := range r.Pool {
@@ -114,6 +115,12 @@ func (z *Zone) resolveLoot(victim *Entity, rng *rand.Rand) {
 			for _, entry := range z.resolveRoll(looter, &table.rolls[i], rng) {
 				z.deliverLoot(looter, entry, rng)
 			}
+		}
+		// on_roll(ctx) Lua hatch (docs/REMAINING.md §4): after the declarative rolls, a content body may
+		// return additional CONDITIONAL drops (branching on looter/victim state the declarative form can't
+		// express). Each returned item ref is delivered through the SAME pipeline (quality/binding/merge).
+		for _, ref := range z.runLootOnRollLua(looter, victim, table) {
+			z.deliverLoot(looter, lootEntry{item: ref}, rng)
 		}
 	}
 }
