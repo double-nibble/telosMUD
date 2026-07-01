@@ -39,6 +39,42 @@ func TestOpRestoreRaisesPoolClampedAtMax(t *testing.T) {
 	}
 }
 
+// TestOpHealRollsDice pins the docs/REMAINING.md §4 fix: a restorative op honors a dice roll (and dice_num/
+// dice_size), not just a flat amount — a `2d8` heal raises the pool by a rolled 2..16, and `amount` stacks
+// on top of the dice. restore delegates to heal, so it inherits the dice form. (The `bonus` formula path is
+// the same evalCheckFormula call opDealDamage already exercises.)
+func TestOpHealRollsDice(t *testing.T) {
+	z, caster := abilityTestZone(t)
+
+	// A pure-dice heal (2d8, no flat amount) raises hp by a rolled amount within [2, 16].
+	setResourceCurrent(caster.entity, "hp", 0)
+	c := seededCtx(z, caster.entity, caster.entity, dispHelpful)
+	if err := opHeal(c, &effectOp{resource: "hp", diceNum: 2, diceSize: 8}); err != nil {
+		t.Fatalf("heal dice: %v", err)
+	}
+	if got := resourceCurrent(caster.entity, "hp"); got < 2 || got > 16 {
+		t.Fatalf("2d8 heal from 0 -> %d, want within [2,16] (dice must contribute)", got)
+	}
+
+	// amount stacks on top of the dice: 5 + 2d8 lands in [7, 21].
+	setResourceCurrent(caster.entity, "hp", 0)
+	if err := opHeal(c, &effectOp{resource: "hp", amount: 5, diceNum: 2, diceSize: 8}); err != nil {
+		t.Fatalf("heal amount+dice: %v", err)
+	}
+	if got := resourceCurrent(caster.entity, "hp"); got < 7 || got > 21 {
+		t.Fatalf("5+2d8 heal from 0 -> %d, want within [7,21]", got)
+	}
+
+	// restore (delegates to heal) inherits the dice form.
+	setResourceCurrent(caster.entity, "hp", 0)
+	if err := opRestore(c, &effectOp{resource: "hp", diceNum: 1, diceSize: 6}); err != nil {
+		t.Fatalf("restore dice: %v", err)
+	}
+	if got := resourceCurrent(caster.entity, "hp"); got < 1 || got > 6 {
+		t.Fatalf("1d6 restore from 0 -> %d, want within [1,6]", got)
+	}
+}
+
 // TestOpSendDeliversToPlayerAndNoOpsOtherwise pins opSend's three cases: it puts the text on a PLAYER
 // target's session, and is a clean no-op (no panic, no error) for a session-less MOB target and for a
 // nil target. opSend is the direct-to-target whisper op; a mob/nil target reaching the s.send path would

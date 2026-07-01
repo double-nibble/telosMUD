@@ -78,7 +78,23 @@ func opHeal(c *effectCtx, op *effectOp) error {
 	if op.resource == "" {
 		return fmt.Errorf("heal: no resource")
 	}
+	// Amount: flat `amount` + rolled dice (literal diceNum/diceSize, or a diceCount formula) + a scoped
+	// `bonus` formula — mirroring opDealDamage so a restorative op can roll `2d8 + $actor.wis_bonus` exactly
+	// like a strike rolls `1d8 + $actor.str_bonus` (docs/REMAINING.md §4; the dice evaluator already exists,
+	// the op-builder already parses these fields for every op — heal just wasn't reading them). Dice/bonus
+	// are scoped to the ACTOR (the healer), so `+WIS` reads the caster's wisdom. restore delegates here, so
+	// it inherits the same dice form.
 	amt := op.amount
+	num := op.diceNum
+	if op.diceCount != nil {
+		num = int(evalCheckFormula(c, op.diceCount, c.actor))
+	}
+	if num > 0 && op.diceSize > 0 {
+		amt += float64(rollDice(c, num, op.diceSize))
+	}
+	if op.bonus != nil {
+		amt += evalCheckFormula(c, op.bonus, c.actor)
+	}
 	if c.mag > 0 {
 		amt *= c.mag
 	}
