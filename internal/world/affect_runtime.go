@@ -281,10 +281,14 @@ func (a *Affected) tickOnce(e *Entity, pulse uint64) {
 	runRegen(e)
 }
 
-// fireOnApplyAffect / fireOnAffectExpire / fireOnTick are the RESERVED affect hooks (docs/ABILITIES.md
-// §8, docs/PHASE5-PLAN.md §1.4 / 5.2 scope boundary). This slice builds the hook POINTS and logs at
-// DEBUG; the gated effect-op interpreter that runs the op-list lands in 5.3. They are intentionally
-// no-op-with-a-log so the runtime is whole and 5.3 only fills the body — no lifecycle change.
+// fireOnApplyAffect / fireOnAffectExpire / fireOnTick are the affect-lifecycle hooks (docs/ABILITIES.md
+// §8). They are LIVE, not stubs: fireOnApplyAffect and fireOnAffectExpire run the affect's Lua on_apply/
+// on_expire hook AND fire the reserved OnApplyAffect / OnAffectExpire event-bus kinds (7.8b) so a content
+// subscriber (a resource/affect on_event, a Lua bus handler) reacts; fireOnTick runs the on_tick op-list
+// through the gated effect-op interpreter (the DoT path, 5.3). The only still-reserved surface is the
+// OP-LIST form of on_apply/on_expire attached directly to the affect def (logged at DEBUG below, not yet
+// executed) — the Lua and event-bus paths are the supported hooks. (OnRest stays dark until a rest
+// mechanic exists to fire it.)
 func fireOnApplyAffect(e *Entity, inst *affectInstance, parent *effectCtx) {
 	// Lua on_apply hook (7.4d): runs when the affect attaches. `self` = e, actor = the affect's
 	// source. nil-safe / no-op when no Lua hook. The op-list onApply remains reserved.
