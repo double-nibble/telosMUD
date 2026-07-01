@@ -380,7 +380,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	// ref+pack is the per-kind PK. The loader reads it back into the same BundleDTO the embedded YAML
 	// produces, so YAML and Postgres packs define bundles identically.
 	for _, bn := range pk.Bundles {
-		body, err := json.Marshal(bundleBody{Kind: bn.Kind, Grants: bn.Grants})
+		body, err := json.Marshal(bundleBody{Kind: bn.Kind, Uncapped: bn.Uncapped, Grants: bn.Grants})
 		if err != nil {
 			return fmt.Errorf("store: marshal bundle %s body: %w", bn.Ref, err)
 		}

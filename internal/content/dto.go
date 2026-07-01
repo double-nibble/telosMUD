@@ -148,9 +148,13 @@ type TrackDTO struct {
 // set_flag / …) applied to the entity. Entry prerequisites (a prestige class's stat floor) are expressed
 // by gating the apply behind a `check` in the calling content, not on the bundle itself.
 type BundleDTO struct {
-	Ref    string `json:"ref" yaml:"ref"`
-	Kind   string `json:"kind" yaml:"kind"`
-	Grants any    `json:"grants,omitempty" yaml:"grants,omitempty"` // a grant op-list (same shape as on_resolve)
+	Ref  string `json:"ref" yaml:"ref"`
+	Kind string `json:"kind" yaml:"kind"`
+	// Uncapped marks a `kind: profession` bundle whose profession does NOT count against the learned-profession
+	// cap (a gathering/utility trade, unlimited — vs a capped crafting trade). Ignored for non-profession
+	// bundles. The cap VALUE is the content attribute `max_professions` (defaults when unset). docs/REMAINING.md §4.
+	Uncapped bool `json:"uncapped,omitempty" yaml:"uncapped,omitempty"`
+	Grants   any  `json:"grants,omitempty" yaml:"grants,omitempty"` // a grant op-list (same shape as on_resolve)
 }
 
 // ChargenDTO is one content-defined character-generation flow (Phase 14.8, docs/ACCOUNT.md §14.8). It is pure

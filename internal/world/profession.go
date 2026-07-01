@@ -11,11 +11,16 @@ import "fmt"
 // Single-writer: every helper runs on the zone goroutine; the set is COW-safe (mutableLiving) + persisted
 // (the granted-abilities precedent, ability_grant.go).
 
-// craftProfessionCap is the default ceiling on learned professions (D2: "a cap on crafting professions, e.g.
-// 2"). v1 applies it UNIFORMLY to every learned profession. The D2 nuances — gathering/utility professions
-// unlimited (a kind split) and making the cap CONTENT-CONFIGURABLE — are a deferred follow-up
-// (docs/FOLLOW-UPS.md); the cap is not on 13.3's done-when, only the membership + gate are.
-const craftProfessionCap = 2
+// defaultProfessionCap is the ceiling on learned CAPPED (crafting) professions when content does not define
+// the cap attribute (D2: "a cap on crafting professions, e.g. 2"). The cap is CONTENT-CONFIGURABLE via the
+// professionCapAttr attribute (so a class/feat can raise it) and only CAPPED professions count — a profession
+// bundle marked `uncapped` (gathering/utility) is unlimited (docs/REMAINING.md §4).
+const defaultProfessionCap = 2
+
+// professionCapAttr is the content attribute that holds a character's learned-CAPPED-profession ceiling. When
+// unset (attr == 0) the engine uses defaultProfessionCap, so a pack that defines nothing keeps the old
+// behavior; a pack can register it (and a bundle can modify_attribute_base it) to make the cap vary.
+const professionCapAttr = "max_professions"
 
 // hasProfession reports whether entity e has learned profession ref. Zone-goroutine read.
 func hasProfession(e *Entity, ref string) bool {
@@ -25,10 +30,46 @@ func hasProfession(e *Entity, ref string) bool {
 	return e.living.professions[ref]
 }
 
+// professionIsCapped reports whether profession ref counts against the learned-profession cap. A profession
+// bundle (ref == the profession membership ref by convention) marked `uncapped` is a gathering/utility trade
+// and does NOT count; anything else — including a profession with no matching bundle def — counts (the safe
+// default: an unknown profession is treated as capped so it can't dodge the ceiling). Zone-goroutine read.
+func (z *Zone) professionIsCapped(ref string) bool {
+	if def := z.bundleDefs().get(ref); def != nil && def.uncapped {
+		return false
+	}
+	return true
+}
+
+// professionCap resolves e's ceiling on CAPPED professions: the content attribute professionCapAttr when set
+// (>0), else defaultProfessionCap. Zone-goroutine read.
+func (z *Zone) professionCap(e *Entity) int {
+	if v := int(attr(e, professionCapAttr)); v > 0 {
+		return v
+	}
+	return defaultProfessionCap
+}
+
+// cappedProfessionCount counts how many of e's currently-learned professions count against the cap (i.e.
+// excludes uncapped gathering/utility trades). Zone-goroutine read.
+func (z *Zone) cappedProfessionCount(e *Entity) int {
+	if e == nil || e.living == nil {
+		return 0
+	}
+	n := 0
+	for ref := range e.living.professions {
+		if z.professionIsCapped(ref) {
+			n++
+		}
+	}
+	return n
+}
+
 // learnProfession records profession ref in e's membership set (COW-safe). Idempotent: re-learning a known
-// profession is a no-op that never counts against the cap twice. Returns false (and changes nothing) when
-// adding a NEW profession would exceed craftProfessionCap. Zone goroutine only.
-func learnProfession(e *Entity, ref string) bool {
+// profession is a no-op. Returns false (and changes nothing) when adding a NEW CAPPED profession would exceed
+// the character's cap (professionCap); an UNCAPPED (gathering/utility) profession is never blocked. Load
+// restores a saved set directly (character.go), bypassing this — a saved set already passed. Zone goroutine only.
+func (z *Zone) learnProfession(e *Entity, ref string) bool {
 	l := mutableLiving(e) // COW: fork a proto-aliased entity's Living before mutating its professions map
 	if l == nil {
 		return false
@@ -36,7 +77,7 @@ func learnProfession(e *Entity, ref string) bool {
 	if l.professions[ref] { // nil-map read is false — safe
 		return true
 	}
-	if len(l.professions) >= craftProfessionCap {
+	if z.professionIsCapped(ref) && z.cappedProfessionCount(e) >= z.professionCap(e) {
 		return false
 	}
 	if l.professions == nil {
@@ -75,9 +116,9 @@ func opLearnProfession(c *effectCtx, op *effectOp) error {
 	if !guardCrossPlayerWrite(c, c.target) {
 		return nil
 	}
-	if !learnProfession(c.target, op.profession) {
+	if !c.z.learnProfession(c.target, op.profession) {
 		c.z.log.Debug("learn_profession: at cap, not enrolled",
-			"entity", c.target.short, "profession", op.profession, "cap", craftProfessionCap)
+			"entity", c.target.short, "profession", op.profession, "cap", c.z.professionCap(c.target))
 	}
 	return nil
 }

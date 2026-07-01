@@ -15,15 +15,16 @@ import (
 
 // bundleDef is the runtime form of a content BundleDTO: the kind + the parsed grant op-list.
 type bundleDef struct {
-	ref    string
-	kind   string
-	grants []effectOp
+	ref      string
+	kind     string
+	uncapped bool // a profession bundle that does NOT count against the learned-profession cap (gathering/utility)
+	grants   []effectOp
 }
 
 // buildBundleDef maps a content.BundleDTO onto the runtime bundleDef, parsing its grant op-list. A parse
 // error returns the partial def + the error (registered with whatever parsed — content-lint is the gate).
 func buildBundleDef(b content.BundleDTO) (*bundleDef, error) {
-	def := &bundleDef{ref: b.Ref, kind: b.Kind}
+	def := &bundleDef{ref: b.Ref, kind: b.Kind, uncapped: b.Uncapped}
 	ops, err := parseOpList(b.Grants)
 	if err != nil {
 		return def, fmt.Errorf("bundle %s grants: %w", b.Ref, err)

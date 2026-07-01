@@ -139,21 +139,55 @@ func TestAugmentItemBumpsAffix(t *testing.T) {
 	}
 }
 
-// TestProfessionCap: learnProfession refuses a NEW profession past the cap; an already-known one is idempotent.
+// TestProfessionCap: learnProfession refuses a NEW capped profession past the cap; an already-known one is
+// idempotent. (No content cap attr / no uncapped bundles here => the defaultProfessionCap applies to all.)
 func TestProfessionCap(t *testing.T) {
 	e := newCmdEnv(t)
 	actor := e.actor.entity
-	for i := 0; i < craftProfessionCap; i++ {
+	for i := 0; i < defaultProfessionCap; i++ {
 		ref := string(rune('a'+i)) + "_trade"
-		if !learnProfession(actor, ref) {
-			t.Fatalf("learning profession %d of %d should succeed", i+1, craftProfessionCap)
+		if !e.z.learnProfession(actor, ref) {
+			t.Fatalf("learning profession %d of %d should succeed", i+1, defaultProfessionCap)
 		}
 	}
-	if learnProfession(actor, "one_too_many") {
-		t.Fatalf("learning past the cap (%d) should be refused", craftProfessionCap)
+	if e.z.learnProfession(actor, "one_too_many") {
+		t.Fatalf("learning past the cap (%d) should be refused", defaultProfessionCap)
 	}
 	// Re-learning a KNOWN profession is idempotent — never refused, never double-counts.
-	if !learnProfession(actor, "a_trade") {
+	if !e.z.learnProfession(actor, "a_trade") {
 		t.Fatal("re-learning a known profession should be idempotent (true)")
+	}
+}
+
+// TestProfessionCapUncappedAndAttr: an `uncapped` profession bundle never counts against the cap, and the
+// content attribute professionCapAttr overrides the default ceiling.
+func TestProfessionCapUncappedAndAttr(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+
+	// An uncapped (gathering) profession bundle: learnable without limit and never counts toward the cap.
+	e.z.defs.bundle.register("mining", &bundleDef{ref: "mining", kind: "profession", uncapped: true})
+	for i := 0; i < defaultProfessionCap+3; i++ {
+		if !e.z.learnProfession(actor, "mining") { // idempotent, but proves it's never blocked
+			t.Fatal("an uncapped profession must never be blocked by the cap")
+		}
+	}
+	if got := e.z.cappedProfessionCount(actor); got != 0 {
+		t.Fatalf("an uncapped profession must not count against the cap: cappedCount = %d, want 0", got)
+	}
+
+	// Fill the capped slots to the default, then raise the cap via the content attribute and learn one more.
+	for i := 0; i < defaultProfessionCap; i++ {
+		if !e.z.learnProfession(actor, string(rune('a'+i))+"_craft") {
+			t.Fatalf("capped profession %d should fit under the default cap", i+1)
+		}
+	}
+	if e.z.learnProfession(actor, "extra_craft") {
+		t.Fatal("a capped profession past the default cap should be refused")
+	}
+	e.z.defs.attr.register(professionCapAttr, &attributeDef{ref: professionCapAttr, base: litNode{v: 0}})
+	setAttrBase(actor, professionCapAttr, float64(defaultProfessionCap+1))
+	if !e.z.learnProfession(actor, "extra_craft") {
+		t.Fatalf("raising %s should admit one more capped profession", professionCapAttr)
 	}
 }

@@ -295,3 +295,21 @@ func TestRecipeBodyTrackRoundTrips(t *testing.T) {
 		t.Fatalf("recipeBody round-trip changed the value: %+v -> %+v", in, out)
 	}
 }
+
+// TestBundleBodyUncappedRoundTrips pins that the profession `uncapped` flag survives the bundle_defs JSONB
+// body round-trip (docs/REMAINING.md §4) — the store field-drop class. Import (marshal) + export (unmarshal)
+// share this bundleBody, so pinning its round-trip catches a mistyped/missing json tag.
+func TestBundleBodyUncappedRoundTrips(t *testing.T) {
+	in := bundleBody{Kind: "profession", Uncapped: true, Grants: nil}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bundleBody
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Uncapped {
+		t.Fatalf("bundle uncapped flag dropped in body round-trip: %+v", out)
+	}
+}

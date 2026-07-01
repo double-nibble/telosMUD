@@ -463,8 +463,9 @@ type trackBody struct {
 // ref/pack PK. It mirrors content.BundleDTO minus its Ref, so the bundle SHAPE (its kind + grant op-list)
 // is content carried in the body — the engine names no bundle.
 type bundleBody struct {
-	Kind   string `json:"kind,omitempty"`
-	Grants any    `json:"grants,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+	Uncapped bool   `json:"uncapped,omitempty"`
+	Grants   any    `json:"grants,omitempty"`
 }
 
 // rarityTierBody / lootTableBody are the JSONB-tail shapes for the loot def rows (Phase 12.1), each
@@ -869,7 +870,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				bnRows.Close()
 				return fmt.Errorf("store: bundle_def %s body: %w", bn.Ref, err)
 			}
-			bn.Kind, bn.Grants = b.Kind, b.Grants
+			bn.Kind, bn.Uncapped, bn.Grants = b.Kind, b.Uncapped, b.Grants
 		}
 		pp := pack(pk)
 		pp.Bundles = append(pp.Bundles, bn)
