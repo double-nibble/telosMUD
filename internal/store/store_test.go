@@ -273,3 +273,25 @@ func roomForWriter(i int) string {
 	}
 	return rooms[i%len(rooms)]
 }
+
+// TestRecipeBodyTrackRoundTrips pins that the recipe `track` field survives the recipe_defs JSONB body
+// round-trip (docs/REMAINING.md §4) — a hermetic guard against the store field-drop class (the same class
+// the reflect-walk DTO round-trip test in §7 will generalize). The import (marshal) and export (unmarshal)
+// paths share this recipeBody, so pinning its round-trip catches a mistyped/missing json tag.
+func TestRecipeBodyTrackRoundTrips(t *testing.T) {
+	in := recipeBody{Profession: "smith", Track: "smithing", Skill: "raw", MinSkill: 3, Station: "forge", QualityBase: 5}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out recipeBody
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Track != "smithing" {
+		t.Fatalf("recipe track dropped in body round-trip: got %q", out.Track)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Fatalf("recipeBody round-trip changed the value: %+v -> %+v", in, out)
+	}
+}

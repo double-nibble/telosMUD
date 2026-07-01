@@ -285,14 +285,20 @@ type SpawnScheduleDTO struct {
 }
 
 // RecipeDTO is one content-defined crafting recipe (Phase 13.5, docs/CRAFTING.md): the data the craft op
-// (craft_recipe) runs. Profession + Skill/MinSkill gate it (the actor must have learned the trade and reached
-// the skill level); Station is an optional REQUIRED ROOM FLAG (D3 — a `forge`; "" crafts anywhere); Inputs are
+// (craft_recipe) runs. Profession + Track-or-Skill/MinSkill gate it (the actor must have learned the trade and
+// reached the skill level — Track resolves the level attr from the track_def, Skill is the raw-attr fallback);
+// Station is an optional REQUIRED ROOM FLAG (D3 — a `forge`; "" crafts anywhere); Inputs are
 // the components consumed; Output is the produced item. QualityBase is the coarse output-quality band base —
 // the crafted item's level is QualityBase + the actor's skill level (the rich affix roll stays §10-deferred).
 type RecipeDTO struct {
-	Ref         string           `json:"ref" yaml:"ref"`
-	Profession  string           `json:"profession,omitempty" yaml:"profession,omitempty"`
-	Skill       string           `json:"skill,omitempty" yaml:"skill,omitempty"`         // the skill LEVEL attribute gating + scaling
+	Ref        string `json:"ref" yaml:"ref"`
+	Profession string `json:"profession,omitempty" yaml:"profession,omitempty"`
+	// Track, when set, names the skill TRACK whose level_attr gates + scales this recipe — the engine resolves
+	// the attribute live from the track_def, so the recipe follows the track's level_attr instead of duplicating
+	// it (docs/REMAINING.md §4). Skill is the raw-attribute fallback used when Track is unset (a level-less or
+	// ad-hoc gate). Track takes precedence when both are set.
+	Track       string           `json:"track,omitempty" yaml:"track,omitempty"`
+	Skill       string           `json:"skill,omitempty" yaml:"skill,omitempty"`         // the skill LEVEL attribute (fallback when Track unset)
 	MinSkill    int              `json:"min_skill,omitempty" yaml:"min_skill,omitempty"` // minimum skill level required
 	Station     string           `json:"station,omitempty" yaml:"station,omitempty"`     // required room flag (D3); "" = craft anywhere
 	Inputs      []RecipeInputDTO `json:"inputs" yaml:"inputs"`                           // components consumed

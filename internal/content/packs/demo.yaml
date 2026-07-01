@@ -891,6 +891,9 @@ spawn_schedules:
 recipes:
   - ref: craft:leather_vest
     profession: leatherworking
+    # track resolves the skill gate/scaling from leatherworking_skill's level_attr (=leatherworking) live, so
+    # the recipe follows the track rather than duplicating the attr; skill stays as the raw-attr fallback.
+    track: leatherworking_skill
     skill: leatherworking
     min_skill: 0
     station: forge

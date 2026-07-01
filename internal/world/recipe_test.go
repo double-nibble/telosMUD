@@ -6,6 +6,35 @@ import "testing"
 // an item at the required station from its component inputs (consumed), the output lands in inventory, and
 // crafting without the station/skill/components is refused.
 
+// TestRecipeSkillAttrResolvesTrackLevelAttr pins the docs/REMAINING.md §4 fix: a recipe that names a `track`
+// resolves the gate/scaling attribute from the track's level_attr LIVE, and degrades to the raw `skill`
+// attribute when the track is unset, unknown, or level-less (so a misconfigured track never silently
+// ungates a recipe).
+func TestRecipeSkillAttrResolvesTrackLevelAttr(t *testing.T) {
+	z, _ := combatZone(t)
+	z.defs.track.register("smithing", &trackDef{ref: "smithing", levelAttr: "smith_level"})
+	z.defs.track.register("usebased", &trackDef{ref: "usebased"}) // level-less (no levelAttr)
+
+	cases := []struct {
+		name string
+		def  *recipeDef
+		want string
+	}{
+		{"track resolves to its level_attr", &recipeDef{track: "smithing", skill: "raw_skill"}, "smith_level"},
+		{"unknown track falls back to skill", &recipeDef{track: "nope", skill: "raw_skill"}, "raw_skill"},
+		{"level-less track falls back to skill", &recipeDef{track: "usebased", skill: "raw_skill"}, "raw_skill"},
+		{"no track uses raw skill", &recipeDef{skill: "raw_skill"}, "raw_skill"},
+		{"neither track nor skill => no gate", &recipeDef{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := z.recipeSkillAttr(tc.def); got != tc.want {
+				t.Fatalf("recipeSkillAttr = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // giveComponents puts the leather (×3) + essence (×1) the leather-vest recipe needs into the actor.
 func giveComponents(z *Zone, actor *Entity) {
 	leather := z.spawn(ProtoRef("midgaard:obj:leather"))

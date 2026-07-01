@@ -496,6 +496,7 @@ type spawnScheduleBody struct {
 // the recipe's profession/skill gate, station flag, inputs, output, and quality band, all content.
 type recipeBody struct {
 	Profession  string                   `json:"profession,omitempty"`
+	Track       string                   `json:"track,omitempty"`
 	Skill       string                   `json:"skill,omitempty"`
 	MinSkill    int                      `json:"min_skill,omitempty"`
 	Station     string                   `json:"station,omitempty"`
@@ -986,7 +987,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				rcRows.Close()
 				return fmt.Errorf("store: recipe_def %s body: %w", rc.Ref, err)
 			}
-			rc.Profession, rc.Skill, rc.MinSkill, rc.Station = b.Profession, b.Skill, b.MinSkill, b.Station
+			rc.Profession, rc.Track, rc.Skill, rc.MinSkill, rc.Station = b.Profession, b.Track, b.Skill, b.MinSkill, b.Station
 			rc.Inputs, rc.Output, rc.QualityBase = b.Inputs, b.Output, b.QualityBase
 		}
 		pack(pk).Recipes = append(pack(pk).Recipes, rc)

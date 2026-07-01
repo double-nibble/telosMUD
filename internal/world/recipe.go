@@ -17,12 +17,27 @@ import (
 type recipeDef struct {
 	ref         string
 	profession  string // required profession membership ("" = none)
-	skill       string // skill LEVEL attribute gating + scaling ("" = no skill gate)
+	track       string // skill TRACK whose level_attr gates + scales ("" = use `skill` directly)
+	skill       string // skill LEVEL attribute (fallback when `track` is unset; "" = no skill gate)
 	minSkill    int    // minimum skill level required
 	station     string // required room flag, D3 ("" = craft anywhere)
 	inputs      []recipeInput
 	output      recipeOutput
 	qualityBase int
+}
+
+// skillAttr resolves the attribute this recipe's skill gate + quality scaling read. It prefers the TRACK's
+// level_attr (resolved live from the track_def, so a recipe follows its track's level_attr rather than
+// duplicating it — docs/REMAINING.md §4); it falls back to the raw `skill` attribute when no track is set,
+// or when the named track is unknown / level-less (so a misconfigured track degrades to the fallback, not a
+// silently-ungated recipe). "" => no skill gate.
+func (z *Zone) recipeSkillAttr(def *recipeDef) string {
+	if def.track != "" {
+		if td := z.trackDefs().get(def.track); td != nil && td.levelAttr != "" {
+			return td.levelAttr
+		}
+	}
+	return def.skill
 }
 
 type recipeInput struct {
@@ -39,7 +54,7 @@ type recipeOutput struct {
 // buildRecipeDef maps a content RecipeDTO onto the runtime recipeDef (qty defaults to 1).
 func buildRecipeDef(d content.RecipeDTO) *recipeDef {
 	def := &recipeDef{
-		ref: d.Ref, profession: d.Profession, skill: d.Skill, minSkill: d.MinSkill,
+		ref: d.Ref, profession: d.Profession, track: d.Track, skill: d.Skill, minSkill: d.MinSkill,
 		station: d.Station, qualityBase: d.QualityBase,
 		output: recipeOutput{item: d.Output.Item, qty: max1(d.Output.Qty), bind: d.Output.Bind},
 	}
@@ -81,8 +96,8 @@ func opCraftRecipe(c *effectCtx, op *effectOp) error {
 		craftRefuse(c.actor, "You lack the training for that craft.")
 		return nil
 	}
-	// Gate: skill level.
-	if def.skill != "" && def.minSkill > 0 && int(attr(c.actor, def.skill)) < def.minSkill {
+	// Gate: skill level (resolved from the track's level_attr when the recipe names a track, else the raw skill attr).
+	if skillAttr := c.z.recipeSkillAttr(def); skillAttr != "" && def.minSkill > 0 && int(attr(c.actor, skillAttr)) < def.minSkill {
 		craftRefuse(c.actor, "Your skill is not yet equal to that recipe.")
 		return nil
 	}
@@ -145,8 +160,8 @@ func consumeQuantity(e *Entity, ref string, qty int) error {
 // override. A material output merges into a held stack like a pickup. Zone goroutine.
 func (z *Zone) produceRecipeOutput(actor *Entity, def *recipeDef) {
 	level := def.qualityBase
-	if def.skill != "" {
-		level += int(attr(actor, def.skill))
+	if skillAttr := z.recipeSkillAttr(def); skillAttr != "" {
+		level += int(attr(actor, skillAttr))
 	}
 	for i := 0; i < def.output.qty; i++ {
 		item := z.spawn(ProtoRef(def.output.item))
