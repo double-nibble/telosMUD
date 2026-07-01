@@ -849,6 +849,48 @@ func (s *Shard) loadCharacterSnapshot(ctx context.Context, name string) (CharSna
 // the deeper guard.
 const maxItemNestDepth = 16
 
+// maxCarryItemNodes bounds the TOTAL item-node count (inventory + worn + all nested container contents) a
+// cross-shard handoff may carry — the WIDTH guard that complements maxItemNestDepth's depth guard. A
+// wide-but-shallow adversarial tree would otherwise be bounded only by the gRPC message size, still large
+// enough to stall the destination zone goroutine on rehydrate (spawn-bomb). A generous ceiling for a real
+// inventory; a carry past it is rejected at Prepare.
+const maxCarryItemNodes = 512
+
+// maxCarryStateBytes bounds the marshalled StateJson a cross-shard handoff may carry — the total-payload
+// guard checked before unmarshal, so a forged/oversized carry (the handoff is unauthenticated, §5) can't
+// force a huge allocation on the destination. Generous for a real player's full state; gRPC's own message
+// limit is far too loose to protect the zone goroutine.
+const maxCarryStateBytes = 256 * 1024
+
+// carryItemAudit walks a carried inventory tree (inventory + worn + nested contents) ONCE and returns both
+// the prototype refs this shard cannot spawn (missing — a pack mismatch) and the total item-node count (for
+// the width cap). A cross-shard Prepare rejects on either, before committing. A uniform-pack fleet with a
+// normal inventory returns (nil, small). The depth-cap-truncated tail is not counted or flagged missing.
+func (z *Zone) carryItemAudit(st StateJSON) (missing []string, nodes int) {
+	var walk func(its []ItemJSON, depth int)
+	walk = func(its []ItemJSON, depth int) {
+		if depth > maxItemNestDepth {
+			return
+		}
+		for _, it := range its {
+			nodes++
+			if z.protos.get(ProtoRef(it.ProtoRef)) == nil {
+				missing = append(missing, it.ProtoRef)
+			}
+			walk(it.Contents, depth+1)
+		}
+	}
+	walk(st.Inventory, 0)
+	for _, it := range st.Equipment {
+		nodes++
+		if z.protos.get(ProtoRef(it.ProtoRef)) == nil {
+			missing = append(missing, it.ProtoRef)
+		}
+		walk(it.Contents, 1)
+	}
+	return missing, nodes
+}
+
 // loadItem spawns one persisted item from its prototype ref into parent's contents, recursing
 // into container contents. Returns the spawned entity (nil if the prototype is unknown) and the
 // count of item prototypes that could NOT be spawned (unknown on this shard) anywhere in this

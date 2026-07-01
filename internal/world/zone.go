@@ -1189,6 +1189,43 @@ func (z *Zone) prepare(m prepareMsg) {
 		m.reply <- status.Errorf(codes.FailedPrecondition, "zone %q cannot place room %q", z.id, m.room)
 		return
 	}
+	// Pack-set validation (security hardening): if the carried inventory/equipment names a prototype this
+	// shard's enabled packs don't define, REJECT the handoff BEFORE rehydrating — the source then thaws the
+	// player in place WITH their items intact, instead of accepting the move and silently DROPPING the items
+	// post-commit (the old destination-mismatch data-loss window). A uniform-pack fleet never trips this; a
+	// genuine mismatch (zones sharing an exit but not their packs) is a deployment misconfiguration surfaced
+	// loudly rather than eaten. A malformed carry is NOT rejected here (it degrades to defaults below).
+	if raw := m.snap.GetStateJson(); raw != "" {
+		// Byte cap FIRST (cheap, before unmarshal): a forged/oversized carry — the handoff is unauthenticated
+		// (§5) — can't force a huge allocation or a rehydrate-bomb. gRPC's message limit is far too loose to
+		// bound the destination zone-goroutine work.
+		if len(raw) > maxCarryStateBytes {
+			z.log.Warn("handoff prepare rejected: carried state exceeds the byte cap",
+				"player", character, "bytes", len(raw), "cap", maxCarryStateBytes, "zone", z.id)
+			m.reply <- status.Errorf(codes.FailedPrecondition, "carried state too large (%d bytes)", len(raw))
+			return
+		}
+		var st StateJSON
+		if err := json.Unmarshal([]byte(raw), &st); err == nil {
+			missing, nodes := z.carryItemAudit(st)
+			switch {
+			case len(missing) > 0:
+				// Pack-set mismatch: reject before committing so the source keeps the player + items rather
+				// than accepting the move and silently dropping the unknown items post-arrival.
+				z.log.Warn("handoff prepare rejected: carried item prototypes unknown on this shard",
+					"player", character, "missing", missing, "zone", z.id)
+				m.reply <- status.Errorf(codes.FailedPrecondition,
+					"destination lacks %d carried item prototype(s): %v", len(missing), missing)
+				return
+			case nodes > maxCarryItemNodes:
+				// Width guard: a wide-but-shallow tree past the node cap would stall the zone on rehydrate.
+				z.log.Warn("handoff prepare rejected: carried item count exceeds the node cap",
+					"player", character, "nodes", nodes, "cap", maxCarryItemNodes, "zone", z.id)
+				m.reply <- status.Errorf(codes.FailedPrecondition, "carried inventory too large (%d items)", nodes)
+				return
+			}
+		}
+	}
 	s := &session{
 		character:    character,
 		appliedSeq:   m.snap.GetAppliedSeq(),
@@ -1223,10 +1260,11 @@ func (z *Zone) prepare(m prepareMsg) {
 		} else {
 			dropped := applyStateComponents(z, s, st)
 			if dropped > 0 {
-				// LOUD operator surface + a one-line player notice deferred to bind (the pending session has
-				// no out channel yet). The deeper fix (destination pack-set validation BEFORE accepting the
-				// handoff) is recorded in docs/FOLLOW-UPS.md.
-				z.log.Warn("handoff: some carried items have no prototype on this shard (dropped)",
+				// After the pack-set pre-check above, an unknown PROTOTYPE can no longer reach here (that
+				// path rejects the whole handoff). A residual drop is now only the maxItemNestDepth
+				// TRUNCATION of a degenerately-deep carried container — still worth a loud log + the player
+				// notice, but bounded and not a pack mismatch.
+				z.log.Warn("handoff: carried container exceeded the nesting cap (deepest contents dropped)",
 					"player", character, "dropped", dropped, "zone", z.id)
 				s.pendingNotice = "Some of your items did not transfer to this area."
 			}

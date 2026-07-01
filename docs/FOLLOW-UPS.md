@@ -149,10 +149,12 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
 - **Multi-vital unsupported** — `vitalResource` collapses all `vital: true` resources
   to the single lowest-ref one, so a 2nd vital pool (stamina/blood) would be dead
   config. Generalize damage/death/respawn across vitals if/when authored. · *world*
-- **Death/corpse hardening (Phase 11 + security)** — `death.go:150` death-narration
-  `mag = victim max-hp` is builder-influenceable; `death.go:194` the corpse is an
-  UNOWNED free-for-all (no loot ownership). Both are intentional minimal-slice
-  behavior to revisit with the progression/loot ruleset. · *progression/security*
+- **Death/corpse hardening (Phase 11 + security)** — `death.go` death-narration `mag = victim max-hp` is
+  builder-influenceable (still open — see the per-mob `xp_value`/kill-magnitude cap in §7). ~~The corpse is an
+  UNOWNED free-for-all~~ **RESOLVED (security hardening):** `makeCorpse` stamps a `CorpseOwner` killer
+  loot-ownership window (`corpseLootWindow` = 60s); the `getFrom` gate refuses a non-killer within it
+  (anti-ninja-loot / kill-steal), then it decays to a free-for-all. A mob-on-mob kill (no player killer) is
+  free-for-all from the start. Test: `TestCorpseLootOwnershipWindow`. · *progression/security*
 - ~~**Retire the redundant `Redirect.resume_input_seq` wire field (`Play` protocol)**~~ —
   RESOLVED (option a): deleted `Redirect.resume_input_seq` from `play.proto` (field 3 now
   `reserved`) + all the Go plumbing that only fed its diagnostic log (the `redirectFrame`
@@ -259,22 +261,19 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
     persona in the end-of-roadmap wiki and the permission/trust model; the visibility half is the
     elevated counterpart to the player-facing `canSee` gate. · *mudlib/edge*
 
-- **Cross-shard handoff: destination pack-set VALIDATION (the unknown-prototype data-loss window).**
-  The full-state carry (`internal/world/handoff.go` `buildSnapshot` `StateJson`, applied in
-  `internal/world/zone.go` `prepare`) re-spawns carried items by prototype ref on the destination.
-  If the destination shard enables a DIFFERENT pack set than the source, an item's prototype can be
-  unknown there: `loadItem` skips it with a LOUD `Warn` and the arriving player gets a one-line notice
-  ("Some of your items did not transfer to this area.") — but the item is GONE. This is a data-loss
-  window save/load does NOT have (same content on both ends of a reload). The deeper fix: validate the
-  destination's enabled-pack set covers the carried prototypes BEFORE accepting the handoff (reject /
-  re-route / stage the item), rather than dropping post-commit. Until then the carry conserves exactly
-  what save/load does plus the loud warn + notice. · *persistence/distsys*
-- **Cross-shard handoff: total inventory node/byte CAP (depth cap only today).** The carry's container
-  nesting is currently bounded only by `maxItemNestDepth` (`internal/world/character.go` `loadItem`):
-  a degenerate/adversarial tree is truncated at depth 16 with a loud log. The script/comms/tell
-  subtrees each have their own size caps; inventory still lacks a TOTAL node-count / byte ceiling on
-  the Prepare payload (a wide-but-shallow tree is unbounded). Add a total-node or marshalled-byte cap
-  on the carry (and ideally on the durable `characters.state` write) as the complete guard. · *persistence*
+- ~~**Cross-shard handoff: destination pack-set VALIDATION**~~ **RESOLVED (security hardening)** — `prepare`
+  (`internal/world/zone.go`) now runs `z.carryItemAudit` on the carried inventory/equipment BEFORE
+  rehydrating: any prototype ref this shard's packs don't define REJECTS the handoff (FailedPrecondition), so
+  the source thaws the player in place WITH their items instead of accepting the move and silently dropping
+  them post-commit. A uniform-pack fleet never trips it; a genuine mismatch is a surfaced misconfiguration.
+  The residual post-commit drop is now only the `maxItemNestDepth` truncation. Test:
+  `TestPrepareRejectsUnknownItemPrototype`. · *persistence/distsys*
+- ~~**Cross-shard handoff: total inventory node/byte CAP**~~ **RESOLVED (security hardening)** — `prepare`
+  now enforces `maxCarryStateBytes` (256 KiB, checked before unmarshal) + `maxCarryItemNodes` (512, the WIDTH
+  guard `carryItemAudit` counts) on the Prepare payload, so a forged/oversized carry (the handoff is
+  unauthenticated, §5) can't force a huge allocation or a rehydrate spawn-bomb — gRPC's own limit is far too
+  loose. Test: `TestPrepareRejectsOversizedCarry`. (Deferred, smaller: a matching cap on the durable
+  `characters.state` write.) · *persistence*
 
 ### Content-authoring gaps surfaced by the richer demo pack (Phase 8 playtest)
 

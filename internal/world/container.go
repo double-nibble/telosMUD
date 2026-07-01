@@ -3,6 +3,7 @@ package world
 import (
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Containers, inventory, and equipment commands (docs/MUDLIB.md §3, §4, §6, §7) — the
@@ -157,6 +158,13 @@ func (z *Zone) getFrom(c *Context, item, cont string) error {
 	}
 	if cc.closed {
 		c.z.act("$p is closed.", c.Actor, box, nil, "", "", ToActor)
+		return nil
+	}
+	// Corpse loot-ownership window (anti-ninja-loot): while a fresh kill's window is open, only the killer
+	// may loot it; a bystander is refused until it lapses (death.go stamps the CorpseOwner). No component /
+	// a lapsed window / your own kill => no gate.
+	if co, ok := Get[*CorpseOwner](box); ok && co.owner != "" && co.owner != c.s.character && time.Now().Before(co.until) {
+		c.z.act("$p is not yours to loot yet.", c.Actor, box, nil, "", "", ToActor)
 		return nil
 	}
 	matches := c.z.resolveInContainer(c.Actor, box, parseTargetSpec(item))

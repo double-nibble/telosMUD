@@ -1,6 +1,24 @@
 package world
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
+
+// corpseLootWindow is how long a fresh corpse is loot-OWNED by its killer: within it, only the killer may
+// loot (no ninja-loot / kill-steal by a bystander); after it the corpse decays to a free-for-all. A mob
+// killed by another mob (no player killer) has no owner and is free-for-all from the start.
+const corpseLootWindow = 60 * time.Second
+
+// CorpseOwner marks a corpse with a killer loot-ownership window (security: anti-ninja-loot). owner is the
+// killer's character id; until is when the window lapses. A corpse with no CorpseOwner (or a lapsed one) is
+// lootable by anyone. Checked at the get-from-container gate (container.go). Zone-goroutine-owned.
+type CorpseOwner struct {
+	owner string
+	until time.Time
+}
+
+func (*CorpseOwner) componentKind() Kind { return KindCorpseOwner }
 
 // death.go is the DEATH -> CORPSE -> OnKill machinery + the THREAT list and AGGRO initiation
 // (docs/COMBAT.md §7, docs/PHASE6-PLAN.md §1.3 / §1.3.1 [G-D]). Everything here runs ON the zone
@@ -207,14 +225,20 @@ func (z *Zone) die(victim, killer *Entity, parent *effectCtx) {
 // can carry. The engine NAMES no mob/loot — the corpse merely inherits whatever CONTENT the mob held
 // (P6-D6). Loot TABLES / affix rolls are Phase 11/12 (reserved): for now the corpse holds the carried
 // items only.
-// TODO(phase11, security review): the corpse is currently an UNOWNED free-for-all — any player in the
-// room can `get all corpse` regardless of who landed the kill (ninja-loot / kill-steal). Low-impact
-// today (mob loot only; player death drops NO gear), but BEFORE any drop-on-death loot ruleset ships,
-// add a killer/threat-derived loot-ownership window. The hook exists: makeCorpse already records the
-// killer. Single-writer: zone goroutine.
+// makeCorpse builds the victim's corpse, moves their carried items into it, and stamps a killer
+// loot-ownership window (CorpseOwner) so a bystander can't ninja-loot / kill-steal a fresh kill (the gate is
+// in container.go getFrom). Single-writer: zone goroutine.
 func (z *Zone) makeCorpse(victim, killer *Entity) {
 	room := victim.location
 	corpse := z.newCorpse(victim)
+
+	// Loot-ownership window (anti-ninja-loot): if a PLAYER landed the kill, only they may loot the corpse
+	// until the window lapses. A mob-on-mob kill (no player killer) leaves it a free-for-all from the start.
+	if killer != nil {
+		if ks, ok := sessionOf(killer); ok && ks.character != "" {
+			Add(corpse, &CorpseOwner{owner: ks.character, until: time.Now().Add(corpseLootWindow)})
+		}
+	}
 
 	// Move every item the victim carried into the corpse. Worn items live in the victim's contents too
 	// (equipped is a STATE over a carried item, container.go), so a single contents walk captures BOTH

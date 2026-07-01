@@ -3,6 +3,7 @@ package world
 import (
 	"math/rand"
 	"testing"
+	"time"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
@@ -103,6 +104,83 @@ func TestOnVitalDepletedIdempotent(t *testing.T) {
 	z.onVitalDepleted(mob, s.entity, nil)
 	if got := countCorpses(); got != 1 {
 		t.Fatalf("second onVitalDepleted built a duplicate corpse: %d corpses, want 1 (latch failed)", got)
+	}
+}
+
+// TestCorpseLootOwnershipWindow pins the anti-ninja-loot gate: while a fresh kill's ownership window is
+// open, a BYSTANDER (who didn't land the kill) is refused `get all corpse`; the KILLER loots freely; and once
+// the window lapses the corpse decays to a free-for-all any looter can take.
+func TestCorpseLootOwnershipWindow(t *testing.T) {
+	z := newDemoZone("darkwood", newProtoCache())
+	z.testCombatRng = rand.New(rand.NewSource(7))
+	hollow := z.rooms["darkwood:room:hollow"]
+
+	killer := &session{character: "Hero", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(killer, "Hero")
+	Move(killer.entity, hollow)
+	z.players["Hero"] = killer
+	setAttrBase(killer.entity, "strength", 18)
+	setAttrBase(killer.entity, "accuracy", 20)
+	setAttrBase(killer.entity, "attacks", 5)
+	setAttrBase(killer.entity, "damroll", 20)
+	equipWeapon(killer.entity, &Weapon{diceNum: 2, diceSize: 6, damageType: "slash"})
+
+	bystander := &session{character: "Jackal", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(bystander, "Jackal")
+	Move(bystander.entity, hollow)
+	z.players["Jackal"] = bystander
+
+	if err := cmdKill(&Context{z: z, s: killer, Actor: killer.entity, arg: "goblin"}); err != nil {
+		t.Fatalf("cmdKill: %v", err)
+	}
+	var corpse *Entity
+	for round := 0; round < 40 && corpse == nil; round++ {
+		for i := uint64(0); i < PULSE_VIOLENCE; i++ {
+			z.pulses.tick()
+		}
+		for _, e := range hollow.contents {
+			if _, ok := Get[*Container](e); ok {
+				corpse = e
+			}
+		}
+	}
+	if corpse == nil {
+		t.Fatal("the goblin never died / no corpse dropped")
+	}
+	if co, ok := Get[*CorpseOwner](corpse); !ok || co.owner != "Hero" {
+		t.Fatalf("corpse ownership = %+v, want owner Hero", co)
+	}
+
+	// Bystander is refused within the window: the knife stays in the corpse.
+	if err := cmdGet(&Context{z: z, s: bystander, Actor: bystander.entity, arg: "all corpse"}); err != nil {
+		t.Fatalf("cmdGet(bystander): %v", err)
+	}
+	for _, e := range bystander.entity.contents {
+		if e.proto == "darkwood:obj:rusty-knife" {
+			t.Fatal("bystander looted the corpse within the killer's ownership window (ninja-loot)")
+		}
+	}
+
+	// After the window lapses, the bystander CAN loot (free-for-all). Force expiry.
+	expireCorpseWindow(corpse)
+	if err := cmdGet(&Context{z: z, s: bystander, Actor: bystander.entity, arg: "all corpse"}); err != nil {
+		t.Fatalf("cmdGet(bystander, post-window): %v", err)
+	}
+	var looted bool
+	for _, e := range bystander.entity.contents {
+		if e.proto == "darkwood:obj:rusty-knife" {
+			looted = true
+		}
+	}
+	if !looted {
+		t.Fatal("a lapsed corpse was not lootable by a bystander (free-for-all after the window)")
+	}
+}
+
+// expireCorpseWindow forces a corpse's ownership window into the past (test helper).
+func expireCorpseWindow(corpse *Entity) {
+	if co, ok := Get[*CorpseOwner](corpse); ok {
+		co.until = time.Now().Add(-time.Second)
 	}
 }
 
