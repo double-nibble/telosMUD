@@ -94,13 +94,15 @@ seam are independent and can run in parallel — the constraints that matter are
   the flavor is which text a builder colors, already in content's hands). Adjacent tokens COALESCE into one SGR
   (`{{FG_RED}}{{BOLD}}` → `\x1b[31;1m`); unknown `{{XYZ}}` passes through literally; an auto-`\x1b[0m` at frame
   end stops an unclosed color bleeding. Per-player `color on/off` (persisted) strips instead of renders.
-  **Slices:** (1) edge core (token table + `renderTokens`/`stripTokens` wired into Write after sanitize, per-Conn
-  `colorEnabled`, auto-reset, tests incl. an injection-safety proof); (2) `color on/off` command + pref; (3) demo
-  colored room + a couple engine auto-colors (exits cyan). **Deferred:** GMCP token-strip (the Track-0 GMCP-
-  bypasses-sanitize path), width-aware framing (`Width(stripTokens(s))` for `score`), optional semantic aliases
-  (`{{ENEMY}}` → direct tokens, only if a pack wants global re-theming). **Do slice 1's markup before
-  capitalization** so cap logic targets the text, not the token. See [[content-alias-and-salvage-direction]]
-  for the mechanism/flavor split. · *edge/mudlib*
+  **Slices:** (1) DONE (commit 92191b4) — edge core (`internal/telnet/color.go` renderColor + per-Conn
+  `colorEnabled` + Write wiring + injection-safety proof). (2) DONE — the edge-local `color on/off` command
+  (`internal/gate/color.go`, intercepted in the line pump, NOT forwarded to the world since color is a terminal
+  concern; session-scoped). (3) demo colored room + a couple engine auto-colors (exits cyan). **Deferred:**
+  PERSIST the color pref across sessions via the ACCOUNT (not the world — color stays an edge concern; slice 2
+  is session-scoped today); GMCP token-strip (the Track-0 GMCP-bypasses-sanitize path — `Comm.Channel.Text`
+  ships raw `{{tokens}}`, JSON-escaped so injection-safe, just cosmetic); width-aware framing
+  (`Width(stripTokens(s))` for `score`); optional semantic aliases (`{{ENEMY}}` → direct tokens). Capitalization
+  (next) targets the text, not the token. See [[content-alias-and-salvage-direction]]. · *edge/mudlib*
 - **Presentation capitalization.** (1) At the START of a line/sentence, a lowercase-article short/message renders
   capitalized (`a torch` → `A torch.`, `a goblin arrives.` → `A goblin arrives.`) while the SAME short stays
   lowercase mid-sentence (`You get a torch.`); (2) proper names always capitalized. Seam: `act()` (the Diku

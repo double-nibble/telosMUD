@@ -329,6 +329,11 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 				log.Debug("line pump ended", "err", err)
 				return
 			}
+			// Edge-local commands (color) are a terminal concern, handled here and NOT forwarded to the
+			// world — the gate owns rendering, the world owns game state.
+			if handleColorCommand(tc, line) {
+				continue
+			}
 			lines <- line
 		}
 	}()
