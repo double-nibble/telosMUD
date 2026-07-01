@@ -93,3 +93,16 @@ func (h *handoffServer) Abort(_ context.Context, req *handoffv1.AbortRequest) (*
 	}
 	return &handoffv1.AbortResponse{}, nil
 }
+
+// AdoptZone runtime-hosts a draining peer's zone on this shard (Phase 16.4b): it builds + runs the zone
+// (HostZone, idempotent) and starts its lease renewal, which waits out the draining source's ownership and
+// takes over the instant the source's HandoverZone flip lands. It is BUILD-ONLY — it does NOT claim the
+// lease itself; the caller (the draining source) owns the atomic flip so ShardForZone never observes an
+// ownerless gap. Errors (FailedPrecondition) if this shard can't host the zone (not running / no content).
+func (h *handoffServer) AdoptZone(_ context.Context, req *handoffv1.AdoptZoneRequest) (*handoffv1.AdoptZoneResponse, error) {
+	z, err := h.shard.HostZone(req.GetZoneId())
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "adopt zone %q: %v", req.GetZoneId(), err)
+	}
+	return &handoffv1.AdoptZoneResponse{Hosted: z != nil}, nil
+}

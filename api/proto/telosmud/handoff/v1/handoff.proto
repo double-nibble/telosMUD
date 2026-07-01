@@ -10,6 +10,10 @@ service Handoff {
   rpc Prepare(PrepareRequest) returns (PrepareResponse); // rehydrate in PENDING state
   rpc Commit(CommitRequest) returns (CommitResponse); // activate after gate re-attaches
   rpc Abort(AbortRequest) returns (AbortResponse); // roll back on failure/timeout
+  // AdoptZone asks this shard to runtime-host a draining peer's zone (Phase 16.4b graceful drain), so the
+  // source can then flip the lease (HandoverZone) and hand its players off into the zone here. Build-only:
+  // it hosts + starts renewal; the caller owns the atomic lease flip that makes ShardForZone resolve here.
+  rpc AdoptZone(AdoptZoneRequest) returns (AdoptZoneResponse);
 }
 
 message PrepareRequest {
@@ -40,6 +44,14 @@ message AbortRequest {
 }
 
 message AbortResponse {}
+
+message AdoptZoneRequest {
+  string zone_id = 1; // the draining peer's zone this shard should build + run + start renewing
+}
+
+message AdoptZoneResponse {
+  bool hosted = 1; // true once the zone is live on this shard (idempotent if already hosted)
+}
 
 // PlayerSnapshot is the authoritative in-memory player state carried in a
 // handoff, so the destination resumes with zero DB round-trips.
