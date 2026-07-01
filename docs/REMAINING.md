@@ -235,17 +235,14 @@ A privilege layer above player — its own project (much like documentation).
 - **The 5e-SRD / multi-system acceptance packs** are now folded into the "[LARGE] Multi-file demo packs"
   item in §4 (basic + 5eSRD + WoWSRD). The game-systems gap analysis (archived in COMPLETED.md) stays the
   design reference for them.
-- **Flaky tests.** (1) `gate.TestSessionLockTakeoverKicksDisplacedConnection` — de-flake with a
-  generous/synchronized kick-message deadline (the "rebuild on OAuth login" note is moot). (2)
-  `gate.TestChannelLineRendersVerbatimNoTellPrefix` — raise the per-line wait / settle the comms path under a
-  loaded `-race` job.
-- **Orphaned `account_auth` / `ssh_keys` tables (dead schema).** Migration `00015_accounts.sql` still creates
-  the passphrase (`account_auth`) and `ssh_keys` tables, but Phase 15 removed every code path that reads or
-  writes them (auth is OAuth-only). Add a follow-up migration to drop them (or a comment marking them
-  intentionally retained). `db/migrations/`.
-- **Stale doc-comment in `internal/web/oauth.go`.** Its header still describes "the account dashboard, and
-  the 'Play' bridge," which `internal/web/server.go` says no longer exists ("no longer a website: it is a
-  bare auth bridge"). A one-line code-comment cleanup.
+*Burned down (see COMPLETED.md → "Launch-hardening burn-down round 2"): the two flaky gate tests
+(`TestSessionLockTakeoverKicksDisplacedConnection`, `TestChannelLineRendersVerbatimNoTellPrefix`), the
+orphaned `account_auth`/`ssh_keys` drop migration (00017), and the stale `internal/web/oauth.go` header.*
+
+- **Stale Phase-14 docstrings sweep (comment-only).** Beyond oauth.go (done), several headers still describe
+  removed passphrase/SSH-login functionality: `internal/account/service.go:4`, `internal/store/account.go:17`,
+  `cmd/telos-account/main.go:3`, `internal/gate/gate.go:3/182/226`, `internal/config/config.go:25`. Correct
+  them to the OAuth-only state (found during the 00017 review). Low-risk cleanup; touches account/gate/config.
 - **Builder-guide note: top-level `state.x = …` re-runs on hot reload.** A reloaded script's non-handler body
   re-executes against the PRESERVED `self.state`, so `state.x = 0` clobbers a live value; idiomatic content
   guards it (`state.x = state.x or 0`). The PERSISTENCE.md note is added; this remains for the builder guide

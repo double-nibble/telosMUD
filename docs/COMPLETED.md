@@ -5154,3 +5154,20 @@ committed green. Kept here for posterity; the live TODO no longer lists them.
   `affect_runtime.go`.
 - **Durable `characters.state` byte cap.** A log-only soft cap (`maxDurableStateBytes`, mirrors the handoff
   carry cap) warns on unbounded state growth at the saver, off the zone goroutine. `internal/world/saver.go`.
+
+## §8 Housekeeping
+
+- **Dropped dead auth schema.** Migration `00017_drop_dead_auth_tables.sql` drops `account_auth` (passphrase)
+  and `ssh_keys` — Phase 15 removed every reader (OAuth-only). Reviewed by persistence-engineer + auth-engineer.
+- **Corrected the stale `internal/web/oauth.go` package comment** to the Phase-15 device/broker OAuth bridge
+  (no dashboard/forms/Play bridge). auth-engineer-confirmed.
+- **De-flaked two gate tests.** `TestSessionLockTakeoverKicksDisplacedConnection` — poll-Acquire until the
+  login's own lock token is observed as the previous holder, a happens-before that stops the login's initial
+  Acquire from clobbering the simulated takeover. `TestChannelLineRendersVerbatimNoTellPrefix` — retry the
+  gossip send (harness `tryExpect`) until the async channel subscription is live (MemBus has no replay).
+  Both reviewed by test-engineer + edge-engineer, `-race -count=10` clean.
+
+Still open in §8 (contingent on unbuilt features or other clusters): `ClearPlayer` dir cleanup (awaits
+`ClearPlayer`), cross-respawn op-list guard (with the respawn-sickness slice), multi-vital support (a 2nd
+authored vital pool), instanced zones (a later content phase), the death-mag cap (folded into §4 `xp_value`),
+a stale-Phase-14-docstrings sweep, and the builder-guide hot-reload note (docs/wiki project).
