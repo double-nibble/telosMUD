@@ -5171,3 +5171,27 @@ Still open in §8 (contingent on unbuilt features or other clusters): `ClearPlay
 `ClearPlayer`), cross-respawn op-list guard (with the respawn-sickness slice), multi-vital support (a 2nd
 authored vital pool), instanced zones (a later content phase), the death-mag cap (folded into §4 `xp_value`),
 a stale-Phase-14-docstrings sweep, and the builder-guide hot-reload note (docs/wiki project).
+
+## §4 Content / itemization
+
+- **Restorative ops honor dice + bonus.** `opHeal`/`opRestore` compute `amount + rolled dice + scoped bonus`
+  like `opDealDamage` (a `2d8 + $actor.wis_bonus` heal), actor-scoped; the non-negative clamp preserves the
+  ungated-heal invariant. Reviewed by abilities-engineer + security-auditor.
+- **Formula evaluator fails closed on NaN/±Inf** (found in the heal-dice security review). `evalFinite` rejects
+  a non-finite TOP-LEVEL result (a tamed intermediate Inf that min/clamp bounds is still allowed); the three
+  formula consumers (check bonus, attribute base, grant base) route through it, closing the `int(+Inf)`=maxint
+  damage / NaN-attribute-poison vector. Fuzz test now asserts finiteness; the stale "never NaN" comment fixed.
+- **OnKill kill-magnitude cap.** `killMagnitude` prefers an explicit content `xp_value`, else the vital-pool
+  max capped at `maxKillMagnitude`, so a tanky mob can't be farmed for outsized XP. Loot is threat-based /
+  mag-independent (XP-scoped). Reviewed by combat-engineer + progression-engineer. (Closes the §8 death-mag item.)
+- **Affect-hook reconciliation.** `OnApplyAffect`/`OnAffectExpire`/`OnAffectTick` already fire (7.8b) — the
+  stale "no-op-with-a-log" comment on `fireOnApplyAffect`/`fireOnAffectExpire`/`fireOnTick` was corrected;
+  a content `on_event` subscriber does get the callback. Only `OnRest` stays dark (no rest mechanic to fire it).
+- **Recipe skill-gate resolves a track's level_attr.** `RecipeDTO.Track` (optional): the skill gate + quality
+  scaling resolve the attribute from the track_def's `level_attr` live (fallback to the raw `skill` attr), so a
+  recipe follows its track instead of duplicating the level attr. Wired through the recipe_defs JSONB (no
+  migration); the demo leather-vest recipe now uses `track`. Reviewed by progression-engineer + persistence-engineer.
+- **Profession cap: content-configurable + uncapped kind.** The cap is the content attribute `max_professions`
+  (defaults to 2 when unset; a class/feat can raise it); `BundleDTO.Uncapped` marks a gathering/utility
+  profession as unlimited/non-counting; only capped professions count (unknown => capped, safe). Wired through
+  the bundle_defs JSONB (no migration). Reviewed by progression-engineer + persistence-engineer.

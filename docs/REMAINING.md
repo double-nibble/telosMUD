@@ -74,31 +74,35 @@ cookie prefix, mid-session hear-access republish, and the durable `characters.st
   a stub: a worn item confers no bonus (no affect hook), and the wearable slot set is an engine-fixed enum.
   Wire the gear-modifier seam (a rolled item's affixes register as a `modSource` on wear, unregister on
   remove) and make the slot vocabulary content-defined (a `wear_slots` table).
-- **The declarative `heal` effect-op ignores dice.** A `heal` op takes a flat amount; wire a dice-expression
-  form (`2d8+WIS`) through it (and by symmetry any restorative op). The dice evaluator already exists.
+*Burned down (see COMPLETED.md → "Launch-hardening burn-down round 2"): the `heal`/restorative dice+bonus
+form, the formula NaN/±Inf fail-closed guard (found in the heal-dice review), the OnKill kill-magnitude cap
+(`xp_value` + fallback cap — also §8 death-mag), the reserved-affect-event-kinds reconciliation (those hooks
+already fire; only OnRest is dark, pending a rest mechanic), the recipe skill-gate `track` resolution, and
+the content-configurable profession cap + uncapped kind.*
+
+- **Dedupe the op amount roll (optional, low priority).** opDealDamage and opHeal now duplicate the
+  `amount + dice(diceNum/diceCount) + bonus` block; extract a `rollOpAmount(c, op)` helper so they can't drift
+  (abilities-engineer advisory during the heal-dice review). · *abilities/world*
 - **Generic object-targeted salvage/craft verbs (13.4/13.5).** Each salvage/craft is one verb bound to a
   FIXED source proto / recipe ref. A real client wants `disenchant <item>` (object-targeted, item-TAG gated)
   and `craft <recipe>` (recipe chosen by argument).
-- **Recipe skill-gate uses the level ATTR, not the track (13.5).** `RecipeDTO.Skill` names the skill-level
-  attribute; it does not resolve the track's `level_attr`. Brittle if they diverge.
-- **Profession cap: content-config + kind split (13.3, D2).** `craftProfessionCap` is a uniform constant (2);
-  make it content-configurable and only applied to *crafting* professions (gathering/utility unlimited) via a
-  profession "kind".
+- **Content-lint: `learn_profession.profession` must name a `kind: profession` bundle (found in the cap review).**
+  The uncapped/capped resolution keys off `bundleDefs().get(profession_ref)` (ref == bundle ref by convention);
+  a content-lint rule asserting every `learn_profession.profession` names a matching `kind: profession` bundle
+  ref would machine-check that convention instead of relying on authorial discipline. Low severity (the engine
+  already defaults to capped on a miss — conservative). · *progression/content*
 - **`on_roll(ctx)` Lua loot hatch (12.1).** The loot resolver is fully declarative; add the Lua escape hatch
   for conditional drops the declarative form can't express.
 - **Normalized `affix_defs` table (12.3).** The affix pool is inline in each loot entry's `quality` spec; a
   shared `affix_defs` content table (named affixes by ref) de-duplicates pools and enables richer legendaries.
 - **Demo spawn/death handler content (12.4).** The director broadcasts `spawn.boss` DOWN; ship demo
   `on_world("spawn.boss")` + boss-death `signal_world("boss.died")` content to close the live boss-loot loop
-  end to end.
-- **Per-mob `xp_value` / kill-magnitude cap (11.3/12).** `death.go` fires OnKill with `mag` = the victim's raw
-  max-hp (builder-influenceable — a high-max-hp mob is an XP/loot farm). Read a content `xp_value` or
-  cap/normalize the magnitude before it feeds XP or loot.
-- **Reserved-but-unfired affect event kinds.** `OnRest`, `OnApplyAffect`, `OnAffectTick`, `OnAffectExpire`
-  are named in `internal/world/event.go`'s known-kinds map (a content handler for them parses), but the
-  engine never FIRES them — so a builder subscribing to an affect-lifecycle hook gets no callback. Light the
-  hooks at the affect apply/tick/expire + rest sites (the combat/movement/progression/custom kinds all fire;
-  only these are dark). · *abilities/world*
+  end to end. (When touching the demo, also add an `uncapped: true` gathering profession so the gated
+  store-round-trip `DeepEqual` covers the new `uncapped` bundle flag — currently blind, only a `true` can drop.)
+- **`OnRest` event kind is dark (needs a rest mechanic).** `OnApplyAffect`/`OnAffectExpire`/`OnAffectTick`
+  now fire (reconciled); `OnRest` is defined but has no fire site because there is no rest command / rest-regen
+  mechanic to fire it from. Lighting it requires BUILDING rest (a `rest`/`sit` verb + resting regen) first, not
+  just wiring a hook. · *abilities/world*
 - **Shared-def hot reload (7.7 scope).** `reload.go buildPrototype` handles only Room/Item/Mob; a `(kind,ref)`
   invalidation for a SHARED def (ability/affect/formula/`pvp_allowed` policy) is skipped and `z.defs` is
   boot-immutable — no live edit path to a pvp policy / formula. When a slice swaps `z.defs` at runtime, hook
@@ -228,7 +232,6 @@ A privilege layer above player — its own project (much like documentation).
   that died+respawned mid-list; build it WITH the respawn-sickness slice.
 - **Multi-vital support.** `vitalResource` collapses all `vital: true` resources to the single lowest-ref one;
   generalize damage/death/respawn across vitals if/when a 2nd vital pool is authored.
-- **Death-narration `mag` builder-influenceable.** (`death.go`) — see the per-mob `xp_value` cap in §4.
 - **Instanced zones (party dungeons).** Multiple runtime instances of a zone on the Phase-10.6 dynamic-
   placement substrate: the director mints/reaps instances and routes a party to its own copy. A world/content
   feature for a later content phase; the placement coordinator + scoped bus are the substrate.
