@@ -202,6 +202,15 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	// deterministically by sorted ref, but >1 vital is a content modelling error — only the lowest-ref
 	// one ever takes damage / drives death). Warn loudly so an author sees it at load, not in a fight.
 	lintVitalResources(d.res.table())
+	// Load-time content-lint (docs/REMAINING.md §4): every learn_profession op's `profession` must name a
+	// registered kind:"profession" bundle. professionIsCapped/uncapped resolve the D2 cap by looking up
+	// that bundle (ref == the membership ref by convention); a miss means the trade grants nothing AND its
+	// capped/uncapped resolution silently defaults to CAPPED. Runs after all bundles are registered so the
+	// kind is resolvable. Logs (does not fail the build), like the other content-lints.
+	for _, m := range lintLearnProfessionRefs(d) {
+		slog.Error("content: learn_profession.profession does not name a kind:profession bundle",
+			"owner", m.owner, "profession", m.profession)
+	}
 	slog.Debug("global defs registered", "attributes", d.attr.len(),
 		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len(),
 		"abilities", d.ability.len(), "ability_commands", len(d.abilityCmds),
@@ -225,6 +234,71 @@ func lintVitalResources(table map[string]*resourceDef) {
 		slog.Warn("content: more than one VITAL resource defined; only the lowest ref takes damage / drives death",
 			"vitals", vitals, "used", vitals[0])
 	}
+}
+
+// learnProfessionMiss is one content-lint finding: a learn_profession op whose `profession` does not name
+// a kind:"profession" bundle. owner locates the offending op-list.
+type learnProfessionMiss struct {
+	owner      string
+	profession string
+}
+
+// lintLearnProfessionRefs walks every registered op-list (ability on_resolve + on_event, bundle grants,
+// track step grants, affect on_event + tick, resource on_event + on_depleted) and returns a finding for each learn_profession op whose
+// `profession` does NOT name a registered kind:"profession" bundle. This machine-checks the
+// ref==profession-bundle-ref convention that professionIsCapped/uncapped keys the D2 cap off
+// (docs/REMAINING.md §4): a miss means the learned trade grants nothing and its cap resolution silently
+// defaults to CAPPED. Build-time only; the caller logs (does not abort boot — the runtime already defaults
+// conservatively), like the other content-lints.
+func lintLearnProfessionRefs(d *defRegistries) []learnProfessionMiss {
+	isProfBundle := func(ref string) bool {
+		b := d.bundle.get(ref)
+		return b != nil && b.kind == "profession"
+	}
+	var misses []learnProfessionMiss
+	var walk func(owner string, ops []effectOp)
+	walk = func(owner string, ops []effectOp) {
+		for i := range ops {
+			op := &ops[i]
+			if op.kind == "learn_profession" && !isProfBundle(op.profession) {
+				misses = append(misses, learnProfessionMiss{owner: owner, profession: op.profession})
+			}
+			walk(owner, op.then)
+			walk(owner, op.els)
+			if op.check != nil {
+				for j := range op.check.bands {
+					walk(owner, op.check.bands[j].ops)
+				}
+			}
+		}
+	}
+	for ref, def := range d.ability.table() {
+		walk("ability "+ref, def.ops)
+		for kind, ops := range def.onEvent {
+			walk("ability "+ref+" on_event["+string(kind)+"]", ops)
+		}
+	}
+	for ref, def := range d.bundle.table() {
+		walk("bundle "+ref, def.grants)
+	}
+	for ref, def := range d.track.table() {
+		for _, ops := range def.steps {
+			walk("track "+ref+" step", ops)
+		}
+	}
+	for ref, def := range d.affect.table() {
+		for kind, ops := range def.onEvent {
+			walk("affect "+ref+" on_event["+string(kind)+"]", ops)
+		}
+		walk("affect "+ref+" tick", def.tickOps)
+	}
+	for ref, def := range d.res.table() {
+		for kind, ops := range def.onEvent {
+			walk("resource "+ref+" on_event["+string(kind)+"]", ops)
+		}
+		walk("resource "+ref+" on_depleted", def.onDepleted)
+	}
+	return misses
 }
 
 // parseAttributeBase turns an AttributeDTO's default_base (a {lit} OR {expr} spec) into a parsed
