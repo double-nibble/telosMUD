@@ -33,8 +33,11 @@ import (
 // caller resolved; subject/body are already sanitized. sent_at/read_at default in SQL (now() / NULL).
 func (p *Pool) SendMail(ctx context.Context, to, from, subject, body string) (string, error) {
 	id := uuid.New()
-	// Cap the recipient's inbox ATOMICALLY: the count subquery + insert are one statement, so two concurrent
-	// sends can't both slip past the ceiling (no TOCTOU). RowsAffected()==0 means the inbox was already full.
+	// Cap the recipient's inbox: the count subquery + insert are one statement, which bounds the UNBOUNDED
+	// growth vector. Under READ COMMITTED a concurrency burst can still over-shoot by (writers-1) rows (the
+	// classic phantom), so the ceiling is "≈cap, may briefly reach cap+N" — fine for a resource guard, and
+	// the per-sender rate limit throttles the fill. A HARD ceiling would need a counter row + ON CONFLICT or
+	// SERIALIZABLE. RowsAffected()==0 means the inbox was full at statement time.
 	tag, err := p.pool.Exec(ctx,
 		`INSERT INTO mail (id, to_player, from_player, subject, body)
 		 SELECT $1, $2, $3, $4, $5

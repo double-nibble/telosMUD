@@ -275,6 +275,22 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   loose. Test: `TestPrepareRejectsOversizedCarry`. (Deferred, smaller: a matching cap on the durable
   `characters.state` write.) · *persistence*
 
+- **Cross-shard handoff snapshot AUTHENTICATION (MEDIUM econ-integrity — security review of the Cluster-1
+  hardening).** The Handoff.Prepare RPC is unauthenticated (`internal/world/handoff_server.go`): the token is
+  `sha256(character/epoch)[:16]` with NO secret, and there's no per-call auth. Anyone who can reach the
+  inter-shard Handoff port + knows a character name + a small epoch int can forge a Prepare carrying an
+  arbitrary `state_json` — and the pack-set audit only rejects UNKNOWN prototypes, so a forged carry can
+  INJECT any prototype the destination DOES define (high-tier gear → item dupe / econ break). The Cluster-1
+  caps + pack-set audit harden AVAILABILITY (no spawn-bomb, no silent data loss) but NOT this integrity gap.
+  Fix: sign the snapshot (Ed25519, reuse the account assertion key seam) OR inter-shard mTLS, and verify at
+  Prepare. Gated on network reachability of the inter-shard port, but it's the real fix for handoff-seam
+  integrity. · *distsys/security*
+- **Corpse owner keyed by character NAME, not PID (low, latent).** `CorpseOwner.owner` is the killer's
+  character name (`internal/world/death.go`). Safe while names are UNIQUE + immutable (a rename flow doesn't
+  exist), but if character renaming / delete-and-recreate ever lands, a stale 60s window keyed by a freed
+  name could be matched by a new character claiming it. Prefer a PersistID key IF the PID is always set at
+  kill time (it may not be in the async-create window — why name was chosen). · *world/security*
+
 ### Content-authoring gaps surfaced by the richer demo pack (Phase 8 playtest)
 
 Building the richer demo content (11 abilities, reaction mobs, 5 affects, restricted `guild`

@@ -162,7 +162,9 @@ func (z *Zone) getFrom(c *Context, item, cont string) error {
 	}
 	// Corpse loot-ownership window (anti-ninja-loot): while a fresh kill's window is open, only the killer
 	// may loot it; a bystander is refused until it lapses (death.go stamps the CorpseOwner). No component /
-	// a lapsed window / your own kill => no gate.
+	// a lapsed window / your own kill => no gate. NOTE: this gate is COMMAND-scoped, not enforced at the
+	// Move() chokepoint — a future item-extraction path (autoloot, a Lua give/take, summon) MUST re-check
+	// CorpseOwner or it bypasses this window (security-review "can't-forget" note).
 	if co, ok := Get[*CorpseOwner](box); ok && co.owner != "" && co.owner != c.s.character && time.Now().Before(co.until) {
 		c.z.act("$p is not yours to loot yet.", c.Actor, box, nil, "", "", ToActor)
 		return nil
