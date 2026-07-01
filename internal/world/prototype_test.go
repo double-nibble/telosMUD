@@ -195,11 +195,13 @@ func TestRoomPrototypeRendersSameAsBefore(t *testing.T) {
 	z.post(joinMsg{s: s})
 
 	got := nextOutput(t, s)
-	// The richer demo adds a west exit (the guild hall) to the temple; the name/long are unchanged.
+	// The richer demo adds a west exit (the guild hall) to the temple; the name/long are unchanged. The
+	// exits render now carries the Track-1 engine auto-color markup ({{FG_CYAN}}…{{RESET}}); the gate renders
+	// it to ANSI SGR at the edge (or strips it for `color off`), so the world-side text is this markup form.
 	want := "The Temple Square\n" +
 		"A broad plaza of worn flagstones stretches before the great temple. " +
 		"Pilgrims murmur in the shade of its columns.\n" +
-		"Exits: north, west"
+		"Exits: {{FG_CYAN}}north, west{{RESET}}"
 	if got != want {
 		t.Fatalf("temple render changed:\n got: %q\nwant: %q", got, want)
 	}

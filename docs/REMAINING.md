@@ -99,8 +99,12 @@ seam are independent and can run in parallel — the constraints that matter are
   (`internal/gate/color.go`, intercepted in the line pump, NOT forwarded to the world since color is a terminal
   concern; session-scoped). (3) demo colored room + a couple engine auto-colors (exits cyan). **Deferred:**
   PERSIST the color pref across sessions via the ACCOUNT (not the world — color stays an edge concern; slice 2
-  is session-scoped today); GMCP token-strip (the Track-0 GMCP-bypasses-sanitize path — `Comm.Channel.Text`
-  ships raw `{{tokens}}`, JSON-escaped so injection-safe, just cosmetic); width-aware framing
+  is session-scoped today); GMCP token-strip — **priority guard rail now that the demo advertises `{{tokens}}`
+  in content**: a token in a room NAME (→ GMCP `Room.Info`) or a `channel_def` format (→ `Comm.Channel.Text`
+  raw body) would ship literal `{{tokens}}` to a rich client (JSON-escaped so injection-safe, just cosmetic).
+  Strip tokens on the GMCP text fields (a `renderColor(s,false)` helper) before builders are broadly told they
+  can color any content; a content-lint that rejects tokens in room names / channel formats is an alternative;
+  width-aware framing
   (`Width(stripTokens(s))` for `score`); optional semantic aliases (`{{ENEMY}}` → direct tokens). Capitalization
   (next) targets the text, not the token. See [[content-alias-and-salvage-direction]]. · *edge/mudlib*
 - **Presentation capitalization.** (1) At the START of a line/sentence, a lowercase-article short/message renders

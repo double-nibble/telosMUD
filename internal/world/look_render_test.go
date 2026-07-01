@@ -50,3 +50,20 @@ func TestLookRoomRendersMobsItemsAndPlayers(t *testing.T) {
 		t.Fatalf("look rendered the looker's own presence; got:\n%v", lines)
 	}
 }
+
+// TestLookRoomColorsExitsCyan pins the engine auto-color (Track 1): the exits line emits the `{{FG_CYAN}}`
+// color markup (the gate renders it to ANSI SGR, or strips it for `color off` — tested in internal/telnet).
+// The world's job is to emit the token, so this asserts the markup, not the rendered escape.
+func TestLookRoomColorsExitsCyan(t *testing.T) {
+	z := newZone("test")
+	s := makeRoomPlayer(z, "Looker")
+	s.entity.location.room.exits = map[string]ProtoRef{"north": "test:room:n", "east": "test:room:e"}
+
+	z.lookRoom(s)
+	lines := drainCombat(s)
+
+	// sortedExits orders by canonical direction (n/s/e/w/…) → "north, east", wrapped in the cyan token + reset.
+	if want := "Exits: {{FG_CYAN}}north, east{{RESET}}"; !contains(lines, want) {
+		t.Fatalf("lookRoom did not color exits cyan; want %q in:\n%v", want, lines)
+	}
+}

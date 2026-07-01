@@ -1124,7 +1124,10 @@ zones:
           north: darkwood:room:lair
       - ref: darkwood:room:lair
         name: A Reeking Lair
-        long: Bones and gnawed scraps litter a foul den. The stench of goblin is overpowering.
+        # A builder-authored color example (Track 1 color): {{TOKEN}} markup renders to ANSI at the edge
+        # (a coalesced red+bold warning), or plain text for a `color off` player. Single-quoted so YAML
+        # treats the braces literally.
+        long: 'Bones and gnawed scraps litter a foul den. The {{FG_GREEN}}stench of goblin{{RESET}} is overpowering, and a {{FG_RED}}{{BOLD}}warning{{RESET}} is scrawled in blood on the wall.'
         # lair is NOT in the content-parity want-map, so adding an east exit here is parity-safe.
         exits:
           south: darkwood:room:hollow

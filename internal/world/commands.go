@@ -195,6 +195,12 @@ func cmdQuit(c *Context) error {
 	return nil
 }
 
+// colorize wraps s in an engine color token + reset (the internal/telnet/color.go `{{TOKEN}}` vocabulary),
+// for the engine's default auto-coloring (e.g. exits cyan). It is plain markup TEXT — the gate renders the
+// tokens to ANSI SGR downstream of the control-strip, or strips them for a `color off` player — so the world
+// never ships raw ESC. token is a bare name like "FG_CYAN"; content authors color room longs the same way.
+func colorize(s, token string) string { return "{{" + token + "}}" + s + "{{RESET}}" }
+
 // lookRoom sends the actor the current room's name, description, exits, and the other
 // occupants present. Used by "look" and automatically on join/move. It reads the room
 // entity (s.entity.location) and its Room component for exits/desc, and walks the room's
@@ -209,8 +215,11 @@ func (z *Zone) lookRoom(s *session) {
 	b.WriteString(r.Long())
 	b.WriteByte('\n')
 	if ex := room.sortedExits(); len(ex) > 0 {
+		// Engine auto-color (Track 1): exits render cyan. This emits the `{{TOKEN}}` markup the color layer
+		// (internal/telnet/color.go) renders to SGR at the edge — or strips for a `color off` player — so it
+		// is safe plain-looking text, never raw ESC. Content can layer its own colors in room longs.
 		b.WriteString("Exits: ")
-		b.WriteString(strings.Join(ex, ", "))
+		b.WriteString(colorize(strings.Join(ex, ", "), "FG_CYAN"))
 	} else {
 		b.WriteString("Exits: none")
 	}
