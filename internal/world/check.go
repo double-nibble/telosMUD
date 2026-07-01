@@ -204,7 +204,7 @@ func evalCheckFormula(c *effectCtx, node formulaNode, def *Entity) float64 {
 			return attr(ent, bare), nil
 		},
 	}
-	v, err := node.eval(r)
+	v, err := evalFinite(node, r)
 	if err != nil {
 		if c.z != nil {
 			c.z.log.Debug("check formula error", "err", err)

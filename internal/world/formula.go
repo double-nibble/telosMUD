@@ -193,6 +193,24 @@ func (n opNode) eval(r *formulaResolver) (float64, error) {
 	}
 }
 
+// evalFinite evaluates a formula node and FAILS CLOSED on a non-finite result (docs/REMAINING.md §4). A
+// content formula can overflow to ±Inf (`1e308*1e308`) or produce NaN (`Inf-Inf`, `0*Inf`) with no
+// arithmetic error; left unchecked that non-finite value reaches a game value as `int(+Inf)`=maxint64 (e.g.
+// maxint damage on the ungated paths) or `int(NaN)`=0. Only the TOP-LEVEL result is checked, so a harmless
+// intermediate Inf that a `min`/`clamp` tames back to a finite value is still allowed — only a formula whose
+// FINAL value is non-finite is rejected. Every top-level formula consumer (check bonus, attribute base,
+// grant base) evaluates through this, so the guard is inherited uniformly rather than re-implemented per op.
+func evalFinite(n formulaNode, r *formulaResolver) (float64, error) {
+	v, err := n.eval(r)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("formula: non-finite result (NaN or ±Inf)")
+	}
+	return v, nil
+}
+
 // parseFormula parses a generic decoded JSON/YAML value (the FormulaNodeDTO) into a typed tree. It
 // accepts:
 //   - a number              -> litNode

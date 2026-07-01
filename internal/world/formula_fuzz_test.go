@@ -13,13 +13,15 @@ import (
 // parse/eval error), never panic the zone and never silently yield a NaN that then poisons every
 // downstream derivation (combat math, clamps, resource maxes).
 //
-// Invariants for ANY json-decodable input:
+// Invariants for ANY json-decodable input (asserted against evalFinite, the guarded chokepoint EVERY
+// top-level formula consumer goes through — check bonus, attribute base, grant base):
 //   - parseFormula never panics — malformed structure returns an error;
 //   - eval never panics — a bad op (div-by-zero, wrong arity, unknown head, cycle) returns an error;
-//   - a SUCCESSFUL eval is never NaN. NaN is unambiguously broken (it compares false to everything and
-//     silently corrupts clamps/derivations); the evaluator must error rather than return it. (±Inf from
-//     a literal-overflow multiply is allowed here — it is a content-authoring problem, not an evaluator
-//     bug, and div-by-zero, the usual Inf source, is already guarded with an error.)
+//   - a SUCCESSFUL evalFinite is always FINITE — never NaN, never ±Inf. Both are unambiguously broken (NaN
+//     compares false to everything and silently corrupts clamps/derivations; `int(+Inf)`=maxint64 injects a
+//     maxint value into a game quantity), so evalFinite fails closed rather than returning either. (Raw
+//     opNode.eval may still yield an intermediate ±Inf that a `min`/`clamp` tames back to finite — only the
+//     FINAL consumed value is guarded, so a tamed-intermediate formula still succeeds.)
 func FuzzFormulaEval(f *testing.F) {
 	for _, s := range []string{
 		`["+",1,2]`, `["-",5,3]`, `["*",2,3]`, `["/",10,2]`, `["/",1,0]`,
@@ -55,12 +57,12 @@ func FuzzFormulaEval(f *testing.F) {
 				return float64(len(ref)%7) + 1, nil
 			},
 		}
-		got, err := node.eval(r)
+		got, err := evalFinite(node, r)
 		if err != nil {
-			return // clean eval error — fail-closed
+			return // clean eval error (incl. a non-finite result) — fail-closed
 		}
-		if math.IsNaN(got) {
-			t.Fatalf("formula %q evaluated to NaN with no error — it must fail closed, not poison derivation", src)
+		if math.IsNaN(got) || math.IsInf(got, 0) {
+			t.Fatalf("evalFinite(%q) returned a non-finite value (%v) with no error — it must fail closed, not poison derivation", src, got)
 		}
 	})
 }

@@ -127,7 +127,7 @@ func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, erro
 			},
 			visited: visited,
 		}
-		v, err := def.base.eval(r)
+		v, err := evalFinite(def.base, r)
 		if err != nil {
 			return 0, err
 		}

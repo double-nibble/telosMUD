@@ -82,7 +82,7 @@ func attrBaseValue(e *Entity, name string) float64 {
 		resolve: func(ref string, v map[string]bool) (float64, error) { return resolveAttr(e, ref, v) },
 		visited: map[string]bool{},
 	}
-	v, err := def.base.eval(r)
+	v, err := evalFinite(def.base, r)
 	if err != nil {
 		return 0
 	}
