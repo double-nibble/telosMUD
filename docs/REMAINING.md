@@ -175,7 +175,7 @@ A privilege layer above player — its own project (much like documentation).
   placement substrate: the director mints/reaps instances and routes a party to its own copy. A world/content
   feature for a later content phase; the placement coordinator + scoped bus are the substrate.
 - **[LARGE] The 5e-SRD acceptance-test sample MUD.** The design target from
-  [GAME-SYSTEMS-GAP-ANALYSIS.md](GAME-SYSTEMS-GAP-ANALYSIS.md): build a real content pack exercising the
+  the game-systems gap analysis (archived in COMPLETED.md): build a real content pack exercising the
   CC-BY 5e SRD (classes/spells/saves/rests as pure content) to PROVE the engine expresses a full game system
   with zero engine changes — the capstone that validates the "engine = mechanism, content = flavor" pillar.
   A content project, not engine work; the gap analysis stays the design reference.
