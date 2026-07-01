@@ -64,6 +64,25 @@ hardening fix — call them out for dedicated planning rather than a quick slice
 
 ## 4. Content / itemization
 
+- **[LARGE] Multi-file demo packs — the multi-system acceptance sprint.** A sprint of its own; the real
+  capstone that proves the "engine = mechanism, content = flavor" pillar holds across DIFFERENT game systems.
+  Two parts:
+  - **Directory-tree pack assembly (loader).** Today a pack is a single `internal/content/packs/demo.yaml`.
+    Support a pack as a TREE of small files the loader walks + assembles into one logical pack — e.g.
+    `content/packs/<pack>/common/{attributes,weapons,armor}.yaml`,
+    `content/packs/<pack>/areas/<area>/{rooms,enemies,bosses,vendors}/*.yaml`, and
+    `content/packs/<pack>/areas/<area>/scripts/*.lua`. The assembly must feed the SAME import/`LoadedContent`
+    path (both the embedded-pack loader and the DB seed import). Payoff: a builder edits ONE area/boss/vendor
+    file without touching the rest.
+  - **The three demo packs (content authoring).** (1) Split the current `demo.yaml` into
+    `content/packs/demo/basic/…` (a simple Diku/ROM-flavored pack) as the reference tree. (2) `content/packs/5eSRD`
+    — the CC-BY D&D 5e SRD as pure content (Vancian slots, six abilities → modifiers + proficiency,
+    advantage, class/subclass/background, short/long rest). (3) `content/packs/WoWSRD` — the WoW-d20 skeleton
+    (rage/energy/focus/combo resources, talent trees, cooldown pacing, threat, a raid/loot economy). Each pack
+    must run with ZERO engine changes for flavor — that is the acceptance test. (The gap analysis also names
+    Pathfinder as a third tabletop capstone; a 4th pack if wanted.) Absorbs the former "5e-SRD sample MUD"
+    item. · *content/persistence*
+
 - **[LARGE] Worn-affix stat effect + content-defined wear slots (the itemization pass, Phase 12.3).** Equip is
   a stub: a worn item confers no bonus (no affect hook), and the wearable slot set is an engine-fixed enum.
   Wire the gear-modifier seam (a rolled item's affixes register as a `modSource` on wear, unregister on
@@ -99,6 +118,46 @@ hardening fix — call them out for dedicated planning rather than a quick slice
   that seam and re-run the pvp permissive→restrictive end-to-end check.
 
 ## 5. Player commands / HUD
+
+- **`score` command — the character stat sheet.** A player types `score` (classic `sc`) and sees a framed
+  summary of their character: name + title/epithet, the vital pools (`HP: 150(150)`, `SP: 205(205)` — current
+  (max) per resource), gold/currency, XP as `have/next-level`, carry weight (as a % of capacity), the
+  progression levels (overall `Level`, plus any per-track level like `Guild Level`), and the attribute block
+  (STR/DEX/CON/INT/WIS/CHR — grid-formatted). Everything shown is already engine state (resources, attributes,
+  progression tracks, carry weight, currency); this is a RENDER of it. Design question to settle: the LAYOUT
+  and the SET of rows/attributes are flavor, so the template should be CONTENT-DEFINED (a content-authored
+  score layout referencing resource/attribute/track refs, rendered by the engine) rather than a hardcoded
+  Go sheet — otherwise a 5e vs. WoW pack couldn't show its own stat names/order. Plain-telnet render path;
+  GMCP clients already get the same data structured via `Char.Stats`/`Char.Vitals`. · *mudlib/edge*
+
+- **ANSI color (16-color palette).** Colorize output so it reads like a classic MUD — enemies red, exits
+  cyan, items/gold, damage, channel names, etc. The world emits SEMANTIC color TOKENS (a category, not raw
+  ESC — e.g. an `{enemy}`/`{exit}` markup class, content-nameable per the mechanism/flavor pillar); the GATE
+  renders tokens → ANSI SGR downstream of the control-strip. NOTE the existing seam: `internal/telnet/telnet.go`
+  `Write`/`sanitizeOutput` STRIPS ESC today, with a documented comment that a future ANSI renderer must
+  produce the SGR bytes DOWNSTREAM of (not through) the control-strip, or the strip must whitelist well-formed
+  SGR — so the world never ships raw ESC (injection-safe). Include a per-player `color on/off` toggle (the
+  conventional MUD control; a client that can't do ANSI gets plain text), and a small default token→color map
+  (enemy/exit/item/damage/heal/channel/system). GMCP clients already get structured data; this is the plain-
+  telnet render path. · *edge/mudlib*
+
+- **Coalesce identical items in listings (`A torch. (5)`).** In the room-contents render (`lookRoom`),
+  inventory (`inventory`/`i`), and container listings (`look <corpse>`, get-from), group identical items onto
+  ONE line with a `(N)` count instead of repeating the line N times. This is DISPLAY-time grouping of discrete
+  entities — distinct from the Phase-13.2 `Stack` component (true stackable materials, which already carry a
+  count). Grouping key: same rendered short name AND no distinguishing per-instance state (don't merge a
+  bound/quality-affixed/differently-worn item with a plain one — group by prototype + equal delta, or fall
+  back to identical short). Keep single items uncounted (`A torch.`). Mirror the count in GMCP
+  `Char.Items.List` (a count field) so rich clients group too, and keep it consistent with how the `Stack`
+  materials render their count. · *edge/mudlib*
+
+- **Presentation capitalization.** Capitalize for readability: (1) at the START of a line/sentence, an item
+  short or a message beginning with a lowercase article renders capitalized — `a torch` → `A torch.` on a
+  room-contents/inventory line, `a goblin arrives.` → `A goblin arrives.` — while the SAME short stays
+  lowercase mid-sentence (`You get a torch.`); (2) character/proper names always render capitalized. The
+  natural seam is the render layer: `act()` (`internal/world/act.go`) for perspective messages (the classic
+  Diku initial-cap-the-leading-token rule) and `lookRoom` / item-listing lines. Content authors still write
+  shorts lowercase (`a torch`); the engine capitalizes at presentation, not in the data. · *edge/mudlib*
 
 - **vitals enable/disable + live on-change vitals.** A player-toggleable on-CHANGE emitter hooked at
   `setResourceCurrent` (where every vital change funnels), driving both the text prompt and GMCP Char.Vitals
@@ -154,6 +213,13 @@ A privilege layer above player — its own project (much like documentation).
   windowed drop-RATE (the `consecutiveDrops` signal only catches a fully-stalled client). (2) Add a
   world-side `stream.Recv` idle deadline / max-blocked-`Send` bound so reclaim doesn't DEPEND on gate
   correctness (defends the in-trust-domain direct-shard path).
+- **UTF-8 rendering tests (multibyte-clean edge path).** UTF-8 should already pass through end-to-end, but
+  there's no explicit coverage. Add tests asserting multibyte content (`Hello, 世界`, emoji, combining marks,
+  RTL) survives the full edge render path intact — through `Write`/`sanitizeOutput` (the ESC control-strip must
+  NOT corrupt or split multibyte sequences), `act()` perspective messaging, `lookRoom`/item shorts, GMCP JSON
+  payloads, and mail/tell bodies. Also pin behavior at boundaries: never split a rune across a chunk/flush,
+  and confirm any width-based framing (e.g. the future `score` sheet / column layout) measures DISPLAY width,
+  not byte length. If a gap turns up, fix it; the deliverable is the regression tests either way. · *edge/tests*
 - **Reflect-walk DTO round-trip test.** Assert EVERY store DTO field round-trips (a reflect-walk over a fully
   populated synthetic pack), so a new field can't be silently dropped on the store path.
 - **Comms chaos test doubles.** (1) Pin the MemJetStream park-at-`maxDeliver` divergence from real NATS
@@ -179,11 +245,9 @@ A privilege layer above player — its own project (much like documentation).
 - **Instanced zones (party dungeons).** Multiple runtime instances of a zone on the Phase-10.6 dynamic-
   placement substrate: the director mints/reaps instances and routes a party to its own copy. A world/content
   feature for a later content phase; the placement coordinator + scoped bus are the substrate.
-- **[LARGE] The 5e-SRD acceptance-test sample MUD.** The design target from
-  the game-systems gap analysis (archived in COMPLETED.md): build a real content pack exercising the
-  CC-BY 5e SRD (classes/spells/saves/rests as pure content) to PROVE the engine expresses a full game system
-  with zero engine changes — the capstone that validates the "engine = mechanism, content = flavor" pillar.
-  A content project, not engine work; the gap analysis stays the design reference.
+- **The 5e-SRD / multi-system acceptance packs** are now folded into the "[LARGE] Multi-file demo packs"
+  item in §4 (basic + 5eSRD + WoWSRD). The game-systems gap analysis (archived in COMPLETED.md) stays the
+  design reference for them.
 - **Flaky tests.** (1) `gate.TestSessionLockTakeoverKicksDisplacedConnection` — de-flake with a
   generous/synchronized kick-message deadline (the "rebuild on OAuth login" note is moot). (2)
   `gate.TestChannelLineRendersVerbatimNoTellPrefix` — raise the per-line wait / settle the comms path under a
