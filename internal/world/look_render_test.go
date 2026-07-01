@@ -37,7 +37,7 @@ func TestLookRoomRendersMobsItemsAndPlayers(t *testing.T) {
 	for _, want := range []string{
 		"A wiry goblin bares its teeth.",        // mob long
 		"A rusty, notched knife lies here.",     // ground item long
-		"the corpse of a small goblin is here.", // long-less fallback (corpse)
+		"The corpse of a small goblin is here.", // long-less fallback (corpse), presentation initial-capped (Track 1)
 		"Bystander is here.",                    // player presence
 	} {
 		if !contains(lines, want) {

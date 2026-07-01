@@ -25,7 +25,44 @@ package world
 // inside them is data, never a format directive or a re-scanned token. There is no path
 // by which player-supplied content becomes a format string.
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+// capitalizeFirst upper-cases the first RENDERED letter of s for presentation (the classic Diku initial-cap
+// rule, docs/REMAINING.md Track 1): a line that begins with a lowercase-authored short ("a torch", "a goblin
+// arrives.") renders capitalized ("A torch", "A goblin arrives."), while content authors still write shorts
+// lowercase and the SAME short stays lowercase mid-sentence. Only the first letter changes; the rest is
+// untouched. It is TOKEN-AWARE — it skips leading whitespace and any leading `{{...}}`-shaped run (color
+// tokens or not; internal/telnet/color.go markup) so it caps the TEXT, not a '{' or a space. It skips an
+// UNKNOWN `{{...}}` too, rather than duplicate the gate's color allowlist across the world/edge boundary (an
+// unknown token is already-broken authored content). A caseless script (Arabic, CJK) is unaffected (ToUpper
+// is a no-op there), so this composes cleanly with the i18n/bidi render path.
+func capitalizeFirst(s string) string {
+	i := 0
+	for i < len(s) {
+		switch {
+		case s[i] == ' ' || s[i] == '\t':
+			i++
+		case strings.HasPrefix(s[i:], "{{"):
+			end := strings.Index(s[i:], "}}")
+			if end < 0 {
+				return s // unclosed token: nothing safe to cap past it
+			}
+			i += end + 2
+		default:
+			r, size := utf8.DecodeRuneInString(s[i:])
+			up := unicode.ToUpper(r)
+			if up == r { // already upper, not a letter, or caseless script — leave as-is
+				return s
+			}
+			return s[:i] + string(up) + s[i+size:]
+		}
+	}
+	return s
+}
 
 // ActTo selects which recipients an act() call reaches (MUDLIB §7).
 type ActTo int
@@ -137,7 +174,10 @@ func (z *Zone) render(tmpl string, viewer, actor, obj, obj2, vict *Entity, t1, t
 			b.WriteByte(tmpl[i])
 		}
 	}
-	return b.String()
+	// Presentation initial-cap (Track 1): every act line starts capitalized, so a lowercase-authored short
+	// leading a message ("a goblin arrives.") renders "A goblin arrives." A line already starting with "You"/
+	// a proper name / an article-capped short is unchanged.
+	return capitalizeFirst(b.String())
 }
 
 // nameFor returns how viewer should see ent's name in a rendered line (MUDLIB §7):

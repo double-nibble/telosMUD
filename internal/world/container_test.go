@@ -233,7 +233,7 @@ func TestClosedContainerRejects(t *testing.T) {
 	addTestItem(e.z, e.actor.entity, "a gold coin", []string{"coin"})
 
 	aout, _ := e.run("put coin in bag")
-	if !has(aout, "a leather bag is closed.") {
+	if !has(aout, "A leather bag is closed.") { // presentation initial-cap (Track 1)
 		t.Errorf("put into closed container = %v", aout)
 	}
 	// nothing entered the bag.
@@ -251,7 +251,7 @@ func TestContainerCapacity(t *testing.T) {
 
 	e.run("put one in pouch")
 	aout, _ := e.run("put two in pouch")
-	if !has(aout, "a tiny pouch can't hold any more.") {
+	if !has(aout, "A tiny pouch can't hold any more.") { // presentation initial-cap (Track 1)
 		t.Errorf("over-capacity put = %v", aout)
 	}
 	if len(bag.contents) != 1 {

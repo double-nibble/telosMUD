@@ -235,18 +235,20 @@ func (z *Zone) lookRoom(s *session) {
 		// dark/invis flags exist — rendering all contents here is a second path past the canSee
 		// chokepoint (see who()), consistent with the existing player-presence disclosure.
 		b.WriteByte('\n')
+		// Each occupant line is a room-presence LINE, so it gets the presentation initial-cap (Track 1):
+		// a lowercase-authored short/long ("the corpse of a goblin is here.") renders capitalized.
+		var line string
 		switch {
 		case Has[*PlayerControlled](occ):
-			b.WriteString(occ.Name())
-			b.WriteString(" is here.")
+			line = occ.Name() + " is here."
 		case occ.Long() != "":
 			// A mob, a ground item, or a corpse — its long line is its room/ground presence.
-			b.WriteString(occ.Long())
+			line = occ.Long()
 		default:
 			// No long line authored: fall back to the short name.
-			b.WriteString(occ.Name())
-			b.WriteString(" is here.")
+			line = occ.Name() + " is here."
 		}
+		b.WriteString(capitalizeFirst(line))
 	}
 	s.send(textFrame(b.String()))
 

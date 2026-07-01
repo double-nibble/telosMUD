@@ -279,11 +279,11 @@ func TestActLiteralSubstitution(t *testing.T) {
 		t.Fatalf("text-arg substitution = %v, want literal", got)
 	}
 
-	// $$ renders a single literal '$'.
+	// $$ renders a single literal '$'. The line's first letter is presentation-capped (Track 1): "cost" -> "Cost".
 	z.act("cost is $$5", actor.entity, nil, nil, "", "", ToActor)
 	got = drainOutputs(actor)
-	if len(got) != 1 || got[0] != "cost is $5" {
-		t.Fatalf("$$ escape = %v, want \"cost is $5\"", got)
+	if len(got) != 1 || got[0] != "Cost is $5" {
+		t.Fatalf("$$ escape = %v, want \"Cost is $5\"", got)
 	}
 }
 
