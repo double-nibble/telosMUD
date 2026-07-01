@@ -114,6 +114,20 @@ type Shard struct {
 	runWG  *sync.WaitGroup
 	closed bool
 
+	// Zone-lease ownership (Phase 16.4b): moved into the shard (from cmd/telos-world) so a graceful drain can
+	// hand a zone's lease to a peer WITHOUT the source's own renewal fencing the whole shard. leaser is the
+	// directory write-port (nil => no leasing, single-shard/dev); shardID is the directory write-authority
+	// key; onFence cancels the shard's run ctx when we UNEXPECTEDLY lose a lease. handedOff records zones we
+	// DELIBERATELY handed off (their renewal stops silently, no fence); leaseStop cancels a hosted zone's
+	// renewal goroutine on handoff. handedOff + leaseStop are guarded by mu.
+	leaser     ZoneLeaser
+	shardID    string
+	leaseTTL   time.Duration
+	leaseRenew time.Duration
+	onFence    func()
+	handedOff  map[string]bool
+	leaseStop  map[string]context.CancelFunc
+
 	// saver is the shard's async character writer (saver.go): one per shard, shared by every
 	// hosted zone, drained by a single background goroutine started in Run. It does all the
 	// off-zone-goroutine character I/O (Redis checkpoint + Postgres CAS). Always non-nil but
@@ -256,6 +270,8 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		dir:        dir,
 		peers:      peers,
 		tokenIndex: map[string]*Zone{},
+		handedOff:  map[string]bool{},
+		leaseStop:  map[string]context.CancelFunc{},
 		saver:      newSaver(nil, nil), // disabled until WithPersistence configures it
 		// Empty global-definition bundle (defs.go); the constructor registers content into it
 		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
@@ -497,6 +513,7 @@ func (s *Shard) HostZone(id string) (*Zone, error) {
 		defer s.runWG.Done()
 		z.Run(runCtx)
 	}()
+	s.startZoneRenewal(runCtx, id) // renew the adopted zone's lease (16.4b; no-op when leasing is off)
 	slog.Info("hosting zone at runtime", "zone", id, "shard", s.addr)
 	return z, nil
 }
@@ -589,6 +606,7 @@ func (s *Shard) Run(ctx context.Context) {
 			defer wg.Done()
 			z.Run(ctx)
 		}(z)
+		s.startZoneRenewal(ctx, z.id) // shard-owned lease renewal (16.4b; no-op when leasing is off)
 	}
 	// Block on the shard's lifetime, THEN wait for every zone (incl. runtime-added ones) to finish.
 	// A standby that won no zones has an empty wg; without the ctx wait it would exit Run immediately

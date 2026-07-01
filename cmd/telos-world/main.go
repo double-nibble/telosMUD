@@ -233,10 +233,11 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	}
 	for _, zoneID := range won {
 		slog.Info("claimed zone", "zone", zoneID, "shard_id", cfg.ShardID, "lease", directory.DefaultZoneLease)
-		// Keep each won lease alive while we run; release it on shutdown so another shard can take over
-		// immediately. stop fences us if we ever lose any lease.
-		go renewZoneLease(ctx, stop, dir, zoneID, cfg.ShardID) //nolint:gosec // G118: ctx is the shard's main lifetime ctx (cancelled on shutdown) — exactly what this lease goroutine should follow.
 	}
+	// Zone-lease RENEWAL now lives in the shard (WithZoneLeasing below), not per-zone goroutines here — so a
+	// graceful drain can hand a zone's lease to a peer without the source's renewal fencing the whole shard
+	// (Phase 16.4b). The shard renews every hosted zone (boot + runtime-adopted) and fences via stop on an
+	// UNEXPECTED lease loss, releasing on clean shutdown — the same contract the old renewZoneLease had.
 	if len(won) == 0 {
 		slog.Warn("won no zones from the pool: running as a STANDBY (registered, hosting nothing, ready to take over)", "pool", zones)
 	}
@@ -254,6 +255,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithVerifyKey(verifyKey).
 		WithSessionLock(sessionlock.NewRedis(rdb), 0, 0). // Phase 14.4: cross-shard single-session lock (Redis)
 		WithScopeBus(scopeBus, lc.Regions).
+		WithZoneLeasing(dir, cfg.ShardID, directory.DefaultZoneLease, directory.DefaultZoneLease/3, stop).
 		WithPresence(roster, cfg.ShardID).
 		WithMail(mailStore).
 		WithTells(tellJS)
@@ -344,40 +346,6 @@ func renewShardRegistration(ctx context.Context, dir *directory.Redis, shardID, 
 			cancel()
 			if err != nil {
 				slog.Warn("shard registration renewal error", "shard_id", shardID, "err", err)
-			}
-		}
-	}
-}
-
-// renewZoneLease heartbeats this shard's zone claim until ctx is cancelled, then
-// releases it. If a renewal ever reports the lease was lost to ANOTHER shard, it
-// fences this process (stop) — a shard that no longer owns its zone must not keep
-// writing, or we are back to two writers. Each renewal has its own short timeout so a
-// slow Redis can't silently stall the heartbeat past the lease.
-func renewZoneLease(ctx context.Context, stop func(), dir *directory.Redis, zoneID, shardID string) {
-	t := time.NewTicker(directory.DefaultZoneLease / 3)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			rctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = dir.ReleaseZone(rctx, zoneID, shardID)
-			cancel()
-			return
-		case <-t.C:
-			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			ok, err := dir.ClaimZone(rctx, zoneID, shardID, directory.DefaultZoneLease)
-			cancel()
-			switch {
-			case err != nil:
-				// Transient (Redis blip): keep trying. If it persists past the lease the
-				// claim lapses and the next renewal returns !ok, fencing us below.
-				slog.Warn("zone lease renewal error", "zone", zoneID, "err", err)
-			case !ok:
-				// Another shard now owns this zone; we must stop writing immediately.
-				slog.Error("lost zone lease to another shard; fencing this shard", "zone", zoneID)
-				stop()
-				return
 			}
 		}
 	}
