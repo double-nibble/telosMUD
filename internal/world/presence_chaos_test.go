@@ -39,6 +39,43 @@ func (f *failingRoster) List(ctx context.Context) ([]roster.Entry, error) {
 	return f.inner.List(ctx)
 }
 
+// listCountRoster wraps a roster and counts List calls, to prove the who-read cache collapses a `who` flood.
+type listCountRoster struct {
+	roster.Roster
+	lists atomic.Int64
+}
+
+func (c *listCountRoster) List(ctx context.Context) ([]roster.Entry, error) {
+	c.lists.Add(1)
+	return c.Roster.List(ctx)
+}
+
+// TestWhoCacheCollapsesReads pins the scale win: many `who` reads within whoCacheTTL do ONE Redis SCAN
+// (List), not one each; after the window a read refreshes. This is the anti-`who`-flood guard.
+func TestWhoCacheCollapsesReads(t *testing.T) {
+	cr := &listCountRoster{Roster: roster.NewMem()}
+	za := presenceShard(t, cr, "shard-a")
+	joinPlayer(t, za, "Alice")
+	tracker := za.shard.presence
+
+	for i := 0; i < 25; i++ {
+		if _, ok := tracker.cachedList(context.Background()); !ok {
+			t.Fatal("cachedList degraded unexpectedly")
+		}
+	}
+	if n := cr.lists.Load(); n != 1 {
+		t.Fatalf("25 rapid who reads did %d Redis SCANs, want 1 (the cache must collapse them)", n)
+	}
+
+	time.Sleep(whoCacheTTL + 50*time.Millisecond)
+	if _, ok := tracker.cachedList(context.Background()); !ok {
+		t.Fatal("cachedList degraded after the window")
+	}
+	if n := cr.lists.Load(); n != 2 {
+		t.Fatalf("after the cache window: %d SCANs, want 2 (one refresh)", n)
+	}
+}
+
 // TestWhoDegradesToLocalOnRosterReadFailure pins the never-fatal presence contract: when the roster
 // read fails (a Redis blip), `who` falls back to the zone-LOCAL list — the player still gets a valid
 // listing of who is here, never an error and never the (now-unreadable) cross-shard view. A seeded
@@ -67,16 +104,26 @@ func TestWhoDegradesToLocalOnRosterReadFailure(t *testing.T) {
 		}
 	}
 
-	// FAILURE: the roster read errors → who DEGRADES to the zone-local list. The player still gets a
-	// valid "Players online:" listing with the local player, and the cross-shard Bob is absent (the
-	// fallback can't see him) — never an error to the player.
+	// FAILURE: the roster read errors → who DEGRADES to the zone-local list. The player still gets a valid
+	// "Players online:" listing with the local player, and the cross-shard Bob is absent (the fallback can't
+	// see him) — never an error to the player. NOTE: the who-read cache (whoCacheTTL) may serve the last-good
+	// cross-shard snapshot for up to a window after the read starts failing, so poll until the cache lapses
+	// and the fallback kicks in (a ≤1s stale view during a blip is acceptable, and better than an instant
+	// vanish of the whole cross-shard roster).
 	fr.failList.Store(true)
-	degraded := waitWho(t, za, alice)
+	var degraded string
+	for deadline := 0; deadline < 100; deadline++ {
+		degraded = waitWho(t, za, alice)
+		if !strings.Contains(degraded, "Bob") {
+			break // the cache lapsed; the failing read now degrades to the local list
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
 	if !strings.Contains(degraded, "Alice") {
 		t.Fatalf("degraded who dropped the local player; got %q", degraded)
 	}
 	if strings.Contains(degraded, "Bob") {
-		t.Fatalf("who showed a cross-shard player despite the roster read failing — it did not fall back to local: %q", degraded)
+		t.Fatalf("who still showed a cross-shard player after the cache window despite the read failing: %q", degraded)
 	}
 
 	// RECOVERY: the roster read works again → who shows the cross-shard view (Bob reappears).

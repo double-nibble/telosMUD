@@ -48,6 +48,11 @@ import (
 // shrink it to exercise the timeout->thaw path quickly.
 var handoffRPCTimeout = 5 * time.Second
 
+// maxConcurrentHandoffs bounds the in-flight cross-shard handoff Prepares this shard runs at once, so a
+// graceful drain's fan-out over a whole zone paces its Prepares against the target instead of stampeding it
+// (16.4b review). A normal move is never throttled by a 32-deep pool.
+const maxConcurrentHandoffs = 32
+
 // HandoffDialer resolves a Handoff client for a peer shard's address. Injected so
 // tests can dial in-process shards over bufconn.
 type HandoffDialer func(addr string) (handoffv1.HandoffClient, error)
@@ -131,6 +136,11 @@ type Shard struct {
 	// draining flips true on BeginDrain (16.4b): the Play attach path then REFUSES a fresh login (this shard
 	// is going away) while still accepting a handoff BIND, so an in-flight cross-shard move completes. mu.
 	draining bool
+
+	// handoffSem bounds the number of CONCURRENT in-flight cross-shard handoffs (Prepare RPCs) this shard
+	// runs — so a graceful drain's fan-out over a whole zone doesn't fire N simultaneous Prepares at one
+	// target and stampede it (16.4b review). A normal move (rare) is never throttled by a 32-deep slot pool.
+	handoffSem chan struct{}
 
 	// saver is the shard's async character writer (saver.go): one per shard, shared by every
 	// hosted zone, drained by a single background goroutine started in Run. It does all the
@@ -276,6 +286,7 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		tokenIndex: map[string]*Zone{},
 		handedOff:  map[string]bool{},
 		leaseStop:  map[string]context.CancelFunc{},
+		handoffSem: make(chan struct{}, maxConcurrentHandoffs),
 		saver:      newSaver(nil, nil), // disabled until WithPersistence configures it
 		// Empty global-definition bundle (defs.go); the constructor registers content into it
 		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
@@ -660,6 +671,14 @@ func (s *Shard) Register(gs *grpc.Server) {
 // claim and the redirect; step 5 wires the gate to act on the Redirect.
 func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone, destRoom string, epoch uint64) {
 	go func() {
+		// Bound concurrent in-flight handoffs so a drain's whole-zone fan-out doesn't stampede the target
+		// (16.4b review). Acquired BEFORE the ctx below so the RPC timeout covers only the conversation, not
+		// the queue wait; a long drain queue still drains well within the freeze backstop. nil (a raw
+		// test-built shard) => unbounded, the pre-change behavior.
+		if s.handoffSem != nil {
+			s.handoffSem <- struct{}{}
+			defer func() { <-s.handoffSem }()
+		}
 		// Bound the whole conversation: a hung Prepare to a restarting/draining destination
 		// must not strand the frozen player forever. On deadline the fail(...) path below
 		// thaws + restores them. Runs off the zone goroutine, so blocking here is safe.

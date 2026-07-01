@@ -103,10 +103,21 @@ const RebalanceThreshold = 1
 //
 // Two phases: (1) ASSIGN every unclaimed pool zone to the least-loaded live shard (From=="" — a fresh
 // claim, not a drain); (2) REBALANCE — while the busiest shard exceeds the idlest by more than the
-// threshold, move one zone from busiest to idlest (a graceful drain). v1 balances by zone COUNT;
-// load-aware balance (player count / tick time) and locality are the documented follow-ups (PLACEMENT.md
-// §7). With no live shards, Plan returns nil (nothing can be hosted).
+// threshold, move one zone from busiest to idlest (a graceful drain). Plan balances by zone COUNT; use
+// PlanWeighted to balance by per-zone player load. With no live shards, Plan returns nil.
 func Plan(liveShards []string, assignment map[string]string, pool []string) []Move {
+	return PlanWeighted(liveShards, assignment, pool, nil)
+}
+
+// PlanWeighted is Plan balancing by per-zone WEIGHT (e.g. live player count / tick cost) instead of raw
+// zone count — so a busy newbie town counts more than an empty wilderness (PLACEMENT.md §7 load-aware
+// balance). zoneWeight[zone] is the zone's weight; a zone absent from the map (or weight <= 0) defaults to
+// 1, so a nil map reproduces the zone-COUNT Plan exactly. Still PURE + deterministic (the directory CAS is
+// the safety arbiter, not the plan). REMAINING follow-ups (PLACEMENT.md §7): the occupancy SIGNAL pipeline
+// (world -> director) that supplies real weights, wiring the plan to DRIVE the drain executor, a
+// weight-proportional RebalanceThreshold (a 1-player threshold would thrash), locality-aware colocation,
+// and rebalance cooldowns.
+func PlanWeighted(liveShards []string, assignment map[string]string, pool []string, zoneWeight map[string]int) []Move {
 	if len(liveShards) == 0 {
 		return nil
 	}
@@ -114,7 +125,13 @@ func Plan(liveShards []string, assignment map[string]string, pool []string) []Mo
 	for _, s := range liveShards {
 		live[s] = true
 	}
-	// Current load per live shard (zones it owns that are in the pool).
+	weight := func(zone string) int {
+		if w, ok := zoneWeight[zone]; ok && w > 0 {
+			return w
+		}
+		return 1 // an unweighted/empty zone still costs 1 slot, so a nil map == the zone-count plan
+	}
+	// Current load per live shard = the summed WEIGHT of the pool zones it owns.
 	load := map[string]int{}
 	for _, s := range liveShards {
 		load[s] = 0
@@ -124,7 +141,7 @@ func Plan(liveShards []string, assignment map[string]string, pool []string) []Mo
 		o := assignment[zone]
 		if o != "" && live[o] {
 			owner[zone] = o
-			load[o]++
+			load[o] += weight(zone)
 		} else {
 			owner[zone] = ""
 		}
@@ -140,26 +157,32 @@ func Plan(liveShards []string, assignment map[string]string, pool []string) []Mo
 		to := leastLoaded(liveShards, load)
 		moves = append(moves, Move{Zone: zone, From: "", To: to})
 		owner[zone] = to
-		load[to]++
+		load[to] += weight(zone)
 	}
 
 	// Phase 2: rebalance by draining one zone at a time from the busiest to the idlest until the spread is
-	// within the threshold. Bounded by the number of zones (each move strictly reduces the gap), so it
-	// always terminates.
+	// within the threshold. Each move strictly reduces the gap (a moved zone's weight leaves hi and joins
+	// lo), so it terminates in a bounded number of moves.
 	for {
 		hi := mostLoaded(liveShards, load)
 		lo := leastLoaded(liveShards, load)
-		if load[hi]-load[lo] <= RebalanceThreshold {
+		gap := load[hi] - load[lo]
+		if gap <= RebalanceThreshold {
 			break
 		}
-		zone := pickZoneOn(hi, owner, pool)
+		// Move a zone on hi whose weight STRICTLY reduces the gap (weight < gap). With uniform weights this
+		// is every zone (gap >= 2 > 1); with weights it excludes an INDIVISIBLE heavy zone whose move would
+		// merely flip the imbalance to lo — the guard that keeps Phase 2 terminating instead of ping-ponging
+		// one big zone forever. If no zone qualifies, the current spread is the best a single-zone move can do.
+		zone := pickMovableZone(hi, owner, pool, weight, gap)
 		if zone == "" {
-			break // defensive: the busiest owns no movable pool zone
+			break
 		}
 		moves = append(moves, Move{Zone: zone, From: hi, To: lo})
+		w := weight(zone)
 		owner[zone] = lo
-		load[hi]--
-		load[lo]++
+		load[hi] -= w
+		load[lo] += w
 	}
 	return moves
 }
@@ -186,14 +209,21 @@ func mostLoaded(shards []string, load map[string]int) string {
 	return best
 }
 
-// pickZoneOn returns a pool zone currently owned by shard (deterministic order), or "".
-func pickZoneOn(shard string, owner map[string]string, pool []string) string {
+// pickMovableZone returns a pool zone owned by shard whose weight strictly reduces the imbalance gap
+// (weight < gap) — so moving it always shrinks the spread and Phase 2 terminates. It prefers the HEAVIEST
+// such zone (the biggest gap-reducing move), ties broken by pool order for determinism. "" when no zone
+// owned by shard has weight < gap (an indivisible-heavy-zone stall).
+func pickMovableZone(shard string, owner map[string]string, pool []string, weight func(string) int, gap int) string {
+	best, bestW := "", 0
 	for _, zone := range pool {
-		if owner[zone] == shard {
-			return zone
+		if owner[zone] != shard {
+			continue
+		}
+		if w := weight(zone); w < gap && w > bestW {
+			best, bestW = zone, w
 		}
 	}
-	return ""
+	return best
 }
 
 func sortedShards(shards []string) []string {

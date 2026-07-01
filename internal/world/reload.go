@@ -232,7 +232,13 @@ func (r *reloader) notifyZones(kind, ref string) {
 		return
 	}
 	for _, z := range r.shard.zonesList() { // mu-guarded: safe against a runtime HostZone (16.4a)
-		z.post(reloadLuaMsg{kind: kind, ref: ref})
+		// NON-BLOCKING fan-out: the cache is already swapped, so a dropped invalidation just means that zone
+		// recompiles its Lua chunk on the next invalidation/access. A blocking post here would let ONE
+		// saturated zone inbox head-of-line-stall every LATER zone's invalidation shard-wide (distsys review).
+		if !z.postOrDrop(reloadLuaMsg{kind: kind, ref: ref}) {
+			slog.Warn("hot-reload invalidation dropped (zone inbox full); zone recompiles on next access",
+				"zone", z.id, "kind", kind, "ref", ref)
+		}
 	}
 }
 

@@ -46,7 +46,20 @@ type presenceTracker struct {
 	mu        sync.Mutex
 	residents map[string]roster.Entry // player id -> {name, afk}; the set THIS shard hosts
 	eager     chan eagerOp            // immediate add/remove I/O, drained off the zone goroutine
+
+	// who-read cache (scale hardening): a `who` reads the WHOLE cross-shard roster (a Redis SCAN + an HMGET
+	// per online player), which a `who` flood or a large roster makes the first scale pressure point. This
+	// caches the last List result for whoCacheTTL so N concurrent `who` collapse to ONE SCAN per window;
+	// whoMu (separate from mu) serializes the refresh so only one goroutine hits Redis at the window edge.
+	whoMu    sync.Mutex
+	whoCache []roster.Entry
+	whoAt    time.Time
+	whoOK    bool
 }
+
+// whoCacheTTL bounds how stale a `who` list may be — small enough that the roster looks live, large enough
+// to collapse a spam of `who` into one SCAN per window.
+const whoCacheTTL = time.Second
 
 // eagerOp is a single immediate presence write enqueued by a zone goroutine: a join SET (one key) or a
 // clean-quit REMOVE. It is drained by the background loop so the blocking Redis call never runs on a zone
@@ -238,14 +251,29 @@ func (z *Zone) rosterList(ctx context.Context) ([]roster.Entry, bool) {
 	if z.shard == nil || z.shard.presence == nil || !z.shard.presence.enabled() {
 		return nil, false
 	}
-	r := z.shard.presence.currentRoster()
+	return z.shard.presence.cachedList(ctx)
+}
+
+// cachedList returns the cross-shard roster, serving a sub-whoCacheTTL cached snapshot when one exists so a
+// `who` flood collapses to ONE Redis SCAN per window. whoMu serializes the refresh: at the window edge one
+// goroutine does the List (holding the lock) and the rest block briefly, then read the just-refreshed cache
+// — so N concurrent `who` cost one SCAN, not N. A List error degrades to the zone-local fallback (ok=false),
+// the unchanged contract. Runs off the zone goroutine (cmdWho).
+func (p *presenceTracker) cachedList(ctx context.Context) ([]roster.Entry, bool) {
+	r := p.currentRoster()
 	if r == nil {
 		return nil, false
 	}
+	p.whoMu.Lock()
+	defer p.whoMu.Unlock()
+	if p.whoOK && time.Since(p.whoAt) < whoCacheTTL {
+		return p.whoCache, true
+	}
 	entries, err := r.List(ctx)
 	if err != nil {
-		return nil, false // a roster read error degrades to the zone-local fallback, never an error to the player
+		return nil, false // a roster read error degrades to the zone-local fallback (unchanged contract)
 	}
+	p.whoCache, p.whoAt, p.whoOK = entries, time.Now(), true
 	return entries, true
 }
 

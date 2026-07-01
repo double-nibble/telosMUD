@@ -518,6 +518,20 @@ func newZone(id string) *Zone {
 // this is the *only* sanctioned way to reach zone state from outside the loop.
 func (z *Zone) post(m msg) { z.inbox <- m }
 
+// postOrDrop is a NON-BLOCKING inbox post: it enqueues m if the inbox has room, else DROPS it and returns
+// false. Only for RECOVERABLE notices — e.g. a hot-reload invalidation, where the shared prototype cache is
+// ALREADY swapped so a dropped notice just means that zone recompiles its Lua chunk on the next
+// invalidation/access — where a blocking post to ONE saturated zone must not head-of-line-stall a shard-wide
+// fan-out. NEVER use it for state the zone must not miss (attach/handoff/leave/save/input).
+func (z *Zone) postOrDrop(m msg) bool {
+	select {
+	case z.inbox <- m:
+		return true
+	default:
+		return false
+	}
+}
+
 // Run is the zone's single-threaded event loop and the heart of the actor model.
 // It runs on one dedicated goroutine and serially handles inbox messages until ctx
 // is cancelled. Because all state mutation funnels through here, no other goroutine

@@ -87,12 +87,11 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   a pvp policy / formula today. The source-aware `chunkFor` + the `reloadLua` chunk-drop are the
   correct fail-safe FOUNDATION for it; when a slice swaps `z.defs` at runtime, hook that seam and
   **re-run the pvp permissive→restrictive end-to-end check** against a live policy edit. (deferred) · *scripting/security*
-- **`notifyZones` blocking-posts can head-of-line-stall the shard reload pipeline** — `reload.go:180`:
-  the subscriber goroutine does a blocking `z.post(reloadLuaMsg)` to EVERY hosted zone; one wedged /
-  saturated zone inbox stalls all later invalidations shard-wide. Low-probability today; if a shard
-  hosts many zones (Phase-10 placement packs more per process), make the `reloadLuaMsg` post
-  non-blocking (a dropped notice is recoverable — the cache is already swapped; next invalidation
-  re-posts). (distsys/hardening) · *world/distsys*
+- ~~**`notifyZones` blocking-posts can head-of-line-stall the shard reload pipeline**~~ **RESOLVED** —
+  `notifyZones` (`internal/world/reload.go`) now uses `z.postOrDrop` (a non-blocking inbox send); a saturated
+  zone inbox drops the invalidation (logged Warn) instead of stalling every LATER zone's invalidation
+  shard-wide. Recoverable: the cache is already swapped, so a dropped notice just means that zone recompiles
+  its Lua chunk on the next invalidation/access. · *world/distsys*
 - **`reloadLua` chunk-cache invalidation is a substring match** — `reload.go:163` uses
   `strings.Contains(key, ref)` (plus dropping `pvp_allowed`/`formula:` every reload), so it
   over-invalidates (a harmless recompile-from-current-source). Correctness-safe; tighten with a keyed
@@ -107,12 +106,13 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   clobbers a live value (e.g. a quest counter) on an unrelated edit. Idiomatic content guards it
   (`state.x = state.x or 0`). One-liner for `docs/PERSISTENCE.md` (the `self.state` section) + the
   builder authoring guide. (doc) · *persistence/mudlib*
-- **`who` scale: SCAN + N×HMGET per call, unbounded** — `internal/presence/redis.go` (8.4): every
-  `who` spawns a goroutine doing a full keyspace SCAN + an HMGET per online player, with no rate-limit
-  or result cache; a `who` flood or a large roster is the first scale pressure point. Off-zone-goroutine
-  + 5s-timeout-bounded so it can't stall the actor loop, so it's a scale item not a correctness bug.
-  Before high-concurrency launch: a short per-session `who` cooldown OR a shared ~1s-TTL cached roster
-  snapshot (collapse N spammers to one SCAN/sec). (scale, deferred) · *distsys/persistence*
+- ~~**`who` scale: SCAN + N×HMGET per call, unbounded**~~ **RESOLVED (scale hardening)** —
+  `presenceTracker.cachedList` (`internal/world/presence.go`) caches the roster List for `whoCacheTTL` (1s)
+  behind `whoMu`, so a `who` flood collapses to ONE Redis SCAN per window (concurrent reads at the window
+  edge serialize on the one refresh, the rest read the cache). A List error still degrades to the zone-local
+  fallback (unchanged never-fatal contract). Tests: `TestWhoCacheCollapsesReads` +
+  `TestWhoDegradesToLocalOnRosterReadFailure`. (Deferred, smaller: a per-session `who` cooldown too.) ·
+  *distsys/persistence*
 - **`who` visibility filter** — `internal/world/presence.go` `renderWho` (8.4): `who` lists every online
   player cross-shard with NO visibility filter, so an invisible/builder-hidden/wizinvis player appears.
   Acceptable now (no visibility flags exist yet); when the visibility tier lands (the [[builder/wizard
@@ -423,9 +423,13 @@ something an author would reasonably want to:
   TRANSIENT (a live push). A zone that was down when a flag flipped misses it until the next set; it has no
   initial snapshot of current scope state on join. Add a snapshot fetch (read region_state/world_state at
   zone boot, or a director "sync" reply to a zone "I'm here") and/or a durable down tier. · *orchestration*
-- **Load/locality-aware placement balance (Phase 10.6).** `placement.Plan` balances by zone COUNT; a newbie
-  town ≫ an empty wilderness. Move to load-aware (player count / tick time) and locality-aware (keep adjacent
-  zones colocated so common moves stay in-process) balancing, with rebalance cooldowns (PLACEMENT.md §7). · *orchestration*
+- **Load/locality-aware placement balance (Phase 10.6) — PARTIAL.** The PLANNER is now load-aware:
+  `placement.PlanWeighted` (`internal/placement/placement.go`) balances by per-zone WEIGHT (player count)
+  instead of raw zone count, with a weight-guard so an indivisible heavy zone doesn't thrash Phase 2 (tests:
+  `TestPlanWeighted*`). `Plan` stays the uniform-weight (zone-count) case. **Remaining** (the larger
+  orchestration piece): the occupancy SIGNAL pipeline (world → director) that supplies real weights, wiring
+  the plan to DRIVE the drain executor (`BeginDrain`), a weight-proportional `RebalanceThreshold`,
+  locality-aware colocation, and rebalance cooldowns. · *orchestration*
 
 ## 7. Phase 12 (loot & spawns) deferred work
 
@@ -508,11 +512,11 @@ something an author would reasonably want to:
   ~30s (write deadline) + the link-death grace, not 30s — and a wedged client caught MID-DRAIN is
   deadline-dropped by design, so "zero-drop" graceful drain (16.4) must be scoped to HEALTHY connections
   and separately count deadline-reclaimed ones. · *world/gate/distributed*
-- **Bounded drain fan-out concurrency (Phase 16.4b review).** `Zone.drainZone` (internal/world/drain.go)
-  fans `beginHandoff` over EVERY resident at once — N residents = N concurrent Handoff.Prepare RPCs to the
-  single target shard. Correct (each handoff is epoch/CAS-fenced) but a synchronized burst at the ~1-2k/box
-  ceiling is a real load spike on the target. Add a per-target semaphore (~32 in flight) or pace the
-  drain-emit before leaning on this under a production rolling redeploy. · *world/distributed*
+- ~~**Bounded drain fan-out concurrency (Phase 16.4b review).**~~ **RESOLVED (scale hardening)** — the shard
+  now holds a `handoffSem` (`maxConcurrentHandoffs` = 32); `beginHandoff` acquires it before the Prepare
+  conversation, so a drain's whole-zone fan-out paces its Prepares (≤32 in flight) instead of stampeding the
+  target. Acquired before the RPC ctx so the timeout covers only the conversation, not the queue wait; a
+  normal move is never throttled. · *world/distributed*
 - **Drain reclaim = clean-disconnect + honest metric (Phase 16.4b).** A straggler still resident at the
   BeginDrain deadline (its handoff failed / it never re-dialed) is currently only FLUSHED (Drain) and counted
   in DrainResult.Reclaimed; the shard exit then drops its socket. That's the intended honest drop, but it is

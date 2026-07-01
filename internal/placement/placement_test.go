@@ -120,6 +120,41 @@ func TestPlanRebalancesBusyShardToNewcomer(t *testing.T) {
 	}
 }
 
+// TestPlanWeightedBalancesByLoad: with per-zone weights the plan balances by PLAYER load, not zone count.
+func TestPlanWeightedBalancesByLoad(t *testing.T) {
+	pool := []string{"z1", "z2", "z3", "z4"}
+	// shard-a owns 3 LIGHT zones (weight 1 each = 3); shard-b owns 1 HEAVY zone (weight 5).
+	assignment := map[string]string{"z1": "shard-a", "z2": "shard-a", "z3": "shard-a", "z4": "shard-b"}
+	weights := map[string]int{"z1": 1, "z2": 1, "z3": 1, "z4": 5}
+
+	// Zone-COUNT (unweighted) sees a=3, b=1 and would drain a light zone a->b — making the WEIGHT worse.
+	count := Plan([]string{"shard-a", "shard-b"}, assignment, pool)
+	require.NotEmpty(t, count, "the zone-count plan moves a light zone a->b (count 3 vs 1)")
+
+	// Weighted sees a=3, b=5: b is busier, but b's only zone (weight 5) can't reduce the gap-of-2 without
+	// over-correcting, so the LOAD-aware plan correctly leaves it alone (no load-worsening move).
+	weighted := PlanWeighted([]string{"shard-a", "shard-b"}, assignment, pool, weights)
+	assert.Empty(t, weighted, "load-aware: a=3 vs b=5 with an indivisible heavy zone => no gap-reducing move")
+}
+
+// TestPlanWeightedTerminatesOnIndivisibleHeavyZone: a single zone whose weight exceeds the gap must not
+// ping-pong forever (the weight-guard) — the plan terminates with no move.
+func TestPlanWeightedTerminatesOnIndivisibleHeavyZone(t *testing.T) {
+	pool := []string{"z1", "z2"}
+	assignment := map[string]string{"z1": "shard-a", "z2": "shard-b"}
+	weights := map[string]int{"z1": 10, "z2": 1} // a=10, b=1, gap 9; z1 (w10) can't move without flipping it worse
+	moves := PlanWeighted([]string{"shard-a", "shard-b"}, assignment, pool, weights)
+	assert.Empty(t, moves, "an indivisible heavy zone stalls Phase 2 cleanly (no thrash, no move)")
+}
+
+// TestPlanWeightedNilIsZoneCount: a nil weight map reproduces the zone-count Plan exactly.
+func TestPlanWeightedNilIsZoneCount(t *testing.T) {
+	pool := []string{"z1", "z2", "z3", "z4"}
+	assignment := map[string]string{"z1": "shard-a", "z2": "shard-a", "z3": "shard-a", "z4": "shard-a"}
+	shards := []string{"shard-a", "shard-b"}
+	assert.Equal(t, Plan(shards, assignment, pool), PlanWeighted(shards, assignment, pool, nil))
+}
+
 func TestPlanStableWhenBalanced(t *testing.T) {
 	pool := []string{"z1", "z2", "z3", "z4"}
 	assignment := map[string]string{"z1": "shard-a", "z2": "shard-a", "z3": "shard-b", "z4": "shard-b"}
