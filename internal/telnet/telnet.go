@@ -105,6 +105,12 @@ type Conn struct {
 	// a plain field is race-free (like onGmcp). Only effective when the underlying writer is a net.Conn
 	// (exposes SetWriteDeadline); a plain io.Writer (tests) silently ignores it.
 	writeTimeout time.Duration
+
+	// colorEnabled gates the `{{TOKEN}}` -> SGR rendering in Write (color.go). Default TRUE (MUD convention;
+	// a non-ANSI client types `color off`). Read on the writer goroutine, flipped by the `color on/off`
+	// command from the reader/dispatch goroutine, so it is atomic (like gmcpOn). When false, Write STRIPS the
+	// tokens to clean text instead of rendering them.
+	colorEnabled atomic.Bool
 }
 
 // SetWriteTimeout bounds how long a single Write may block on a slow/wedged client before returning a
@@ -116,14 +122,25 @@ func (c *Conn) SetWriteTimeout(d time.Duration) { c.writeTimeout = d }
 // New wraps a bidirectional connection (the common case: a net.Conn straight
 // from Accept). Reads are buffered; writes go to the same underlying stream.
 func New(rw io.ReadWriter) *Conn {
-	return &Conn{r: bufio.NewReader(rw), w: rw}
+	c := &Conn{r: bufio.NewReader(rw), w: rw}
+	c.colorEnabled.Store(true) // color on by default (MUD convention); `color off` disables
+	return c
 }
 
 // NewReadWriter is for tests with separate reader/writer halves, so a test can
 // feed a scripted byte stream in and inspect the negotiation answers written out.
 func NewReadWriter(r io.Reader, w io.Writer) *Conn {
-	return &Conn{r: bufio.NewReader(r), w: w}
+	c := &Conn{r: bufio.NewReader(r), w: w}
+	c.colorEnabled.Store(true)
+	return c
 }
+
+// SetColor toggles `{{TOKEN}}` -> ANSI SGR rendering for this connection (the `color on/off` command). When
+// off, Write strips the tokens to clean plain text. Race-safe (atomic): the writer goroutine reads it in Write.
+func (c *Conn) SetColor(on bool) { c.colorEnabled.Store(on) }
+
+// ColorEnabled reports whether ANSI color rendering is on for this connection.
+func (c *Conn) ColorEnabled() bool { return c.colorEnabled.Load() }
 
 // ReadLine returns the next line of input with IAC sequences removed, CR/NUL
 // stripped, and control characters filtered out (sanitizeLine). A trailing
@@ -353,14 +370,14 @@ func (c *Conn) skipSubneg() error {
 // frames output with "\r\n"; everything else unicode.IsControl flags is dropped.
 // Inbound ReadLine sanitization remains the primary fix; this is belt-and-braces.
 //
-// NOTE for the future ANSI renderer (later phase): the edge does not yet emit ESC
-// sequences — the world sends semantic markup and the gate writes it verbatim, so
-// stripping ESC here is safe today. When the gate gains an ANSI renderer it must
-// produce the ESC color bytes from trusted color tokens DOWNSTREAM of (i.e. not
-// through) this control-stripping Write, or this strip must learn to whitelist
-// well-formed SGR sequences. Until then, no legitimate output contains ESC.
+// ANSI color: renderColor (color.go) runs AFTER sanitizeOutput has stripped every raw control rune, so it is
+// the SOLE source of ESC in the output and that ESC is always a well-formed SGR (`ESC [ <params> m`). This is
+// the "produce SGR downstream of, not through, the control-strip" ordering: a player's raw ESC never survives
+// (sanitizeOutput ate it), while the allowlisted `{{TOKEN}}` markup renders to color here. IAC-escaping runs
+// last on the final bytes; SGR contains no 0xFF, so it is untouched by that step.
 func (c *Conn) Write(s string) error {
 	s = sanitizeOutput(s)
+	s = renderColor(s, c.colorEnabled.Load())
 	if strings.IndexByte(s, iac) >= 0 {
 		s = strings.ReplaceAll(s, "\xff", "\xff\xff")
 	}

@@ -83,13 +83,24 @@ seam are independent and can run in parallel — the constraints that matter are
 
 *Why clustered:* all four edit the same render functions and the ESC/width seam; sequencing avoids re-touching.
 
-- **ANSI color (16-color palette) — settle the token markup first.** The world emits SEMANTIC color TOKENS (a
-  category, not raw ESC — an `{enemy}`/`{exit}` markup class, content-nameable); the GATE renders tokens → ANSI
-  SGR DOWNSTREAM of the control-strip (`internal/telnet/telnet.go` `Write`/`sanitizeOutput` STRIPS ESC today —
-  the renderer must produce SGR downstream of, not through, the strip, or the strip must whitelist well-formed
-  SGR, so the world never ships raw ESC). Per-player `color on/off` toggle; a default token→color map
-  (enemy/exit/item/damage/heal/channel/system). **Do the markup convention before capitalization** so cap logic
-  targets the text, not the token. · *edge/mudlib*
+- **ANSI color — `{{TOKEN}}` SGR markup (DESIGN DECIDED).** Color is expressed as `{{TOKEN}}` TEXT tokens in
+  any string (room longs, names, `act()`, chat, mail); the world/domain treat them as ordinary text and pass
+  them through untouched. Only at the telnet edge, in `Write` AFTER `sanitizeOutput`, a renderer translates the
+  ALLOWLISTED tokens → SGR (`\x1b[<params>m`, terminator hardcoded `m`, params from a FIXED numeric allowlist:
+  0–9 styles, 30–37/90–97 fg, 40–47/100–107 bg). This is airtight against escape injection — a player/builder
+  can produce color and NOTHING else (raw ESC/BEL/BS is stripped twice; no token maps to cursor/erase/bell, and
+  the `m` terminator makes a non-SGR CSI unexpressible). Vocabulary is FIXED + universal (RESET/BOLD/DIM/
+  UNDERLINE/REVERSE[/ITALIC/BLINK/STRIKE], `FG_*`/`BG_*` + bright) — NOT content-defined (red==31 everywhere;
+  the flavor is which text a builder colors, already in content's hands). Adjacent tokens COALESCE into one SGR
+  (`{{FG_RED}}{{BOLD}}` → `\x1b[31;1m`); unknown `{{XYZ}}` passes through literally; an auto-`\x1b[0m` at frame
+  end stops an unclosed color bleeding. Per-player `color on/off` (persisted) strips instead of renders.
+  **Slices:** (1) edge core (token table + `renderTokens`/`stripTokens` wired into Write after sanitize, per-Conn
+  `colorEnabled`, auto-reset, tests incl. an injection-safety proof); (2) `color on/off` command + pref; (3) demo
+  colored room + a couple engine auto-colors (exits cyan). **Deferred:** GMCP token-strip (the Track-0 GMCP-
+  bypasses-sanitize path), width-aware framing (`Width(stripTokens(s))` for `score`), optional semantic aliases
+  (`{{ENEMY}}` → direct tokens, only if a pack wants global re-theming). **Do slice 1's markup before
+  capitalization** so cap logic targets the text, not the token. See [[content-alias-and-salvage-direction]]
+  for the mechanism/flavor split. · *edge/mudlib*
 - **Presentation capitalization.** (1) At the START of a line/sentence, a lowercase-article short/message renders
   capitalized (`a torch` → `A torch.`, `a goblin arrives.` → `A goblin arrives.`) while the SAME short stays
   lowercase mid-sentence (`You get a torch.`); (2) proper names always capitalized. Seam: `act()` (the Diku
@@ -122,6 +133,14 @@ seam are independent and can run in parallel — the constraints that matter are
     internal state a player never does.
   - **Runtime-tweakable per-builder toggles.** Show/hide own dice rolls, holylight on/off, wizinvis level,
     verbose debug echoes — flipped live, session-scoped.
+  - **Trusted full-screen ANSI / `screen.play(frames)` (tier 2 of the color design).** The ANSI color item
+    (Track 1) is SGR-only by design — safe for anyone, but it cannot move the cursor or redraw the screen. A
+    `telnet towel.blinkenlights.nl`-style animation (cursor positioning, erase, scroll regions) is a distinct
+    TRUSTED output mode: raw ANSI written to the socket BYPASSING `sanitizeOutput`, invocable only by trusted
+    code (a login splash / `clear` / HUD = engine-owned; a builder-authored intro animation = a sandboxed
+    `screen.*` capability gated behind THIS trust tier). Safety is by PROVENANCE, not an allowlist — player text
+    never reaches it, so cursor/screen control stays out of untrusted hands. Orthogonal to the Track-1 token
+    layer (no pipeline change). · *edge/scripting*
 - **GMCP `Char.Status` target visibility.** `charStatusJSON` emits the opponent's short bypassing act/canSee;
   route it through `nameFor`/canSee. **Prereq:** the visibility flags above (constraint 1). · *edge*
 - **Mobs/occupants in the room over GMCP (`Room.Players`).** Add `Room.Players` (+ a mob/occupant list) from
