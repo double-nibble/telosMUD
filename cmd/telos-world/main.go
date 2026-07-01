@@ -140,6 +140,38 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		slog.Info("session-assertion verification enabled (ed25519)")
 	}
 
+	// Cross-shard handoff keypair (docs/REMAINING.md §1): the shared cluster Ed25519 keys this shard signs
+	// outgoing Prepares with and verifies incoming ones against. Invalid keys are fatal (a misconfiguration
+	// that would silently disable handoff authentication); absent keys mean handoff signing is NOT enforced.
+	var handoffSignKey ed25519.PrivateKey
+	var handoffVerifyKey ed25519.PublicKey
+	if cfg.HandoffSigningKey != "" {
+		sk, err := assertion.ParsePrivateKey(cfg.HandoffSigningKey)
+		if err != nil {
+			slog.Error("invalid handoff signing key", "err", err)
+			os.Exit(1)
+		}
+		handoffSignKey = sk
+	}
+	if cfg.HandoffVerifyKey != "" {
+		pk, err := assertion.ParsePublicKey(cfg.HandoffVerifyKey)
+		if err != nil {
+			slog.Error("invalid handoff verify key", "err", err)
+			os.Exit(1)
+		}
+		handoffVerifyKey = pk
+	}
+	switch {
+	case handoffSignKey != nil && handoffVerifyKey != nil:
+		slog.Info("cross-shard handoff authentication enabled (ed25519)")
+	case handoffSignKey != nil || handoffVerifyKey != nil:
+		// Exactly one half configured. This is legal (asymmetric test shards) but in a real cluster it is
+		// almost certainly a misconfiguration: a signing-only shard leaves its RECEIVE side accepting
+		// unsigned/forged Prepares, and a verify-only shard cannot hand its own players off. Warn loudly.
+		slog.Warn("cross-shard handoff auth is HALF-configured — set BOTH handoff_signing_key and handoff_verify_key",
+			"have_signing", handoffSignKey != nil, "have_verify", handoffVerifyKey != nil)
+	}
+
 	// Load content BEFORE building any zone (docs/PHASE4-PLAN.md §3). This is synchronous boot
 	// I/O on the construction goroutine — never on a zone goroutine — so blocking is fine. If
 	// Postgres is unreachable the shard boots EMPTY (the bare-engine invariant), exactly as it
@@ -221,6 +253,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithHotReload(defSource, bus, enabledPacks).
 			WithComms(comms).
 			WithVerifyKey(verifyKey).
+			WithHandoffKeys(handoffSignKey, handoffVerifyKey).
 			WithScopeBus(scopeBus, lc.Regions).
 			WithMail(mailStore).
 			WithTells(tellJS), nil
@@ -301,6 +334,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithHotReload(defSource, bus, enabledPacks).
 		WithComms(comms).
 		WithVerifyKey(verifyKey).
+		WithHandoffKeys(handoffSignKey, handoffVerifyKey).
 		WithSessionLock(sessionlock.NewRedis(rdb), 0, 0). // Phase 14.4: cross-shard single-session lock (Redis)
 		WithScopeBus(scopeBus, lc.Regions).
 		WithZoneLeasing(dir, cfg.ShardID, directory.DefaultZoneLease, directory.DefaultZoneLease/3, stop).

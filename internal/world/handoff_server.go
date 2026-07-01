@@ -37,6 +37,14 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 	if snap == nil || snap.GetCharacterId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "missing snapshot")
 	}
+	// Authenticate the handoff BEFORE any state work (docs/REMAINING.md §1): when this shard has a handoff
+	// verify key, an unsigned or tampered Prepare is rejected outright, so a forged carry can never reach
+	// the pack-set audit / rehydrate path. A keyless shard (dev/test) skips this — mirroring WithVerifyKey.
+	if h.shard.handoffVerifyKey != nil {
+		if err := verifySnapshot(h.shard.handoffVerifyKey, req); err != nil {
+			return nil, status.Error(codes.PermissionDenied, "handoff snapshot authentication failed")
+		}
+	}
 	z := h.shard.zoneByID(req.GetTargetZoneId())
 	if z == nil {
 		return nil, status.Errorf(codes.NotFound, "zone %q not hosted on this shard", req.GetTargetZoneId())

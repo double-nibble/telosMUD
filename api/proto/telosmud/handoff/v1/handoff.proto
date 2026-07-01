@@ -24,6 +24,13 @@ message PrepareRequest {
   uint64 epoch = 5; // ownership epoch; destination records it
   string from_shard_id = 6;
   reserved 7; // applied_seq moved onto PlayerSnapshot (it is player freeze-state)
+  // snapshot_sig authenticates the handoff as coming from a legitimate cluster shard and binds
+  // the integrity-critical fields (character/epoch/target/state) so a network attacker cannot forge
+  // a Prepare that injects an arbitrary state_json. It is an Ed25519 signature over a canonical
+  // digest of those fields (see internal/world/handoffsig.go), verified at Prepare when the
+  // destination has a handoff verify key configured. Empty when signing is unconfigured (dev/test),
+  // in which case the destination does not enforce it — mirroring the session-assertion seam.
+  bytes snapshot_sig = 8;
 }
 
 message PrepareResponse {

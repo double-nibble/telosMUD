@@ -91,6 +91,14 @@ type Shard struct {
 	// assertions are NOT enforced (dev / pre-14.3 — the shard trusts the gate's asserted identity directly).
 	verifyKey ed25519.PublicKey
 
+	// handoffSignKey / handoffVerifyKey authenticate the cross-shard handoff (docs/REMAINING.md §1). All
+	// shards in a cluster share the handoff keypair: the source SIGNS an outgoing Prepare with the private
+	// key, the destination VERIFIES the incoming Prepare's snapshot_sig with the public key, so a forged
+	// Prepare from a party without the key cannot inject an arbitrary state_json. Both nil => signing off
+	// and enforcement off (dev/test, and the pre-signing behavior) — see handoffsig.go.
+	handoffSignKey   ed25519.PrivateKey
+	handoffVerifyKey ed25519.PublicKey
+
 	// sessionLock is the Phase-14.4 cross-shard single-session lock (sessionlock.Lock): on a fresh login the
 	// stream goroutine ACQUIRES it (takeover) and a renewer heartbeats it; a session displaced by a newer
 	// login (anywhere in the fleet) sees its renew fail and self-kicks. nil => not enforced (no Redis / dev).
@@ -336,6 +344,17 @@ func (s *Shard) WithComms(bus commbus.Bus) *Shard {
 // called before Run.
 func (s *Shard) WithVerifyKey(pub ed25519.PublicKey) *Shard {
 	s.verifyKey = pub
+	return s
+}
+
+// WithHandoffKeys wires the shared cluster handoff keypair (docs/REMAINING.md §1). The shard signs its
+// outgoing Prepare snapshots with priv and enforces the signature on incoming Prepares with pub. Either
+// half may be nil independently (a shard that only sends, or only receives, in an asymmetric test), but a
+// production cluster gives every shard BOTH so every handoff is signed and verified. Must be called before
+// Run.
+func (s *Shard) WithHandoffKeys(priv ed25519.PrivateKey, pub ed25519.PublicKey) *Shard {
+	s.handoffSignKey = priv
+	s.handoffVerifyKey = pub
 	return s
 }
 
@@ -719,15 +738,19 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			return
 		}
 
-		// Prepare the destination: it rehydrates the player as a pending entity.
-		resp, err := client.Prepare(ctx, &handoffv1.PrepareRequest{
+		// Prepare the destination: it rehydrates the player as a pending entity. Sign the request so a
+		// key-enforcing destination accepts it (docs/REMAINING.md §1); an unconfigured source signs nil,
+		// which only a keyless destination accepts.
+		prepReq := &handoffv1.PrepareRequest{
 			SessionId:    character, // session-id stand-in (deterministic token, §5)
 			Snapshot:     snap,
 			TargetZoneId: destZone,
 			TargetRoomId: destRoom,
 			Epoch:        newEpoch,
 			FromShardId:  s.addr,
-		})
+		}
+		prepReq.SnapshotSig = signSnapshot(s.handoffSignKey, prepReq)
+		resp, err := client.Prepare(ctx, prepReq)
 		if err != nil {
 			log.Warn("prepare rejected by destination", "err", err)
 			fail("destination rejected the handoff")

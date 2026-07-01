@@ -49,6 +49,14 @@ type Config struct {
 	AccountSigningKey string `yaml:"account_signing_key"`
 	AccountVerifyKey  string `yaml:"account_verify_key"`
 
+	// Cross-shard handoff keypair (docs/REMAINING.md §1). A SHARED cluster Ed25519 keypair (base64; the
+	// signing key is the 64-byte key or 32-byte seed) every world shard holds: a shard SIGNS its outgoing
+	// Handoff.Prepare snapshots with HandoffSigningKey and VERIFIES incoming ones with HandoffVerifyKey, so
+	// a forged Prepare cannot inject arbitrary player state. Both empty => handoff signing is off (dev/test;
+	// the pre-signing behavior). Distinct from the account keys above (a different trust boundary).
+	HandoffSigningKey string `yaml:"handoff_signing_key"`
+	HandoffVerifyKey  string `yaml:"handoff_verify_key"`
+
 	// Phase 14.7 / 15 OAuth broker (served by telos-account).
 	WebListen          string `yaml:"web_listen"`           // broker listen, e.g. ":8080" ("" => broker off)
 	WebPublicURL       string `yaml:"web_public_url"`       // the broker's externally-visible base URL (the /login/<code> link + OAuth callback derive from it)
@@ -166,6 +174,12 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_ACCOUNT_VERIFY_KEY"); ok {
 		c.AccountVerifyKey = v
+	}
+	if v, ok := os.LookupEnv("TELOS_HANDOFF_SIGNING_KEY"); ok {
+		c.HandoffSigningKey = v
+	}
+	if v, ok := os.LookupEnv("TELOS_HANDOFF_VERIFY_KEY"); ok {
+		c.HandoffVerifyKey = v
 	}
 	if v, ok := os.LookupEnv("TELOS_GATE_ALLOW_PLAINTEXT"); ok {
 		c.GateAllowPlaintext = v == "1" || strings.EqualFold(v, "true")
