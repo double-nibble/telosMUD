@@ -314,9 +314,11 @@ func (s *Service) ReserveName(ctx context.Context, req *accountv1.ReserveNameReq
 	return &accountv1.ReserveNameResponse{Ok: true}, nil
 }
 
-// CreateCharacter creates a character on an account. 14.1 lands the name + location write; applying the
-// chosen content bundles' grants into the initial state is wired in 14.8 (the chargen front-end), so the
-// bundles field is validated + recorded but the grant application is a TODO until then.
+// CreateCharacter creates a character on an account (name + location write + records the chosen chargen
+// bundles). By design (Model A, Phase 14.8) the account service only VALIDATES + RECORDS the bundles; the
+// WORLD applies their grants into the entity on FIRST SPAWN (via the characters.chargen marker), so there is
+// deliberately no grant application here — the account tier stays content-reading + validating, never a
+// world mutator.
 func (s *Service) CreateCharacter(ctx context.Context, req *accountv1.CreateCharacterRequest) (*accountv1.CreateCharacterResponse, error) {
 	if req.GetAccountId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "account_id required")

@@ -141,7 +141,7 @@ no TODO-nolints remaining; new ones should be resolved or reclassified as they a
   ceiling), a `LIMIT`/paging on `ListMail` (bound the query+render; the position-by-OFFSET addressing
   must page with it), and/or a read-mail retention sweep. Also reaps the directory-error dead-letter rows.
   (security/persistence MEDIUM, deferred) · *persistence/security*
-- **`ClearPlayer` deferred coupling** — `cmd/telos-gate/main.go:93,108`: reconnect
+- **`ClearPlayer` deferred coupling** — `cmd/telos-gate/main.go` (~:127,142,145): reconnect
   routing falls back to the home-zone shard, correct ONLY while `ClearPlayer` is
   deferred. Revisit when `ClearPlayer` (directory cleanup on logout) lands. · *gate/distsys*
 - **Cross-respawn op-list guard** — `runOps` (death seam) should skip remaining
@@ -302,11 +302,10 @@ something an author would reasonably want to:
   so a 5e-style "cure wounds" can only approximate. The dice evaluator exists (combat uses it);
   the gap is wiring a dice-expression form through the declarative heal op (and, by symmetry,
   any restorative op). · *abilities/combat*
-- **No content verb/op grants a flag.** The restricted `guild` channel gates on a `guildmember`
-  flag, but no content-authored action can SET that flag on a player — it must be seeded or set
-  out-of-band, so a "join the guild" interaction can't be authored as pure content. Needs a
-  flag-grant/revoke effect-op (with the obvious authz: a content action can only grant flags the
-  pack declares it owns), closing the loop on flag-gated content. · *abilities/world*
+- ~~**No content verb/op grants a flag.**~~ **RESOLVED (Phase 11.1)** — `effect_op_grant.go` ships
+  `set_flag(target, flag)` + `clear_flag(target, flag)` effect-ops (persisted via `setFlag`), so a content
+  ability CAN now set/clear the `guildmember` flag (the exact example) and a "join the guild" interaction is
+  authorable as pure content. Both go through the PvP/harm gate like every op. · *abilities/world*
 
 ### Comms chaos coverage follow-ups (W8, from the distsys review of comms_chaos_test.go)
 
@@ -382,6 +381,10 @@ something an author would reasonably want to:
 
 ## 5. Housekeeping
 
+- **Combat reproducibility — production draws from the process-global `math/rand`** (`internal/world/combat.go:646`,
+  code TODO not previously in this list). A live fight is not seedable/replayable, so a bug can't be
+  deterministically reproduced. Thread a per-zone (or per-fight) seeded RNG through the combat resolver instead
+  of the global default. · *combat/test*
 - Delete merged local branches as work lands (e.g. `test-standard-structure`).
 - **Flaky `gate.TestChannelLineRendersVerbatimNoTellPrefix` under CI -race load.** Timed out once at 10s
   waiting for a channel line on a docs-only commit (no code change), passed on re-run + 5x locally under
@@ -446,20 +449,19 @@ something an author would reasonably want to:
 - **Recipe skill gate uses the level ATTR, not the track (Phase 13.5).** RecipeDTO.Skill names the skill
   LEVEL attribute (e.g. leatherworking) + min_skill; it does not resolve the track's level_attr. Fine while
   the convention holds (track level_attr == the named attr) but brittle if they diverge. · *progression*
-- **Web auth hardening — deferred from the 14.7 security audit (Phase 15).** Three deployment-time gaps the
-  audit flagged but that aren't blocking the dev/feature surface: (F2) the SESSION cookie is a stateless
-  bearer token with no server-side revocation — add a per-account session `version` (bumped on
-  "sign out everywhere") and check it in `sessionAccount`, so logout/leak is revocable without rotating the
-  HMAC key; (F4) once the website is served over TLS, give both cookies the `__Host-` prefix (requires
-  Secure + Path=/ + no Domain) so a `telos_oauth` flow cookie can't be planted over http / from a sibling
-  subdomain (the login-fixation chain); (F8) `/play` + `/logout` rely on SameSite=Lax alone — add an explicit
-  CSRF token for defense-in-depth. `SecureCookies` is already config-driven (default true). · *web/auth/security*
+- **Web auth hardening (re-triaged after the Phase-15 pivot).** The 14.7 audit flagged F2/F4/F8, but Phase 15
+  DELETED the website (the dashboard, the persistent SESSION cookie, and `/play` + `/logout`), so: **F2 MOOT**
+  (no stateless session bearer token remains — only the single-use `flowCookie`, cleared after the OAuth
+  callback), **F8 MOOT** (`/play` + `/logout` no longer exist). **F4 still applies, shrunk:** the broker's
+  `flowCookie` (`internal/web/session.go`) should take the `__Host-` prefix when served over TLS (Secure +
+  Path=/ + no Domain) so it can't be planted over http / from a sibling subdomain (login-fixation on the OAuth
+  state). Minor, deployment-time; `secureCookies` is already config-driven. · *web/auth/security*
 - **Flaky session-lock takeover test under -race CI (Phase 15.1 sighting).** `internal/gate`
   `TestSessionLockTakeoverKicksDisplacedConnection` timed out (10s) waiting for "logged in from another
   location" on the loaded `-race` CI runner (passed 5/5 locally; resolved by a job re-run). The takeover-kick
-  delivery is timing-sensitive. It rides the stub name-login path, which the Phase-15.3 gate OAuth rework
-  replaces — so when reworking gate login, rebuild this test on the new login (dev-autoauth seam) and give the
-  kick-message wait a generous/synchronized deadline rather than a fixed 10s. · *gate/test*- **Instanced zones (deferred from Phase 16, 2026-06-30).** Multiple runtime instances of a zone on the
+  delivery is timing-sensitive. (Re-triaged: it uses a hermetic no-account gate harness with the legacy
+  name-login, which is legitimate + still present, so the "rebuild on the OAuth login" note is MOOT — the
+  remaining work is just to de-flake: give the kick-message wait a generous/synchronized deadline.) · *gate/test*- **Instanced zones (deferred from Phase 16, 2026-06-30).** Multiple runtime instances of a zone on the
   Phase-10.6 dynamic-placement substrate: the director mints/reaps zone instances and routes a party to its
   own copy (a dungeon instance). Deferred out of Phase 16 (hardening/scale) as a world/content feature; fold
   into a later content phase. The placement coordinator + the scoped event bus are the substrate. · *world/orchestration*
