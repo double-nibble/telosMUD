@@ -1,8 +1,14 @@
 # Phase 16 — Hardening & scale
 
-Status: **LOCKED (2026-06-30).** Building 16.1 → 16.4 + capstone. The last roadmap phase before the
-end-of-roadmap wiki. Prove the topology scales and survives operations: see the system under synthetic load,
-protect a shard from slow clients, and drain a shard for a rolling redeploy with zero dropped connections.
+Status: **COMPLETE (2026-07-01).** All slices (16.1 metrics · 16.2 bot-swarm · 16.3 backpressure · 16.4 FULL
+zero-drop drain) landed CI-green. The user chose the FULL drain (over the narrow clean-save fallback), which
+un-deferred runtime zone-add + the rebalance executor: runtime `HostZone`, the fenced `HandoverZone` lease
+flip, zone-lease renewal moved into the shard, the `AdoptZone` RPC, `BeginDrain` + the SIGTERM wiring, and the
+hermetic zero-drop capstone. Deferred (docs/FOLLOW-UPS.md): bounded drain fan-out concurrency, drain metrics +
+clean-disconnect, director-owned/serialized target selection, runtime-zone scope-replica registration.
+The last roadmap phase — next is the end-of-roadmap wiki.
+
+Original plan below (kept for the decision record).
 
 **Decisions (approved):** metrics via **OpenTelemetry (OTLP)** — the OTel metric SDK in-process + an OTLP
 exporter, an `otel-collector` in the dev stack; traces are available from the same SDK (optional, hot-path

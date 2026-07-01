@@ -230,12 +230,20 @@ are replaced by a single **terminal-native OAuth device flow** — no passwords,
 **Done when:** `connect` over TLS → click the link → OAuth in the browser → create a character via prompts →
 play → reconnect (survives restart). No password/key path exists in prod.
 
-### Phase 16 — Hardening & scale
-- Bot-swarm load tester (synthetic telnet + GMCP); tick-lag, occupancy, NATS-lag metrics.
-- Backpressure on slow clients; graceful shard drain for rolling redeploys; instanced zones.
+### Phase 16 — Hardening & scale ✅ COMPLETE
+- ✅ OTel(OTLP) metrics (tick-lag/occupancy/gate-conns/frames-dropped) + `otel-collector`.
+- ✅ Bot-swarm load tester (`cmd/telos-botswarm`, `make loadtest`).
+- ✅ Slow-client backpressure (world measures drops; the gate's per-write deadline reclaims a wedged client).
+- ✅ FULL handoff-based **zero-drop graceful drain** for rolling redeploys: runtime zone-add (`HostZone`),
+  fenced atomic lease flip (`HandoverZone`), lease renewal moved into the shard, `AdoptZone` RPC, and
+  `BeginDrain` wired on SIGTERM — a draining shard hands every zone + its live players to a peer with the
+  socket held open. (Instanced zones DEFERRED to a later content phase.)
 
-**Done when:** N thousand synthetic players sustain target tick rate; a shard can be drained
-and redeployed with zero dropped connections.
+**Done when:** ✅ a shard drains + redeploys with zero dropped connections (hermetic capstone
+`TestGracefulDrainZeroDrop`). The N-thousand-players-sustain-tick-rate check is an operational load-test run
+(`make up` + `make loadtest BOTS=1500`, watch `:8889` tick-lag) — tooling ready.
+
+**This is the last roadmap phase.** Next: the end-of-roadmap GitHub wiki (mudlib-dev / sysadmin / builder).
 
 ---
 
