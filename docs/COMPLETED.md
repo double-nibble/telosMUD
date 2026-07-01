@@ -5195,3 +5195,80 @@ a stale-Phase-14-docstrings sweep, and the builder-guide hot-reload note (docs/w
   (defaults to 2 when unset; a class/feat can raise it); `BundleDTO.Uncapped` marks a gathering/utility
   profession as unlimited/non-counting; only capped professions count (unknown => capped, safe). Wired through
   the bundle_defs JSONB (no migration). Reviewed by progression-engineer + persistence-engineer.
+
+---
+
+# Burn-down round 3 — regression nets & the render path (2026-07-01)
+
+Continued post-roadmap burn-down of `docs/REMAINING.md`, each item board-reviewed (owning + a cross-cutting
+engineer), `make verify` + CI green before every push. REMAINING was also reorganized this round from §1–§8
+DOMAIN sections into dependency-ordered TRACKS (a shared-seam map + 8 hard ordering constraints).
+
+## §4 Content / itemization (round-3 leftovers)
+
+- **`rollOpAmount` dedupe.** Extracted the shared `amount + dice(diceNum/diceCount) + bonus`, magnitude-scaled
+  roll from `opDealDamage`/`opHeal` into one `rollOpAmount(c, op)` helper so the two can't drift; the heal
+  non-negative clamp stays in the caller. Reviewed by abilities + combat engineers. (commit 43a6d45)
+- **`learn_profession.profession` content-lint.** `lintLearnProfessionRefs` (load-time, build.go) walks every
+  registered op-list — ability ops+on_event, bundle grants, track steps, affect on_event+tick, resource
+  on_event+on_depleted — and logs any `learn_profession` op whose `profession` doesn't name a `kind:profession`
+  bundle (the ref==bundle-ref convention `professionIsCapped` keys the D2 cap off). Reviewed by progression +
+  mudlib (mudlib caught two missed op-list roots). (commit 42a54ad)
+- **`on_roll(ctx)` Lua loot hatch.** A per-loot-table Lua body run once per eligible looter AFTER the declarative
+  rolls, returning a list of item refs delivered through the SAME loot pipeline. Read-only decision hatch
+  (returns refs; the engine delivers), fail-closed via `invokeForStringList` (non-table/error → no drops),
+  breaker-scoped by origin, deterministic array-order read, capped at `maxLootOnRollDrops` against a runaway
+  body. `OnRoll` rides the loot_table JSONB body (symmetric marshal/unmarshal + hermetic round-trip test).
+  Reviewed by progression + scripting. (commit 51a20a0)
+
+## Track 0 — Regression nets
+
+- **Reflect-walk DTO store round-trip net.** `tests/integration/store_reflect_test.go`: a synthetic all-non-zero
+  `content.Pack` round-tripped through Postgres (ImportPack→Load) asserts every field of all 15 persisted
+  global-def kinds survives — closing `TestStorePackRoundTrip`'s blind spot (a field no demo content populates
+  drops invisibly). A hermetic drift guard fails if a new `content.Pack` def slice goes uncovered. It CAUGHT +
+  FIXED two real silent store drops: resource `on_event_lua`/`on_reaction_lua` (resourceBody) and ability
+  `on_event` (the messages JSONB) — both rode an existing JSONB body (no migration). Reviewed by persistence +
+  test engineers. Surfaced two follow-ups (still open in REMAINING): Commands/PvpLua/Formulas have no DB
+  import/load path; the scope-state CAS tests aren't re-run safe. (commit 65961b3)
+- **Display-width helper `internal/textwidth`.** A terminal CELL-width measure (not bytes/runes): combining
+  marks (Mn/Me) + format chars (Cf: ZWJ/ZWNJ/ZWSP/bidi marks/BOM/Arabic subtending) → 0, East-Asian
+  wide/fullwidth → 2, ambiguous → 1. `Width`/`Truncate`/`Pad` give `score` framing + any ANSI-aware framing a
+  cell-accurate measure; delegates the wide table to `golang.org/x/text/width` (promoted to a direct dep). Tests
+  are code-point-built (unambiguous), covering RTL Arabic, decomposed base+combining, spacing-combining Mc
+  (correctly 1), C0/C1/DEL, ZWJ/bidi-marks/fullwidth-vs-halfwidth, grapheme-cluster rune-sum, and bidi
+  order-independence. Reviewed by edge + test engineers. (commit 9b3cfb2)
+- **UTF-8 / bidi / grapheme / zero-width render-path tests + live RTL e2e.** `internal/telnet` output-path:
+  `TestWritePreservesMultibyteUTF8` (byte-intact through Write→sanitizeOutput→IAC-escape; RTL, implicit-bidi
+  LTR-in-RTL, CJK, decomposed, ZWJ/flag/skin-tone clusters, ZWSP) + `TestWriteStripsControlKeepsAdjacentMultibyte`
+  (a C0 BEL and a C1 NEL between base+combining and inside a ZWJ cluster are stripped without tearing the
+  multibyte or breaking the cluster — proving the rune-level strip, and that ZWJ, being Cf not Cc, survives). A
+  LIVE e2e say-echo (`tests/e2e/utf8_render_test.go`) round-trips RTL Arabic + implicit-bidi + CJK + decomposed +
+  a ZWJ emoji cluster through the full edge; live-verified `You say, 'مرحباً يا عالم 世界'` renders. Vertical text
+  intentionally unsupported (telnet). Reviewed by edge + test engineers. (commit 291109e)
+
+## Track 1 — Plain-telnet render path
+
+- **ANSI color — the `{{TOKEN}}` SGR layer (slices 1–3).** Color is `{{TOKEN}}` TEXT markup that rides the whole
+  pipeline as ordinary text; only at the telnet edge (Write, AFTER `sanitizeOutput`) an allowlisted renderer
+  turns tokens → SGR. INJECTION-PROOF (security-auditor verified under adversarial input, incl. the "reform a
+  token via a stripped control byte" attack): renderColor is the SOLE ESC source and emits only `ESC[<params>m`
+  with a hardcoded `m` terminator and params from a fixed map — no cursor/erase/bell expressible; raw ESC is
+  stripped first. Fixed universal vocabulary (RESET/styles/FG_*/BG_* + bright); case-insensitive; adjacent
+  tokens COALESCE into one SGR; unknown/unclosed `{{...}}` passes through literally; an idempotent trailing
+  reset stops color bleeding past the frame. Per-Conn `colorEnabled` (default on). Slice 2: the edge-local
+  `color on/off` command intercepted in the gate line pump, NOT forwarded to the world (DS-confirmed transparent
+  to input-seq/replay/handoff; `color` is now a reserved edge verb). Slice 3: `lookRoom` auto-colors exits cyan
+  (a `colorize` helper) + the demo `darkwood:room:lair` long carries a builder color example; live-verified
+  (exits `\x1b[36m`, the coalesced warning `\x1b[31;1m`). Cursor/screen control (towel-style full-screen ANSI)
+  is a SEPARATE trusted path (REMAINING Track 2 `screen.play`). Reviewed across slices by edge + security-auditor
+  + distributed-systems + mudlib. (commits 92191b4, ce38348, d17cdb1)
+- **Presentation initial-cap.** `capitalizeFirst` (act.go) upper-cases the first RENDERED letter of a line (the
+  Diku rule): a message beginning with a lowercase-authored short renders capitalized ("a goblin arrives." →
+  "A goblin arrives.") while content authors still write shorts lowercase and the same short stays lowercase
+  mid-sentence. Applied at the end of act()'s `render()` (every perspective message per recipient) + each
+  `lookRoom` occupant line. TOKEN-AWARE (skips a leading `{{...}}`-shaped run so it caps the text, not the '{'),
+  UTF-8-safe (rune-wise `unicode.ToUpper`, which is rune→rune so ss/ligature expansion can't corrupt the
+  reslice), inert on caseless scripts (Arabic/CJK) so it composes with the i18n render path. Mudlib audited every
+  act call site (no intentionally-lowercase-leading template; tell/channel/mail/system paths correctly bypass
+  `render()`). Reviewed by mudlib + edge. (commits 73bf2b6, 5ebcca4)

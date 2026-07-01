@@ -1,7 +1,7 @@
 # Remaining work — dependency-ordered backlog
 
 Everything here is **not yet done**. It is the consolidated, de-duplicated backlog after the roadmap
-(Phases 0–16) and two launch-hardening burn-down rounds shipped. Completed work lives in
+(Phases 0–16) and three burn-down rounds shipped. Completed work lives in
 [COMPLETED.md](COMPLETED.md).
 
 **How this list is organized.** The old §1–§8 *domain* grouping is replaced by dependency-ordered **tracks**:
@@ -16,7 +16,8 @@ seam are independent and can run in parallel — the constraints that matter are
 ## Shared seams (the touch-the-same-code map)
 
 - **Render path** — `internal/world/act.go`, `lookRoom`, item-listing, `internal/telnet` `Write`/`sanitizeOutput`,
-  a display-width helper → *Track 1* (capitalization, coalescing, ANSI color, `score`) + the UTF-8 tests.
+  the `internal/textwidth` display-width helper → *Track 1* (coalescing + `score` remain; ANSI color,
+  capitalization, and the UTF-8 tests SHIPPED — round 3).
 - **`canSee`/`nameFor` visibility chokepoint** → *Track 2* (holylight/visibility flags, `who`-filter, GMCP
   `Char.Status` visibility, `Room.Players`).
 - **`Resolve`/parser + content aliases** → *Track 3* (alias system, `craft <name>`, salvaging object-targeting).
@@ -39,34 +40,21 @@ seam are independent and can run in parallel — the constraints that matter are
 4. **Director-owned drain ownership** (Track 6) **before / with** wiring placement to DRIVE `BeginDrain`.
 5. **Rest mechanic** (Track 5) **before** firing `OnRest` and **before** the 5eSRD pack's short/long rest (Track 8).
 6. **Directory-tree loader** (Track 8) **before** the 5eSRD / WoWSRD packs.
-7. **Display-width helper** (Track 0 UTF-8 work) **before** `score`'s column framing (Track 1).
-8. **ANSI token markup convention** (Track 1) settled **before / with** presentation capitalization (cap the
-   text, not the `{enemy}` token).
+7. **Display-width helper** (SHIPPED, `internal/textwidth`) — `score`'s column framing (Track 1) must use it,
+   measuring `Width(stripTokens(s))` so color markup doesn't inflate the width.
 
 ---
 
 ## Track 0 — Regression nets (do first; they de-risk the store + render churn below)
 
-- *DONE — Reflect-walk DTO round-trip net (`tests/integration/store_reflect_test.go`): a synthetic all-non-zero
-  pack round-tripped through Postgres asserts every field of all 15 persisted global-def kinds survives, +
-  a hermetic drift guard that fails if a new `content.Pack` def slice goes uncovered. It auto-covers every
-  later store-field add (`affix_defs`, `wear_slots`, `help_defs`, `salvage_table`, a stored `score` layout).
-  It immediately caught + fixed two real silent drops: resource `on_event_lua`/`on_reaction_lua` and ability
-  `on_event`.*
+*Reflect-walk store net + display-width helper + UTF-8/bidi/grapheme render tests SHIPPED — see COMPLETED.md
+"Burn-down round 3". Still-open follow-ups they surfaced:*
+
 - **Commands / PvpLua / Formulas have no Postgres import/load path (found by the reflect net).** A YAML pack's
   custom Lua verbs (`Commands`), PvP policy (`PvpLua`), and ruleset `Formulas` are NOT persisted through
   `ImportPack`/`Load` — no INSERT/DELETE/SELECT in `internal/store/import.go`/`content.go`. A DB-SEEDED pack
   silently loses them (they survive only via the embedded-YAML load path). Decide whether that's intentional
   (embedded-only) or a gap to close with a store path (a def table or pack_meta columns) + reflect-net coverage. · *persistence*
-- *DONE — display-width helper (`internal/textwidth`) + UTF-8/bidi/grapheme render-path tests. The helper
-  measures terminal CELLS (Mn/Me/Cf → 0, wide/fullwidth → 2, ambiguous → 1); `Width`/`Truncate`/`Pad` give
-  `score` framing a cell-accurate measure (delegates the wide table to x/text/width). Render-path coverage:
-  `internal/telnet` output-path (`TestWritePreservesMultibyteUTF8` byte-intact + the strip-loop
-  `TestWriteStripsControlKeepsAdjacentMultibyte` proving a control between base+combining, and inside a ZWJ
-  cluster, is stripped without tearing the multibyte / breaking the cluster), plus a LIVE e2e say-echo
-  (`tests/e2e/utf8_render_test.go`) round-tripping RTL Arabic + implicit-bidi LTR-in-RTL + CJK + decomposed +
-  a ZWJ emoji cluster through the full edge. Verified live: `You say, 'مرحباً يا عالم 世界'` renders. Vertical
-  text intentionally unsupported (telnet).*
 - **UTF-8 coverage gaps NOT yet closed by the render-path tests (found in review).** The say-echo + output
   sanitize cover the `$t` verbatim + strip seams; still UNVERIFIED for multibyte: (1) **GMCP JSON payloads**
   — highest value, they BYPASS `sanitizeOutput` entirely (Room.Info names, Comm.Channel bodies) and have only
@@ -83,35 +71,19 @@ seam are independent and can run in parallel — the constraints that matter are
 
 *Why clustered:* all four edit the same render functions and the ESC/width seam; sequencing avoids re-touching.
 
-- **ANSI color — `{{TOKEN}}` SGR markup (DESIGN DECIDED).** Color is expressed as `{{TOKEN}}` TEXT tokens in
-  any string (room longs, names, `act()`, chat, mail); the world/domain treat them as ordinary text and pass
-  them through untouched. Only at the telnet edge, in `Write` AFTER `sanitizeOutput`, a renderer translates the
-  ALLOWLISTED tokens → SGR (`\x1b[<params>m`, terminator hardcoded `m`, params from a FIXED numeric allowlist:
-  0–9 styles, 30–37/90–97 fg, 40–47/100–107 bg). This is airtight against escape injection — a player/builder
-  can produce color and NOTHING else (raw ESC/BEL/BS is stripped twice; no token maps to cursor/erase/bell, and
-  the `m` terminator makes a non-SGR CSI unexpressible). Vocabulary is FIXED + universal (RESET/BOLD/DIM/
-  UNDERLINE/REVERSE[/ITALIC/BLINK/STRIKE], `FG_*`/`BG_*` + bright) — NOT content-defined (red==31 everywhere;
-  the flavor is which text a builder colors, already in content's hands). Adjacent tokens COALESCE into one SGR
-  (`{{FG_RED}}{{BOLD}}` → `\x1b[31;1m`); unknown `{{XYZ}}` passes through literally; an auto-`\x1b[0m` at frame
-  end stops an unclosed color bleeding. Per-player `color on/off` (persisted) strips instead of renders.
-  **Slices:** (1) DONE (commit 92191b4) — edge core (`internal/telnet/color.go` renderColor + per-Conn
-  `colorEnabled` + Write wiring + injection-safety proof). (2) DONE — the edge-local `color on/off` command
-  (`internal/gate/color.go`, intercepted in the line pump, NOT forwarded to the world since color is a terminal
-  concern; session-scoped). (3) demo colored room + a couple engine auto-colors (exits cyan). **Deferred:**
-  PERSIST the color pref across sessions via the ACCOUNT (not the world — color stays an edge concern; slice 2
-  is session-scoped today); GMCP token-strip — **priority guard rail now that the demo advertises `{{tokens}}`
-  in content**: a token in a room NAME (→ GMCP `Room.Info`) or a `channel_def` format (→ `Comm.Channel.Text`
-  raw body) would ship literal `{{tokens}}` to a rich client (JSON-escaped so injection-safe, just cosmetic).
-  Strip tokens on the GMCP text fields (a `renderColor(s,false)` helper) before builders are broadly told they
-  can color any content; a content-lint that rejects tokens in room names / channel formats is an alternative;
-  width-aware framing
-  (`Width(stripTokens(s))` for `score`); optional semantic aliases (`{{ENEMY}}` → direct tokens). Capitalization
-  (next) targets the text, not the token. See [[content-alias-and-salvage-direction]]. · *edge/mudlib*
-- **Presentation capitalization.** (1) At the START of a line/sentence, a lowercase-article short/message renders
-  capitalized (`a torch` → `A torch.`, `a goblin arrives.` → `A goblin arrives.`) while the SAME short stays
-  lowercase mid-sentence (`You get a torch.`); (2) proper names always capitalized. Seam: `act()` (the Diku
-  initial-cap-the-leading-token rule) + `lookRoom`/item-listing lines. Authors still write shorts lowercase.
-  **Prereq:** ANSI token markup (cap the text inside a leading `{token}`, not the marker). · *edge/mudlib*
+*ANSI color (the `{{TOKEN}}` SGR layer + `color on/off` + exits/demo auto-color) and presentation
+initial-cap SHIPPED — see COMPLETED.md "Burn-down round 3". Still-open color follow-ups:*
+
+- **ANSI color — deferred follow-ups.** (1) **PERSIST** the `color on/off` pref across sessions via the ACCOUNT
+  — color stays an EDGE concern; the persistence path must NOT route through the input-seq stream (would
+  reintroduce the world/edge coupling slice 2 deliberately avoids). Session-scoped today. (2) **GMCP token-strip
+  — priority guard rail now that the demo advertises `{{tokens}}` in content:** a token in a room NAME (→ GMCP
+  `Room.Info`) or a `channel_def` format (→ `Comm.Channel.Text` raw body) ships literal `{{tokens}}` to a rich
+  client (JSON-escaped so injection-safe, just cosmetic). Strip via a `renderColor(s,false)` helper on the GMCP
+  text fields, or a content-lint rejecting tokens in names/formats, BEFORE builders are broadly told they can
+  color any content. (3) **width-aware framing:** `score`'s column measure + any future word-wrap must measure
+  `Width(stripTokens(s))`, not the raw markup. (4) optional **semantic aliases** (`{{ENEMY}}` → direct tokens,
+  only if a pack wants global re-theming). See [[content-alias-and-salvage-direction]]. · *edge/mudlib*
 - **Coalesce identical items in listings (`A torch. (5)`).** Group identical discrete items onto one line with a
   `(N)` count in `lookRoom`, inventory, and container listings — distinct from the Phase-13.2 `Stack` component.
   Grouping key: same rendered short AND no distinguishing per-instance state (group by prototype + equal delta,
@@ -358,8 +330,9 @@ reconciliation, the recipe skill-gate `track` resolution, the content-configurab
 kind; the two flaky gate tests, the orphaned `account_auth`/`ssh_keys` drop migration (00017), the stale
 `oauth.go` header.
 
-*Round 3 (2026-07-01):* the `rollOpAmount` dedupe (shared `amount + dice + bonus` roll extracted from
-opDealDamage/opHeal); the `learn_profession.profession` → `kind:profession` content-lint (`lintLearnProfessionRefs`,
-load-time, walks every registered op-list incl. `on_depleted`/`tickOps`); the `on_roll(ctx)` Lua loot hatch
-(per-table body → conditional drops through the normal pipeline, fail-closed + breaker-scoped + capped, `OnRoll`
-round-trips the loot JSONB body).
+*Round 3 (2026-07-01) — COMPLETED.md → "Burn-down round 3":* the `rollOpAmount` dedupe; the
+`learn_profession.profession` → `kind:profession` content-lint; the `on_roll(ctx)` Lua loot hatch; the
+reflect-walk DTO store round-trip net (which caught + fixed the resource `on_event_lua`/`on_reaction_lua` and
+ability `on_event` silent drops); the `internal/textwidth` display-width helper; the UTF-8/bidi/grapheme/
+zero-width render-path tests + live RTL e2e; the ANSI color `{{TOKEN}}` layer (slices 1–3: renderer, `color
+on/off`, exits/demo auto-color); and the presentation initial-cap.
