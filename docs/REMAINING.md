@@ -1,278 +1,314 @@
-# Remaining work — the live TODO list
+# Remaining work — dependency-ordered backlog
 
 Everything here is **not yet done**. It is the consolidated, de-duplicated backlog after the roadmap
-(Phases 0–16) shipped and the launch-hardening burn-down (mail/handoff/corpse security, who-cache, drain
-semaphore, weighted placement, runtime-zone scope registration) landed. Completed work — the phase plans and
-every resolved follow-up — lives in [COMPLETED.md](COMPLETED.md).
+(Phases 0–16) and two launch-hardening burn-down rounds shipped. Completed work lives in
+[COMPLETED.md](COMPLETED.md).
 
-Items tagged **[LARGE]** are really their own project (a subsystem / a design-heavy feature), not a bounded
-hardening fix — call them out for dedicated planning rather than a quick slice.
+**How this list is organized.** The old §1–§8 *domain* grouping is replaced by dependency-ordered **tracks**:
+items that touch the SAME code seam are clustered so we edit a chokepoint once, and hard "do-X-before-Y"
+constraints are called out so we don't build against a stub and then rework it. Each item keeps its owning
+component tag (`· *mudlib/edge*` …). **[LARGE]** = a subsystem / design-heavy feature that wants its own
+planning pass, not a quick slice. Tracks are listed in a sensible *start* order, but tracks with no shared
+seam are independent and can run in parallel — the constraints that matter are the per-item **Prereq** notes.
 
 ---
 
-## 1. Security
+## Shared seams (the touch-the-same-code map)
 
-*Burned down (see COMPLETED.md → "Launch-hardening burn-down round 2"): handoff snapshot Ed25519
-authentication, corpse-owner PersistID keying, mail evict-oldest-READ retention sweep, the `__Host-` broker
-cookie prefix, mid-session hear-access republish, and the durable `characters.state` byte cap.*
+- **Render path** — `internal/world/act.go`, `lookRoom`, item-listing, `internal/telnet` `Write`/`sanitizeOutput`,
+  a display-width helper → *Track 1* (capitalization, coalescing, ANSI color, `score`) + the UTF-8 tests.
+- **`canSee`/`nameFor` visibility chokepoint** → *Track 2* (holylight/visibility flags, `who`-filter, GMCP
+  `Char.Status` visibility, `Room.Players`).
+- **`Resolve`/parser + content aliases** → *Track 3* (alias system, `craft <name>`, salvaging object-targeting).
+- **Equip/wear + the gear-modifier `modSource`** → *Track 4* (worn-affix + `wear_slots`, inventory-by-slot,
+  `affix_defs`, salvaging).
+- **`setResourceCurrent`/regen + `OnRest`** → *Track 5* (rest mechanic, live on-change vitals).
+- **`BeginDrain` + director + scoped-bus envelope** → *Track 6* (drain ownership, placement pipeline, drain
+  metrics, durable DOWN, bus-lag, mail reaper, Lua director).
+- **GMCP outbound path** → *Track 7* (Char.Items deltas, Comm.Channel, Char.Stats flags, builder gmcp.send) —
+  note the cross-links into Tracks 1/2.
+- **Store DTO round-trip + content loader** → *Track 0* (reflect-walk net) and *Track 8* (directory-tree loader
+  → demo packs).
+- **`reload.go`** → *Track 9* (shared-def hot reload, `reloadLua` substring, determinism RNG).
 
-- **Mail dead-letter reap (background job).** The evict-oldest-READ sweep landed; still open is a PERIODIC
-  reaper for undeliverable/orphaned mail (rows to a name that never logs in) — a maintenance job needing a
-  scheduler tick (director-owned, like the weekly spawn scheduler), not a per-send store fix.
-  `internal/store/mail.go`.
-- **`config.<player>` comms subject under future NATS authz (note, no code).** When subject-level NATS authz
-  lands, put `telos.comms.config.*` under world-publish-only alongside `chan`/`tell`. Nothing to build until
-  NATS subject authz ships.
+## Hard ordering constraints (violate → you rework)
 
-## 2. Scale / performance
+1. **Visibility flags** (Track 2 holylight) **before** GMCP `Char.Status` visibility + `Room.Players` routing.
+2. **`wear_slots` content-defined** (Track 4) **before** inventory-renders-worn-items-by-slot (Track 4).
+3. **Alias/`Resolve` resolver** (Track 3) **before** unified `craft <name>` + salvaging object-targeting.
+4. **Director-owned drain ownership** (Track 6) **before / with** wiring placement to DRIVE `BeginDrain`.
+5. **Rest mechanic** (Track 5) **before** firing `OnRest` and **before** the 5eSRD pack's short/long rest (Track 8).
+6. **Directory-tree loader** (Track 8) **before** the 5eSRD / WoWSRD packs.
+7. **Display-width helper** (Track 0 UTF-8 work) **before** `score`'s column framing (Track 1).
+8. **ANSI token markup convention** (Track 1) settled **before / with** presentation capitalization (cap the
+   text, not the `{enemy}` token).
 
-- **Load/locality-aware placement — the pipeline (PARTIAL).** The PLANNER is load-aware (`placement.PlanWeighted`
-  balances by per-zone weight, tested). Remaining: the occupancy SIGNAL pipeline (world → director) that
-  supplies real weights, wiring the plan to DRIVE the drain executor (`BeginDrain`), a weight-proportional
-  `RebalanceThreshold`, locality-aware colocation, and rebalance cooldowns. `internal/placement`, director.
-- **Per-session `who` cooldown (smaller).** The ~1s roster cache is in; a per-session `who` cooldown would
-  further blunt a single spammer.
+---
 
-## 3. Orchestration
+## Track 0 — Regression nets (do first; they de-risk the store + render churn below)
 
-- **[LARGE] Content-defined (Lua) director script (Phase 10.4).** The director's `SignalHandler` is a Go func;
-  the production `cmd/telos-director` wires a NIL handler. A real deployment needs director logic as CONTENT —
-  a sandboxed Lua VM in the director (the same model as a zone) reacting to signal-up + scheduling on the
-  director tick. A whole subsystem.
-- **Durable DOWN state broadcast + snapshot-on-join (Phase 10.4).** The director's state broadcast DOWN is
-  transient; a zone that was down when a flag flipped misses it until the next set, and has no initial
-  snapshot on join. Add a snapshot fetch (read region_state/world_state at zone boot, or a director "sync"
-  reply) and/or a durable down tier.
-- **Director-owned + serialized drain target selection (16.4b).** `BeginDrain` takes an injectable
-  `TargetChooser`; production self-selects a peer. The DS review wants the DIRECTOR (Phase 10.6 leader) to own
-  selection + SERIALIZE simultaneous drains (avoid two shards draining onto one target past its one-core
-  ceiling, and split-brain during a fleet rollout). Wire a director-driven chooser; keep the decentralized one
-  as the standalone/dev fallback.
-
-## 4. Content / itemization
-
-- **[LARGE] Multi-file demo packs — the multi-system acceptance sprint.** A sprint of its own; the real
-  capstone that proves the "engine = mechanism, content = flavor" pillar holds across DIFFERENT game systems.
-  Two parts:
-  - **Directory-tree pack assembly (loader).** Today a pack is a single `internal/content/packs/demo.yaml`.
-    Support a pack as a TREE of small files the loader walks + assembles into one logical pack — e.g.
-    `content/packs/<pack>/common/{attributes,weapons,armor}.yaml`,
-    `content/packs/<pack>/areas/<area>/{rooms,enemies,bosses,vendors}/*.yaml`, and
-    `content/packs/<pack>/areas/<area>/scripts/*.lua`. The assembly must feed the SAME import/`LoadedContent`
-    path (both the embedded-pack loader and the DB seed import). Payoff: a builder edits ONE area/boss/vendor
-    file without touching the rest.
-  - **The three demo packs (content authoring).** (1) Split the current `demo.yaml` into
-    `content/packs/demo/basic/…` (a simple Diku/ROM-flavored pack) as the reference tree. (2) `content/packs/5eSRD`
-    — the CC-BY D&D 5e SRD as pure content (Vancian slots, six abilities → modifiers + proficiency,
-    advantage, class/subclass/background, short/long rest). (3) `content/packs/WoWSRD` — the WoW-d20 skeleton
-    (rage/energy/focus/combo resources, talent trees, cooldown pacing, threat, a raid/loot economy). Each pack
-    must run with ZERO engine changes for flavor — that is the acceptance test. (The gap analysis also names
-    Pathfinder as a third tabletop capstone; a 4th pack if wanted.) Absorbs the former "5e-SRD sample MUD"
-    item. · *content/persistence*
-
-- **[LARGE] Worn-affix stat effect + content-defined wear slots (the itemization pass, Phase 12.3).** Equip is
-  a stub: a worn item confers no bonus (no affect hook), and the wearable slot set is an engine-fixed enum.
-  Wire the gear-modifier seam (a rolled item's affixes register as a `modSource` on wear, unregister on
-  remove) and make the slot vocabulary content-defined (a `wear_slots` table).
-*Burned down (see COMPLETED.md → "Launch-hardening burn-down round 2"): the `heal`/restorative dice+bonus
-form, the formula NaN/±Inf fail-closed guard (found in the heal-dice review), the OnKill kill-magnitude cap
-(`xp_value` + fallback cap — also §8 death-mag), the reserved-affect-event-kinds reconciliation (those hooks
-already fire; only OnRest is dark, pending a rest mechanic), the recipe skill-gate `track` resolution, the
-content-configurable profession cap + uncapped kind, the `rollOpAmount` dedupe (extracted the shared
-`amount + dice + bonus` roll from opDealDamage/opHeal), the `learn_profession.profession` → `kind:profession`
-bundle content-lint (`lintLearnProfessionRefs`, load-time), and the `on_roll(ctx)` Lua loot hatch
-(per-table body → conditional drops through the normal pipeline, fail-closed + capped, OnRoll round-trips
-the loot JSONB body).*
-
-- **[LARGE] Cross-content alias / keyword targeting system (+ discovery listings).** Promoted from the old
-  "generic object-targeted salvage/craft verbs" item once the design intent came clear: a builder should be
-  able to declare SHORT aliases on ANY content object, and the parser resolves a player's partial phrase to
-  it — the same mechanism for items, mobs, recipes, and abilities. E.g. `weapon:heavy_wooden_sword` →
-  "heavy sword"/"wooden sword"/"wood sword"/"sword" (`get sword` / `get wood sword` both work);
-  `enemy:big_scary_skeletal_guard` → "guard"/"skeletal guard"/"skeleton"/"big skeleton" (`attack skeleton`);
-  recipes → `craft <name>` by a builder-declared alias. The pillar is DISCOVERABILITY: it pairs with listing
-  commands (e.g. "what can I craft?") that print exactly the names a player then types. This touches the
-  targeting/`Resolve` layer for ALL content types + the parser + per-content authoring, so it wants a design
-  pass before slices (recipes-first is a reasonable first slice, then generalize to items/mobs). Subsumes the
-  `craft <recipe>` half of the old item. · *mudlib/content/edge*
-- **[LARGE] MMO-style salvaging subsystem (disenchant, 13.4).** Promoted from the old item: `disenchant <item>`
-  is object-targeted (resolve a held item by keyword) + item-TAG gated, and the YIELD works like modern-MMO
-  salvage. Spec: (1) yield DERIVES from the item's rarity TIER + item LEVEL (trash→trash, high-level rare→rare
-  mats, epic→epic mats) via a tier+level → table mapping; (2) a per-item `salvage_table` OVERRIDE beats the
-  derived one; (3) a per-item un-salvageable BLOCK flag refuses the verb (a super-rare-metal item); (4) a
-  salvaging SKILL requirement scaled by the item's level/rarity — below it you can't salvage at all; (5) an
-  OVER-SKILL BONUS (far exceeding the requirement yields bonus materials). Today `salvage_item(item, table)`
-  takes a FIXED source proto + fixed table, no tag gate, no tier/level derivation, no skill gate. Build in
-  board-reviewed slices (object-target + tag gate + per-item override/block first; then derived tables + skill
-  gate + over-skill bonus). · *progression/content*
-- **`on_roll` unknown-ref diagnostic (low priority, found in the on_roll review).** An `on_roll` body that
-  returns a ref which doesn't resolve to a prototype is a silent no-op in `deliverLoot` (`spawn == nil`),
-  consistent with the declarative path — but the ref is opaque Lua, so a typo vanishes with no diagnostic.
-  A debug log (or content-lint) on the on_roll `spawn(ref) == nil` path would surface it. · *progression/observability*
-- **[LARGE] Normalized `affix_defs` table (12.3).** The affix pool is inline in each loot entry's `quality`
-  spec; a shared `affix_defs` content table (named affixes by ref) de-duplicates pools and enables richer
-  legendaries. This is a first-class def table on the scale of the prior `recipe_defs`/`bundle_defs` slices:
-  a new migration (`00018_affix_defs.sql`, the `ref/pack/JSONB body` pattern), an `AffixDefDTO`, loader +
-  `LoadedContent.Affixes` wiring, a per-shard registry, build-time resolution (a `quality` affix entry gains
-  a `ref` alternative to inline `attr/min/max`, resolved against `affix_defs` in `buildLootTableDef`), the
-  store import/export round-trip, tests, and demo usage. **Design fork to settle when built:** first-class
-  table (edit-an-affix-once → propagates on reload; the normalized choice) vs. loader-time EXPANSION (resolve
-  refs into inline pools before storage — small/no-migration, but BAKES the values so a later affix edit
-  doesn't propagate). The first-class table matches the normalization philosophy in
-  [[content-alias-and-salvage-direction]]. · *progression/persistence/content*
-- **Demo spawn/death handler content (12.4).** The director broadcasts `spawn.boss` DOWN; ship demo
-  `on_world("spawn.boss")` + boss-death `signal_world("boss.died")` content to close the live boss-loot loop
-  end to end. (When touching the demo, also add an `uncapped: true` gathering profession so the gated
-  store-round-trip `DeepEqual` covers the new `uncapped` bundle flag — currently blind, only a `true` can drop.)
-- **`OnRest` event kind is dark (needs a rest mechanic).** `OnApplyAffect`/`OnAffectExpire`/`OnAffectTick`
-  now fire (reconciled); `OnRest` is defined but has no fire site because there is no rest command / rest-regen
-  mechanic to fire it from. Lighting it requires BUILDING rest (a `rest`/`sit` verb + resting regen) first, not
-  just wiring a hook. · *abilities/world*
-- **Shared-def hot reload (7.7 scope).** `reload.go buildPrototype` handles only Room/Item/Mob; a `(kind,ref)`
-  invalidation for a SHARED def (ability/affect/formula/`pvp_allowed` policy) is skipped and `z.defs` is
-  boot-immutable — no live edit path to a pvp policy / formula. When a slice swaps `z.defs` at runtime, hook
-  that seam and re-run the pvp permissive→restrictive end-to-end check.
-
-## 5. Player commands / HUD
-
-- **`score` command — the character stat sheet.** A player types `score` (classic `sc`) and sees a framed
-  summary of their character: name + title/epithet, the vital pools (`HP: 150(150)`, `SP: 205(205)` — current
-  (max) per resource), gold/currency, XP as `have/next-level`, carry weight (as a % of capacity), the
-  progression levels (overall `Level`, plus any per-track level like `Guild Level`), and the attribute block
-  (STR/DEX/CON/INT/WIS/CHR — grid-formatted). Everything shown is already engine state (resources, attributes,
-  progression tracks, carry weight, currency); this is a RENDER of it. Design question to settle: the LAYOUT
-  and the SET of rows/attributes are flavor, so the template should be CONTENT-DEFINED (a content-authored
-  score layout referencing resource/attribute/track refs, rendered by the engine) rather than a hardcoded
-  Go sheet — otherwise a 5e vs. WoW pack couldn't show its own stat names/order. Plain-telnet render path;
-  GMCP clients already get the same data structured via `Char.Stats`/`Char.Vitals`. · *mudlib/edge*
-
-- **ANSI color (16-color palette).** Colorize output so it reads like a classic MUD — enemies red, exits
-  cyan, items/gold, damage, channel names, etc. The world emits SEMANTIC color TOKENS (a category, not raw
-  ESC — e.g. an `{enemy}`/`{exit}` markup class, content-nameable per the mechanism/flavor pillar); the GATE
-  renders tokens → ANSI SGR downstream of the control-strip. NOTE the existing seam: `internal/telnet/telnet.go`
-  `Write`/`sanitizeOutput` STRIPS ESC today, with a documented comment that a future ANSI renderer must
-  produce the SGR bytes DOWNSTREAM of (not through) the control-strip, or the strip must whitelist well-formed
-  SGR — so the world never ships raw ESC (injection-safe). Include a per-player `color on/off` toggle (the
-  conventional MUD control; a client that can't do ANSI gets plain text), and a small default token→color map
-  (enemy/exit/item/damage/heal/channel/system). GMCP clients already get structured data; this is the plain-
-  telnet render path. · *edge/mudlib*
-
-- **Coalesce identical items in listings (`A torch. (5)`).** In the room-contents render (`lookRoom`),
-  inventory (`inventory`/`i`), and container listings (`look <corpse>`, get-from), group identical items onto
-  ONE line with a `(N)` count instead of repeating the line N times. This is DISPLAY-time grouping of discrete
-  entities — distinct from the Phase-13.2 `Stack` component (true stackable materials, which already carry a
-  count). Grouping key: same rendered short name AND no distinguishing per-instance state (don't merge a
-  bound/quality-affixed/differently-worn item with a plain one — group by prototype + equal delta, or fall
-  back to identical short). Keep single items uncounted (`A torch.`). Mirror the count in GMCP
-  `Char.Items.List` (a count field) so rich clients group too, and keep it consistent with how the `Stack`
-  materials render their count. · *edge/mudlib*
-
-- **Presentation capitalization.** Capitalize for readability: (1) at the START of a line/sentence, an item
-  short or a message beginning with a lowercase article renders capitalized — `a torch` → `A torch.` on a
-  room-contents/inventory line, `a goblin arrives.` → `A goblin arrives.` — while the SAME short stays
-  lowercase mid-sentence (`You get a torch.`); (2) character/proper names always render capitalized. The
-  natural seam is the render layer: `act()` (`internal/world/act.go`) for perspective messages (the classic
-  Diku initial-cap-the-leading-token rule) and `lookRoom` / item-listing lines. Content authors still write
-  shorts lowercase (`a torch`); the engine capitalizes at presentation, not in the data. · *edge/mudlib*
-
-- **vitals enable/disable + live on-change vitals.** A player-toggleable on-CHANGE emitter hooked at
-  `setResourceCurrent` (where every vital change funnels), driving both the text prompt and GMCP Char.Vitals
-  — so a combat round's HP drain updates a plain client's prompt and a rich client's gauge live (subsumes the
-  9.2 combat-tick-HUD follow-up). A `vitals enable`/`disable` verb stores the preference.
-- **[LARGE] Builder-defined `help` system.** A browsable `help` / `help <topic>` command backed by a
-  `help_defs` content table (topic ref, title, body, category, "see also"), auto-including the registered
-  command set. Ties to the docs project.
-- **Inventory shows equipment; can't drop equipped; `keep`/`unkeep`.** (1) `inventory` folds in the worn
-  items (flagged); (2) `drop` REFUSES an equipped item (require explicit `remove` first); (3) a
-  `keep`/`unkeep` per-item no-drop flag that rides the carry + durable save (important once carried items
-  grant abilities).
-- **Mobs/occupants in the room over GMCP.** Add `Room.Players` (+ a mob/occupant list), emitted from lookRoom
-  alongside Room.Info, change-detected, routed through the canSee/nameFor chokepoint.
-- **Builder-extensible GMCP hooks.** Let content/Lua emit custom GMCP (the `Mud.*` namespace) via a sandboxed
-  `gmcp.send(player, pkg, table)` handle, routed through the outbound support filter + `validGMCPPackage`
-  guard, with a namespace allowlist so content can't spoof `Char.*`/`Core.*`.
-- **GMCP Char.Items incremental deltas + `Char.Items.Contents`.** Char.Items.List is a full list re-sent on
-  change; add `Char.Items.Add/Remove/Update` deltas + a container-contents payload + live room-item updates.
-- **GMCP Comm.Channel raw text + `Comm.Channel.List/Players`.** Carry the raw message body (not just the
-  rendered line) as a Message field so a client can route to a per-channel tab; emit the channel list/players.
-- **GMCP Char.Stats gauge/stat flags + Char.Vitals gauge filter.** Emit only content-flagged resources
-  (`gauge`/`hud` bool) and attributes (`stat` bool) so internal pools don't leak into the HUD.
-- **GMCP Char.Status target visibility.** `charStatusJSON` emits the opponent's short bypassing the
-  act/canSee filter; route it through `nameFor`/canSee once invis/disguise content lands.
-- **"Comms unavailable" player notice.** When the comms bus is wholly down, a player sees no channels/tells
-  and no notice; expose a `Bus.Available()` probe and emit a one-line notice after login.
-- **Channel HEAR vs SPEAK access split.** `channelDef.canHear` delegates to the same predicate as `canSpeak`;
-  split them for "announce" channels (anyone hears, only admins speak).
-
-## 6. [LARGE] Builder / wizard trust tier
-
-A privilege layer above player — its own project (much like documentation).
-
-- **See-all visibility (holylight).** A builder always sees an `invisible`/hidden/dark/wizinvis entity — the
-  elevated end of the `canSee`/`nameFor` chokepoint the visibility flags will introduce (the
-  `phase5-visibility` TODO in `commands.go lookRoom`). This also finally provides the **`who` visibility
-  filter** (hidden players filtered at the render boundary).
-- **Object inspection (`stat`/vnum).** A builder examining a thing sees instance + prototype identity +
-  internal state a player never does (an inspect/`stat`-style command).
-- **Runtime-tweakable per-builder toggles.** Show/hide my own dice rolls, holylight on/off, wizinvis level,
-  verbose debug echoes — flipped live, scoped to that session.
-
-## 7. Observability / tests
-
-- **Bus deliver-lag metric wiring (16.1/16.2).** `metrics.RecordBusLag` + `telos.bus.deliver_lag_ms` exist but
-  have no call site: scoped-bus envelopes carry no publish timestamp. When the envelope next changes, stamp
-  publish time and record (publish→deliver) at the deliver path.
-- **Drain reclaim metrics + clean-disconnect (16.4b).** A straggler at the BeginDrain deadline is flushed +
-  dropped on exit; emit OTel `drain_redirected`/`drain_reclaimed` counters (infra-fault vs client-fault) and
-  send a "server restarting, reconnect" disconnect to stragglers.
-- **Slow-client observability + backstop (16.3 review).** (1) Reframe the per-player "wedged" Warn off a
-  windowed drop-RATE (the `consecutiveDrops` signal only catches a fully-stalled client). (2) Add a
-  world-side `stream.Recv` idle deadline / max-blocked-`Send` bound so reclaim doesn't DEPEND on gate
-  correctness (defends the in-trust-domain direct-shard path).
-- **UTF-8 rendering tests (multibyte-clean edge path).** UTF-8 should already pass through end-to-end, but
-  there's no explicit coverage. Add tests asserting multibyte content (`Hello, 世界`, emoji, combining marks,
-  RTL) survives the full edge render path intact — through `Write`/`sanitizeOutput` (the ESC control-strip must
-  NOT corrupt or split multibyte sequences), `act()` perspective messaging, `lookRoom`/item shorts, GMCP JSON
-  payloads, and mail/tell bodies. Also pin behavior at boundaries: never split a rune across a chunk/flush,
-  and confirm any width-based framing (e.g. the future `score` sheet / column layout) measures DISPLAY width,
-  not byte length. If a gap turns up, fix it; the deliverable is the regression tests either way. · *edge/tests*
 - **Reflect-walk DTO round-trip test.** Assert EVERY store DTO field round-trips (a reflect-walk over a fully
-  populated synthetic pack), so a new field can't be silently dropped on the store path.
-- **Comms chaos test doubles.** (1) Pin the MemJetStream park-at-`maxDeliver` divergence from real NATS
-  (a "fails past maxDeliver → parks" test) + confirm prod AckWait/redelivery config. (2) An AFK-auto-reply
-  best-effort-failure chaos test. (3) A subscribe-side / delivery-drop double (flakyBus only models a publish
-  outage).
-- **Combat reproducibility.** Production combat draws from the process-global `math/rand`
-  (`internal/world/combat.go`), so a live fight isn't seedable/replayable. Thread a per-zone/per-fight seeded
-  RNG through the resolver.
+  populated synthetic pack), so a new field can't be silently dropped on the store path. **Payoff:** auto-covers
+  every later store-field addition (`affix_defs`, `wear_slots` table, `help_defs`, a per-item `salvage_table`,
+  a stored `score` layout) — do it before those so each rides the net instead of a bespoke round-trip test. · *tests/persistence*
+- **UTF-8 rendering tests + a display-width helper.** Assert multibyte content (`Hello, 世界`, emoji, combining
+  marks, RTL) survives the full edge render path — `Write`/`sanitizeOutput` (the ESC control-strip must not
+  corrupt/split multibyte), `act()`, `lookRoom`/item shorts, GMCP JSON, mail/tell bodies — and never split a
+  rune across a chunk/flush. Establish a DISPLAY-width measure (not byte length) here; it's the helper `score`'s
+  column framing and any ANSI-aware framing must use. Fix any gap found; the deliverable is the regression tests
+  either way. **Prereq for:** Track 1 `score` framing + ANSI ESC-strip safety. · *edge/tests*
+
+## Track 1 — Plain-telnet render path  ·  seam: `act()` / `lookRoom` / item-listing / `sanitizeOutput`
+
+*Why clustered:* all four edit the same render functions and the ESC/width seam; sequencing avoids re-touching.
+
+- **ANSI color (16-color palette) — settle the token markup first.** The world emits SEMANTIC color TOKENS (a
+  category, not raw ESC — an `{enemy}`/`{exit}` markup class, content-nameable); the GATE renders tokens → ANSI
+  SGR DOWNSTREAM of the control-strip (`internal/telnet/telnet.go` `Write`/`sanitizeOutput` STRIPS ESC today —
+  the renderer must produce SGR downstream of, not through, the strip, or the strip must whitelist well-formed
+  SGR, so the world never ships raw ESC). Per-player `color on/off` toggle; a default token→color map
+  (enemy/exit/item/damage/heal/channel/system). **Do the markup convention before capitalization** so cap logic
+  targets the text, not the token. · *edge/mudlib*
+- **Presentation capitalization.** (1) At the START of a line/sentence, a lowercase-article short/message renders
+  capitalized (`a torch` → `A torch.`, `a goblin arrives.` → `A goblin arrives.`) while the SAME short stays
+  lowercase mid-sentence (`You get a torch.`); (2) proper names always capitalized. Seam: `act()` (the Diku
+  initial-cap-the-leading-token rule) + `lookRoom`/item-listing lines. Authors still write shorts lowercase.
+  **Prereq:** ANSI token markup (cap the text inside a leading `{token}`, not the marker). · *edge/mudlib*
+- **Coalesce identical items in listings (`A torch. (5)`).** Group identical discrete items onto one line with a
+  `(N)` count in `lookRoom`, inventory, and container listings — distinct from the Phase-13.2 `Stack` component.
+  Grouping key: same rendered short AND no distinguishing per-instance state (group by prototype + equal delta,
+  else identical short); single items uncounted. **Mirror the count in GMCP `Char.Items.List`** — coordinate
+  with Track 7 (do it with, or after, the Char.Items delta restructure so the count field isn't re-placed). · *edge/mudlib*
+- **`score` command — the character stat sheet.** `score`/`sc` → a framed summary: name + title, vital pools
+  (`HP: 150(150)` current(max) per resource), currency, XP `have/next-level`, carry weight %, progression levels
+  (overall + per-track), the attribute grid. All already engine state — this is a RENDER. **Design fork:** the
+  LAYOUT + row/attribute SET are flavor, so the template should be CONTENT-DEFINED (a content score layout
+  referencing resource/attribute/track refs, engine-rendered) not a hardcoded Go sheet — else a 5e vs WoW pack
+  can't show its own stat names/order. **Prereq:** the Track 0 display-width helper (column framing). GMCP clients
+  already get this via `Char.Stats`/`Char.Vitals`. · *mudlib/edge*
+
+## Track 2 — Visibility & the `canSee`/`nameFor` chokepoint  ·  [LARGE] foundation + its consumers
+
+*Why clustered:* the GMCP visibility-consumers explicitly wait on the visibility system — build the chokepoint first.
+
+- **[LARGE] Builder / wizard trust tier** — a privilege layer above player, its own project (much like docs).
+  - **See-all visibility (holylight) + the visibility flags.** A builder always sees an
+    `invisible`/hidden/dark/wizinvis entity — the elevated end of the `canSee`/`nameFor` chokepoint the
+    visibility flags introduce (`phase5-visibility` TODO in `commands.go lookRoom`). This is the FOUNDATION the
+    consumers below need; it also delivers the **`who` visibility filter** (hidden players filtered at the render
+    boundary). · *mudlib/edge*
+  - **Object inspection (`stat`/vnum).** A builder examining a thing sees instance + prototype identity +
+    internal state a player never does.
+  - **Runtime-tweakable per-builder toggles.** Show/hide own dice rolls, holylight on/off, wizinvis level,
+    verbose debug echoes — flipped live, session-scoped.
+- **GMCP `Char.Status` target visibility.** `charStatusJSON` emits the opponent's short bypassing act/canSee;
+  route it through `nameFor`/canSee. **Prereq:** the visibility flags above (constraint 1). · *edge*
+- **Mobs/occupants in the room over GMCP (`Room.Players`).** Add `Room.Players` (+ a mob/occupant list) from
+  `lookRoom` alongside Room.Info, change-detected, **routed through the canSee/nameFor chokepoint**. **Prereq:**
+  visibility flags (else you route through a stub and rework). · *edge/mudlib*
+
+## Track 3 — Naming, targeting & discovery  ·  seam: `Resolve`/parser + content aliases
+
+*Why first in its chain:* unify resolution before the consumers (Track 4 salvaging, `craft <name>`) so they
+don't each hand-roll keyword parsing that the alias system then supersedes.
+
+- **[LARGE] Cross-content alias / keyword targeting system (+ discovery listings).** A builder declares SHORT
+  aliases on ANY content object; the parser resolves a player's partial phrase to it — one mechanism for items,
+  mobs, recipes, abilities. E.g. `weapon:heavy_wooden_sword` → "heavy sword"/"wood sword"/"sword";
+  `enemy:big_scary_skeletal_guard` → "guard"/"skeleton"/"big skeleton"; recipes → `craft <name>`. Pillar is
+  DISCOVERABILITY: pairs with listing commands ("what can I craft?") that print exactly the names a player then
+  types. Touches the `Resolve` layer for ALL content types + the parser + per-content authoring → a design pass
+  before slices (recipes-first, then generalize to items/mobs). Subsumes the `craft <recipe>` need. See
+  [[content-alias-and-salvage-direction]]. · *mudlib/content/edge*
+
+## Track 4 — Itemization & gear  ·  seam: equip/wear, gear-modifier `modSource`, affix data
+
+*Why this order:* `wear_slots` content-defined + the `modSource`-on-wear seam are the foundation the render and
+salvaging items build on; `affix_defs` and worn-affix both touch the affix data model.
+
+- **[LARGE] Worn-affix stat effect + content-defined wear slots (Phase 12.3).** Equip is a stub: a worn item
+  confers no bonus (no affect hook) and the wearable slot set is an engine-fixed enum. Wire the gear-modifier
+  seam (a rolled item's affixes register as a `modSource` on wear, unregister on remove) and make the slot
+  vocabulary content-defined (a `wear_slots` table). **Foundation for:** inventory-by-slot render (below) +
+  making gear matter (Track 8 packs lean on it). · *mudlib/progression*
+- **Inventory shows equipment; can't drop equipped; `keep`/`unkeep`.** (1) `inventory` folds in worn items
+  (flagged, by slot); (2) `drop` REFUSES an equipped item (require explicit `remove`); (3) a `keep`/`unkeep`
+  per-item no-drop flag riding the carry + durable save. **Prereq:** `wear_slots` content-defined (constraint 2)
+  for the by-slot render; the drop-refusal + keep/unkeep are independent and can land earlier. · *mudlib/edge*
+- **[LARGE] Normalized `affix_defs` table (Phase 12.3).** A shared `affix_defs` content table (named affixes by
+  ref) de-duplicates the pools inline in each loot entry's `quality` spec and enables richer legendaries. A
+  first-class def table on the scale of `recipe_defs`/`bundle_defs`: migration (`00018_affix_defs.sql`, the
+  `ref/pack/JSONB body` pattern), an `AffixDefDTO`, loader + `LoadedContent.Affixes`, a per-shard registry,
+  build-time resolution (a `quality` affix entry gains a `ref` alternative to inline `attr/min/max`, resolved in
+  `buildLootTableDef`), the store round-trip, tests, demo usage. **Design fork:** first-class table (edit-once →
+  propagates on reload; the normalized choice) vs. loader-time EXPANSION (resolve refs into inline pools before
+  storage — small/no-migration but BAKES values). The first-class table matches
+  [[content-alias-and-salvage-direction]]. **Rides the Track 0 reflect-walk net.** · *progression/persistence/content*
+- **[LARGE] MMO-style salvaging subsystem (disenchant, 13.4).** `disenchant <item>` object-targeted (resolve a
+  held item by keyword) + item-TAG gated; the YIELD like modern-MMO salvage: (1) DERIVES from rarity TIER +
+  item LEVEL via a tier+level→table map; (2) a per-item `salvage_table` OVERRIDE; (3) a per-item un-salvageable
+  BLOCK flag; (4) a salvaging SKILL requirement scaled by item level/rarity; (5) an OVER-SKILL BONUS. Today
+  `salvage_item(item, table)` takes a FIXED source proto + fixed table, no tag gate/derivation/skill. Slices:
+  object-target + tag gate + per-item override/block first, then derived tables + skill gate + over-skill bonus.
+  **Prereq:** Track 3 resolver for clean object-targeting; the per-item `salvage_table` field rides the Track 0
+  net. See [[content-alias-and-salvage-direction]]. · *progression/content*
+- **`on_roll` unknown-ref diagnostic (low priority).** An `on_roll` body returning a ref that doesn't resolve to
+  a prototype is a silent `deliverLoot` no-op (`spawn == nil`) — consistent with the declarative path, but the
+  ref is opaque Lua so a typo vanishes. A debug log (or content-lint) on the `spawn(ref) == nil` path. Independent
+  of the rest of this track. · *progression/observability*
+
+## Track 5 — Rest & regen  ·  seam: `setResourceCurrent`/regen + `OnRest`
+
+- **Rest mechanic → light `OnRest`.** `OnApplyAffect`/`OnAffectExpire`/`OnAffectTick` now fire; `OnRest` is
+  defined but has no fire site because there's no rest command / rest-regen. Build rest (a `rest`/`sit` verb +
+  resting regen), THEN fire `OnRest`. **Prereq for:** the 5eSRD pack's short/long rest (Track 8, constraint 5). · *abilities/world*
+- **vitals enable/disable + live on-change vitals.** A player-toggleable on-CHANGE emitter hooked at
+  `setResourceCurrent` (where every vital change funnels), driving both the text prompt and GMCP Char.Vitals —
+  so a combat round's HP drain updates a plain prompt and a rich gauge live (subsumes the 9.2 combat-tick-HUD
+  follow-up). A `vitals enable`/`disable` verb stores the preference. **Same funnel as resting regen** — do with
+  or after the rest mechanic. · *edge/mudlib*
+
+## Track 6 — Director, scale & drain  ·  seam: `BeginDrain` + director + scoped-bus envelope
+
+*Why this order:* settle drain OWNERSHIP before placement DRIVES it; piggyback the bus-lag stamp on the envelope
+change; the Lua director script is the big substrate the smaller Go handlers could later move into — last.
+
+- **Director-owned + serialized drain target selection (16.4b).** `BeginDrain` takes an injectable
+  `TargetChooser`; production self-selects a peer. Make the DIRECTOR (Phase 10.6 leader) own selection +
+  SERIALIZE simultaneous drains (avoid two shards draining onto one target past its one-core ceiling, and
+  split-brain during a fleet rollout); keep the decentralized chooser as the standalone/dev fallback. **Settle
+  before** placement drives drain (constraint 4). · *orchestration*
+- **Load/locality-aware placement — the pipeline (PARTIAL).** The PLANNER is load-aware
+  (`placement.PlanWeighted`, tested). Remaining: the occupancy SIGNAL pipeline (world → director) supplying real
+  weights, wiring the plan to DRIVE `BeginDrain`, a weight-proportional `RebalanceThreshold`, locality-aware
+  colocation, and rebalance cooldowns. `internal/placement`, director. · *orchestration/scale*
+- **Drain reclaim metrics + clean-disconnect (16.4b).** A straggler at the `BeginDrain` deadline is flushed +
+  dropped; emit OTel `drain_redirected`/`drain_reclaimed` counters (infra- vs client-fault) and send a "server
+  restarting, reconnect" disconnect to stragglers. Same `BeginDrain` seam as above. · *observability*
+- **Durable DOWN state broadcast + snapshot-on-join (Phase 10.4)  [+ piggyback bus deliver-lag].** The director's
+  state broadcast DOWN is transient; a zone down when a flag flipped misses it and has no snapshot on join. Add a
+  snapshot fetch (read region_state/world_state at boot, or a director "sync" reply) and/or a durable down tier.
+  **Piggyback:** this touches the scoped-bus envelope — stamp publish time and record `metrics.RecordBusLag`
+  (`telos.bus.deliver_lag_ms`, which today has no call site) at the deliver path while the envelope is open. · *orchestration/observability*
+- **Mail dead-letter reap (background job).** A PERIODIC reaper for undeliverable/orphaned mail (rows to a name
+  that never logs in) — a director-owned scheduler tick like the weekly spawn scheduler. `internal/store/mail.go`.
+  Uses the director scheduler infra this track exercises. · *persistence/orchestration*
+- **Slow-client observability + backstop (16.3).** (1) Reframe the per-player "wedged" Warn off a windowed
+  drop-RATE (`consecutiveDrops` only catches a fully-stalled client). (2) A world-side `stream.Recv` idle
+  deadline / max-blocked-`Send` bound so reclaim doesn't DEPEND on gate correctness. Reliability; loosely here. · *edge/observability*
+- **[LARGE] Content-defined (Lua) director script (Phase 10.4).** The director's `SignalHandler` is a Go func;
+  `cmd/telos-director` wires NIL. A real deployment needs director logic as CONTENT — a sandboxed Lua VM in the
+  director (the zone model) reacting to signal-up + scheduling on the director tick. The substrate the drain
+  chooser / mail reaper / placement-signal logic could later move into — build those as Go first, this last. · *orchestration*
+
+## Track 7 — GMCP enrichment  ·  seam: GMCP outbound path
+
+*Cross-links:* `Char.Status` visibility + `Room.Players` live in Track 2 (they gate on visibility);
+`Char.Items` count from coalescing lives in Track 1 — do the delta restructure below aware of it.
+
+- **GMCP Char.Items incremental deltas + `Char.Items.Contents`.** Char.Items.List is a full re-send on change;
+  add `Char.Items.Add/Remove/Update` deltas + a container-contents payload + live room-item updates. **Coordinate
+  with Track 1 coalescing** (the `(N)` count field) so the count lands in the delta shape, not the old full-list. · *edge*
+- **GMCP Comm.Channel raw text + `Comm.Channel.List/Players`.** Carry the raw message body (not just the rendered
+  line) as a Message field so a client can tab per channel; emit the channel list/players. · *edge*
+- **GMCP Char.Stats gauge/stat flags + Char.Vitals gauge filter.** Emit only content-flagged resources
+  (`gauge`/`hud` bool) and attributes (`stat` bool) so internal pools don't leak into the HUD. Pairs with the
+  `score` content-layout (both decide "what's player-visible"). · *edge/content*
+- **Builder-extensible GMCP hooks.** Let content/Lua emit custom GMCP (`Mud.*`) via a sandboxed
+  `gmcp.send(player, pkg, table)` handle, routed through the outbound support filter + `validGMCPPackage` guard,
+  with a namespace allowlist so content can't spoof `Char.*`/`Core.*`. Scripting-surface addition. · *edge/scripting*
+
+## Track 8 — Content packs capstone  ·  seam: the loader + everything downstream
+
+*Why last:* the packs are the ACCEPTANCE TEST — they exercise worn-affix + salvaging (Track 4), aliases
+(Track 3), and rest (Track 5). The directory-tree loader precedes the packs (constraint 6).
+
+- **[LARGE] Multi-file demo packs — the multi-system acceptance sprint.** Two parts:
+  - **Directory-tree pack assembly (loader) [FIRST].** Support a pack as a TREE of small files the loader walks +
+    assembles into one logical pack (`content/packs/<pack>/common/*.yaml`,
+    `.../areas/<area>/{rooms,enemies,bosses,vendors}/*.yaml`, `.../scripts/*.lua`), feeding the SAME
+    import/`LoadedContent` path (embedded + DB seed). Payoff: edit ONE area/boss file without touching the rest.
+  - **The three packs (content authoring) [after the engine features they showcase].** (1) Split `demo.yaml`
+    into `content/packs/demo/basic/…` (Diku/ROM reference tree). (2) `content/packs/5eSRD` — the CC-BY 5e SRD as
+    pure content (Vancian slots, six abilities → modifiers + proficiency, advantage, class/subclass/background,
+    **short/long rest — needs Track 5**). (3) `content/packs/WoWSRD` — the WoW-d20 skeleton (rage/energy/focus/
+    combo, talent trees, cooldown pacing, threat, raid/loot economy). ZERO engine changes for flavor is the
+    acceptance test. (Pathfinder = optional 4th.) · *content/persistence*
+- **Demo spawn/death handler content (12.4) — near-term, independent of the loader tree.** Ship demo
+  `on_world("spawn.boss")` + boss-death `signal_world("boss.died")` content (the hooks + `mud.spawn` exist) to
+  close the live boss-loot loop end to end. **When touching the demo, add an `uncapped: true` gathering
+  profession** so the GATED store-round-trip `DeepEqual` covers the `uncapped` bundle flag (currently blind —
+  only a `true` can drop it). Can land anytime; naturally rides whatever demo work is active. · *content/orchestration*
+
+## Track 9 — Hot reload & determinism infra  ·  seam: `reload.go`, `combat.go`
+
+- **Shared-def hot reload (7.7).** `reload.go buildPrototype` handles only Room/Item/Mob; a `(kind,ref)`
+  invalidation for a SHARED def (ability/affect/formula/`pvp_allowed` policy) is skipped and `z.defs` is
+  boot-immutable — no live edit path to a pvp policy / formula. When a slice swaps `z.defs` at runtime, hook that
+  seam and re-run the pvp permissive→restrictive end-to-end check. · *world/persistence*
 - **`reloadLua` chunk-cache invalidation is a substring match (perf, minor).** `reload.go` uses
-  `strings.Contains(key, ref)`, over-invalidating; tighten with a keyed `ref → {chunk keys}` index if the
-  chunk cache grows large.
+  `strings.Contains(key, ref)`, over-invalidating; tighten with a keyed `ref → {chunk keys}` index if the chunk
+  cache grows large. Same file as above — batch them. · *scripting/perf*
+- **Combat reproducibility.** Production combat draws from the process-global `math/rand` (`combat.go`), so a
+  live fight isn't seedable/replayable. Thread a per-zone/per-fight seeded RNG through the resolver. · *world/tests*
 
-## 8. Housekeeping / deferred features
+## Track 10 — Comms & channels  ·  mostly independent
 
-- **`ClearPlayer` directory cleanup on logout.** Reconnect routing falls back to the home-zone shard, correct
-  only while `ClearPlayer` is deferred (`cmd/telos-gate/main.go`). Revisit when it lands.
-- **Cross-respawn op-list guard.** `runOps` (death seam) should skip remaining same-op-list ops on a target
-  that died+respawned mid-list; build it WITH the respawn-sickness slice.
-- **Multi-vital support.** `vitalResource` collapses all `vital: true` resources to the single lowest-ref one;
-  generalize damage/death/respawn across vitals if/when a 2nd vital pool is authored.
-- **Instanced zones (party dungeons).** Multiple runtime instances of a zone on the Phase-10.6 dynamic-
-  placement substrate: the director mints/reaps instances and routes a party to its own copy. A world/content
-  feature for a later content phase; the placement coordinator + scoped bus are the substrate.
-- **The 5e-SRD / multi-system acceptance packs** are now folded into the "[LARGE] Multi-file demo packs"
-  item in §4 (basic + 5eSRD + WoWSRD). The game-systems gap analysis (archived in COMPLETED.md) stays the
-  design reference for them.
-*Burned down (see COMPLETED.md → "Launch-hardening burn-down round 2"): the two flaky gate tests
-(`TestSessionLockTakeoverKicksDisplacedConnection`, `TestChannelLineRendersVerbatimNoTellPrefix`), the
-orphaned `account_auth`/`ssh_keys` drop migration (00017), and the stale `internal/web/oauth.go` header.*
+- **Channel HEAR vs SPEAK access split.** `channelDef.canHear` delegates to the same predicate as `canSpeak`;
+  split them for "announce" channels (anyone hears, only admins speak). · *comms*
+- **"Comms unavailable" player notice.** When the comms bus is wholly down a player sees no channels/tells and no
+  notice; expose a `Bus.Available()` probe and emit a one-line notice after login. · *comms/edge*
+- **Comms chaos test doubles.** (1) Pin the MemJetStream park-at-`maxDeliver` divergence from real NATS + confirm
+  prod AckWait/redelivery config. (2) An AFK-auto-reply best-effort-failure chaos test. (3) A subscribe-side /
+  delivery-drop double (flakyBus only models a publish outage). · *tests*
+- **`config.<player>` comms subject under future NATS authz (BLOCKED, note only).** When subject-level NATS authz
+  lands, put `telos.comms.config.*` under world-publish-only alongside `chan`/`tell`. Nothing to build until NATS
+  subject authz ships. · *security/comms*
 
-- **Stale Phase-14 docstrings sweep (comment-only).** Beyond oauth.go (done), several headers still describe
-  removed passphrase/SSH-login functionality: `internal/account/service.go:4`, `internal/store/account.go:17`,
-  `cmd/telos-account/main.go:3`, `internal/gate/gate.go:3/182/226`, `internal/config/config.go:25`. Correct
-  them to the OAuth-only state (found during the 00017 review). Low-risk cleanup; touches account/gate/config.
+## Standalone [LARGE]
+
+- **[LARGE] Builder-defined `help` system.** A browsable `help` / `help <topic>` backed by a `help_defs` content
+  table (topic ref, title, body, category, "see also"), auto-including the registered command set. Ties to the
+  docs/wiki project; largely self-contained (rides the Track 0 reflect-walk net for its DTO). · *mudlib/docs*
+
+## Independent / anytime (no seam entanglement)
+
+- **Per-session `who` cooldown (smaller).** The ~1s roster cache is in; a per-session cooldown further blunts a
+  single spammer. · *scale*
+- **Stale Phase-14 docstrings sweep (comment-only).** Several headers still describe removed passphrase/SSH-login:
+  `internal/account/service.go:4`, `internal/store/account.go:17`, `cmd/telos-account/main.go:3`,
+  `internal/gate/gate.go:3/182/226`, `internal/config/config.go:25`. Correct to the OAuth-only state. · *cleanup*
 - **Builder-guide note: top-level `state.x = …` re-runs on hot reload.** A reloaded script's non-handler body
   re-executes against the PRESERVED `self.state`, so `state.x = 0` clobbers a live value; idiomatic content
-  guards it (`state.x = state.x or 0`). The PERSISTENCE.md note is added; this remains for the builder guide
-  (the docs/wiki project).
-- **Delete merged local branches as work lands.**
+  guards it (`state.x = state.x or 0`). PERSISTENCE.md note added; this remains for the builder guide. · *docs*
+- **Delete merged local branches as work lands.** · *hygiene*
+
+## Blocked / deferred (waiting on another slice — don't start cold)
+
+- **Cross-respawn op-list guard.** `runOps` (death seam) should skip remaining same-op-list ops on a target that
+  died+respawned mid-list; build it WITH the respawn-sickness slice. · *world*
+- **`ClearPlayer` directory cleanup on logout.** Reconnect routing falls back to the home-zone shard, correct
+  only while `ClearPlayer` is deferred (`cmd/telos-gate/main.go`). Revisit when it lands. · *edge*
+- **Multi-vital support.** `vitalResource` collapses all `vital: true` resources to the single lowest-ref one;
+  generalize damage/death/respawn across vitals if/when a 2nd vital pool is authored. · *world*
+- **Instanced zones (party dungeons).** Multiple runtime instances of a zone on the Phase-10.6 dynamic-placement
+  substrate: the director mints/reaps instances and routes a party to its own copy. A later content phase; the
+  placement coordinator + scoped bus are the substrate. · *orchestration/content*
+
+---
+
+## Recently burned down (context)
+
+*Launch-hardening rounds 1–2 (COMPLETED.md → "Launch-hardening burn-down round 2"):* handoff snapshot Ed25519
+auth, corpse-owner PersistID keying, mail evict-oldest-READ sweep, `__Host-` broker cookie, mid-session
+hear-access republish, durable `characters.state` byte cap; the `heal`/restorative dice+bonus form, the formula
+NaN/±Inf fail-closed guard, the OnKill kill-magnitude cap (`xp_value` + fallback), the reserved-affect-event-kinds
+reconciliation, the recipe skill-gate `track` resolution, the content-configurable profession cap + uncapped
+kind; the two flaky gate tests, the orphaned `account_auth`/`ssh_keys` drop migration (00017), the stale
+`oauth.go` header.
+
+*Round 3 (2026-07-01):* the `rollOpAmount` dedupe (shared `amount + dice + bonus` roll extracted from
+opDealDamage/opHeal); the `learn_profession.profession` → `kind:profession` content-lint (`lintLearnProfessionRefs`,
+load-time, walks every registered op-list incl. `on_depleted`/`tickOps`); the `on_roll(ctx)` Lua loot hatch
+(per-table body → conditional drops through the normal pipeline, fail-closed + breaker-scoped + capped, `OnRoll`
+round-trips the loot JSONB body).
