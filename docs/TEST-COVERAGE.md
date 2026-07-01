@@ -237,7 +237,7 @@ All ten waves' high-value coverage landed. Highlights and the THREE real bugs th
 🐛 **Also W6-adjacent:** the richer demo content surfaced a real persistence bug — the store dropped a
 prototype's Lua through the Postgres `protoBody` JSONB (the same class as the earlier dropped `Living`).
 
-Remaining work is incremental and tracked in docs/FOLLOW-UPS.md (the comms-chaos deepenings —
+Remaining work is incremental and tracked in docs/REMAINING.md (the comms-chaos deepenings —
 MemJetStream park-at-maxDeliver vs NATS, the subscribe-side partition double, the AFK best-effort path —
 plus the per-file coverage-% long tail). The 3-tier CI is in place: per-commit hermetic + gated
 (Postgres `integration`, NATS `comms`), and the `nightly` workflow (active fuzz + deep soak).

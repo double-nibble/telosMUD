@@ -67,7 +67,7 @@ content-defined affect — all without engine code changes.
 ### Phase 6 — Combat (+ the check primitive, the event bus, AoE & room affects) ✅
 **Status: complete (slices 6.1–6.5).** Round-based resolution on top of the substrate — and the phase
 that builds the load-bearing primitives combat is assembled *from*. ([COMBAT.md](COMBAT.md),
-[PHASE6-PLAN.md](PHASE6-PLAN.md), [GAME-SYSTEMS-GAP-ANALYSIS.md](GAME-SYSTEMS-GAP-ANALYSIS.md))
+[PHASE6-PLAN.md](COMPLETED.md#phase-6), [GAME-SYSTEMS-GAP-ANALYSIS.md](GAME-SYSTEMS-GAP-ANALYSIS.md))
 
 Foundational primitives (built *with/before* the fight loop — to-hit and saves *are* these):
 - **The check/save/contested primitive** [G2] — a `check` flow op beside `if`/`chance`: a
@@ -149,7 +149,7 @@ Rich-client data. ([GMCP.md](GMCP.md)) (`Room.Info` can be pulled forward to Pha
 ### Phase 10 — Orchestration (directors, scopes, event bus) ✅
 Supra-zone state and cross-zone consequences. ([WORLD-EVENTS.md](WORLD-EVENTS.md))
 > Done. Dynamic-placement core landed (claim-from-pool + the coordinator's decision engine); the live
-> rebalance-drain executor + runtime zone-add are documented follow-ups (FOLLOW-UPS.md §6).
+> rebalance-drain executor + runtime zone-add are documented follow-ups (REMAINING.md).
 - `telos-director` tier with leader election; region/world state (single-writer).
 - **Cross-zone** scoped event bus: `transient` (NATS core) + `durable` (JetStream, idempotent,
   ordered) — extends the Phase 6 *in-zone, synchronous* bus to region/world scopes across shards.
@@ -186,7 +186,7 @@ track), trains a skill through use on another, and the build survives a restart 
 ### Phase 12 — Loot & scheduled spawns ✅
 > Done (12.1–12.4 + capstone). Loot resolver + pity + per-instance quality + director-owned weekly
 > spawns. Deferred: a worn affix's stat effect (the gear-modifier seam), an `on_roll` Lua hatch, a
-> normalized `affix_defs` table, per-mob xp-value cap (see FOLLOW-UPS.md).
+> normalized `affix_defs` table, per-mob xp-value cap (see REMAINING.md).
 ([LOOT-AND-SPAWNS.md](LOOT-AND-SPAWNS.md))
 - Loot resolver on death: roll kinds, rarity tiers, personal loot, pity counters.
 - Item quality/affix rolls into instance deltas (coarse v1; deep affixes deferred).
@@ -200,7 +200,7 @@ timer.
 > track + a membership set, no new def table), salvage/disenchant (tier-bound components, owner may
 > deconstruct bound gear), `recipe_defs` (station = a room flag) + the §9 material loop. Deferred: generic
 > `disenchant <item>`/`craft <recipe>` verbs, profession-cap content-config, augment affix depth
-> (FOLLOW-UPS.md).
+> (REMAINING.md).
 ([CRAFTING.md](CRAFTING.md))
 - Rarity/binding (BoP rules, tier-dependent component binding) + the transfer/bind gate.
 - Professions, recipes, stackable items, deconstruction (salvage yields = weighted rolls).
@@ -221,7 +221,7 @@ station.
 **Done when:** create an account on the web, get a link code, `connect` over TLS/SSH.
 
 ### Phase 15 — Terminal-native OAuth (login rework) ✅
-([PHASE15-PLAN.md](PHASE15-PLAN.md)) Reworks Phase 14's front-end: the website + passphrase + SSH logins
+([PHASE15-PLAN.md](COMPLETED.md#phase-15)) Reworks Phase 14's front-end: the website + passphrase + SSH logins
 are replaced by a single **terminal-native OAuth device flow** — no passwords, auth externalized.
 - `connect` → a one-click link → the browser does OAuth (brokered, PKCE) → the telnet session is authed.
 - Prompt-driven character select + chargen (the content-driven chargen *engine* from 14.8 is reused).

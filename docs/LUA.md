@@ -6,7 +6,7 @@ API** — never raw Go internals. Lua runs *inside* the owning zone's goroutine,
 a consistent, single-threaded world.
 
 Runtime: `gopher-lua` (a minimal fork — [github.com/double-nibble/gopher-lua](https://github.com/double-nibble/gopher-lua), pulled in via a go.mod `replace`; the fork keeps the `github.com/yuin/gopher-lua` module path).
-Status: design baseline; **[PHASE7-PLAN.md](PHASE7-PLAN.md) is the implementation source of
+Status: design baseline; **[Phase 7 in COMPLETED.md](COMPLETED.md#phase-7) is the implementation source of
 truth** (it orders this into slices, resolves the three open forks §10 flagged, and supersedes
 §5's mechanism claims — see the §5 note below).
 
@@ -106,7 +106,7 @@ This buys three things:
 
 ## 5. The sandbox
 
-> **Superseded by [PHASE7-PLAN.md](PHASE7-PLAN.md) (§1.1, §2 threat rows T3/T4/T13/T14,
+> **Superseded by [Phase 7 in COMPLETED.md](COMPLETED.md#phase-7) (§1.1, §2 threat rows T3/T4/T13/T14,
 > §2.1 the allowlist).** The original draft of this section cited `SetMaxStackSize` and
 > "instruction budget via the LState context" — **both are wrong for gopher-lua v1.1.1**
 > (verified against the real runtime): `SetMaxStackSize` does not exist, and the `LState`
