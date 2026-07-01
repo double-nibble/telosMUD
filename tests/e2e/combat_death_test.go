@@ -157,7 +157,7 @@ func runDeathPhase(t *testing.T, c *helpers.TelnetClient, killCmd string) {
 	// on death its inventory flows into the corpse, so looking in the corpse lists it.
 	from = c.Len()
 	c.Send("look corpse")
-	require.Truef(t, c.ExpectFrom(from, "a rusty knife", 10*time.Second),
+	require.Truef(t, c.ExpectFrom(from, "A rusty knife", 10*time.Second), // container listing lines are initial-capped (Track 1)
 		"`look corpse` did not list the goblin's rusty knife (death-sequence inventory->corpse transfer regression); transcript:\n%s",
 		c.Transcript())
 

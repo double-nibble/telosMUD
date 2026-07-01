@@ -53,20 +53,23 @@ func containerCommands() []*Command {
 // — the "in your hands/pack" set — matching player expectation. Pure read; no mutation.
 func cmdInventory(c *Context) error {
 	wr, _ := Get[*Wearer](c.Actor)
-	var b strings.Builder
-	b.WriteString("You are carrying:")
-	n := 0
+	var held []*Entity
 	for _, item := range c.Actor.contents {
 		if wr != nil && wr.slotOf(item) != WearLocNone {
 			continue // shown under equipment
 		}
-		b.WriteByte('\n')
-		b.WriteString("  ")
-		b.WriteString(item.Name())
-		n++
+		held = append(held, item)
 	}
-	if n == 0 {
+	var b strings.Builder
+	b.WriteString("You are carrying:")
+	if len(held) == 0 {
 		b.WriteString("\n  Nothing.")
+	} else {
+		// Identical items coalesce to "<Name> (N)" (Track 1); materials/containers list individually.
+		for _, line := range coalesceItemLines(held, (*Entity).Name) {
+			b.WriteString("\n  ")
+			b.WriteString(line)
+		}
 	}
 	c.Send(b.String())
 	return nil

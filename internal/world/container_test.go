@@ -100,7 +100,7 @@ func TestGetAndDrop(t *testing.T) {
 
 	// inventory lists it.
 	inv, _ := e.run("inventory")
-	if !has(inv, "a long sword") {
+	if !has(inv, "A long sword") { // inventory lines are presentation initial-capped (Track 1)
 		t.Errorf("inventory missing sword: %v", inv)
 	}
 
@@ -165,7 +165,7 @@ func TestWearAndRemove(t *testing.T) {
 		t.Fatalf("helmet still worn after remove")
 	}
 	inv, _ = e.run("inventory")
-	if !has(inv, "an iron helmet") {
+	if !has(inv, "An iron helmet") { // inventory lines are presentation initial-capped (Track 1)
 		t.Errorf("removed item not back in inventory: %v", inv)
 	}
 }

@@ -3,6 +3,7 @@ package world
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"strings"
 )
 
@@ -98,9 +99,10 @@ func (z *Zone) lookAt(s *session, target *Entity) {
 			b.WriteString("\nIt is empty.")
 		} else {
 			b.WriteString("\nIt holds:")
-			for _, item := range target.contents {
+			// Identical items coalesce to "<Name> (N)" (Track 1); materials/containers list individually.
+			for _, line := range coalesceItemLines(target.contents, (*Entity).Name) {
 				b.WriteString("\n  ")
-				b.WriteString(item.Name())
+				b.WriteString(line)
 			}
 		}
 	}
@@ -195,6 +197,49 @@ func cmdQuit(c *Context) error {
 	return nil
 }
 
+// coalesceItemLines renders a list of items as listing lines, GROUPING identical discrete items into ONE line
+// with a " (N)" count (Track 1). `render` maps an item to its base line — `(*Entity).Name` for inventory/
+// container listings, the ground long for lookRoom — and each line is presentation-capped (capitalizeFirst).
+// The group key is the prototype PLUS the per-instance DELTA (bound state + rolled quality, via dumpItemDelta),
+// so a bound or quality-varied item never merges with a plain one (docs/REMAINING.md). Materials (Stack items,
+// which already carry their own count) and containers (chests/corpses, whose hidden contents differ) are NEVER
+// grouped — each lists on its own line. First-appearance order; a single item is uncounted.
+func coalesceItemLines(items []*Entity, render func(*Entity) string) []string {
+	type grp struct {
+		line string
+		n    int
+	}
+	order := make([]string, 0, len(items))
+	groups := map[string]*grp{}
+	uniq := 0
+	for _, it := range items {
+		// The delta key is STABLE because dumpItemDelta serializes via encoding/json, which sorts map keys —
+		// so two items with the same rolled-affix map (map[string]float64) produce byte-identical JSON and
+		// group. A future refactor to hand-rolled delta serialization must preserve that sorted-key output.
+		key := string(it.proto) + "\x00" + string(dumpItemDelta(it))
+		if isMaterial(it) || Has[*Container](it) {
+			uniq++
+			key = "\x00u" + strconv.Itoa(uniq) // a material/container never groups (its own line)
+		}
+		g := groups[key]
+		if g == nil {
+			g = &grp{line: capitalizeFirst(render(it))}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.n++
+	}
+	out := make([]string, 0, len(order))
+	for _, key := range order {
+		if g := groups[key]; g.n > 1 {
+			out = append(out, g.line+" ("+strconv.Itoa(g.n)+")")
+		} else {
+			out = append(out, groups[key].line)
+		}
+	}
+	return out
+}
+
 // colorize wraps s in an engine color token + reset (the internal/telnet/color.go `{{TOKEN}}` vocabulary),
 // for the engine's default auto-coloring (e.g. exits cyan). It is plain markup TEXT — the gate renders the
 // tokens to ANSI SGR downstream of the control-strip, or strips them for a `color off` player — so the world
@@ -227,6 +272,9 @@ func (z *Zone) lookRoom(s *session) {
 	// and corpses (a mob/item/corpse's `long` IS its room/ground presence line). Previously only
 	// PlayerControlled entities rendered, so mobs and dropped items/corpses were invisible to `look`
 	// even though they were really in the room (targeting/`kill` still resolved them) — a render gap.
+	// CREATURES (players + mobs) render individually, in room order; GROUND ITEMS are collected and coalesced
+	// below so identical items show as one "<long> (N)" line (Track 1). Each line is presentation-capped.
+	var groundItems []*Entity
 	for _, occ := range r.contents {
 		if occ == e {
 			continue
@@ -234,21 +282,30 @@ func (z *Zone) lookRoom(s *session) {
 		// TODO(phase5-visibility): route this presence/name disclosure through canSee/nameFor once
 		// dark/invis flags exist — rendering all contents here is a second path past the canSee
 		// chokepoint (see who()), consistent with the existing player-presence disclosure.
-		b.WriteByte('\n')
-		// Each occupant line is a room-presence LINE, so it gets the presentation initial-cap (Track 1):
-		// a lowercase-authored short/long ("the corpse of a goblin is here.") renders capitalized.
+		if occ.living == nil && !Has[*PlayerControlled](occ) {
+			groundItems = append(groundItems, occ) // a dropped item / corpse — coalesced after the creatures
+			continue
+		}
 		var line string
-		switch {
-		case Has[*PlayerControlled](occ):
+		if Has[*PlayerControlled](occ) {
 			line = occ.Name() + " is here."
-		case occ.Long() != "":
-			// A mob, a ground item, or a corpse — its long line is its room/ground presence.
+		} else if occ.Long() != "" { // a mob: its long line is its room presence
 			line = occ.Long()
-		default:
-			// No long line authored: fall back to the short name.
+		} else {
 			line = occ.Name() + " is here."
 		}
+		b.WriteByte('\n')
 		b.WriteString(capitalizeFirst(line))
+	}
+	// Ground items: identical ones coalesce to "<long> (N)" (capitalizeFirst is applied inside the helper).
+	for _, line := range coalesceItemLines(groundItems, func(it *Entity) string {
+		if it.Long() != "" {
+			return it.Long() // a ground item / corpse's long IS its ground-presence line
+		}
+		return it.Name() + " is here."
+	}) {
+		b.WriteByte('\n')
+		b.WriteString(line)
 	}
 	s.send(textFrame(b.String()))
 
