@@ -130,10 +130,11 @@ func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
 	}
 }
 
-// markHandedOff records that zoneID's lease was deliberately handed to a peer during a drain, and stops its
-// renewal goroutine — so the source's renewal never fences the shard nor races the atomic HandoverZone flip.
-// Idempotent. Guarded by mu.
-func (s *Shard) markHandedOff(zoneID string) {
+// markZoneHandedOff records that zoneID's lease was deliberately handed to a peer during a drain, and stops
+// its renewal goroutine — so the source's renewal never fences the shard nor races the atomic HandoverZone
+// flip. Idempotent. Guarded by mu. (Distinct from Zone.markHandedOff, which flips a PLAYER's handoff-commit
+// discriminator — same verb, different scope.)
+func (s *Shard) markZoneHandedOff(zoneID string) {
 	s.mu.Lock()
 	s.handedOff[zoneID] = true
 	stop := s.leaseStop[zoneID]
@@ -177,7 +178,7 @@ func (s *Shard) handoverZoneTo(ctx context.Context, zoneID, targetShardID, targe
 
 	// Suppress our own fence/renewal for this zone BEFORE the flip, so our renewal can never mistake the
 	// deliberate flip for a lost lease.
-	s.markHandedOff(zoneID)
+	s.markZoneHandedOff(zoneID)
 
 	ttl, _ := s.leaseParams()
 	ok, err := s.leaser.HandoverZone(ctx, zoneID, s.shardID, targetShardID, ttl)

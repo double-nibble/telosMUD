@@ -117,6 +117,14 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		// If no zone holds the token, fall through with home zone; the zone's attach
 		// rejects the unknown token rather than spawning a fresh character.
 	}
+	// Phase 16.4b: a draining shard refuses a FRESH login (it is handing its zones + players to a peer and is
+	// about to exit) so a new arrival doesn't land here and become a drain straggler; the gate re-resolves
+	// via the directory (whose zone leases have flipped to the peer) and dials there. A handoff BIND
+	// (token != "") is still accepted so an in-flight cross-shard move completes.
+	if token == "" && s.shard.isDraining() {
+		s.log.Info("refusing fresh login: shard draining", "character", character)
+		return status.Error(codes.Unavailable, "shard draining; reconnect")
+	}
 	var currentZone atomic.Pointer[Zone]
 	currentZone.Store(zone)
 

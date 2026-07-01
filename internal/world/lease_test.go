@@ -122,8 +122,8 @@ func TestHandedOffZoneStopsRenewalWithoutFenceOrRelease(t *testing.T) {
 
 	waitCond(t, "renewing", func() bool { return leaser.claimCount("midgaard") >= 1 })
 
-	sh.markHandedOff("midgaard") // stops the renewal goroutine
-	leaser.deny("midgaard")      // even if a stray tick claimed, it would now be denied — must not fence
+	sh.markZoneHandedOff("midgaard") // stops the renewal goroutine
+	leaser.deny("midgaard")          // even if a stray tick claimed, it would now be denied — must not fence
 
 	// Give several renew intervals to prove renewal stopped and no fence fired.
 	time.Sleep(60 * time.Millisecond)

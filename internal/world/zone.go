@@ -52,6 +52,11 @@ type Zone struct {
 	inbox     chan msg             // message queue; the only ingress to zone state
 	log       *slog.Logger         // scoped logger: component=zone, zone=<id>
 
+	// pop mirrors len(players) as an atomic so an OFF-goroutine reader (BeginDrain's wait-until-empty poll)
+	// can observe occupancy without posting a query. Written ONLY on the zone goroutine (at the join/leave
+	// occupancy points), read anywhere. Phase 16.4b.
+	pop atomic.Int64
+
 	// protos is the per-SHARD prototype cache (prototype.go), shared READ-ONLY across all
 	// the shard's zone goroutines. The zone reads it via spawn; it is never mutated after
 	// shard construction, so the cross-goroutine sharing needs no lock. A bare test zone
@@ -611,6 +616,8 @@ func (z *Zone) handle(m msg) {
 		z.saveReconcile(v.id, v.newVersion)
 	case drainFlushMsg:
 		z.saveAll(saveFlush)
+	case drainZoneMsg:
+		z.drainZone() // Phase 16.4b: hand every live player off to the zone's new (post-flip) owner
 	case createdMsg:
 		z.characterCreated(v.id, v.pid)
 	case createFailedMsg:
@@ -719,7 +726,7 @@ func (z *Zone) join(s *session, room ProtoRef) {
 		s.send(disconnectFrame("world has no content"))
 		return
 	}
-	z.players[s.character] = s
+	z.setPlayer(s.character, s)
 	delete(z.forwarding, s.character) // present here again; no stale forward
 	Move(s.entity, r)
 	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
@@ -799,7 +806,7 @@ func (z *Zone) leave(id string) {
 	if z.lua != nil && s.entity != nil {
 		z.lua.dropEntityScript(s.entity.rid)
 	}
-	delete(z.players, id)
+	z.delPlayer(id)
 	// Eager removal from the cross-shard `who` roster: a clean quit/leave drops the player immediately,
 	// before the TTL (8.4). The roster's owner-guard means a handoff AWAY whose source-leave races the
 	// destination's join can't evict the destination's fresh entry.
@@ -834,7 +841,7 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// The entity now belongs to this zone: re-home it (rid allocator, zone owner) so a
 	// future target reference resolves here, then place it in the destination room.
 	s.entity.zone = z
-	z.players[s.character] = s
+	z.setPlayer(s.character, s)
 	// Belt-and-suspenders combat clear: transferOut already disengaged the mover (and move() refuses
 	// to walk while fighting), so this is normally a no-op. But it GUARANTEES the destination never
 	// inherits a SOURCE-zone `fighting` *Entity or a posFighting state — combat is TRANSIENT and never
@@ -897,7 +904,7 @@ func (z *Zone) attach(m attachMsg) {
 	// both-own guard). Setting s=nil falls the switch through to the fresh-login default.
 	if s != nil && s.frozen && s.handedOff {
 		z.log.Debug("attach: reaping orphaned handed-off source copy; proceeding as fresh login", "player", character)
-		delete(z.players, character)
+		z.delPlayer(character)
 		if z.shard != nil && s.token != "" {
 			z.shard.dropToken(s.token)
 		}
@@ -1165,7 +1172,7 @@ func (z *Zone) prepare(m prepareMsg) {
 			// frozen copy is still GC'd later (freeze-timeout / discard signal, deferred).
 			z.log.Debug("discarding stale frozen copy for return handoff",
 				"player", character, "old_epoch", existing.epoch, "new_epoch", m.epoch)
-			delete(z.players, character)
+			z.delPlayer(character)
 		default:
 			// A genuinely present (live) player with this id.
 			m.reply <- status.Errorf(codes.AlreadyExists, "character %q already present", character)
@@ -1250,7 +1257,7 @@ func (z *Zone) prepare(m prepareMsg) {
 	// a pending player is invisible until the gate's re-dial activates it (attach Moves
 	// it into the room then). location is how attach later recovers the destination room.
 	e.location = r
-	z.players[character] = s
+	z.setPlayer(character, s)
 	if z.shard != nil {
 		// Index the token so a Play attach (the gate's re-dial) can route the bind to
 		// THIS zone even on a multi-zone shard.
@@ -1268,7 +1275,7 @@ func (z *Zone) abortPending(token string) {
 	for id, s := range z.players {
 		if s.pending && s.token == token {
 			z.log.Debug("handoff aborted: discarding pending player", "player", id)
-			delete(z.players, id)
+			z.delPlayer(id)
 			if z.shard != nil {
 				z.shard.dropToken(token)
 			}
@@ -1284,7 +1291,7 @@ func (z *Zone) abortPending(token string) {
 func (z *Zone) pendingExpire(id string, gen uint64) {
 	if s := z.players[id]; s != nil && s.pending && s.attachGen == gen {
 		z.log.Debug("pending player expired (gate never bound)", "player", id)
-		delete(z.players, id)
+		z.delPlayer(id)
 		if z.shard != nil {
 			z.shard.dropToken(s.token)
 		}
@@ -1322,12 +1329,7 @@ func (z *Zone) freezeExpire(id string, gen uint64) {
 	if s.handedOff {
 		// Successful handoff's orphaned source copy: remove it so reconnect to the source works.
 		z.log.Debug("freeze timeout: reaping orphaned handed-off source copy", "player", id)
-		delete(z.players, id)
-		if z.shard != nil && s.token != "" {
-			z.shard.dropToken(s.token)
-		}
-		z.presenceLeave(id)    // drop the orphaned source copy from the `who` roster (owner-guarded) (8.4)
-		z.stopTellConsumer(id) // ensure the source consumer is gone (idempotent; normally stopped at markHandedOff) (8.5)
+		z.reapHandedOffOrphan(id, s)
 		return
 	}
 	// Handoff never completed: thaw in place and restore to the room they tried to leave.
@@ -1452,6 +1454,38 @@ func (z *Zone) redirect(v redirectMsg) {
 	s.epoch = v.epoch
 	s.send(redirectFrame(v.targetAddr, v.token))
 	z.log.Debug("redirect sent", "player", v.id, "target", v.targetAddr, "epoch", v.epoch)
+	// Phase 16.4b: during a graceful drain the player is committed to the peer (handedOff is set — the
+	// commit-marker handedOffMsg is enqueued ahead of this redirectMsg), so reap the frozen source orphan
+	// NOW rather than waiting out freezeTTL. The zone then empties promptly and BeginDrain's wait completes.
+	if s.handedOff && z.shard != nil && z.shard.isDraining() {
+		z.reapHandedOffOrphan(v.id, s)
+	}
+}
+
+// reapHandedOffOrphan removes a successfully-handed-off player's orphaned SOURCE copy — the destination owns
+// them now, so this copy has no purpose. Shared by the freeze-timeout backstop and, during a graceful drain,
+// the eager reap on redirect. Keeps the pop mirror accurate so BeginDrain's wait-until-empty sees the drop.
+func (z *Zone) reapHandedOffOrphan(id string, s *session) {
+	z.delPlayer(id)
+	if z.shard != nil && s.token != "" {
+		z.shard.dropToken(s.token) // the destination bound (or will bind) its own copy; drop the source token
+	}
+	z.presenceLeave(id)    // drop the orphaned source copy from the `who` roster (owner-guarded) (8.4)
+	z.stopTellConsumer(id) // ensure the source consumer is gone (idempotent; normally stopped at markHandedOff) (8.5)
+}
+
+// setPlayer / delPlayer are the ONLY sanctioned ways to mutate z.players, so the pop mirror (read
+// off-goroutine by BeginDrain's wait-until-empty) stays EXACTLY len(z.players) after every insert/delete —
+// including the pending-add, transfer, and handoff-reap paths a scattered pop.Store would miss (Phase 16.4b
+// review). Zone-goroutine only, like every z.players access.
+func (z *Zone) setPlayer(id string, s *session) {
+	z.players[id] = s
+	z.pop.Store(int64(len(z.players)))
+}
+
+func (z *Zone) delPlayer(id string) {
+	delete(z.players, id)
+	z.pop.Store(int64(len(z.players)))
 }
 
 // handoffFailed thaws a player whose cross-shard move could not be initiated, so they

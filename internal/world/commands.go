@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"strings"
-	"time"
 )
 
 // Verb handlers and the base command table (docs/MUDLIB.md §6). The parser/registry and
@@ -308,33 +307,7 @@ func (z *Zone) move(s *session, dir string) bool {
 			s.send(textFrame("The way is sealed."))
 			return false
 		}
-		// Combat exclusion is ENFORCED above (move refuses while posFighting), so a fighting player can
-		// never reach here. disengage anyway, as belt-and-suspenders, BEFORE detaching from the room: it
-		// guarantees no `fighting` pointer / posFighting crosses the shard boundary in the snapshot, and
-		// drops any opponent's link to the departing player while the room scan can still find them.
-		z.disengage(s.entity)
-		// Freeze first: from now on this shard stops acting for the player. Build the
-		// snapshot on this (zone) goroutine, then kick off the async handoff.
-		s.frozen = true
-		// The player has departed this room: detach the entity from the room so they
-		// don't linger as a ghost others can see while the handoff is in flight. (The
-		// frozen session/entity itself is GC'd later, once a discard signal lands.)
-		// Remember the room so handoffFailed can put the entity BACK if the handoff can't
-		// be initiated — otherwise the entity's location stays nil and the next room action
-		// null-derefs.
-		s.frozenFrom = from
-		s.handedOff = false // not yet committed; the freeze reaper reads this discriminator
-		z.act("$n departs "+dir+".", s.entity, nil, nil, "", "", ToRoom)
-		Move(s.entity, nil)
-		z.log.Debug("cross-shard move initiated", "player", s.character,
-			"dest_zone", destZone, "dest_room", destRoom, "epoch", s.epoch)
-		// Backstop the freeze: if neither the redirect (success) nor handoffFailed (RPC
-		// timeout) has resolved this session within freezeTTL, freezeExpire either reaps the
-		// orphan (handed off) or thaws it in place. The gen guard ignores a stale timer for a
-		// session that has since rebound. AfterFunc only POSTS to the inbox — single-writer holds.
-		gen := s.attachGen
-		time.AfterFunc(freezeTTL, func() { z.post(freezeExpireMsg{id: s.character, gen: gen}) })
-		z.handoff(z, buildSnapshot(s), destZone, string(destRoom), s.epoch)
+		z.initiateHandoff(s, from, destZone, destRoom, "$n departs "+dir+".")
 		// s is now frozen/redirecting; the source must stop acting for it (no prompt).
 		return true
 	}
@@ -409,7 +382,7 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 	z.disengage(s.entity)
 	z.act("$n leaves "+dir+".", s.entity, nil, nil, "", "", ToRoom)
 	Move(s.entity, nil) // detach from the source room before handing off
-	delete(z.players, s.character)
+	z.delPlayer(s.character)
 	// Forward in-flight input to dest until the reader loop observes the new
 	// currentZone (which dest.transferIn Stores). dest dedups by appliedSeq.
 	z.forwarding[s.character] = dest

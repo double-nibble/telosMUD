@@ -128,6 +128,10 @@ type Shard struct {
 	handedOff  map[string]bool
 	leaseStop  map[string]context.CancelFunc
 
+	// draining flips true on BeginDrain (16.4b): the Play attach path then REFUSES a fresh login (this shard
+	// is going away) while still accepting a handoff BIND, so an in-flight cross-shard move completes. mu.
+	draining bool
+
 	// saver is the shard's async character writer (saver.go): one per shard, shared by every
 	// hosted zone, drained by a single background goroutine started in Run. It does all the
 	// off-zone-goroutine character I/O (Redis checkpoint + Postgres CAS). Always non-nil but

@@ -493,3 +493,24 @@ something an author would reasonably want to:
   ~30s (write deadline) + the link-death grace, not 30s — and a wedged client caught MID-DRAIN is
   deadline-dropped by design, so "zero-drop" graceful drain (16.4) must be scoped to HEALTHY connections
   and separately count deadline-reclaimed ones. · *world/gate/distributed*
+- **Bounded drain fan-out concurrency (Phase 16.4b review).** `Zone.drainZone` (internal/world/drain.go)
+  fans `beginHandoff` over EVERY resident at once — N residents = N concurrent Handoff.Prepare RPCs to the
+  single target shard. Correct (each handoff is epoch/CAS-fenced) but a synchronized burst at the ~1-2k/box
+  ceiling is a real load spike on the target. Add a per-target semaphore (~32 in flight) or pace the
+  drain-emit before leaning on this under a production rolling redeploy. · *world/distributed*
+- **Drain reclaim = clean-disconnect + honest metric (Phase 16.4b).** A straggler still resident at the
+  BeginDrain deadline (its handoff failed / it never re-dialed) is currently only FLUSHED (Drain) and counted
+  in DrainResult.Reclaimed; the shard exit then drops its socket. That's the intended honest drop, but it is
+  not yet an explicit clean-disconnect frame nor split into infra-fault vs client-fault buckets (the 16.3
+  review's `drain_reclaimed` labelling). Emit OTel drain_redirected/drain_reclaimed counters + send a
+  "server restarting, reconnect" disconnect to stragglers. · *world/obs*
+- **Director-owned drain target selection (Phase 16.4b, decentralized default shipped).** BeginDrain takes an
+  injectable TargetChooser; the hermetic tests + single-box use a fixed/self-select peer. The DS review wants
+  the DIRECTOR (Phase 10.6 leader) to own selection + SERIALIZE simultaneous drains (avoid two shards draining
+  onto one target past its one-core zone ceiling, and split-brain during a fleet rollout). Wire a
+  director-driven chooser (load-aware + admission-capped) for multi-shard rollouts; the decentralized chooser
+  stays the standalone/dev fallback. · *orchestration/distributed*
+- **Runtime-hosted zone scope-replica registration (Phase 16.4a defer).** A zone brought up via HostZone is
+  NOT added to the scope replication's zoneRegion map (that's built once in WithScopeBus, pre-Run), so a
+  region/world scope delta won't route to a runtime-adopted zone until re-registered. Wire HostZone (or the
+  drain coordinator that owns the placement flip) to register the new zone with `scopeReplication`. · *world/orchestration*
