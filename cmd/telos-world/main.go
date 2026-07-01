@@ -3,13 +3,15 @@
 //
 // Startup order: load config -> obs.Init (installs the slog default logger; honors
 // DEBUG=1 to enable Debug-level world tracing) -> start the zone actor goroutine ->
-// serve gRPC. SIGINT/SIGTERM cancels ctx, which both stops the zone loop and
-// gracefully drains the gRPC server.
+// serve gRPC. SIGINT/SIGTERM triggers a graceful DRAIN (Phase 16.4c): every zone +
+// its live players are handed off to a peer shard (sockets stay open) BEFORE the zone
+// loops stop, then the gRPC server is drained.
 package main
 
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -53,8 +55,15 @@ func main() {
 	}
 	shutdown := obs.Init(cfg.Service, cfg.LogLevel)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// SIGINT/SIGTERM triggers a graceful DRAIN; the zone/lease lifetime (worldCtx) is deliberately SEPARATE
+	// so the drain runs while the zones are still LIVE (the flush + handoff must precede the zone loops
+	// stopping — PERSISTENCE.md §6), then worldCtx is cancelled to stop them. A lease-loss FENCE (onFence =
+	// stopWorld, passed to buildShard) cancels worldCtx too — that path stops immediately WITHOUT a drain
+	// (we lost the lease, so we can't hand our zones off).
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	worldCtx, stopWorld := context.WithCancel(context.Background())
+	defer stopWorld()
 
 	// Build the shard. With Redis reachable, register every zone this shard hosts in
 	// the directory and wire cross-shard handoff; otherwise fall back to a single-shard
@@ -63,8 +72,8 @@ func main() {
 	if len(zones) == 0 {
 		zones = []string{"midgaard"}
 	}
-	shard := buildShard(ctx, stop, cfg, zones)
-	go shard.Run(ctx) // each zone actor loop owns its world state from here on
+	shard, chooseTarget := buildShard(worldCtx, stopWorld, cfg, zones)
+	go shard.Run(worldCtx) // each zone actor loop owns its world state from here on
 
 	lis, err := net.Listen("tcp", cfg.WorldListen)
 	if err != nil {
@@ -75,15 +84,29 @@ func main() {
 	shard.Register(gs)
 
 	go func() {
-		<-ctx.Done()
-		slog.Info("shutting down")
-		// Shutdown durability rests on the per-player save-on-Detach flush (a clean client
-		// disconnect runs leave -> flush while everything is still live). The Shard.Drain hook —
-		// a bulk flush of every live player — is built (PERSISTENCE.md §6) but its TRIGGER is
-		// Phase 10: a true graceful drain must flush BEFORE ctx cancels the zone+saver goroutines,
-		// which the placement controller will coordinate. Calling it here post-cancel would be
-		// best-effort only, so we leave the trigger to Phase 10 and rely on per-session flushes.
-		gs.GracefulStop()
+		select {
+		case <-sigCtx.Done():
+			// Graceful drain (Phase 16.4c): hand every zone + its live players off to a peer over the
+			// cross-shard handoff (sockets stay open — zero dropped connections) BEFORE the zones stop.
+			// Bounded by the drain timeout so a stuck handoff can't hang shutdown forever.
+			slog.Info("signal received: draining before shutdown")
+			if chooseTarget != nil {
+				dctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				res, derr := shard.BeginDrain(dctx, chooseTarget, 30*time.Second)
+				cancel()
+				if derr != nil {
+					slog.Warn("graceful drain incomplete; stopping anyway", "err", derr)
+				} else {
+					slog.Info("drain complete", "redirected", res.Redirected, "reclaimed", res.Reclaimed)
+				}
+			} else {
+				shard.Drain() // single-shard: no peer to hand off to; best-effort durable flush
+			}
+		case <-worldCtx.Done():
+			slog.Warn("lease fence: stopping without drain")
+		}
+		stopWorld()       // stop the zone + saver goroutines (state already flushed / handed off)
+		gs.GracefulStop() // then drain the gRPC server and let Serve return
 	}()
 
 	slog.Info("starting", "env", cfg.Env, "listen", cfg.WorldListen)
@@ -100,7 +123,7 @@ func main() {
 // handoff; otherwise it logs a warning and returns a single-shard world whose
 // cross-shard exits are sealed (so a bare run without backing services still works).
 // home (the spawn zone for fresh logins) is the first configured zone.
-func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []string) *world.Shard {
+func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []string) (*world.Shard, world.TargetChooser) {
 	home := zones[0]
 
 	// Session-assertion verify key (Phase 14.3): account's Ed25519 PUBLIC key, if configured. The shard then
@@ -192,6 +215,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			"addr", cfg.Redis.Addr, "err", err)
 		// Redis down: no checkpoint tier, but the Postgres tier (if up) still gives save-on-logout
 		// durability — a character survives a restart, just with a wider crash window.
+		// No directory (single-shard) => no peer to drain onto => nil chooser (BeginDrain degrades to a flush).
 		return world.NewShardFromContent(lc, zones, home, "", nil, nil).
 			WithPersistence(charStore, nil).
 			WithHotReload(defSource, bus, enabledPacks).
@@ -199,7 +223,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithVerifyKey(verifyKey).
 			WithScopeBus(scopeBus, lc.Regions).
 			WithMail(mailStore).
-			WithTells(tellJS)
+			WithTells(tellJS), nil
 	}
 	dir := directory.NewRedis(rdb, "telos")
 	ckpt := checkpoint.NewRedis(rdb, "telos") // ~10s Redis checkpoint tier of the ladder
@@ -248,6 +272,30 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		hostHome = won[0]
 	}
 
+	// chooseDrainTarget selects a live PEER shard to hand this shard's zones + players to on a graceful drain
+	// (Phase 16.4c). Decentralized self-select: the first live shard in the directory that isn't us. Good for
+	// a single rolling redeploy (the replacement/standby is the peer); director-owned load-aware selection +
+	// serialization of simultaneous drains is the documented follow-up.
+	chooseDrainTarget := func(string) (string, string, error) {
+		lctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		shards, err := dir.ListShards(lctx)
+		if err != nil {
+			return "", "", err
+		}
+		for _, id := range shards {
+			if id == cfg.ShardID {
+				continue
+			}
+			addr, err := dir.EndpointForShard(lctx, id)
+			if err != nil {
+				continue // registration lapsed between the list and the resolve
+			}
+			return id, addr, nil
+		}
+		return "", "", fmt.Errorf("no live peer shard to drain onto")
+	}
+
 	return world.NewShardFromContent(lc, won, hostHome, cfg.ShardAddr, dir, world.GRPCDialer()).
 		WithPersistence(charStore, ckpt).
 		WithHotReload(defSource, bus, enabledPacks).
@@ -258,7 +306,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithZoneLeasing(dir, cfg.ShardID, directory.DefaultZoneLease, directory.DefaultZoneLease/3, stop).
 		WithPresence(roster, cfg.ShardID).
 		WithMail(mailStore).
-		WithTells(tellJS)
+		WithTells(tellJS), chooseDrainTarget
 }
 
 // openLivePool opens the long-lived Postgres pool the shard keeps for its lifetime: it backs both
