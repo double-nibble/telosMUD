@@ -3,7 +3,7 @@
 **Owner:** `rpg-systems-designer`. **Status:** design input for Phases 6 / 7 / a chargen-progression
 phase / 11 / 12. **Companion docs:** [PRINCIPLES.md](PRINCIPLES.md), [ABILITIES.md](ABILITIES.md),
 [COMBAT.md](COMBAT.md), [PERSISTENCE.md](PERSISTENCE.md), [OPEN-GAME-SYSTEMS.md](OPEN-GAME-SYSTEMS.md),
-[ROADMAP.md](ROADMAP.md).
+[the roadmap in COMPLETED.md](COMPLETED.md#roadmap-overview).
 
 This document does **not** modify code or schema. It answers one question exhaustively: *can the
 TelosMUD engine express our target game systems as pure content (def-table rows + JSONB + Lua), with
