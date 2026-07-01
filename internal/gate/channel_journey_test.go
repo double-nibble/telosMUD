@@ -12,6 +12,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -114,8 +115,22 @@ func TestChannelLineRendersVerbatimNoTellPrefix(t *testing.T) {
 	term.login(t, "Talker")
 	term.expect(t, "Temple Square")
 
-	term.send(t, "gossip verbatim please")
-	term.expect(t, "[Gossip] Talker: verbatim please")
+	// The gate subscribes to the gossip channel subject ASYNCHRONOUSLY after login (the world publishes the
+	// hear-set on world-entry, then the gate subscribes), so a gossip typed immediately can outrun that
+	// subscription and be dropped — the flake. Re-send until the line comes back (tryExpect is the harness's
+	// non-fatal bounded wait built for exactly this async-subscription retry), rather than sleep-and-hope
+	// against the round-trip. Extra gossip lines are harmless: the verbatim assertion below only cares that
+	// NO line was wrapped in the tell renderer.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		term.send(t, "gossip verbatim please")
+		if term.tryExpect("[Gossip] Talker: verbatim please", 500*time.Millisecond) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("gossip line never arrived; got %q", term.acc.String())
+		}
+	}
 	if got := term.acc.String(); strings.Contains(got, "tells you, '[Gossip]") {
 		t.Fatalf("a channel line was wrapped in the tell renderer: %q", got)
 	}
