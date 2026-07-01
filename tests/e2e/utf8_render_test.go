@@ -1,5 +1,8 @@
+//go:build e2e
+
 // Package e2e — see combat_death_test.go for the tier's contract (live stack, real telnet client, skips
-// cleanly when the gate is unreachable).
+// cleanly when the gate is unreachable). The `e2e` build tag keeps this tier OUT of the default hermetic
+// `go test ./...` surface (it belongs to `make test-e2e`, which CI's e2e job runs against `make up`).
 package e2e
 
 import (

@@ -148,7 +148,7 @@ func runDeathPhase(t *testing.T, c *helpers.TelnetClient, killCmd string) {
 	// corpse AND that lookRoom renders it (the same render gap that hid the live goblin).
 	from := c.Len()
 	c.Send("look")
-	require.Truef(t, c.ExpectFrom(from, "the corpse of a small goblin lies here.", 10*time.Second),
+	require.Truef(t, c.ExpectFrom(from, "The corpse of a small goblin lies here.", 10*time.Second), // presentation initial-cap (Track 1): lookRoom caps the corpse's room-presence line
 		"the goblin's corpse did not render in `look` after the kill (death-sequence or lookRoom regression); transcript:\n%s",
 		c.Transcript())
 
