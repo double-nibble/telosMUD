@@ -78,8 +78,11 @@ cookie prefix, mid-session hear-access republish, and the durable `characters.st
 form, the formula NaN/±Inf fail-closed guard (found in the heal-dice review), the OnKill kill-magnitude cap
 (`xp_value` + fallback cap — also §8 death-mag), the reserved-affect-event-kinds reconciliation (those hooks
 already fire; only OnRest is dark, pending a rest mechanic), the recipe skill-gate `track` resolution, the
-content-configurable profession cap + uncapped kind, and the `rollOpAmount` dedupe (extracted the shared
-`amount + dice + bonus` roll from opDealDamage/opHeal).*
+content-configurable profession cap + uncapped kind, the `rollOpAmount` dedupe (extracted the shared
+`amount + dice + bonus` roll from opDealDamage/opHeal), the `learn_profession.profession` → `kind:profession`
+bundle content-lint (`lintLearnProfessionRefs`, load-time), and the `on_roll(ctx)` Lua loot hatch
+(per-table body → conditional drops through the normal pipeline, fail-closed + capped, OnRoll round-trips
+the loot JSONB body).*
 
 - **[LARGE] Cross-content alias / keyword targeting system (+ discovery listings).** Promoted from the old
   "generic object-targeted salvage/craft verbs" item once the design intent came clear: a builder should be
@@ -102,13 +105,10 @@ content-configurable profession cap + uncapped kind, and the `rollOpAmount` dedu
   takes a FIXED source proto + fixed table, no tag gate, no tier/level derivation, no skill gate. Build in
   board-reviewed slices (object-target + tag gate + per-item override/block first; then derived tables + skill
   gate + over-skill bonus). · *progression/content*
-- **Content-lint: `learn_profession.profession` must name a `kind: profession` bundle (found in the cap review).**
-  The uncapped/capped resolution keys off `bundleDefs().get(profession_ref)` (ref == bundle ref by convention);
-  a content-lint rule asserting every `learn_profession.profession` names a matching `kind: profession` bundle
-  ref would machine-check that convention instead of relying on authorial discipline. Low severity (the engine
-  already defaults to capped on a miss — conservative). · *progression/content*
-- **`on_roll(ctx)` Lua loot hatch (12.1).** The loot resolver is fully declarative; add the Lua escape hatch
-  for conditional drops the declarative form can't express.
+- **`on_roll` unknown-ref diagnostic (low priority, found in the on_roll review).** An `on_roll` body that
+  returns a ref which doesn't resolve to a prototype is a silent no-op in `deliverLoot` (`spawn == nil`),
+  consistent with the declarative path — but the ref is opaque Lua, so a typo vanishes with no diagnostic.
+  A debug log (or content-lint) on the on_roll `spawn(ref) == nil` path would surface it. · *progression/observability*
 - **Normalized `affix_defs` table (12.3).** The affix pool is inline in each loot entry's `quality` spec; a
   shared `affix_defs` content table (named affixes by ref) de-duplicates pools and enables richer legendaries.
 - **Demo spawn/death handler content (12.4).** The director broadcasts `spawn.boss` DOWN; ship demo
