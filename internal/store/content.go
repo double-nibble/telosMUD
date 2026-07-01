@@ -399,12 +399,14 @@ type attrBody struct {
 }
 
 type resourceBody struct {
-	Regen             int            `json:"regen,omitempty"`
-	RegenInCombat     bool           `json:"regen_in_combat,omitempty"` // keep regenerating while fighting (default false)
-	DepletedThreshold int            `json:"depleted_threshold,omitempty"`
-	OnEvent           map[string]any `json:"on_event,omitempty"`    // [G3] event subscriptions (6.2)
-	OnDepleted        []any          `json:"on_depleted,omitempty"` // [G-D] death hook (6.3b)
-	PerRound          bool           `json:"per_round,omitempty"`   // [G9] per-round reaction budget (6.4b)
+	Regen             int               `json:"regen,omitempty"`
+	RegenInCombat     bool              `json:"regen_in_combat,omitempty"` // keep regenerating while fighting (default false)
+	DepletedThreshold int               `json:"depleted_threshold,omitempty"`
+	OnEvent           map[string]any    `json:"on_event,omitempty"`        // [G3] event subscriptions (6.2)
+	OnEventLua        map[string]string `json:"on_event_lua,omitempty"`    // [G3] Lua-body event subscriptions (7.4g)
+	OnReactionLua     map[string]string `json:"on_reaction_lua,omitempty"` // result-altering reaction hooks (7.9)
+	OnDepleted        []any             `json:"on_depleted,omitempty"`     // [G-D] death hook (6.3b)
+	PerRound          bool              `json:"per_round,omitempty"`       // [G9] per-round reaction budget (6.4b)
 }
 
 type dmgBody struct {
@@ -584,6 +586,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 			r.Regen, r.DepletedThreshold = b.Regen, b.DepletedThreshold
 			r.RegenInCombat = b.RegenInCombat
 			r.OnEvent, r.OnDepleted = b.OnEvent, b.OnDepleted
+			r.OnEventLua, r.OnReactionLua = b.OnEventLua, b.OnReactionLua
 			r.PerRound = b.PerRound
 		}
 		pp := pack(pk)
@@ -706,6 +709,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		ab.Words = mb.Words
 		ab.RequiresGrant = mb.RequiresGrant // Phase 11.4a ownership flag, ridden in the messages JSONB
 		ab.Skill = mb.Skill                 // Phase 11.3 skill-track tag, ridden in the messages JSONB
+		ab.OnEvent = mb.OnEvent             // [G3] event subscriptions, ridden in the messages JSONB
 		// on_resolve is a raw op-list (or null); carry it as the decoded generic form the world-side
 		// op-list parser consumes, exactly like the affect tick op-list.
 		if len(onResolve) > 0 {
@@ -1068,6 +1072,10 @@ type abilityMessages struct {
 	// sets neither (omitempty keeps every existing ability's body byte-identical).
 	RequiresGrant bool   `json:"requires_grant,omitempty"`
 	Skill         string `json:"skill,omitempty"`
+	// OnEvent ([G3], Phase 6.2) is a top-level AbilityDTO field with no first-class column; it rides THIS
+	// messages JSONB wrapper like Words/Skill/RequiresGrant so a DB round-trip preserves an ability's event
+	// subscriptions without a schema migration. omitempty keeps every existing ability's body byte-identical.
+	OnEvent map[string]any `json:"on_event,omitempty"`
 }
 
 // decodeBaseSpec unmarshals an attribute's default_base JSONB into a content.BaseSpecDTO. A JSON

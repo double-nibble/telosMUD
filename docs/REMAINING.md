@@ -47,10 +47,17 @@ seam are independent and can run in parallel — the constraints that matter are
 
 ## Track 0 — Regression nets (do first; they de-risk the store + render churn below)
 
-- **Reflect-walk DTO round-trip test.** Assert EVERY store DTO field round-trips (a reflect-walk over a fully
-  populated synthetic pack), so a new field can't be silently dropped on the store path. **Payoff:** auto-covers
-  every later store-field addition (`affix_defs`, `wear_slots` table, `help_defs`, a per-item `salvage_table`,
-  a stored `score` layout) — do it before those so each rides the net instead of a bespoke round-trip test. · *tests/persistence*
+- *DONE — Reflect-walk DTO round-trip net (`tests/integration/store_reflect_test.go`): a synthetic all-non-zero
+  pack round-tripped through Postgres asserts every field of all 15 persisted global-def kinds survives, +
+  a hermetic drift guard that fails if a new `content.Pack` def slice goes uncovered. It auto-covers every
+  later store-field add (`affix_defs`, `wear_slots`, `help_defs`, `salvage_table`, a stored `score` layout).
+  It immediately caught + fixed two real silent drops: resource `on_event_lua`/`on_reaction_lua` and ability
+  `on_event`.*
+- **Commands / PvpLua / Formulas have no Postgres import/load path (found by the reflect net).** A YAML pack's
+  custom Lua verbs (`Commands`), PvP policy (`PvpLua`), and ruleset `Formulas` are NOT persisted through
+  `ImportPack`/`Load` — no INSERT/DELETE/SELECT in `internal/store/import.go`/`content.go`. A DB-SEEDED pack
+  silently loses them (they survive only via the embedded-YAML load path). Decide whether that's intentional
+  (embedded-only) or a gap to close with a store path (a def table or pack_meta columns) + reflect-net coverage. · *persistence*
 - **UTF-8 rendering tests + a display-width helper.** Assert multibyte content (`Hello, 世界`, emoji, combining
   marks, RTL) survives the full edge render path — `Write`/`sanitizeOutput` (the ESC control-strip must not
   corrupt/split multibyte), `act()`, `lookRoom`/item shorts, GMCP JSON, mail/tell bodies — and never split a
@@ -281,6 +288,11 @@ change; the Lua director script is the big substrate the smaller Go handlers cou
 - **Builder-guide note: top-level `state.x = …` re-runs on hot reload.** A reloaded script's non-handler body
   re-executes against the PRESERVED `self.state`, so `state.x = 0` clobbers a live value; idiomatic content
   guards it (`state.x = state.x or 0`). PERSISTENCE.md note added; this remains for the builder guide. · *docs*
+- **Gated scope-state CAS tests aren't re-run safe (found alongside the reflect net).** `TestWorldStateRoundTripAndCAS`
+  + `TestRegionStateRoundTripAndCAS` (`internal/store/scopestate_test.go`) do a version-0 CAS-create and never
+  TRUNCATE their rows, so they PASS only on a fresh DB (CI) and FAIL on a re-run against a persistent local DB.
+  Fix: `t.Cleanup` a TRUNCATE, or key each run off a unique suffix — the "gated tests must be re-run safe"
+  discipline the pack/reflect tests already honor (they strip-and-replace). · *tests*
 - **Delete merged local branches as work lands.** · *hygiene*
 
 ## Blocked / deferred (waiting on another slice — don't start cold)

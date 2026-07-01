@@ -227,7 +227,8 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	for _, r := range pk.Resources {
 		body, _ := json.Marshal(resourceBody{
 			Regen: r.Regen, RegenInCombat: r.RegenInCombat, DepletedThreshold: r.DepletedThreshold,
-			OnEvent: r.OnEvent, OnDepleted: r.OnDepleted, PerRound: r.PerRound,
+			OnEvent: r.OnEvent, OnEventLua: r.OnEventLua, OnReactionLua: r.OnReactionLua,
+			OnDepleted: r.OnDepleted, PerRound: r.PerRound,
 		})
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO resource_defs (ref, pack, display_name, max_attr, vital, body)
@@ -289,6 +290,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		messages, _ := json.Marshal(abilityMessages{
 			AbilityMessagesDTO: ab.Messages, Words: ab.Words,
 			RequiresGrant: ab.RequiresGrant, Skill: ab.Skill, // Phase 11.4a/11.3 fields ride the messages JSONB (no column)
+			OnEvent: ab.OnEvent, // [G3] event subscriptions ride the messages JSONB too (no column)
 		})
 		tags := ab.Tags
 		if tags == nil {
