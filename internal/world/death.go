@@ -162,6 +162,38 @@ func (z *Zone) deathCtx(victim, killer *Entity, parent *effectCtx) *effectCtx {
 	return c
 }
 
+// xpValueAttr is the content-defined attribute a builder sets to declare a mob's explicit "kill worth"
+// (the magnitude a content OnKill XP formula can scale by). When absent (0), killMagnitude falls back to
+// the victim's vital-pool max — capped, so tankiness doesn't leak into reward. (Only XP consumes the OnKill
+// magnitude today; loot eligibility is threat-based and mag-independent, so this is XP-scoped.)
+const xpValueAttr = "xp_value"
+
+// maxKillMagnitude caps the FALLBACK kill magnitude (the vital-pool max) so a builder can't turn a
+// high-max-hp mob into an XP farm just by making it tanky (docs/REMAINING.md §4/§8: raw max-hp is
+// builder-influenceable). It is a generous sanity ceiling, NOT the reward curve — real reward scaling
+// belongs in the content XP formula or an explicit `xp_value`; a mob worth more than this authors xp_value.
+const maxKillMagnitude = 100000.0
+
+// killMagnitude is the "size of the kill" a content OnKill XP formula can scale by. It prefers a content-
+// defined `xp_value` attribute (the builder's explicit, deliberate kill worth — trusted as authored);
+// absent that it falls back to the victim's vital-pool max CAPPED at maxKillMagnitude, so an incidentally-
+// tanky mob can't be farmed for outsized XP. Always >= 1 (a bare/vital-less victim is worth 1).
+func killMagnitude(victim *Entity) float64 {
+	if v := attr(victim, xpValueAttr); v > 0 {
+		return v // explicit content kill value — a deliberate authoring choice, trusted
+	}
+	mag := 1.0
+	if pool := vitalResource(victim); pool != "" {
+		if m := resourceMax(victim, pool); m > 0 {
+			mag = float64(m)
+		}
+	}
+	if mag > maxKillMagnitude {
+		mag = maxKillMagnitude
+	}
+	return mag
+}
+
 // die runs the full death of `victim` slain by `killer`: fire OnKill, drop ALL combat pointers to/from
 // the victim, scrub it from every threat table, then dispose of the body — a MOB becomes a CORPSE
 // container holding its gear+inventory and the entity is removed; a PLAYER respawns at the start room
@@ -177,21 +209,10 @@ func (z *Zone) die(victim, killer *Entity, parent *effectCtx) {
 	z.act("$n is DEAD!", victim, nil, nil, "", "", ToRoom)
 
 	// --- OnKill (the reserved combat event, now LIT). subject=KILLER (the event is ABOUT the slayer —
-	// it awards the slayer XP/quest credit), other=VICTIM. mag = the victim's max hp (a sensible "size of
-	// the kill" the content XP formula can scale by; 1 when no vital max). The content handler is Phase 11
-	// — here we just light the fire point, depth+width guarded like OnHit/OnDamageTaken. A nil killer (a
-	// non-combat death) fires nothing (no subject).
-	// TODO(phase11, security review): mag = raw victim max-hp is BUILDER-INFLUENCEABLE — a high-max-hp
-	// mob becomes a farm target. The Phase-11 XP/honor formula must cap/normalize the kill magnitude
-	// (or read a content-defined xp_value attribute), not trust raw max-hp. ------------------------
+	// it awards the slayer XP/quest credit), other=VICTIM. mag = the "size of the kill" the content XP/loot
+	// formula scales by (see killMagnitude). A nil killer (a non-combat death) fires nothing (no subject).
 	if killer != nil {
-		mag := 1.0
-		if pool := vitalResource(victim); pool != "" {
-			if m := resourceMax(victim, pool); m > 0 {
-				mag = float64(m)
-			}
-		}
-		z.fireEvent(parent, evOnKill, killer, victim, mag)
+		z.fireEvent(parent, evOnKill, killer, victim, killMagnitude(victim))
 	}
 
 	// --- Loot (Phase 12.1): run the victim's loot table per eligible looter BEFORE the threat table is

@@ -392,6 +392,36 @@ func TestOnKillFiresWithKillerAsSubject(t *testing.T) {
 	}
 }
 
+// TestKillMagnitudePrefersXPValueAndCapsMaxHP pins the docs/REMAINING.md §4/§8 anti-farm fix: the OnKill
+// magnitude prefers an explicit content `xp_value`, and its max-hp fallback is capped so a tanky mob can't
+// be farmed for outsized reward just by having a huge health pool.
+func TestKillMagnitudePrefersXPValueAndCapsMaxHP(t *testing.T) {
+	z, s := combatZone(t)
+	z.defs.attr.register("xp_value", &attributeDef{ref: "xp_value", base: litNode{v: 0}})
+
+	// (1) An explicit xp_value wins over max-hp (a tanky mob with a deliberate, modest kill worth).
+	rich := combatMob(z, s.entity, "rich", "", 100)
+	setAttrBase(rich, "max_hp", 5000)
+	setAttrBase(rich, "xp_value", 250)
+	if got := killMagnitude(rich); got != 250 {
+		t.Fatalf("explicit xp_value should win: killMagnitude = %v, want 250", got)
+	}
+
+	// (2) No xp_value + a huge max-hp is CAPPED (the farm-prevention core).
+	whale := combatMob(z, s.entity, "whale", "", 100)
+	setAttrBase(whale, "max_hp", 1_000_000_000)
+	if got := killMagnitude(whale); got != maxKillMagnitude {
+		t.Fatalf("huge max-hp should cap: killMagnitude = %v, want %v", got, maxKillMagnitude)
+	}
+
+	// (3) A modest max-hp passes through uncapped (normal mobs unaffected).
+	grunt := combatMob(z, s.entity, "grunt", "", 100)
+	setAttrBase(grunt, "max_hp", 40)
+	if got := killMagnitude(grunt); got != 40 {
+		t.Fatalf("modest max-hp: killMagnitude = %v, want 40", got)
+	}
+}
+
 // TestOnDepletedHookRunsBeforeDeath proves the content on_depleted op-list runs on the dying entity
 // before die(). A "second wind" hook that heals the victim back above 0 ABORTS the death (corpse not
 // dropped) — proving on_depleted runs first and can genuinely prevent death as pure content.
