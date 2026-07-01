@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/content"
@@ -106,8 +107,11 @@ func (z *Zone) applyScopeDelta(m scopeDeltaMsg) {
 // affected hosted zone. Nil on a shard built without a scoped bus (the single-shard tests + a bare run) —
 // such a shard does zero scope work and is byte-identical to a pre-10.3 shard.
 type scopeReplication struct {
-	bus        *scopebus.Bus
-	shard      *Shard
+	bus   *scopebus.Bus
+	shard *Shard
+	// mu guards zoneRegion/regions/subs, which were construction-immutable until registerZone (16.4a runtime
+	// zone-add) can add a hosted zone at runtime. The delivery goroutine reads under RLock.
+	mu         sync.RWMutex
 	zoneRegion map[string]string // hosted zone id -> its region id (only zones that are in a region)
 	regions    map[string]bool   // the distinct regions this shard hosts a member of
 	subs       []commbus.Subscription
@@ -189,6 +193,56 @@ func (sr *scopeReplication) start() {
 	}
 }
 
+// registerZone brings a RUNTIME-hosted zone (HostZone / a drain adoption, 16.4a) into scope replication: it
+// stamps the zone's region-id replica, adds it to the region delivery map, and SUBSCRIBES to its region if
+// this shard wasn't already a member — so region deltas reach a zone hosted after boot (world deltas already
+// fan out to every hosted zone via zonesList). MUST be called before the zone's actor starts, so the
+// regionID stamp isn't a data race with a region:get on the zone goroutine. A zone in no region, or a nil
+// replication (no scoped bus), is a no-op.
+func (sr *scopeReplication) registerZone(z *Zone) {
+	if sr == nil {
+		return
+	}
+	regionID := sr.regionForZone(z.id)
+	if regionID == "" {
+		return // not a region member; world-scope deltas still reach it via zonesList
+	}
+	z.scopes.regionID = regionID // safe: the caller invokes this BEFORE z.Run starts
+	sr.mu.Lock()
+	sr.zoneRegion[z.id] = regionID
+	newRegion := !sr.regions[regionID]
+	sr.regions[regionID] = true
+	sr.mu.Unlock()
+	if newRegion {
+		rid := regionID
+		if sub, err := sr.bus.Subscribe(scopebus.Region(rid), func(event string, payload json.RawMessage, _ string) {
+			sr.onScopeEvent("region", rid, event, payload)
+		}); err != nil {
+			sr.log.Warn("runtime region scope subscribe failed", "region", rid, "zone", z.id, "err", err)
+		} else {
+			sr.mu.Lock()
+			sr.subs = append(sr.subs, sub)
+			sr.mu.Unlock()
+		}
+	}
+	sr.log.Debug("registered runtime-hosted zone for scope replication", "zone", z.id, "region", regionID)
+}
+
+// regionForZone returns the region id a zone belongs to per the shard's loaded region_defs, or "".
+func (sr *scopeReplication) regionForZone(zoneID string) string {
+	if sr.shard == nil || sr.shard.content == nil {
+		return ""
+	}
+	for _, rg := range sr.shard.content.Regions {
+		for _, z := range rg.Zones {
+			if z == zoneID {
+				return rg.Ref
+			}
+		}
+	}
+	return ""
+}
+
 // onScopeEvent routes a director broadcast to the affected zones. Runs OFF the zone goroutines (a bus-
 // owned goroutine), so it only ever POSTS — it never touches zone state. The reserved EventStateSet is a
 // STATE delta (updates the read-replica); any OTHER event is a REMOTE EFFECT (10.4b) that fires the
@@ -217,11 +271,17 @@ func (sr *scopeReplication) postToScopeZones(kind, regionID string, m msg) {
 		}
 		return
 	}
+	sr.mu.RLock()
+	targets := make([]string, 0, len(sr.zoneRegion))
 	for zoneID, rgID := range sr.zoneRegion {
 		if rgID == regionID {
-			if z := sr.shard.zoneByID(zoneID); z != nil {
-				z.post(m)
-			}
+			targets = append(targets, zoneID)
+		}
+	}
+	sr.mu.RUnlock()
+	for _, zoneID := range targets {
+		if z := sr.shard.zoneByID(zoneID); z != nil {
+			z.post(m)
 		}
 	}
 }
@@ -231,10 +291,13 @@ func (sr *scopeReplication) stop() {
 	if sr == nil {
 		return
 	}
-	for _, sub := range sr.subs {
+	sr.mu.Lock()
+	subs := sr.subs
+	sr.subs = nil
+	sr.mu.Unlock()
+	for _, sub := range subs {
 		_ = sub.Unsubscribe()
 	}
-	sr.subs = nil
 }
 
 // --- Signal UP (a zone commands its director) --------------------------------------------------

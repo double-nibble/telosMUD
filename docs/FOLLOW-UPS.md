@@ -529,7 +529,8 @@ something an author would reasonably want to:
   onto one target past its one-core zone ceiling, and split-brain during a fleet rollout). Wire a
   director-driven chooser (load-aware + admission-capped) for multi-shard rollouts; the decentralized chooser
   stays the standalone/dev fallback. · *orchestration/distributed*
-- **Runtime-hosted zone scope-replica registration (Phase 16.4a defer).** A zone brought up via HostZone is
-  NOT added to the scope replication's zoneRegion map (that's built once in WithScopeBus, pre-Run), so a
-  region/world scope delta won't route to a runtime-adopted zone until re-registered. Wire HostZone (or the
-  drain coordinator that owns the placement flip) to register the new zone with `scopeReplication`. · *world/orchestration*
+- ~~**Runtime-hosted zone scope-replica registration (Phase 16.4a defer).**~~ **RESOLVED** — `HostZone` now
+  calls `scopeReplication.registerZone(z)` before the zone's actor starts: it stamps the zone's region-id
+  replica, adds it to the (now mutex-guarded) region delivery map, and subscribes to its region if the shard
+  wasn't already a member — so a region scope delta reaches a runtime-adopted zone, not just the boot zones
+  (world deltas already fanned out via zonesList). Test: `TestHostZoneRegistersScopeReplica`. · *world/orchestration*

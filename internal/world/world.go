@@ -524,6 +524,11 @@ func (s *Shard) HostZone(id string) (*Zone, error) {
 	s.runWG.Add(1)
 	s.mu.Unlock()
 
+	// Bring the zone into scope replication (stamp its region + subscribe) BEFORE its actor starts, so a
+	// region/world scope delta reaches a runtime-hosted zone and the regionID stamp isn't a race with a
+	// region:get on the zone goroutine (16.4a defer). No-op when there's no scoped bus / the zone has no region.
+	s.scopes.registerZone(z)
+
 	go func() {
 		defer s.runWG.Done()
 		z.Run(runCtx)
