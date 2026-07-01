@@ -2,9 +2,41 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/double-nibble/telosmud/internal/world"
 )
+
+// TestMailInboxCapPersists pins the ATOMIC pgx inbox cap (the production path the hermetic MemStore test
+// can't): SendMail refuses once the recipient holds world.MailInboxCap rows (the count subquery + insert are
+// one statement, so no TOCTOU), returning ErrMailboxFull, and ListMail bounds its render at the cap.
+func TestMailInboxCapPersists(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+	stamp := time.Now().Format("150405.000000")
+	victim := "MailCap-" + stamp
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM mail WHERE to_player = $1`, victim)
+	})
+
+	for i := 0; i < world.MailInboxCap; i++ {
+		if _, err := p.SendMail(ctx, victim, "Spammer", "s", "b"); err != nil {
+			t.Fatalf("send %d (under cap): %v", i, err)
+		}
+	}
+	if _, err := p.SendMail(ctx, victim, "Spammer", "s", "b"); !errors.Is(err, world.ErrMailboxFull) {
+		t.Fatalf("send past cap: err = %v, want ErrMailboxFull", err)
+	}
+	inbox, err := p.ListMail(ctx, victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != world.MailInboxCap {
+		t.Fatalf("ListMail returned %d rows, want the cap %d", len(inbox), world.MailInboxCap)
+	}
+}
 
 // mail_test.go holds the GATED Postgres integration test for the pgx MailStore (00007_mail.sql;
 // docs/PHASE8-PLAN.md slice 8.7). Like TestCharacterCRUD it requires TELOS_TEST_DSN and t.Skip's when

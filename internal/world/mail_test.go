@@ -2,12 +2,38 @@ package world
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
 )
+
+// TestMailInboxCap pins the anti-griefing/storage cap: SendMail refuses once the recipient is at
+// MailInboxCap (per-recipient), returning the distinct ErrMailboxFull so the caller renders "mailbox full"
+// (not "unavailable"); a different recipient is unaffected, and freeing a slot re-opens delivery.
+func TestMailInboxCap(t *testing.T) {
+	ms := NewMemStore()
+	ctx := context.Background()
+	for i := 0; i < MailInboxCap; i++ {
+		if _, err := ms.SendMail(ctx, "Victim", "Sender", "s", "b"); err != nil {
+			t.Fatalf("send %d (under cap) failed: %v", i, err)
+		}
+	}
+	if _, err := ms.SendMail(ctx, "Victim", "Sender", "s", "b"); !errors.Is(err, ErrMailboxFull) {
+		t.Fatalf("send past cap: err = %v, want ErrMailboxFull", err)
+	}
+	if _, err := ms.SendMail(ctx, "Other", "Sender", "s", "b"); err != nil {
+		t.Fatalf("cap is per-recipient: send to Other failed: %v", err)
+	}
+	if _, err := ms.DeleteMail(ctx, "Victim", 1); err != nil {
+		t.Fatalf("delete to free a slot: %v", err)
+	}
+	if _, err := ms.SendMail(ctx, "Victim", "Sender", "s", "b"); err != nil {
+		t.Fatalf("send after freeing a slot failed: %v", err)
+	}
+}
 
 // mail_test.go is the hermetic Phase-8.7 mail journey (docs/PHASE8-PLAN.md 8.7): send/list/read/delete
 // round-trip, offline-mail-on-login, the new-mail notify to an online recipient, the read/delete

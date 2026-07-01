@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -294,6 +295,10 @@ func (z *Zone) mailSendCmd(s *session, rest string) {
 		}
 
 		id, err := store.SendMail(ctx, target, from, subject, body)
+		if errors.Is(err, ErrMailboxFull) {
+			writeFrameTo(out, textFrame(target+"'s mailbox is full."))
+			return
+		}
 		if err != nil {
 			writeFrameTo(out, textFrame("Mail is unavailable."))
 			return

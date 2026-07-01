@@ -144,6 +144,10 @@ func (m *MemStore) rowVersion(name string) (uint64, bool) {
 func (m *MemStore) SendMail(_ context.Context, to, from, subject, body string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Mirror the pgx inbox cap so the hermetic path enforces the same ceiling (security hardening).
+	if len(m.inboxLocked(to)) >= MailInboxCap {
+		return "", ErrMailboxFull
+	}
 	m.nextMailID++
 	id := "mem-mail-" + strconv.Itoa(m.nextMailID)
 	m.mail = append(m.mail, MailEntry{

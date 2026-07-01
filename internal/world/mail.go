@@ -2,8 +2,20 @@ package world
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// MailInboxCap bounds a recipient's TOTAL inbox (security hardening): SendMail refuses a message once the
+// recipient already holds this many, so N senders — or one attacker's several characters — can't grow a
+// victim's inbox (or the DB) without bound. The per-sender rate limit throttles the fill; this caps the
+// ceiling. A candidate for content-config later; a const is the minimal guard.
+const MailInboxCap = 100
+
+// ErrMailboxFull is returned by SendMail when the recipient is at MailInboxCap. It is a POLICY rejection,
+// DISTINCT from an infrastructure error, so the caller renders "their mailbox is full" (retryable by the
+// recipient clearing space) rather than the generic "mail is unavailable".
+var ErrMailboxFull = errors.New("recipient mailbox is full")
 
 // mail.go is the WORLD-side contract + DTO for Phase-8 slice 8.7 durable mail (docs/PHASE8-PLAN.md
 // 8.7, P8-D6). Mail is a persistent, queryable read/send inbox (Postgres, not a log) and is ENGINE

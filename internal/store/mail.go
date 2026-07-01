@@ -33,12 +33,18 @@ import (
 // caller resolved; subject/body are already sanitized. sent_at/read_at default in SQL (now() / NULL).
 func (p *Pool) SendMail(ctx context.Context, to, from, subject, body string) (string, error) {
 	id := uuid.New()
-	_, err := p.pool.Exec(ctx,
+	// Cap the recipient's inbox ATOMICALLY: the count subquery + insert are one statement, so two concurrent
+	// sends can't both slip past the ceiling (no TOCTOU). RowsAffected()==0 means the inbox was already full.
+	tag, err := p.pool.Exec(ctx,
 		`INSERT INTO mail (id, to_player, from_player, subject, body)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		id, to, from, subject, body)
+		 SELECT $1, $2, $3, $4, $5
+		  WHERE (SELECT count(*) FROM mail WHERE to_player = $2) < $6`,
+		id, to, from, subject, body, world.MailInboxCap)
 	if err != nil {
 		return "", fmt.Errorf("store: send mail to %q: %w", to, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return "", world.ErrMailboxFull
 	}
 	return id.String(), nil
 }
@@ -50,7 +56,8 @@ func (p *Pool) ListMail(ctx context.Context, player string) ([]world.MailEntry, 
 		`SELECT id, to_player, from_player, subject, body, sent_at, read_at IS NOT NULL
 		   FROM mail
 		  WHERE to_player = $1
-		  ORDER BY sent_at DESC, id DESC`, player)
+		  ORDER BY sent_at DESC, id DESC
+		  LIMIT $2`, player, world.MailInboxCap)
 	if err != nil {
 		return nil, fmt.Errorf("store: list mail for %q: %w", player, err)
 	}
