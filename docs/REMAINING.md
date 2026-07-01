@@ -109,8 +109,17 @@ the loot JSONB body).*
   returns a ref which doesn't resolve to a prototype is a silent no-op in `deliverLoot` (`spawn == nil`),
   consistent with the declarative path — but the ref is opaque Lua, so a typo vanishes with no diagnostic.
   A debug log (or content-lint) on the on_roll `spawn(ref) == nil` path would surface it. · *progression/observability*
-- **Normalized `affix_defs` table (12.3).** The affix pool is inline in each loot entry's `quality` spec; a
-  shared `affix_defs` content table (named affixes by ref) de-duplicates pools and enables richer legendaries.
+- **[LARGE] Normalized `affix_defs` table (12.3).** The affix pool is inline in each loot entry's `quality`
+  spec; a shared `affix_defs` content table (named affixes by ref) de-duplicates pools and enables richer
+  legendaries. This is a first-class def table on the scale of the prior `recipe_defs`/`bundle_defs` slices:
+  a new migration (`00018_affix_defs.sql`, the `ref/pack/JSONB body` pattern), an `AffixDefDTO`, loader +
+  `LoadedContent.Affixes` wiring, a per-shard registry, build-time resolution (a `quality` affix entry gains
+  a `ref` alternative to inline `attr/min/max`, resolved against `affix_defs` in `buildLootTableDef`), the
+  store import/export round-trip, tests, and demo usage. **Design fork to settle when built:** first-class
+  table (edit-an-affix-once → propagates on reload; the normalized choice) vs. loader-time EXPANSION (resolve
+  refs into inline pools before storage — small/no-migration, but BAKES the values so a later affix edit
+  doesn't propagate). The first-class table matches the normalization philosophy in
+  [[content-alias-and-salvage-direction]]. · *progression/persistence/content*
 - **Demo spawn/death handler content (12.4).** The director broadcasts `spawn.boss` DOWN; ship demo
   `on_world("spawn.boss")` + boss-death `signal_world("boss.died")` content to close the live boss-loot loop
   end to end. (When touching the demo, also add an `uncapped: true` gathering profession so the gated
