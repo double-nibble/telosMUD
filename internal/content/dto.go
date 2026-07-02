@@ -475,6 +475,10 @@ type ResourceDTO struct {
 	// at the start of every combat round, so a reactor (e.g. a mob with an OnLeaveRoom opportunity attack)
 	// gets a bounded number of reactions/round and a spent reaction does not refill until the next round.
 	PerRound bool `json:"per_round" yaml:"per_round"`
+	// Gauge marks this pool as PLAYER-FACING for the HUD (GMCP Char.Vitals + the live-vitals prompt), #50 —
+	// the resource mirror of AttributeDTO.Stat. When ANY resource in the pack sets it, only gauged pools
+	// appear (an internal pool like `reactions` stays out); when NONE do, all pools show (backward-compat).
+	Gauge bool `json:"gauge" yaml:"gauge"`
 	// OnEvent subscribes op-lists to in-zone engine events ([G3]) for an entity that HAS this resource
 	// (a rage pool that builds on OnHit). Map of event-name -> op-list. Phase 6.2.
 	OnEvent map[string]any `json:"on_event" yaml:"on_event"`

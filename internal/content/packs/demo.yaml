@@ -145,9 +145,10 @@ resources:
     max_attr: max_hp
     vital: true
     regen: 1
+    gauge: true
     on_depleted:
       - {op: act, to: room, text: "$n collapses, lifeless."}
-  - {ref: mana, display_name: Mana,   max_attr: max_mana, vital: false, regen: 1}
+  - {ref: mana, display_name: Mana,   max_attr: max_mana, vital: false, regen: 1, gauge: true}
   # reactions: the per-round REACTION budget ([G9], Phase 6.4b) AND the carrier of the opportunity-attack
   # handler. `per_round: true` makes the round driver refill it to max (max_reactions) at the START of
   # every combat round, so a reactor gets a bounded number of reactions/round and a spent one does not

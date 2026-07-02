@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"sort"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/colormarkup"
@@ -43,18 +44,43 @@ func gmcpFrame(pkg string, payload []byte) *playv1.ServerFrame {
 }
 
 // charVitalsJSON builds the Char.Vitals payload from the entity's CONTENT-DEFINED resource pools: for
-// every registered resource it emits "<ref>": current and "max<ref>": max (the GMCP maxhp/maxmp
-// convention). Nothing is hardcoded — a pack that defines hp/mana/move yields all three, the engine
-// names none — honoring the "engine = mechanism, content = flavor" pillar. Deterministic (map marshal
-// sorts keys), so change-detection compares cleanly.
+// each HUD-visible resource (hudResourceRefs — the gauge filter, #50) it emits "<ref>": current and
+// "max<ref>": max (the GMCP maxhp/maxmp convention). Nothing is hardcoded — the engine names no pool —
+// honoring the "engine = mechanism, content = flavor" pillar. Deterministic (map marshal sorts keys),
+// so change-detection compares cleanly.
 func (z *Zone) charVitalsJSON(e *Entity) []byte {
 	m := make(map[string]int)
-	for ref := range z.defs.res.table() {
+	for _, ref := range z.hudResourceRefs() {
 		m[ref] = resourceCurrent(e, ref)
 		m["max"+ref] = resourceMax(e, ref)
 	}
 	b, _ := json.Marshal(m)
 	return b
+}
+
+// hudResourceRefs returns the resource refs that appear in the PLAYER-FACING HUD — the GMCP Char.Vitals
+// gauges AND the live-vitals prompt (#40/#50), which must agree on "what's player-visible". The gauge
+// filter (#50): when ANY resource opts in with gauge:true, only gauged pools are returned (an internal
+// pool like a per-round reaction budget stays out of the HUD); when NONE are flagged (an un-flagged
+// pack), all pools are returned (backward-compat). Sorted for deterministic output. Zone-goroutine read.
+func (z *Zone) hudResourceRefs() []string {
+	table := z.defs.res.table()
+	anyGauge := false
+	for _, def := range table {
+		if def != nil && def.gauge {
+			anyGauge = true
+			break
+		}
+	}
+	refs := make([]string, 0, len(table))
+	for ref, def := range table {
+		if anyGauge && (def == nil || !def.gauge) {
+			continue
+		}
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	return refs
 }
 
 // charStatsJSON builds the Char.Stats payload from the CONTENT-flagged player-facing attributes: every

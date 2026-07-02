@@ -230,7 +230,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		body, _ := json.Marshal(resourceBody{
 			Regen: r.Regen, RegenInCombat: r.RegenInCombat, DepletedThreshold: r.DepletedThreshold,
 			OnEvent: r.OnEvent, OnEventLua: r.OnEventLua, OnReactionLua: r.OnReactionLua,
-			OnDepleted: r.OnDepleted, PerRound: r.PerRound,
+			OnDepleted: r.OnDepleted, PerRound: r.PerRound, Gauge: r.Gauge,
 		})
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO resource_defs (ref, pack, display_name, max_attr, vital, body)
