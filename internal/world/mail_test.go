@@ -106,6 +106,11 @@ func waitMailLine(t *testing.T, s *session, substr string) string {
 
 // TestMailSendListReadDeleteRoundTrip is the core 8.7 round-trip: a player sends mail to another, who
 // lists it (UNREAD), reads it (marked read, body shown), and deletes it (gone from the inbox).
+//
+// NOTE: since #65 rate-limited list/read/delete, Bob's FIVE mail actions below sit at EXACTLY the
+// default burst (commRateBurst=5). A sixth Bob mail action (or a Bob say/tell interleaved) would spend
+// past the burst and hit the throttle — if you add a step here, raise the budget with
+// `mailShard`+`.WithCommsRate(...)`. The throttle behavior itself is pinned in TestMailReadRateLimited.
 func TestMailSendListReadDeleteRoundTrip(t *testing.T) {
 	_, z, _ := mailShard(t)
 	alice := newTestPlayerEntity(z, "Alice")
