@@ -238,3 +238,149 @@ func TestRTLWidthAligns(t *testing.T) {
 		t.Errorf("RTL and Latin rows misaligned: %d vs %d", a, b)
 	}
 }
+
+// TestRTLCellIsolated pins the baked-in bidi isolation: an RTL cell is wrapped in FSI…PDI (so a bidi terminal
+// keeps columns from reordering), while a pure-LTR cell is left untouched, and the isolates stay zero-width.
+func TestRTLCellIsolated(t *testing.T) {
+	lines := strings.Split(New().Row([]string{"سلام", "x"}).Row([]string{"abcd", "y"}).Render(), "\n")
+	if !strings.Contains(lines[0], fsi) || !strings.Contains(lines[0], pdi) {
+		t.Errorf("RTL cell not wrapped in FSI…PDI: %q", lines[0])
+	}
+	if strings.Contains(lines[1], fsi) || strings.Contains(lines[1], pdi) {
+		t.Errorf("LTR-only row should carry no isolates: %q", lines[1])
+	}
+	// The FSI wraps the content and sits before the padding (grid stays in the base direction).
+	if i, j := strings.Index(lines[0], fsi), strings.Index(lines[0], pdi); i < 0 || j <= i {
+		t.Errorf("isolate order wrong (FSI before PDI): %q", lines[0])
+	}
+}
+
+// TestBidiIsolateNoOpForLTR guards the common-case invariant: LTR/ASCII/CJK content is never wrapped, so
+// existing golden output stays byte-identical.
+func TestBidiIsolateNoOpForLTR(t *testing.T) {
+	for _, s := range []string{"hello", "世界", "{{FG_RED}}x{{RESET}}", "é", "123"} {
+		if got := bidiIsolate(s); got != s {
+			t.Errorf("bidiIsolate(%q) = %q, want unchanged", s, got)
+		}
+	}
+}
+
+// TestRTLIsolatePreservedOnPadTruncate ensures the isolate closes even when the RTL content is truncated to fit
+// (fitCell truncates BEFORE isolating, so the PDI is never cut).
+func TestRTLIsolatePreservedOnPadTruncate(t *testing.T) {
+	got := NewFixed(3).Row([]string{"سلام دنيا"}).Render()
+	if !strings.Contains(got, fsi) || !strings.Contains(got, pdi) {
+		t.Errorf("truncated RTL cell lost its isolate wrapping: %q", got)
+	}
+	if strings.Index(got, pdi) < strings.Index(got, fsi) {
+		t.Errorf("PDI must come after FSI: %q", got)
+	}
+}
+
+// TestHasRTLArabicDigits pins that an Arabic-Indic NUMBER (bidi class AN, no strong letter) still counts as RTL —
+// such a run reorders under the bidi algorithm, so its cell must be isolated.
+func TestHasRTLArabicDigits(t *testing.T) {
+	if !hasRTL("٢٠٠") { // Arabic-Indic digits for 200
+		t.Errorf("hasRTL(Arabic-Indic digits) = false, want true")
+	}
+}
+
+// TestRTLLinePinnedLTR pins the base-direction fix: a line carrying RTL is prefixed with LRM so a first-strong
+// terminal can't flip the whole grid to RTL when column 0 is RTL. A pure-LTR line gets no LRM.
+func TestRTLLinePinnedLTR(t *testing.T) {
+	lines := strings.Split(New().Row([]string{"سلام", "x"}).Row([]string{"abcd", "y"}).Render(), "\n")
+	if !strings.HasPrefix(lines[0], lrm) {
+		t.Errorf("RTL-bearing line not base-pinned with LRM: %q", lines[0])
+	}
+	if strings.Contains(lines[1], lrm) {
+		t.Errorf("pure-LTR line should carry no LRM: %q", lines[1])
+	}
+}
+
+// TestHasRTL pins the detection: both Hebrew (bidi class R) and Arabic (AL) trigger; Latin/CJK/digits don't.
+func TestHasRTL(t *testing.T) {
+	for _, s := range []string{"שלום", "سلام", "مرحبا World"} {
+		if !hasRTL(s) {
+			t.Errorf("hasRTL(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"Hello", "世界", "12345", ""} {
+		if hasRTL(s) {
+			t.Errorf("hasRTL(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestBidiIsolateWrapsOnce pins that a mixed LTR+RTL cell (the realistic case: an English word inside Arabic) is
+// wrapped exactly ONCE, not per directional run — so width stays correct and there's a single FSI…PDI.
+func TestBidiIsolateWrapsOnce(t *testing.T) {
+	got := bidiIsolate("مرحبا World")
+	if n := strings.Count(got, fsi); n != 1 {
+		t.Errorf("mixed cell wrapped %d times, want 1: %q", n, got)
+	}
+	if visibleWidth(got) != visibleWidth("مرحبا World") {
+		t.Errorf("isolation changed visible width")
+	}
+}
+
+// TestRTLBannerAndSpan covers the two seams with their own isolate calls: a banner title (renderBanner) and a
+// full-width span both isolate RTL while keeping the visible width exact.
+func TestRTLBannerAndSpan(t *testing.T) {
+	banner := New().Banner("שלום", "~").Render()
+	if !strings.Contains(banner, fsi) || !strings.Contains(banner, pdi) {
+		t.Errorf("RTL banner title not isolated: %q", banner)
+	}
+	if w := visibleWidth(banner); w != 8 { // "שלום"(4) + 2 spaces + 2 fill
+		t.Errorf("RTL banner width = %d, want 8 (%q)", w, banner)
+	}
+	span := New().Span("سلام", Left).Render()
+	if !strings.Contains(span, fsi) || !strings.Contains(span, pdi) {
+		t.Errorf("RTL span not isolated: %q", span)
+	}
+}
+
+// TestRTLWithColorTokens pins that isolation composes with color markup: the whole token+text run is wrapped, the
+// tokens survive, and the visible width ignores both the tokens and the isolates.
+func TestRTLWithColorTokens(t *testing.T) {
+	cell := "{{FG_RED}}سلام{{RESET}}"
+	if visibleWidth(cell) != 4 {
+		t.Errorf("colored RTL cell width = %d, want 4", visibleWidth(cell))
+	}
+	got := bidiIsolate(cell)
+	if !strings.HasPrefix(got, fsi) || !strings.HasSuffix(got, pdi) {
+		t.Errorf("colored RTL cell not wrapped: %q", got)
+	}
+	if !strings.Contains(got, "{{FG_RED}}") || !strings.Contains(got, "{{RESET}}") {
+		t.Errorf("color tokens dropped from isolated cell: %q", got)
+	}
+}
+
+// TestRTLCenterAlign pins that centering pads OUTSIDE the isolate (isolates are zero-width, so centering matches
+// an equal-width plain string).
+func TestRTLCenterAlign(t *testing.T) {
+	got := New().Row([]string{"سلام"}, Center).Row([]string{"12345678"}).Render()
+	row0 := strings.Split(got, "\n")[0]
+	// Base-pinned line: LRM, then centering pads OUTSIDE the isolate — "سلام"(4) in width 8 = 2 leading spaces.
+	if !strings.HasPrefix(row0, lrm+"  "+fsi) {
+		t.Errorf("centered RTL cell = %q, want LRM + 2 spaces + FSI", row0)
+	}
+}
+
+// TestMultiCellLineTruncateClosesIsolates is the key guard: fixed-mode WHOLE-LINE truncation walks several
+// fsi…pdi pairs and, when it cuts inside a later isolated cell, must close every still-open isolate — leaving
+// balanced FSI/PDI counts and no dangling isolate that would reorder the whole terminal line.
+func TestMultiCellLineTruncateClosesIsolates(t *testing.T) {
+	got := NewFixed(7).Row([]string{"سلام", "دنيا"}).Render() // 4 + sep + 4 = 9 > 7, cut inside cell 2
+	if o, c := strings.Count(got, fsi), strings.Count(got, pdi); o != c {
+		t.Errorf("unbalanced isolates after line truncation: %d FSI vs %d PDI (%q)", o, c, got)
+	}
+	if o := strings.Count(got, fsi); o < 2 {
+		t.Errorf("expected both cells isolated before the cut, got %d FSI (%q)", o, got)
+	}
+	if !strings.Contains(got, "…") {
+		t.Errorf("expected an ellipsis on truncation: %q", got)
+	}
+	if visibleWidth(got) != 7 {
+		t.Errorf("truncated line width = %d, want 7 (%q)", visibleWidth(got), got)
+	}
+}

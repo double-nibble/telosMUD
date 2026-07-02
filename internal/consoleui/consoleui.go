@@ -7,6 +7,17 @@
 // renders to zero-width SGR at the edge). So a `{{FG_RED}}200{{RESET}}` cell aligns with a plain `200`, and a
 // CJK name lines up with a Latin one — the alignment survives the edge's color render and multibyte text.
 //
+// RTL text is handled three ways: its width is measured correctly (Arabic base letters = 1 cell, harakat = 0);
+// any cell containing RTL is auto-wrapped in a bidi isolate (FSI…PDI) so a bidi terminal can't reorder it across
+// column boundaries; and a line carrying RTL is prefixed with an LRM to pin its base direction to LTR (so an
+// RTL column 0 can't flip the whole grid). Pure-LTR content is untouched.
+//
+// These controls (U+2068/U+2069/U+200E) are zero-width on a UTF-8, bidi-aware or Cf-suppressing client — the
+// modern common case. On a non-UTF-8 client they'd be garbage bytes, but such a client already can't render the
+// RTL runes that trigger them. Gating isolate emission on the edge's negotiated CHARSET (like ANSI is gated on
+// color capability) is a follow-up for the edge, which — unlike this pure layout engine — knows the client's
+// encoding.
+//
 // The Go engine here is pure + fully unit-testable; a later slice exposes it to the Lua sandbox (the `ui`
 // module display templates use) and resolves "full" width from the client's negotiated terminal size.
 package consoleui
@@ -15,8 +26,20 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golang.org/x/text/unicode/bidi"
+
 	"github.com/double-nibble/telosmud/internal/colormarkup"
 	"github.com/double-nibble/telosmud/internal/textwidth"
+)
+
+// Bidi isolate controls (Unicode 6.3). A cell containing RTL text is wrapped in FSI…PDI so a bidi-capable
+// terminal treats it as a self-contained unit that can't reorder relative to neighboring columns — keeping the
+// monospace grid stable. FSI auto-detects the cell's direction; both controls are zero-width (Cf), so non-bidi
+// terminals ignore them and the width math is unaffected.
+const (
+	fsi = "\u2068" // FIRST STRONG ISOLATE
+	pdi = "\u2069" // POP DIRECTIONAL ISOLATE
+	lrm = "\u200e" // LEFT-TO-RIGHT MARK (pins a line's base direction to LTR)
 )
 
 // Align controls a column's or a spanning line's horizontal alignment.
@@ -112,13 +135,13 @@ func (s *Sheet) Render() string {
 	for _, e := range s.elems {
 		switch e.kind {
 		case elemRow:
-			lines = append(lines, s.renderRow(e, colW, tableW))
+			lines = append(lines, pinBaseLTR(s.renderRow(e, colW, tableW)))
 		case elemSpan:
-			lines = append(lines, padVisible(e.text, tableW, e.align))
+			lines = append(lines, pinBaseLTR(fitCell(e.text, tableW, e.align)))
 		case elemDivider:
 			lines = append(lines, repeatTo(e.fill, tableW))
 		case elemBanner:
-			lines = append(lines, renderBanner(e.text, e.fill, tableW))
+			lines = append(lines, pinBaseLTR(renderBanner(e.text, e.fill, tableW)))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -167,10 +190,12 @@ func (s *Sheet) renderRow(e element, colW []int, tableW int) string {
 		if i < len(colW) {
 			w = colW[i]
 		}
-		parts[i] = padVisible(c, w, a)
+		parts[i] = fitCell(c, w, a)
 	}
 	line := strings.TrimRight(strings.Join(parts, colSep), " ")
 	if s.fixed() && visibleWidth(line) > tableW {
+		// Fixed-mode overflow: truncate the assembled row. This can cut mid-cell and drop a trailing PDI, but a
+		// bidi terminal auto-closes an open isolate at the line boundary, so the blast radius is one line.
 		line = truncateVisible(line, tableW)
 	}
 	return line
@@ -178,12 +203,59 @@ func (s *Sheet) renderRow(e element, colW []int, tableW int) string {
 
 // renderBanner centers text with fill on both sides to tableW: `<fill> text <fill>`.
 func renderBanner(text, fill string, tableW int) string {
+	text = bidiIsolate(text) // keep an RTL title from reordering with the fill
 	if visibleWidth(text)+2 >= tableW || fill == "" {
 		return padVisible(text, tableW, Center) // no room for fill; just center
 	}
 	gap := tableW - (visibleWidth(text) + 2) // space consumed by the two spaces around text
 	l := gap / 2
 	return repeatTo(fill, l) + " " + text + " " + repeatTo(fill, gap-l)
+}
+
+// fitCell lays a cell into a fixed-width slot: it first TRUNCATES the raw content to fit (so any closing color
+// token / ellipsis is decided on the real text), then wraps it in a bidi isolate if it holds RTL text (applied
+// AFTER truncation so the closing PDI is never cut), then pads to width. The isolate is zero-width, so padding
+// (grid structure, in the line's base direction) lands outside it and the width math is unchanged.
+func fitCell(content string, width int, align Align) string {
+	if visibleWidth(content) > width {
+		content = truncateVisible(content, width)
+	}
+	return padVisible(bidiIsolate(content), width, align)
+}
+
+// bidiIsolate wraps s in FSI…PDI when it contains any strong RTL character (bidi class R or AL); pure-LTR/ASCII
+// content is returned unchanged so the common case stays byte-for-byte identical.
+func bidiIsolate(s string) string {
+	if !hasRTL(s) {
+		return s
+	}
+	return fsi + s + pdi
+}
+
+// pinBaseLTR pins a rendered line's BASE paragraph direction to LTR (via a leading zero-width LRM) when the line
+// carries an RTL isolate. Without it, a terminal that first-strong-detects the line's direction would flip the
+// whole grid — padding, column order, and all — to RTL when column 0 happens to be RTL. LRM needs no closer, so
+// it doesn't perturb the FSI/PDI balance. No-op for the pure-LTR common case (and for dividers, which never
+// contain an isolate).
+func pinBaseLTR(line string) string {
+	if strings.Contains(line, fsi) {
+		return lrm + line
+	}
+	return line
+}
+
+// hasRTL reports whether s contains a right-to-left character: strong RTL (Hebrew = R, Arabic = AL) or an
+// Arabic-Indic NUMBER (AN) — AN runs also reorder under the bidi algorithm, so an all-Arabic-digits cell still
+// needs isolation even with no strong-RTL letter.
+func hasRTL(s string) bool {
+	for _, r := range s {
+		p, _ := bidi.LookupRune(r)
+		switch p.Class() {
+		case bidi.R, bidi.AL, bidi.AN:
+			return true
+		}
+	}
+	return false
 }
 
 // --- visible-width helpers (color-token + display-width aware) ----------------------------------
@@ -236,12 +308,15 @@ func padVisible(s string, width int, align Align) string {
 }
 
 // truncateVisible truncates s to at most maxCells visible cells, PRESERVING `{{...}}` color tokens and appending
-// an ellipsis "…" (1 cell) when content is dropped. maxCells<=0 yields "".
+// an ellipsis "…" (1 cell) when content is dropped. It also tracks bidi-isolate nesting and CLOSES any isolate
+// still open at the cut (before the ellipsis), so truncating an RTL cell never leaves a dangling FSI. maxCells<=0
+// yields "".
 //
-// Known limitation: if truncation cuts before a cell's closing reset token, that token is dropped and the color
-// can bleed rightward until the edge's end-of-payload reset. This only bites fixed-width overflow of a colored
-// cell; a color-vocabulary-aware reset on truncation is a follow-up (the package intentionally knows the token
-// FORMAT, not the token NAMES, to stay decoupled from the edge's SGR map).
+// Known limitation: if truncation cuts before a cell's closing COLOR reset token, that token is dropped and the
+// color can bleed rightward until the edge's end-of-payload reset. This only bites fixed-width overflow of a
+// colored cell; a color-vocabulary-aware reset on truncation is a follow-up (the package intentionally knows the
+// token FORMAT, not the token NAMES, to stay decoupled from the edge's SGR map — unlike the isolate pair, which
+// is this package's own).
 func truncateVisible(s string, maxCells int) string {
 	if maxCells <= 0 {
 		return ""
@@ -249,6 +324,8 @@ func truncateVisible(s string, maxCells int) string {
 	limit := maxCells - 1 // reserve one cell for the ellipsis
 	var b strings.Builder
 	vw := 0
+	isolateDepth := 0
+	cut := func() string { return b.String() + "…" + strings.Repeat(pdi, isolateDepth) }
 	for i := 0; i < len(s); {
 		if strings.HasPrefix(s[i:], "{{") {
 			if params, next := colormarkup.ScanTokenRun(s, i); len(params) > 0 {
@@ -257,7 +334,7 @@ func truncateVisible(s string, maxCells int) string {
 				continue
 			}
 			if vw+2 > limit { // literal "{{" is two visible cells (matches the edge)
-				return b.String() + "…"
+				return cut()
 			}
 			b.WriteString("{{")
 			vw += 2
@@ -267,7 +344,15 @@ func truncateVisible(s string, maxCells int) string {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		rw := textwidth.RuneWidth(r)
 		if vw+rw > limit {
-			return b.String() + "…"
+			return cut()
+		}
+		switch s[i : i+size] { // track isolate nesting so a mid-isolate cut still closes it
+		case fsi:
+			isolateDepth++
+		case pdi:
+			if isolateDepth > 0 {
+				isolateDepth--
+			}
 		}
 		b.WriteString(s[i : i+size])
 		vw += rw
