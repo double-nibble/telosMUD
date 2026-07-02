@@ -344,7 +344,9 @@ func TestCharStatusJSONReflectsCombat(t *testing.T) {
 		State  string `json:"state"`
 		Target string `json:"target"`
 	}
-	json.Unmarshal(z.charStatusJSON(caster.entity), &st)
+	if err := json.Unmarshal(z.charStatusJSON(caster.entity), &st); err != nil {
+		t.Fatalf("Char.Status (idle) not valid JSON: %v", err)
+	}
 	if st.State != "standing" || st.Target != "" {
 		t.Fatalf("idle status = %+v, want standing + no target", st)
 	}
@@ -352,7 +354,9 @@ func TestCharStatusJSONReflectsCombat(t *testing.T) {
 	// Fighting a mob → state fighting + the target's name.
 	mob := makeMobTarget(z, caster.entity, "goblin")
 	z.startFight(caster.entity, mob)
-	json.Unmarshal(z.charStatusJSON(caster.entity), &st)
+	if err := json.Unmarshal(z.charStatusJSON(caster.entity), &st); err != nil {
+		t.Fatalf("Char.Status (combat) not valid JSON: %v", err)
+	}
 	if st.State != "fighting" || st.Target != "goblin" {
 		t.Fatalf("combat status = %+v, want fighting + goblin", st)
 	}
