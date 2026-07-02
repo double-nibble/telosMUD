@@ -47,8 +47,10 @@ func TestGMCPOfferAndNegotiation(t *testing.T) {
 
 func TestGMCPInboundParseAndLineIntact(t *testing.T) {
 	sink := &gmcpSink{}
+	// Negotiate GMCP on first (IAC DO 201), then:
 	// IAC SB 201 "Core.Hello {\"client\":\"Mudlet\"}" IAC SE, then a data-less "Core.Ping", then "go" LF.
 	var input []byte
+	input = append(input, iac, doo, optGMCP)
 	input = append(input, iac, sb, optGMCP)
 	input = append(input, []byte(`Core.Hello {"client":"Mudlet"}`)...)
 	input = append(input, iac, se)
