@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/colormarkup"
@@ -154,16 +155,23 @@ func (z *Zone) roomInfoJSON(r *Entity) []byte {
 	return b
 }
 
-// gmcpItem is one entry in a Char.Items.List (Phase 9.4): a stable per-instance id, the display name,
-// and an attrib string of single-char flags (w=wearable, c=container, W=currently worn/wielded) for the
-// client's inventory/equipment panel.
+// gmcpItem is one entry in a Char.Items panel (Phase 9.4): a stable id, the display name, an attrib
+// string of single-char flags (w=wearable, c=container, W=currently worn/wielded), and an optional
+// coalescing count (#26) — N when identical discrete items GROUP into one "torch (5)" entry, omitted for
+// a singleton. The id is STABLE across counts: a grouped discrete entry uses "g<hash>" derived from the
+// group's identity (proto+delta), so raising/lowering the count is a Char.Items.Update on the same id;
+// a non-grouping item (worn gear, a material, a container — each individually meaningful) uses its
+// per-instance "i<runtimeID>". Stable ids are what make the incremental Add/Remove/Update deltas (#48)
+// diff cleanly.
 type gmcpItem struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Attrib string `json:"attrib,omitempty"`
+	Count  int    `json:"count,omitempty"`
 }
 
-// itemEntry builds a gmcpItem for e. wr (the holder's Wearer, or nil) decides the worn flag.
+// itemEntry builds a gmcpItem for e (singleton id, count 0). wr (the holder's Wearer, or nil) decides the
+// worn flag. Callers that group override ID/Count via coalesceGMCPItems.
 func itemEntry(e *Entity, wr *Wearer) gmcpItem {
 	attrib := ""
 	if Has[*Wearable](e) {
@@ -178,35 +186,96 @@ func itemEntry(e *Entity, wr *Wearer) gmcpItem {
 	return gmcpItem{ID: fmt.Sprintf("i%v", e.RuntimeID()), Name: gmcpText(e.Name()), Attrib: attrib}
 }
 
-// charItemsJSON builds a Char.Items.List payload {location, items}. location is "inv" (everything the
-// player carries, worn flagged with "W") or "room" (ground items in the player's room — items only, not
-// players/mobs). The Mudlet-standard one-message-per-location shape, so the client routes to the right
-// panel.
-func charItemsInvJSON(e *Entity) []byte {
-	wr, _ := Get[*Wearer](e)
-	items := []gmcpItem{}
-	for _, it := range e.contents {
-		items = append(items, itemEntry(it, wr))
+// coalesceGMCPItems groups a slice of items into Char.Items entries the SAME way the plain-telnet listing
+// coalesces (coalesceItemLines): identical DISCRETE items merge into one entry carrying a Count (#26).
+// Materials (their own stack count), containers (hidden differing contents), and WORN gear (each slot is
+// individually meaningful and toggles) NEVER group — each keeps its per-instance "i<id>". A grouped entry
+// gets a count-stable "g<hash>" id (see gmcpItem). First-appearance order, matching the text listing.
+func coalesceGMCPItems(items []*Entity, wr *Wearer) []gmcpItem {
+	type grp struct {
+		item gmcpItem
+		n    int
 	}
-	b, _ := json.Marshal(map[string]any{"location": "inv", "items": items})
+	order := make([]string, 0, len(items))
+	groups := map[string]*grp{}
+	uniq := 0
+	for _, it := range items {
+		worn := wr != nil && wr.slotOf(it) != WearLocNone
+		grouping := !isMaterial(it) && !Has[*Container](it) && !worn
+		var key string
+		if grouping {
+			// STABLE group identity: prototype + per-instance delta (bound state + rolled quality), the
+			// same key coalesceItemLines uses — encoding/json sorts map keys so identical affix maps group.
+			key = string(it.proto) + "\x00" + string(dumpItemDelta(it))
+		} else {
+			uniq++
+			key = "\x00u" + strconv.Itoa(uniq) // never groups — its own line/entry
+		}
+		g := groups[key]
+		if g == nil {
+			entry := itemEntry(it, wr)
+			if grouping {
+				entry.ID = "g" + gmcpGroupID(key) // count-stable id (not the first instance's runtime id)
+			}
+			g = &grp{item: entry}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.n++
+	}
+	out := make([]gmcpItem, 0, len(order))
+	for _, key := range order {
+		g := groups[key]
+		item := g.item
+		if g.n > 1 {
+			item.Count = g.n
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// gmcpGroupID hashes a coalescing group key to a short stable hex id (fnv-64a). It is NOT sent as raw
+// bytes (the key holds JSON/NUL) — the client only ever sees the hex, and the id is stable as long as the
+// group (proto+delta) exists, so a count change is a same-id Update, not a Remove+Add.
+func gmcpGroupID(key string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// invItems / roomItems build the coalesced Char.Items entry list for a location. inv is everything the
+// player carries (worn flagged "W"); room is ground items in the player's room (items/corpses, NOT
+// players/mobs — a corpse carries only a Container, so filtering on Has[*Living] keeps loot visible).
+func invItems(e *Entity) []gmcpItem {
+	wr, _ := Get[*Wearer](e)
+	return coalesceGMCPItems(e.contents, wr)
+}
+
+func roomItems(e *Entity) []gmcpItem {
+	if e.location == nil {
+		return []gmcpItem{}
+	}
+	ground := make([]*Entity, 0, len(e.location.contents))
+	for _, occ := range e.location.contents {
+		if occ == e || Has[*Living](occ) {
+			continue
+		}
+		ground = append(ground, occ)
+	}
+	return coalesceGMCPItems(ground, nil)
+}
+
+// charItemsInvJSON / charItemsRoomJSON build the FULL Char.Items.List {location, items} snapshot — the
+// login / reconnect / handoff-arrival payload and the diff baseline. The Mudlet-standard one-message-per-
+// location shape. Steady-state changes ride the incremental deltas (diffItems) instead of a full re-send.
+func charItemsInvJSON(e *Entity) []byte {
+	b, _ := json.Marshal(map[string]any{"location": "inv", "items": invItems(e)})
 	return b
 }
 
 func charItemsRoomJSON(e *Entity) []byte {
-	items := []gmcpItem{}
-	if e.location != nil {
-		for _, occ := range e.location.contents {
-			// A ground item is any room occupant that is NOT a living creature: real items, CORPSES (a
-			// Container, no Physical), and dropped containers all qualify; players and mobs (Living) do
-			// not. Filtering on Has[*Living] rather than Has[*Physical] is what lets a corpse — which
-			// carries only a Container — show up in the panel so a client can see loot on the ground.
-			if occ == e || Has[*Living](occ) {
-				continue
-			}
-			items = append(items, itemEntry(occ, nil))
-		}
-	}
-	b, _ := json.Marshal(map[string]any{"location": "room", "items": items})
+	b, _ := json.Marshal(map[string]any{"location": "room", "items": roomItems(e)})
 	return b
 }
 
@@ -228,14 +297,58 @@ func (z *Zone) sendPrompt(s *session) {
 			s.lastStats = ss
 			s.send(gmcpFrame("Char.Stats", ss))
 		}
-		if iv := charItemsInvJSON(e); !bytes.Equal(iv, s.lastInv) {
-			s.lastInv = iv
-			s.send(gmcpFrame("Char.Items.List", iv))
-		}
-		if ri := charItemsRoomJSON(e); !bytes.Equal(ri, s.lastRoomItems) {
-			s.lastRoomItems = ri
-			s.send(gmcpFrame("Char.Items.List", ri))
-		}
+		s.lastInvItems = z.diffItems(s, "inv", invItems(e), s.lastInvItems)
+		s.lastRoomItems = z.diffItems(s, "room", roomItems(e), s.lastRoomItems)
 	}
 	s.send(promptFrameMarkup(z.promptMarkup(s))) // vitals-bearing prompt when `vitals on` (#40), else "> "
+}
+
+// diffItems emits the minimal GMCP Char.Items frames for one location and returns the new per-id snapshot
+// to store on the session. On the FIRST emit for the location (last == nil — a login, reconnect, or
+// handoff arrival) it sends the FULL Char.Items.List so a fresh client gets the whole panel in one frame;
+// thereafter it sends only Char.Items.Add / .Remove / .Update for the entries that changed (#48), so a
+// single pickup no longer re-ships the whole inventory. Entries are keyed by their STABLE id (gmcpItem),
+// so a coalescing count change (#26) is a same-id Update. Removes/adds are emitted in sorted-id order for
+// a deterministic frame sequence. Zone-goroutine only (it reads/writes session state).
+func (z *Zone) diffItems(s *session, location string, items []gmcpItem, last map[string]gmcpItem) map[string]gmcpItem {
+	next := make(map[string]gmcpItem, len(items))
+	for _, it := range items {
+		next[it.ID] = it
+	}
+	if last == nil {
+		b, _ := json.Marshal(map[string]any{"location": location, "items": items})
+		s.send(gmcpFrame("Char.Items.List", b))
+		return next
+	}
+	// Removes + Updates: walk the previous set in sorted-id order.
+	oldIDs := make([]string, 0, len(last))
+	for id := range last {
+		oldIDs = append(oldIDs, id)
+	}
+	sort.Strings(oldIDs)
+	for _, id := range oldIDs {
+		nw, ok := next[id]
+		if !ok {
+			b, _ := json.Marshal(map[string]any{"location": location, "item": gmcpItem{ID: id}})
+			s.send(gmcpFrame("Char.Items.Remove", b))
+			continue
+		}
+		if nw != last[id] {
+			b, _ := json.Marshal(map[string]any{"location": location, "item": nw})
+			s.send(gmcpFrame("Char.Items.Update", b))
+		}
+	}
+	// Adds: new ids not previously present, sorted.
+	newIDs := make([]string, 0, len(next))
+	for id := range next {
+		if _, had := last[id]; !had {
+			newIDs = append(newIDs, id)
+		}
+	}
+	sort.Strings(newIDs)
+	for _, id := range newIDs {
+		b, _ := json.Marshal(map[string]any{"location": location, "item": next[id]})
+		s.send(gmcpFrame("Char.Items.Add", b))
+	}
+	return next
 }

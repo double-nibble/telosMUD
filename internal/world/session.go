@@ -53,10 +53,12 @@ type session struct {
 	lastStatus []byte
 	lastStats  []byte
 	lastRoom   []byte // last GMCP Room.Info payload (Phase 9.3); re-emitted only on a room change
-	// lastInv / lastRoomItems are the last Char.Items.List payloads (Phase 9.4) for the inventory and the
-	// room-ground panels, re-emitted only on change.
-	lastInv       []byte
-	lastRoomItems []byte
+	// lastInvItems / lastRoomItems are the last Char.Items snapshots (Phase 9.4 + #48) for the inventory
+	// and room-ground panels, keyed by stable gmcpItem id. sendPrompt diffs the live set against these and
+	// emits only Add/Remove/Update deltas; a nil map means "not sent yet" (login / reconnect / handoff
+	// arrival), which forces a full Char.Items.List. Zone-goroutine-owned like the HUD buffers above.
+	lastInvItems  map[string]gmcpItem
+	lastRoomItems map[string]gmcpItem
 
 	// vitalsLive is the player's live-vitals HUD pref (#40, vitals.go): when true the prompt carries a
 	// "[hp: 80/100 …]" block and re-emits (with a GMCP Char.Vitals delta) at each combat-round boundary,

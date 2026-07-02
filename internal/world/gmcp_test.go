@@ -335,21 +335,94 @@ func TestCharItemsRoomIncludesCorpse(t *testing.T) {
 
 func TestSendPromptEmitsItemsOnInventoryChange(t *testing.T) {
 	z, caster := abilityTestZone(t)
-	z.sendPrompt(caster)
-	drainGMCP(caster) // clear initial frames
-
-	// Pick up nothing changed → no re-emit. Then add an item → Char.Items.List re-emitted.
-	z.sendPrompt(caster)
-	if _, ok := drainGMCP(caster)["Char.Items.List"]; ok {
-		t.Fatal("Char.Items.List re-emitted with no inventory change")
+	z.sendPrompt(caster) // first prompt: full Char.Items.List snapshot
+	if _, ok := drainGMCP(caster)["Char.Items.List"]; !ok {
+		t.Fatal("first prompt did not send the full Char.Items.List snapshot")
 	}
+
+	// No change → no delta of any kind.
+	z.sendPrompt(caster)
+	frames := drainGMCP(caster)
+	for _, pkg := range []string{"Char.Items.List", "Char.Items.Add", "Char.Items.Remove", "Char.Items.Update"} {
+		if _, ok := frames[pkg]; ok {
+			t.Fatalf("%s emitted with no inventory change", pkg)
+		}
+	}
+
+	// Pick up an item → an incremental Char.Items.Add delta (NOT a full-list re-send, #48).
 	gem := z.newEntity("test:gem")
 	gem.short = "a gem"
 	Add(gem, &Physical{})
 	Move(gem, caster.entity)
 	z.sendPrompt(caster)
-	if _, ok := drainGMCP(caster)["Char.Items.List"]; !ok {
-		t.Fatal("picking up an item did not re-emit Char.Items.List")
+	frames = drainGMCP(caster)
+	if _, ok := frames["Char.Items.List"]; ok {
+		t.Fatal("a single pickup re-sent the whole Char.Items.List instead of a delta")
+	}
+	add, ok := frames["Char.Items.Add"]
+	if !ok {
+		t.Fatal("picking up an item did not emit Char.Items.Add")
+	}
+	if !strings.Contains(add, `"location":"inv"`) || !strings.Contains(add, `"a gem"`) {
+		t.Fatalf("Char.Items.Add payload wrong: %s", add)
+	}
+
+	// Drop it → a Char.Items.Remove delta.
+	Move(gem, caster.entity.location)
+	z.sendPrompt(caster)
+	frames = drainGMCP(caster)
+	if _, ok := frames["Char.Items.Remove"]; !ok {
+		t.Fatalf("dropping the item did not emit Char.Items.Remove; frames = %v", frames)
+	}
+}
+
+// TestCharItemsCoalescesCount pins #26: identical discrete items GROUP into one Char.Items entry carrying
+// a count, and adding a third is a same-id Char.Items.Update (count 2 → 3), never a Remove+Add churn.
+func TestCharItemsCoalescesCount(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	mk := func() *Entity {
+		it := z.newEntity("test:torch") // same prototype → coalesces; each gets a unique runtime id
+		it.short = "a torch"
+		Add(it, &Physical{})
+		Move(it, e)
+		return it
+	}
+	mk()
+	mk()
+
+	inv := invItems(e)
+	var torch *gmcpItem
+	for i := range inv {
+		if inv[i].Name == "a torch" {
+			torch = &inv[i]
+		}
+	}
+	if torch == nil {
+		t.Fatalf("no coalesced torch entry: %+v", inv)
+	}
+	if torch.Count != 2 {
+		t.Fatalf("two identical torches should coalesce to count 2, got %d", torch.Count)
+	}
+	if !strings.HasPrefix(torch.ID, "g") {
+		t.Fatalf("a coalesced group should carry a stable g<hash> id, got %q", torch.ID)
+	}
+
+	// Prime the diff, then add a third torch → a same-id Update to count 3 (id stable).
+	z.sendPrompt(caster)
+	drainGMCP(caster)
+	mk()
+	z.sendPrompt(caster)
+	frames := drainGMCP(caster)
+	upd, ok := frames["Char.Items.Update"]
+	if !ok {
+		t.Fatalf("a third identical item should Update the group count; frames = %v", frames)
+	}
+	if !strings.Contains(upd, torch.ID) || !strings.Contains(upd, `"count":3`) {
+		t.Fatalf("Update should raise the same group id to count 3: %s", upd)
+	}
+	if _, churned := frames["Char.Items.Add"]; churned {
+		t.Fatal("raising a coalesced count churned an Add instead of an Update")
 	}
 }
 
