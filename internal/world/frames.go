@@ -15,10 +15,12 @@ func textFrame(markup string) *playv1.ServerFrame {
 	}}}
 }
 
-// promptFrame is the "> " prompt sent after each handled line of input.
-func promptFrame() *playv1.ServerFrame {
+// promptFrameMarkup builds a prompt frame with an explicit markup string: the classic "> " after each
+// handled line, or the live-vitals prompt that prefixes the pools when `vitals on` (vitals.go /
+// z.promptMarkup). Emitted without a trailing newline.
+func promptFrameMarkup(markup string) *playv1.ServerFrame {
 	return &playv1.ServerFrame{Payload: &playv1.ServerFrame_Prompt{Prompt: &playv1.PromptUpdate{
-		Markup: "> ",
+		Markup: markup,
 	}}}
 }
 

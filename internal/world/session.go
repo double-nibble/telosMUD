@@ -58,6 +58,13 @@ type session struct {
 	lastInv       []byte
 	lastRoomItems []byte
 
+	// vitalsLive is the player's live-vitals HUD pref (#40, vitals.go): when true the prompt carries a
+	// "[hp: 80/100 …]" block and re-emits (with a GMCP Char.Vitals delta) at each combat-round boundary,
+	// so a round's HP drain tracks live. Default false (the classic bare "> " prompt, update-on-command).
+	// Zone-goroutine-owned like the HUD buffers; session-scoped (rides a zone transfer, resets on a
+	// cross-shard handoff — a UI pref, not persisted).
+	vitalsLive bool
+
 	// lastWho is when this session last ran `who` — the per-session cooldown mark (cmdWho reads and
 	// writes it against zone.whoCooldown). Zone-goroutine-owned like the HUD buffers above; it rides
 	// the session across an intra-shard zone transfer, so a cross-zone walk doesn't reset the cooldown.

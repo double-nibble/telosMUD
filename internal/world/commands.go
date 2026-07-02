@@ -61,6 +61,8 @@ func registerCommands() []*Command {
 	// Rest/stand (Track 5, #39): registered low-priority (after combat) so rest/sit/stand never shadow
 	// a movement/look/say abbreviation.
 	base = append(base, restCommands()...)
+	// Live-vitals toggle (Track 5, #40): also low-priority.
+	base = append(base, vitalsCommands()...)
 	// Comms toggles (Phase 8.6): channels/ignore/afk. Registered last (lowest priority) so they never
 	// shadow or abbreviate a movement/look/say verb.
 	base = append(base, commsCommands()...)
