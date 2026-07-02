@@ -18,6 +18,15 @@ func TestWorldStateRoundTripAndCAS(t *testing.T) {
 	ctx := context.Background()
 	const key = "test_invasion_active"
 
+	// The test needs the key ABSENT (the version-0 CAS-create is the first assertion), and the local
+	// dev database persists across runs — so scrub before AND after (before covers a prior failed run).
+	// The up-front scrub is a PRECONDITION, so its error fails fast; the cleanup one is best-effort.
+	_, err := p.pool.Exec(ctx, `DELETE FROM world_state WHERE key = $1`, key)
+	require.NoError(t, err, "pre-scrub world_state")
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM world_state WHERE key = $1`, key)
+	})
+
 	// Absent → not found, version 0.
 	_, ver, found, err := p.LoadWorldState(ctx, key)
 	require.NoError(t, err)
@@ -57,6 +66,16 @@ func TestRegionStateRoundTripAndCAS(t *testing.T) {
 	p := testPool(t)
 	ctx := context.Background()
 	const region, key = "test_duskwall", "mood"
+
+	// Same re-run-safety scrub as the world-state test: the version-0 CAS-create and the
+	// other-region not-found probe both require these rows absent at start.
+	_, err := p.pool.Exec(ctx,
+		`DELETE FROM region_state WHERE region_id IN ($1, $2) AND key = $3`, region, "test_other", key)
+	require.NoError(t, err, "pre-scrub region_state")
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(),
+			`DELETE FROM region_state WHERE region_id IN ($1, $2) AND key = $3`, region, "test_other", key)
+	})
 
 	nv, ok, err := p.SaveRegionState(ctx, region, key, []byte(`"besieged"`), 0)
 	require.NoError(t, err)
