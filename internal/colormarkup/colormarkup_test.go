@@ -121,9 +121,23 @@ func TestRenderIsInjectionSafe(t *testing.T) {
 			if i+1 >= len(out) || out[i+1] != '[' {
 				t.Fatalf("ESC not starting a CSI at %d: %q", i, out)
 			}
-			if strings.IndexByte(out[i:], 'm') < 0 {
+
+			j := i + 2
+			for j < len(out) {
+				b := out[j]
+				if b == 'm' {
+					break
+				}
+				if (b < '0' || b > '9') && b != ';' {
+					t.Fatalf("CSI contains non-SGR parameter byte %q at %d: %q", b, j, out)
+				}
+				j++
+			}
+			if j >= len(out) || out[j] != 'm' {
 				t.Fatalf("SGR not terminated by 'm' at %d: %q", i, out)
 			}
+
+			i = j
 		}
 	}
 }
