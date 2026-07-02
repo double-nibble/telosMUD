@@ -406,6 +406,23 @@ func TestAFKAutoReply(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no AFK auto-reply reached the sender")
 	}
+
+	// Deliver a BACKLOG tell from Caller to Sleeper; backlog drain must not trigger AFK auto-reply.
+	ack = z.deliverDrainedTell(tellDeliverMsg{
+		target:  "Sleeper",
+		msg:     commbus.Message{AuthorID: "Caller", AuthorName: "Caller", Seq: 2, Body: "still sleeping?"},
+		backlog: true,
+	})
+	if !ack {
+		t.Fatal("backlog tell to an AFK target was not acked")
+	}
+
+	select {
+	case m := <-senderTells:
+		t.Fatalf("unexpected AFK auto-reply for backlog tell: %q", m.Body)
+	case <-time.After(300 * time.Millisecond):
+		// expected: backlog tell does not emit AFK auto-reply
+	}
 }
 
 // containsStr reports whether s contains v.
