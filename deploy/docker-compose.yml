@@ -243,6 +243,7 @@ services:
       TELOS_DEV_AUTOAUTH: "1" # DEV/TEST ONLY: bypass the browser OAuth with the bare name login so smoke/e2e stay headless
       TELOS_WORLD_TARGET: world:9090 # fallback if the directory is unreachable
       TELOS_REDIS_ADDR: redis:6379 # directory: resolve the home shard on login
+      TELOS_NATS_URL: nats://nats:4222 # comms SINK: subscribe to the player's channels/tells (#78 — without this the gate degrades to Disabled and comms are silently dead)
       TELOS_ZONES: midgaard # players spawn in midgaard
       DEBUG: true
     ports:
@@ -252,6 +253,8 @@ services:
         condition: service_started
       world-darkwood:
         condition: service_started
+      nats:
+        condition: service_healthy
     restart: unless-stopped
 
   # gate-auth: the ACCOUNT-BACKED front door (Phase 14 capstone). Identical to `gate` but pointed at
@@ -274,6 +277,7 @@ services:
       TELOS_ACCOUNT_TARGET: account:9100 # account-backed login (link code / passphrase)
       TELOS_WORLD_TARGET: world:9090
       TELOS_REDIS_ADDR: redis:6379
+      TELOS_NATS_URL: nats://nats:4222 # comms SINK (#78) — same as the plain gate
       TELOS_ZONES: midgaard
       DEBUG: true
     ports:
@@ -285,4 +289,6 @@ services:
         condition: service_started
       account:
         condition: service_started
+      nats:
+        condition: service_healthy
     restart: unless-stopped
