@@ -178,6 +178,24 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, cmd := range lc.Commands {
 		registerCustomCommand(d, cmd)
 	}
+	// Display templates: register each surface's Lua render body into the per-shard display table (last-write
+	// -wins by surface). Warn LOUDLY when a template names a surface the engine does not yet consume (only
+	// `score` is wired today) — otherwise the author's body is a silently-dead seam, the same discipline as
+	// the formula-not-consulted warning below.
+	for _, dd := range lc.DisplayDefs {
+		if dd.Surface == "" {
+			slog.Warn("content: display_def with an empty surface; skipped")
+			continue
+		}
+		if d.displayDefs == nil {
+			d.displayDefs = map[string]string{}
+		}
+		d.displayDefs[dd.Surface] = dd.Render
+		if !consultedDisplaySurfaces[dd.Surface] {
+			slog.Warn("content: display template defined for a surface not yet consumed by the engine; it will not render",
+				"surface", dd.Surface)
+		}
+	}
 	// PvP policy + ruleset formulas (7.4f): carried for the gate/formula seams to consult.
 	d.pvpLua = lc.PvpLua
 	for name, body := range lc.Formulas {

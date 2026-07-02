@@ -515,6 +515,12 @@ type chargenBody struct {
 	Steps []content.ChargenStepDTO `json:"steps,omitempty"`
 }
 
+// displayDefBody is the JSONB-tail shape for a display_defs row: the Lua render body, everything but the
+// (pack, surface) PK.
+type displayDefBody struct {
+	Render string `json:"render,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -1032,6 +1038,36 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	cgRows.Close()
+
+	// Display templates: (pack, surface) first-class, the Lua render body in the JSONB body. Ordered by
+	// (pack, surface) for deterministic load; the loader's per-pack accumulation applies last-write-wins.
+	ddRows, err := p.pool.Query(ctx,
+		`SELECT surface, pack, body FROM display_defs WHERE pack = ANY($1) ORDER BY pack, surface`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query display_defs: %w", err)
+	}
+	for ddRows.Next() {
+		var dd content.DisplayDefDTO
+		var pk string
+		var body []byte
+		if err := ddRows.Scan(&dd.Surface, &pk, &body); err != nil {
+			ddRows.Close()
+			return fmt.Errorf("store: scan display_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b displayDefBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				ddRows.Close()
+				return fmt.Errorf("store: display_def %s body: %w", dd.Surface, err)
+			}
+			dd.Render = b.Render
+		}
+		pack(pk).DisplayDefs = append(pack(pk).DisplayDefs, dd)
+	}
+	if err := ddRows.Err(); err != nil {
+		return err
+	}
+	ddRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

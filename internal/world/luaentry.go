@@ -214,6 +214,41 @@ func (rt *luaRuntime) invokeForNumber(ch *compiledChunk, inv *luaInvocation, bin
 	return 0, false
 }
 
+// invokeForString runs a compiled chunk and returns its first return value as a string. A compile-absent
+// chunk, a runtime error, or a non-string return yields ("", false) — the caller falls back to its default
+// (fail-closed: a broken display template never renders garbage). pcall-isolated like invoke. Used by the
+// display-template render path (a body returning the assembled sheet string).
+func (rt *luaRuntime) invokeForString(ch *compiledChunk, inv *luaInvocation, binds map[string]lua.LValue) (string, bool) {
+	if rt == nil || rt.L == nil || ch == nil || ch.proto == nil {
+		return "", false
+	}
+	key := rt.breakerKeyFor(inv, ch.origin)
+	if rt.breakerDisabled(key) {
+		return "", false // quarantined: caller uses its fallback
+	}
+	L := rt.L
+	env := rt.freshCallEnv(binds)
+	fn := L.NewFunctionFromProto(ch.proto)
+	L.SetFEnv(fn, env)
+
+	prev := rt.inv
+	rt.inv = inv
+	defer func() { rt.inv = prev }()
+
+	top := L.GetTop()
+	if err := rt.runGuardedFn(key, ch.origin, fn, 0, 1); err != nil {
+		rt.log.Warn("lua display template error (isolated; using fallback)", "origin", ch.origin, "err", err.Error())
+		L.SetTop(top)
+		return "", false
+	}
+	ret := L.Get(-1)
+	L.SetTop(top)
+	if s, ok := ret.(lua.LString); ok {
+		return string(s), true
+	}
+	return "", false
+}
+
 // invokeForBool runs a compiled chunk (the pvp_allowed POLICY) and returns its boolean result.
 // SECURITY (fail-closed): a compile-absent chunk, a runtime error, or a non-boolean/false return
 // all yield (false) for the gate's "is harm allowed?" question — a missing or erroring policy

@@ -56,6 +56,9 @@ type LoadedContent struct {
 	// Commands are the pack-global custom Lua verbs (Phase 7.4e), accumulated across packs (last-write
 	// -wins by verb). The world side registers them into the per-shard custom-command table.
 	Commands []CommandDTO
+	// DisplayDefs are the pack-global display templates (Lua render body per surface), accumulated across
+	// packs (last-write-wins by surface). The world side registers them into the per-shard display table.
+	DisplayDefs []DisplayDefDTO
 	// Channels are the pack-global comms channel definitions (Phase 8.3), same last-write-wins
 	// override rule keyed by ref. The world side registers them into the per-shard channel registry
 	// and binds each channel's verb(s) into the per-shard channel-command table. An empty list => no
@@ -153,7 +156,8 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			}
 			lc.Formulas[name] = body
 		}
-		lc.Commands = append(lc.Commands, p.Commands...) // 7.4e: accumulate custom verbs
+		lc.Commands = append(lc.Commands, p.Commands...)          // 7.4e: accumulate custom verbs
+		lc.DisplayDefs = append(lc.DisplayDefs, p.DisplayDefs...) // display templates (last-write-wins by surface)
 		for i := range p.Zones {
 			z := p.Zones[i]
 			if idx, ok := idxByRef[z.Ref]; ok {

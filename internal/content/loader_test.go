@@ -2,6 +2,7 @@ package content
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -183,6 +184,20 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	}
 	if len(rc.Inputs) != 2 || rc.Output.Item != "midgaard:obj:leather-vest" || rc.Output.Bind != "bound" {
 		t.Fatalf("recipe inputs/output = %+v / %+v, want 2 inputs -> bound leather-vest", rc.Inputs, rc.Output)
+	}
+
+	// Display templates: the demo ships a `score` sheet template (the display-templating feature's first consumer).
+	var score *DisplayDefDTO
+	for i := range lc.DisplayDefs {
+		if lc.DisplayDefs[i].Surface == "score" {
+			score = &lc.DisplayDefs[i]
+		}
+	}
+	if score == nil {
+		t.Fatalf("display_defs = %+v, want a score template", lc.DisplayDefs)
+	}
+	if !strings.Contains(score.Render, "ui.sheet()") || !strings.Contains(score.Render, "self:name()") {
+		t.Fatalf("score template body does not build a ui.sheet with self: %q", score.Render)
 	}
 }
 

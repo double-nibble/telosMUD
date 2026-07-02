@@ -74,6 +74,7 @@ func (rt *luaRuntime) installHandleType() {
 		"short":            rt.hShort,
 		"attr":             rt.hAttr,
 		"resource":         rt.hResource,
+		"resource_max":     rt.hResourceMax,
 		"level":            rt.hLevel,
 		"has_affect":       rt.hHasAffect,
 		"affect_magnitude": rt.hAffectMagnitude,
@@ -217,6 +218,19 @@ func (rt *luaRuntime) hResource(l *lua.LState) int {
 		return 1
 	}
 	l.Push(lua.LNumber(resourceCurrent(e, name)))
+	return 1
+}
+
+// hResourceMax is self:resource_max(ref) — the entity's MAX for a resource (the denominator a display template
+// pairs with resource() for "cur/max"). nil on a stale handle. Read-only, like resource().
+func (rt *luaRuntime) hResourceMax(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	name := l.CheckString(2)
+	if e == nil {
+		l.Push(lua.LNil)
+		return 1
+	}
+	l.Push(lua.LNumber(resourceMax(e, name)))
 	return 1
 }
 

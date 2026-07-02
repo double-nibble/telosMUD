@@ -103,6 +103,20 @@ type Pack struct {
 	// (to_hit/soak/regen/xp_for) to a Lua body that returns a number, an alternative to the prefix-AST
 	// data formula. A ref uses the data formula OR the Lua one, never both.
 	Formulas map[string]string `json:"formulas" yaml:"formulas"`
+
+	// DisplayDefs are pack-GLOBAL display templates (docs/REMAINING.md display-templating): a Lua render body
+	// per SURFACE (score/who/inventory/room/…) that returns the rendered sheet string, typically built with the
+	// sandbox `ui` toolkit. Content-authored so a 5e vs WoW pack shows its own sheet layout, labels, and stat
+	// order without an engine change (the mechanism/flavor pillar). Same last-write-wins override-by-surface.
+	DisplayDefs []DisplayDefDTO `json:"display_defs" yaml:"display_defs"`
+}
+
+// DisplayDefDTO is one content-defined display template: a surface name and the Lua render body. The body runs
+// in the sandbox with `self` bound to the VIEWING entity's handle and returns a string (typically assembled with
+// `ui.sheet()`). Surfaces the engine consumes today: "score" (more — who/inventory/room — as they are wired).
+type DisplayDefDTO struct {
+	Surface string `json:"surface" yaml:"surface"` // e.g. "score", "who", "inventory"
+	Render  string `json:"render" yaml:"render"`   // Lua body returning the sheet string
 }
 
 // RegionDTO is one content-defined region (Phase 10.3, docs/WORLD-EVENTS.md §1): a named grouping of

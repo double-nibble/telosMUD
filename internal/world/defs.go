@@ -144,6 +144,11 @@ type defRegistries struct {
 	// body (7.4f). Both built once, read-only.
 	pvpLua   string
 	formulas map[string]string
+
+	// displayDefs is the per-shard DISPLAY-TEMPLATE table: a surface name ("score"/"who"/…) -> the Lua
+	// render body that returns the sheet string. Consulted by the surface's command (e.g. `score`), which
+	// runs the body with `self` bound and sends the result. Built once at construction, then read-only.
+	displayDefs map[string]string
 }
 
 // newDefRegistries builds an empty bundle (all three registries empty/published). A bare zone gets
@@ -165,6 +170,7 @@ func newDefRegistries() *defRegistries {
 		abilityCmds: map[string]*abilityDef{},
 		customCmds:  map[string]string{},
 		formulas:    map[string]string{},
+		displayDefs: map[string]string{},
 	}
 }
 

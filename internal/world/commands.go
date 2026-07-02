@@ -46,6 +46,7 @@ func registerCommands() []*Command {
 		// Common verbs next.
 		{Name: "look", Aliases: []string{"l"}, Run: cmdLook},
 		{Name: "say", Aliases: []string{"'"}, Run: cmdSay},
+		{Name: "score", Aliases: []string{"sc"}, Run: cmdScore},
 		{Name: "who", Run: cmdWho},
 		{Name: "tell", Run: cmdTell},
 		{Name: "reply", Run: cmdReply},
@@ -138,6 +139,18 @@ func cmdSay(c *Context) error {
 // same off-goroutine discipline the login epoch-resume and async character create use. The async frame is
 // written straight to the out channel (ack 0, like a comms frame), so it does not touch the zone-owned
 // appliedSeq from another goroutine.
+// cmdScore shows the actor their character sheet. The layout is CONTENT: if the pack defines a `score` display
+// template (a Lua render body built with the `ui` toolkit), it renders that with `self` bound to the actor;
+// otherwise it falls back to a minimal built-in sheet (name/level/resources) so the verb works for any pack.
+func cmdScore(c *Context) error {
+	if sheet, ok := c.z.renderDisplaySheet("score", c.Actor); ok {
+		c.Send(sheet)
+		return nil
+	}
+	c.Send(c.z.defaultScoreSheet(c.Actor))
+	return nil
+}
+
 func cmdWho(c *Context) error {
 	z := c.z
 	out := c.s.out

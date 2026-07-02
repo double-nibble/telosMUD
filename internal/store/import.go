@@ -107,6 +107,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM recipe_defs WHERE pack=$1`,
 		// Chargens (Phase 14.8): same strips-and-replaces idempotency.
 		`DELETE FROM chargen_defs WHERE pack=$1`,
+		// Display templates: same strips-and-replaces idempotency.
+		`DELETE FROM display_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -451,6 +453,17 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO chargen_defs (ref, pack, body) VALUES ($1,$2,$3)`, cg.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert chargen %s: %w", cg.Ref, err)
+		}
+	}
+	// Display templates: (pack, surface) PK, the Lua render body in the JSONB body.
+	for _, dd := range pk.DisplayDefs {
+		body, err := json.Marshal(displayDefBody{Render: dd.Render})
+		if err != nil {
+			return fmt.Errorf("store: marshal display_def %s body: %w", dd.Surface, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO display_defs (surface, pack, body) VALUES ($1,$2,$3)`, dd.Surface, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert display_def %s: %w", dd.Surface, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

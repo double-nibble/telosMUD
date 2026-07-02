@@ -55,6 +55,16 @@ func (z *Zone) customCommandFor(v string) string {
 	return b.customCmds[v]
 }
 
+// displayDef returns the Lua render body registered for a display surface ("score"/"who"/…), or "" when the
+// pack defines none (the caller then uses its built-in fallback). Lock-free read of the published per-shard table.
+func (z *Zone) displayDef(surface string) string {
+	b := z.defBundle()
+	if b == nil || b.displayDefs == nil {
+		return ""
+	}
+	return b.displayDefs[surface]
+}
+
 // runCustomCommand runs a custom command's Lua body for actor `s.entity`, binding `self` (the
 // actor handle) and `arg` (the verb's argument tail, textsan-cleaned). It is a clean ROOT
 // invocation (a player-issued command, not inside a cascade): depth 0, nil eventBudget — exactly

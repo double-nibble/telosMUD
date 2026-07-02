@@ -904,6 +904,25 @@ recipes:
     output: {item: midgaard:obj:leather-vest, bind: bound}
     announce: "A great roar echoes across the land — the Warden has returned!"
 
+# Display templates: content owns the layout of the character sheet. The `score` verb renders this with `self`
+# bound to the viewer; it builds the sheet with the `ui` toolkit (auto-sized columns, color-token markup that
+# renders at the edge). A pack that defines no score template falls back to the engine's minimal built-in sheet.
+display_defs:
+  - surface: score
+    render: |
+      local s = ui.sheet()
+      s:banner("{{FG_CYAN}}" .. self:name() .. "{{RESET}}", "=")
+      s:row({"Level", tostring(self:level())}, {"left", "right"})
+      s:divider("-")
+      s:row({"{{FG_GREEN}}Health{{RESET}}", self:resource("hp") .. "/" .. self:resource_max("hp")}, {"left", "right"})
+      s:row({"{{FG_BLUE}}Mana{{RESET}}",   self:resource("mana") .. "/" .. self:resource_max("mana")}, {"left", "right"})
+      s:divider("-")
+      s:row({"Strength",     tostring(self:attr("strength"))},     {"left", "right"})
+      s:row({"Intellect",    tostring(self:attr("intellect"))},    {"left", "right"})
+      s:row({"Constitution", tostring(self:attr("constitution"))}, {"left", "right"})
+      s:divider("=")
+      return s:render()
+
 zones:
   - ref: midgaard
     name: The City of Midgaard
