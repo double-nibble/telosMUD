@@ -5280,3 +5280,49 @@ DOMAIN sections into dependency-ordered TRACKS (a shared-seam map + 8 hard order
   containers (hidden contents differ, e.g. two corpses with different loot) list individually. Listing lines are
   now presentation initial-capped (folded into the same helper). GMCP `Char.Items.List` count mirror deferred to
   Track 7. Reviewed by mudlib + progression; full e2e tier verified against a rebuilt stack. (commit e14d24d)
+
+# Burn-down round 4 — content display-templating subsystem (2026-07-01)
+
+The Track-1 `score` item revealed itself as the first consumer of a GENERAL content-authored display-templating
+subsystem (the user's expanded vision). Built as five board-reviewed, CI-green slices. **Template LANGUAGE decided
+with the user:** a sandboxed Lua render func returning a string (reuses the existing gopher-lua sandbox/budget/
+breaker/hot-reload; native loops/conditionals; sidesteps the `{{ }}` collision a Jinja-style `{{ var }}` would
+have with the shipped color markup). On top of it, a `ui` "Bootstrap for console" toolkit so authors describe
+tables, never compute widths.
+
+- **`internal/consoleui` layout engine + `internal/colormarkup` shared tokenizer.** consoleui: a builder for
+  dividers/banners/columnar rows (L/R/C align)/spans, auto/fixed/"full" width, truncate-with-ellipsis; sizing is
+  DISPLAY-width aware (CJK/combining, via `internal/textwidth`) and COLOR-token aware. The edge review caught a
+  ship-blocker — a second `{{...}}` tokenizer would drift from the edge on unknown/typo'd tokens (which render as
+  LITERAL visible text, not zero-width) — so the `{{TOKEN}}` vocabulary+tokenizer was extracted from
+  telnet/color.go into a shared leaf `internal/colormarkup` (Render/Strip/ScanTokenRun); edge + width-measurement
+  now share ONE tokenizer. Injection-safety proof moved to the leaf (security-audited intact). Reviewed by edge +
+  security + test. (commit 273ef24)
+- **Baked-in RTL bidi isolation + LRM base-pin.** Cells with RTL text (bidi class R/AL/AN) auto-wrap in FSI…PDI so
+  a bidi terminal can't reorder them across columns; fitCell truncates-before-isolate + pads-outside; a line
+  carrying RTL is prefixed LRM to pin base direction LTR (an RTL column 0 would else flip the whole grid on a
+  first-strong terminal); truncateVisible closes any open isolate before the ellipsis. `\u` escapes (no
+  Trojan-Source bytes in source). Reviewed by edge + test. (commit 4b52485)
+- **`ui.sheet()` Lua sandbox binding + DoS hardening.** Exposes consoleui to content Lua:
+  `:row(cells[,aligns]):rows(list,mapFn):span():divider():banner():render()`, chaining, string aligns, auto/
+  number/"full" width. Mirrors the handle/timer userdata conventions; read-only module like `mud`; rows() mapper
+  added to the sole-chokepoint lint allowlist. Security audit found + closed an OOM-class alloc bomb (auto-width ×
+  rows in one deadline-blind Go builtin, ~440 MiB): a `consoleui.MaxWidth` ceiling that caps every column AND
+  makes renderRow STOP building a row at the table width (kills the cells×colW amplifier → worst transient ~6 MiB)
+  plus four add-time caps (width/elems/columns/input-bytes), fail-closed. Reviewed by scripting + security + edge.
+  (commit 97fcd38)
+- **`display_defs` content table + the `score`/`sc` command + Postgres persistence.** A Lua render body per
+  SURFACE (`DisplayDefDTO`, `Pack.DisplayDefs`, per-shard registry, `renderDisplaySheet` + a new `invokeForString`,
+  a new `self:resource_max()` handle accessor); `score` renders the content template if present else a built-in Go
+  fallback sheet. The e2e caught that the docker world loads content from Postgres and YAML-only defs (like
+  Commands) don't survive — so a `display_defs` table (migration 00018) + import/load was added, moving DisplayDefs
+  into the reflect drift-guard's COVERED set. `TestScoreSheetE2E` proves the demo template renders with SGR at the
+  edge (no literal-markup leak). Reviewed by persistence + mudlib + scripting. (commit 15ed817)
+- **`inventory` + `equipment` display surfaces.** Both commands now consult a content template (render(self) via
+  self:contents()/self:equipment()) with the built-in listing as a byte-identical fallback; added to
+  `consultedDisplaySurfaces`. No demo templates shipped (the demo-content buildout is a later project). Reviewed by
+  mudlib + test. (commit 97b0db7)
+
+Deferred (documented): `who` (async roster collection — needs a list binding + on-goroutine render), `look`/room
+(exits/occupants/items handle-API expansion), a per-slot equipment LABEL accessor, edge CHARSET-gating of the bidi
+controls for non-UTF-8 clients, and the truncate-drops-a-color-reset cosmetic bleed.

@@ -16,8 +16,9 @@ seam are independent and can run in parallel — the constraints that matter are
 ## Shared seams (the touch-the-same-code map)
 
 - **Render path** — `internal/world/act.go`, `lookRoom`, item-listing, `internal/telnet` `Write`/`sanitizeOutput`,
-  the `internal/textwidth` display-width helper → *Track 1* (coalescing + `score` remain; ANSI color,
-  capitalization, and the UTF-8 tests SHIPPED — round 3).
+  `internal/textwidth`, `internal/consoleui`, `internal/colormarkup` → *Track 1* SHIPPED (ANSI color, capitalization,
+  coalescing, UTF-8/RTL, and the whole display-templating subsystem — rounds 3–4); only small follow-ups remain
+  (more display surfaces on the shipped mechanism, GMCP token-strip, the coalescing `(N)`→GMCP count).
 - **`canSee`/`nameFor` visibility chokepoint** → *Track 2* (holylight/visibility flags, `who`-filter, GMCP
   `Char.Status` visibility, `Room.Players`).
 - **`Resolve`/parser + content aliases** → *Track 3* (alias system, `craft <name>`, salvaging object-targeting).
@@ -40,8 +41,38 @@ seam are independent and can run in parallel — the constraints that matter are
 4. **Director-owned drain ownership** (Track 6) **before / with** wiring placement to DRIVE `BeginDrain`.
 5. **Rest mechanic** (Track 5) **before** firing `OnRest` and **before** the 5eSRD pack's short/long rest (Track 8).
 6. **Directory-tree loader** (Track 8) **before** the 5eSRD / WoWSRD packs.
-7. **Display-width helper** (SHIPPED, `internal/textwidth`) — `score`'s column framing (Track 1) must use it,
-   measuring `Width(stripTokens(s))` so color markup doesn't inflate the width.
+7. ~~Display-width helper → score framing~~ — SATISFIED (round 4): `internal/consoleui` frames all sheets with
+   the color-token-aware `internal/textwidth` measure; any future word-wrap must reuse it.
+
+---
+
+## Suggested ordering for the next burn-down (round 5)
+
+The Track-1 render subsystem (color, capitalization, coalescing, UTF-8/RTL, the whole display-templating stack)
+is DONE. What's left is a handful of small/medium items scattered across tracks, plus a cluster of [LARGE]s. The
+user's operating model: knock out the small ones each pass, plan the LARGEs, repeat until only LARGEs remain.
+Proposed order:
+
+- **A. Small-items sweep (quick, de-risking) — start here.** Track 0: close the `Commands`/`PvpLua`/`Formulas`
+  Postgres gap (now a KNOWN pattern — identical to the `display_defs` persistence just shipped) + the scope-state
+  CAS re-run-safety fix; the GMCP `{{token}}`-strip guard rail (Track 1, security-adjacent, before content is
+  broadly colored); the stale Phase-14 docstrings sweep; the `on_roll` unknown-ref diagnostic (Track 4); the
+  `drop`-refuses-equipped + `keep`/`unkeep` (Track 4, the independent parts); Track 10 channel HEAR/SPEAK split +
+  "comms unavailable" notice; the per-session `who` cooldown.
+- **B. Medium items.** Track 5 rest mechanic → fire `OnRest` + the live on-change vitals (same `setResourceCurrent`
+  funnel); the discrete Track 6 items (mail dead-letter reaper, drain reclaim metrics + bus-lag stamp, durable
+  DOWN snapshot-on-join); the Track 7 GMCP enrichments (Char.Items deltas — carries the coalescing `(N)` count,
+  Comm.Channel raw text, Char.Stats/Vitals gauge flags).
+- **C. The [LARGE]s — plan each, then build, in dependency order.**
+  1. **Content install & reload** (Track 8, design SETTLED) — highest leverage: it unblocks the demo-content
+     project (the acceptance test) and spans director + loader + reload. Split `demo.yaml` into the tree first.
+  2. **Visibility / builder-wizard trust tier** (Track 2) — foundation for GMCP `Char.Status`/`Room.Players` +
+     the `who` filter + the trusted full-screen-ANSI mode + the remaining display surfaces' visibility.
+  3. **Cross-content alias/targeting** (Track 3) — unblocks the Track 4 gear cluster.
+  4. **Track 4 gear cluster** (after Track 3): worn-affix + `wear_slots`, `affix_defs`, salvaging.
+  5. **Lua director script** (Track 6), **builder `help` system** (standalone), and finally the **demo packs**
+     (Track 8: 5eSRD/WoWSRD — the zero-engine-change acceptance test, after content-install + the features they
+     showcase).
 
 ---
 
@@ -54,7 +85,11 @@ seam are independent and can run in parallel — the constraints that matter are
   custom Lua verbs (`Commands`), PvP policy (`PvpLua`), and ruleset `Formulas` are NOT persisted through
   `ImportPack`/`Load` — no INSERT/DELETE/SELECT in `internal/store/import.go`/`content.go`. A DB-SEEDED pack
   silently loses them (they survive only via the embedded-YAML load path). Decide whether that's intentional
-  (embedded-only) or a gap to close with a store path (a def table or pack_meta columns) + reflect-net coverage. · *persistence*
+  (embedded-only) or a gap to close with a store path (a def table or pack_meta columns) + reflect-net coverage.
+  **`DisplayDefs` was the same shape and was CLOSED (round 4): a `display_defs` table (migration 00018) + import/
+  load, now in the reflect net — `Commands` INSERT/DELETE/SELECT is the exact same pattern if we close it.**
+  NOTE: the content-install [LARGE] moves the source of truth to an EXTERNAL versioned store (git/S3), so this PG
+  gap may become moot for those three — decide alongside that design. · *persistence*
 - **UTF-8 coverage gaps NOT yet closed by the render-path tests (found in review).** The say-echo + output
   sanitize cover the `$t` verbatim + strip seams; still UNVERIFIED for multibyte: (1) **GMCP JSON payloads**
   — highest value, they BYPASS `sanitizeOutput` entirely (Room.Info names, Comm.Channel bodies) and have only
@@ -81,30 +116,30 @@ initial-cap SHIPPED — see COMPLETED.md "Burn-down round 3". Still-open color f
   `Room.Info`) or a `channel_def` format (→ `Comm.Channel.Text` raw body) ships literal `{{tokens}}` to a rich
   client (JSON-escaped so injection-safe, just cosmetic). Strip via a `renderColor(s,false)` helper on the GMCP
   text fields, or a content-lint rejecting tokens in names/formats, BEFORE builders are broadly told they can
-  color any content. (3) **width-aware framing:** `score`'s column measure + any future word-wrap must measure
-  `Width(stripTokens(s))`, not the raw markup. (4) optional **semantic aliases** (`{{ENEMY}}` → direct tokens,
-  only if a pack wants global re-theming). See [[content-alias-and-salvage-direction]]. · *edge/mudlib*
-*The Track-1 render PRIMITIVES all SHIPPED (COMPLETED.md "Burn-down round 3"): `{{TOKEN}}` ANSI color,
-presentation initial-cap, item coalescing (`A torch (5)`), and the UTF-8/textwidth work. Only `score` remained —
-and it revealed itself as the first consumer of a LARGE templating subsystem, below. Still-open coalescing
-follow-up: mirror the `(N)` count into GMCP `Char.Items.List` — coordinate with Track 7 (do it with/after the
-Char.Items delta restructure so the count field isn't re-placed).*
+  color any content. (3) ~~width-aware framing~~ — DONE: `internal/consoleui` measures visible width
+  (color-token + display-width aware) for all sheet framing; any FUTURE word-wrap must reuse that. (4) optional
+  **semantic aliases** (`{{ENEMY}}` → direct tokens, only if a pack wants global re-theming). See
+  [[content-alias-and-salvage-direction]]. · *edge/mudlib*
+*The display-templating subsystem SHIPPED (COMPLETED.md "Burn-down round 4"): `internal/consoleui` layout engine
++ `internal/colormarkup` shared tokenizer, RTL bidi isolation, the `ui.sheet()` Lua sandbox binding (DoS-hardened),
+the `display_defs` content table + Postgres persistence (migration 00018), and the `score`/`sc`, `inventory`,
+`equipment` surfaces (Lua render body per surface, built-in fallback). Template language = a sandboxed Lua render
+func + the `ui` toolkit. Still-open in this area:*
 
-- **[LARGE] Content-defined display-templating subsystem (`score` is its first consumer).** The user wants a
-  GENERAL content-authored display-template mechanism, NOT a score-specific sheet: named surfaces include ROOM
-  descriptions, the `score` sheet, GUILD sheets, PROFESSION sheets, INVENTORY, `who` lists — an OPEN set ("to
-  name a few"). A content template references engine state by ref (resource/attribute/track refs, entity
-  fields, currency, carry-weight) and the engine renders it, so a 5e vs WoW pack shows its own stat
-  names/order/labels/sections with ZERO engine change (the mechanism/flavor pillar). MUST compose with the
-  shipped Track-1 primitives: `{{TOKEN}}` color, the `textwidth` framing (measure `Width(stripTokens(s))`),
-  capitalization, and coalescing (the inventory template needs the `(N)` grouping). **Design forks for the
-  design pass (ASK user):** the template LANGUAGE — a small engine-evaluated layout DSL (rows/columns/sections
-  referencing refs) vs a structured-YAML layout vs a sandboxed Lua render hook (scripting surface exists); one
-  generic `display_template` def table vs per-surface DTOs; conditional/repeated rows (e.g. one row per track);
-  persistence (a def table → rides the Track-0 reflect-walk store net). Build `score` FIRST to prove the
-  abstraction, then generalize. **`score` content:** name+title, vital pools (`HP: 150(150)`), currency, XP
-  `have/next`, carry-weight %, progression levels, the attribute grid — all already engine state (GMCP clients
-  get it via `Char.Stats`/`Char.Vitals`). See [[content-display-templates-direction]]. · *mudlib/edge/content*
+- **Remaining display surfaces (small each, on the shipped mechanism).** Wire more commands to
+  `renderDisplaySheet` as they fit: (a) **`who`** — renders a COLLECTION fetched ASYNC off the zone goroutine, so
+  it needs a list binding + the Lua render threaded back onto the zone goroutine (single-writer), not the
+  render(self) shape; (b) **`look`/room** — exits + occupants + coalesced items = a real handle-API expansion;
+  (c) a per-slot **equipment LABEL accessor** on the handle (`self:equipment()` is a bare list today) so an
+  equipment template can show `<worn on head>`. guild/profession surfaces have NO command yet and need new
+  content → they belong to the demo-content project (Track 8), not here. · *mudlib/edge*
+- **Display-templating cleanup follow-ups (minor).** (a) `consoleui.truncateVisible` drops a cell's closing
+  `{{RESET}}` mid-truncation → color can bleed until the edge's end-of-frame reset (cosmetic, bounded; the isolate
+  pair it DOES close since it owns them); (b) the bidi isolate/LRM controls should be gated on the edge's
+  negotiated CHARSET (stripped for non-UTF-8 clients, like ANSI is gated on color) — an EDGE follow-up, since
+  consoleui can't see the client encoding. See [[content-display-templates-direction]]. · *edge/mudlib*
+- **Coalescing → GMCP `Char.Items.List` count.** Mirror the `A torch (5)` `(N)` count into the GMCP item list —
+  coordinate with Track 7 (do it with/after the Char.Items delta restructure so the count field isn't re-placed). · *edge*
 
 ## Track 2 — Visibility & the `canSee`/`nameFor` chokepoint  ·  [LARGE] foundation + its consumers
 
@@ -164,8 +199,8 @@ salvaging items build on; `affix_defs` and worn-affix both touch the affix data 
   for the by-slot render; the drop-refusal + keep/unkeep are independent and can land earlier. · *mudlib/edge*
 - **[LARGE] Normalized `affix_defs` table (Phase 12.3).** A shared `affix_defs` content table (named affixes by
   ref) de-duplicates the pools inline in each loot entry's `quality` spec and enables richer legendaries. A
-  first-class def table on the scale of `recipe_defs`/`bundle_defs`: migration (`00018_affix_defs.sql`, the
-  `ref/pack/JSONB body` pattern), an `AffixDefDTO`, loader + `LoadedContent.Affixes`, a per-shard registry,
+  first-class def table on the scale of `recipe_defs`/`bundle_defs`: migration (`00019_affix_defs.sql` — 00018 is
+  now `display_defs`; the `ref/pack/JSONB body` pattern), an `AffixDefDTO`, loader + `LoadedContent.Affixes`, a per-shard registry,
   build-time resolution (a `quality` affix entry gains a `ref` alternative to inline `attr/min/max`, resolved in
   `buildLootTableDef`), the store round-trip, tests, demo usage. **Design fork:** first-class table (edit-once →
   propagates on reload; the normalized choice) vs. loader-time EXPANSION (resolve refs into inline pools before
@@ -251,10 +286,19 @@ change; the Lua director script is the big substrate the smaller Go handlers cou
 (Track 3), and rest (Track 5). The directory-tree loader precedes the packs (constraint 6).
 
 - **[LARGE] Multi-file demo packs — the multi-system acceptance sprint.** Two parts:
-  - **Directory-tree pack assembly (loader) [FIRST].** Support a pack as a TREE of small files the loader walks +
-    assembles into one logical pack (`content/packs/<pack>/common/*.yaml`,
-    `.../areas/<area>/{rooms,enemies,bosses,vendors}/*.yaml`, `.../scripts/*.lua`), feeding the SAME
-    import/`LoadedContent` path (embedded + DB seed). Payoff: edit ONE area/boss file without touching the rest.
+  - **[LARGE] Content install & reload pipeline [FIRST] — DESIGN SETTLED (2026-07-01), see
+    [[content-install-and-reload-direction]].** Grew beyond a dir-walk into the whole install story:
+    (1) **layout** — a pack is a directory TREE of small files (`content/packs/<pack>/` with a `pack.yaml` manifest
+    + `attributes.yaml`/`abilities/*.yaml`/`zones/<z>/rooms/*.yaml`/…), merged by the loader (extend across-packs
+    last-write-wins to across-FILES); (2) **source of truth = an EXTERNAL versioned store** (git/S3; CI publishes
+    an immutable versioned snapshot — NO in-game editing); (3) **DIRECTOR-coordinated apply** for multi-shard
+    consistency: author publishes version N → director validates (compiles?) → broadcasts a SCOPED `content.reload`
+    over the event bus → each shard PULLS + hot-swaps (triggers: git-push/CI, a webhook, or an in-game
+    `reload <scope>` builder command; director poll as fallback); (4) **scope-mapped reload** — zone/region/world;
+    AREA content reloads live, SHARED defs (attrs/abilities/combat) may need a rolling reboot (accepted); (5) an
+    **embedded CORE pack** for bootstrap (a start room + builder verbs + minimal scaffold) so a fresh server boots
+    and builders can connect+reload. Spans this track + Track 6 (director) + Track 9 (shared-def reload). Payoff:
+    edit ONE area/boss file, push, reload just that area. First move: split `demo.yaml` into the tree.
   - **The three packs (content authoring) [after the engine features they showcase].** (1) Split `demo.yaml`
     into `content/packs/demo/basic/…` (Diku/ROM reference tree). (2) `content/packs/5eSRD` — the CC-BY 5e SRD as
     pure content (Vancian slots, six abilities → modifiers + proficiency, advantage, class/subclass/background,
@@ -272,7 +316,9 @@ change; the Lua director script is the big substrate the smaller Go handlers cou
 - **Shared-def hot reload (7.7).** `reload.go buildPrototype` handles only Room/Item/Mob; a `(kind,ref)`
   invalidation for a SHARED def (ability/affect/formula/`pvp_allowed` policy) is skipped and `z.defs` is
   boot-immutable — no live edit path to a pvp policy / formula. When a slice swaps `z.defs` at runtime, hook that
-  seam and re-run the pvp permissive→restrictive end-to-end check. · *world/persistence*
+  seam and re-run the pvp permissive→restrictive end-to-end check. **This is the "shared defs" leg of the settled
+  content-install reload design ([[content-install-and-reload-direction]]): the user accepts shared-def/mudlib
+  changes may need a ROLLING REBOOT rather than a live swap — so a safe live path here is optional, not required.** · *world/persistence*
 - **`reloadLua` chunk-cache invalidation is a substring match (perf, minor).** `reload.go` uses
   `strings.Contains(key, ref)`, over-invalidating; tighten with a keyed `ref → {chunk keys}` index if the chunk
   cache grows large. Same file as above — batch them. · *scripting/perf*
@@ -313,6 +359,14 @@ change; the Lua director script is the big substrate the smaller Go handlers cou
   TRUNCATE their rows, so they PASS only on a fresh DB (CI) and FAIL on a re-run against a persistent local DB.
   Fix: `t.Cleanup` a TRUNCATE, or key each run off a unique suffix — the "gated tests must be re-run safe"
   discipline the pack/reflect tests already honor (they strip-and-replace). · *tests*
+- **[Launch milestone] Squash the goose migrations to a baseline.** By launch there are 18+ incremental
+  `db/migrations/*.sql`. Goose can't reverse-engineer/regenerate — the method is a SQUASH: fresh PG → `goose up`
+  all → `pg_dump --schema-only` → replace `00001..N` with one `00001_baseline.sql` → apply to a fresh DB +
+  `pg_dump` again + diff-verify EMPTY. Clean ONLY while there is NO live server (dev+CI apply from zero, no
+  `goose_db_version` history to reconcile); do it ONCE at a stable/launch milestone, not repeatedly. Wrap as a
+  `make squash-migrations` target. At squash time also REVIEW the def tables — the content-install [LARGE] moves
+  content to an external store, so some def tables (`recipe_defs`, `display_defs`, …) may be vestigial and
+  shouldn't be baked into the baseline. See [[content-install-and-reload-direction]]. · *persistence/hygiene*
 - **Delete merged local branches as work lands.** · *hygiene*
 
 ## Blocked / deferred (waiting on another slice — don't start cold)
@@ -338,6 +392,12 @@ NaN/±Inf fail-closed guard, the OnKill kill-magnitude cap (`xp_value` + fallbac
 reconciliation, the recipe skill-gate `track` resolution, the content-configurable profession cap + uncapped
 kind; the two flaky gate tests, the orphaned `account_auth`/`ssh_keys` drop migration (00017), the stale
 `oauth.go` header.
+
+*Round 4 (2026-07-01) — COMPLETED.md → "Burn-down round 4":* the content display-templating subsystem —
+`internal/consoleui` layout engine + `internal/colormarkup` shared tokenizer, baked-in RTL bidi isolation, the
+`ui.sheet()` Lua sandbox binding (DoS-hardened after a security-audit OOM find), the `display_defs` content table
++ Postgres persistence (migration 00018), and the `score`/`sc` + `inventory` + `equipment` surfaces. Also settled
+the content-install & reload [LARGE] design and logged the migration squash-to-baseline as a launch follow-up.
 
 *Round 3 (2026-07-01) — COMPLETED.md → "Burn-down round 3":* the `rollOpAmount` dedupe; the
 `learn_profession.profession` → `kind:profession` content-lint; the `on_roll(ctx)` Lua loot hatch; the
