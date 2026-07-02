@@ -16,10 +16,20 @@ import (
 // template for a surface, the command falls back to a minimal built-in sheet so the verb always works.
 
 // consultedDisplaySurfaces is the set of surfaces the engine ACTUALLY renders today. defineGlobals warns at
-// load when a pack defines a template for a surface NOT in this set (a dead seam). Grow it as who/inventory/
-// room/… are wired to their commands.
+// load when a pack defines a template for a surface NOT in this set (a dead seam). Grow it as more commands
+// are wired.
+//
+// Wired: the self-subject, synchronous, on-zone-goroutine commands (render(self) fits them directly). Deferred,
+// because they don't fit the render(self) shape as-is:
+//   - who: renders a COLLECTION (the roster), fetched ASYNC off the zone goroutine — needs a list binding and
+//     the Lua render threaded back onto the zone goroutine (single-writer), not a self-subject render.
+//   - look/room: the room render weaves in exits/occupants/coalesced items — a large handle-API expansion.
+//   - equipment templates that want per-slot LABELS need a slot accessor on the handle (self:equipment() is a
+//     bare handle list today); wireable now for a name-only sheet, richer with that follow-up accessor.
 var consultedDisplaySurfaces = map[string]bool{
-	"score": true,
+	"score":     true,
+	"inventory": true, // cmdInventory (render(self) via self:contents())
+	"equipment": true, // cmdEquipment (render(self) via self:equipment())
 }
 
 // renderDisplaySheet runs the pack's Lua render body for `surface` with `self` bound to the viewing entity's

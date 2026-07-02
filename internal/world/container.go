@@ -52,6 +52,12 @@ func containerCommands() []*Command {
 // inventory but is shown by equipment, so inventory lists only the items NOT in a worn slot
 // — the "in your hands/pack" set — matching player expectation. Pure read; no mutation.
 func cmdInventory(c *Context) error {
+	// Content may template the inventory sheet (a `render(self)` body iterating self:contents()); absent one,
+	// fall through to the built-in coalesced listing.
+	if sheet, ok := c.z.renderDisplaySheet("inventory", c.Actor); ok {
+		c.Send(sheet)
+		return nil
+	}
 	wr, _ := Get[*Wearer](c.Actor)
 	var held []*Entity
 	for _, item := range c.Actor.contents {
@@ -78,6 +84,12 @@ func cmdInventory(c *Context) error {
 // cmdEquipment lists what the actor is wearing/wielding/holding by slot (MUDLIB §6). Reads
 // the Wearer slot map in canonical slot order. Pure read.
 func cmdEquipment(c *Context) error {
+	// Content may template the equipment sheet (a `render(self)` body iterating self:equipment()); absent one,
+	// fall through to the built-in by-slot listing.
+	if sheet, ok := c.z.renderDisplaySheet("equipment", c.Actor); ok {
+		c.Send(sheet)
+		return nil
+	}
 	wr, ok := Get[*Wearer](c.Actor)
 	var b strings.Builder
 	b.WriteString("You are using:")

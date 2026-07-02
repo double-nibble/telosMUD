@@ -3,7 +3,27 @@ package world
 import (
 	"strings"
 	"testing"
+
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
+
+// drainAllText reads every currently-queued frame (non-blocking) and returns their output markup joined by
+// newlines — used when a test issues more than one command so a lingering prompt frame from the previous
+// dispatch doesn't get mistaken for the next command's output.
+func drainAllText(out chan *playv1.ServerFrame) string {
+	var b strings.Builder
+	for {
+		select {
+		case f := <-out:
+			if o := f.GetOutput(); o != nil {
+				b.WriteString(o.GetMarkup())
+				b.WriteByte('\n')
+			}
+		default:
+			return b.String()
+		}
+	}
+}
 
 // luadisplay_test.go — gates for the content display-template path (luadisplay.go): the `score` command renders
 // a pack-defined template when present, else the built-in fallback sheet.
@@ -48,6 +68,86 @@ func TestScoreContentTemplate(t *testing.T) {
 	if !strings.Contains(out, "Tara") {
 		t.Fatalf("content template did not bind self:name(): %q", out)
 	}
+}
+
+// TestInventorySurface: cmdInventory renders a pack `inventory` template when present (and the template can read
+// the viewer's carried items via self:contents()), else the built-in coalesced listing, and fails closed to the
+// built-in on a broken (non-string) template.
+func TestInventorySurface(t *testing.T) {
+	t.Run("template binds self:contents()", func(t *testing.T) {
+		z := newZone("inv")
+		z.defBundle().displayDefs["inventory"] = `
+			local s = ui.sheet()
+			for _, item in ipairs(self:contents()) do
+				s:row({item:name()})
+			end
+			return s:render()`
+		s := scorePlayer(z, "Bilbo")
+		addTestItem(z, s.entity, "a magic ring", []string{"ring"})
+		z.dispatch(s, "inventory")
+		if out := drainText(t, s.out); !strings.Contains(out, "a magic ring") {
+			t.Fatalf("inventory template did not see the self:contents() item: %q", out)
+		}
+	})
+	t.Run("fallback", func(t *testing.T) {
+		z := newZone("inv")
+		s := scorePlayer(z, "Bilbo")
+		z.dispatch(s, "inventory")
+		if out := drainText(t, s.out); !strings.Contains(out, "You are carrying") {
+			t.Fatalf("no-template inventory should use the built-in listing: %q", out)
+		}
+	})
+	t.Run("non-string template falls back", func(t *testing.T) {
+		z := newZone("inv")
+		z.defBundle().displayDefs["inventory"] = `return 42`
+		s := scorePlayer(z, "Bilbo")
+		z.dispatch(s, "inventory")
+		if out := drainText(t, s.out); !strings.Contains(out, "You are carrying") {
+			t.Fatalf("a non-string inventory template should fall back to the built-in: %q", out)
+		}
+	})
+}
+
+// TestDisplaySurfaceIsolation pins that a template for one surface does NOT affect another (guards the
+// "wrong surface key" bug class): defining `inventory` leaves `equipment` on its built-in listing.
+func TestDisplaySurfaceIsolation(t *testing.T) {
+	z := newZone("iso")
+	z.defBundle().displayDefs["inventory"] = `return "CUSTOM-INV"`
+	s := scorePlayer(z, "Frodo")
+
+	z.dispatch(s, "inventory")
+	if out := drainAllText(s.out); !strings.Contains(out, "CUSTOM-INV") {
+		t.Fatalf("inventory template not applied: %q", out)
+	}
+	z.dispatch(s, "equipment")
+	if out := drainAllText(s.out); !strings.Contains(out, "You are using") {
+		t.Fatalf("equipment must stay on its built-in when only inventory is templated: %q", out)
+	}
+}
+
+// TestEquipmentSurface: cmdEquipment renders a pack `equipment` template when present, else the built-in
+// by-slot listing.
+func TestEquipmentSurface(t *testing.T) {
+	t.Run("template", func(t *testing.T) {
+		z := newZone("eq")
+		z.defBundle().displayDefs["equipment"] = `
+			local s = ui.sheet()
+			s:banner("GEAR", "=")
+			return s:render()`
+		s := scorePlayer(z, "Gimli")
+		z.dispatch(s, "equipment")
+		if out := drainText(t, s.out); !strings.Contains(out, "GEAR") {
+			t.Fatalf("equipment template not rendered: %q", out)
+		}
+	})
+	t.Run("fallback", func(t *testing.T) {
+		z := newZone("eq")
+		s := scorePlayer(z, "Gimli")
+		z.dispatch(s, "equipment")
+		if out := drainText(t, s.out); !strings.Contains(out, "You are using") {
+			t.Fatalf("no-template equipment should use the built-in listing: %q", out)
+		}
+	})
 }
 
 // TestScoreTemplateErrorFallsBack: a broken template (returns a non-string) fails closed to the built-in sheet
