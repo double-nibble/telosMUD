@@ -370,6 +370,12 @@ func (rt *luaRuntime) installSandbox() {
 	// banners, rows, spans) content display templates render sheets with. No world state / no harm.
 	rt.installUITable()
 
+	// Register the `gmcp` custom-frame handle (luagmcp.go, #51): gmcp.send(player, pkg, table) emits a
+	// content-namespaced (Mud.*) GMCP frame to a rich client, guarded by a fail-closed namespace allowlist
+	// (content can't spoof Char.*/Core.*) + a bounded payload encoder. The gate's outbound support filter
+	// still applies, so a client that didn't advertise the package stays silent.
+	rt.installGMCPTable()
+
 	// Arm the default per-call budgets (T3/T4). The per-call re-arm chokepoint is slice 7.5;
 	// arming once here makes the abort path live and testable now.
 	L.SetInstructionBudget(luaInstrBudget)
