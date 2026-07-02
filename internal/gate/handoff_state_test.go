@@ -256,11 +256,14 @@ func TestCrossShardHandoffCarriesWornGear(t *testing.T) {
 	term.expectCount(t, "<head> an iron helmet", 2)
 	term.expectCount(t, "<wielded> a steel longsword", 2)
 
-	// FUNCTIONAL clincher: the items are really HERE, not just re-echoed. remove unslots the helmet and
-	// drop puts the sword on darkwood's floor — both succeed ONLY if the gear actually transferred (the
-	// grove has no helmet/sword of its own to satisfy these).
+	// FUNCTIONAL clincher: the items are really HERE, not just re-echoed. remove unslots the helmet, and
+	// remove+drop puts the sword on darkwood's floor — succeeding ONLY if the gear actually transferred
+	// (the grove has no helmet/sword of its own). NOTE (#36): drop now REFUSES a still-worn item, so the
+	// sword must be `remove`d before it can be dropped.
 	term.send(t, "remove helmet")
 	term.expect(t, "You stop using an iron helmet.")
+	term.send(t, "remove sword")
+	term.expect(t, "You stop using a steel longsword.")
 	term.send(t, "drop sword")
 	term.expect(t, "You drop a steel longsword.")
 

@@ -89,6 +89,7 @@ type itemDeltaJSON struct {
 	Quality *itemQualityJSON `json:"quality,omitempty"`
 	Bound   bool             `json:"bound,omitempty"`
 	Stack   int              `json:"stack,omitempty"`
+	Kept    bool             `json:"kept,omitempty"` // #36: the per-item keep (no-drop) flag survives a reload
 }
 
 // dumpItemDelta marshals an item instance's per-instance delta (quality + bound + stack) to its
@@ -102,7 +103,8 @@ func dumpItemDelta(item *Entity) json.RawMessage {
 	if s, ok := Get[*Stack](item); ok {
 		d.Stack = s.count // Phase 13.2: a partially-used material stack survives a reload
 	}
-	if d.Quality == nil && !d.Bound && d.Stack == 0 {
+	d.Kept = isKept(item)
+	if d.Quality == nil && !d.Bound && d.Stack == 0 && !d.Kept {
 		return nil
 	}
 	b, err := json.Marshal(d)
@@ -130,5 +132,8 @@ func loadItemDelta(item *Entity, delta json.RawMessage) {
 	}
 	if d.Stack != 0 {
 		setItemStackCount(item, d.Stack) // Phase 13.2
+	}
+	if d.Kept {
+		keepItem(item) // #36
 	}
 }
