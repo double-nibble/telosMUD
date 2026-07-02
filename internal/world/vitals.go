@@ -19,10 +19,13 @@ import (
 // Coalescing / cadence: the live push is at the combat-ROUND boundary (one PULSE_VIOLENCE), NOT per
 // setResourceCurrent — a per-change push would re-emit the text prompt every heartbeat during passive
 // regen (spam). The round-boundary flush is change-detected (bytes.Equal against s.lastVitals), so it
-// emits at most once per round and only when a vital actually moved. Live updates for non-combat
-// changes (passive regen ticks) are a documented follow-up — they want a slower prompt cadence than the
-// per-heartbeat tick to stay readable. Default OFF: a fresh session keeps the classic bare "> " prompt
-// and updates on its own command, so existing behavior + tests are unchanged until a player opts in.
+// emits at most once per round and only when a vital actually moved. Two things are a documented
+// follow-up (not gaps in the combat case #40 targets): (1) live updates for non-combat changes (passive
+// regen ticks) — they want a SLOWER prompt cadence than the per-heartbeat tick to stay readable; and
+// (2) flushLiveVitals pushes only Char.Vitals + the prompt, not the Char.Status/Char.Stats deltas
+// sendPrompt sends, so a mid-combat status change with ZERO vital movement reaches a rich client's
+// status panel only on the player's next command. Default OFF: a fresh session keeps the classic bare
+// "> " prompt and updates on its own command, so existing behavior + tests are unchanged until opt-in.
 
 // vitalsCommands returns the `vitals` toggle verb (registered low-priority with the other toggles).
 func vitalsCommands() []*Command {
