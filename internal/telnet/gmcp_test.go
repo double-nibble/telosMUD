@@ -278,6 +278,8 @@ func FuzzGMCPSubneg(f *testing.F) {
 		})
 		// Drain the stream: ReadLine must never panic on any framing, and must eventually return an
 		// error (EOF) rather than looping. Bound the iterations defensively.
+		// We allow one pass per input byte, plus a small fixed slack for internal parser transitions
+		// around telnet control framing before EOF is surfaced.
 		for i := 0; i < len(data)+8; i++ {
 			if _, err := c.ReadLine(); err != nil {
 				break
