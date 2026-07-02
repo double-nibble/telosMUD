@@ -254,6 +254,10 @@ type Bus interface {
 	// (broker down or unconfigured) is false; an in-process bus is always true; a NATS bus reflects its
 	// LIVE connection (false during a disconnect/blip, true once reconnected). It is a point-in-time
 	// probe — the gate reads it after login to warn a player when chat is offline. Safe from any goroutine.
+	//
+	// It is for surfacing STATUS to a human, NOT for control flow: do NOT gate Publish on it. Publish is
+	// already never-fatal, and `if Available() { Publish() }` is a check-then-act race (the conn can drop
+	// between the two). Just Publish — a down bus is a safe no-op.
 	Available() bool
 
 	// Close releases the bus. Idempotent.
