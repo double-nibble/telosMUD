@@ -406,6 +406,24 @@ func TestAFKAutoReply(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no AFK auto-reply reached the sender")
 	}
+
+	// A BACKLOG (offline catch-up) drain must NOT auto-reply: those are old tells whose senders
+	// should not get a stale "is AFK" now (the header's second claim, previously unasserted —
+	// ai-finding #13). Seq 2 > the cursor the live tell advanced, so it genuinely delivers.
+	ack = z.deliverDrainedTell(tellDeliverMsg{
+		target:  "Sleeper",
+		msg:     commbus.Message{AuthorID: "Caller", AuthorName: "Caller", Seq: 2, Body: "still there?"},
+		backlog: true,
+	})
+	if !ack {
+		t.Fatal("backlog tell to an AFK target was not acked")
+	}
+	select {
+	case m := <-senderTells:
+		t.Fatalf("a backlog drain triggered an AFK auto-reply: %q", m.Body)
+	case <-time.After(300 * time.Millisecond):
+		// expected: no auto-reply for a backlog drain
+	}
 }
 
 // containsStr reports whether s contains v.
