@@ -87,6 +87,9 @@ const memSubDepth = 256
 // Role reports this handle's publish capability.
 func (b *MemBus) Role() Role { return b.role }
 
+// Available is always true for an in-process bus: there is no transport to lose.
+func (b *MemBus) Available() bool { return true }
+
 // Publish enforces the ACL then fans msg out to every subscriber whose pattern matches subj, IN
 // PUBLISH ORDER per subscriber. The ACL check is FIRST (P8-A2): a RoleGate handle publishing a
 // chan/tell subject returns ErrPublishForbidden and NOTHING is enqueued — the impersonation gate.

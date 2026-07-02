@@ -227,3 +227,44 @@ func TestGateCommsRoleIsGate(t *testing.T) {
 		t.Fatalf("gate publish on a tell subject = %v, want ErrPublishForbidden", err)
 	}
 }
+
+// TestCommsUnavailableNoticeAtLogin pins the #61 notice: when comms are CONFIGURED (commsExpected)
+// but the bus is unavailable (a down/Disabled broker), the player gets a one-line "chat is offline"
+// notice at login and still enters the world normally. The complement — an AVAILABLE bus emits NO
+// notice — guards against nagging a healthy gate.
+func TestCommsUnavailableNoticeAtLogin(t *testing.T) {
+	const notice = "chat is currently offline"
+
+	t.Run("configured but down -> notice", func(t *testing.T) {
+		const addr = "addr-down"
+		h := newHarness(t)
+		h.addShard("midgaard", addr, nil, nil)
+		// A Disabled gate bus is exactly what OpenGate returns when a configured broker is unreachable.
+		h.serveGateWithComms(directory.Static{Addr: addr}, commbus.Disabled(commbus.RoleGate))
+		h.srv.WithCommsExpected(true)
+
+		term := h.dial(t)
+		term.login(t, "Alice")
+		term.expect(t, notice)
+		term.expect(t, "Temple Square") // the notice does not block entering the world
+	})
+
+	t.Run("bus available -> no notice", func(t *testing.T) {
+		const addr = "addr-up"
+		worldBus, gateBus := commbus.NewWorldBus() // an available (in-process) gate handle
+		t.Cleanup(func() { _ = worldBus.Close() })
+		h := newHarness(t)
+		h.addShard("midgaard", addr, nil, nil)
+		h.serveGateWithComms(directory.Static{Addr: addr}, gateBus)
+		h.srv.WithCommsExpected(true) // configured AND up: still no notice
+
+		term := h.dial(t)
+		term.login(t, "Bob")
+		// The notice (if any) is written before the world's room output, so once "Temple Square"
+		// is in the buffer a notice would be too — its absence here is race-free.
+		term.expect(t, "Temple Square")
+		if strings.Contains(term.acc.String(), notice) {
+			t.Fatalf("an available comms bus emitted the offline notice: %q", term.acc.String())
+		}
+	})
+}

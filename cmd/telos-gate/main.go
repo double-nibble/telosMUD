@@ -88,6 +88,7 @@ func main() {
 	srv.WithTransports(cfg.GateAllowPlaintext, cfg.GateTLSListen, cfg.GateTLSCert, cfg.GateTLSKey)
 	srv.WithDevAutoAuth(cfg.DevAutoAuth)
 	srv.WithWriteTimeout(cfg.GateWriteTimeout) // Phase 16.3: bound writes so a wedged client is reclaimed
+	srv.WithCommsExpected(cfg.NATS.URL != "")  // #61: warn players when a CONFIGURED comms bus is down
 	// Wire the real telos-account client when an account service is configured (it drives the browser OAuth
 	// device login); otherwise the gate keeps the bare-name dev stub.
 	if cfg.AccountTarget != "" {
