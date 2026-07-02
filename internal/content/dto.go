@@ -363,14 +363,20 @@ type RecipeOutputDTO struct {
 //     per-player toggles are slice 8.6). History is the recent-lines buffer size (carried; retrieval
 //     is deferred — slice 8.3 only records the field).
 type ChannelDTO struct {
-	Ref       string           `json:"ref" yaml:"ref"`
-	Name      string           `json:"name" yaml:"name"`
-	Words     []string         `json:"words" yaml:"words"`
-	Color     string           `json:"color" yaml:"color"`
-	Format    string           `json:"format" yaml:"format"`
-	Access    ChannelAccessDTO `json:"access" yaml:"access"`
-	DefaultOn bool             `json:"default_on" yaml:"default_on"`
-	History   int              `json:"history" yaml:"history"`
+	Ref    string           `json:"ref" yaml:"ref"`
+	Name   string           `json:"name" yaml:"name"`
+	Words  []string         `json:"words" yaml:"words"`
+	Color  string           `json:"color" yaml:"color"`
+	Format string           `json:"format" yaml:"format"`
+	Access ChannelAccessDTO `json:"access" yaml:"access"`
+	// HearAccess, when present, is the LISTEN predicate, split from the speak predicate above. nil
+	// (the field absent in YAML) keeps the v1 rule — hear mirrors Access, a restricted channel
+	// restricts both directions. Present-but-EMPTY (`hear_access: {}`) means anyone may hear — the
+	// "announce" channel shape (only privileged speakers, everyone listens). A non-empty predicate
+	// restricts hearing independently of speaking.
+	HearAccess *ChannelAccessDTO `json:"hear_access,omitempty" yaml:"hear_access"`
+	DefaultOn  bool              `json:"default_on" yaml:"default_on"`
+	History    int               `json:"history" yaml:"history"`
 }
 
 // ChannelAccessDTO is a channel's access predicate (P8-A8): a small content gate the source world

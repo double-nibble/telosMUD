@@ -338,7 +338,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	for _, ch := range pk.Channels {
 		body, err := json.Marshal(channelBody{
 			Name: ch.Name, Words: ch.Words, Color: ch.Color, Format: ch.Format,
-			Access: ch.Access, DefaultOn: ch.DefaultOn, History: ch.History,
+			Access: ch.Access, HearAccess: ch.HearAccess, DefaultOn: ch.DefaultOn, History: ch.History,
 		})
 		if err != nil {
 			return fmt.Errorf("store: marshal channel %s body: %w", ch.Ref, err)

@@ -240,7 +240,7 @@ func (p *Pool) loadChannelDefinition(ctx context.Context, ref, pack string) (con
 			return content.Definition{}, fmt.Errorf("store: channel %s body: %w", ref, err)
 		}
 		ch.Name, ch.Words, ch.Color, ch.Format = b.Name, b.Words, b.Color, b.Format
-		ch.Access, ch.DefaultOn, ch.History = b.Access, b.DefaultOn, b.History
+		ch.Access, ch.HearAccess, ch.DefaultOn, ch.History = b.Access, b.HearAccess, b.DefaultOn, b.History
 	}
 	return content.Definition{Kind: content.KindChannel, Ref: ref, Found: true, Channel: ch}, nil
 }
@@ -434,13 +434,14 @@ type combatProfileBody struct {
 // (verb words, color/format template, access predicate, default_on, history) is content carried in the
 // body — the engine names no channel.
 type channelBody struct {
-	Name      string                   `json:"name,omitempty"`
-	Words     []string                 `json:"words,omitempty"`
-	Color     string                   `json:"color,omitempty"`
-	Format    string                   `json:"format,omitempty"`
-	Access    content.ChannelAccessDTO `json:"access,omitempty"`
-	DefaultOn bool                     `json:"default_on,omitempty"`
-	History   int                      `json:"history,omitempty"`
+	Name       string                    `json:"name,omitempty"`
+	Words      []string                  `json:"words,omitempty"`
+	Color      string                    `json:"color,omitempty"`
+	Format     string                    `json:"format,omitempty"`
+	Access     content.ChannelAccessDTO  `json:"access,omitempty"`
+	HearAccess *content.ChannelAccessDTO `json:"hear_access,omitempty"` // nil vs empty is load-bearing (hear=speak vs open)
+	DefaultOn  bool                      `json:"default_on,omitempty"`
+	History    int                       `json:"history,omitempty"`
 }
 
 // regionBody is the JSONB-tail shape for a region_defs row (Phase 10.3): everything that is not the
@@ -785,7 +786,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				return fmt.Errorf("store: channel_def %s body: %w", ch.Ref, err)
 			}
 			ch.Name, ch.Words, ch.Color, ch.Format = b.Name, b.Words, b.Color, b.Format
-			ch.Access, ch.DefaultOn, ch.History = b.Access, b.DefaultOn, b.History
+			ch.Access, ch.HearAccess, ch.DefaultOn, ch.History = b.Access, b.HearAccess, b.DefaultOn, b.History
 		}
 		pp := pack(pk)
 		pp.Channels = append(pp.Channels, ch)

@@ -240,6 +240,60 @@ func TestPublishCommsConfigCarriesHearSetAndIgnore(t *testing.T) {
 	}
 }
 
+// TestRepublishOnAccessChangeCoversHearRestricted pins the mid-session republish FLOW for the SPLIT
+// predicate (the round-5 review finding): with a channel whose HEARING alone is gated (open speak,
+// hear_access require-flag), republishCommsOnAccessChange must actually publish — the cheap guard
+// (anyChannelGatesHearing) must not short-circuit on the open SPEAK predicate — and the published
+// hear-set must track the flag both ways (gain hears, loss stops hearing).
+func TestRepublishOnAccessChangeCoversHearRestricted(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(content.Pack{
+		Pack: "hr",
+		Channels: []content.ChannelDTO{{
+			Ref: "confession", Name: "Confession", Words: []string{"confess"},
+			DefaultOn:  true,
+			HearAccess: &content.ChannelAccessDTO{RequireFlag: "confessor"},
+		}},
+		Zones: []content.ZoneDTO{{
+			Ref: "hr", Name: "Hear Restricted", StartRoom: "hr:room:start",
+			Rooms: []content.RoomDTO{{Ref: "hr:room:start", Name: "Start", Long: "A room."}},
+		}},
+	})
+	lc, err := content.Load(context.Background(), src, []string{"hr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wbus, gate := commbus.NewWorldBus()
+	t.Cleanup(func() { _ = wbus.Close() })
+	sh := NewShardFromContent(lc, []string{"hr"}, "hr", "", nil, nil).WithComms(wbus)
+	z := sh.Zone()
+
+	s := newTestPlayerEntity(z, "Sinner")
+	cfg := drainConfig(t, gate, "Sinner")
+
+	// Gain the flag mid-session → the republish must fire and the hear-set must include the channel.
+	setFlag(s.entity, "confessor", true)
+	z.republishCommsOnAccessChange(s.entity)
+	p, ok := recvConfig(t, cfg)
+	if !ok {
+		t.Fatal("republish did not publish for a hear-restricted channel (the guard short-circuited on the open speak predicate)")
+	}
+	if !containsStr(p.HearChannels, "confession") {
+		t.Fatalf("hear-set %v missing `confession` after gaining the flag", p.HearChannels)
+	}
+
+	// Lose the flag mid-session → republished hear-set must DROP the ref (the eavesdropping fix).
+	setFlag(s.entity, "confessor", false)
+	z.republishCommsOnAccessChange(s.entity)
+	p, ok = recvConfig(t, cfg)
+	if !ok {
+		t.Fatal("republish did not publish after the flag was lost")
+	}
+	if containsStr(p.HearChannels, "confession") {
+		t.Fatalf("hear-set %v still includes `confession` after losing the flag (mid-session eavesdropping)", p.HearChannels)
+	}
+}
+
 // TestChannelsToggleCommand drives the `channels off`/`channels on` command and asserts it records the
 // override + re-publishes the config (so the gate re-subscribes).
 func TestChannelsToggleCommand(t *testing.T) {

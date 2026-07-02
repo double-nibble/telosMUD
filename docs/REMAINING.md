@@ -326,8 +326,20 @@ change; the Lua director script is the big substrate the smaller Go handlers cou
 
 ## Track 10 — Comms & channels  ·  mostly independent
 
-- **Channel HEAR vs SPEAK access split.** `channelDef.canHear` delegates to the same predicate as `canSpeak`;
-  split them for "announce" channels (anyone hears, only admins speak). · *comms*
+- ~~Channel HEAR vs SPEAK access split~~ — DONE (round 5): optional `hear_access` on the channel_def (nil =
+  hear mirrors speak; present-but-empty = the announce shape; non-empty = independent hear gate), rides the
+  channel_defs JSONB body; `hearPredicate()` is the single dispatch point (canHear + the republish guard —
+  review caught the guard still reading the SPEAK predicate, which would have left mid-session hear-loss
+  unenforced for hear-restricted channels). · *comms*
+- **Republish comms config on flag GRANT OPS + hot reload (opened round 5, security review).** The round-2
+  mid-session republish is hooked only at affect apply/expire; (1) `set_flag`/`clear_flag` grant ops
+  (`effect_op_grant.go`) never call `republishCommsOnAccessChange` — a guild-leave via `clear_flag` leaves the
+  player hearing guild chat until relog/toggle/handoff; (2) a channel-def HOT RELOAD that tightens
+  access/hear_access doesn't republish for live sessions. Hook both. · *comms/security*
+- **Content-lint: present-but-zero access conditions (minor, opened round 5).** `hear_access:\n  require_flag:`
+  (present key, null condition) parses as present-but-EMPTY — a builder who typos a restriction silently gets
+  the announce shape (same class exists for `access`). A lint warning on a present-but-zero condition inside a
+  non-empty-intent block. · *content*
 - **"Comms unavailable" player notice.** When the comms bus is wholly down a player sees no channels/tells and no
   notice; expose a `Bus.Available()` probe and emit a one-line notice after login. · *comms/edge*
 - **Comms chaos test doubles.** (1) Pin the MemJetStream park-at-`maxDeliver` divergence from real NATS + confirm

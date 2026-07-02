@@ -47,17 +47,24 @@ import (
 // *abilityDef/*affectDef — and swapped wholesale by the hot-reload path (defRegistry.reload). The
 // publish path reads it (canSpeak/render); the gate never sees it (the world renders into Body).
 type channelDef struct {
-	ref       string
-	name      string
-	words     []string // command verbs that emit on this channel (lower-cased, registered exact-only)
-	color     string   // color/markup token prepended to the rendered line (content; empty => none)
-	format    string   // listener-perspective template ("[$channel] $name: $t"); empty => defaultChannelFormat
-	history   int      // recent-lines buffer size (carried; retrieval deferred — P8-D3)
-	defaultOn bool     // is a fresh character subscribed by default (drives the hear-set vs a toggle, 8.6)
+	ref    string
+	name   string
+	words  []string // command verbs that emit on this channel (lower-cased, registered exact-only)
+	color  string   // color/markup token prepended to the rendered line (content; empty => none)
+	format string   // listener-perspective template ("[$channel] $name: $t"); empty => defaultChannelFormat
+	// history is the recent-lines buffer size (carried; retrieval deferred — P8-D3). When retrieval
+	// lands it MUST gate fetches on canHear (the split hear predicate) AT FETCH TIME — a player who
+	// lost hear access must not replay lines from when they had it.
+	history   int
+	defaultOn bool // is a fresh character subscribed by default (drives the hear-set vs a toggle, 8.6)
 
-	// access is the parsed speak/hear predicate (P8-A8). A zero predicate (no conditions) is the open
+	// access is the parsed SPEAK predicate (P8-A8). A zero predicate (no conditions) is the open
 	// channel — anyone may speak. canSpeak evaluates it against the live *Entity.
 	access channelAccess
+	// hearAccess is the parsed LISTEN predicate when content SPLITS it from access (hear_access in the
+	// channel_def). nil => hear mirrors the speak predicate (the v1 rule); non-nil (even zero — the
+	// "announce" shape) => canHear evaluates THIS predicate instead.
+	hearAccess *channelAccess
 }
 
 // channelAccess is the parsed access predicate (P8-A8). All present conditions AND together; a zero
@@ -98,12 +105,39 @@ func buildChannelDef(c content.ChannelDTO) *channelDef {
 		history:   c.History,
 		defaultOn: c.DefaultOn,
 	}
-	def.access.requireFlag = c.Access.RequireFlag
-	if c.Access.MinAttr != nil && c.Access.MinAttr.Attr != "" {
-		def.access.minAttrName = c.Access.MinAttr.Attr
-		def.access.minAttrVal = c.Access.MinAttr.Min
+	def.access = parseChannelAccess(c.Access)
+	if c.HearAccess != nil {
+		ha := parseChannelAccess(*c.HearAccess)
+		def.hearAccess = &ha
 	}
 	return def
+}
+
+// parseChannelAccess maps a content access predicate onto its runtime form (shared by the speak and
+// the optional split hear predicate).
+func parseChannelAccess(a content.ChannelAccessDTO) channelAccess {
+	var out channelAccess
+	out.requireFlag = a.RequireFlag
+	if a.MinAttr != nil && a.MinAttr.Attr != "" {
+		out.minAttrName = a.MinAttr.Attr
+		out.minAttrVal = a.MinAttr.Min
+	}
+	return out
+}
+
+// meets evaluates one parsed predicate against a live entity: all present conditions AND together, a
+// zero predicate admits everyone, nil entity refused (defensive). Zone-goroutine only.
+func (a *channelAccess) meets(e *Entity) bool {
+	if e == nil {
+		return false
+	}
+	if a.requireFlag != "" && !hasFlag(e, a.requireFlag) {
+		return false
+	}
+	if a.minAttrName != "" && attr(e, a.minAttrName) < a.minAttrVal {
+		return false
+	}
+	return true
 }
 
 // canSpeak evaluates the channel's access predicate against the speaking entity (P8-A8). It is the
@@ -111,37 +145,29 @@ func buildChannelDef(c content.ChannelDTO) *channelDef {
 // content rule is checked, never the client. A nil entity (defensive) is refused. An open channel (no
 // conditions) admits anyone. Pure read of the immutable def + the live entity; zone-goroutine only.
 func (d *channelDef) canSpeak(e *Entity) bool {
-	if e == nil {
-		return false
-	}
-	if d.access.requireFlag != "" && !hasFlag(e, d.access.requireFlag) {
-		return false
-	}
-	if d.access.minAttrName != "" && attr(e, d.access.minAttrName) < d.access.minAttrVal {
-		return false
-	}
-	return true
+	return d.access.meets(e)
 }
 
-// canHear evaluates the channel's access predicate against the LISTENING entity (Phase 8.6, the
-// receiver HEAR-filter). For v1 a channel's HEAR access is the SAME predicate as its SPEAK access (a
-// restricted channel restricts both sending and hearing) — so this delegates to the same evaluation as
-// canSpeak. It is a DISTINCT method so a future content shape (a channel you may hear but not speak, or
-// vice versa) has an obvious divergence point without touching the call sites. The world evaluates it
-// against the live *Entity (zone-goroutine) when computing the player's effective hear-set
-// (effectiveHearSet); the gate never runs it (it has no content) — it just subscribes the refs the world
-// put in the hear-set. A nil entity is refused (defensive).
+// canHear evaluates the channel's LISTEN predicate against the LISTENING entity (Phase 8.6, the
+// receiver HEAR-filter). When content supplies a split hear_access, THAT predicate rules (a zero one
+// admits everyone — the "announce" channel: restricted speak, open hear); otherwise hear mirrors the
+// speak predicate (the v1 rule — a restricted channel restricts both directions). The world evaluates
+// it against the live *Entity (zone-goroutine) when computing the player's effective hear-set
+// (effectiveHearSet); the gate never runs it (it has no content) — it just subscribes the refs the
+// world put in the hear-set. A nil entity is refused (defensive, in meets).
 func (d *channelDef) canHear(e *Entity) bool {
-	if e == nil {
-		return false
+	return d.hearPredicate().meets(e)
+}
+
+// hearPredicate returns the EFFECTIVE listen predicate: the split hear_access when content supplies
+// one, else the speak predicate (the v1 mirror rule). The single dispatch point — canHear and the
+// anyChannelGatesHearing republish guard both use it, so they cannot disagree on which predicate
+// gates hearing.
+func (d *channelDef) hearPredicate() *channelAccess {
+	if d.hearAccess != nil {
+		return d.hearAccess
 	}
-	if d.access.requireFlag != "" && !hasFlag(e, d.access.requireFlag) {
-		return false
-	}
-	if d.access.minAttrName != "" && attr(e, d.access.minAttrName) < d.access.minAttrVal {
-		return false
-	}
-	return true
+	return &d.access
 }
 
 // renderLine produces the FULLY-rendered channel line the gate will write verbatim (P8-A7). The world

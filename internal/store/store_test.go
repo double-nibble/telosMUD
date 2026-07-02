@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/double-nibble/telosmud/db"
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/world"
 )
 
@@ -311,6 +312,46 @@ func TestBundleBodyUncappedRoundTrips(t *testing.T) {
 	}
 	if !out.Uncapped {
 		t.Fatalf("bundle uncapped flag dropped in body round-trip: %+v", out)
+	}
+}
+
+// TestChannelBodyHearAccessRoundTrips pins that the split hear_access predicate survives the
+// channel_defs JSONB body round-trip (docs/REMAINING.md Track 10) — the store field-drop class. The
+// nil-vs-EMPTY distinction is LOAD-BEARING (nil = hear mirrors speak; empty = anyone hears, the
+// announce shape), so both shapes are pinned: nil stays absent/nil, a present-but-zero pointer
+// survives as present-but-zero.
+func TestChannelBodyHearAccessRoundTrips(t *testing.T) {
+	// Present-but-empty (the announce channel) survives as present-but-empty.
+	in := channelBody{
+		Name: "Announce", Access: content.ChannelAccessDTO{RequireFlag: "immortal"},
+		HearAccess: &content.ChannelAccessDTO{},
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out channelBody
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.HearAccess == nil {
+		t.Fatal("present-but-empty hear_access became nil in the body round-trip (announce shape lost)")
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Fatalf("channelBody round-trip changed the value: %+v -> %+v", in, out)
+	}
+
+	// Absent (nil) stays nil — the v1 hear-mirrors-speak rule must not become an open channel.
+	b2, err := json.Marshal(channelBody{Name: "Guild", Access: content.ChannelAccessDTO{RequireFlag: "guildmember"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out2 channelBody
+	if err := json.Unmarshal(b2, &out2); err != nil {
+		t.Fatal(err)
+	}
+	if out2.HearAccess != nil {
+		t.Fatalf("nil hear_access became non-nil in the body round-trip: %+v", out2.HearAccess)
 	}
 }
 

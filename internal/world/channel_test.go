@@ -278,6 +278,84 @@ func TestChannelHotReload(t *testing.T) {
 // restoreRate restores the package rate-limit knobs after a test mutates them.
 func restoreRate(burst int, refill time.Duration) { commRateBurst, commRateRefill = burst, refill }
 
+// TestChannelHearSpeakSplit pins the split hear_access predicate (docs/REMAINING.md Track 10): nil
+// keeps the v1 mirror rule; a present-but-EMPTY hear_access is the "announce" channel (restricted
+// speak, EVERYONE hears); a non-empty hear_access restricts listening independently of speaking.
+func TestChannelHearSpeakSplit(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	plain := newTestPlayerEntity(z, "Plain")
+	herald := newTestPlayerEntity(z, "Herald")
+	setFlag(herald.entity, "immortal", true)
+
+	// Announce shape: only the flagged may speak, anyone hears.
+	announce := buildChannelDef(content.ChannelDTO{
+		Ref: "announce", Name: "Announce",
+		Access:     content.ChannelAccessDTO{RequireFlag: "immortal"},
+		HearAccess: &content.ChannelAccessDTO{},
+	})
+	if announce.canSpeak(plain.entity) {
+		t.Fatal("announce: an unflagged player must not speak")
+	}
+	if !announce.canHear(plain.entity) {
+		t.Fatal("announce: everyone must hear (empty hear_access)")
+	}
+	if !announce.canSpeak(herald.entity) || !announce.canHear(herald.entity) {
+		t.Fatal("announce: the flagged speaker must both speak and hear")
+	}
+
+	// Hear-restricted shape: anyone speaks, only the flagged hear.
+	confess := buildChannelDef(content.ChannelDTO{
+		Ref: "confess", Name: "Confess",
+		HearAccess: &content.ChannelAccessDTO{RequireFlag: "immortal"},
+	})
+	if !confess.canSpeak(plain.entity) {
+		t.Fatal("confess: open speak must admit anyone")
+	}
+	if confess.canHear(plain.entity) {
+		t.Fatal("confess: an unflagged player must not hear")
+	}
+	if !confess.canHear(herald.entity) {
+		t.Fatal("confess: the flagged listener must hear")
+	}
+
+	// nil hear_access keeps the mirror rule (TestRichDemoRestrictedGuildChannel pins it live too).
+	mirror := buildChannelDef(content.ChannelDTO{
+		Ref: "mirror", Access: content.ChannelAccessDTO{RequireFlag: "immortal"},
+	})
+	if mirror.canHear(plain.entity) {
+		t.Fatal("mirror: nil hear_access must keep hear == speak")
+	}
+}
+
+// TestAnyChannelGatesHearingUsesHearPredicate pins the republish guard against the SPLIT predicate
+// (the review-caught bug): a hear-restricted channel (open speak, gated hear_access) MUST trigger the
+// mid-session republish guard, and an announce channel (gated speak, EMPTY hear_access) must NOT —
+// its hearing is open, so an access change can't alter any hear-set.
+func TestAnyChannelGatesHearingUsesHearPredicate(t *testing.T) {
+	// A bare zone (no pack) gates nothing.
+	z := newZone("gate-test")
+	if z.anyChannelGatesHearing() {
+		t.Fatal("a channel-less zone must not report gated hearing")
+	}
+
+	// Announce shape only: speak gated, hear OPEN → guard must stay false.
+	z.channelDefs().register("announce", buildChannelDef(content.ChannelDTO{
+		Ref: "announce", Access: content.ChannelAccessDTO{RequireFlag: "immortal"},
+		HearAccess: &content.ChannelAccessDTO{},
+	}))
+	if z.anyChannelGatesHearing() {
+		t.Fatal("an announce channel (open hear) must not trigger the hear-republish guard")
+	}
+
+	// Add a hear-restricted shape: open speak, gated hear → guard must flip true.
+	z.channelDefs().register("confess", buildChannelDef(content.ChannelDTO{
+		Ref: "confess", HearAccess: &content.ChannelAccessDTO{RequireFlag: "immortal"},
+	}))
+	if !z.anyChannelGatesHearing() {
+		t.Fatal("a hear-restricted channel must trigger the hear-republish guard")
+	}
+}
+
 // drainContains drains a session's out channel for up to a short deadline, returning true if any
 // Output frame's markup contains substr.
 func drainContains(t *testing.T, s *session, substr string) bool {

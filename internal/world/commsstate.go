@@ -175,7 +175,10 @@ func (z *Zone) effectiveHearSet(s *session) []string {
 // no access-gated channels (the common case) pays only this immutable-registry scan and never republishes.
 func (z *Zone) anyChannelGatesHearing() bool {
 	for _, def := range z.channelDefs().table() {
-		if def.access.requireFlag != "" || def.access.minAttrName != "" {
+		// The EFFECTIVE hear predicate (hearPredicate dispatches split-vs-mirror): a hear-restricted
+		// channel (open speak, gated hear_access) must trigger the republish, and an announce channel
+		// (gated speak, EMPTY hear_access) must not — hearing there is open.
+		if ha := def.hearPredicate(); ha.requireFlag != "" || ha.minAttrName != "" {
 			return true
 		}
 	}
