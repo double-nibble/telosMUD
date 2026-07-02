@@ -389,7 +389,9 @@ func TestSendPromptEmitsHUDOnChangeOnly(t *testing.T) {
 		t.Fatal("a vitals change did not re-emit Char.Vitals")
 	}
 	var m map[string]int
-	json.Unmarshal([]byte(v), &m)
+	if err := json.Unmarshal([]byte(v), &m); err != nil {
+		t.Fatalf("failed to unmarshal Char.Vitals payload %q: %v", v, err)
+	}
 	if m["hp"] != 55 {
 		t.Fatalf("re-emitted Char.Vitals hp = %d, want 55", m["hp"])
 	}
