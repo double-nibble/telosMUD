@@ -173,9 +173,9 @@ type Zone struct {
 	// globals sandbox, constructed at zone build and called ONLY from this goroutine (the
 	// single-writer invariant — gopher-lua is not goroutine-safe). It is torn down when Run
 	// returns. A zone with NO scripted content compiles/runs no scripts: the VM exists but does
-	// nothing (the bare-engine invariant — Phase-6 empty-boot behavior is byte-identical). Only
-	// the zone goroutine touches it. Slice 7.1 builds the VM + sandbox skeleton; handles, effect
-	// ops, and entry points hang off it in 7.2+.
+	// nothing (bare-engine invariant: although introduced in Phase 7, no-script execution remains
+	// byte-identical to the Phase-6 empty-boot baseline). Only the zone goroutine touches it.
+	// Slice 7.1 builds the VM + sandbox skeleton; handles, effect ops, and entry points hang off it in 7.2+.
 	lua *luaRuntime
 
 	// pendingFinalFlush stashes the LOGOUT snapshot of a brand-new character that quit BEFORE its
