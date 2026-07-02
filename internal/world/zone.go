@@ -1365,6 +1365,15 @@ func (z *Zone) pendingExpire(id string, gen uint64) {
 // It is a package var (not a const) so a test can shrink it to exercise the reaper quickly.
 var freezeTTL = pendingTTL
 
+func validateFreezeTTL() {
+	if freezeTTL < pendingTTL {
+		panic(fmt.Sprintf("invalid freezeTTL: %v must be >= pendingTTL (%v)", freezeTTL, pendingTTL))
+	}
+	if freezeTTL <= handoffRPCTimeout {
+		panic(fmt.Sprintf("invalid freezeTTL: %v must be > handoffRPCTimeout (%v)", freezeTTL, handoffRPCTimeout))
+	}
+}
+
 // freezeExpire is the backstop for a frozen source-side player still frozen after freezeTTL.
 // The gen check ignores a stale timer for a session that has since rebound/rebuilt (a return
 // handoff, a re-attach). It then discriminates on s.handedOff:
