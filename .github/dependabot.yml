@@ -1,0 +1,10 @@
+# Keeps the SHA-pinned workflow actions current: the workflows pin every `uses:` to a commit SHA
+# (CodeQL actions/unpinned-tag, supply-chain hardening), and Dependabot is the mechanism that bumps
+# those pins — it rewrites BOTH the SHA and the trailing `# vN` comment when an action releases.
+# Without this, a pinned action would silently freeze forever, including for its own security fixes.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

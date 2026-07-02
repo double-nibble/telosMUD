@@ -34,27 +34,27 @@ jobs:
           - language: actions
             build-mode: none
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Generated *.pb.go is gitignored; produce it BEFORE CodeQL's autobuild (mirrors ci.yml).
-      - uses: bufbuild/buf-setup-action@v1
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         if: matrix.language == 'go'
         with:
           version: 1.71.0
           github_token: ${{ secrets.GITHUB_TOKEN }}
       - run: buf generate
         if: matrix.language == 'go'
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: matrix.language == 'go'
         with:
           go-version: "1.25"
           cache: true
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           # security-and-quality keeps the QUALITY findings the Code Quality preview surfaced,
           # now against a fully-extracted program instead of the degraded default-setup build.
           queries: security-and-quality
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           category: "/language:${{ matrix.language }}"
