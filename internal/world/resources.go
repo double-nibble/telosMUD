@@ -84,8 +84,9 @@ func hasResource(e *Entity, name string) bool {
 }
 
 // restRegenMultiplier scales passive regen while an entity is posResting — the engine "resting heals
-// faster" bonus (#39). An integer factor (1 = no bonus); a package var so a test can tune it and a
-// future content knob could make it per-resource. Applied in runRegen.
+// faster" bonus (#39). An integer factor (1 = no bonus). A package var so a test can tune it (set it
+// BEFORE ticking; it is read on the zone goroutine and must not be mutated concurrently with a live
+// zone). A future content knob could make it per-resource. Applied in runRegen.
 var restRegenMultiplier = 2
 
 // needsRegen reports whether the entity has at least one content-defined resource with a positive

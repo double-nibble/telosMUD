@@ -35,13 +35,18 @@ func cmdRest(c *Context) error {
 		c.Send("You are already resting.")
 		return nil
 	}
+	// posStanding (and posSleeping, unreachable for players today — no sleep verb) fall through to sit.
+	// When a `sleep` verb lands, add a posSleeping case here so resting a sleeper emits a wake transition.
 	setPosition(e, posResting)
 	c.Send("You sit down and rest.")
 	c.z.act("$n sits down to rest.", e, nil, nil, "", "", ToRoom)
-	// OnRest (event bus, evOnRest): the subject rested — a discrete root fire (self counterpart) content
-	// reacts to with short/long-rest recovery. Fired ONCE on entering rest; the ongoing benefit is the
-	// passive regen bonus while posResting (runRegen). A world with no OnRest subscriber is a clean no-op.
-	c.z.fireEvent(nil, evOnRest, e, e, 1)
+	// OnRest (event bus, evOnRest): the subject rested — a discrete root fire content reacts to with
+	// short/long-rest recovery. Counterpart is NIL: rest is a solo reflexive action with no other party,
+	// so it patterns with OnLevel/OnTrackStep (nil `other`), NOT a self-counterpart — a `target: other`
+	// op in a handler must find no target, not silently resolve to the rester. Fired ONCE on entering
+	// rest; the ongoing benefit is the passive regen bonus while posResting (runRegen). A world with no
+	// OnRest subscriber is a clean no-op.
+	c.z.fireEvent(nil, evOnRest, e, nil, 1)
 	return nil
 }
 
@@ -59,6 +64,7 @@ func cmdStand(c *Context) error {
 		c.Send("You are already on your feet.") // fighting is an upright, active state
 		return nil
 	}
+	// posResting (and posSleeping, unreachable for players today) fall through to stand — see cmdRest.
 	setPosition(e, posStanding)
 	c.Send("You stand up.")
 	c.z.act("$n stands up.", e, nil, nil, "", "", ToRoom)
