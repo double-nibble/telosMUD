@@ -808,8 +808,8 @@ func (z *Zone) leave(id string) {
 			// starts the row at version 0, so this deferred snapshot CASes at version 0 (dumpCharacter
 			// reads s.stateVersion, still 0 — no save has bumped it). This keeps logout a true flush
 			// point across the create window. If the create ultimately FAILS (stays ephemeral), the
-			// stash is simply never replayed — no worse than the prior behavior, but the common case
-			// (a fast create that just hadn't returned yet) is saved.
+			// stash is evicted by characterCreateFailed (never replayed) — no worse than the prior
+			// behavior, but the common case (a fast create that just hadn't returned yet) is saved.
 			z.pendingFinalFlush[id] = dumpCharacter(s)
 			z.log.Info("character logged out before its durable id was assigned; deferring final flush to create completion", "player", id)
 		} else {
