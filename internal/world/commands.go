@@ -58,6 +58,9 @@ func registerCommands() []*Command {
 	// live in container.go (Phase 3) and combat_commands.go (Phase 6.3a).
 	base = append(base, containerCommands()...)
 	base = append(base, combatCommands()...)
+	// Rest/stand (Track 5, #39): registered low-priority (after combat) so rest/sit/stand never shadow
+	// a movement/look/say abbreviation.
+	base = append(base, restCommands()...)
 	// Comms toggles (Phase 8.6): channels/ignore/afk. Registered last (lowest priority) so they never
 	// shadow or abbreviate a movement/look/say verb.
 	base = append(base, commsCommands()...)
@@ -376,6 +379,13 @@ func (z *Zone) move(s *session, dir string) bool {
 	if position(s.entity) == posFighting {
 		s.send(textFrame("You can't leave while fighting! Flee first."))
 		return false
+	}
+	// Auto-stand: a resting player gets to their feet before walking (rest.go, #39). Standing here (not
+	// refusing the move) keeps movement frictionless — you don't have to `stand` then walk.
+	if position(s.entity) == posResting {
+		setPosition(s.entity, posStanding)
+		s.send(textFrame("You stop resting and stand up."))
+		z.act("$n stops resting and stands up.", s.entity, nil, nil, "", "", ToRoom)
 	}
 	from := s.entity.location // the current room entity
 	ref, ok := from.room.exits[dir]

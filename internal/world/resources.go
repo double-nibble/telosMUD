@@ -83,6 +83,12 @@ func hasResource(e *Entity, name string) bool {
 	return e.zone.resourceDefs().has(name)
 }
 
+// restRegenMultiplier scales passive regen while an entity is posResting — the engine "resting heals
+// faster" bonus (#39). An integer factor (1 = no bonus). A package var so a test can tune it (set it
+// BEFORE ticking; it is read on the zone goroutine and must not be mutated concurrently with a live
+// zone). A future content knob could make it per-resource. Applied in runRegen.
+var restRegenMultiplier = 2
+
 // needsRegen reports whether the entity has at least one content-defined resource with a positive
 // regen rate that is not already at its derived max — i.e. whether the per-entity tick has regen work
 // to do. It is the second reason (besides active affects) the tick stays registered (affect_runtime.go
@@ -139,6 +145,12 @@ func runRegen(e *Entity) {
 		amount := def.regen
 		if v, ok := e.zone.luaFormula("regen", e, nil); ok {
 			amount = int(v)
+		}
+		// Resting bonus (#39): passive regen is faster while posResting — the engine "rest heals faster"
+		// mechanic. Applied to whichever amount was chosen (flat or Lua). A tunable package var, not a
+		// hardcoded literal; a future content knob could make it per-resource.
+		if position(e) == posResting {
+			amount *= restRegenMultiplier
 		}
 		next := cur + amount
 		if next > maxV {
