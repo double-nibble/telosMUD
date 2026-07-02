@@ -55,6 +55,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/double-nibble/telosmud/internal/colormarkup"
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
@@ -249,11 +250,14 @@ func (c *commsClient) deliverChannel(msg commbus.Message) {
 	// Comm.Channel.Text {channel, talker, text} so it can route to a per-channel tab. Same hear-set +
 	// ignore funnel as the text line (we are past both gates here), so a muted/ignored line emits no
 	// GMCP either. (text is the rendered line today; carrying the raw message text is a follow-up.)
+	// A channel_def format may carry {{TOKEN}} color markup, which only the telnet Write path renders —
+	// strip it here so a rich client doesn't display literal braces (colormarkup.Strip is the shared edge
+	// tokenizer; JSON escaping already made a leaked token injection-safe, this is cosmetic).
 	if c.gmcp.supported("Comm.Channel.Text") {
 		payload, _ := json.Marshal(map[string]string{
 			"channel": strings.TrimPrefix(msg.Subject, commbus.ChanPrefix),
-			"talker":  msg.AuthorName,
-			"text":    msg.Body,
+			"talker":  colormarkup.Strip(msg.AuthorName),
+			"text":    colormarkup.Strip(msg.Body),
 		})
 		_ = c.tc.WriteGMCP("Comm.Channel.Text", payload)
 	}

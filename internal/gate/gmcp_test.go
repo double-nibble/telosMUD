@@ -47,6 +47,31 @@ func TestDeliverChannelEmitsGMCP(t *testing.T) {
 	}
 }
 
+// TestDeliverChannelGMCPStripsColorTokens pins the Track-1 guard rail on the Comm mirror: a
+// channel_def format may carry {{TOKEN}} color markup, which the telnet Write path renders — the
+// structured Comm.Channel.Text payload must carry the STRIPPED text, never the literal tokens.
+func TestDeliverChannelGMCPStripsColorTokens(t *testing.T) {
+	msg := commbus.Message{
+		Subject:    commbus.ChanSubject("gossip"),
+		AuthorName: "{{BOLD}}Alice{{RESET}}", // talker is stripped too (engine-set today, defense in depth)
+		Body:       "[{{FG_MAGENTA}}Gossip{{RESET}}] Alice: hi",
+	}
+	var out bytes.Buffer
+	tc := telnet.NewReadWriter(bytes.NewReader([]byte{255, 253, 201}), &out) // IAC DO 201 → GMCP enabled
+	tc.ReadLine()
+	g := newGMCPState()
+	g.setSupports([]string{"Comm"})
+	cc := &commsClient{log: discardLog(), tc: tc, gmcp: g, ignore: map[string]struct{}{}}
+	cc.deliverChannel(msg)
+	got := out.String()
+	if !strings.Contains(got, `"text":"[Gossip] Alice: hi"`) {
+		t.Fatalf("Comm.Channel.Text did not carry the stripped body; out = %q", got)
+	}
+	if strings.Contains(got, "{{") {
+		t.Fatalf("literal {{tokens}} leaked to the client; out = %q", got)
+	}
+}
+
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func TestGMCPSupportedPrefix(t *testing.T) {

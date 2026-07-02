@@ -2,6 +2,7 @@ package world
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
@@ -195,6 +196,63 @@ func TestCharItemsInvAndRoom(t *testing.T) {
 	}
 	if sawSelf {
 		t.Error("room items leaked the player (only ground items belong)")
+	}
+}
+
+// TestGMCPPayloadsStripColorTokens pins the Track-1 guard rail: content-authored names may carry
+// {{TOKEN}} color markup, which only the telnet edge renders — a GMCP payload must never ship the
+// literal tokens to a rich client. Covers the three name-shaped fields: Room.Info name, Char.Items
+// item names, and the Char.Status combat target.
+func TestGMCPPayloadsStripColorTokens(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+
+	// Room name with markup → Room.Info name is the stripped text.
+	e.location.short = "{{FG_CYAN}}Temple{{RESET}} Square"
+	var info struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(z.roomInfoJSON(e.location), &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "Temple Square" {
+		t.Errorf("Room.Info name = %q, want the tokens stripped (%q)", info.Name, "Temple Square")
+	}
+
+	// Carried item with markup → Char.Items name is stripped.
+	ruby := z.newEntity("test:ruby")
+	ruby.short = "{{FG_RED}}a ruby{{RESET}}"
+	Add(ruby, &Physical{})
+	Move(ruby, e)
+	var inv gmcpItemList
+	if err := json.Unmarshal(charItemsInvJSON(e), &inv); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, it := range inv.Items {
+		if it.Name == "a ruby" {
+			found = true
+		}
+		if strings.Contains(it.Name, "{{") {
+			t.Errorf("Char.Items name leaked literal markup: %q", it.Name)
+		}
+	}
+	if !found {
+		t.Error("stripped ruby not found in Char.Items")
+	}
+
+	// Combat target with markup → Char.Status target is stripped. An UNKNOWN token stays literal,
+	// matching what a color-off telnet client sees (the shared-tokenizer contract).
+	mob := makeMobTarget(z, e, "{{FG_GREEN}}goblin{{RESET}} {{NOSUCH}}")
+	z.startFight(e, mob)
+	var st struct {
+		Target string `json:"target"`
+	}
+	if err := json.Unmarshal(z.charStatusJSON(e), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Target != "goblin {{NOSUCH}}" {
+		t.Errorf("Char.Status target = %q, want known tokens stripped + unknown literal", st.Target)
 	}
 }
 

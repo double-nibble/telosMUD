@@ -30,6 +30,12 @@ IAC SB 201  <package-message-name> SP <json-payload>  IAC SE
   `gmcp.Send(player, "Room.Info", payload)` without checking support.
 - GMCP emitters subscribe to the **same per-zone event bus** as text output: when an entity's
   vitals change, both the prompt and `Char.Vitals` are emitted from one event.
+- **String fields carry STRIPPED display text.** Content-authored text may embed `{{TOKEN}}` color
+  markup, which only the telnet edge renders — a GMCP payload must never ship the literal tokens.
+  Every payload builder routes content-authored strings through `colormarkup.Strip` at BUILD time
+  (world: the `gmcpText` helper in `gmcp.go`; gate: the Comm mirror). Unknown `{{...}}` stays
+  literal, matching the color-off telnet projection. Any NEW emitter — including the future
+  builder-facing `gmcp.send` Lua lane — must honor this contract.
 
 ## Implemented packages
 

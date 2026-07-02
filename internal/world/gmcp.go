@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/colormarkup"
 )
 
 // roomNum maps a room's ProtoRef to the stable integer id GMCP Room.Info uses (`num`, and the exit
@@ -26,6 +27,15 @@ func roomNum(ref ProtoRef) int {
 // it to a GMCP-enabled client (Phase 9.1), so the world emits unconditionally: a plain-telnet player's
 // gate silently drops these. Change-detection (per-session last-sent) keeps it from re-emitting an
 // identical payload on every prompt.
+//
+// Content-authored NAMES may carry {{TOKEN}} color markup, which only the telnet edge renders — GMCP is
+// structured data a rich client displays raw, so every name-shaped field below goes through gmcpText
+// (JSON-escaping makes a leaked token injection-safe, but the client would SHOW the literal braces).
+
+// gmcpText strips the known {{TOKEN}} color vocabulary from a content-authored display string bound for
+// a GMCP payload. Unknown {{...}} runs stay literal, exactly matching what a color-off telnet client
+// sees (colormarkup.Strip is the shared edge tokenizer, so the two can't drift).
+func gmcpText(s string) string { return colormarkup.Strip(s) }
 
 // gmcpFrame wraps a GMCP package name + JSON payload as a world->gate ServerFrame.
 func gmcpFrame(pkg string, payload []byte) *playv1.ServerFrame {
@@ -78,7 +88,7 @@ func (z *Zone) charStatusJSON(e *Entity) []byte {
 		st.State = "dead"
 	}
 	if e.living != nil && e.living.fighting != nil {
-		st.Target = e.living.fighting.Name()
+		st.Target = gmcpText(e.living.fighting.Name())
 	}
 	b, _ := json.Marshal(st)
 	return b
@@ -99,12 +109,12 @@ func (z *Zone) roomInfoJSON(r *Entity) []byte {
 		Exits       map[string]int `json:"exits"`
 	}{
 		Num:   roomNum(r.proto),
-		Name:  r.Name(),
+		Name:  gmcpText(r.Name()),
 		Zone:  zoneName,
 		Exits: map[string]int{},
 	}
 	if r.room != nil {
-		info.Environment = r.room.sector
+		info.Environment = gmcpText(r.room.sector)
 		for dir, dst := range r.room.exits {
 			info.Exits[dir] = roomNum(dst)
 		}
@@ -139,7 +149,7 @@ func itemEntry(e *Entity, wr *Wearer) gmcpItem {
 	if wr != nil && wr.slotOf(e) != WearLocNone {
 		attrib += "W"
 	}
-	return gmcpItem{ID: fmt.Sprintf("i%v", e.RuntimeID()), Name: e.Name(), Attrib: attrib}
+	return gmcpItem{ID: fmt.Sprintf("i%v", e.RuntimeID()), Name: gmcpText(e.Name()), Attrib: attrib}
 }
 
 // charItemsJSON builds a Char.Items.List payload {location, items}. location is "inv" (everything the
