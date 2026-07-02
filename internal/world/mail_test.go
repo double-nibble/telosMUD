@@ -140,6 +140,33 @@ func TestMailSendListReadDeleteRoundTrip(t *testing.T) {
 	waitMailLine(t, bob, "Your mailbox is empty.")
 }
 
+// TestMailReadRateLimited pins #65: mail list/read/delete each spawn a goroutine + a Postgres query, so
+// they share the per-author comms token bucket (mail send already did). Once the burst is spent, the next
+// mail read/list is throttled SYNCHRONOUSLY — the store is never touched — instead of being an unbounded
+// per-session async-PG spam path.
+func TestMailReadRateLimited(t *testing.T) {
+	ms := NewMemStore()
+	// Burst 2, effectively no refill for the test window: Bob gets exactly two mail actions.
+	sh := NewDemoShard().WithMail(ms).WithCommsRate(2, time.Minute)
+	z := sh.Zone()
+	alice := newTestPlayerEntity(z, "Alice")
+	bob := newTestPlayerEntity(z, "Bob")
+
+	// Alice mails Bob so he has something to read (spends ALICE's bucket, not Bob's — buckets are per-author).
+	z.dispatch(alice, "mail send Bob Subj | body one")
+	waitMailLine(t, alice, "Mail sent to Bob.")
+
+	// Bob's two mail actions spend his 2-token burst.
+	z.dispatch(bob, "mail")
+	waitMailLine(t, bob, "Your mailbox:")
+	z.dispatch(bob, "mail read 1")
+	waitMailLine(t, bob, "body one")
+
+	// The THIRD is throttled — the guard runs on the zone goroutine before any goroutine/PG.
+	z.dispatch(bob, "mail")
+	waitMailLine(t, bob, "checking your mail too fast")
+}
+
 // TestMailOfflineThenReadOnLogin proves an OFFLINE recipient (never joined / no live session) receives
 // mail, stored durably, and reads it when they next come online via `mail`. The mail store is independent
 // of session presence — the message lands in the inbox at send and waits.
