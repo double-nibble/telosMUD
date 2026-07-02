@@ -366,6 +366,10 @@ func (rt *luaRuntime) installSandbox() {
 	// region:get — reads are local; the write surface (signal_region/signal_world) is 10.3c.
 	rt.installScopeTables()
 
+	// Register the `ui` sheet toolkit (luaui.go): the pure-formatting layout engine (dividers,
+	// banners, rows, spans) content display templates render sheets with. No world state / no harm.
+	rt.installUITable()
+
 	// Arm the default per-call budgets (T3/T4). The per-call re-arm chokepoint is slice 7.5;
 	// arming once here makes the abort path live and testable now.
 	L.SetInstructionBudget(luaInstrBudget)

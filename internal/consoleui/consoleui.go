@@ -76,6 +76,7 @@ type element struct {
 // or NewFixed (a fixed column count of cells wide); the chainable add-methods return the Sheet.
 type Sheet struct {
 	fixedWidth int // 0 => auto (fit the widest content)
+	maxWidth   int // 0 => unbounded; else a hard ceiling on every column AND the total width
 	elems      []element
 }
 
@@ -85,6 +86,15 @@ func New() *Sheet { return &Sheet{} }
 // NewFixed returns a sheet whose total width is exactly width cells; content wider than that is truncated
 // with an ellipsis. (The Lua layer maps a "full" request to the client's terminal width via this.)
 func NewFixed(width int) *Sheet { return &Sheet{fixedWidth: width} }
+
+// MaxWidth sets a hard ceiling (in cells) on every column width AND the total table width, so an untrusted
+// caller can't drive an unbounded allocation via a huge AUTO width (one giant cell, or a divider/pad filling to
+// it). Content wider than the ceiling is truncated with an ellipsis, exactly like fixed mode. n<=0 clears it.
+// Returns the sheet for chaining.
+func (s *Sheet) MaxWidth(n int) *Sheet {
+	s.maxWidth = n
+	return s
+}
 
 // Row adds a columnar row. aligns[i] sets column i's alignment (default Left when omitted).
 func (s *Sheet) Row(cells []string, aligns ...Align) *Sheet {
@@ -127,6 +137,9 @@ func (s *Sheet) Render() string {
 	} else {
 		tableW = s.fixedWidth
 	}
+	if s.maxWidth > 0 && tableW > s.maxWidth { // hard ceiling on the total width (auto or fixed)
+		tableW = s.maxWidth
+	}
 	if tableW < 0 {
 		tableW = 0
 	}
@@ -149,7 +162,12 @@ func (s *Sheet) Render() string {
 
 func (s *Sheet) fixed() bool { return s.fixedWidth > 0 }
 
-// columnWidths computes the max visible width of each column across all rows.
+// bounded reports whether the sheet has a hard total width (fixed or a max ceiling) that a too-wide row must be
+// truncated to.
+func (s *Sheet) bounded() bool { return s.fixedWidth > 0 || s.maxWidth > 0 }
+
+// columnWidths computes the max visible width of each column across all rows, capping each at maxWidth so no
+// single column can drive an unbounded per-cell pad allocation.
 func (s *Sheet) columnWidths() []int {
 	var colW []int
 	for _, e := range s.elems {
@@ -160,7 +178,11 @@ func (s *Sheet) columnWidths() []int {
 			for len(colW) <= i {
 				colW = append(colW, 0)
 			}
-			colW[i] = max(colW[i], visibleWidth(c))
+			w := max(colW[i], visibleWidth(c))
+			if s.maxWidth > 0 && w > s.maxWidth {
+				w = s.maxWidth
+			}
+			colW[i] = w
 		}
 	}
 	return colW
@@ -178,10 +200,25 @@ func colsTotal(colW []int) int {
 }
 
 // renderRow pads each cell to its column width (per align), joins with the separator, and truncates the whole
-// line to the sheet width in fixed mode. Trailing padding on the final column is trimmed for clean output.
+// line to the sheet width when bounded. Trailing padding on the final column is trimmed for clean output.
+//
+// When bounded, it stops building once the accumulated width reaches tableW and caps the straddling cell's pad
+// to what still fits: everything past tableW is truncated away anyway, so building it is pure waste — and,
+// crucially, that waste is the render-time DoS amplifier (cells × colW can be far larger than tableW). Capping
+// the BUILD to ~tableW bounds a row's allocation to the line width regardless of column count or column widths.
+// For fitting content (or an unbounded sheet) the accumulator never reaches tableW, so this is a no-op and the
+// layout is byte-identical.
 func (s *Sheet) renderRow(e element, colW []int, tableW int) string {
-	parts := make([]string, len(e.cells))
+	var b strings.Builder
+	acc := 0 // visible cells built so far
 	for i, c := range e.cells {
+		if s.bounded() && acc >= tableW {
+			break // the rest of the row would be truncated away — don't allocate it (DoS guard)
+		}
+		if i > 0 {
+			b.WriteString(colSep)
+			acc += visibleWidth(colSep)
+		}
 		a := Left
 		if i < len(e.aligns) {
 			a = e.aligns[i]
@@ -190,11 +227,15 @@ func (s *Sheet) renderRow(e element, colW []int, tableW int) string {
 		if i < len(colW) {
 			w = colW[i]
 		}
-		parts[i] = fitCell(c, w, a)
+		if s.bounded() && acc+w > tableW { // cap the straddling cell to the remaining width
+			w = tableW - acc
+		}
+		b.WriteString(fitCell(c, w, a))
+		acc += w
 	}
-	line := strings.TrimRight(strings.Join(parts, colSep), " ")
-	if s.fixed() && visibleWidth(line) > tableW {
-		// Fixed-mode overflow: truncate the assembled row. This can cut mid-cell and drop a trailing PDI, but a
+	line := strings.TrimRight(b.String(), " ")
+	if s.bounded() && visibleWidth(line) > tableW {
+		// Bounded-width overflow: truncate the assembled row. This can cut mid-cell and drop a trailing PDI, but a
 		// bidi terminal auto-closes an open isolate at the line boundary, so the blast radius is one line.
 		line = truncateVisible(line, tableW)
 	}

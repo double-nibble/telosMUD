@@ -285,6 +285,24 @@ func TestHasRTLArabicDigits(t *testing.T) {
 	}
 }
 
+// TestBoundedRowBuildCapped is the render-product DoS guard: with a MaxWidth ceiling, a wide column and many
+// columns must NOT make a row build past the table width — every rendered line stays within the ceiling
+// regardless of column count or per-column width.
+func TestBoundedRowBuildCapped(t *testing.T) {
+	// 30 columns each forced to 50 cells by one row: naive padding would build 30*50=1500 cells; the ceiling
+	// (20) must cap the built line.
+	wide := make([]string, 30)
+	for i := range wide {
+		wide[i] = strings.Repeat("y", 50)
+	}
+	s := New().MaxWidth(20).Row(wide).Row([]string{"a", "b", "c"})
+	for _, ln := range strings.Split(s.Render(), "\n") {
+		if visibleWidth(ln) > 20 {
+			t.Errorf("line exceeds MaxWidth ceiling: %d cells (%q)", visibleWidth(ln), ln)
+		}
+	}
+}
+
 // TestRTLLinePinnedLTR pins the base-direction fix: a line carrying RTL is prefixed with LRM so a first-strong
 // terminal can't flip the whole grid to RTL when column 0 is RTL. A pure-LTR line gets no LRM.
 func TestRTLLinePinnedLTR(t *testing.T) {

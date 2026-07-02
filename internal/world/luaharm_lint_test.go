@@ -323,6 +323,7 @@ var callExemptFuncs = map[string]bool{
 	"callLuaFuncRepl":   true, // string.gsub function-replacement callback
 	"tableLookupRepl":   true, // string.gsub table-replacement lookup (no Call, defensive)
 	"outputGuardedFunc": true, // the gsub output-guard wrapper (no Call, defensive)
+	"sheetRows":         true, // ui.sheet:rows() mapper callback (in-builtin Call under the armed entry-point context)
 }
 
 // TestNoRawLuaCallsOutsideChokepoint is the SOLE-CHOKEPOINT build-failing lint. It loads the world
