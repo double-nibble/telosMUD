@@ -27,7 +27,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # Generated *.pb.go is gitignored; produce it before building (mirrors ci.yml).
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
@@ -57,7 +57,7 @@ jobs:
   soak:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
           version: 1.71.0

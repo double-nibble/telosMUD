@@ -13,7 +13,7 @@ jobs:
   go:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # Generated *.pb.go is gitignored; produce it before building.
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
@@ -39,7 +39,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
           version: 1.71.0
@@ -58,7 +58,7 @@ jobs:
   proto:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff # v1
         with:
           lint: true
@@ -92,7 +92,7 @@ jobs:
     env:
       TELOS_TEST_DSN: postgres://telos:telos@localhost:5432/telosmud?sslmode=disable
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
           version: 1.71.0
@@ -115,7 +115,7 @@ jobs:
   comms:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
           version: 1.71.0
@@ -144,7 +144,7 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: make smoke-twice
 
   # Black-box e2e (tests/e2e, built with -tags e2e): bring the FULL stack up, then drive
@@ -155,7 +155,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
           version: 1.71.0
