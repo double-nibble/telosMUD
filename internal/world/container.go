@@ -45,6 +45,8 @@ func containerCommands() []*Command {
 		{Name: "open", Run: cmdOpen},
 		{Name: "close", Run: cmdClose},
 		{Name: "split", Run: cmdSplit},
+		{Name: "keep", Run: cmdKeep},
+		{Name: "unkeep", Run: cmdUnkeep},
 	}
 }
 
@@ -211,17 +213,11 @@ func cmdDrop(c *Context) error {
 		c.Send("You aren't carrying that.")
 		return nil
 	}
-	// Binding gate (Phase 13.1): a bound item cannot be dropped (the ground is shared — dropping is a
-	// transfer-to-others). Equip/destroy/deconstruct stay allowed; only transfer is gated.
-	if transferBlocked(c, target) {
+	// Transfer-out gates (in order of the most actionable message): a still-WORN item must be `remove`d
+	// first (#36 — no more silent un-equip); a `keep`-flagged item must be `unkeep`ed (#36); a BOUND item
+	// can't be parted with at all (Phase 13.1). Equip/destroy/deconstruct stay allowed; only transfer is gated.
+	if equippedBlocked(c, target) || keptBlocked(c, target) || transferBlocked(c, target) {
 		return nil
-	}
-	// Clear any worn slot the item occupies before it leaves inventory (so the slot map
-	// never points at an item that is no longer carried).
-	if wr, ok := Get[*Wearer](c.Actor); ok {
-		if loc := wr.slotOf(target); loc != WearLocNone {
-			delete(wr.worn, loc)
-		}
 	}
 	Move(target, c.Actor.location)
 	c.z.act("You drop $p.", c.Actor, target, nil, "", "", ToActor)
@@ -264,20 +260,15 @@ func cmdPut(c *Context) error {
 			c.Send("You can't put something inside itself.")
 			continue
 		}
-		// Binding gate (Phase 13.1): a bound item cannot be stowed in a container others could open (a
-		// transfer path). Skipped per-item so the rest of a multi-item put still proceeds.
-		if transferBlocked(c, m) {
+		// Transfer-out gates (#36 + Phase 13.1): a worn item must be removed first, a kept item unkept, a
+		// bound item can't be stowed in a container others could open. Skipped per-item so the rest of a
+		// multi-item put still proceeds.
+		if equippedBlocked(c, m) || keptBlocked(c, m) || transferBlocked(c, m) {
 			continue
 		}
 		if !cc.hasRoom(len(box.contents)) {
 			c.z.act("$p can't hold any more.", c.Actor, box, nil, "", "", ToActor)
 			break
-		}
-		// Clear a worn slot if the item being stowed was equipped.
-		if wr, ok := Get[*Wearer](c.Actor); ok {
-			if loc := wr.slotOf(m); loc != WearLocNone {
-				delete(wr.worn, loc)
-			}
 		}
 		Move(m, box)
 		c.z.act2("You put $p in $P.", c.Actor, m, box, nil, "", "", ToActor)

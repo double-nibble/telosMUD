@@ -39,6 +39,7 @@ const (
 	KindItemMeta    // Phase 13.1: an item's bind rule + rarity tier + tags (proto metadata)
 	KindBound       // Phase 13.1: a per-instance marker — this item is BOUND (untradeable)
 	KindStack       // Phase 13.2: a stackable material's per-instance count
+	KindKept        // #36: a per-instance "do not drop" marker (keep/unkeep)
 	KindCorpseOwner // security hardening: a corpse's killer loot-ownership window (anti-ninja-loot)
 )
 
@@ -107,6 +108,27 @@ func Add[T Component](e *Entity, c T) {
 		e.room = v
 	case *Living:
 		e.living = v
+	}
+}
+
+// Remove deletes component T from e (a no-op if absent), keeping the direct-pointer escape hatches in
+// sync so a removed *Room/*Living can't leave a dangling e.room/e.living (the invariant Add's comment
+// flags). Used for TOGGLEABLE per-instance markers (e.g. the Kept flag); permanent markers like Bound
+// have no removal. Zone goroutine only.
+func Remove[T Component](e *Entity) {
+	if e == nil || e.comps == nil {
+		return
+	}
+	t := reflect.TypeFor[T]()
+	if _, ok := e.comps[t]; !ok {
+		return
+	}
+	delete(e.comps, t)
+	if t == reflect.TypeFor[*Room]() {
+		e.room = nil
+	}
+	if t == reflect.TypeFor[*Living]() {
+		e.living = nil
 	}
 }
 
