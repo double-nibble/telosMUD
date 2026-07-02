@@ -418,6 +418,12 @@ func TestAFKAutoReply(t *testing.T) {
 	if !ack {
 		t.Fatal("backlog tell to an AFK target was not acked")
 	}
+	// The suppress branch ALSO acks, so pin that this backlog tell genuinely DELIVERED (cursor
+	// advanced to 2) — otherwise a future cursor-semantics change could silently degrade this into
+	// testing the suppress path, which skips the auto-reply too (a vacuous pass).
+	if got := z.players["Sleeper"].tellCursor["Caller"]; got != 2 {
+		t.Fatalf("backlog tell did not deliver (cursor = %d, want 2); the no-auto-reply window below would be vacuous", got)
+	}
 	select {
 	case m := <-senderTells:
 		t.Fatalf("a backlog drain triggered an AFK auto-reply: %q", m.Body)
