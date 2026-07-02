@@ -1,6 +1,10 @@
 package world
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/double-nibble/telosmud/internal/content"
+)
 
 // effect_op_grant_test.go — the Phase-11.1 grant ops (modify_attribute_base, set_flag/clear_flag): the
 // op behavior + the grant-survives-a-reload guarantee the progression machinery rests on.
@@ -96,6 +100,40 @@ func TestGrantOpsRepublishCommsOnAccessChange(t *testing.T) {
 	}
 	if !containsStr(p.HearChannels, "secret") {
 		t.Fatalf("hear-set %v missing `secret` after set_flag granted access", p.HearChannels)
+	}
+}
+
+// TestModifyAttributeBaseRepublishesOnMinAttrFloor is the symmetry pin for the OTHER access predicate
+// (both reviews of the flag fix asked for it): modify_attribute_base shares the same one-line republish
+// hook, so a grant op dropping a player BELOW a channel's min_attr floor must refresh the hear-set and
+// drop the channel — the eavesdropping direction for an attribute-gated channel.
+func TestModifyAttributeBaseRepublishesOnMinAttrFloor(t *testing.T) {
+	_, z, gate := restrictedHearShard(t)
+	// Add an attribute (default base 10) and a channel gated on it (floor 5), straight into the zone's
+	// registries — the shard isn't running its loop here, so registration is safe on the test goroutine.
+	z.defs.attr.register("clout", &attributeDef{ref: "clout", base: litNode{v: 10}})
+	z.channelDefs().register("elite", buildChannelDef(content.ChannelDTO{
+		Ref: "elite", Name: "Elite", Words: []string{"elite"}, DefaultOn: true,
+		Access: content.ChannelAccessDTO{MinAttr: &content.MinAttrDTO{Attr: "clout", Min: 5}},
+	}))
+
+	s := newTestPlayerEntity(z, "Aspirant")
+	if !containsStr(z.effectiveHearSet(s), "elite") {
+		t.Fatal("precondition: a player at clout 10 (>= floor 5) should hear the min_attr-gated `elite`")
+	}
+	cfg := drainConfig(t, gate, "Aspirant")
+
+	c := seededCtx(z, s.entity, s.entity, dispHelpful)
+	// 10 - 8 = 2 < 5: drops below the floor, so the republish must drop `elite`.
+	if err := opModifyAttributeBase(c, &effectOp{attr: "clout", amount: -8}); err != nil {
+		t.Fatalf("modify_attribute_base: %v", err)
+	}
+	p, ok := recvConfig(t, cfg)
+	if !ok {
+		t.Fatal("modify_attribute_base did not republish comms config after crossing a min_attr floor")
+	}
+	if containsStr(p.HearChannels, "elite") {
+		t.Fatalf("hear-set %v still includes `elite` after dropping below the min_attr floor", p.HearChannels)
 	}
 }
 
