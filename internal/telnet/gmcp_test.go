@@ -45,6 +45,11 @@ func TestGMCPOfferAndNegotiation(t *testing.T) {
 	}
 }
 
+// The inbound tests below deliberately do NOT negotiate DO 201 first: `gmcpOn` gates OUTBOUND
+// emission only (WriteGMCP), while handleIAC routes an inbound SB 201 to readGMCPSubneg
+// unconditionally — a client that subnegotiates without accepting the offer is parsed, not
+// refused, and the gate's semantic layer decides what to do with the payload. So skipping the
+// handshake here matches production exactly (ai-finding #11 asked; this is by design, not a gap).
 func TestGMCPInboundParseAndLineIntact(t *testing.T) {
 	sink := &gmcpSink{}
 	// IAC SB 201 "Core.Hello {\"client\":\"Mudlet\"}" IAC SE, then a data-less "Core.Ping", then "go" LF.
@@ -277,7 +282,10 @@ func FuzzGMCPSubneg(f *testing.F) {
 			}
 		})
 		// Drain the stream: ReadLine must never panic on any framing, and must eventually return an
-		// error (EOF) rather than looping. Bound the iterations defensively.
+		// error (EOF) rather than looping. Bound the iterations defensively: every returned line
+		// consumed at least one input byte, so len(data) iterations reach EOF; the +8 is slack for
+		// the zero-consumption edges (empty input, a trailing partial frame). If that reasoning
+		// were ever off, the loop just exits early — it can never hang the fuzzer (ai-finding #12).
 		for i := 0; i < len(data)+8; i++ {
 			if _, err := c.ReadLine(); err != nil {
 				break
