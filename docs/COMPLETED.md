@@ -5272,3 +5272,11 @@ DOMAIN sections into dependency-ordered TRACKS (a shared-seam map + 8 hard order
   reslice), inert on caseless scripts (Arabic/CJK) so it composes with the i18n render path. Mudlib audited every
   act call site (no intentionally-lowercase-leading template; tell/channel/mail/system paths correctly bypass
   `render()`). Reviewed by mudlib + edge. (commits 73bf2b6, 5ebcca4)
+- **Item coalescing in listings.** `coalesceItemLines` (commands.go) groups identical DISCRETE items into one
+  `"<Name> (N)"` line across the three listing sites — inventory, container (`It holds:`), and lookRoom ground
+  items (which now renders creatures individually, then coalesces ground items). The group key is prototype +
+  the per-instance DELTA (`dumpItemDelta`: bound/quality) — stable because encoding/json sorts the affix-map
+  keys — so a bound or quality-varied item never merges with a plain one. Materials (own stack count) and
+  containers (hidden contents differ, e.g. two corpses with different loot) list individually. Listing lines are
+  now presentation initial-capped (folded into the same helper). GMCP `Char.Items.List` count mirror deferred to
+  Track 7. Reviewed by mudlib + progression; full e2e tier verified against a rebuilt stack. (commit e14d24d)

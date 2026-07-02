@@ -84,18 +84,27 @@ initial-cap SHIPPED — see COMPLETED.md "Burn-down round 3". Still-open color f
   color any content. (3) **width-aware framing:** `score`'s column measure + any future word-wrap must measure
   `Width(stripTokens(s))`, not the raw markup. (4) optional **semantic aliases** (`{{ENEMY}}` → direct tokens,
   only if a pack wants global re-theming). See [[content-alias-and-salvage-direction]]. · *edge/mudlib*
-- **Coalesce identical items in listings (`A torch. (5)`).** Group identical discrete items onto one line with a
-  `(N)` count in `lookRoom`, inventory, and container listings — distinct from the Phase-13.2 `Stack` component.
-  Grouping key: same rendered short AND no distinguishing per-instance state (group by prototype + equal delta,
-  else identical short); single items uncounted. **Mirror the count in GMCP `Char.Items.List`** — coordinate
-  with Track 7 (do it with, or after, the Char.Items delta restructure so the count field isn't re-placed). · *edge/mudlib*
-- **`score` command — the character stat sheet.** `score`/`sc` → a framed summary: name + title, vital pools
-  (`HP: 150(150)` current(max) per resource), currency, XP `have/next-level`, carry weight %, progression levels
-  (overall + per-track), the attribute grid. All already engine state — this is a RENDER. **Design fork:** the
-  LAYOUT + row/attribute SET are flavor, so the template should be CONTENT-DEFINED (a content score layout
-  referencing resource/attribute/track refs, engine-rendered) not a hardcoded Go sheet — else a 5e vs WoW pack
-  can't show its own stat names/order. **Prereq:** the Track 0 display-width helper (column framing). GMCP clients
-  already get this via `Char.Stats`/`Char.Vitals`. · *mudlib/edge*
+*The Track-1 render PRIMITIVES all SHIPPED (COMPLETED.md "Burn-down round 3"): `{{TOKEN}}` ANSI color,
+presentation initial-cap, item coalescing (`A torch (5)`), and the UTF-8/textwidth work. Only `score` remained —
+and it revealed itself as the first consumer of a LARGE templating subsystem, below. Still-open coalescing
+follow-up: mirror the `(N)` count into GMCP `Char.Items.List` — coordinate with Track 7 (do it with/after the
+Char.Items delta restructure so the count field isn't re-placed).*
+
+- **[LARGE] Content-defined display-templating subsystem (`score` is its first consumer).** The user wants a
+  GENERAL content-authored display-template mechanism, NOT a score-specific sheet: named surfaces include ROOM
+  descriptions, the `score` sheet, GUILD sheets, PROFESSION sheets, INVENTORY, `who` lists — an OPEN set ("to
+  name a few"). A content template references engine state by ref (resource/attribute/track refs, entity
+  fields, currency, carry-weight) and the engine renders it, so a 5e vs WoW pack shows its own stat
+  names/order/labels/sections with ZERO engine change (the mechanism/flavor pillar). MUST compose with the
+  shipped Track-1 primitives: `{{TOKEN}}` color, the `textwidth` framing (measure `Width(stripTokens(s))`),
+  capitalization, and coalescing (the inventory template needs the `(N)` grouping). **Design forks for the
+  design pass (ASK user):** the template LANGUAGE — a small engine-evaluated layout DSL (rows/columns/sections
+  referencing refs) vs a structured-YAML layout vs a sandboxed Lua render hook (scripting surface exists); one
+  generic `display_template` def table vs per-surface DTOs; conditional/repeated rows (e.g. one row per track);
+  persistence (a def table → rides the Track-0 reflect-walk store net). Build `score` FIRST to prove the
+  abstraction, then generalize. **`score` content:** name+title, vital pools (`HP: 150(150)`), currency, XP
+  `have/next`, carry-weight %, progression levels, the attribute grid — all already engine state (GMCP clients
+  get it via `Char.Stats`/`Char.Vitals`). See [[content-display-templates-direction]]. · *mudlib/edge/content*
 
 ## Track 2 — Visibility & the `canSee`/`nameFor` chokepoint  ·  [LARGE] foundation + its consumers
 
