@@ -48,6 +48,52 @@ func TestStripIsDisabledRender(t *testing.T) {
 	}
 }
 
+// TestScanWindowBoundsAdversarialInput pins the tokenScanWindow hardening: (a) a "{{...}}" pair wider
+// than the window is LITERAL even if a distant "}}" exists (before the window, each such "{{" rescanned
+// to that distant close — O(n²) on adversarial input); (b) generously-padded KNOWN tokens still render;
+// (c) a huge token-less "{{" run round-trips verbatim in time only a linear scan allows (a quadratic
+// scan of this input would visibly hang the suite).
+func TestScanWindowBoundsAdversarialInput(t *testing.T) {
+	// (a) The "}}" sits past the window → literal, both enabled and disabled.
+	wide := "{{" + strings.Repeat(" ", tokenScanWindow+4) + "FG_RED}} tail"
+	if got := Render(wide, true); got != wide {
+		t.Fatalf("over-window pair should be literal: got %q", got)
+	}
+	if got := Strip(wide); got != wide {
+		t.Fatalf("Strip of over-window pair should be identity: got %q", got)
+	}
+	// (b) Padding within the window still renders (the trim semantics are unchanged for sane input).
+	padded := "{{  " + "FG_RED" + "  }}hi"
+	if got := Render(padded, true); got != "\x1b[31mhi\x1b[0m" {
+		t.Fatalf("padded known token should render: got %q", got)
+	}
+	// Exact boundary: a name region of exactly tokenScanWindow bytes renders; one byte more is
+	// literal (pins the limit arithmetic, not just the far-over case).
+	atLimit := "{{" + strings.Repeat(" ", tokenScanWindow-6) + "FG_RED}}x"
+	if got := Render(atLimit, true); got != "\x1b[31mx\x1b[0m" {
+		t.Fatalf("exactly-at-window token should render: got %q", got)
+	}
+	pastLimit := "{{" + strings.Repeat(" ", tokenScanWindow-5) + "FG_RED}}x"
+	if got := Render(pastLimit, true); got != pastLimit {
+		t.Fatalf("one-past-window pair should be literal: got %q", got)
+	}
+	// Vocabulary-growth guard: every known token name must fit the window with room to spare, so
+	// adding a long name can never silently make a bare (unpadded) token unscannable.
+	for name := range sgrTokens {
+		if len(name) > tokenScanWindow {
+			t.Errorf("token %q (%d bytes) exceeds tokenScanWindow (%d)", name, len(name), tokenScanWindow)
+		}
+	}
+	// (c) 200k token-less "{{" bytes: identity, and fast only if the scan is linear.
+	run := strings.Repeat("{{", 100_000)
+	if got := Strip(run); got != run {
+		t.Fatal("token-less {{ run must round-trip verbatim")
+	}
+	if got := Render(run+"{{FG_RED}}x", true); !strings.HasSuffix(got, "\x1b[31mx\x1b[0m") || !strings.HasPrefix(got, run) {
+		t.Fatalf("trailing real token after a literal run must still render: got tail %q", got[len(got)-20:])
+	}
+}
+
 // sgrOnly matches text in which EVERY ESC begins a well-formed SGR (`ESC [ <digits/semicolons> m`) and nothing
 // else — no cursor move, erase, scroll, bell, or device query is expressible.
 var sgrOnly = regexp.MustCompile("^([^\x1b]|\x1b\\[[0-9;]*m)*$")

@@ -99,16 +99,31 @@ func Render(s string, enabled bool) string {
 // that wants the visible string without SGR.
 func Strip(s string) string { return Render(s, false) }
 
+// tokenScanWindow bounds how many bytes past a "{{" the closing "}}" may sit for the pair to be a
+// candidate token. The longest vocabulary name is 17 bytes ("BG_BRIGHT_MAGENTA"); 32 leaves generous
+// slack for the whitespace sgrParam trims. The bound is what keeps scanning LINEAR on adversarial
+// input: without it, every "{{" in a long token-less run rescans to a distant (or absent) "}}",
+// which is O(n²) — and this function runs on zone goroutines and the edge write path. A "{{...}}"
+// pair wider than the window is treated as LITERAL. That deliberately drops one previously-working
+// shape: a known name padded with enough whitespace (sgrParam trims) to push its "}}" past the
+// window no longer renders — in every projection at once (single shared scanner, so no drift).
+const tokenScanWindow = 32
+
 // ScanTokenRun reads a maximal run of adjacent known `{{TOKEN}}` tokens starting at s[i] (which begins "{{"),
 // returning their SGR params and the index just past the run. An empty result (next == i) means s[i] does not
-// begin a known token (unknown name or unclosed), so the caller treats "{{" as literal text. This is the shared
-// primitive: the edge renders these runs to SGR, and consoleui zero-widths them for measurement.
+// begin a known token (unknown name, unclosed, or a "}}" beyond tokenScanWindow), so the caller treats "{{"
+// as literal text. This is the shared primitive: the edge renders these runs to SGR, and consoleui
+// zero-widths them for measurement.
 func ScanTokenRun(s string, i int) (params []string, next int) {
 	j := i
 	for strings.HasPrefix(s[j:], "{{") {
-		end := strings.Index(s[j:], "}}")
+		limit := j + 2 + tokenScanWindow + 2
+		if limit > len(s) {
+			limit = len(s)
+		}
+		end := strings.Index(s[j:limit], "}}")
 		if end < 0 {
-			break // unclosed
+			break // unclosed (within the window)
 		}
 		param, ok := sgrParam(s[j+2 : j+end])
 		if !ok {
