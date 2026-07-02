@@ -53,12 +53,12 @@ is DONE. What's left is a handful of small/medium items scattered across tracks,
 user's operating model: knock out the small ones each pass, plan the LARGEs, repeat until only LARGEs remain.
 Proposed order:
 
-- **A. Small-items sweep (quick, de-risking) — start here.** Track 0: close the `Commands`/`PvpLua`/`Formulas`
-  Postgres gap (now a KNOWN pattern — identical to the `display_defs` persistence just shipped) + the scope-state
-  CAS re-run-safety fix; the GMCP `{{token}}`-strip guard rail (Track 1, security-adjacent, before content is
-  broadly colored); the stale Phase-14 docstrings sweep; the `on_roll` unknown-ref diagnostic (Track 4); the
-  `drop`-refuses-equipped + `keep`/`unkeep` (Track 4, the independent parts); Track 10 channel HEAR/SPEAK split +
-  "comms unavailable" notice; the per-session `who` cooldown.
+- **A. Small-items sweep — MOSTLY DONE (round 5, 2026-07-02; see COMPLETED.md "Burn-down round 5"):** the
+  scope-state CAS re-run fix, the docstrings sweep, the `on_roll` diagnostic, and the GMCP token-strip (+ its
+  security tail: brace-name rejection, tokenizer scan window) all landed. **Still open from A:** the
+  `Commands`/`PvpLua`/`Formulas` Postgres gap (Track 0, has a decide-first element); `drop`-refuses-equipped +
+  `keep`/`unkeep` (Track 4, the independent parts); Track 10 channel HEAR/SPEAK split + "comms unavailable"
+  notice; the per-session `who` cooldown.
 - **B. Medium items.** Track 5 rest mechanic → fire `OnRest` + the live on-change vitals (same `setResourceCurrent`
   funnel); the discrete Track 6 items (mail dead-letter reaper, drain reclaim metrics + bus-lag stamp, durable
   DOWN snapshot-on-join); the Track 7 GMCP enrichments (Char.Items deltas — carries the coalescing `(N)` count,
@@ -111,12 +111,11 @@ initial-cap SHIPPED — see COMPLETED.md "Burn-down round 3". Still-open color f
 
 - **ANSI color — deferred follow-ups.** (1) **PERSIST** the `color on/off` pref across sessions via the ACCOUNT
   — color stays an EDGE concern; the persistence path must NOT route through the input-seq stream (would
-  reintroduce the world/edge coupling slice 2 deliberately avoids). Session-scoped today. (2) **GMCP token-strip
-  — priority guard rail now that the demo advertises `{{tokens}}` in content:** a token in a room NAME (→ GMCP
-  `Room.Info`) or a `channel_def` format (→ `Comm.Channel.Text` raw body) ships literal `{{tokens}}` to a rich
-  client (JSON-escaped so injection-safe, just cosmetic). Strip via a `renderColor(s,false)` helper on the GMCP
-  text fields, or a content-lint rejecting tokens in names/formats, BEFORE builders are broadly told they can
-  color any content. (3) ~~width-aware framing~~ — DONE: `internal/consoleui` measures visible width
+  reintroduce the world/edge coupling slice 2 deliberately avoids). Session-scoped today. (2) ~~GMCP token-strip~~ — DONE
+  (round 5, fe50c85): every GMCP text field strips the known vocabulary via `colormarkup.Strip` at payload
+  BUILD (world `gmcpText`, gate Comm mirror); the contract is documented in docs/GMCP.md for future emitters.
+  Its security tail also landed: name validators reject `{`/`}` (impersonation, c8a4f48) and the tokenizer
+  scan is window-bounded/linear (8858f32). (3) ~~width-aware framing~~ — DONE: `internal/consoleui` measures visible width
   (color-token + display-width aware) for all sheet framing; any FUTURE word-wrap must reuse that. (4) optional
   **semantic aliases** (`{{ENEMY}}` → direct tokens, only if a pack wants global re-theming). See
   [[content-alias-and-salvage-direction]]. · *edge/mudlib*
@@ -214,10 +213,10 @@ salvaging items build on; `affix_defs` and worn-affix both touch the affix data 
   object-target + tag gate + per-item override/block first, then derived tables + skill gate + over-skill bonus.
   **Prereq:** Track 3 resolver for clean object-targeting; the per-item `salvage_table` field rides the Track 0
   net. See [[content-alias-and-salvage-direction]]. · *progression/content*
-- **`on_roll` unknown-ref diagnostic (low priority).** An `on_roll` body returning a ref that doesn't resolve to
-  a prototype is a silent `deliverLoot` no-op (`spawn == nil`) — consistent with the declarative path, but the
-  ref is opaque Lua so a typo vanishes. A debug log (or content-lint) on the `spawn(ref) == nil` path. Independent
-  of the rest of this track. · *progression/observability*
+- ~~`on_roll` unknown-ref diagnostic~~ — DONE (round 5, c80f78f). NOTE the item's "silent no-op" premise was
+  stale (`z.spawn` has Warned on unknown prototypes since Phase 3); the shipped fix adds the missing loot-table
+  CONTEXT (ref+table+looter) to that Warn. A build-time lint of DECLARATIVE loot-entry refs remains possible if
+  the runtime Warn ever proves too late/noisy. · *progression/observability*
 
 ## Track 5 — Rest & regen  ·  seam: `setResourceCurrent`/regen + `OnRest`
 
@@ -348,17 +347,15 @@ change; the Lua director script is the big substrate the smaller Go handlers cou
 
 - **Per-session `who` cooldown (smaller).** The ~1s roster cache is in; a per-session cooldown further blunts a
   single spammer. · *scale*
-- **Stale Phase-14 docstrings sweep (comment-only).** Several headers still describe removed passphrase/SSH-login:
-  `internal/account/service.go:4`, `internal/store/account.go:17`, `cmd/telos-account/main.go:3`,
-  `internal/gate/gate.go:3/182/226`, `internal/config/config.go:25`. Correct to the OAuth-only state. · *cleanup*
+- **Load-time ref-charset content-lint (opened round 5).** Several safety judgments (GMCP strip skipping
+  Vitals/Stats/zone/exit KEYS, comms subjects, the tokenizer) rest on "refs can't contain braces/controls" by
+  CONVENTION only — no charset validation exists at pack load. A loader-time lint (letters/digits/underscore/
+  colon, say) would harden all of them at once. · *content/persistence*
 - **Builder-guide note: top-level `state.x = …` re-runs on hot reload.** A reloaded script's non-handler body
   re-executes against the PRESERVED `self.state`, so `state.x = 0` clobbers a live value; idiomatic content
   guards it (`state.x = state.x or 0`). PERSISTENCE.md note added; this remains for the builder guide. · *docs*
-- **Gated scope-state CAS tests aren't re-run safe (found alongside the reflect net).** `TestWorldStateRoundTripAndCAS`
-  + `TestRegionStateRoundTripAndCAS` (`internal/store/scopestate_test.go`) do a version-0 CAS-create and never
-  TRUNCATE their rows, so they PASS only on a fresh DB (CI) and FAIL on a re-run against a persistent local DB.
-  Fix: `t.Cleanup` a TRUNCATE, or key each run off a unique suffix — the "gated tests must be re-run safe"
-  discipline the pack/reflect tests already honor (they strip-and-replace). · *tests*
+- ~~Gated scope-state CAS tests aren't re-run safe~~ — DONE (round 5, 4ebc6ef): targeted before+after row
+  scrubs (deliberately NOT the TRUNCATE this item suggested — a shared dev DB may hold live director state). · *tests*
 - **[Launch milestone] Squash the goose migrations to a baseline.** By launch there are 18+ incremental
   `db/migrations/*.sql`. Goose can't reverse-engineer/regenerate — the method is a SQUASH: fresh PG → `goose up`
   all → `pg_dump --schema-only` → replace `00001..N` with one `00001_baseline.sql` → apply to a fresh DB +

@@ -5326,3 +5326,50 @@ tables, never compute widths.
 Deferred (documented): `who` (async roster collection — needs a list binding + on-goroutine render), `look`/room
 (exits/occupants/items handle-API expansion), a per-slot equipment LABEL accessor, edge CHARSET-gating of the bidi
 controls for non-UTF-8 clients, and the truncate-drops-a-color-reset cosmetic bleed.
+
+# Burn-down round 5 — small-items sweep + the GMCP color guard rail (2026-07-02)
+
+The round-5 opening sweep of docs/REMAINING.md "A. Small items": seven board-reviewed commits, each CI-green
+on main. The GMCP token-strip item grew a small security tail (an impersonation finding + a scanner-complexity
+finding), both closed in-round.
+
+- **Gated scope-state CAS tests made re-run safe.** `TestWorldStateRoundTripAndCAS`/`TestRegionStateRoundTripAndCAS`
+  did a version-0 CAS-create and never scrubbed, so they passed only on a fresh DB and failed on re-run against the
+  persistent local Postgres. Targeted DELETEs (never TRUNCATE — a dev DB may hold live director state) both up-front
+  (fail-fast precondition, covers a prior failed run) and in `t.Cleanup`. Board: persistence + test. (4ebc6ef)
+- **Stale Phase-14 auth docstrings swept to the OAuth-only state.** ~15 comments across gate/account/config/store
+  still described removed passphrase/SSH/link-code login and the dropped website; corrected to the device-flow
+  OAuth + in-process broker + prompt-driven chargen reality, incl. the reviewers' found misses (serveListener/
+  validateName docs, telos-gate header, account.go stub/link-code refs, service.go website refs) and the one stale
+  log string. Board: auth + edge. (e656400)
+- **Loot unknown-ref diagnostic — with a corrected premise.** The backlog's "silent no-op" wording was STALE
+  (z.spawn has Warned on unknown prototypes since Phase 3); the real gap was CONTEXT — which loot table produced
+  the bad ref, critical for an opaque `on_roll` Lua-computed ref no lint can see. `deliverLoot` now takes the
+  table ref and layers a loot-scoped Warn (ref+table+looter) onto spawn's generic one. Board: progression (caught
+  the stale premise, required the table-ref plumb) + mudlib (caught `looter.Name` logging a method value). (c80f78f)
+- **GMCP `{{token}}`-strip guard rail (Track 1 priority).** Content-authored names/formats may carry color markup
+  only the telnet edge renders; rich clients displayed literal braces. All GMCP text fields now strip the known
+  vocabulary at payload BUILD time via the shared tokenizer: world-side `gmcpText()` (Room.Info name+sector,
+  Char.Status target, Char.Items names), gate-side the Comm.Channel.Text talker+text. Unknown `{{...}}` stays
+  literal (the color-off telnet projection — no third projection). Contract documented in docs/GMCP.md for future
+  emitters (Track 7's `gmcp.send`). e2e-verified against the rebuilt stack. Board: edge + security. (fe50c85)
+- **Name validators reject `{`/`}` (security M-1 from the strip audit).** A registrable "{{FG_RED}}Bob" rendered
+  as a colored "Bob" on telnet and STRIPPED to "Bob" in GMCP — impersonation. Both validators (account =
+  the security boundary, gate = the UX mirror) reject braces outright at the same rule position (account reason
+  code `contains_brace`) — monotonic vs. a strip-mutation check (future vocab growth can't retro-spoof), and it
+  kills partial-token cross-boundary composition. Dev DB scanned: no pre-existing braced names. Board: auth +
+  security (auditor confirms M-1 closed). (c8a4f48)
+- **Tokenizer scan window (security L-1).** `ScanTokenRun` rescanned to a distant/absent `}}` per `{{` — O(n²)
+  on adversarial input, on the edge write path + zone goroutines + consoleui measurement. A `tokenScanWindow=32`
+  bound (longest vocab name is 17 bytes) makes every consumer of the single shared scanner linear AT ONCE (no
+  projection drift). Deliberate, documented semantics change: a known token whitespace-padded past the window is
+  now literal in every projection. Tests pin the exact boundary, a vocab-growth guard, and a 200k `{{` run a
+  quadratic scan couldn't survive. Board: edge + security. (8858f32, + G101 label fix 3a8d422)
+- **Process lesson (two red pushes forward-fixed).** c8a4f48/8858f32 sat lint-red on main: gosec G101
+  pattern-matched a test label containing the word "token", and the local gate's `make verify | tail` swallowed
+  the failure (pipeline exit = tail's) while the immediate `gh run watch` raced the push and reported a stale
+  green run. Gate hardened: `set -o pipefail` + SHA-confirmed CI watch (memory updated).
+
+New follow-ups opened this round (in REMAINING): a load-time ref-charset content-lint (several safety judgments
+rest on "refs can't contain braces" by convention only); the pre-existing `capitalizeFirst` shape-based token
+skip now diverges on one more adversarial-only shape (INFO, documented, no action).
