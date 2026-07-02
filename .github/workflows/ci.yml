@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# Least privilege for every job (CodeQL actions/missing-workflow-permissions): CI only checks out
+# code and reads the token for rate limits — nothing writes back to the repo.
+permissions:
+  contents: read
+
 jobs:
   go:
     runs-on: ubuntu-latest
@@ -59,6 +64,8 @@ jobs:
           lint: true
           format: true
           push: false
+          # PR comments need pull-requests:write; disabled to keep the workflow at contents:read.
+          pr_comment: false
 
   # Gated Postgres integration tests (tests/integration + the co-located
   # internal/store/*_test.go). The hermetic `go` job above SKIPs these (they t.Skip

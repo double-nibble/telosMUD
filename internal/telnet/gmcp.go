@@ -5,6 +5,11 @@ import (
 	"log/slog"
 )
 
+// maxGMCPPayload bounds one OUTBOUND GMCP frame's pkg+json (WriteGMCP). Engine-built payloads are
+// far smaller (a room's item list, a vitals map); 1MiB is a generous wedge against a future
+// unbounded emitter and makes the frame-capacity arithmetic provably overflow-free.
+const maxGMCPPayload = 1 << 20
+
 // gmcp.go is the telnet-codec half of GMCP (option 201, docs/GMCP.md Phase 9): the negotiation OFFER,
 // the inbound IAC SB 201 <pkg> SP <json> IAC SE parser, and the outbound encoder. The dispatch in
 // handleIAC (telnet.go) routes DO/DONT 201 to gmcpOn and SB 201 to readGMCPSubneg here; everything else
@@ -94,10 +99,24 @@ func (c *Conn) dispatchGMCP(buf []byte, over bool) error {
 // WriteGMCP frames a GMCP message as IAC SB 201 <pkg> SP <json> IAC SE and writes it, escaping any 0xFF
 // in the payload as IAC IAC so a byte in the JSON can never be misread as a telnet command. It is a
 // no-op when the client has not enabled GMCP (so the engine/gate can emit unconditionally). A data-less
-// message (nil/empty json) omits the space + payload. Write is mutex-guarded, so this is safe to call
-// from the writer goroutine concurrently with the reader's negotiation answers.
+// message (nil/empty json) omits the space + payload. An over-cap frame (maxGMCPPayload) is silently
+// SHED (logged, nil return) — GMCP is advisory and the error return is reserved for socket failures.
+// Write is mutex-guarded, so this is safe to call from the writer goroutine concurrently with the
+// reader's negotiation answers.
 func (c *Conn) WriteGMCP(pkg string, json []byte) error {
 	if !c.gmcpOn.Load() {
+		return nil
+	}
+	// Bound one frame's payload. Engine-built payloads are far smaller; this is edge hygiene (a
+	// wedge against a future unbounded emitter, e.g. the builder gmcp.send lane) and it makes the
+	// capacity arithmetic below provably non-overflowing (CodeQL go/allocation-size-overflow).
+	// DROP-and-log, nil return: the error return is reserved for socket-level failures — runWriter
+	// treats a renderFrame error as a dead socket and closes the connection, and shedding one
+	// oversize advisory frame must not disconnect the player (mirrors the inbound over-cap drop).
+	// Lengths only in the log, never the (potentially huge) pkg content.
+	if len(pkg) > maxGMCPPayload || len(json) > maxGMCPPayload-1-len(pkg) {
+		slog.Warn("gmcp outbound frame over cap; dropped",
+			"component", "telnet", "pkg_len", len(pkg), "json_len", len(json), "cap", maxGMCPPayload)
 		return nil
 	}
 	payload := make([]byte, 0, len(pkg)+1+len(json))

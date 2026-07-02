@@ -148,6 +148,20 @@ func TestWriteGMCPFramingAndGate(t *testing.T) {
 	if got := out.Bytes(); !bytes.Equal(got, want2) {
 		t.Fatalf("data-less frame = % x\nwant         % x", got, want2)
 	}
+
+	// An over-cap frame is SHED, not an error: nil return, zero bytes written, connection still
+	// usable (the error return is reserved for socket failures — an error here would make the
+	// gate's runWriter close the connection over one oversize advisory frame).
+	out.Reset()
+	if err := c.WriteGMCP("Big.Package", make([]byte, maxGMCPPayload+1)); err != nil {
+		t.Fatalf("over-cap WriteGMCP returned an error (would disconnect the player): %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("over-cap WriteGMCP wrote %d bytes, want 0 (dropped)", out.Len())
+	}
+	if err := c.WriteGMCP("Core.Ping", nil); err != nil || out.Len() == 0 {
+		t.Fatalf("connection unusable after an over-cap drop: err=%v wrote=%d", err, out.Len())
+	}
 }
 
 func TestWriteGMCPEscapesIAC(t *testing.T) {

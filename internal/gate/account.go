@@ -3,6 +3,7 @@ package gate
 import (
 	"context"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -180,7 +181,10 @@ func (g *grpcAccountClient) CreateChargenCharacter(ctx context.Context, accountI
 	for stepID, m := range allocs {
 		vals := make(map[string]int32, len(m))
 		for attr, v := range m {
-			vals[attr] = int32(v) //nolint:gosec // chargen point-buy values are small content-bounded ints.
+			// Chargen point-buy values are small content-bounded ints (telos-account re-validates
+			// against the flow), but saturate the wire conversion anyway so an absurd value can't
+			// wrap (CodeQL go/incorrect-integer-conversion).
+			vals[attr] = clampInt32(v)
 		}
 		pa[stepID] = &accountv1.AttrAlloc{Values: vals}
 	}
@@ -286,4 +290,15 @@ func loginByName(tc *telnet.Conn, log *slog.Logger) (string, bool) {
 		}
 		return candidate, true
 	}
+}
+
+// clampInt32 saturates an int to the int32 range for a wire conversion (rather than wrapping).
+func clampInt32(v int) int32 {
+	if v > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if v < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(v)
 }

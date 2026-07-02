@@ -18,6 +18,11 @@ on:
         required: false
         default: "100000"
 
+# Least privilege for every job (CodeQL actions/missing-workflow-permissions): the nightly tier only
+# checks out code and reads the token for rate limits — nothing writes back to the repo.
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
