@@ -61,6 +61,44 @@ func TestOpSetClearFlag(t *testing.T) {
 	}
 }
 
+// TestGrantOpsRepublishCommsOnAccessChange proves a flag grant op that crosses a channel's access
+// predicate re-publishes the target's comms config so the gate's hear-set stops (or starts) matching a
+// restricted channel WITHOUT waiting for the player's next toggle/handoff/relog — the round-5 security
+// follow-up. Before this the affect apply/expire sites republished but the grant ops did not, so a
+// guild-leave via clear_flag left the player still hearing guild chat.
+func TestGrantOpsRepublishCommsOnAccessChange(t *testing.T) {
+	_, z, gate := restrictedHearShard(t) // pack has `secret` (require_flag: insider), default_on
+	s := newTestPlayerEntity(z, "Insider")
+	setFlag(s.entity, "insider", true) // grants access → hears `secret`
+	cfg := drainConfig(t, gate, "Insider")
+
+	c := seededCtx(z, s.entity, s.entity, dispHelpful)
+
+	// Revoke via clear_flag: the republish must DROP `secret` from the hear-set (the eavesdropping fix).
+	if err := opClearFlag(c, &effectOp{flag: "insider"}); err != nil {
+		t.Fatalf("clear_flag: %v", err)
+	}
+	p, ok := recvConfig(t, cfg)
+	if !ok {
+		t.Fatal("clear_flag grant op did not republish comms config — the hear-set stays stale (still hearing a revoked channel)")
+	}
+	if containsStr(p.HearChannels, "secret") {
+		t.Fatalf("hear-set %v still includes `secret` after clear_flag revoked access", p.HearChannels)
+	}
+
+	// Re-grant via set_flag: the republish must ADD it back.
+	if err := opSetFlag(c, &effectOp{flag: "insider"}); err != nil {
+		t.Fatalf("set_flag: %v", err)
+	}
+	p, ok = recvConfig(t, cfg)
+	if !ok {
+		t.Fatal("set_flag grant op did not republish comms config")
+	}
+	if !containsStr(p.HearChannels, "secret") {
+		t.Fatalf("hear-set %v missing `secret` after set_flag granted access", p.HearChannels)
+	}
+}
+
 // TestGrantOpsMissingArgsError proves a malformed grant op returns a descriptive error (not a panic) so
 // runOps logs+skips it — the content-lint-is-the-gate discipline.
 func TestGrantOpsMissingArgsError(t *testing.T) {
