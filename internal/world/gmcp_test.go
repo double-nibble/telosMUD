@@ -118,7 +118,9 @@ func TestLookRoomEmitsRoomInfoOnChangeOnly(t *testing.T) {
 	var info struct {
 		Num int `json:"num"`
 	}
-	json.Unmarshal([]byte(got), &info)
+	if err := json.Unmarshal([]byte(got), &info); err != nil {
+		t.Fatalf("Room.Info after move not valid JSON: %v (%s)", err, got)
+	}
 	if info.Num != roomNum("midgaard:room:market") {
 		t.Fatalf("Room.Info after move has num %d, want market %d", info.Num, roomNum("midgaard:room:market"))
 	}
@@ -344,7 +346,9 @@ func TestCharStatusJSONReflectsCombat(t *testing.T) {
 		State  string `json:"state"`
 		Target string `json:"target"`
 	}
-	json.Unmarshal(z.charStatusJSON(caster.entity), &st)
+	if err := json.Unmarshal(z.charStatusJSON(caster.entity), &st); err != nil {
+		t.Fatalf("Char.Status (idle) not valid JSON: %v", err)
+	}
 	if st.State != "standing" || st.Target != "" {
 		t.Fatalf("idle status = %+v, want standing + no target", st)
 	}
@@ -352,7 +356,9 @@ func TestCharStatusJSONReflectsCombat(t *testing.T) {
 	// Fighting a mob → state fighting + the target's name.
 	mob := makeMobTarget(z, caster.entity, "goblin")
 	z.startFight(caster.entity, mob)
-	json.Unmarshal(z.charStatusJSON(caster.entity), &st)
+	if err := json.Unmarshal(z.charStatusJSON(caster.entity), &st); err != nil {
+		t.Fatalf("Char.Status (combat) not valid JSON: %v", err)
+	}
 	if st.State != "fighting" || st.Target != "goblin" {
 		t.Fatalf("combat status = %+v, want fighting + goblin", st)
 	}
@@ -389,7 +395,9 @@ func TestSendPromptEmitsHUDOnChangeOnly(t *testing.T) {
 		t.Fatal("a vitals change did not re-emit Char.Vitals")
 	}
 	var m map[string]int
-	json.Unmarshal([]byte(v), &m)
+	if err := json.Unmarshal([]byte(v), &m); err != nil {
+		t.Fatalf("re-emitted Char.Vitals not valid JSON: %v (%s)", err, v)
+	}
 	if m["hp"] != 55 {
 		t.Fatalf("re-emitted Char.Vitals hp = %d, want 55", m["hp"])
 	}
