@@ -2,11 +2,13 @@
 
 This is the historical record of DELIVERED work: the per-phase plan docs (Phases 3–16, all shipped and
 CI-green) followed by every resolved follow-up. It exists for posterity — the live list of outstanding
-work is [REMAINING.md](REMAINING.md). The original per-phase `PHASEXX-PLAN.md` files and `FOLLOW-UPS.md`
-were consolidated here and removed; their raw form is preserved in git history.
+work now lives in **GitHub Issues / Projects / Milestones** (see [REMAINING.md](REMAINING.md), which is
+a pointer to it). The original per-phase `PHASEXX-PLAN.md` files and `FOLLOW-UPS.md` were consolidated
+here and removed; their raw form is preserved in git history.
 
-> Note: some phase plans contain forward-looking "deferred" callouts. Any of that work that is still
-> outstanding is tracked in REMAINING.md — treat those in-plan notes as historical context, not the TODO list.
+> Note: some phase plans (and older entries below) contain forward-looking "deferred" callouts and refer
+> to `REMAINING.md` as the TODO list. Any of that work that is still outstanding is now a GitHub issue —
+> treat those in-doc notes as historical context, not the live TODO.
 
 ## Contents
 - [Phase 3](#phase-3)
