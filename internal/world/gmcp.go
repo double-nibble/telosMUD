@@ -211,5 +211,5 @@ func (z *Zone) sendPrompt(s *session) {
 			s.send(gmcpFrame("Char.Items.List", ri))
 		}
 	}
-	s.send(promptFrame())
+	s.send(promptFrameMarkup(z.promptMarkup(s))) // vitals-bearing prompt when `vitals on` (#40), else "> "
 }
