@@ -66,6 +66,10 @@ func connect(url string, role Role, name string) (*NATSBus, error) {
 // Role reports this handle's publish capability.
 func (b *NATSBus) Role() Role { return b.role }
 
+// Available reflects the LIVE NATS connection: false during a disconnect/blip (the client reconnects
+// in the background — MaxReconnects(-1)), true once (re)connected. A point-in-time read of the conn.
+func (b *NATSBus) Available() bool { return b.nc != nil && b.nc.IsConnected() }
+
 // Publish enforces the ACL (P8-A2), marshals msg, and publishes it on subj. The ACL check is FIRST
 // and IN-PROCESS: a RoleGate handle publishing a chan/tell subject returns ErrPublishForbidden and
 // NOTHING reaches the broker — the impersonation gate holds even though NATS has no role concept.

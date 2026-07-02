@@ -38,6 +38,10 @@ func (d disabledBus) Subscribe(_ string, _ func(Message)) (Subscription, error) 
 	return disabledSub{}, nil
 }
 
+// Available is always false on a disabled bus — comms are down/unconfigured, which is exactly the
+// state the gate's post-login notice exists to surface.
+func (d disabledBus) Available() bool { return false }
+
 func (d disabledBus) Close() error { return nil }
 
 // disabledSub is the no-op Subscription handed back by a disabled bus.

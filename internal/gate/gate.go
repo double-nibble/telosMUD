@@ -92,6 +92,10 @@ type Server struct {
 	pool    *pool
 	comms   commbus.Bus   // RoleGate comms handle; never nil (Disabled when NATS is down)
 	account AccountClient // Phase 14 seam to telos-account; a stub when no account service is configured
+	// commsExpected is true when comms are CONFIGURED (a broker URL is set) — so a comms.Available()==false
+	// means "the broker is down" (warn the player) rather than "comms simply aren't wired" (a dev/test gate,
+	// stay silent). Off by default so the comms-agnostic journey tests see no notice.
+	commsExpected bool
 	// accountConfigured is true once a REAL account client is wired (WithAccountClient). It switches the
 	// login flow from the bare "type a name" prompt to the OAuth device flow (Phase 15).
 	accountConfigured bool
@@ -136,6 +140,14 @@ func (s *Server) WithTransports(allowPlaintext bool, tlsListen, tlsCert, tlsKey 
 // gate it behind TELOS_DEV_AUTOAUTH and never enable in production. Returns the Server for chaining.
 func (s *Server) WithDevAutoAuth(on bool) *Server {
 	s.devAutoAuth = on
+	return s
+}
+
+// WithCommsExpected records that comms are CONFIGURED (a broker URL is set), so the gate warns a player
+// at login when the bus is unavailable — a configured-but-down broker, not an unwired dev/test gate.
+// cmd/telos-gate sets it from `cfg.NATS.URL != ""`. Returns the Server for chaining.
+func (s *Server) WithCommsExpected(expected bool) *Server {
+	s.commsExpected = expected
 	return s
 }
 
@@ -308,6 +320,14 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 	// (NATS down) yields no-op subscriptions, so this is a clean no-op when comms are unavailable.
 	cc := openComms(log, s.comms, tc, gmcp, name)
 	defer cc.close()
+
+	// Comms-down notice (#61): when comms are CONFIGURED but the bus is unavailable (broker down), the
+	// player's channels + tells silently go nowhere. Tell them once, at login, so the silence isn't
+	// mistaken for "nobody's talking." Suppressed when comms aren't configured at all (a dev/test gate),
+	// so an unwired setup never nags.
+	if s.commsExpected && !s.comms.Available() {
+		_ = tc.Write("\r\nNotice: chat is currently offline — channels and tells are unavailable until it recovers.\r\n")
+	}
 
 	// --- directory seam: resolve the initial shard for this character ---
 	addr, ok := s.dir.ShardForCharacter(name)

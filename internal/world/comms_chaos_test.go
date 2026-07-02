@@ -45,6 +45,8 @@ func (b *flakyBus) Subscribe(subj string, handler func(commbus.Message)) (commbu
 	return b.inner.Subscribe(subj, handler)
 }
 
+func (b *flakyBus) Available() bool { return b.inner.Available() }
+
 func (b *flakyBus) Close() error { return b.inner.Close() }
 
 // TestZoneSurvivesCommsBusPublishFailure pins the never-fatal contract: when a channel publish fails

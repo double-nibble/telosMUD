@@ -250,6 +250,12 @@ type Bus interface {
 	// stops delivery. A nil/disabled bus returns a no-op Subscription so callers need no nil-check.
 	Subscribe(subj string, handler func(Message)) (Subscription, error)
 
+	// Available reports whether the transport is currently usable for send/receive. A disabled bus
+	// (broker down or unconfigured) is false; an in-process bus is always true; a NATS bus reflects its
+	// LIVE connection (false during a disconnect/blip, true once reconnected). It is a point-in-time
+	// probe — the gate reads it after login to warn a player when chat is offline. Safe from any goroutine.
+	Available() bool
+
 	// Close releases the bus. Idempotent.
 	Close() error
 }
