@@ -796,27 +796,31 @@ func (z *Zone) leave(id string) {
 	// point). Dump BEFORE detaching from the room so room_ref reflects where they logged out;
 	// the dump is on this goroutine (race-free) and the write is the saver's job (off-goroutine),
 	// so removal does not wait on I/O. A storeless/ephemeral player is a no-op.
-	if z.saver != nil && z.saver.enabled() && s.entity != nil && s.entity.pid == nil {
-		// Brand-new character that quit BEFORE its async create returned a PersistID. The normal
-		// enqueueSave below would be SKIPPED (no PID to CAS on) and the in-flight createdMsg, when it
-		// finally lands on a now-gone session, would DROP the data — silently losing every action the
-		// player took during the create round-trip (e.g. the room they walked to). Instead, DUMP the
-		// final snapshot NOW (on this goroutine: e.location is current, room_ref reflects the move) and
-		// stash it keyed by name; characterCreated stamps the freshly-minted PID onto it and enqueues
-		// the saveFinal once the row exists. The CreateCharacter INSERT starts the row at version 0, so
-		// this deferred snapshot CASes at version 0 (dumpCharacter reads s.stateVersion, still 0 — no
-		// save has bumped it). This keeps logout a true flush point across the create window. If the
-		// create ultimately FAILS (stays ephemeral), the stash is simply never replayed — no worse than
-		// the prior behavior, but the common case (a fast create that just hadn't returned yet) is saved.
-		z.pendingFinalFlush[id] = dumpCharacter(s)
-		z.log.Info("character logged out before its durable id was assigned; deferring final flush to create completion", "player", id)
+	if z.saver != nil && z.saver.enabled() && s.entity != nil {
+		if s.entity.pid == nil {
+			// Brand-new character that quit BEFORE its async create returned a PersistID. enqueueSave
+			// cannot flush yet (no PID to CAS on — its guard would no-op) and the in-flight createdMsg,
+			// when it finally lands on a now-gone session, would DROP the data — silently losing every
+			// action the player took during the create round-trip (e.g. the room they walked to).
+			// Instead, DUMP the final snapshot NOW (on this goroutine: e.location is current, room_ref
+			// reflects the move) and stash it keyed by name; characterCreated stamps the freshly-minted
+			// PID onto it and enqueues the saveFinal once the row exists. The CreateCharacter INSERT
+			// starts the row at version 0, so this deferred snapshot CASes at version 0 (dumpCharacter
+			// reads s.stateVersion, still 0 — no save has bumped it). This keeps logout a true flush
+			// point across the create window. If the create ultimately FAILS (stays ephemeral), the
+			// stash is simply never replayed — no worse than the prior behavior, but the common case
+			// (a fast create that just hadn't returned yet) is saved.
+			z.pendingFinalFlush[id] = dumpCharacter(s)
+			z.log.Info("character logged out before its durable id was assigned; deferring final flush to create completion", "player", id)
+		} else {
+			// saveFinal (not saveFlush): the session is removed below in this same handler, so a CAS
+			// miss must NOT bounce a conflict back (there would be no session to re-dump). The saver
+			// instead re-reads, rebases this authoritative logout snapshot, and retries the CAS itself
+			// — so a cadence flush winning the race can never strand the durable record at the pre-move
+			// room (docs/PERSISTENCE.md §6, the TestQuitFlushReliableAfterMove regression).
+			z.enqueueSave(id, s, saveFinal)
+		}
 	}
-	// saveFinal (not saveFlush): the session is removed below in this same handler, so a CAS miss
-	// must NOT bounce a conflict back (there would be no session to re-dump). The saver instead
-	// re-reads, rebases this authoritative logout snapshot, and retries the CAS itself — so a
-	// cadence flush winning the race can never strand the durable record at the pre-move room
-	// (docs/PERSISTENCE.md §6, the TestQuitFlushReliableAfterMove regression).
-	z.enqueueSave(id, s, saveFinal)
 	if r := s.entity.location; r != nil {
 		z.act("$n leaves.", s.entity, nil, nil, "", "", ToRoom)
 		Move(s.entity, nil)
@@ -868,7 +872,9 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// crosses a zone (P6-D8); the destination re-engages via a fresh `kill`. (No opponent-link to drop:
 	// any opponent was in the SOURCE room, not reachable from here.)
 	if s.entity.living != nil {
-		mutableLiving(s.entity).fighting = nil // a player (prototype==nil) is a no-fork pass-through; routes through the COW choke-point for uniform auditing
+		// A player (prototype==nil) is a no-fork pass-through; routing through the COW
+		// choke-point anyway keeps every Living mutation on one audited path.
+		mutableLiving(s.entity).fighting = nil
 		if position(s.entity) == posFighting {
 			setPosition(s.entity, posStanding)
 		}
@@ -1358,7 +1364,9 @@ func (z *Zone) pendingExpire(id string, gen uint64) {
 
 // freezeTTL bounds how long a source-side frozen player (an in-flight cross-shard handoff)
 // may linger before the backstop reaper fires. It MUST be >= pendingTTL and longer than
-// handoffRPCTimeout so the normal resolutions win first: the RPC timeout thaws a failed
+// handoffRPCTimeout so the normal resolutions win first (the >= holds today by CONSTRUCTION —
+// it initializes TO pendingTTL and tracks it if pendingTTL changes; there is deliberately no
+// runtime enforcement because tests shrink this var to exercise the reaper): the RPC timeout thaws a failed
 // handoff (handoffFailMsg) and a successful one redirects, both well before this. This only
 // catches the leftover: a frozen copy that never got cleaned up (e.g. a dead gate never
 // re-dialed after a successful redirect, or a path that froze but neither posted result).
