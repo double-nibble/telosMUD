@@ -765,7 +765,10 @@ func (s *Server) renderFrame(log *slog.Logger, c *connState, f *playv1.ServerFra
 //     that, and we also reject other non-graphic runes like odd spaces here);
 //   - no leading '.' and no embedded '.', because targeting parses `N.kw` /
 //     `all.kw` — a dotted name would split into a count/selector and a keyword;
-//   - no leading digit, because a leading digit reads as the `N.` count in `N.kw`.
+//   - no leading digit, because a leading digit reads as the `N.` count in `N.kw`;
+//   - no '{' or '}', reserved for the {{TOKEN}} color markup — a name embedding a
+//     known token would render colored on telnet and strip differently in GMCP
+//     (an impersonation vector; mirrors account.ValidateCharacterName).
 //
 // Letters, digits-after-the-first, and intra-name punctuation other than '.' are
 // allowed; this is intentionally permissive on charset beyond the grammar hazards.
@@ -784,6 +787,9 @@ func validateName(name string) (string, bool) {
 	}
 	if strings.ContainsRune(name, '.') {
 		return "it can't contain a dot", false
+	}
+	if strings.ContainsAny(name, "{}") {
+		return "it can't contain braces", false
 	}
 	for _, r := range name {
 		if unicode.IsControl(r) || !unicode.IsPrint(r) {

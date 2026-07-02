@@ -33,6 +33,8 @@ func TestValidateNameRejects(t *testing.T) {
 		"leading digit": "2nd",
 		"dotted":        "all.orc",
 		"trailing dot":  "bob.",
+		"color token":   "{{FG_RED}}Bob",
+		"lone brace":    "Bo}b",
 	}
 	for label, name := range cases {
 		if reason, ok := validateName(name); ok {

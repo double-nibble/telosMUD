@@ -14,8 +14,8 @@ import (
 const MaxNameLen = 20
 
 // ValidateCharacterName checks a candidate name. It returns ("", true) when valid, else a short reason code
-// + false. The reason codes ("required"/"too_long"/"leading_dot"/"leading_digit"/"contains_dot"/"invalid_char")
-// are stable enough for a UI to localize.
+// + false. The reason codes ("required"/"too_long"/"leading_dot"/"leading_digit"/"contains_dot"/
+// "contains_brace"/"invalid_char") are stable enough for a UI to localize.
 func ValidateCharacterName(name string) (string, bool) {
 	if name == "" {
 		return "required", false
@@ -31,6 +31,13 @@ func ValidateCharacterName(name string) (string, bool) {
 	}
 	if strings.ContainsRune(name, '.') {
 		return "contains_dot", false
+	}
+	// Braces are reserved for the {{TOKEN}} color markup: a name embedding a known token (e.g.
+	// "{{FG_RED}}Bob") renders as a colored "Bob" on telnet and STRIPS to "Bob" in GMCP payloads —
+	// an impersonation vector. Reject the characters outright (not just names the strip mutates) so
+	// a future vocabulary addition can't retroactively turn an accepted name into a spoof.
+	if strings.ContainsAny(name, "{}") {
+		return "contains_brace", false
 	}
 	for _, r := range name {
 		if unicode.IsControl(r) || !unicode.IsPrint(r) {

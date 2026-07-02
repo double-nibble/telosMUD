@@ -123,6 +123,8 @@ func TestValidateCharacterName(t *testing.T) {
 		{".dot", "leading_dot", false},
 		{"9nine", "leading_digit", false},
 		{"a.b", "contains_dot", false},
+		{"{{FG_RED}}Bob", "contains_brace", false},
+		{"Bo}b", "contains_brace", false},
 		{"bad\tname", "invalid_char", false},
 	}
 	for _, tc := range cases {
