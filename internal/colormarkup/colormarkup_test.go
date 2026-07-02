@@ -121,8 +121,17 @@ func TestRenderIsInjectionSafe(t *testing.T) {
 			if i+1 >= len(out) || out[i+1] != '[' {
 				t.Fatalf("ESC not starting a CSI at %d: %q", i, out)
 			}
-			if strings.IndexByte(out[i:], 'm') < 0 {
-				t.Fatalf("SGR not terminated by 'm' at %d: %q", i, out)
+			// Parse THIS sequence to its own terminator: after ESC[ only digits/semicolons may
+			// appear, and the very next byte must be 'm'. (A bare substring search for 'm' could
+			// be satisfied by a LATER sequence's terminator, silently passing a malformed one —
+			// ai-finding #10. The sgrOnly regex above already enforces this; this loop is the
+			// independent second proof, so it must be just as strict.)
+			j := i + 2
+			for j < len(out) && (out[j] == ';' || (out[j] >= '0' && out[j] <= '9')) {
+				j++
+			}
+			if j >= len(out) || out[j] != 'm' {
+				t.Fatalf("SGR at %d not terminated by 'm' after its parameter bytes: %q", i, out)
 			}
 		}
 	}
