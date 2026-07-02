@@ -1,8 +1,12 @@
 name: ci
 
+# Runs ONLY for PRs into main and on merges to main (branch protection makes a push to main = a
+# merged PR). Feature-branch pushes don't run CI — the PR run is the gate.
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
 
 # Least privilege for every job (CodeQL actions/missing-workflow-permissions): CI only checks out
 # code and reads the token for rate limits — nothing writes back to the repo.

@@ -6,13 +6,14 @@
 # exactly like ci.yml, so CodeQL sees the same program CI builds.
 name: CodeQL
 
+# Runs ONLY for PRs into main and on merges to main (the weekly re-scan cron was dropped by owner
+# decision — the tradeoff: CodeQL query-pack updates won't re-scan UNCHANGED code until the next
+# merge; workflow_dispatch stays as the manual recovery hatch, it never fires on its own).
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    - cron: "0 8 * * 1" # weekly re-scan (query-pack updates find new issues in unchanged code)
   workflow_dispatch:
 
 permissions:
