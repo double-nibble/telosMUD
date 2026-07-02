@@ -407,6 +407,7 @@ type resourceBody struct {
 	OnReactionLua     map[string]string `json:"on_reaction_lua,omitempty"` // result-altering reaction hooks (7.9)
 	OnDepleted        []any             `json:"on_depleted,omitempty"`     // [G-D] death hook (6.3b)
 	PerRound          bool              `json:"per_round,omitempty"`       // [G9] per-round reaction budget (6.4b)
+	Gauge             bool              `json:"gauge,omitempty"`           // #50: player-facing HUD pool (Char.Vitals filter)
 }
 
 type dmgBody struct {
@@ -595,6 +596,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 			r.OnEvent, r.OnDepleted = b.OnEvent, b.OnDepleted
 			r.OnEventLua, r.OnReactionLua = b.OnEventLua, b.OnReactionLua
 			r.PerRound = b.PerRound
+			r.Gauge = b.Gauge
 		}
 		pp := pack(pk)
 		pp.Resources = append(pp.Resources, r)

@@ -2,7 +2,6 @@ package world
 
 import (
 	"bytes"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -56,16 +55,18 @@ func cmdVitals(c *Context) error {
 	return nil
 }
 
-// vitalsPrompt builds the "[hp: 80/100 mana: 30/50] " prefix from the entity's pooled resources (those
-// with a derived max), sorted by ref for a stable order. Empty for a Living-less/contentless entity.
-// Zone-goroutine read.
+// vitalsPrompt builds the "[hp: 80/100 mana: 30/50] " prefix from the entity's HUD-visible pooled
+// resources — the same gauge-filtered set as GMCP Char.Vitals (z.hudResourceRefs, #50), further limited
+// to pools that can render a cur/max (a derived max that's > 0), sorted by ref for a stable order. Empty
+// for a Living-less/contentless entity. Zone-goroutine read.
 func (z *Zone) vitalsPrompt(e *Entity) string {
 	if e == nil || e.living == nil || e.zone == nil {
 		return ""
 	}
+	table := e.zone.resourceDefs().table()
 	refs := make([]string, 0)
-	for ref, def := range e.zone.resourceDefs().table() {
-		if def.maxAttr == "" {
+	for _, ref := range e.zone.hudResourceRefs() {
+		if def := table[ref]; def == nil || def.maxAttr == "" {
 			continue
 		}
 		if resourceMax(e, ref) <= 0 {
@@ -76,7 +77,6 @@ func (z *Zone) vitalsPrompt(e *Entity) string {
 	if len(refs) == 0 {
 		return ""
 	}
-	sort.Strings(refs)
 	var b strings.Builder
 	b.WriteByte('[')
 	for i, ref := range refs {

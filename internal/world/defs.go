@@ -305,6 +305,12 @@ type resourceDef struct {
 	// (opportunity attacks) per round and a spent reaction does not refill until the next round. Content
 	// declares `per_round: true`; the engine names no "reactions" pool — the flag is the convention.
 	perRound bool
+	// gauge marks a PLAYER-FACING pool surfaced in the HUD (GMCP Char.Vitals + the live-vitals prompt),
+	// #50 — the resource mirror of attributeDef.stat. When ANY resource opts in, only gauged ones show, so
+	// an INTERNAL pool (a per-round reaction budget, a hidden mechanic pool) never leaks into a rich
+	// client's gauges. When NO resource is flagged, all pooled resources show (backward-compat). Content
+	// flags it (ResourceDTO.Gauge); the engine names none. Default false.
+	gauge bool
 	// onEvent subscribes content op-lists to in-zone engine events ([G3], event.go). An entity that
 	// HAS this resource (a positive max or a stored current) reacts to the keyed event — e.g. a `rage`
 	// pool with onEvent[OnHit] = modify_resource rage +N is the canonical builder. nil => no handlers.

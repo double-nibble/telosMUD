@@ -355,6 +355,27 @@ func TestChannelBodyHearAccessRoundTrips(t *testing.T) {
 	}
 }
 
+// TestResourceBodyGaugeRoundTrips pins that the #50 gauge flag survives the resource_defs JSONB body
+// round-trip (the store field-drop class). Import (marshal) + export (unmarshal) share resourceBody, so
+// a mistyped/missing json tag would silently drop a pool's HUD-visibility on a DB reload.
+func TestResourceBodyGaugeRoundTrips(t *testing.T) {
+	in := resourceBody{Regen: 1, PerRound: true, Gauge: true}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out resourceBody
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Gauge {
+		t.Fatalf("resource gauge flag dropped in body round-trip: %+v", out)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Fatalf("resourceBody round-trip changed the value: %+v -> %+v", in, out)
+	}
+}
+
 // TestLootTableBodyOnRollRoundTrips pins that the loot on_roll Lua hatch survives the loot_table_defs JSONB
 // body round-trip (docs/REMAINING.md §4) — the store field-drop class. Import (marshal) + export (unmarshal)
 // share this lootTableBody, so pinning its round-trip catches a mistyped/missing json tag on the new field.

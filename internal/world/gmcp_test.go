@@ -44,6 +44,47 @@ func TestCharVitalsJSONContentDriven(t *testing.T) {
 	}
 }
 
+// TestHUDResourceRefsGaugeFilter proves the #50 gauge filter: the demo flags hp+mana gauge:true and
+// leaves the internal per-round `reactions` pool unflagged, so the HUD (Char.Vitals + the vitals prompt)
+// shows the two player pools and hides reactions. Char.Vitals therefore no longer leaks the reaction
+// budget into a rich client's gauge display.
+func TestHUDResourceRefsGaugeFilter(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+
+	refs := z.hudResourceRefs()
+	got := map[string]bool{}
+	for _, r := range refs {
+		got[r] = true
+	}
+	if !got["hp"] || !got["mana"] {
+		t.Errorf("hudResourceRefs missing a gauged pool: %v", refs)
+	}
+	if got["reactions"] {
+		t.Errorf("hudResourceRefs leaked the un-gauged internal reactions pool: %v", refs)
+	}
+	// Sorted for deterministic HUD output.
+	for i := 1; i < len(refs); i++ {
+		if refs[i-1] > refs[i] {
+			t.Errorf("hudResourceRefs not sorted: %v", refs)
+		}
+	}
+}
+
+// TestHUDResourceRefsFallbackShowsAll proves the backward-compat fallback: when NO resource in a pack
+// opts into gauge, every pool is HUD-visible (an un-flagged pack behaves exactly as before #50).
+func TestHUDResourceRefsFallbackShowsAll(t *testing.T) {
+	z, _ := abilityTestZone(t) // its combat resources set no gauge flag
+	table := z.resourceDefs().table()
+	for _, def := range table {
+		if def.gauge {
+			t.Fatalf("test precondition: abilityTestZone unexpectedly flags a gauge pool")
+		}
+	}
+	if len(z.hudResourceRefs()) != len(table) {
+		t.Errorf("fallback should surface all %d pools, got %v", len(table), z.hudResourceRefs())
+	}
+}
+
 func TestRoomInfoJSON(t *testing.T) {
 	z := newDemoZone("midgaard", newProtoCache())
 	temple := z.rooms["midgaard:room:temple"]

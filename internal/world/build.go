@@ -75,6 +75,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 			vital: r.Vital, regen: r.Regen, regenInCombat: r.RegenInCombat,
 			depletedThreshold: r.DepletedThreshold,
 			perRound:          r.PerRound,
+			gauge:             r.Gauge,
 			onEvent:           parseEventMap(r.OnEvent, "resource "+r.Ref),
 			onEventLua:        parseLuaEventMap(r.OnEventLua, "resource "+r.Ref),
 			onReactionLua:     parseLuaEventMap(r.OnReactionLua, "resource "+r.Ref+" (reaction)"),
