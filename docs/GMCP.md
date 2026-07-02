@@ -58,12 +58,25 @@ attributes appear is entirely content's choice, honoring the "engine = mechanism
 flavor" pillar. Both are change-detected (map marshal sorts keys) and re-emitted only on change.
 
 ### Char.Items (inventory/equipment panel)
-| Message              | Dir | Purpose                                            |
-|----------------------|-----|----------------------------------------------------|
-| `Char.Items.List`    | S->C | a `{location, items}` list, re-sent on change      |
+| Message              | Dir | Purpose                                                              |
+|----------------------|-----|---------------------------------------------------------------------|
+| `Char.Items.List`    | S->C | a `{location, items}` FULL snapshot — sent on login/reconnect/handoff arrival (the baseline)   |
+| `Char.Items.Add`     | S->C | `{location, item}` — one entry appeared                              |
+| `Char.Items.Remove`  | S->C | `{location, item:{id}}` — the entry with that id is gone (id-only)   |
+| `Char.Items.Update`  | S->C | `{location, item}` — an entry changed (worn/removed, or its count)   |
 
-Item entry: `{"id":"i4821","name":"a steel longsword","attrib":"wWc"}` — `attrib` is
-single-char flags (`w`=wearable, `c`=container, `W`=currently worn/wielded).
+`location` is `"inv"` (what the player carries, worn gear flagged `W`) or `"room"` (ground
+items/corpses in the player's room). After the initial `Char.Items.List` baseline, steady-state
+changes ride the incremental `Add`/`Remove`/`Update` deltas — a single pickup no longer re-ships
+the whole panel. A fresh or reconnected client always receives a full `List` before any delta.
+
+Item entry: `{"id":"i4821","name":"a steel longsword","attrib":"wWc","count":3}`
+- `attrib` — single-char flags (`w`=wearable, `c`=container, `W`=currently worn/wielded).
+- `count` — present only when identical discrete items COALESCE into one entry (`"a torch"` ×5);
+  omitted for a singleton.
+- `id` — STABLE across count changes: a coalesced group uses `g<hash>` (so raising/lowering the
+  count is a same-id `Update`); a non-grouping entry (worn gear, a material, a container) uses its
+  per-instance `i<runtimeID>`.
 
 ### Room (the minimap)
 | Message            | Dir | Purpose                                                       |

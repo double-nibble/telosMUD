@@ -1069,7 +1069,7 @@ func (z *Zone) attach(m attachMsg) {
 		// unchanged vitals would leave the client's gauge blank/stale. The cross-shard handoff path gets
 		// this for free (Prepare rehydrates a fresh session with nil buffers).
 		s.lastVitals, s.lastStatus, s.lastStats, s.lastRoom = nil, nil, nil, nil
-		s.lastInv, s.lastRoomItems = nil, nil
+		s.lastInvItems, s.lastRoomItems = nil, nil
 		s.currentZone = curZone
 		if curZone != nil {
 			curZone.Store(z)
