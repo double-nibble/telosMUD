@@ -113,14 +113,14 @@ func (z *Zone) resolveLoot(victim *Entity, rng *rand.Rand) {
 	for _, looter := range looters {
 		for i := range table.rolls {
 			for _, entry := range z.resolveRoll(looter, &table.rolls[i], rng) {
-				z.deliverLoot(looter, entry, rng)
+				z.deliverLoot(looter, entry, table.ref, rng)
 			}
 		}
 		// on_roll(ctx) Lua hatch (docs/REMAINING.md §4): after the declarative rolls, a content body may
 		// return additional CONDITIONAL drops (branching on looter/victim state the declarative form can't
 		// express). Each returned item ref is delivered through the SAME pipeline (quality/binding/merge).
 		for _, ref := range z.runLootOnRollLua(looter, victim, table) {
-			z.deliverLoot(looter, lootEntry{item: ref}, rng)
+			z.deliverLoot(looter, lootEntry{item: ref}, table.ref, rng)
 		}
 	}
 }
@@ -299,10 +299,15 @@ func (z *Zone) entryWeight(e lootEntry) float64 {
 
 // deliverLoot spawns the entry's item, rolls its quality (Phase 12.3) onto the instance, and delivers it
 // directly into the looter's inventory with a message. Personal loot: the item is the looter's, never
-// placed in the contested corpse. A nil/unknown prototype is a clean no-op (content-lint discipline).
-func (z *Zone) deliverLoot(looter *Entity, entry lootEntry, rng *rand.Rand) {
+// placed in the contested corpse. A nil/unknown prototype drops the entry (never aborts the kill); spawn
+// already Warns generically, so the Warn here layers the LOOT context — which table produced the ref —
+// onto it (the reset.go/character.go pattern). That context is what lets a builder chase a typo'd ref,
+// especially one computed by an opaque on_roll(ctx) Lua body that no build-time lint can see.
+func (z *Zone) deliverLoot(looter *Entity, entry lootEntry, tableRef string, rng *rand.Rand) {
 	item := z.spawn(ProtoRef(entry.item))
 	if item == nil {
+		z.log.Warn("loot: unknown item prototype, entry dropped",
+			"ref", entry.item, "table", tableRef, "looter", looter.short)
 		return
 	}
 	if entry.quality != nil {
