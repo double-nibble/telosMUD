@@ -52,6 +52,7 @@ package gate
 import (
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 
@@ -204,6 +205,31 @@ func (c *commsClient) applyConfig(msg commbus.Message) {
 		c.mu.Unlock()
 	}
 	c.log.Debug("comms config applied", "player", c.player, "hear", len(want), "ignore", len(payload.Ignore))
+
+	// GMCP Comm.Channel.List (#49): a rich client that advertised Comm learns the set of channels it can
+	// use (its {enabled ∩ hearable} refs) so it can create one tab per channel. Emitted on every config
+	// apply — login, a handoff arrival, and any hear-set change (a granted/revoked flag re-publishes the
+	// config) — so the client's tab set tracks the authoritative world. Sorted for a deterministic frame.
+	c.emitChannelList(payload.HearChannels)
+}
+
+// emitChannelList pushes the GMCP Comm.Channel.List frame (a sorted array of the player's usable channel
+// refs) when the client advertised Comm. Content-free: the gate forwards the refs the world handed it (it
+// holds no channel_defs), so the list is exactly the world-authoritative hear-set. A no-op for a plain
+// telnet client. Called from applyConfig on a bus goroutine (no connection lock held).
+func (c *commsClient) emitChannelList(refs []string) {
+	if !c.gmcp.supported("Comm.Channel.List") {
+		return
+	}
+	list := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref != "" {
+			list = append(list, ref)
+		}
+	}
+	sort.Strings(list)
+	payload, _ := json.Marshal(list)
+	_ = c.tc.WriteGMCP("Comm.Channel.List", payload)
 }
 
 // ignored is the SINGLE receiver-side ignore funnel (P8-A6): it reports whether an inbound comms frame's
@@ -247,17 +273,19 @@ func (c *commsClient) deliverChannel(msg commbus.Message) {
 	_ = c.tc.Write(msg.Body + "\r\n")
 
 	// GMCP mirror (Phase 9.5): a rich client that advertised Comm gets the same line as structured
-	// Comm.Channel.Text {channel, talker, text} so it can route to a per-channel tab. Same hear-set +
-	// ignore funnel as the text line (we are past both gates here), so a muted/ignored line emits no
-	// GMCP either. (text is the rendered line today; carrying the raw message text is a follow-up.)
+	// Comm.Channel.Text {channel, talker, text, msg} so it can route to a per-channel tab. Same hear-set +
+	// ignore funnel as the text line (we are past both gates here), so a muted/ignored line emits no GMCP
+	// either. `text` is the fully-rendered line (the displayable form); `msg` is the RAW player message
+	// (#49), carried so a client can re-render it in its own per-channel tab without the server's format.
 	// A channel_def format may carry {{TOKEN}} color markup, which only the telnet Write path renders —
-	// strip it here so a rich client doesn't display literal braces (colormarkup.Strip is the shared edge
-	// tokenizer; JSON escaping already made a leaked token injection-safe, this is cosmetic).
+	// strip it from both here so a rich client doesn't display literal braces (colormarkup.Strip is the
+	// shared edge tokenizer; JSON escaping already made a leaked token injection-safe, this is cosmetic).
 	if c.gmcp.supported("Comm.Channel.Text") {
 		payload, _ := json.Marshal(map[string]string{
 			"channel": strings.TrimPrefix(msg.Subject, commbus.ChanPrefix),
 			"talker":  colormarkup.Strip(msg.AuthorName),
 			"text":    colormarkup.Strip(msg.Body),
+			"msg":     colormarkup.Strip(msg.Text),
 		})
 		_ = c.tc.WriteGMCP("Comm.Channel.Text", payload)
 	}

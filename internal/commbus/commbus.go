@@ -154,7 +154,8 @@ type Message struct {
 	AuthorName     string `json:"author_name"`     // engine-set display name (P8-A2)
 	Seq            uint64 `json:"seq"`             // monotonic per-author sequence (P8-A3)
 	IdempotencyKey string `json:"idempotency_key"` // "<AuthorID>:<Seq>" — the 8.5 dedup key, carried now
-	Body           string `json:"body"`            // player-supplied text — DATA, sanitized as $t at render (P8-A7)
+	Body           string `json:"body"`            // the FULLY-RENDERED line the source world produced (format+color+$t); the gate writes it VERBATIM
+	Text           string `json:"text,omitempty"`  // the RAW sanitized player message ($t DATA), carried so a rich sink can render its own per-channel line (#49); empty for a config/system message
 }
 
 // ConfigPayload is the per-player comms-config the SOURCE world publishes to ConfigSubject(player)
