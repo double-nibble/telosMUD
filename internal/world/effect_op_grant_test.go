@@ -1,6 +1,10 @@
 package world
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/double-nibble/telosmud/internal/content"
+)
 
 // effect_op_grant_test.go — the Phase-11.1 grant ops (modify_attribute_base, set_flag/clear_flag): the
 // op behavior + the grant-survives-a-reload guarantee the progression machinery rests on.
@@ -58,6 +62,78 @@ func TestOpSetClearFlag(t *testing.T) {
 	}
 	if hasFlag(e, "guildmember") {
 		t.Fatal("clear_flag did not clear the flag")
+	}
+}
+
+// TestGrantOpsRepublishCommsOnAccessChange proves a flag grant op that crosses a channel's access
+// predicate re-publishes the target's comms config so the gate's hear-set stops (or starts) matching a
+// restricted channel WITHOUT waiting for the player's next toggle/handoff/relog — the round-5 security
+// follow-up. Before this the affect apply/expire sites republished but the grant ops did not, so a
+// guild-leave via clear_flag left the player still hearing guild chat.
+func TestGrantOpsRepublishCommsOnAccessChange(t *testing.T) {
+	_, z, gate := restrictedHearShard(t) // pack has `secret` (require_flag: insider), default_on
+	s := newTestPlayerEntity(z, "Insider")
+	setFlag(s.entity, "insider", true) // grants access → hears `secret`
+	cfg := drainConfig(t, gate, "Insider")
+
+	c := seededCtx(z, s.entity, s.entity, dispHelpful)
+
+	// Revoke via clear_flag: the republish must DROP `secret` from the hear-set (the eavesdropping fix).
+	if err := opClearFlag(c, &effectOp{flag: "insider"}); err != nil {
+		t.Fatalf("clear_flag: %v", err)
+	}
+	p, ok := recvConfig(t, cfg)
+	if !ok {
+		t.Fatal("clear_flag grant op did not republish comms config — the hear-set stays stale (still hearing a revoked channel)")
+	}
+	if containsStr(p.HearChannels, "secret") {
+		t.Fatalf("hear-set %v still includes `secret` after clear_flag revoked access", p.HearChannels)
+	}
+
+	// Re-grant via set_flag: the republish must ADD it back.
+	if err := opSetFlag(c, &effectOp{flag: "insider"}); err != nil {
+		t.Fatalf("set_flag: %v", err)
+	}
+	p, ok = recvConfig(t, cfg)
+	if !ok {
+		t.Fatal("set_flag grant op did not republish comms config")
+	}
+	if !containsStr(p.HearChannels, "secret") {
+		t.Fatalf("hear-set %v missing `secret` after set_flag granted access", p.HearChannels)
+	}
+}
+
+// TestModifyAttributeBaseRepublishesOnMinAttrFloor is the symmetry pin for the OTHER access predicate
+// (both reviews of the flag fix asked for it): modify_attribute_base shares the same one-line republish
+// hook, so a grant op dropping a player BELOW a channel's min_attr floor must refresh the hear-set and
+// drop the channel — the eavesdropping direction for an attribute-gated channel.
+func TestModifyAttributeBaseRepublishesOnMinAttrFloor(t *testing.T) {
+	_, z, gate := restrictedHearShard(t)
+	// Add an attribute (default base 10) and a channel gated on it (floor 5), straight into the zone's
+	// registries — the shard isn't running its loop here, so registration is safe on the test goroutine.
+	z.defs.attr.register("clout", &attributeDef{ref: "clout", base: litNode{v: 10}})
+	z.channelDefs().register("elite", buildChannelDef(content.ChannelDTO{
+		Ref: "elite", Name: "Elite", Words: []string{"elite"}, DefaultOn: true,
+		Access: content.ChannelAccessDTO{MinAttr: &content.MinAttrDTO{Attr: "clout", Min: 5}},
+	}))
+
+	s := newTestPlayerEntity(z, "Aspirant")
+	if !containsStr(z.effectiveHearSet(s), "elite") {
+		t.Fatal("precondition: a player at clout 10 (>= floor 5) should hear the min_attr-gated `elite`")
+	}
+	cfg := drainConfig(t, gate, "Aspirant")
+
+	c := seededCtx(z, s.entity, s.entity, dispHelpful)
+	// 10 - 8 = 2 < 5: drops below the floor, so the republish must drop `elite`.
+	if err := opModifyAttributeBase(c, &effectOp{attr: "clout", amount: -8}); err != nil {
+		t.Fatalf("modify_attribute_base: %v", err)
+	}
+	p, ok := recvConfig(t, cfg)
+	if !ok {
+		t.Fatal("modify_attribute_base did not republish comms config after crossing a min_attr floor")
+	}
+	if containsStr(p.HearChannels, "elite") {
+		t.Fatalf("hear-set %v still includes `elite` after dropping below the min_attr floor", p.HearChannels)
 	}
 }
 

@@ -29,6 +29,12 @@ func opModifyAttributeBase(c *effectCtx, op *effectOp) error {
 		return nil // gated cross-player write: clean no-op
 	}
 	setAttrBase(c.target, op.attr, attrBaseValue(c.target, op.attr)+op.amount)
+	// A grant op can cross a channel's access predicate (here a min_attr floor), so re-publish the
+	// target's comms config — the same mid-session hear-set refresh the affect apply/expire sites do.
+	// Without it a player who drops below (or rises to) a channel's floor keeps a stale subscription
+	// until their next toggle/handoff/relog (security follow-up, round 5). Cheap: no-op unless the
+	// target is a player and some channel actually gates hearing (republishCommsOnAccessChange guards).
+	c.z.republishCommsOnAccessChange(c.target)
 	return nil
 }
 
@@ -45,6 +51,7 @@ func opSetFlag(c *effectCtx, op *effectOp) error {
 		return nil
 	}
 	setFlag(c.target, op.flag, true)
+	c.z.republishCommsOnAccessChange(c.target) // a require_flag channel may now be hearable (see modify_attribute_base)
 	return nil
 }
 
@@ -60,6 +67,7 @@ func opClearFlag(c *effectCtx, op *effectOp) error {
 		return nil
 	}
 	setFlag(c.target, op.flag, false)
+	c.z.republishCommsOnAccessChange(c.target) // a require_flag channel may no longer be hearable — the guild-leave case
 	return nil
 }
 
