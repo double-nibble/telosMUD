@@ -868,7 +868,9 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// crosses a zone (P6-D8); the destination re-engages via a fresh `kill`. (No opponent-link to drop:
 	// any opponent was in the SOURCE room, not reachable from here.)
 	if s.entity.living != nil {
-		mutableLiving(s.entity).fighting = nil // a player (prototype==nil) is a no-fork pass-through; routes through the COW choke-point for uniform auditing
+		// Clear transferred combat state. For players (prototype==nil), mutableLiving is a
+		// no-fork pass-through and still uses the same audited mutation path.
+		mutableLiving(s.entity).fighting = nil
 		if position(s.entity) == posFighting {
 			setPosition(s.entity, posStanding)
 		}
