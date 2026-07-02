@@ -82,9 +82,13 @@ mud.after(pulses, fn) -> handle    mud.cancel(handle)        -- zone-timer sched
 mud.random()  mud.random(n)  mud.roll("2d6+1")               -- engine RNG (§9)
 mud.now()     mud.pvp_allowed(a, b)                          -- queries
 mud.scan(room)  mud.broadcast(room, markup)
-mud.gmcp(h, package, data)                                   -- push a GMCP message
 mud.log(level, msg)                                          -- structured log (print is redirected here)
 ```
+
+**`gmcp.send(player, pkg, table)`** — push a custom GMCP frame to a rich client (#51). `pkg` must be
+under an allowlisted namespace (`Mud.*`) — content can't spoof engine packages (`Char.*`/`Core.*`/…);
+the payload table is bounded (depth/nodes/bytes, no funcs/cycles). Returns `true` if it reached a live
+player session. See [GMCP.md](GMCP.md#the-mud-namespace).
 
 **`on(event, fn)`** registers a trigger; **`self`** is the scripted entity in trigger/affect
 context; **`ctx`** carries `actor`/`target(s)`/`room` in ability context.

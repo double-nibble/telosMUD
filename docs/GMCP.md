@@ -108,6 +108,26 @@ exit destinations are stable per-room integer ids mapped from the room's `ProtoR
 Custom features live under a branded **`Mud.*`** namespace (rather than overloading `Char.*`),
 so standard clients ignore what they don't understand.
 
+Content/Lua emits custom frames with the sandboxed handle **`gmcp.send(player, pkg, table)`**
+(`internal/world/luagmcp.go`, #51), e.g. a quest tracker or a boss-fight timer:
+
+```lua
+gmcp.send(target, "Mud.Quest", { name = "Slay the dragon", step = 2, done = false })
+```
+
+Guards (all fail-closed):
+- **Namespace allowlist** — `pkg`'s top-level segment must be in the allowlist (`Mud`), so content
+  can never name an engine package (`Char.*`/`Core.*`/`Room.*`/`Comm.*`) to spoof a client's HUD.
+  The gate's outbound filter only checks the client *advertised* the package; the engine-vs-content
+  boundary is enforced in the world, at the source.
+- **Charset/length** — same alnum+`.`, ≤64-byte, no-edge-dot rule the gate enforces on inbound names.
+- **Bounded payload** — the table is walked by a depth + node + byte bounded encoder (no
+  functions/userdata, no cycles); an over-budget or unencodable table is a clean Lua error.
+
+`gmcp.send` returns `true` when it reached a live player session, `false` for a session-less/mob
+handle. The frame still rides the outbound support filter, so a client that never advertised `Mud`
+stays silent.
+
 ## Testing
 Mudlet is the reference client (built-in GMCP debugger). The bot-swarm load tool also speaks
 GMCP, so vitals/room/inventory correctness can be asserted under load.
