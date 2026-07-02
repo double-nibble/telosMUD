@@ -14,13 +14,14 @@ import (
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
 
-// TestDeliverChannelEmitsGMCP pins the Comm.Channel.Text mirror (Phase 9.5): a channel line delivered to
-// a client that advertised "Comm" is ALSO emitted as structured Comm.Channel.Text {channel, talker,
-// text}; a client that did not advertise Comm gets only the text line, no GMCP.
+// TestDeliverChannelEmitsGMCP pins the Comm.Channel.Text mirror (Phase 9.5 + #49): a channel line
+// delivered to a client that advertised "Comm" is ALSO emitted as structured Comm.Channel.Text
+// {channel, talker, text, msg} — text is the rendered line, msg the raw body; a client that did not
+// advertise Comm gets only the text line, no GMCP.
 func TestDeliverChannelEmitsGMCP(t *testing.T) {
-	msg := commbus.Message{Subject: commbus.ChanSubject("gossip"), AuthorName: "Alice", Body: "[Gossip] Alice: hi"}
+	msg := commbus.Message{Subject: commbus.ChanSubject("gossip"), AuthorName: "Alice", Body: "[Gossip] Alice: hi", Text: "hi"}
 
-	// Advertised "Comm" → the GMCP frame is emitted with the channel/talker.
+	// Advertised "Comm" → the GMCP frame is emitted with the channel/talker + the RAW message body.
 	var out bytes.Buffer
 	tc := telnet.NewReadWriter(bytes.NewReader([]byte{255, 253, 201}), &out) // IAC DO 201 → GMCP enabled
 	tc.ReadLine()
@@ -34,6 +35,10 @@ func TestDeliverChannelEmitsGMCP(t *testing.T) {
 	}
 	if !strings.Contains(got, `"channel":"gossip"`) || !strings.Contains(got, `"talker":"Alice"`) {
 		t.Fatalf("Comm.Channel.Text payload missing channel/talker; out = %q", got)
+	}
+	// #49: the RAW player message rides alongside the rendered `text` so a client can tab per channel.
+	if !strings.Contains(got, `"msg":"hi"`) {
+		t.Fatalf("Comm.Channel.Text payload missing the raw msg body; out = %q", got)
 	}
 
 	// NOT advertised → only the text line, no GMCP subnegotiation.
@@ -55,6 +60,7 @@ func TestDeliverChannelGMCPStripsColorTokens(t *testing.T) {
 		Subject:    commbus.ChanSubject("gossip"),
 		AuthorName: "{{BOLD}}Alice{{RESET}}", // talker is stripped too (engine-set today, defense in depth)
 		Body:       "[{{FG_MAGENTA}}Gossip{{RESET}}] Alice: hi",
+		Text:       "{{BOLD}}hi{{RESET}}", // the raw body is stripped on the same path (#49)
 	}
 	var out bytes.Buffer
 	tc := telnet.NewReadWriter(bytes.NewReader([]byte{255, 253, 201}), &out) // IAC DO 201 → GMCP enabled
@@ -67,8 +73,54 @@ func TestDeliverChannelGMCPStripsColorTokens(t *testing.T) {
 	if !strings.Contains(got, `"text":"[Gossip] Alice: hi"`) {
 		t.Fatalf("Comm.Channel.Text did not carry the stripped body; out = %q", got)
 	}
+	if !strings.Contains(got, `"msg":"hi"`) {
+		t.Fatalf("Comm.Channel.Text raw msg body not stripped; out = %q", got)
+	}
 	if strings.Contains(got, "{{") {
 		t.Fatalf("literal {{tokens}} leaked to the client; out = %q", got)
+	}
+}
+
+// TestApplyConfigEmitsChannelList pins Comm.Channel.List (#49): when the world publishes a hear-set, a
+// client that advertised Comm.Channel.List gets a sorted array of its usable channel refs (one tab each);
+// a client that did not advertise it gets none.
+func TestApplyConfigEmitsChannelList(t *testing.T) {
+	body, err := commbus.MarshalConfig(commbus.ConfigPayload{HearChannels: []string{"gossip", "auction", "chat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := commbus.Message{Body: body}
+
+	// Advertised → the sorted list frame is emitted.
+	var out bytes.Buffer
+	tc := telnet.NewReadWriter(bytes.NewReader([]byte{255, 253, 201}), &out) // IAC DO 201 → GMCP enabled
+	tc.ReadLine()
+	g := newGMCPState()
+	g.setSupports([]string{"Comm"})
+	cc := &commsClient{
+		log: discardLog(), tc: tc, gmcp: g, bus: commbus.OpenGate("", nil),
+		chanSubs: map[string]commbus.Subscription{}, ignore: map[string]struct{}{},
+	}
+	cc.applyConfig(cfg)
+	got := out.String()
+	if !strings.Contains(got, string([]byte{255, 250, 201})+"Comm.Channel.List ") {
+		t.Fatalf("no Comm.Channel.List GMCP frame; out = %q", got)
+	}
+	if !strings.Contains(got, `["auction","chat","gossip"]`) {
+		t.Fatalf("Comm.Channel.List not the sorted ref array; out = %q", got)
+	}
+
+	// NOT advertised → no list frame.
+	var out2 bytes.Buffer
+	tc2 := telnet.NewReadWriter(bytes.NewReader([]byte{255, 253, 201}), &out2)
+	tc2.ReadLine()
+	cc2 := &commsClient{
+		log: discardLog(), tc: tc2, gmcp: newGMCPState(), bus: commbus.OpenGate("", nil),
+		chanSubs: map[string]commbus.Subscription{}, ignore: map[string]struct{}{},
+	}
+	cc2.applyConfig(cfg)
+	if strings.Contains(out2.String(), "Comm.Channel.List") {
+		t.Fatalf("Comm.Channel.List reached a client that didn't advertise it; out = %q", out2.String())
 	}
 }
 

@@ -280,6 +280,7 @@ func (z *Zone) cmdChannel(s *session, def *channelDef, text string) {
 		Seq:            seq,
 		IdempotencyKey: commbus.NewIdempotencyKey(authorID, seq),
 		Body:           line,
+		Text:           safe, // RAW sanitized player text (#49): the gate's GMCP mirror carries it so a rich client can render its own per-channel line
 	}
 
 	// (1) REF-VALIDATE'd subject: built from the def's KNOWN ref (commbus.ChanSubject does no validation;
