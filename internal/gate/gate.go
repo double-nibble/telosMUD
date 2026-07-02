@@ -1,6 +1,7 @@
-// Package gate is the edge service: it accepts telnet connections, runs a minimal
-// login, and proxies each player to a world shard over the gRPC Play stream.
-// TLS/SSH, GMCP, and real auth arrive in later phases (docs/ACCOUNT.md, GMCP.md).
+// Package gate is the edge service: it accepts telnet connections (plain and TLS),
+// runs the login (browser OAuth via telos-account's device flow when a real account
+// client is wired, a bare-name dev stub otherwise — docs/ACCOUNT.md), speaks GMCP
+// (docs/GMCP.md), and proxies each player to a world shard over the gRPC Play stream.
 //
 // # The edge invariant
 //
@@ -14,7 +15,8 @@
 // # Connection lifecycle
 //
 //  1. Accept a telnet connection (ListenAndServe -> handle).
-//  2. Prompt for a name and read one line (the minimal stand-in for real auth).
+//  2. Run the login: the browser OAuth device flow + character select when a real
+//     account client is wired, the bare-name dev stub otherwise.
 //  3. Mint the session ONCE: a stable session_id and a session-scoped input seq
 //     that survive re-dials (docs/PROTOCOL.md §5: the gate owns the input buffer).
 //  4. Ask the directory which shard hosts that character; dial it via the pool.
@@ -73,9 +75,10 @@ import (
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
 
-// maxNameLen caps the login name length. The name becomes the in-world entity
+// maxNameLen caps a character name's length. The name becomes the in-world entity
 // name and a targeting keyword, so it must be short enough to render and type. 20
-// runes is generous for a stand-in login (real auth/chargen lands in Phase 13).
+// runes is generous; validateName enforces it on both the bare-name dev login and
+// the chargen name prompt.
 const maxNameLen = 20
 
 // Server accepts telnet connections and bridges them to world shards. It is
@@ -172,25 +175,25 @@ func newServer(listen string, dir directory.Directory, p *pool, comms commbus.Bu
 		dir:     dir,
 		pool:    p,
 		comms:   comms,
-		account: stubAccountClient{}, // legacy "type a name" login until a real account service is wired
+		account: stubAccountClient{}, // bare-name dev fallback; production replaces it via WithAccountClient
 		log:     slog.With("component", "gate"),
 	}
 }
 
-// ListenAndServe starts the configured transport listeners and serves until ctx is cancelled (Phase 14.6).
+// ListenAndServe starts the configured transport listeners and serves until ctx is cancelled.
 // PLAIN telnet runs only when explicitly enabled (allowPlaintext); TLS telnet runs when a listen addr +
-// cert/key are configured. At least one transport must be enabled. The SSH transport (14.6b) joins here.
+// cert/key are configured. At least one transport must be enabled.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	var wg sync.WaitGroup
 	started := 0
 
-	// Plain telnet — OFF by default; credentials cross the wire in cleartext when enabled.
+	// Plain telnet — OFF by default; play crosses the wire in cleartext when enabled.
 	if s.allowPlaintext {
 		ln, err := net.Listen("tcp", s.listen)
 		if err != nil {
 			return err
 		}
-		slog.Warn("PLAIN telnet enabled — credentials cross the wire UNENCRYPTED", "addr", s.listen)
+		slog.Warn("PLAIN telnet enabled — play crosses the wire UNENCRYPTED", "addr", s.listen)
 		wg.Add(1)
 		go func() { defer wg.Done(); s.serveListener(ctx, ln, false) }()
 		started++
@@ -223,8 +226,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 }
 
 // serveListener runs one transport's accept loop, handing each connection to its own goroutine. `encrypted`
-// records whether the transport is encrypted (TLS/SSH) so the login flow can skip the cleartext-credential
-// warning. Closing the listener on ctx cancellation unblocks Accept.
+// records whether the transport is TLS; it is plumbed to the login flow, which currently ignores it (no
+// credentials cross the telnet wire in the OAuth device flow — the browser carries them). Closing the
+// listener on ctx cancellation unblocks Accept.
 func (s *Server) serveListener(ctx context.Context, ln net.Listener, encrypted bool) {
 	go func() { <-ctx.Done(); _ = ln.Close() }()
 	for {
@@ -265,7 +269,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 	_ = tc.OfferGMCP()
 	tc.SetGMCPHandler(gmcpHandler(gmcp, tc, log))
 
-	// --- login: a link code (Phase 14.2, when an account service is wired) or the legacy name prompt. ---
+	// --- login: the browser OAuth device flow (when an account service is wired) or the bare-name dev stub. ---
 	_ = tc.Write("\r\nWelcome to TelosMUD.\r\n")
 	name, account, ok := s.login(ctx, tc, log, remote, encrypted)
 	if !ok {
@@ -750,9 +754,9 @@ func (s *Server) renderFrame(log *slog.Logger, c *connState, f *playv1.ServerFra
 // targeting keyword. It returns (reason, false) for a rejected name (the reason is
 // shown to the player on re-prompt) or ("", true) for an accepted one.
 //
-// This is a deliberately minimal stopgap until Phase 13 real auth/chargen — just
-// enough that a name cannot inject into a terminal or confuse the targeting
-// grammar. The rules:
+// This is the shared name-safety gate for the bare-name dev login and the chargen
+// name prompt — just enough that a name cannot inject into a terminal or confuse
+// the targeting grammar. The rules:
 //
 //   - non-empty after trimming;
 //   - at most maxNameLen runes (so it renders and types cleanly);

@@ -1,6 +1,7 @@
-// Command telos-gate is the edge service: it terminates telnet connections and
-// proxies players to world shards over the gRPC Play stream. TLS/SSH, GMCP, and
-// real auth arrive in later phases (docs/ACCOUNT.md, GMCP.md).
+// Command telos-gate is the edge service: it terminates telnet connections (plain
+// and TLS), runs the browser OAuth device login via telos-account (docs/ACCOUNT.md),
+// speaks GMCP (docs/GMCP.md), and proxies players to world shards over the gRPC
+// Play stream.
 //
 // Startup wiring:
 //
@@ -87,8 +88,8 @@ func main() {
 	srv.WithTransports(cfg.GateAllowPlaintext, cfg.GateTLSListen, cfg.GateTLSCert, cfg.GateTLSKey)
 	srv.WithDevAutoAuth(cfg.DevAutoAuth)
 	srv.WithWriteTimeout(cfg.GateWriteTimeout) // Phase 16.3: bound writes so a wedged client is reclaimed
-	// Phase 14: wire the real telos-account client when an account service is configured; otherwise the gate
-	// keeps the stub "type a name" login. The login flow that USES it lands in 14.2 (link codes).
+	// Wire the real telos-account client when an account service is configured (it drives the browser OAuth
+	// device login); otherwise the gate keeps the bare-name dev stub.
 	if cfg.AccountTarget != "" {
 		ac, err := gate.DialAccount(cfg.AccountTarget)
 		if err != nil {

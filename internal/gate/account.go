@@ -59,9 +59,9 @@ type CharacterInfo struct {
 	RoomRef string
 }
 
-// stubAccountClient is the no-service fallback. It returns a single character whose name is the (legacy)
-// connection-chosen name carried as the accountID, preserving today's "By what name shall you be known?"
-// login until link codes (14.2) replace it.
+// stubAccountClient is the no-service fallback. It returns a single character whose name is the
+// connection-chosen name carried as the accountID, preserving the bare "By what name shall you be known?"
+// dev login used when no account service is wired.
 type stubAccountClient struct{}
 
 func (stubAccountClient) ListCharacters(_ context.Context, accountID string) ([]CharacterInfo, error) {
@@ -196,7 +196,7 @@ func (g *grpcAccountClient) CreateChargenCharacter(ctx context.Context, accountI
 // Close releases the gRPC connection.
 func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 
-// --- login flow (Phase 14.2) ---------------------------------------------------------------------------
+// --- login flow (Phase 15 OAuth device flow) -------------------------------------------------------------
 
 // login resolves the character name + account id to enter the world with. When a real account service is
 // wired it runs the Phase-15 terminal-native OAuth device flow; otherwise it falls back to the bare "type a

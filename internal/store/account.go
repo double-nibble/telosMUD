@@ -12,10 +12,10 @@ import (
 	"github.com/double-nibble/telosmud/internal/world"
 )
 
-// account.go — Phase-14 account/character store methods backing telos-account (docs/ACCOUNT.md). These are
-// the queries the Account gRPC service runs: the character list/create for an account, name reservation, and
-// (later slices) the OAuth identity + passphrase + SSH-key lookups. The gate/world never call these directly
-// — only telos-account does.
+// account.go — account/character store methods backing telos-account (docs/ACCOUNT.md). These are
+// the queries the Account gRPC service and the OAuth broker run: the character list/create for an account,
+// name reservation, and the OAuth identity lookups (auth is OAuth-only since Phase 15). The gate/world never
+// call these directly — only telos-account does.
 
 // CharacterSummary is the account-facing summary of a character (the select menu / dashboard list).
 type CharacterSummary struct {

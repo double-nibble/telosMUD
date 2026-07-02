@@ -1,8 +1,8 @@
-// Command telos-account runs the accounts/auth service (docs/ACCOUNT.md, Phase 14). It is the only service
-// that touches OAuth providers + credentials; telos-gate calls its Account gRPC API to redeem link codes,
-// verify passphrases, resolve SSH keys, and list/create characters. The world never calls it on the hot path
-// — it trusts the signed session assertion (§9). The deployable fourth-and-a-half alongside gate/world/
-// director; the website (14.7) attaches to this same service.
+// Command telos-account runs the accounts/auth service (docs/ACCOUNT.md). It is the only service that
+// touches OAuth providers + identities; telos-gate calls its Account gRPC API to run the browser OAuth
+// device login (start/poll), list/create characters, and mint session assertions. The world never calls it
+// on the hot path — it trusts the signed session assertion (§9). The deployable fourth-and-a-half alongside
+// gate/world/director; the Phase-15 OAuth broker (the one-click login page) serves from this same process.
 //
 // Startup: load config -> obs.Init -> open the Postgres store (the account/character tables) -> serve the
 // Account gRPC API. SIGINT/SIGTERM gracefully stops the server.
@@ -163,7 +163,7 @@ func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer)
 }
 
 // loadChargen loads the pack content and returns the chargen flow + the selectable bundle options (race/class/
-// …) the website renders. ok=false when content is absent or defines no chargen flow.
+// …) the gate's prompt-driven chargen renders. ok=false when content is absent or defines no chargen flow.
 func loadChargen(ctx context.Context, pool *store.Pool) (content.ChargenDTO, []content.ChargenBundleOption, bool) {
 	lc, err := content.Load(ctx, pool, []string{content.DemoPack})
 	if err != nil || lc == nil || len(lc.Chargens) == 0 {

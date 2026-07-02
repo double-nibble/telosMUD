@@ -1,7 +1,8 @@
 // Package account implements telos-account: the accounts/auth service (docs/ACCOUNT.md). It is the only
-// service that touches OAuth providers + credentials; the gate reaches it over the Account gRPC API. Phase
-// 14.1 lands the service skeleton + the character RPCs (list/reserve/create); the auth-backend RPCs
-// (link codes, passphrase, SSH) return Unimplemented until their slices (14.2/14.5/14.6).
+// service that touches OAuth providers + identities; the gate reaches it over the Account gRPC API. Auth is
+// OAuth-only (Phase 15): the device-auth RPCs (StartDeviceAuth/PollDeviceAuth) drive the browser login, the
+// character RPCs (list/reserve/create) and the chargen RPCs back the prompt-driven flow, and
+// IssueSessionAssertion signs the gate->world session assertion.
 package account
 
 import (
@@ -48,8 +49,9 @@ type Service struct {
 	// pack's start room). Config-supplied; later chargen (14.8) may let content choose a starting zone.
 	startZone string
 	startRoom string
-	// Chargen (Phase 14.8): the content flow + selectable bundle options the website renders + validates
-	// against. Empty (chargenOK=false) => the website falls back to a bare name-only create.
+	// Chargen (Phase 14.8): the content flow + selectable bundle options the gate's prompt-driven chargen
+	// renders + validates against. Empty (chargenOK=false) => GetChargenFlow reports unconfigured and the
+	// gate falls back to a bare name-only create.
 	chargenFlow    content.ChargenDTO
 	chargenOptions []content.ChargenBundleOption
 	chargenKind    map[string]string // bundle ref -> kind (the bundle_choice legality check)
@@ -85,8 +87,8 @@ func (s *Service) WithMaxCharacters(n int) *Service {
 	return s
 }
 
-// WithChargen wires the content chargen flow + selectable bundle options (Phase 14.8). The website reads them
-// to render + validate the signup form. Without it, the website offers a bare name-only create.
+// WithChargen wires the content chargen flow + selectable bundle options (Phase 14.8). The gate reads them
+// (via GetChargenFlow) to drive the prompt-driven chargen. Without it, the gate offers a bare name-only create.
 func (s *Service) WithChargen(flow content.ChargenDTO, options []content.ChargenBundleOption) *Service {
 	s.chargenFlow = flow
 	s.chargenOptions = options
@@ -98,16 +100,16 @@ func (s *Service) WithChargen(flow content.ChargenDTO, options []content.Chargen
 	return s
 }
 
-// ChargenFlow returns the content chargen flow + bundle options + whether chargen is configured (the website
-// renders the form from these).
+// ChargenFlow returns the content chargen flow + bundle options + whether chargen is configured (the gate
+// renders its chargen prompts from these).
 func (s *Service) ChargenFlow() (content.ChargenDTO, []content.ChargenBundleOption, bool) {
 	return s.chargenFlow, s.chargenOptions, s.chargenOK
 }
 
 // BuildCharacter validates a chargen submission (name + the flow's picks/allocations) and creates the
 // character with its first-spawn marker. It returns a non-empty user-facing reason for a validation failure
-// (err nil); err is reserved for an internal failure. The website calls it in-process (the gate has no
-// telnet chargen yet).
+// (err nil); err is reserved for an internal failure. CreateChargenCharacter calls it in-process on behalf
+// of the gate's telnet chargen.
 func (s *Service) BuildCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (id string, reason string, err error) {
 	if accountID == "" {
 		return "", "", status.Error(codes.InvalidArgument, "account_id required")

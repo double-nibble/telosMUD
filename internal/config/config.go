@@ -22,8 +22,8 @@ type Config struct {
 	Redis    RedisConfig    `yaml:"redis"`
 	NATS     NATSConfig     `yaml:"nats"`
 
-	// Phase 14.6 transport posture: TLS + SSH are the encrypted defaults; PLAIN telnet is OFF unless
-	// explicitly enabled (credentials/play would otherwise cross the wire in cleartext).
+	// Transport posture: TLS telnet is the encrypted default; PLAIN telnet is OFF unless
+	// explicitly enabled (play would otherwise cross the wire in cleartext).
 	GateAllowPlaintext bool   `yaml:"gate_allow_plaintext"` // enable the unencrypted telnet listener (default false)
 	GateTLSListen      string `yaml:"gate_tls_listen"`      // TLS telnet listen, e.g. ":4443" (needs cert+key)
 	GateTLSCert        string `yaml:"gate_tls_cert"`        // PEM cert file
