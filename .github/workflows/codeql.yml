@@ -1,0 +1,60 @@
+# CodeQL ADVANCED setup (replaces GitHub's default setup, which cannot run a pre-build step).
+# This repo gitignores the generated protobuf packages (api/gen/**/*.pb.go — see the repo policy:
+# `buf generate` on a fresh checkout), so a default-setup scan cannot resolve them: the Go extractor
+# degrades ("could not import …/play/v1", cascading to "no metadata for time" / "undefined: Zone")
+# and every analysis covers only a PARTIAL program. Here we `buf generate` before the Go analysis,
+# exactly like ci.yml, so CodeQL sees the same program CI builds.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 8 * * 1" # weekly re-scan (query-pack updates find new issues in unchanged code)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload the SARIF results
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v4
+      # Generated *.pb.go is gitignored; produce it BEFORE CodeQL's autobuild (mirrors ci.yml).
+      - uses: bufbuild/buf-setup-action@v1
+        if: matrix.language == 'go'
+        with:
+          version: 1.71.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: buf generate
+        if: matrix.language == 'go'
+      - uses: actions/setup-go@v5
+        if: matrix.language == 'go'
+        with:
+          go-version: "1.25"
+          cache: true
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # security-and-quality keeps the QUALITY findings the Code Quality preview surfaced,
+          # now against a fully-extracted program instead of the degraded default-setup build.
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
