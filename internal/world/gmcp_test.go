@@ -118,7 +118,9 @@ func TestLookRoomEmitsRoomInfoOnChangeOnly(t *testing.T) {
 	var info struct {
 		Num int `json:"num"`
 	}
-	json.Unmarshal([]byte(got), &info)
+	if err := json.Unmarshal([]byte(got), &info); err != nil {
+		t.Fatalf("failed to unmarshal Room.Info payload %q: %v", got, err)
+	}
 	if info.Num != roomNum("midgaard:room:market") {
 		t.Fatalf("Room.Info after move has num %d, want market %d", info.Num, roomNum("midgaard:room:market"))
 	}
