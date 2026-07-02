@@ -52,6 +52,11 @@ type Zone struct {
 	inbox     chan msg             // message queue; the only ingress to zone state
 	log       *slog.Logger         // scoped logger: component=zone, zone=<id>
 
+	// whoCooldown rate-limits `who` PER SESSION (the shared roster cache already collapses concurrent
+	// reads; this blunts a single spammer). Zone-goroutine-read in cmdWho against session.lastWho.
+	// Tests that poll `who` on one session set it to 0 at construction (before Run).
+	whoCooldown time.Duration
+
 	// pop mirrors len(players) as an atomic so an OFF-goroutine reader (BeginDrain's wait-until-empty poll)
 	// can observe occupancy without posting a query. Written ONLY on the zone goroutine (at the join/leave
 	// occupancy points), read anywhere. Phase 16.4b.
@@ -476,6 +481,7 @@ func (whoFallbackMsg) zoneMsg()   {}
 func newZone(id string) *Zone {
 	z := &Zone{
 		id:                id,
+		whoCooldown:       defaultWhoCooldown,
 		rooms:             map[ProtoRef]*Entity{},
 		players:           map[string]*session{},
 		forwarding:        map[string]*Zone{},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync/atomic"
+	"time"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/metrics"
@@ -56,6 +57,13 @@ type session struct {
 	// room-ground panels, re-emitted only on change.
 	lastInv       []byte
 	lastRoomItems []byte
+
+	// lastWho is when this session last ran `who` — the per-session cooldown mark (cmdWho reads and
+	// writes it against zone.whoCooldown). Zone-goroutine-owned like the HUD buffers above; it rides
+	// the session across an intra-shard zone transfer, so a cross-zone walk doesn't reset the cooldown.
+	// A cross-SHARD handoff rebuilds the session and DOES reset it — deliberately not on the handoff
+	// snapshot (protocol churn for zero risk: a crossing buys one who, dominated by the handoff cost).
+	lastWho time.Time
 
 	// currentZone is the per-connection routing pointer the Play stream owns (server.go):
 	// it names the zone this player's input should be posted to right now. The zone that

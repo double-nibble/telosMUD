@@ -5,6 +5,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Verb handlers and the base command table (docs/MUDLIB.md §6). The parser/registry and
@@ -153,6 +154,16 @@ func cmdScore(c *Context) error {
 
 func cmdWho(c *Context) error {
 	z := c.z
+	// Per-session cooldown (docs/REMAINING.md, scale): the shared roster cache already collapses
+	// CONCURRENT reads to one SCAN per window; this blunts one session hammering the verb. Runs on
+	// the zone goroutine (dispatch), which owns both z.whoCooldown and s.lastWho.
+	if z.whoCooldown > 0 {
+		if time.Since(c.s.lastWho) < z.whoCooldown {
+			c.Send("You just checked; give it a moment.")
+			return nil
+		}
+		c.s.lastWho = time.Now()
+	}
 	out := c.s.out
 	if !z.presenceEnabled() {
 		z.who(c.s) // zone-local fallback (no roster): unchanged output
@@ -172,6 +183,11 @@ func cmdWho(c *Context) error {
 	}()
 	return nil
 }
+
+// defaultWhoCooldown is the per-session `who` rate limit (zone.whoCooldown, checked in cmdWho). Long
+// enough to blunt a spammer, short enough that a human retyping it never notices; the roster cache's
+// whoCacheTTL (1s) already amortizes CONCURRENT sessions, so this only guards the per-session path.
+const defaultWhoCooldown = 2 * time.Second
 
 // presenceEnabled reports whether this zone's shard has a live presence roster (so `who` should read it
 // cross-shard rather than the zone-local list). False on a bare zone or a no-Redis run.

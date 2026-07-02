@@ -345,8 +345,15 @@ change; the Lua director script is the big substrate the smaller Go handlers cou
 
 ## Independent / anytime (no seam entanglement)
 
-- **Per-session `who` cooldown (smaller).** The ~1s roster cache is in; a per-session cooldown further blunts a
-  single spammer. · *scale*
+- ~~Per-session `who` cooldown~~ — DONE (round 5): `zone.whoCooldown` (2s) vs `session.lastWho` in cmdWho,
+  ahead of both the roster and zone-local paths; anchored at the last SUCCESSFUL who so spam can't extend its
+  own window; resets on a cross-shard handoff by design (dominated by handoff cost). Opened the `mail`
+  rate-limit follow-up below. · *scale*
+- **Rate-limit `mail`/`mail read` (opened round 5, DS review of the who cooldown).** `mailList`/`mailReadCmd`
+  (`internal/world/mailcmds.go`) spawn a goroutine + a POSTGRES query per invocation with no guard — the comms
+  token bucket (`commRateOK`) covers `mail send` only. With `who` now cooled down, mail list/read is the
+  cheapest unbounded per-session async-I/O path, and it hits PG (worse than the 1s-cached Redis SCAN). Extend
+  `commRateOK` to mail list/read, or reuse the session-cooldown pattern. · *world/scale*
 - **Load-time ref-charset content-lint (opened round 5).** Several safety judgments (GMCP strip skipping
   Vitals/Stats/zone/exit KEYS, comms subjects, the tokenizer) rest on "refs can't contain braces/controls" by
   CONVENTION only — no charset validation exists at pack load. A loader-time lint (letters/digits/underscore/

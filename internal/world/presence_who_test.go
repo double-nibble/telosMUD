@@ -23,10 +23,45 @@ func presenceShard(t *testing.T, shared roster.Roster, shardID string) *Zone {
 	t.Helper()
 	sh := NewDemoShard().WithPresence(shared, shardID)
 	sh.presence.heartbeat = 20 * time.Millisecond // fast beat for the test
+	sh.Zone().whoCooldown = 0                     // these tests POLL `who` on one session (waitWho loops)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go sh.Run(ctx)
 	return sh.Zone()
+}
+
+// TestWhoSessionCooldown pins the per-session rate limit: a second `who` inside the cooldown window
+// gets the notice, another SESSION is unaffected, and the window expiring restores the list.
+func TestWhoSessionCooldown(t *testing.T) {
+	z := NewDemoShard().Zone() // no presence → the zone-local path, same cmdWho guard
+	z.whoCooldown = 500 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go z.Run(ctx)
+
+	alice := joinPlayer(t, z, "Alice")
+	bob := joinPlayer(t, z, "Bob")
+
+	drain(alice)
+	z.post(inputMsg{id: "Alice", line: "who"})
+	waitMarkup(t, alice, "Players online:")
+
+	// Inside the window → the cooldown notice, not a list.
+	drain(alice)
+	z.post(inputMsg{id: "Alice", line: "who"})
+	waitMarkup(t, alice, "You just checked")
+
+	// A different session is not throttled by Alice's mark.
+	drain(bob)
+	z.post(inputMsg{id: "Bob", line: "who"})
+	waitMarkup(t, bob, "Players online:")
+
+	// Past the window → Alice gets the list again. (lastWho is anchored at the first successful who —
+	// the notice path doesn't re-mark — so the sleep only needs to beat the window once.)
+	time.Sleep(550 * time.Millisecond)
+	drain(alice)
+	z.post(inputMsg{id: "Alice", line: "who"})
+	waitMarkup(t, alice, "Players online:")
 }
 
 // joinPlayer joins a fresh player into z and waits until they have arrived (the temple).
