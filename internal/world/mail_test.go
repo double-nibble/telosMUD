@@ -106,6 +106,11 @@ func waitMailLine(t *testing.T, s *session, substr string) string {
 
 // TestMailSendListReadDeleteRoundTrip is the core 8.7 round-trip: a player sends mail to another, who
 // lists it (UNREAD), reads it (marked read, body shown), and deletes it (gone from the inbox).
+//
+// NOTE: since #65 rate-limited list/read/delete, Bob's FIVE mail actions below sit at EXACTLY the
+// default burst (commRateBurst=5). A sixth Bob mail action (or a Bob say/tell interleaved) would spend
+// past the burst and hit the throttle — if you add a step here, raise the budget with
+// `mailShard`+`.WithCommsRate(...)`. The throttle behavior itself is pinned in TestMailReadRateLimited.
 func TestMailSendListReadDeleteRoundTrip(t *testing.T) {
 	_, z, _ := mailShard(t)
 	alice := newTestPlayerEntity(z, "Alice")
@@ -138,6 +143,33 @@ func TestMailSendListReadDeleteRoundTrip(t *testing.T) {
 	waitMailLine(t, bob, "Message 1 deleted.")
 	z.dispatch(bob, "mail")
 	waitMailLine(t, bob, "Your mailbox is empty.")
+}
+
+// TestMailReadRateLimited pins #65: mail list/read/delete each spawn a goroutine + a Postgres query, so
+// they share the per-author comms token bucket (mail send already did). Once the burst is spent, the next
+// mail read/list is throttled SYNCHRONOUSLY — the store is never touched — instead of being an unbounded
+// per-session async-PG spam path.
+func TestMailReadRateLimited(t *testing.T) {
+	ms := NewMemStore()
+	// Burst 2, effectively no refill for the test window: Bob gets exactly two mail actions.
+	sh := NewDemoShard().WithMail(ms).WithCommsRate(2, time.Minute)
+	z := sh.Zone()
+	alice := newTestPlayerEntity(z, "Alice")
+	bob := newTestPlayerEntity(z, "Bob")
+
+	// Alice mails Bob so he has something to read (spends ALICE's bucket, not Bob's — buckets are per-author).
+	z.dispatch(alice, "mail send Bob Subj | body one")
+	waitMailLine(t, alice, "Mail sent to Bob.")
+
+	// Bob's two mail actions spend his 2-token burst.
+	z.dispatch(bob, "mail")
+	waitMailLine(t, bob, "Your mailbox:")
+	z.dispatch(bob, "mail read 1")
+	waitMailLine(t, bob, "body one")
+
+	// The THIRD is throttled — the guard runs on the zone goroutine before any goroutine/PG.
+	z.dispatch(bob, "mail")
+	waitMailLine(t, bob, "checking your mail too fast")
 }
 
 // TestMailOfflineThenReadOnLogin proves an OFFLINE recipient (never joined / no live session) receives

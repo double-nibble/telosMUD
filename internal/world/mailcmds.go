@@ -104,6 +104,14 @@ func (z *Zone) mailStore() MailStore {
 // mailList lists the player's inbox newest-first (off the zone goroutine). The store scopes the query to
 // the authenticated player, so it can only ever return that player's own mail.
 func (z *Zone) mailList(s *session) {
+	// RATE-LIMIT (P8-A1): mail list spawns a goroutine + a Postgres query, so bound it on the same
+	// per-author comms bucket mail send / channels / tells use — otherwise it is the cheapest unbounded
+	// per-session async-I/O path (worse than the cached who roster: it hits PG). Enforced on the zone
+	// goroutine BEFORE the goroutine spawns, so a throttled invocation never touches the store.
+	if !z.commRateOK(s.character) {
+		s.send(textFrame("You are checking your mail too fast."))
+		return
+	}
 	store := z.mailStore()
 	player := s.character
 	out := s.out
@@ -158,6 +166,12 @@ func (z *Zone) mailReadCmd(s *session, arg string) {
 		writeFrameTo(s.out, textFrame("Read which message? (mail read <n>)"))
 		return
 	}
+	// RATE-LIMIT the async-PG read (see mailList) — AFTER the cheap arg parse, so a malformed `mail read`
+	// that never hits the store also never spends a token.
+	if !z.commRateOK(s.character) {
+		s.send(textFrame("You are reading your mail too fast."))
+		return
+	}
 	store := z.mailStore()
 	player := s.character
 	out := s.out
@@ -209,6 +223,11 @@ func (z *Zone) mailDeleteCmd(s *session, arg string) {
 	pos, ok := parseMailPos(arg)
 	if !ok {
 		writeFrameTo(s.out, textFrame("Delete which message? (mail delete <n>)"))
+		return
+	}
+	// RATE-LIMIT the async-PG delete (see mailList) — same bucket, after the arg parse.
+	if !z.commRateOK(s.character) {
+		s.send(textFrame("You are deleting mail too fast."))
 		return
 	}
 	store := z.mailStore()
