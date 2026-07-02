@@ -40,7 +40,10 @@ services:
 
   nats:
     image: nats:2.10-alpine
-    # -js enables JetStream (durable cross-scope events); -m exposes monitoring.
+    # -js enables JetStream (durable cross-scope events); -m exposes monitoring. SINGLE INSTANCE = demo
+    # only: the whole stack (every world publishes, every gate subscribes) rendezvous here, so at scale
+    # this becomes a fan-out/availability chokepoint — prod shards/CLUSTERS NATS (and JetStream needs a
+    # cluster for HA). Fine for the single-box demo.
     command: ["-js", "-m", "8222"]
     ports:
       - "4222:4222"
