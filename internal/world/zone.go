@@ -280,7 +280,10 @@ type leaveMsg struct{ id string }
 // whoFallbackMsg is posted back by the async cross-shard `who` read (cmdWho) when the roster read FAILED:
 // the fallback zone-local render runs on the zone goroutine (single-writer over z.players) and writes to
 // the captured out channel. A roster miss thus degrades to the local list, never an error to the player.
-type whoFallbackMsg struct{ out chan *playv1.ServerFrame }
+type whoFallbackMsg struct {
+	out    chan *playv1.ServerFrame
+	viewer *Entity // the requester, for the #28 canSee visibility filter (captured at post time)
+}
 
 // transferInMsg hands an existing session (and its entity) from a sibling zone on the
 // SAME shard (an intra-shard cross-zone walk). The destination zone takes ownership: it
@@ -654,7 +657,7 @@ func (z *Zone) handle(m msg) {
 	case reloadLuaMsg:
 		z.reloadLua(v.kind, v.ref)
 	case whoFallbackMsg:
-		writeFrameTo(v.out, textFrame(z.whoLocal()))
+		writeFrameTo(v.out, textFrame(z.whoLocal(v.viewer)))
 	case tellDeliverMsg:
 		v.ack <- z.deliverDrainedTell(v) // drained durable tell: dedup-via-cursor, render+emit, ack/nak
 	case tellCursorProbeMsg:

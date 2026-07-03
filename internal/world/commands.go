@@ -181,7 +181,7 @@ func cmdWho(c *Context) error {
 		if !ok {
 			// A roster read error degrades to the zone-local list — never an error to the player. We post
 			// a message back to the zone goroutine so the fallback render stays single-writer.
-			z.post(whoFallbackMsg{out: out})
+			z.post(whoFallbackMsg{out: out, viewer: c.s.entity})
 			return
 		}
 		writeFrameTo(out, textFrame(renderWho(entries)))
@@ -313,9 +313,12 @@ func (z *Zone) lookRoom(s *session) {
 		if occ == e {
 			continue
 		}
-		// TODO(phase5-visibility): route this presence/name disclosure through canSee/nameFor once
-		// dark/invis flags exist — rendering all contents here is a second path past the canSee
-		// chokepoint (see who()), consistent with the existing player-presence disclosure.
+		// Route presence/name disclosure through the canSee chokepoint (#28): an occupant the viewer
+		// can't perceive (invisible, no detect) is OMITTED from the room listing entirely — a builder
+		// with holylight still sees it. Ground items always show (they carry no viewer concealment).
+		if (occ.living != nil || Has[*PlayerControlled](occ)) && !z.canSee(e, occ) {
+			continue
+		}
 		if occ.living == nil && !Has[*PlayerControlled](occ) {
 			groundItems = append(groundItems, occ) // a dropped item / corpse — coalesced after the creatures
 			continue
@@ -503,17 +506,21 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 // who lists every player currently online in the zone (the zone-local fallback when presence is
 // disabled / a roster read failed). Sends the whoLocal() render to s.
 func (z *Zone) who(s *session) {
-	s.send(textFrame(z.whoLocal()))
+	s.send(textFrame(z.whoLocal(s.entity)))
 }
 
-// whoLocal builds the zone-local "Players online:" list (this zone's players only). It is the pre-8.4
-// who output, kept as the no-roster fallback. Runs on the zone goroutine (reads z.players single-writer).
-func (z *Zone) whoLocal() string {
+// whoLocal builds the zone-local "Players online:" list (this zone's players only), as seen BY viewer. It
+// is the pre-8.4 who output, kept as the no-roster fallback. Runs on the zone goroutine (reads z.players
+// single-writer). A player the viewer can't perceive (invisible, no detect) is OMITTED (#28) — a holylight
+// viewer still sees everyone. (The CROSS-SHARD roster path renderWho is a separate follow-up: it needs the
+// presence Entry to carry a concealment bit.)
+func (z *Zone) whoLocal(viewer *Entity) string {
 	var b strings.Builder
 	b.WriteString("Players online:")
-	// TODO(phase5-visibility): this online list discloses presence/name bypassing the
-	// canSee chokepoint; honor anonymity/invis flags here when they land.
 	for _, o := range z.players {
+		if o.entity != viewer && !z.canSee(viewer, o.entity) {
+			continue
+		}
 		b.WriteByte('\n')
 		b.WriteByte(' ')
 		b.WriteString(o.entity.Name())
