@@ -516,6 +516,13 @@ func dumpFlags(e *Entity) []string {
 	}
 	out := make([]string, 0, len(e.living.flags))
 	for name := range e.living.flags {
+		// #27/#28: the RESERVED trust flags (holylight/builder/admin) are NEVER persisted — they are derived
+		// from the account tier at login (applyTierFlags), so they can't be injected via the state/handoff
+		// snapshot (an UNAUTHENTICATED channel) and restored through the trusted setFlag path, bypassing the
+		// content op guard. Keeping them off the persistence boundary is the structural fix (security-audit H-1).
+		if reservedFlag(name) {
+			continue
+		}
 		out = append(out, name)
 	}
 	sort.Strings(out)
@@ -711,8 +718,16 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 				duration: af.Remaining, magnitude: af.Mag, stacks: af.Stacks, reattach: true,
 			}, nil) // a persistence reattach is a root (and skips on_apply/the bus fire anyway)
 		}
-		// Re-install the entity's named flags (Phase 5.3, flags.go) — e.g. a player's "pvp" consent.
+		// Re-install the entity's named flags (Phase 5.3, flags.go) — e.g. a player's "pvp" consent. The
+		// RESERVED trust flags (holylight/builder/admin) are SKIPPED (security-audit H-1): they are never
+		// persisted (dumpFlags) and must never be installed from a state/handoff snapshot — this restore runs
+		// via the TRUSTED setFlag, bypassing the content op guard, and the handoff snapshot is unauthenticated.
+		// They are derived solely from the verified account tier at login (applyTierFlags). Defense-in-depth:
+		// even a forged/legacy snapshot carrying one is ignored here.
 		for _, name := range st.Flags {
+			if reservedFlag(name) {
+				continue
+			}
 			setFlag(e, name, true)
 		}
 		// Re-install the entity's advancement-track steps (Phase 11.2, track.go). The step is the high-

@@ -1111,7 +1111,8 @@ func (z *Zone) attach(m attachMsg) {
 		// Persistence (docs/PHASE4-PLAN.md §4): rehydrate from the snapshot read off-goroutine,
 		// or create a brand-new durable row, or (no store) stay ephemeral exactly as before.
 		room := z.loginRoom(s, m)
-		z.join(s, room) // registers, places, announces arrival, looks, prompts
+		applyTierFlags(s.entity, s.tier) // #27: reconcile builder/admin/holylight to the verified tier (post-load)
+		z.join(s, room)                  // registers, places, announces arrival, looks, prompts
 		z.startSaveCadence()
 	}
 }

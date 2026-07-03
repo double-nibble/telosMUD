@@ -46,9 +46,12 @@ type session struct {
 	entity *Entity
 
 	// tier is the account trust tier (#27) from the VERIFIED session assertion, set on fresh-login attach.
-	// player/builder/admin; "" (== player) on the dev/unverified path. It is a LOGIN-TIME input the zone
-	// uses to apply the matching builder/admin flags on spawn (Slice 3) — NOT runtime state (the applied
-	// flags, which ride the entity across a handoff, are the source of truth after spawn). Zone-goroutine-owned.
+	// player/builder/admin; "" (== player) on the dev/unverified path. It is a LOGIN-TIME input the zone uses
+	// to DERIVE the reserved builder/admin/holylight flags on spawn (applyTierFlags). Those flags are NOT
+	// persisted or carried on the (unauthenticated) handoff snapshot (security-audit H-1) — they are re-
+	// derived from the tier at each fresh login. A cross-shard handoff currently DROPS elevation (fail-closed);
+	// carrying the tier on the signed handoff snapshot to re-derive at the destination is a follow-up.
+	// Zone-goroutine-owned.
 	tier string
 
 	// lastVitals / lastStatus are the last GMCP Char.Vitals / Char.Status payloads emitted to this
