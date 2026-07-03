@@ -244,6 +244,43 @@ func gmcpGroupID(key string) string {
 	return strconv.FormatUint(h.Sum64(), 16)
 }
 
+// gmcpOccupant is one entry in Room.Players (#33): a room creature (player or mob) the viewer can see.
+type gmcpOccupant struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"` // "player" | "mob"
+}
+
+// roomPlayersJSON builds the GMCP Room.Players payload — the room's VISIBLE creature occupants (players +
+// mobs) as seen BY viewer, routed through the canSee chokepoint (#33/#28) so an occupant the viewer can't
+// perceive (invisible, no detect) never appears; a holylight viewer sees all. Excludes the viewer itself
+// and non-creature contents (ground items ride Char.Items). Room-contents order → deterministic bytes for
+// clean change-detection. Names go through gmcpText (the shared {{token}} strip) like every GMCP name.
+func (z *Zone) roomPlayersJSON(viewer *Entity) []byte {
+	occ := []gmcpOccupant{}
+	if viewer != nil && viewer.location != nil {
+		for _, o := range viewer.location.contents {
+			if o == viewer {
+				continue
+			}
+			isPlayer := Has[*PlayerControlled](o)
+			if o.living == nil && !isPlayer {
+				continue // not a creature (a ground item / corpse) — belongs to Char.Items
+			}
+			if !z.canSee(viewer, o) {
+				continue // the visibility chokepoint (#28): an unseen occupant is omitted
+			}
+			typ := "mob"
+			if isPlayer {
+				typ = "player"
+			}
+			occ = append(occ, gmcpOccupant{ID: fmt.Sprintf("i%v", o.RuntimeID()), Name: gmcpText(o.Name()), Type: typ})
+		}
+	}
+	b, _ := json.Marshal(occ)
+	return b
+}
+
 // invItems / roomItems build the coalesced Char.Items entry list for a location. inv is everything the
 // player carries (worn flagged "W"); room is ground items in the player's room (items/corpses, NOT
 // players/mobs — a corpse carries only a Container, so filtering on Has[*Living] keeps loot visible).
@@ -302,6 +339,10 @@ func (z *Zone) sendPrompt(s *session) {
 		}
 		s.lastInvItems = z.diffItems(s, "inv", invItems(e), s.lastInvItems)
 		s.lastRoomItems = z.diffItems(s, "room", roomItems(e), s.lastRoomItems)
+		if rp := z.roomPlayersJSON(e); !bytes.Equal(rp, s.lastRoomPlayers) {
+			s.lastRoomPlayers = rp
+			s.send(gmcpFrame("Room.Players", rp))
+		}
 	}
 	s.send(promptFrameMarkup(z.promptMarkup(s))) // vitals-bearing prompt when `vitals on` (#40), else "> "
 }
