@@ -143,6 +143,48 @@ func TestBootstrapAdminTierAndAudit(t *testing.T) {
 	assert.Equal(t, TierAdmin, newTier)
 }
 
+// TestSetAccountTierAndResolve (#27 Slice 4): resolve a character name to its account, change the account's
+// tier, and confirm the previous tier is returned + an actor-stamped audit row is written.
+func TestSetAccountTierAndResolve(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	acct := uuid.NewString()
+	_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status, tier) VALUES ($1, 'active', 'player')`, acct)
+	require.NoError(t, err)
+	name := "GatedTier-" + time.Now().Format("150405.000000")
+	_, err = p.CreateAccountCharacter(ctx, acct, name, "midgaard", "midgaard:room:temple", nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_role_audit WHERE target_account = $1`, acct)
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM characters WHERE account_id = $1`, acct)
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, acct)
+	})
+
+	// The character name resolves to its owning account.
+	got, found, err := p.AccountByCharacterName(ctx, name)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, acct, got)
+
+	// Promote player -> builder: returns the previous tier, updates the row.
+	old, err := p.SetAccountTier(ctx, acct, acct, TierBuilder)
+	require.NoError(t, err)
+	assert.Equal(t, TierPlayer, old)
+	tier, _, err := p.AccountTier(ctx, acct)
+	require.NoError(t, err)
+	assert.Equal(t, TierBuilder, tier)
+
+	// The change is audited with the acting account + the new tier.
+	var actor, newTier string
+	err = p.pool.QueryRow(ctx,
+		`SELECT actor_account, new_tier FROM account_role_audit WHERE target_account = $1 AND actor_account IS NOT NULL`,
+		acct).Scan(&actor, &newTier)
+	require.NoError(t, err)
+	assert.Equal(t, acct, actor)
+	assert.Equal(t, TierBuilder, newTier)
+}
+
 // TestPendingChargenRoundTrip (Phase 14.8) proves the first-spawn chargen marker survives create -> load, and
 // that the FIRST save clears it (chargen = NULL) — so the world applies the build exactly once.
 func TestPendingChargenRoundTrip(t *testing.T) {

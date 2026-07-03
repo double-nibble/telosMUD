@@ -16,22 +16,35 @@ import (
 
 // fakeStore is an in-memory CharStore for the service tests.
 type fakeStore struct {
-	chars map[string][]store.CharacterSummary
-	taken map[string]bool
-	tiers map[string]string // accountID -> tier (#27); absent => not found
+	chars       map[string][]store.CharacterSummary
+	taken       map[string]bool
+	tiers       map[string]string // accountID -> tier (#27); absent => not found
+	charAccount map[string]string // character name -> owning accountID (#27)
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		chars: map[string][]store.CharacterSummary{},
-		taken: map[string]bool{},
-		tiers: map[string]string{},
+		chars:       map[string][]store.CharacterSummary{},
+		taken:       map[string]bool{},
+		tiers:       map[string]string{},
+		charAccount: map[string]string{},
 	}
 }
 
 func (f *fakeStore) AccountTier(_ context.Context, accountID string) (string, bool, error) {
 	t, ok := f.tiers[accountID]
 	return t, ok, nil
+}
+
+func (f *fakeStore) AccountByCharacterName(_ context.Context, name string) (string, bool, error) {
+	a, ok := f.charAccount[name]
+	return a, ok, nil
+}
+
+func (f *fakeStore) SetAccountTier(_ context.Context, _, targetAccountID, newTier string) (string, error) {
+	old := f.tiers[targetAccountID]
+	f.tiers[targetAccountID] = newTier
+	return old, nil
 }
 
 func (f *fakeStore) AccountCharacters(_ context.Context, accountID string) ([]store.CharacterSummary, error) {

@@ -37,6 +37,10 @@ type CharStore interface {
 	CreateCharacterWithChargen(ctx context.Context, accountID, name, zoneRef, roomRef string, bundles []string, attrs map[string]float64) (string, error)
 	// AccountTier (#27) returns the account's trust tier — signed into the session assertion.
 	AccountTier(ctx context.Context, accountID string) (string, bool, error)
+	// AccountByCharacterName (#27) resolves a character name to its owning account (the promote target).
+	AccountByCharacterName(ctx context.Context, name string) (string, bool, error)
+	// SetAccountTier (#27) writes the target's new tier + an audit row; returns the previous tier.
+	SetAccountTier(ctx context.Context, actorAccountID, targetAccountID, newTier string) (string, error)
 }
 
 // Service implements the Account gRPC server. It is transport-thin: validation + a store call + a mapping to
@@ -295,6 +299,53 @@ func (s *Service) IssueSessionAssertion(ctx context.Context, req *accountv1.Issu
 		return nil, status.Error(codes.Internal, "sign failed")
 	}
 	return &accountv1.IssueSessionAssertionResponse{Assertion: tok}, nil
+}
+
+// validTiers is the set of assignable trust tiers (#27) — mirrors the accounts.tier CHECK (migration 00019).
+var validTiers = map[string]bool{store.TierPlayer: true, store.TierBuilder: true, store.TierAdmin: true}
+
+// SetAccountTier is the promote/demote authority (#27). AUTHZ IS HERE, not the edge: it reads the ACTOR's
+// tier from the store and refuses unless the actor is an admin — so a compromised/forged edge request from a
+// non-admin account cannot elevate anyone. It resolves the target character to its account, writes the new
+// tier + an audit row (actor recorded), and returns the previous tier. The change takes effect on the
+// target's NEXT login (the assertion re-reads the tier). A user-facing refusal rides ok=false + reason (the
+// gate prints it); only unexpected I/O is a gRPC error.
+func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountTierRequest) (*accountv1.SetAccountTierResponse, error) {
+	if req.GetActorAccountId() == "" || req.GetTargetCharacter() == "" {
+		return nil, status.Error(codes.InvalidArgument, "actor_account_id and target_character required")
+	}
+	// AUTHZ FIRST (before any other validation): the actor must be an admin, per the authoritative store
+	// (never the edge's word). Checking this before tier/target validation avoids disclosing the tier
+	// vocabulary or probing character existence to a non-admin.
+	actorTier, found, err := s.store.AccountTier(ctx, req.GetActorAccountId())
+	if err != nil {
+		s.log.Error("SetAccountTier: actor tier", "actor", req.GetActorAccountId(), "err", err)
+		return nil, status.Error(codes.Internal, "tier lookup failed")
+	}
+	if !found || actorTier != store.TierAdmin {
+		s.log.Warn("SetAccountTier refused: actor not admin", "actor", req.GetActorAccountId(), "actor_tier", actorTier)
+		return &accountv1.SetAccountTierResponse{Reason: "You are not authorized to change trust tiers."}, nil
+	}
+	if !validTiers[req.GetNewTier()] {
+		return &accountv1.SetAccountTierResponse{Reason: "Unknown tier (use player, builder, or admin)."}, nil
+	}
+	// Resolve the target character to its owning account.
+	target, found, err := s.store.AccountByCharacterName(ctx, req.GetTargetCharacter())
+	if err != nil {
+		s.log.Error("SetAccountTier: resolve target", "target", req.GetTargetCharacter(), "err", err)
+		return nil, status.Error(codes.Internal, "target lookup failed")
+	}
+	if !found {
+		return &accountv1.SetAccountTierResponse{Reason: "No such character."}, nil
+	}
+	old, err := s.store.SetAccountTier(ctx, req.GetActorAccountId(), target, req.GetNewTier())
+	if err != nil {
+		s.log.Error("SetAccountTier: write", "target", target, "err", err)
+		return nil, status.Error(codes.Internal, "set tier failed")
+	}
+	s.log.Info("account tier changed", "actor", req.GetActorAccountId(), "target_character", req.GetTargetCharacter(),
+		"target_account", target, "old_tier", old, "new_tier", req.GetNewTier())
+	return &accountv1.SetAccountTierResponse{Ok: true, OldTier: old}, nil
 }
 
 // ListCharacters returns the characters owned by an account (the select menu).
