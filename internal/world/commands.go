@@ -68,7 +68,11 @@ func registerCommands() []*Command {
 	base = append(base, commsCommands()...)
 	// Mail (Phase 8.7): the durable inbox. Registered last with the other comms commands so it never
 	// shadows a movement/look/say verb.
-	return append(base, mailCommands()...)
+	base = append(base, mailCommands()...)
+	// Staff verbs (#29, stat.go): registered LAST (lowest priority) and each carries a positive MinRank, so
+	// a staff verb is both invisible below that rank (dispatch gate) and never wins an abbreviation against
+	// a mortal verb.
+	return append(base, staffCommands()...)
 }
 
 // cmdLook shows the actor their current room (MUDLIB §6). Slice 2 keeps look's behavior
