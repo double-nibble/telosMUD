@@ -23,13 +23,14 @@ const (
 	flagWizinvis    = "wizinvis"     // target: a STAFF member hidden from LOWER trust ranks (#30, rank-aware)
 )
 
-// SECURITY POSTURE (#28, confirmed by audit): holylight/detect_invis are plain open-string flags today —
-// any set_flag content could grant them, and a self-targeted set_flag is unguarded. That is safe for now
-// because (a) canSee gates PERCEPTION ONLY — never harm/authz (the harm gate is guardHarmful, separate),
-// so see-all is a pure information capability that cannot bypass the hostility gate; and (b) no shipped
-// content grants either flag, and setFlag has no Lua surface (luaharm_lint_test), so no player can
-// self-grant. When the builder trust tier (#27/#97) lands, these should become RESERVED flags the engine
-// refuses to set_flag without admin trust — tracked there so an accidental grant can't slip in via a pack.
+// SECURITY POSTURE (#28, updated once the builder trust tier #27 landed): holylight is now a RESERVED trust
+// flag (see reservedFlags in tier.go) — content set_flag/clear_flag refuse it, it is never persisted, and a
+// forged snapshot can't inject it, so no player can self-grant see-all. detect_invis is DELIBERATELY left a
+// plain open-string gameplay flag (a detect-invisibility effect/racial), which is safe because (a) canSee
+// gates PERCEPTION ONLY — never harm/authz (the harm gate is guardHarmful, separate), so piercing invisibility
+// is a pure information capability that cannot bypass the hostility gate; and (b) detect_invis pierces only
+// flagInvisible, never a staff member's flagWizinvis (a distinct trust-rank branch in visibleTo below). See
+// #27/#97.
 
 // visibleTo reports whether target is perceivable by viewer under the concealment flags above. It is the
 // single rule canSee delegates to (kept here beside the flag names so the visibility policy lives in one
