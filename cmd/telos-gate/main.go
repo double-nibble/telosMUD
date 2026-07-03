@@ -87,6 +87,8 @@ func main() {
 	// in Phase 15 — auth is OAuth-only.)
 	srv.WithTransports(cfg.GateAllowPlaintext, cfg.GateTLSListen, cfg.GateTLSCert, cfg.GateTLSKey)
 	srv.WithDevAutoAuth(cfg.DevAutoAuth)
+	srv.WithDevAutoAuthAllowRemoteBind(cfg.DevAutoAuthAllowRemoteBind) // permit a non-loopback bind ONLY in sandboxed orchestration
+
 	srv.WithWriteTimeout(cfg.GateWriteTimeout) // Phase 16.3: bound writes so a wedged client is reclaimed
 	srv.WithCommsExpected(cfg.NATS.URL != "")  // #61: warn players when a CONFIGURED comms bus is down
 	// Wire the real telos-account client when an account service is configured (it drives the browser OAuth
