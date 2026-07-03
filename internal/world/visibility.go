@@ -20,6 +20,7 @@ const (
 	flagInvisible   = "invisible"    // target: not perceivable by an ordinary viewer
 	flagDetectInvis = "detect_invis" // viewer: pierces flagInvisible
 	flagHolylight   = "holylight"    // viewer: sees everything (the elevated end — builders/immortals, #28)
+	flagWizinvis    = "wizinvis"     // target: a STAFF member hidden from LOWER trust ranks (#30, rank-aware)
 )
 
 // SECURITY POSTURE (#28, confirmed by audit): holylight/detect_invis are plain open-string flags today —
@@ -45,6 +46,19 @@ func visibleTo(viewer, target *Entity) bool {
 	}
 	if hasFlag(viewer, flagHolylight) {
 		return true // see-all: the elevated end of the chokepoint (#28)
+	}
+	// Staff wizinvis (#30): a concealed staff member is hidden from any viewer of STRICTLY LOWER trust rank
+	// (resolved through the zone's content ladder). Equal/higher rank still see them (and holylight, above,
+	// already saw everyone) — so a builder hides from mortals but not from an admin. A mortal target's
+	// baseline rank 0 means an accidental flagWizinvis (it is reserved, so content can't set it anyway)
+	// conceals from no one. Rank via the target's zone ladder; a zone-less target skips the rule.
+	if hasFlag(target, flagWizinvis) {
+		if z := target.zone; z != nil {
+			l := z.trustLadder()
+			if l.rank(entityTier(viewer)) < l.rank(entityTier(target)) {
+				return false
+			}
+		}
 	}
 	if hasFlag(target, flagInvisible) && !hasFlag(viewer, flagDetectInvis) {
 		return false
