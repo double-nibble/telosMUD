@@ -2,9 +2,9 @@
 # smoke.sh — the cheapest end-to-end catch for the seed-class bug (and "does the
 # stack even come up").
 #
-# It brings up the FULL docker stack (postgres, redis, nats, migrate, seed, two
-# world shards, gate), then asserts the three things a hermetic unit test
-# structurally cannot see:
+# It brings up the FULL docker stack (postgres, redis, nats, migrate, seed, three
+# world shards, account, and two gates), then asserts the things a hermetic unit
+# test structurally cannot see:
 #
 #   1. The one-shot seed container EXITED 0 — the deletePack/idempotency regression
 #      (a populated Postgres volume + a second `make up`) shows up here and nowhere
@@ -18,6 +18,9 @@
 #      and RECONNECTS into the exact quit room with NO "mid-transfer" rejection — the
 #      regression guard for the live 2-shard reconnect bug (aa64b06), at the layer
 #      (real Redis directory + two real shards + the gate's routing) where it surfaced.
+#   5. The account-backed gate (gate-auth, :4001) is reachable and presents the OAuth
+#      device-auth sign-in link — a wiring check that the second gate is up and reaches
+#      the account service, across a surface the :4000-only asserts never touch.
 #
 # By default it runs the stack ONCE. Pass --twice (or SMOKE_TWICE=1) to run the
 # whole bring-up TWICE against the SAME persisted Postgres volume — that is the
