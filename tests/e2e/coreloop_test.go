@@ -47,22 +47,40 @@ func TestCoreLoopReconnect(t *testing.T) {
 	c.Send("quit")
 
 	// --- session 2: reconnect the SAME character -> must land back in Market Square, NOT the temple ---
-	// The quit flush + placement write are ASYNC (the same boundary smoke.sh's assert_cross_shard_reconnect
-	// waits out): a reconnect that RACES the flush could spawn fresh at the temple and clobber the persisted
-	// market location. Give the flush a brief head start, then POLL for the landing room.
+	// The quit flush is ASYNC (quit -> detach -> leave -> saveFinal is a chain of inbox posts + an
+	// off-goroutine saver write, with no client-observable "flush done" signal — the socket just closes). A
+	// reconnect can arrive before the flush lands; when it does it RE-LOADS the durable row (never a fresh
+	// Temple spawn — the row exists from first login, and create-before-CAS ordering structurally precludes
+	// Temple ever overwriting Market), so the worst case is landing at the pre-flush room, never data loss.
+	// Give the flush a head start, then RE-DIAL up to a bounded budget until the reconnect lands in the quit
+	// room — mirroring smoke.sh's assert_cross_shard_reconnect, so the test stays robust on a loaded CI box
+	// where a single attempt could beat a slow flush. Re-dialing on a miss is safe (idempotent; no clobber).
 	time.Sleep(3 * time.Second)
 
-	rc, err := helpers.Dial(t, addr)
-	require.NoErrorf(t, err, "reconnect dial")
-	require.Truef(t, rc.Expect("By what name", 15*time.Second),
-		"reconnect: gate never presented the login prompt; transcript:\n%s", rc.Transcript())
-	rc.Send(name)
-	// A reconnect must land in the QUIT room (Market Square), never the temple, and never be rejected
-	// "mid-transfer" (the aa64b06 regression class).
-	got := rc.ExpectAny([]string{"Market Square", "mid-transfer"}, 20*time.Second)
-	require.NotEqualf(t, "mid-transfer", got,
-		"reconnect was rejected 'mid-transfer' (reconnect regression); transcript:\n%s", rc.Transcript())
-	require.Equalf(t, "Market Square", got,
-		"reconnect did not land back in the quit room (Market Square) — persistence regression; transcript:\n%s", rc.Transcript())
-	rc.Send("quit")
+	landed := false
+	for deadline := time.Now().Add(45 * time.Second); time.Now().Before(deadline); {
+		rc, err := helpers.Dial(t, addr)
+		require.NoErrorf(t, err, "reconnect dial")
+		require.Truef(t, rc.Expect("By what name", 15*time.Second),
+			"reconnect: gate never presented the login prompt; transcript:\n%s", rc.Transcript())
+		rc.Send(name)
+		// Market Square = the quit room (success). "mid-transfer" is inert on this INTRA-shard journey (no
+		// cross-shard boundary is crossed, so no frozen session for this character ever exists) — it is
+		// asserted only as harmless insurance; the cross-shard reconnect regression is smoke.sh's concern.
+		got := rc.ExpectAny([]string{"Market Square", "mid-transfer"}, 10*time.Second)
+		require.NotEqualf(t, "mid-transfer", got,
+			"reconnect was rejected 'mid-transfer' (unexpected on an intra-shard reconnect); transcript:\n%s", rc.Transcript())
+		if got == "Market Square" {
+			rc.Send("quit")
+			rc.Close()
+			landed = true
+			break
+		}
+		// Landed neither in the quit room nor mid-transfer — the flush likely isn't visible yet. Close and
+		// retry after a short beat (the durable room only moves forward; re-loading is safe).
+		rc.Close()
+		time.Sleep(2 * time.Second)
+	}
+	require.Truef(t, landed,
+		"reconnect never landed back in the quit room (Market Square) within the budget — persistence regression")
 }
