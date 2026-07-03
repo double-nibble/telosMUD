@@ -370,12 +370,10 @@ func areaTargets(c *effectCtx, area string) []*Entity {
 	return out
 }
 
-// canSee is the visibility filter (MUDLIB §7): an actor may only target what it can
-// perceive. Slice 1 left room/entity flags as stubs (no dark/invis/hidden data yet), so
-// this is the honest trivial filter: everything in scope is visible. It is the single
-// chokepoint the resolver consults, so when content supplies dark/invis/hidden flags
-// (Phase 5+) the rule lands here and every command inherits it — and, critically, the
-// can't-see leak surface (see act.go) is gated by the SAME predicate.
-func (z *Zone) canSee(_, _ *Entity) bool {
-	return true
+// canSee is the visibility filter (MUDLIB §7): an actor may only target what it can perceive. It is the
+// single chokepoint the resolver + the act() leak surface consult, so the concealment rule lands in ONE
+// place (visibleTo, visibility.go) and every command inherits it. As of #28 it honors the invisibility /
+// detect-invis / holylight flags; dark rooms and hidden/sneak are follow-up slices that extend visibleTo.
+func (z *Zone) canSee(viewer, target *Entity) bool {
+	return visibleTo(viewer, target)
 }

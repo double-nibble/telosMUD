@@ -253,6 +253,9 @@ func invItems(e *Entity) []gmcpItem {
 }
 
 func roomItems(e *Entity) []gmcpItem {
+	// VISIBILITY (#28): this needs no canSee filter TODAY because concealment (flagInvisible) is Living-
+	// scoped and this list excludes all Living occupants — so no concealed entity can appear here. If
+	// item-level invisibility is ever added, this walk MUST gain a z.canSee(e, occ) filter (like lookRoom).
 	if e.location == nil {
 		return []gmcpItem{}
 	}
