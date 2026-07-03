@@ -39,7 +39,13 @@ fi
 
 # Long-running services that must end up healthy/running. The one-shots
 # (migrate, seed) are checked separately by exit code.
-SERVICES=(postgres redis nats world world-darkwood gate)
+#
+# This is the FULL long-running set: omitting a service means a crash-looping one
+# passes smoke silently. In particular world-crypt (shard-c), account, and gate-auth
+# were previously unlisted — a broken third shard or a down account/second-gate hop
+# was invisible to a smoke run. (otel-collector is a best-effort observability sidecar
+# with no healthcheck and is intentionally not gated on.)
+SERVICES=(postgres redis nats world world-darkwood world-crypt account gate gate-auth)
 
 log()  { printf '\n=== %s\n' "$*"; }
 fail() { printf '\nSMOKE FAIL: %s\n' "$*" >&2; dump_logs; exit 1; }
@@ -262,6 +268,36 @@ assert_cross_shard_reconnect() {
   done
 }
 
+# assert_gate_auth_reachable connects to the SECOND gate (gate-auth, :4001) and asserts it
+# presents the account-backed OAuth sign-in link ("To sign in, open this link ..."), NOT the
+# :4000 dev-autoauth bare-name prompt. This is a wiring check across a surface the :4000-only
+# look/reconnect asserts never touch: gate-auth must be UP and must reach the account service
+# (which mints the device-auth link). A crash-looping gate-auth, a broken gate->account hop, or
+# a gate-auth accidentally started in autoauth mode all fail here.
+assert_gate_auth_reachable() {
+  local port="${GATE_AUTH_PORT:-4001}"
+  local deadline=$(( $(date +%s) + 60 )) out=""
+  while :; do
+    if command -v nc >/dev/null 2>&1; then
+      out="$(printf '' | nc -w 6 "${GATE_HOST}" "${port}" 2>/dev/null || true)"
+    else
+      # /dev/tcp fallback: open, read for a few seconds, then close (no input to send).
+      out="$( { exec {g}<>"/dev/tcp/${GATE_HOST}/${port}" && { cat <&${g} & r=$!; sleep 5; kill "$r" 2>/dev/null; wait "$r" 2>/dev/null; }; } 2>/dev/null || true)"
+    fi
+    if printf '%s' "$out" | grep -qi 'To sign in, open this link'; then
+      if printf '%s' "$out" | grep -qi 'By what name'; then
+        fail "gate-auth :$port showed the dev-autoauth bare-name prompt, not the account-backed sign-in link (started in the wrong mode?)"
+      fi
+      log "gate-auth :$port reachable + account-backed (OAuth sign-in link presented)"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      fail "gate-auth :$port did not present the account-backed sign-in link within deadline (gate-auth down or account hop broken?); got: $(printf '%s' "$out" | head -c 300)"
+    fi
+    sleep 3
+  done
+}
+
 for run in $(seq 1 "$RUNS"); do
   if (( RUNS > 1 )); then log "RUN $run of $RUNS (same Postgres volume; run 2 exercises the re-seed)"; fi
   log "make up (build + start full stack)"
@@ -269,6 +305,7 @@ for run in $(seq 1 "$RUNS"); do
   wait_healthy
   assert_seed_ok
   assert_telnet_look
+  assert_gate_auth_reachable
   assert_cross_shard_reconnect
   if (( run < RUNS )); then
     # Stop the long-running services but KEEP the volume so run 2 re-seeds a populated DB.
