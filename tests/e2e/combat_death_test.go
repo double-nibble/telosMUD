@@ -108,6 +108,10 @@ func TestCombatDeathSequence(t *testing.T) {
 	//
 	// TELOS_E2E_KILL is an OPTIONAL override: set it to a faster one-shot kill verb for
 	// local speed. Unset (the committed/CI path), the test runs the real melee kill.
+	// CONTRACT: the override must be a REAL damage-dealing kill, not a despawn/instant-slay —
+	// runDeathPhase now asserts the personal-loot torch (#146), and loot eligibility is the
+	// victim's THREAT table, so a kill that deals the player no damage delivers no loot and
+	// would false-fail. A faster damage-kill verb is fine; a bare despawn is not.
 	killCmd := os.Getenv("TELOS_E2E_KILL")
 	if killCmd == "" {
 		killCmd = "kill goblin"
