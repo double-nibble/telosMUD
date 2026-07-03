@@ -478,6 +478,36 @@ func TestCharStatusJSONReflectsCombat(t *testing.T) {
 	}
 }
 
+// TestCharStatusTargetRoutesThroughVisibility pins #32: the Char.Status `target` name goes through the
+// canSee chokepoint — an invisible opponent renders as "Someone", never its real name; holylight sees it.
+func TestCharStatusTargetRoutesThroughVisibility(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	mob := makeMobTarget(z, caster.entity, "goblin")
+	z.startFight(caster.entity, mob)
+
+	target := func() string {
+		var st struct {
+			Target string `json:"target"`
+		}
+		if err := json.Unmarshal(z.charStatusJSON(caster.entity), &st); err != nil {
+			t.Fatalf("Char.Status not valid JSON: %v", err)
+		}
+		return st.Target
+	}
+
+	if got := target(); got != "goblin" {
+		t.Fatalf("baseline target = %q, want goblin", got)
+	}
+	setFlag(mob, flagInvisible, true)
+	if got := target(); got != "Someone" {
+		t.Fatalf("invisible opponent target = %q, want Someone (routed through nameFor)", got)
+	}
+	setFlag(caster.entity, flagHolylight, true)
+	if got := target(); got != "goblin" {
+		t.Fatalf("holylight target = %q, want the real name goblin", got)
+	}
+}
+
 func TestSendPromptEmitsHUDOnChangeOnly(t *testing.T) {
 	z, caster := abilityTestZone(t)
 	setResourceCurrent(caster.entity, "hp", 100)
