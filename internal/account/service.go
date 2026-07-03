@@ -376,13 +376,16 @@ func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountT
 	if !found {
 		return &accountv1.SetAccountTierResponse{Reason: "No such character."}, nil
 	}
-	// Ceiling: the actor may not change the tier of an account that outranks it.
-	targetTier, tfound, err := s.store.AccountTier(ctx, target)
+	// Ceiling: the actor may not change the tier of an account that outranks it. A target with no tier row
+	// (not found) reads as the rank-0 baseline via Rank(""), which no authorized actor outranks — so the
+	// found flag is deliberately ignored (defense-in-depth: the guard degrades to "allow the baseline",
+	// never to "skip the check").
+	targetTier, _, err := s.store.AccountTier(ctx, target)
 	if err != nil {
 		s.log.Error("SetAccountTier: target tier", "target", target, "err", err)
 		return nil, status.Error(codes.Internal, "tier lookup failed")
 	}
-	if tfound && ladder.Rank(targetTier) > ladder.Rank(actorTier) {
+	if ladder.Rank(targetTier) > ladder.Rank(actorTier) {
 		return &accountv1.SetAccountTierResponse{Reason: "You cannot change the tier of someone above your own standing."}, nil
 	}
 	old, err := s.store.SetAccountTier(ctx, req.GetActorAccountId(), target, req.GetNewTier())
