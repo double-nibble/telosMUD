@@ -47,6 +47,12 @@ func opSetFlag(c *effectCtx, op *effectOp) error {
 	if op.flag == "" {
 		return fmt.Errorf("set_flag: no flag")
 	}
+	if reservedFlag(op.flag) {
+		// #27/#28: the trust/elevation flags (holylight/builder/admin) are set ONLY by the tier-application
+		// path (applyTierFlags), never by content — else a builder pack could grant itself see-all/admin.
+		c.z.log.Warn("content set_flag refused a reserved trust flag", "flag", op.flag)
+		return nil
+	}
 	if !guardCrossPlayerWrite(c, c.target) {
 		return nil
 	}
@@ -62,6 +68,12 @@ func opClearFlag(c *effectCtx, op *effectOp) error {
 	}
 	if op.flag == "" {
 		return fmt.Errorf("clear_flag: no flag")
+	}
+	if reservedFlag(op.flag) {
+		// #27/#28: content may not clear a reserved trust flag either — only the tier path manages them (a
+		// content clear_flag "holylight" must not be able to strip an admin's see-all).
+		c.z.log.Warn("content clear_flag refused a reserved trust flag", "flag", op.flag)
+		return nil
 	}
 	if !guardCrossPlayerWrite(c, c.target) {
 		return nil
