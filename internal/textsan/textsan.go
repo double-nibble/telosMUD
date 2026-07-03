@@ -40,6 +40,11 @@ const MaxLineBytes = 4096
 // 0xDA) would otherwise EXPAND past MaxLineBytes — a fuzzer (FuzzTextsan) found this.
 // Re-capping after the strip restores the documented byte bound. Cost is nil on the
 // clean fast path (both caps and the strip are unallocated no-ops for in-bounds text).
+//
+// INVARIANT (#156): CleanLine deliberately PRESERVES a raw invalid byte (e.g. an 8-bit C1) on its fast path
+// for edge-parity. That is safe ONLY because every cross-player egress of input-derived text goes through the
+// gate's sanitizeOutput (the universal last-line drop), never a verbatim sink — a future path that writes an
+// input-derived string straight to a socket (WriteScreen or any non-Write path) would reopen the C1 hole.
 func CleanLine(s string) string {
 	return capBytes(stripControl(capBytes(s, MaxLineBytes)), MaxLineBytes)
 }
@@ -58,25 +63,20 @@ func CleanName(s string, maxRunes int) string {
 	return capRunes(stripNonGraphic(s), maxRunes)
 }
 
-// CleanMarkup makes SCRIPT-SUPPLIED outbound markup safe to deliver to a player client
-// (docs/PHASE7-PLAN.md slice 7.3 — builder Lua is a separate trust boundary). It strips
-// every control/escape rune (ESC U+001B and friends) — the terminal-injection vector a
-// non-telnet sink (GMCP, the planned ANSI renderer that stops stripping ESC) would otherwise
-// pass through to other players' clients — while PRESERVING all printable runes, so the
-// engine's markup survives intact: color tokens, the act() '$'-referents ($n/$N/$t/...), and
-// ordinary punctuation are ordinary printable characters, never control runes, so
-// stripControl leaves them untouched. It also caps the result at MaxLineBytes (defense in
-// depth against an over-long broadcast fanning out per room occupant). Engine-generated text
-// is already safe and need not be re-cleaned — apply this ONLY to script-supplied args. A
-// clean, in-bounds string is returned unchanged and unallocated.
+// CleanMarkup makes SCRIPT/content-SUPPLIED outbound markup safe to deliver to a player client (builder Lua
+// is a separate trust boundary). It strips every control rune AND every raw invalid byte via stripOutputControl
+// — the terminal-injection vector a non-telnet sink (GMCP, the ANSI renderer that stops stripping ESC) would
+// otherwise pass through to other players' clients — while PRESERVING all printable runes, so the engine's
+// markup survives intact: color tokens, the act() '$'-referents ($n/$N/$t/...), and ordinary punctuation are
+// printable characters, never control. It also caps the result at MaxLineBytes (defense in depth against an
+// over-long broadcast fanning out per room occupant). Apply this ONLY to script-supplied args; engine-generated
+// text is already safe. A clean, in-bounds string is returned unchanged and unallocated.
 //
-// The byte cap is applied twice for the same reason as CleanLine: the inner cap bounds the
-// strip's work, the outer cap bounds the output after stripControl's slow path expands invalid
-// UTF-8 to U+FFFD (so a hostile script arg of invalid bytes cannot exceed MaxLineBytes).
-// CleanMarkup sanitizes script/content-SUPPLIED text bound for the OUTPUT wire (say/tell/act/broadcast/send).
-// Unlike CleanLine — which mirrors the edge's INPUT contract and preserves/normalizes invalid bytes — the
-// output path must DROP raw invalid bytes: a lone 8-bit C1 introducer (0x9B/0x9D/0x9C) is a
-// terminal-control-injection vector that must never reach a client verbatim (#156).
+// Unlike CleanLine — the INPUT edge-parity contract, which preserves/normalizes invalid bytes — the OUTPUT
+// path DROPS raw invalid bytes: a lone 8-bit C1 introducer (0x9B CSI / 0x9D OSC / 0x9C ST) is invalid UTF-8
+// that a rune-level strip would pass verbatim onto a terminal, a control-injection vector (#156). Because
+// stripOutputControl only ever drops or copies whole runes (it never expands invalid bytes to U+FFFD the way
+// the input-side stripControl does), the outer cap is now merely belt-and-suspenders here.
 func CleanMarkup(s string) string {
 	return capBytes(stripOutputControl(capBytes(s, MaxLineBytes)), MaxLineBytes)
 }
