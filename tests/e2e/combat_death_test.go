@@ -108,6 +108,10 @@ func TestCombatDeathSequence(t *testing.T) {
 	//
 	// TELOS_E2E_KILL is an OPTIONAL override: set it to a faster one-shot kill verb for
 	// local speed. Unset (the committed/CI path), the test runs the real melee kill.
+	// CONTRACT: the override must be a REAL damage-dealing kill, not a despawn/instant-slay —
+	// runDeathPhase now asserts the personal-loot torch (#146), and loot eligibility is the
+	// victim's THREAT table, so a kill that deals the player no damage delivers no loot and
+	// would false-fail. A faster damage-kill verb is fine; a bare despawn is not.
 	killCmd := os.Getenv("TELOS_E2E_KILL")
 	if killCmd == "" {
 		killCmd = "kill goblin"
@@ -143,6 +147,15 @@ func runDeathPhase(t *testing.T, c *helpers.TelnetClient, killCmd string) {
 		t.Fatalf("goblin did not reach 'is DEAD!' within %s via %q (death-path regression or "+
 			"combat wedged); transcript:\n%s", killDeadline, killCmd, c.Transcript())
 	}
+
+	// Personal-loot resolver (#146, Phase 12.1): the hollow goblin's `goblin_loot` table gives a GUARANTEED
+	// common torch to the killer, delivered DIRECTLY to them (distinct from the corpse's carried rusty knife
+	// below). This is the first e2e proof the Phase-12 personal-loot resolver fires in the LIVE death path —
+	// it runs untested at e2e today despite the live demo wiring it. We assert ONLY the guaranteed torch; the
+	// table's 25% rare sword is nondeterministic and is deliberately not asserted (flake-free).
+	require.Truef(t, c.Expect("You receive a wooden torch.", 10*time.Second),
+		"the guaranteed personal-loot torch was not delivered on kill (Phase-12 loot-resolver regression); transcript:\n%s",
+		c.Transcript())
 
 	// look -> the corpse renders. This asserts BOTH that the death sequence built the
 	// corpse AND that lookRoom renders it (the same render gap that hid the live goblin).
