@@ -72,6 +72,26 @@ func TestVerifyRejectsTamperedPayload(t *testing.T) {
 	}
 }
 
+// TestVerifyRejectsForgedTierElevation (#27 security): the trust tier lives INSIDE the signed payload, so an
+// attacker who keeps every other claim but flips only the tier (player -> admin) and reattaches the original
+// signature is rejected. This is distinct from TestVerifyRejectsTamperedPayload (which forges the account) —
+// it pins the ELEVATION-forge vector specifically, the exact attack the signed-tier design (#27) exists to
+// stop. If a refactor ever moved the tier out of the signed bytes, this fails.
+func TestVerifyRejectsForgedTierElevation(t *testing.T) {
+	pub, priv := mustKeys(t)
+	now := time.Unix(1000, 0)
+	tok, _ := Sign(priv, Claims{Account: "acct-1", Session: "s", Tier: "player", Expires: now.Add(time.Minute).Unix()})
+
+	// Same account/session/expiry, tier flipped player->admin, original signature reused: the sig covers the
+	// tier byte, so verification must fail rather than trust the forged elevation.
+	fb, _ := json.Marshal(Claims{Account: "acct-1", Session: "s", Tier: "admin", Expires: now.Add(time.Minute).Unix()})
+	_, sigB64, _ := strings.Cut(tok, ".")
+	forged := b64.EncodeToString(fb) + "." + sigB64
+	if _, err := Verify(pub, forged, now); err != ErrSignature {
+		t.Fatalf("forged tier elevation: err = %v, want ErrSignature", err)
+	}
+}
+
 func TestVerifyRejectsMalformed(t *testing.T) {
 	pub, _ := mustKeys(t)
 	now := time.Unix(1000, 0)

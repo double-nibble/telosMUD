@@ -3,6 +3,7 @@ package account
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"testing"
 	"time"
 
@@ -79,5 +80,36 @@ func TestIssueSessionAssertionDisabledWithoutKey(t *testing.T) {
 	}
 	if resp.GetAssertion() != "" {
 		t.Fatalf("assertion = %q, want empty (signing disabled)", resp.GetAssertion())
+	}
+}
+
+// TestIssueSessionAssertionTierReadErrorFailsSafeToPlayer (#27 fail-safe): when the tier read ERRORS
+// (distinct from a missing row, which TestIssueSessionAssertion already covers), the assertion must still
+// issue AND carry tier="player". An error must never surface the stored elevated tier, and must never fail
+// the whole assertion — the invariant stated at service.go IssueSessionAssertion ("an error must never
+// elevate a tier"). Without this, a transient tier-store blip on an admin's login would either 500 the
+// login or, worse under a buggy refactor, sign whatever partial value the read returned.
+func TestIssueSessionAssertionTierReadErrorFailsSafeToPlayer(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := newFakeStore()
+	fs.tiers["acct-admin"] = "admin"                  // an elevated tier really exists in the store...
+	fs.tierErr = errors.New("tier store unavailable") // ...but the read fails
+	svc := newTestService(fs).WithSigningKey(priv)
+
+	resp, err := svc.IssueSessionAssertion(context.Background(), &accountv1.IssueSessionAssertionRequest{
+		AccountId: "acct-admin", CharacterId: "Gandalf", SessionId: "s",
+	})
+	if err != nil {
+		t.Fatalf("a tier-read error must not fail the assertion: %v", err)
+	}
+	claims, err := assertion.Verify(pub, resp.GetAssertion(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.Tier != "player" {
+		t.Fatalf("tier = %q, want player (a tier-read error must fail safe, never elevate to the stored admin)", claims.Tier)
 	}
 }

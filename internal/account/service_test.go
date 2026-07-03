@@ -21,6 +21,7 @@ type fakeStore struct {
 	taken       map[string]bool
 	tiers       map[string]string // accountID -> tier (#27); absent => not found
 	charAccount map[string]string // character name -> owning accountID (#27)
+	tierErr     error             // when set, AccountTier returns this error (fail-safe tests, #27)
 }
 
 func newFakeStore() *fakeStore {
@@ -33,6 +34,9 @@ func newFakeStore() *fakeStore {
 }
 
 func (f *fakeStore) AccountTier(_ context.Context, accountID string) (string, bool, error) {
+	if f.tierErr != nil {
+		return "", false, f.tierErr
+	}
 	t, ok := f.tiers[accountID]
 	return t, ok, nil
 }
