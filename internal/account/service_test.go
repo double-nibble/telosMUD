@@ -18,13 +18,20 @@ import (
 type fakeStore struct {
 	chars map[string][]store.CharacterSummary
 	taken map[string]bool
+	tiers map[string]string // accountID -> tier (#27); absent => not found
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		chars: map[string][]store.CharacterSummary{},
 		taken: map[string]bool{},
+		tiers: map[string]string{},
 	}
+}
+
+func (f *fakeStore) AccountTier(_ context.Context, accountID string) (string, bool, error) {
+	t, ok := f.tiers[accountID]
+	return t, ok, nil
 }
 
 func (f *fakeStore) AccountCharacters(_ context.Context, accountID string) ([]store.CharacterSummary, error) {

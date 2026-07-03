@@ -248,6 +248,12 @@ type attachMsg struct {
 	// already hold a live session). loadedOK distinguishes "no snapshot found" from "no store".
 	loaded   CharSnapshot
 	loadedOK bool // a durable snapshot was found for this name (rehydrate); else create-or-ephemeral
+
+	// tier is the account trust tier (#27) from the VERIFIED session assertion (server.go), carried to the
+	// session so a fresh login applies the matching builder/admin flags on spawn (Slice 3). Empty on the
+	// dev/unverified path and on a handoff re-dial (the applied flags ride the entity snapshot), meaning
+	// "player unless a signature-checked claim elevated it".
+	tier string
 }
 
 // inputMsg carries one line of player input. seq is the gate's session-scoped input
@@ -1094,9 +1100,9 @@ func (z *Zone) attach(m attachMsg) {
 		if epoch < 1 {
 			epoch = 1
 		}
-		s = &session{character: character, out: out, epoch: epoch, currentZone: curZone}
+		s = &session{character: character, out: out, epoch: epoch, currentZone: curZone, tier: m.tier}
 		z.newPlayerEntity(s, character)
-		z.log.Debug("fresh login epoch seeded", "player", character, "epoch", epoch, "resume", resumeEpoch)
+		z.log.Debug("fresh login epoch seeded", "player", character, "epoch", epoch, "resume", resumeEpoch, "tier", m.tier)
 		if curZone != nil {
 			curZone.Store(z)
 		}

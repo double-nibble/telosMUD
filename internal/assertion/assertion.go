@@ -19,10 +19,11 @@ import (
 
 // Claims is the assertion payload: who the connection authenticated as, and until when.
 type Claims struct {
-	Account   string `json:"acc"`           // account id
-	Character string `json:"chr,omitempty"` // selected character (name/id)
-	Session   string `json:"sid"`           // the gate session id (stable across a redirect)
-	Expires   int64  `json:"exp"`           // expiry, unix seconds
+	Account   string `json:"acc"`            // account id
+	Character string `json:"chr,omitempty"`  // selected character (name/id)
+	Session   string `json:"sid"`            // the gate session id (stable across a redirect)
+	Expires   int64  `json:"exp"`            // expiry, unix seconds
+	Tier      string `json:"tier,omitempty"` // account trust tier (#27): player/builder/admin — signed, so the world trusts it offline. Empty = player (unverified/legacy)
 }
 
 // Common errors callers can branch on.
