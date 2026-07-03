@@ -3,6 +3,7 @@ package gate
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -22,12 +23,13 @@ type tierFakeAccount struct {
 	called                       int
 	ok                           bool
 	reason, oldTier              string
+	err                          error // when set, SetAccountTier returns this (RPC/transport failure)
 }
 
 func (f *tierFakeAccount) SetAccountTier(_ context.Context, actor, target, tier string) (bool, string, string, error) {
 	f.called++
 	f.gotActor, f.gotTarget, f.gotTier = actor, target, tier
-	return f.ok, f.reason, f.oldTier, nil
+	return f.ok, f.reason, f.oldTier, f.err
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -78,5 +80,25 @@ func TestHandleTierCommand(t *testing.T) {
 	_, out = run(fa, "promote Bob")
 	if fa.called != 0 || !strings.Contains(out, "Usage:") {
 		t.Fatalf("bad arity should print usage without calling the service; out=%q calls=%d", out, fa.called)
+	}
+
+	// A transport/RPC error from the account service → the gate makes NO trust decision of its own:
+	// it surfaces a GENERIC "unavailable" (never the raw error), and still CONSUMES the line
+	// (handled=true) rather than leaking a failed `promote` to the world as a normal command. The
+	// service is the sole authority; the edge only relays it, so an error can't fail-open into
+	// world dispatch.
+	fa = &tierFakeAccount{err: errors.New("connection refused")}
+	h, out = run(fa, "promote Bob admin")
+	if !h {
+		t.Fatal("an RPC error must still be consumed (handled), never forwarded to the world as a command")
+	}
+	if fa.called != 1 {
+		t.Fatalf("the service should have been called exactly once, got %d", fa.called)
+	}
+	if !strings.Contains(out, "unavailable") {
+		t.Fatalf("an RPC error should surface a generic 'unavailable' message (not the raw error): %q", out)
+	}
+	if strings.Contains(out, "connection refused") {
+		t.Fatalf("the raw transport error must NOT be leaked to the player: %q", out)
 	}
 }
