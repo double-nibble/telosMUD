@@ -47,11 +47,11 @@ service Account {
 message SetAccountTierRequest {
   string actor_account_id = 1; // the acting account (the logged-in admin); authz is checked against its stored tier
   string target_character = 2; // the character NAME to (de)promote — resolved to its owning account
-  string new_tier = 3;         // "player" | "builder" | "admin"
+  string new_tier = 3; // "player" | "builder" | "admin"
 }
 message SetAccountTierResponse {
   bool ok = 1;
-  string reason = 2;   // user-facing message on refusal (not admin, unknown target, bad tier)
+  string reason = 2; // user-facing message on refusal (not admin, unknown target, bad tier)
   string old_tier = 3; // the target's tier before the change (for the confirmation line)
 }
 
