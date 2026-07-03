@@ -393,11 +393,17 @@ func (c *Conn) Write(s string) error {
 // that keeps Write's downstream 0xFF -> IAC IAC escaping intact. It runs before
 // that escaping step.
 func sanitizeOutput(s string) string {
-	clean := true
-	for _, r := range s {
-		if r != '\r' && r != '\n' && unicode.IsControl(r) {
-			clean = false
-			break
+	// The fast path REQUIRES valid UTF-8: a lone raw 8-bit C1 introducer (0x9B CSI / 0x9D OSC / 0x9C ST) is
+	// invalid utf-8 that decodes to a NON-control RuneError, so an IsControl-only scan would wrongly judge it
+	// clean and return it verbatim onto the wire — a sanitizer-bypassing terminal-control-injection vector
+	// (#156). Fall through to the byte-aware rewrite when the string is not valid UTF-8.
+	clean := utf8.ValidString(s)
+	if clean {
+		for _, r := range s {
+			if r != '\r' && r != '\n' && unicode.IsControl(r) {
+				clean = false
+				break
+			}
 		}
 	}
 	if clean {
@@ -408,9 +414,14 @@ func sanitizeOutput(s string) string {
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if r == utf8.RuneError && size == 1 {
-			// Not a valid rune (e.g. a lone 0xFF): copy the raw byte through so
-			// IAC escaping downstream still sees it.
-			b.WriteByte(s[i])
+			// A lone invalid byte. Preserve 0xFF (IAC) so downstream telnet escaping still doubles it, but
+			// DROP raw 8-bit C1 introducers (0x80-0x9F, e.g. CSI 0x9B / OSC 0x9D / ST 0x9C) and any other
+			// invalid byte — they are sanitizer-bypassing terminal control and must never reach the client
+			// verbatim (#156). This is the universal last-line defense; the world's textsan.CleanMarkup
+			// closes the same hole at the content-output boundary.
+			if s[i] == 0xFF {
+				b.WriteByte(s[i])
+			}
 			i++
 			continue
 		}

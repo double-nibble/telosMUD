@@ -29,35 +29,49 @@ func runScreen(t *testing.T, script string) string {
 // (#31): the trusted screen.* path (screenShow -> screenFrame) is the ONLY producer of a raw Screen frame,
 // the one output the gate writes verbatim without sanitizing. The sibling tests prove the screen.* API
 // itself is safe-by-construction; this guards the complementary seam — that UNTRUSTED content routing text
-// through the NORMAL output op (self:send) cannot smuggle raw ANSI. Even carrying a full-screen clear +
-// reset, self:send must go through textsan.CleanMarkup and arrive as an ordinary Output frame with the ESC
-// stripped — never a Screen frame. A regression that let content emit raw terminal control through the
-// normal path (cursor moves, OSC clipboard writes, screen wipes) would be caught here.
+// through the NORMAL output op (self:send) cannot smuggle raw terminal control. Whether the payload carries
+// a 7-bit ESC CSI or a RAW 8-BIT C1 introducer (0x9B CSI / 0x9D OSC — the #156 vector that a rune-level
+// CleanMarkup used to pass verbatim), self:send must go through textsan.CleanMarkup and arrive as an
+// ordinary Output frame with the control stripped — never a Screen frame.
 func TestScreenProvenanceNormalSendCannotEmitRawANSI(t *testing.T) {
-	z := newZone("screen")
-	player := makeRoomPlayer(z, "Viewer")
-	room := player.entity.location
-	z.rooms[room.proto] = room
-
-	// Content sends text carrying a raw full-screen clear and a raw SGR reset through the normal op.
-	if err := z.lua.runChunkWithSelf(t.Name(), `self:send("\x1b[2J danger \x1b[0m")`, player.entity); err != nil {
-		t.Fatalf("script errored: %v", err)
+	cases := map[string]string{
+		// string.char(155)=0x9B (8-bit CSI), 157=0x9D (8-bit OSC) — raw invalid-utf8 C1 introducers.
+		"7-bit ESC CSI":  `self:send("\x1b[2J danger \x1b[0m")`,
+		"8-bit C1 CSI":   `self:send(string.char(155).."2J danger "..string.char(155).."m")`,
+		"8-bit C1 OSC52": `self:send(string.char(157).."52;c;ZXZpbA==".."\x07")`,
 	}
+	for name, script := range cases {
+		t.Run(name, func(t *testing.T) {
+			z := newZone("screen")
+			player := makeRoomPlayer(z, "Viewer")
+			room := player.entity.location
+			z.rooms[room.proto] = room
 
-	select {
-	case f := <-player.out:
-		if sc := f.GetScreen(); sc != nil {
-			t.Fatalf("content self:send produced a raw Screen frame — provenance boundary breached: %q", sc.GetData())
-		}
-		out := f.GetOutput()
-		if out == nil {
-			t.Fatalf("content self:send should produce an ordinary Output frame, got payload %T", f.GetPayload())
-		}
-		if strings.ContainsRune(out.GetMarkup(), 0x1b) {
-			t.Fatalf("content output must be ESC-sanitized (only the trusted screen path emits raw ANSI); leaked: %q", out.GetMarkup())
-		}
-	case <-time.After(time.Second):
-		t.Fatal("no frame emitted from self:send")
+			if err := z.lua.runChunkWithSelf(t.Name(), script, player.entity); err != nil {
+				t.Fatalf("script errored: %v", err)
+			}
+
+			select {
+			case f := <-player.out:
+				if sc := f.GetScreen(); sc != nil {
+					t.Fatalf("content self:send produced a raw Screen frame — provenance boundary breached: %q", sc.GetData())
+				}
+				out := f.GetOutput()
+				if out == nil {
+					t.Fatalf("content self:send should produce an ordinary Output frame, got payload %T", f.GetPayload())
+				}
+				// BYTE-level checks: a raw 8-bit C1 (0x9B/0x9D/0x9C) is INVALID utf-8, so strings.ContainsRune
+				// would look for the 2-byte U+00xx encoding and MISS the raw byte. Assert on the bytes.
+				markup := out.GetMarkup()
+				for _, bad := range []byte{0x1b, 0x9b, 0x9d, 0x9c, 0x07} { // ESC, CSI, OSC, ST, BEL
+					if strings.IndexByte(markup, bad) >= 0 {
+						t.Fatalf("content output must be sanitized (only the trusted screen path emits raw control); leaked %#x: %q", bad, markup)
+					}
+				}
+			case <-time.After(time.Second):
+				t.Fatal("no frame emitted from self:send")
+			}
+		})
 	}
 }
 

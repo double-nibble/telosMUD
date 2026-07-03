@@ -73,8 +73,12 @@ func CleanName(s string, maxRunes int) string {
 // The byte cap is applied twice for the same reason as CleanLine: the inner cap bounds the
 // strip's work, the outer cap bounds the output after stripControl's slow path expands invalid
 // UTF-8 to U+FFFD (so a hostile script arg of invalid bytes cannot exceed MaxLineBytes).
+// CleanMarkup sanitizes script/content-SUPPLIED text bound for the OUTPUT wire (say/tell/act/broadcast/send).
+// Unlike CleanLine — which mirrors the edge's INPUT contract and preserves/normalizes invalid bytes — the
+// output path must DROP raw invalid bytes: a lone 8-bit C1 introducer (0x9B/0x9D/0x9C) is a
+// terminal-control-injection vector that must never reach a client verbatim (#156).
 func CleanMarkup(s string) string {
-	return capBytes(stripControl(capBytes(s, MaxLineBytes)), MaxLineBytes)
+	return capBytes(stripOutputControl(capBytes(s, MaxLineBytes)), MaxLineBytes)
 }
 
 // capBytes truncates s to at most max bytes, backing off to the nearest rune
@@ -115,7 +119,10 @@ func capRunes(s string, limit int) string {
 // on its own: a lone invalid byte is preserved verbatim on the fast path. If some
 // other control rune does trigger the rewrite, the range-decode normalizes any
 // invalid byte in s to the U+FFFD replacement character. Either way an invalid byte
-// is never dropped and never panics. (This matches the edge's telnet.sanitizeLine.)
+// is never dropped and never panics. This is the INPUT contract (mirrors the edge's
+// telnet.sanitizeLine); OUTPUT-bound markup uses the byte-aware stripOutputControl,
+// which DROPS raw invalid bytes because a raw 8-bit C1 introducer is a wire-injection
+// vector there (#156).
 func stripControl(s string) string {
 	if !strings.ContainsFunc(s, unicode.IsControl) {
 		return s
@@ -127,6 +134,34 @@ func stripControl(s string) string {
 			continue
 		}
 		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// stripOutputControl is the OUTPUT-side counterpart of stripControl: it drops every control rune AND every
+// raw invalid byte. It is BYTE-aware, not merely rune-aware: a lone invalid UTF-8 byte — in particular a raw
+// 8-bit C1 introducer (0x9B CSI / 0x9D OSC / 0x9C ST) — decodes to a NON-control RuneError, so a rune-level
+// unicode.IsControl check (as stripControl uses) would let it pass verbatim onto the OUTPUT wire, a
+// sanitizer-bypassing terminal-control-injection vector (#156: 8-bit CSI erase/cursor, DSR/DA cursor-report
+// input-injection, OSC-52 clipboard exfil). The fast path therefore also requires utf8.ValidString, and the
+// rewrite DROPS invalid bytes outright (mirroring world/luascreen.sanitizeScreenText, the byte-aware model
+// on the trusted screen path). The clean common case (valid UTF-8, no control rune) is returned unallocated.
+func stripOutputControl(s string) string {
+	if utf8.ValidString(s) && !strings.ContainsFunc(s, unicode.IsControl) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++ // a raw invalid byte (8-bit C1 introducer / 0xFF) — drop it; never onto the wire
+			continue
+		}
+		if !unicode.IsControl(r) {
+			b.WriteString(s[i : i+size])
+		}
+		i += size
 	}
 	return b.String()
 }
