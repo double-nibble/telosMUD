@@ -188,6 +188,56 @@ func (p *Pool) AccountTier(ctx context.Context, accountID string) (string, bool,
 	return tier, true, nil
 }
 
+// AccountByCharacterName resolves a character NAME to its owning account id (#27, the promote target). The
+// name is CITEXT (case-insensitive unique). found=false for an unknown character.
+func (p *Pool) AccountByCharacterName(ctx context.Context, name string) (string, bool, error) {
+	var acct *string
+	err := p.pool.QueryRow(ctx, `SELECT account_id FROM characters WHERE name = $1`, name).Scan(&acct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: account by character %q: %w", name, err)
+	}
+	if acct == nil {
+		return "", false, nil // a pre-Phase-14 character with a NULL account
+	}
+	return *acct, true, nil
+}
+
+// SetAccountTier changes targetAccountID's tier to newTier and records the change in account_role_audit
+// (actor = actorAccountID), atomically. Returns the target's PREVIOUS tier (for the confirmation line). It
+// does NOT authorize — the caller (the account Service) checks the actor is an admin first; this is the
+// write. The tier CHECK constraint (migration 00019) rejects an invalid newTier at the DB.
+func (p *Pool) SetAccountTier(ctx context.Context, actorAccountID, targetAccountID, newTier string) (string, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var oldTier string
+	if err := tx.QueryRow(ctx, `SELECT tier FROM accounts WHERE id = $1 FOR UPDATE`, targetAccountID).Scan(&oldTier); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("store: set tier: unknown account %s", targetAccountID)
+		}
+		return "", fmt.Errorf("store: set tier read: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE accounts SET tier = $1 WHERE id = $2`, newTier, targetAccountID); err != nil {
+		return "", fmt.Errorf("store: set tier update: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO account_role_audit (id, actor_account, target_account, old_tier, new_tier)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		uuid.New(), actorAccountID, targetAccountID, oldTier, newTier); err != nil {
+		return "", fmt.Errorf("store: set tier audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("store: commit: %w", err)
+	}
+	return oldTier, nil
+}
+
 // AccountDisplayName returns an account's display name (may be empty). found=false for an unknown account.
 func (p *Pool) AccountDisplayName(ctx context.Context, accountID string) (string, bool, error) {
 	var name *string

@@ -35,6 +35,24 @@ service Account {
   // CreateChargenCharacter validates a prompt-driven chargen submission (the picks + point-buy allocations)
   // and creates the character. reason is a non-empty user-facing message on a validation failure.
   rpc CreateChargenCharacter(CreateChargenCharacterRequest) returns (CreateChargenCharacterResponse);
+
+  // SetAccountTier changes a target account's trust tier (#27, the promote/demote flow). AUTHORIZATION IS
+  // ENFORCED HERE: the actor's tier is looked up from the authoritative store and the change is refused
+  // unless the actor is an admin — the edge never decides this. The change takes effect on the target's
+  // NEXT login (the assertion re-reads + re-signs the tier). Audited (account_role_audit).
+  rpc SetAccountTier(SetAccountTierRequest) returns (SetAccountTierResponse);
+}
+
+// --- #27 trust-tier management ---
+message SetAccountTierRequest {
+  string actor_account_id = 1; // the acting account (the logged-in admin); authz is checked against its stored tier
+  string target_character = 2; // the character NAME to (de)promote — resolved to its owning account
+  string new_tier = 3; // "player" | "builder" | "admin"
+}
+message SetAccountTierResponse {
+  bool ok = 1;
+  string reason = 2; // user-facing message on refusal (not admin, unknown target, bad tier)
+  string old_tier = 3; // the target's tier before the change (for the confirmation line)
 }
 
 // --- Phase 15.4 prompt-driven chargen messages ---

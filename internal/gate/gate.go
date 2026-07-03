@@ -433,6 +433,11 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 			if handleColorCommand(tc, line) {
 				continue
 			}
+			// promote/demote (#27): change an account's trust tier via the account service (authz enforced
+			// there). Edge-local like color, since the account client lives at the gate.
+			if handleTierCommand(ctx, tc, s.account, account, line, log) {
+				continue
+			}
 			lines <- line
 		}
 	}()

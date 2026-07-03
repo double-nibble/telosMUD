@@ -105,6 +105,17 @@ that gates builder/admin powers. `telos-account` is the authority; a later slice
 the session assertion so the world trusts it offline. A promote/demote flow (admin-gated) changes a
 tier; the change takes effect on the target's next login.
 
+**Promote / demote.** An admin changes another account's tier with the edge verbs `promote <character>
+<player|builder|admin>` and `demote <character>` (→ player). Authorization is enforced at the account
+service (the actor's tier is read from the store; a non-admin is refused), never at the edge. The change
+takes effect on the target's **next login** (the assertion re-signs the tier). Every change is audited.
+
+> **Last-admin lockout recovery.** There is no self/last-admin demote guard, so an admin *can* demote the
+> last admin. Config-pin (`TELOS_BOOTSTRAP_ADMIN`) does **not** recover this — it applies only at account
+> *creation*, so re-setting it is a no-op for an existing account. Recovery is a direct DB write
+> (`UPDATE accounts SET tier='admin' WHERE id=…`) or the planned break-glass CLI. Treat the pinned owner's
+> account with care.
+
 **Bootstrap admin (config-pin).** Set `TELOS_BOOTSTRAP_ADMIN` to your OAuth **login**; the FIRST account
 created for a matching identity is granted `admin` (audited with a NULL actor). The match is **login-only,
 by design** — a login is unique and provider-verified, whereas the OAuth email is a public, user-settable,

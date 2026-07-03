@@ -38,6 +38,10 @@ type AccountClient interface {
 	// non-empty user-facing message on a validation failure; atCapacity=true means the account is full (the
 	// gate returns to character SELECT rather than re-running chargen).
 	CreateChargenCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (characterID, reason string, atCapacity bool, err error)
+	// SetAccountTier is the promote/demote call (#27): change targetCharacter's account tier. Authz is
+	// enforced at the account service (the actor must be an admin per the store), so the gate just passes the
+	// actor's account id. ok=false with a user-facing reason on refusal; oldTier is the prior tier on success.
+	SetAccountTier(ctx context.Context, actorAccountID, targetCharacter, newTier string) (ok bool, reason, oldTier string, err error)
 	// Close releases any underlying connection (a no-op for the stub).
 	Close() error
 }
@@ -72,6 +76,12 @@ func (stubAccountClient) ListCharacters(_ context.Context, accountID string) ([]
 // IssueSessionAssertion on the stub returns no token (the stub is the no-auth fallback).
 func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string) (string, error) {
 	return "", nil
+}
+
+// SetAccountTier on the stub refuses: without an account service there is no tier authority (the dev/no-auth
+// path has no accounts).
+func (stubAccountClient) SetAccountTier(_ context.Context, _, _, _ string) (bool, string, string, error) {
+	return false, "Trust tiers require an account service.", "", nil
 }
 
 // StartDeviceAuth/PollDeviceAuth are never reached on the stub (the gate only runs device login when a real
@@ -195,6 +205,17 @@ func (g *grpcAccountClient) CreateChargenCharacter(ctx context.Context, accountI
 		return "", "", false, err
 	}
 	return resp.GetCharacterId(), resp.GetReason(), resp.GetAtCapacity(), nil
+}
+
+// SetAccountTier calls the account service's promote/demote RPC (#27). Authz is enforced service-side.
+func (g *grpcAccountClient) SetAccountTier(ctx context.Context, actorAccountID, targetCharacter, newTier string) (bool, string, string, error) {
+	resp, err := g.cli.SetAccountTier(ctx, &accountv1.SetAccountTierRequest{
+		ActorAccountId: actorAccountID, TargetCharacter: targetCharacter, NewTier: newTier,
+	})
+	if err != nil {
+		return false, "", "", err
+	}
+	return resp.GetOk(), resp.GetReason(), resp.GetOldTier(), nil
 }
 
 // Close releases the gRPC connection.
