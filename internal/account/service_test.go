@@ -2,6 +2,7 @@ package account
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -237,5 +238,111 @@ func TestDeviceAuthService(t *testing.T) {
 	bare := New(newFakeStore(), nil, "midgaard", "midgaard:room:temple")
 	if _, err := bare.StartDeviceAuth(ctx, &accountv1.StartDeviceAuthRequest{}); status.Code(err) != codes.Unavailable {
 		t.Fatalf("StartDeviceAuth without a store should be Unavailable, got %v", err)
+	}
+}
+
+// setTierReq is a small helper for the SetAccountTier authz tests.
+func setTierReq(actor, target, tier string) *accountv1.SetAccountTierRequest {
+	return &accountv1.SetAccountTierRequest{ActorAccountId: actor, TargetCharacter: target, NewTier: tier}
+}
+
+// TestSetAccountTierDefaultLadder pins that with no content ladder wired, promote authz is byte-for-byte
+// round-8: an admin actor may set any of player/builder/admin on anyone; a non-admin (builder/player) is
+// refused (its tier does not grant the manage-tiers capability).
+func TestSetAccountTierDefaultLadder(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeStore()
+	fs.tiers["a-admin"] = "admin"
+	fs.tiers["a-bob"] = "player"
+	fs.charAccount["Bob"] = "a-bob"
+	svc := newTestService(fs) // no WithTrustLadder => default ladder
+
+	// admin promotes Bob player -> builder.
+	resp, err := svc.SetAccountTier(ctx, setTierReq("a-admin", "Bob", "builder"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.GetOk() || resp.GetOldTier() != "player" || fs.tiers["a-bob"] != "builder" {
+		t.Fatalf("admin promote should succeed player->builder, got ok=%v old=%q now=%q", resp.GetOk(), resp.GetOldTier(), fs.tiers["a-bob"])
+	}
+
+	// A builder actor (no manage-tiers capability in the default ladder) is refused.
+	fs.tiers["a-builder"] = "builder"
+	resp, err = svc.SetAccountTier(ctx, setTierReq("a-builder", "Bob", "player"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetOk() || resp.GetReason() == "" {
+		t.Fatalf("a builder must not be authorized to change tiers, got %+v", resp)
+	}
+}
+
+// TestSetAccountTierUnknownTier: an authorized actor requesting a tier not in the ladder is refused with the
+// known-tier list (authz runs first, so only an authorized actor ever sees the vocabulary).
+func TestSetAccountTierUnknownTier(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeStore()
+	fs.tiers["a-admin"] = "admin"
+	fs.tiers["a-bob"] = "player"
+	fs.charAccount["Bob"] = "a-bob"
+	svc := newTestService(fs)
+
+	resp, err := svc.SetAccountTier(ctx, setTierReq("a-admin", "Bob", "wizard"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetOk() || !strings.Contains(resp.GetReason(), "known:") {
+		t.Fatalf("unknown tier should be refused with the known-tier list, got %+v", resp)
+	}
+	if fs.tiers["a-bob"] != "player" {
+		t.Error("a refused promote must not write the tier")
+	}
+}
+
+// TestSetAccountTierRankCeiling: with a content ladder that has an admin-capable mid tier (architect grants
+// the manage-tiers flag at rank 30, below admin=40), an architect may promote up to architect but NOT to
+// admin (a tier above its own standing), and may not change an account that outranks it.
+func TestSetAccountTierRankCeiling(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeStore()
+	fs.tiers["a-arch"] = "architect"
+	fs.tiers["a-bob"] = "player"
+	fs.tiers["a-boss"] = "admin"
+	fs.charAccount["Bob"] = "a-bob"
+	fs.charAccount["Boss"] = "a-boss"
+	svc := newTestService(fs).WithTrustLadder([]content.TrustTierDTO{
+		{Name: "player", Rank: 0},
+		{Name: "architect", Rank: 30, Flags: []string{content.FlagAdmin}},
+		{Name: "admin", Rank: 40, Flags: []string{content.FlagAdmin}},
+	})
+
+	// architect -> architect on Bob: allowed (rank 30 <= actor 30).
+	if resp, err := svc.SetAccountTier(ctx, setTierReq("a-arch", "Bob", "architect")); err != nil || !resp.GetOk() {
+		t.Fatalf("architect should be able to grant architect (<= own rank), got resp=%+v err=%v", resp, err)
+	}
+
+	// architect -> admin on Bob: refused (rank 40 > actor 30).
+	if resp, _ := svc.SetAccountTier(ctx, setTierReq("a-arch", "Bob", "admin")); resp.GetOk() {
+		t.Fatal("architect must not grant admin (a tier above its own standing)")
+	}
+
+	// architect changing Boss (an admin, rank 40 > 30): refused (target outranks the actor).
+	if resp, _ := svc.SetAccountTier(ctx, setTierReq("a-arch", "Boss", "player")); resp.GetOk() {
+		t.Fatal("architect must not change the tier of an account that outranks it")
+	}
+}
+
+// TestSetAccountTierUnverifiedActorRefused: an actor whose account has no tier (empty / not found — the
+// unverified/dev baseline) grants no capability and is refused. Guards the "positive capability required,
+// baseline rank-0 cannot manage" posture.
+func TestSetAccountTierUnverifiedActorRefused(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeStore()
+	fs.tiers["a-bob"] = "player"
+	fs.charAccount["Bob"] = "a-bob"
+	svc := newTestService(fs)
+
+	if resp, _ := svc.SetAccountTier(ctx, setTierReq("a-nobody", "Bob", "builder")); resp.GetOk() {
+		t.Fatal("an actor with no tier (baseline) must not be authorized to change tiers")
 	}
 }
