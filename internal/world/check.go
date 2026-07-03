@@ -269,12 +269,17 @@ func resolveVisibility(spec *checkSpec) checkVisibility {
 // ops narrate). show => the full math; summary => just the band label. Phase 6 emits via the actor's
 // own stream (send); the GMCP structured emit is a reserved Phase-9 hook.
 func emitCheck(c *effectCtx, spec *checkSpec, res checkResult) {
-	vis := resolveVisibility(spec)
-	if vis == visHide {
-		return
-	}
 	s, ok := sessionOf(c.actor)
 	if !ok {
+		return // only a player-driven check emits to a stream
+	}
+	vis := resolveVisibility(spec)
+	// Staff `rolls on` (#30) upgrades a check hidden ONLY by the engine default (visInherit) to full math
+	// for the roller; an explicit content visHide is respected (content intent), so only the default flips.
+	if vis == visHide && spec.visibility == visInherit && s.showRolls {
+		vis = visShow
+	}
+	if vis == visHide {
 		return
 	}
 	label := spec.label
