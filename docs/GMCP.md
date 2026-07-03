@@ -82,6 +82,24 @@ Item entry: `{"id":"i4821","name":"a steel longsword","attrib":"wWc","count":3}`
 | Message            | Dir | Purpose                                                       |
 |--------------------|-----|---------------------------------------------------------------|
 | `Room.Info`        | S->C | the structured room data — see below; re-emitted only on a room change |
+| `Room.Players`     | S->C | the room's VISIBLE creature occupants (players + mobs); re-emitted when the occupant set changes |
+
+`Room.Players` payload — a bare array, one entry per occupant the viewer can perceive:
+```json
+[ {"id":"i4821","name":"Kurt","type":"player"}, {"id":"i5000","name":"a goblin","type":"mob"} ]
+```
+Routed through the `canSee` visibility chokepoint (#28): an occupant the viewer can't see (invisible,
+no detect) is omitted; a `holylight` viewer sees all. Excludes the viewer itself and ground items
+(those ride `Char.Items`). Change-detected per viewer, so it updates on the viewer's next prompt when
+someone enters/leaves. (Live push on another player's arrival — before the viewer's next action — is a
+follow-up, like the Char.Items room deltas.)
+
+**Divergence from IRE:** the IRE-standard `Room.Players` is players-only with `{name, fullname}` entries.
+This frame deliberately also carries **mobs** (`type:"mob"`) and uses `{id, name, type}` — a branded
+extension so a rich client can render the full room roster from one message. A stock Mudlet client that
+feeds `Room.Players` straight into its built-in player list will show mobs there too and read `name`
+(not `fullname`); a custom UI should branch on `type`. Point a stock client at `Room` only if that's
+acceptable, or have the client filter `type == "player"`.
 
 `Room.Info` payload (drives the minimap):
 ```json

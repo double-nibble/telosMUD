@@ -49,10 +49,11 @@ type session struct {
 	// session (Phase 9.2). sendPrompt re-emits a HUD frame only when its payload CHANGED, so an
 	// unchanging vitals line isn't re-sent on every prompt. Zone-goroutine-owned (set only in
 	// sendPrompt), nil until the first prompt (so the first prompt always emits the initial HUD).
-	lastVitals []byte
-	lastStatus []byte
-	lastStats  []byte
-	lastRoom   []byte // last GMCP Room.Info payload (Phase 9.3); re-emitted only on a room change
+	lastVitals      []byte
+	lastStatus      []byte
+	lastStats       []byte
+	lastRoom        []byte // last GMCP Room.Info payload (Phase 9.3); re-emitted only on a room change
+	lastRoomPlayers []byte // last GMCP Room.Players payload (#33); re-emitted only when the visible occupant set changes
 	// lastInvItems / lastRoomItems are the last Char.Items snapshots (Phase 9.4 + #48) for the inventory
 	// and room-ground panels, keyed by stable gmcpItem id. sendPrompt diffs the live set against these and
 	// emits only Add/Remove/Update deltas; a nil map means "not sent yet" (login / reconnect / handoff
