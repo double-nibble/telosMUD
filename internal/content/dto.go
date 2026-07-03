@@ -94,6 +94,14 @@ type Pack struct {
 	// same last-write-wins override-by-ref rule.
 	Chargens []ChargenDTO `json:"chargens" yaml:"chargens"`
 
+	// TrustTiers is the pack-GLOBAL content-defined trust ladder (#27/#29, Round 9 Slice 0): the ordered
+	// set of account trust tiers (player/moderator/builder/architect/admin/…) with their ordinal ranks and
+	// granted capability flags. BOTH telos-account (tier validation + promote authz) and the world (rank +
+	// flag derivation, command gating) load it, so tiers and the permission model are a single authority.
+	// Empty => the engine's DEFAULT ladder (player/builder/admin) — the round-8 behavior. Accumulated
+	// last-write-wins by tier name.
+	TrustTiers []TrustTierDTO `json:"trust_tiers" yaml:"trust_tiers"`
+
 	// PvpLua is the OPTIONAL pack PvP-policy hook (Phase 7.4f): a Lua function body
 	// `function(actor, target) … return true/false end` consulted by the harm gate. Empty => the
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
@@ -399,6 +407,19 @@ type ChannelAccessDTO struct {
 type MinAttrDTO struct {
 	Attr string  `json:"attr" yaml:"attr"`
 	Min  float64 `json:"min" yaml:"min"`
+}
+
+// TrustTierDTO is one rung of the content-defined trust ladder (#27/#29, Round 9 Slice 0): a named tier,
+// its ordinal RANK (higher = more trusted — gated inspection/moderation commands compare ranks, so an
+// actor may act on any target whose rank is <= its own), and the reserved capability flags it grants on
+// login. Both telos-account and the world load the same ladder. Flags may name ONLY the engine's reserved
+// trust flags (holylight/builder/admin) — the ladder is trusted derivation, not a way to invent
+// capabilities; the world ignores any non-reserved flag here. A tier with no flags is a pure rank rung
+// (e.g. a "moderator" that can inspect but carries no engine flag).
+type TrustTierDTO struct {
+	Name  string   `json:"name" yaml:"name"`
+	Rank  int      `json:"rank" yaml:"rank"`
+	Flags []string `json:"flags,omitempty" yaml:"flags,omitempty"`
 }
 
 // CommandDTO is one custom Lua verb (Phase 7.4e). Verb is the word the player types; Lua is the

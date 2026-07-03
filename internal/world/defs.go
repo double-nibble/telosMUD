@@ -120,6 +120,12 @@ type defRegistries struct {
 	loot    *defRegistry[*lootTableDef]  // Phase 12.1 loot tables
 	recipe  *defRegistry[*recipeDef]     // Phase 13.5 crafting recipes
 
+	// trust is the pack's content-defined trust ladder (#27/#29, Round 9 Slice 0): tier→rank + granted
+	// reserved flags, built from lc.TrustTiers. nil => the engine default ladder (player/builder/admin,
+	// the round-8 mapping); the z.trustLadder() accessor substitutes the default so reads never nil-deref.
+	// Set once at construction, then read-only (like defaultCombat).
+	trust *trustLadder
+
 	// defaultCombat is the pack's player-default combat profile ref (Phase 6.3a): the profile a player
 	// entity fights with when its own (none — players aren't prototyped) declares none. newPlayerEntity
 	// stamps it onto the player's Living.combatRef so a player `kill` runs the same content pipeline as a
@@ -201,6 +207,16 @@ func (z *Zone) abilityDefs() *defRegistry[*abilityDef] {
 // Phase 6.3a). Lock-free atomic.Load; a bare zone falls back to its own empty bundle (no profiles).
 func (z *Zone) combatProfiles() *defRegistry[*combatProfile] {
 	return z.defBundle().combat
+}
+
+// trustLadder is the zone-goroutine read accessor for the content-defined trust ladder (#27/#29). Lock-free
+// atomic.Load; a pack that declared no trust_tiers (and the bare zone) falls back to the engine DEFAULT
+// ladder (player/builder/admin), so rank/flag derivation always resolves — the round-8 behavior.
+func (z *Zone) trustLadder() *trustLadder {
+	if l := z.defBundle().trust; l != nil {
+		return l
+	}
+	return defaultTrustLadder()
 }
 
 // channelDefs is the zone-goroutine read accessor for the global channel registry (Phase 8.3). Lock-

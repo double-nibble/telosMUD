@@ -46,21 +46,28 @@ func TestAttachDefaultsTierToPlayer(t *testing.T) {
 	}
 }
 
-// TestTierFlagsAllowlist pins the explicit allowlist (Slice 3): only exactly builder/admin elevate; "",
-// player, and unknown values are the un-elevated baseline (fail-safe against drift).
+// TestTierFlagsAllowlist pins the DEFAULT ladder's flag grants (Slice 3, now via the ladder — Round 9
+// Slice 0): only exactly builder/admin elevate; "", player, and unknown values are the un-elevated
+// baseline (fail-safe against drift). Checks the reserved flags each default tier grants.
 func TestTierFlagsAllowlist(t *testing.T) {
-	cases := map[string][3]bool{ // tier -> {holylight, builder, admin}
-		"admin":     {true, true, true},
-		"builder":   {true, true, false},
-		"player":    {false, false, false},
-		"":          {false, false, false},
-		"ADMIN":     {false, false, false}, // case-sensitive: not the canonical value
-		"superuser": {false, false, false}, // unknown / drifted → no elevation
+	ladder := defaultTrustLadder()
+	cases := map[string]map[string]bool{ // tier -> {holylight?, builder?, admin?}
+		"admin":     {flagHolylight: true, flagBuilder: true, flagAdmin: true},
+		"builder":   {flagHolylight: true, flagBuilder: true},
+		"player":    {},
+		"":          {},
+		"ADMIN":     {}, // case-sensitive: not the canonical value
+		"superuser": {}, // unknown / drifted → no elevation
 	}
 	for tier, want := range cases {
-		h, b, a := tierFlags(tier)
-		if [3]bool{h, b, a} != want {
-			t.Errorf("tierFlags(%q) = {%v,%v,%v}, want %v", tier, h, b, a, want)
+		got := map[string]bool{}
+		for _, f := range ladder.grantedFlags(tier) {
+			got[f] = true
+		}
+		for _, f := range []string{flagHolylight, flagBuilder, flagAdmin} {
+			if got[f] != want[f] {
+				t.Errorf("default ladder grantedFlags(%q): flag %q = %v, want %v", tier, f, got[f], want[f])
+			}
 		}
 	}
 }
