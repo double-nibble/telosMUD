@@ -22,13 +22,26 @@ func newPendingPlayer(t *testing.T, shard *Shard, z *Zone, name, token string) (
 	out := make(chan *playv1.ServerFrame, 16)
 	s := &session{character: name, out: out, epoch: 5, pending: true, token: token}
 	z.newPlayerEntity(s, name)
-	z.players[name] = s
+	z.setPlayer(name, s) // as prepare() does — also updates the z.pop occupancy mirror
 	shard.indexToken(token, z)
 	return s, s.attachGen
 }
 
+// bareShard returns a persistence-backed shard + its home zone WITHOUT starting the zone's Run loop, so a
+// test can safely construct/mutate zone state directly off-goroutine. This mirrors the freezeExpire tests,
+// which use a bare newDemoZone precisely so direct mutation doesn't race a live single-writer loop —
+// persistShard's `go shard.Run(ctx)` would make these direct z.players/pendingExpire writes a data race
+// against the zone goroutine. The persistence wiring is retained only so z.shard (and thus indexToken/
+// dropToken/zoneForToken, the tokenIndex leak surface) resolves.
+func bareShard(t *testing.T) (*Shard, *Zone) {
+	t.Helper()
+	mem := NewMemStore()
+	shard := NewDemoShard().WithPersistence(mem, mem)
+	return shard, shard.Zone()
+}
+
 func TestPendingExpireReapsUnboundPlayerAndDropsToken(t *testing.T) {
-	shard, z, _ := persistShard(t)
+	shard, z := bareShard(t)
 	s, gen := newPendingPlayer(t, shard, z, "Pending", "tok-reap")
 
 	// Precondition: parked + indexed.
@@ -51,7 +64,7 @@ func TestPendingExpireReapsUnboundPlayerAndDropsToken(t *testing.T) {
 }
 
 func TestPendingExpireStaleGenIsNoOp(t *testing.T) {
-	shard, z, _ := persistShard(t)
+	shard, z := bareShard(t)
 	_, gen := newPendingPlayer(t, shard, z, "Kept", "tok-keep")
 
 	// A stale-gen expire (the pending player was rebound/rebuilt after the timer was armed) must NOT reap it —
@@ -67,7 +80,7 @@ func TestPendingExpireStaleGenIsNoOp(t *testing.T) {
 }
 
 func TestPendingExpireBoundPlayerIsNoOp(t *testing.T) {
-	shard, z, _ := persistShard(t)
+	shard, z := bareShard(t)
 	s, gen := newPendingPlayer(t, shard, z, "Bound", "tok-bound")
 	// The gate bound the player: attach clears `pending` on a successful bind.
 	s.pending = false
