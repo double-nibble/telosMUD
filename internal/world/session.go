@@ -77,6 +77,12 @@ type session struct {
 	// cross-shard handoff — a UI pref, not persisted).
 	vitalsLive bool
 
+	// showRolls is a STAFF debug pref (#30, toggles.go): when true, a check the player performs that would
+	// otherwise be hidden by the engine DEFAULT surfaces its full roll math to them (emitCheck). Set live
+	// by `rolls on|off`; only staff can reach the verb (MinRank). Session-scoped like vitalsLive (a debug
+	// pref, not persisted); default false. An explicit content visHide is still respected (content intent).
+	showRolls bool
+
 	// lastWho is when this session last ran `who` — the per-session cooldown mark (cmdWho reads and
 	// writes it against zone.whoCooldown). Zone-goroutine-owned like the HUD buffers above; it rides
 	// the session across an intra-shard zone transfer, so a cross-zone walk doesn't reset the cooldown.
