@@ -846,6 +846,15 @@ func (s *Server) renderFrame(log *slog.Logger, c *connState, f *playv1.ServerFra
 		// responsibility — only engine-owned output or a trust-gated screen.* capability emits this frame,
 		// so player text never reaches the raw path. No word-wrap, no trailing newline (the bytes are a
 		// complete screen sequence).
+		//
+		// CLIENT CAPABILITY: a connection that disabled ANSI (`color off`) or a non-ANSI terminal must not
+		// receive raw escapes — they would garble as literal bytes. We reuse the color toggle as the coarse
+		// ANSI-capability signal (there is no finer TTYPE probe today) and DROP the frame when it is off, so
+		// the raw path never reaches a plain client. Symmetric with Write, where `color off` suppresses SGR.
+		if !tc.ColorEnabled() {
+			log.Debug("screen frame dropped: client ANSI disabled", "bytes", len(pl.Screen.GetData()))
+			return nil
+		}
 		log.Debug("frame rendered", "frame", "screen", "bytes", len(pl.Screen.GetData()))
 		return tc.WriteScreen(pl.Screen.GetData())
 	case *playv1.ServerFrame_Disconnect:
