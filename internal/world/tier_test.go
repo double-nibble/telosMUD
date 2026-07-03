@@ -105,8 +105,10 @@ func TestReservedFlagOpsRefused(t *testing.T) {
 	e := caster.entity
 	c := seededCtx(z, e, e, dispHelpful)
 
-	// A content set_flag of a reserved flag is a clean no-op (not set).
-	for _, f := range []string{flagHolylight, flagBuilder, flagAdmin} {
+	// A content set_flag of a reserved flag is a clean no-op (not set). Iterating the reservedFlags SET keeps
+	// this exhaustive: every reserved flag — incl. flagWizinvis, the concealment flag no tier grants — is
+	// covered, and a future addition to the set is auto-covered here.
+	for f := range reservedFlags {
 		if err := opSetFlag(c, &effectOp{flag: f}); err != nil {
 			t.Fatalf("opSetFlag(%q): %v", f, err)
 		}
@@ -131,6 +133,20 @@ func TestReservedFlagOpsRefused(t *testing.T) {
 	if !hasFlag(e, "guildmember") {
 		t.Error("a non-reserved flag should still be settable by content")
 	}
+
+	// Negative control on the reserved BOUNDARY: flagDetectInvis is DELIBERATELY not reserved (it is a
+	// bounded game mechanic — a detect-invisibility effect/racial — not an engine capability), so content
+	// MUST be able to set it. This pins that the reserved set stops at engine capabilities and does not
+	// creep onto ordinary gameplay flags (the counterpart to flagWizinvis, which IS reserved).
+	if reservedFlag(flagDetectInvis) {
+		t.Fatal("flagDetectInvis must NOT be reserved — it is a game mechanic, not an engine capability")
+	}
+	if err := opSetFlag(c, &effectOp{flag: flagDetectInvis}); err != nil {
+		t.Fatalf("opSetFlag(%q): %v", flagDetectInvis, err)
+	}
+	if !hasFlag(e, flagDetectInvis) {
+		t.Errorf("content must be able to set the non-reserved %q flag", flagDetectInvis)
+	}
 }
 
 // TestReservedFlagsNotPersistedOrRestored is the security-audit H-1 regression: the reserved trust flags
@@ -153,14 +169,19 @@ func TestReservedFlagsNotPersistedOrRestored(t *testing.T) {
 		t.Errorf("a normal flag should persist; got %v", snap.State.Flags)
 	}
 
-	// Forge the snapshot: add the reserved flags as if a tampered handoff / injected DB row carried them.
-	snap.State.Flags = append(snap.State.Flags, flagHolylight, flagBuilder, flagAdmin)
+	// Forge the snapshot with EVERY reserved flag (as if a tampered handoff / injected DB row carried them) —
+	// exhaustive over the reserved set, so flagWizinvis and any future addition are covered too.
+	for f := range reservedFlags {
+		snap.State.Flags = append(snap.State.Flags, f)
+	}
 	dst := &session{character: "Reload"}
 	z.newPlayerEntity(dst, "Reload")
 	loadCharacter(z, dst, snap)
 	de := dst.entity
-	if hasFlag(de, flagHolylight) || hasFlag(de, flagBuilder) || hasFlag(de, flagAdmin) {
-		t.Error("a reserved flag in the restored snapshot was installed — H-1: escalation via the trusted restore path")
+	for f := range reservedFlags {
+		if hasFlag(de, f) {
+			t.Errorf("reserved flag %q in the restored snapshot was installed — H-1: escalation via the trusted restore path", f)
+		}
 	}
 	if !hasFlag(de, "pvp") {
 		t.Error("a normal flag should restore")
