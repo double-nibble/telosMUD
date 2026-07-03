@@ -115,7 +115,9 @@ func (z *Zone) charStatusJSON(e *Entity) []byte {
 		st.State = "dead"
 	}
 	if e.living != nil && e.living.fighting != nil {
-		st.Target = gmcpText(e.living.fighting.Name())
+		// Route the opponent's name through the canSee chokepoint (#32/#28): an invisible foe the viewer
+		// can't perceive renders as "Someone" (the same leak guard as act()), never its real name.
+		st.Target = gmcpText(z.nameFor(e, e.living.fighting, false))
 	}
 	b, _ := json.Marshal(st)
 	return b
