@@ -2,6 +2,7 @@ package directory
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -50,7 +51,7 @@ func TestRegisterZoneRaceElectsExactlyOneOwner(t *testing.T) {
 	shardIDs := make([]string, n)
 	errs := make([]error, n)
 	for i := range shardIDs {
-		shardIDs[i] = "shard-" + string(rune('a'+i%26)) + itoa(i)
+		shardIDs[i] = "shard-" + strconv.Itoa(i)
 	}
 
 	// N distinct shards all try to RegisterZone the SAME zone at once.
@@ -94,7 +95,7 @@ func TestRegisterShardRaceElectsExactlyOneEndpoint(t *testing.T) {
 	endpoints := make([]string, n)
 	errs := make([]error, n)
 	for i := range endpoints {
-		endpoints[i] = "world-" + itoa(i) + ":9090"
+		endpoints[i] = "world-" + strconv.Itoa(i) + ":9090"
 	}
 
 	releaseConcurrently(n, func(i int) {
@@ -116,6 +117,21 @@ func TestRegisterShardRaceElectsExactlyOneEndpoint(t *testing.T) {
 	got, err := d.EndpointForShard(ctx, "shard-a")
 	require.NoError(t, err)
 	require.Equal(t, winner, got, "EndpointForShard must resolve to the race winner's endpoint")
+
+	// The losers left NO orphan/duplicate registration: exactly one live shard id
+	// exists — the direct kill for the "dup id becomes two writers" failure this test
+	// targets. ListShards is the live-fleet view the placement coordinator watches.
+	shards, err := d.ListShards(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"shard-a"}, shards, "the race must leave exactly one live shard, no orphans")
+
+	// Winner is stable: a loser endpoint is still refused under the id, while the
+	// winner renews its own registration cleanly (symmetric with the zone race tail).
+	loser := firstOtherThan(endpoints, winner)
+	require.ErrorIs(t, d.RegisterShard(ctx, "shard-a", loser, DefaultShardLease), ErrShardConflict,
+		"a loser endpoint must still be refused under the live id after the race")
+	require.NoError(t, d.RegisterShard(ctx, "shard-a", winner, DefaultShardLease),
+		"the winning endpoint must be able to renew its own registration")
 }
 
 // TestRegisterZoneConcurrentDistinctZonesAllSucceed is the negative control: one shard
@@ -130,7 +146,7 @@ func TestRegisterZoneConcurrentDistinctZonesAllSucceed(t *testing.T) {
 	zones := make([]string, n)
 	errs := make([]error, n)
 	for i := range zones {
-		zones[i] = "zone-" + itoa(i)
+		zones[i] = "zone-" + strconv.Itoa(i)
 	}
 
 	releaseConcurrently(n, func(i int) {
@@ -145,27 +161,6 @@ func TestRegisterZoneConcurrentDistinctZonesAllSucceed(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "shard-a", got)
 	}
-}
-
-// itoa is a tiny dependency-free int->string for building unique test ids (avoids
-// pulling strconv into the hot barrier path for readability only).
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b []byte
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-	for i > 0 {
-		b = append([]byte{byte('0' + i%10)}, b...)
-		i /= 10
-	}
-	if neg {
-		b = append([]byte{'-'}, b...)
-	}
-	return string(b)
 }
 
 func firstOtherThan(ids []string, exclude string) string {
