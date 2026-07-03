@@ -102,6 +102,12 @@ type Server struct {
 	// devAutoAuth (Phase 15.6, TELOS_DEV_AUTOAUTH) bypasses the browser OAuth flow with the bare name login —
 	// for HEADLESS smoke/e2e + local dev against an account-backed gate. INSECURE: never enable in prod.
 	devAutoAuth bool
+	// devAuthAllowRemoteBind is the deliberate acknowledgment that a dev-autoauth gate may bind a non-loopback
+	// address (TELOS_DEV_AUTOAUTH_ALLOW_REMOTE_BIND). It exists ONLY for sandboxed orchestration — a container
+	// MUST bind 0.0.0.0 for Docker port-publishing, and its exposure is governed by the publish mapping, not
+	// the process bind. Without it, a dev-autoauth gate refuses any non-loopback bind (the bare-metal footgun
+	// guard, ListenAndServe). Setting it says "the network boundary is handled outside this process."
+	devAuthAllowRemoteBind bool
 
 	// Phase 14.6 transport posture: TLS is the encrypted default; plain telnet is OFF unless allowPlaintext.
 	allowPlaintext bool
@@ -140,6 +146,14 @@ func (s *Server) WithTransports(allowPlaintext bool, tlsListen, tlsCert, tlsKey 
 // gate it behind TELOS_DEV_AUTOAUTH and never enable in production. Returns the Server for chaining.
 func (s *Server) WithDevAutoAuth(on bool) *Server {
 	s.devAutoAuth = on
+	return s
+}
+
+// WithDevAutoAuthAllowRemoteBind acknowledges that a dev-autoauth gate may bind a non-loopback address (for
+// containerized dev/CI, where Docker requires a 0.0.0.0 bind and controls exposure via the port publish).
+// Without it, ListenAndServe refuses a non-loopback bind while the bypass is on. Never set it on a bare host.
+func (s *Server) WithDevAutoAuthAllowRemoteBind(on bool) *Server {
+	s.devAuthAllowRemoteBind = on
 	return s
 }
 
@@ -196,6 +210,29 @@ func newServer(listen string, dir directory.Directory, p *pool, comms commbus.Bu
 // PLAIN telnet runs only when explicitly enabled (allowPlaintext); TLS telnet runs when a listen addr +
 // cert/key are configured. At least one transport must be enabled.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	// DEV-AUTOAUTH BIND GUARD: the TELOS_DEV_AUTOAUTH bypass replaces OAuth with the bare name login, so a
+	// gate running it must NEVER be reachable off-host — a non-loopback bind would be an open, remotely
+	// exploitable backdoor. Refuse to start (fail-closed) if the bypass is on and any enabled transport is
+	// about to bind a non-loopback address. This makes the bypass safe for local dev / headless smoke+e2e
+	// (loopback only) while making the dangerous misconfiguration impossible rather than merely discouraged.
+	//
+	// SCOPE: this is a RUNTIME fence against a loopback→wildcard bind slip, NOT complete mitigation — the
+	// bypass code (account.go login()) is still compiled into the binary. The complete fix is to exclude it
+	// from release builds behind a build tag (a tracked follow-up); until then, this guard only guarantees
+	// the bypass can't be opened by an accidental non-loopback bind, not that the code is absent.
+	if s.devAutoAuth {
+		if !s.devAuthAllowRemoteBind {
+			for _, addr := range s.enabledListenAddrs() {
+				if !isLoopbackListen(addr) {
+					return fmt.Errorf("gate: TELOS_DEV_AUTOAUTH (the no-OAuth dev bypass) refuses to bind non-loopback address %q — it must be unreachable off-host; bind 127.0.0.1/::1, or set TELOS_DEV_AUTOAUTH_ALLOW_REMOTE_BIND=1 ONLY in sandboxed orchestration where exposure is controlled outside the process (e.g. a container's port publish)", addr)
+				}
+			}
+			slog.Warn("TELOS_DEV_AUTOAUTH ENABLED — OAuth is BYPASSED (bare name login); loopback-only. NEVER enable in production.", "listen", s.listen, "tls_listen", s.tlsListen)
+		} else {
+			slog.Warn("TELOS_DEV_AUTOAUTH ENABLED with ALLOW_REMOTE_BIND — OAuth is BYPASSED on a non-loopback bind; exposure MUST be controlled outside the process (container port publish / firewall). NEVER on a public host.", "listen", s.listen, "tls_listen", s.tlsListen)
+		}
+	}
+
 	var wg sync.WaitGroup
 	started := 0
 
@@ -235,6 +272,44 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	<-ctx.Done()
 	wg.Wait()
 	return nil
+}
+
+// enabledListenAddrs returns the addresses ListenAndServe will actually bind, given the transport config:
+// the plain listen only when plaintext is allowed, the TLS listen only when it has a cert+key. Used by the
+// dev-autoauth bind guard so it checks exactly what's about to be exposed (not a disabled transport).
+func (s *Server) enabledListenAddrs() []string {
+	var addrs []string
+	if s.allowPlaintext {
+		addrs = append(addrs, s.listen)
+	}
+	if s.tlsListen != "" && s.tlsCert != "" && s.tlsKey != "" {
+		addrs = append(addrs, s.tlsListen)
+	}
+	return addrs
+}
+
+// isLoopbackListen reports whether a listen address binds ONLY the loopback interface — i.e. it is
+// unreachable from off-host. A bare ":4000" (empty host) or "0.0.0.0:4000" binds all interfaces and is NOT
+// loopback. "localhost" and any explicit loopback IP (127.0.0.0/8, ::1) are. A non-localhost hostname is
+// treated as non-loopback (fail-closed) since we don't resolve it here — the guard errs on the safe side.
+//
+// CAVEAT: "localhost" is trusted by NAME, not resolution — a host whose /etc/hosts remaps localhost to a
+// routable IP could bind off-host while passing this check. That requires host-write access (already a
+// compromise) and is vanishingly rare on sane images, so we accept it; operators wanting strictness should
+// bind a literal 127.0.0.1/::1 rather than "localhost".
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false // unparseable → don't assume safe
+	}
+	if host == "" {
+		return false // ":4000" / all-interfaces bind
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // serveListener runs one transport's accept loop, handing each connection to its own goroutine. `encrypted`

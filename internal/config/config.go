@@ -24,11 +24,12 @@ type Config struct {
 
 	// Transport posture: TLS telnet is the encrypted default; PLAIN telnet is OFF unless
 	// explicitly enabled (play would otherwise cross the wire in cleartext).
-	GateAllowPlaintext bool   `yaml:"gate_allow_plaintext"` // enable the unencrypted telnet listener (default false)
-	GateTLSListen      string `yaml:"gate_tls_listen"`      // TLS telnet listen, e.g. ":4443" (needs cert+key)
-	GateTLSCert        string `yaml:"gate_tls_cert"`        // PEM cert file
-	GateTLSKey         string `yaml:"gate_tls_key"`         // PEM key file
-	DevAutoAuth        bool   `yaml:"dev_auto_auth"`        // Phase 15.6: bypass OAuth with the bare name login (DEV/TEST ONLY)
+	GateAllowPlaintext         bool   `yaml:"gate_allow_plaintext"`            // enable the unencrypted telnet listener (default false)
+	GateTLSListen              string `yaml:"gate_tls_listen"`                 // TLS telnet listen, e.g. ":4443" (needs cert+key)
+	GateTLSCert                string `yaml:"gate_tls_cert"`                   // PEM cert file
+	GateTLSKey                 string `yaml:"gate_tls_key"`                    // PEM key file
+	DevAutoAuth                bool   `yaml:"dev_auto_auth"`                   // Phase 15.6: bypass OAuth with the bare name login (DEV/TEST ONLY)
+	DevAutoAuthAllowRemoteBind bool   `yaml:"dev_auto_auth_allow_remote_bind"` // permit a dev-autoauth gate on a non-loopback bind (sandboxed orchestration only; see gate bind guard)
 
 	// GateWriteTimeout (Phase 16.3) bounds a single outbound write to a telnet client; a wedged client that
 	// blocks a write past this is disconnected so it can't pin a writer goroutine / hold its slot. 0 disables.
@@ -186,6 +187,9 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_DEV_AUTOAUTH"); ok {
 		c.DevAutoAuth = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v, ok := os.LookupEnv("TELOS_DEV_AUTOAUTH_ALLOW_REMOTE_BIND"); ok {
+		c.DevAutoAuthAllowRemoteBind = v == "1" || strings.EqualFold(v, "true")
 	}
 	if v, ok := os.LookupEnv("TELOS_GATE_WRITE_TIMEOUT"); ok {
 		if d, err := time.ParseDuration(v); err == nil {
