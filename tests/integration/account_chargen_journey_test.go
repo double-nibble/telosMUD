@@ -47,7 +47,7 @@ func TestChargenAccountJourneyCapstone(t *testing.T) {
 
 	// A real account (the OAuth identity path mints the accounts row the character FK needs).
 	uid := "cap-" + time.Now().Format("150405.000000")
-	acct, err := p.CreateAccountWithIdentity(ctx, "github", uid, "", "Capstone Tester")
+	acct, err := p.CreateAccountWithIdentity(ctx, "github", uid, "", "Capstone Tester", false)
 	require.NoError(t, err)
 
 	svc := account.New(p, nil, "midgaard", "midgaard:room:temple").WithChargen(flow, options)

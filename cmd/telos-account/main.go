@@ -153,12 +153,13 @@ func main() {
 // the OAuth-flow cookie (config or ephemeral — a restart only drops in-flight logins, which is fine).
 func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer) *web.Server {
 	return web.New(st, web.Config{
-		Provider:      web.GitHubProvider(cfg.GithubClientID, cfg.GithubClientSecret, cfg.WebPublicURL+"/auth/github/callback"),
-		Authorizer:    authorizer,
-		SessionKey:    webSessionKey(cfg.WebSessionKey),
-		SecureCookies: cfg.WebSecureCookies, // secure-by-default (config); dev over plain http sets TELOS_WEB_SECURE_COOKIES=0
-		Dev:           cfg.Env == "dev",     // renders the -dev logo badge
-		Log:           slog.Default(),
+		Provider:       web.GitHubProvider(cfg.GithubClientID, cfg.GithubClientSecret, cfg.WebPublicURL+"/auth/github/callback"),
+		Authorizer:     authorizer,
+		SessionKey:     webSessionKey(cfg.WebSessionKey),
+		SecureCookies:  cfg.WebSecureCookies, // secure-by-default (config); dev over plain http sets TELOS_WEB_SECURE_COOKIES=0
+		Dev:            cfg.Env == "dev",     // renders the -dev logo badge
+		BootstrapAdmin: cfg.BootstrapAdmin,   // config-pin: first account matching this OAuth login → admin (#27)
+		Log:            slog.Default(),
 	})
 }
 

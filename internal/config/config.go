@@ -66,6 +66,7 @@ type Config struct {
 	GithubClientID     string `yaml:"github_client_id"`     // GitHub OAuth app client id
 	GithubClientSecret string `yaml:"github_client_secret"` // GitHub OAuth app client secret (from a gitignored env file)
 	MaxCharacters      int    `yaml:"max_characters"`       // per-account character cap (Phase 15.4; 0 => the service default)
+	BootstrapAdmin     string `yaml:"bootstrap_admin"`      // config-pin (#27): the OAuth login whose first account becomes admin ("" disables)
 
 	// Phase 2 shard identity (multi-shard + handoff).
 	ShardID   string   `yaml:"shard_id"`   // this shard's id, e.g. "shard-a"
@@ -227,6 +228,9 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_GITHUB_CLIENT_SECRET"); ok {
 		c.GithubClientSecret = v
+	}
+	if v, ok := os.LookupEnv("TELOS_BOOTSTRAP_ADMIN"); ok {
+		c.BootstrapAdmin = v
 	}
 	if v, ok := os.LookupEnv("TELOS_WORLD_TARGET"); ok {
 		c.WorldTarget = v
