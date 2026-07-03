@@ -125,20 +125,34 @@ func (p *Pool) FindIdentity(ctx context.Context, provider, providerUID string) (
 	return acct, true, nil
 }
 
+// The builder trust tiers (#27/#97). Canonical strings — the accounts.tier CHECK constraint (migration
+// 00019) is the source of truth; keep these in sync with it. Ordered player < builder < admin.
+const (
+	TierPlayer  = "player"
+	TierBuilder = "builder"
+	TierAdmin   = "admin"
+)
+
 // CreateAccountWithIdentity creates a NEW account + its first OAuth identity in one transaction (a first-time
-// sign-in). email is informational only — never an identity key (no auto-merge by email). Returns the new
-// account id.
-func (p *Pool) CreateAccountWithIdentity(ctx context.Context, provider, providerUID, email, displayName string) (string, error) {
+// sign-in). email is informational only — never an identity key (no auto-merge by email). bootstrapAdmin
+// (the config-pin match, decided by the caller) creates the account at the admin tier and records the grant
+// in account_role_audit with a NULL actor (system granted) — all in the same transaction, so a crash can't
+// leave a half-granted admin. Returns the new account id.
+func (p *Pool) CreateAccountWithIdentity(ctx context.Context, provider, providerUID, email, displayName string, bootstrapAdmin bool) (string, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("store: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	tier := TierPlayer
+	if bootstrapAdmin {
+		tier = TierAdmin
+	}
 	acct := uuid.New()
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO accounts (id, status, display_name) VALUES ($1, 'active', $2)`,
-		acct, nullStr(displayName)); err != nil {
+		`INSERT INTO accounts (id, status, display_name, tier) VALUES ($1, 'active', $2, $3)`,
+		acct, nullStr(displayName), tier); err != nil {
 		return "", fmt.Errorf("store: create account: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
@@ -146,10 +160,32 @@ func (p *Pool) CreateAccountWithIdentity(ctx context.Context, provider, provider
 		provider, providerUID, acct, nullStr(email)); err != nil {
 		return "", fmt.Errorf("store: create identity: %w", err)
 	}
+	if bootstrapAdmin {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO account_role_audit (id, actor_account, target_account, old_tier, new_tier)
+			 VALUES ($1, NULL, $2, NULL, $3)`,
+			uuid.New(), acct, TierAdmin); err != nil {
+			return "", fmt.Errorf("store: audit bootstrap admin: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", fmt.Errorf("store: commit: %w", err)
 	}
 	return acct.String(), nil
+}
+
+// AccountTier returns an account's trust tier (player/builder/admin). found=false for an unknown account.
+// telos-account reads this to sign the tier into the session assertion (the world trusts it offline).
+func (p *Pool) AccountTier(ctx context.Context, accountID string) (string, bool, error) {
+	var tier string
+	err := p.pool.QueryRow(ctx, `SELECT tier FROM accounts WHERE id = $1`, accountID).Scan(&tier)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: account tier %s: %w", accountID, err)
+	}
+	return tier, true, nil
 }
 
 // AccountDisplayName returns an account's display name (may be empty). found=false for an unknown account.

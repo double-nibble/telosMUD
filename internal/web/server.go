@@ -5,6 +5,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -17,7 +18,7 @@ import (
 // Store is the persistence surface the broker needs: just the OAuth identity resolution.
 type Store interface {
 	FindIdentity(ctx context.Context, provider, providerUID string) (string, bool, error)
-	CreateAccountWithIdentity(ctx context.Context, provider, providerUID, email, displayName string) (string, error)
+	CreateAccountWithIdentity(ctx context.Context, provider, providerUID, email, displayName string, bootstrapAdmin bool) (string, error)
 }
 
 // DeviceAuthorizer flips a pending device session to authed once the browser completes OAuth (the account
@@ -28,13 +29,14 @@ type DeviceAuthorizer interface {
 
 // Server is the broker. Construct with New, then Handler().
 type Server struct {
-	store         Store
-	authorizer    DeviceAuthorizer
-	provider      OAuthProvider
-	sign          signer
-	secureCookies bool
-	tmpl          *template.Template
-	log           *slog.Logger
+	store          Store
+	authorizer     DeviceAuthorizer
+	provider       OAuthProvider
+	sign           signer
+	secureCookies  bool
+	bootstrapAdmin string // config-pin: the OAuth LOGIN whose FIRST account becomes admin (#27); "" disables
+	tmpl           *template.Template
+	log            *slog.Logger
 }
 
 // Config carries the broker's wiring.
@@ -44,7 +46,10 @@ type Config struct {
 	SessionKey    []byte // HMAC key for the signed flow cookie (a stable random key in prod)
 	SecureCookies bool   // set Secure on the cookie (true when served over TLS)
 	Dev           bool   // dev instance: render the -dev logo variant
-	Log           *slog.Logger
+	// BootstrapAdmin (config-pin, #27) is the OAuth LOGIN whose FIRST-created account is granted the
+	// admin tier — the way the operator claims the first admin without a connect-race. "" disables it.
+	BootstrapAdmin string
+	Log            *slog.Logger
 }
 
 // New builds the broker. It PANICS on a SessionKey shorter than 16 bytes — that key signs the OAuth-flow
@@ -65,14 +70,31 @@ func New(st Store, cfg Config) *Server {
 		Funcs(template.FuncMap{"logoURL": func() string { return logoURL }}).
 		Parse(pageTemplates))
 	return &Server{
-		store:         st,
-		authorizer:    cfg.Authorizer,
-		provider:      cfg.Provider,
-		sign:          signer{key: cfg.SessionKey},
-		secureCookies: cfg.SecureCookies,
-		tmpl:          tmpl,
-		log:           log,
+		store:          st,
+		authorizer:     cfg.Authorizer,
+		provider:       cfg.Provider,
+		sign:           signer{key: cfg.SessionKey},
+		secureCookies:  cfg.SecureCookies,
+		bootstrapAdmin: strings.TrimSpace(cfg.BootstrapAdmin),
+		tmpl:           tmpl,
+		log:            log,
 	}
+}
+
+// isBootstrapAdmin reports whether an OAuth identity matches the configured config-pin admin (#27): a
+// case-insensitive match of the provider LOGIN only. Empty config (the default) matches nothing, so no
+// account is auto-admin'd unless the operator explicitly pins one.
+//
+// SECURITY (login-only by design): the pin matches the provider LOGIN, which is unique and provider-
+// verified. It deliberately does NOT match the OAuth email — that comes from the provider's PUBLIC,
+// user-settable, unverified profile field, so an email pin would let anyone who set that email to the
+// pinned value claim admin (and there is no "already granted" cap). A grant-admin path must not trust an
+// attacker-controllable string. The login is ASCII on GitHub, so simple case-folding (EqualFold) is exact.
+func (s *Server) isBootstrapAdmin(login string) bool {
+	if s.bootstrapAdmin == "" {
+		return false
+	}
+	return strings.EqualFold(login, s.bootstrapAdmin)
 }
 
 // Handler returns the broker's HTTP handler.
@@ -157,12 +179,13 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !found {
-		account, err = s.store.CreateAccountWithIdentity(ctx, s.provider.Name, id.ProviderUID, id.Email, id.Login)
+		bootstrap := s.isBootstrapAdmin(id.Login)
+		account, err = s.store.CreateAccountWithIdentity(ctx, s.provider.Name, id.ProviderUID, id.Email, id.Login, bootstrap)
 		if err != nil {
 			s.fail(w, "callback create", err)
 			return
 		}
-		s.log.Info("new account created via oauth", "provider", s.provider.Name, "login", id.Login)
+		s.log.Info("new account created via oauth", "provider", s.provider.Name, "login", id.Login, "bootstrap_admin", bootstrap)
 	}
 
 	authed, err := s.authorizer.AuthorizeDevice(ctx, device, account)

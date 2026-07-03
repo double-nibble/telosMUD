@@ -98,10 +98,26 @@ the hot path.
 a bare `name` login instead of the browser OAuth flow, so headless smoke/e2e and local dev work
 without a browser. It is **insecure** and gated behind the env flag — never enabled in production.
 
-## 8. Security checklist
+## 8. Builder trust tiers & bootstrap admin
+
+Accounts carry a **tier** — `player < builder < admin` (`accounts.tier`, #27) — the account-level role
+that gates builder/admin powers. `telos-account` is the authority; a later slice signs the tier into
+the session assertion so the world trusts it offline. A promote/demote flow (admin-gated) changes a
+tier; the change takes effect on the target's next login.
+
+**Bootstrap admin (config-pin).** Set `TELOS_BOOTSTRAP_ADMIN` to your OAuth **login**; the FIRST account
+created for a matching identity is granted `admin` (audited with a NULL actor). The match is **login-only,
+by design** — a login is unique and provider-verified, whereas the OAuth email is a public, user-settable,
+unverified provider field, so matching on email would let anyone who set that email to the pinned value
+claim admin. Because config-pin names a single verified login, there is no connect-race. Empty/unset pin =
+no account is ever auto-admin'd. A dev-autoauth (`TELOS_DEV_AUTOAUTH`) bare-name login has no OAuth
+identity, so it never hits this path.
+
+## 9. Security checklist
 
 - OAuth: PKCE, `state` CSRF guard, strict redirect-URI allowlist, store minimal provider data.
 - No email-based account auto-merge — identity is `(provider, provider_uid)` only.
+- Bootstrap admin: pin matches the OAuth login only (never the unverified provider email).
 - Device codes: high entropy (256-bit), single-use, short TTL (~10 min).
 - Session assertions: short-lived, signed, verified offline by shards.
 - Single-session lock with TTL + heartbeat; takeover drops the displaced connection.

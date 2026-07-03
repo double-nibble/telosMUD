@@ -16,8 +16,9 @@ import (
 
 // fakeStore is an in-memory web.Store (OAuth identity resolution only).
 type fakeStore struct {
-	identities map[string]string // "provider/uid" -> account
-	created    int
+	identities    map[string]string // "provider/uid" -> account
+	created       int
+	lastBootstrap bool // the bootstrapAdmin flag passed to the most recent CreateAccountWithIdentity
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{identities: map[string]string{}} }
@@ -27,8 +28,9 @@ func (f *fakeStore) FindIdentity(_ context.Context, provider, uid string) (strin
 	return a, ok, nil
 }
 
-func (f *fakeStore) CreateAccountWithIdentity(_ context.Context, provider, uid, _, _ string) (string, error) {
+func (f *fakeStore) CreateAccountWithIdentity(_ context.Context, provider, uid, _, _ string, bootstrapAdmin bool) (string, error) {
 	f.created++
+	f.lastBootstrap = bootstrapAdmin
 	acct := "acct-" + uid
 	f.identities[provider+"/"+uid] = acct
 	return acct, nil
@@ -75,6 +77,10 @@ func stubProvider(t *testing.T) *httptest.Server {
 }
 
 func newTestBroker(t *testing.T, auth *fakeAuthorizer, st Store) (*httptest.Server, *http.Client) {
+	return newTestBrokerAdmin(t, auth, st, "")
+}
+
+func newTestBrokerAdmin(t *testing.T, auth *fakeAuthorizer, st Store, bootstrapAdmin string) (*httptest.Server, *http.Client) {
 	t.Helper()
 	stub := stubProvider(t)
 	s := New(st, Config{
@@ -83,8 +89,9 @@ func newTestBroker(t *testing.T, auth *fakeAuthorizer, st Store) (*httptest.Serv
 			AuthURL: "https://provider.test/authorize", TokenURL: stub.URL + "/token", UserURL: stub.URL + "/user",
 			RedirectURL: "http://broker.test/auth/github/callback", Scopes: []string{"read:user"},
 		},
-		Authorizer: auth,
-		SessionKey: []byte("0123456789abcdef0123456789abcdef"),
+		Authorizer:     auth,
+		SessionKey:     []byte("0123456789abcdef0123456789abcdef"),
+		BootstrapAdmin: bootstrapAdmin,
 	})
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
@@ -127,6 +134,60 @@ func TestDeviceLoginFlow(t *testing.T) {
 	}
 	if auth.callCount != 1 || auth.gotDevice != "DEVCODE123" || auth.gotAccount != "acct-4242" {
 		t.Fatalf("AuthorizeDevice got (device=%q account=%q calls=%d), want (DEVCODE123, acct-4242, 1)", auth.gotDevice, auth.gotAccount, auth.callCount)
+	}
+}
+
+// TestIsBootstrapAdmin covers the config-pin match (#27): case-insensitive on the LOGIN only; empty config
+// (the default) matches nothing; the email is NEVER matched (login-only by design — the email is an
+// unverified, user-settable provider field).
+func TestIsBootstrapAdmin(t *testing.T) {
+	mk := func(pin string) *Server {
+		return New(newFakeStore(), Config{SessionKey: []byte("0123456789abcdef0123456789abcdef"), Authorizer: &fakeAuthorizer{}, BootstrapAdmin: pin})
+	}
+	if mk("").isBootstrapAdmin("octocat") {
+		t.Error("empty bootstrap config must match nothing")
+	}
+	if !mk("octocat").isBootstrapAdmin("OctoCat") {
+		t.Error("should match the login case-insensitively")
+	}
+	if mk("octo@example.com").isBootstrapAdmin("octocat") {
+		t.Error("a pin must NOT match the login as an email (login-only)")
+	}
+	if mk("theboss").isBootstrapAdmin("octocat") {
+		t.Error("a non-matching login must not be bootstrap admin")
+	}
+}
+
+// TestCallbackGrantsBootstrapAdmin proves the pin flows end-to-end: the callback passes bootstrapAdmin=true
+// to the store ONLY when the configured pin matches the OAuth LOGIN (stub user login "octocat" / email
+// "octo@example.com"). An email pin must NOT grant admin (login-only by design).
+func TestCallbackGrantsBootstrapAdmin(t *testing.T) {
+	for _, tc := range []struct {
+		pin  string
+		want bool
+	}{
+		{"", false},
+		{"octocat", true},
+		{"octo@example.com", false}, // the email must not match — login-only
+		{"someoneelse", false},
+	} {
+		auth := &fakeAuthorizer{ok: true}
+		st := newFakeStore()
+		ts, client := newTestBrokerAdmin(t, auth, st, tc.pin)
+		resp, err := client.Get(ts.URL + "/login/DEV")
+		if err != nil {
+			t.Fatal(err)
+		}
+		loc, _ := url.Parse(resp.Header.Get("Location"))
+		if _, err := client.Get(ts.URL + "/auth/github/callback?code=abc&state=" + url.QueryEscape(loc.Query().Get("state"))); err != nil {
+			t.Fatal(err)
+		}
+		if st.created != 1 {
+			t.Fatalf("pin=%q: expected 1 account created, got %d", tc.pin, st.created)
+		}
+		if st.lastBootstrap != tc.want {
+			t.Errorf("pin=%q: store got bootstrapAdmin=%v, want %v", tc.pin, st.lastBootstrap, tc.want)
+		}
 	}
 }
 

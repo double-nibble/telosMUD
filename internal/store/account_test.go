@@ -84,9 +84,16 @@ func TestOAuthIdentityRoundTrip(t *testing.T) {
 	require.False(t, found)
 
 	// First-time sign-in: create the account + identity. email is informational, login is the display name.
-	acct, err := p.CreateAccountWithIdentity(ctx, provider, uid, "octo@example.com", "octocat")
+	// bootstrapAdmin=false → an ordinary player account.
+	acct, err := p.CreateAccountWithIdentity(ctx, provider, uid, "octo@example.com", "octocat", false)
 	require.NoError(t, err)
 	require.NotEmpty(t, acct)
+
+	// A normal account defaults to the player tier (#27).
+	tier, found, err := p.AccountTier(ctx, acct)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, TierPlayer, tier)
 
 	// The same identity now resolves to that account (a returning sign-in — no new account).
 	got, found, err := p.FindIdentity(ctx, provider, uid)
@@ -99,6 +106,41 @@ func TestOAuthIdentityRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, "octocat", name)
+}
+
+// TestBootstrapAdminTierAndAudit (#27): creating an account with bootstrapAdmin=true grants the admin tier
+// in the same transaction and writes an account_role_audit row with a NULL actor (system-granted).
+func TestBootstrapAdminTierAndAudit(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	provider := "github"
+	uid := "boot-" + time.Now().Format("150405.000000")
+	t.Cleanup(func() {
+		acct, found, _ := p.FindIdentity(context.Background(), provider, uid)
+		if found {
+			_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_role_audit WHERE target_account = $1`, acct)
+			_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_identities WHERE account_id = $1`, acct)
+			_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, acct)
+		}
+	})
+
+	acct, err := p.CreateAccountWithIdentity(ctx, provider, uid, "boss@example.com", "boss", true)
+	require.NoError(t, err)
+
+	tier, found, err := p.AccountTier(ctx, acct)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, TierAdmin, tier)
+
+	// The grant was audited with a NULL actor (system/bootstrap) and new_tier=admin.
+	var actor *string
+	var newTier string
+	err = p.pool.QueryRow(ctx,
+		`SELECT actor_account, new_tier FROM account_role_audit WHERE target_account = $1`, acct).Scan(&actor, &newTier)
+	require.NoError(t, err)
+	assert.Nil(t, actor, "bootstrap grant should have a NULL actor (system-granted)")
+	assert.Equal(t, TierAdmin, newTier)
 }
 
 // TestPendingChargenRoundTrip (Phase 14.8) proves the first-spawn chargen marker survives create -> load, and
