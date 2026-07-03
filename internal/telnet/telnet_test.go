@@ -164,6 +164,38 @@ func TestWriteStripsControlKeepsAdjacentMultibyte(t *testing.T) {
 	}
 }
 
+// TestWriteStripsRawC1Bytes is the #156 regression on the gate's universal output sanitizer. A RAW single-byte
+// 8-bit C1 introducer (0x9B CSI / 0x9D OSC / 0x9C ST) is INVALID utf-8 that decodes to a non-control
+// RuneError, so the old rune-level fast path judged the string "clean" and wrote it verbatim — letting ANY
+// output path (not just content) inject terminal control (screen erase / cursor move / DSR cursor-report
+// input-injection / OSC-52 clipboard exfil) onto the wire. sanitizeOutput must now DROP raw C1. A raw 0xFF
+// (IAC) is NOT terminal control and is still preserved (telnet framing doubles it downstream).
+func TestWriteStripsRawC1Bytes(t *testing.T) {
+	for _, b := range []byte{0x9b, 0x9d, 0x9c} {
+		var out bytes.Buffer
+		c := NewReadWriter(&bytes.Buffer{}, &out)
+		if err := c.Write("hi" + string([]byte{b}) + "2J"); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.IndexByte(out.Bytes(), b) >= 0 {
+			t.Fatalf("Write must drop raw C1 byte %#x; got % x", b, out.Bytes())
+		}
+		if got := out.String(); got != "hi2J" {
+			t.Fatalf("Write(raw C1 %#x) = %q; want %q (C1 dropped, rest intact)", b, got, "hi2J")
+		}
+	}
+	// A raw 0xFF (IAC) is preserved by sanitizeOutput (then doubled by telnet framing so it can't inject a
+	// telnet command) — it is not terminal control, so the C1 fix must not drop it.
+	var out bytes.Buffer
+	c := NewReadWriter(&bytes.Buffer{}, &out)
+	if err := c.Write("x" + string([]byte{0xff}) + "y"); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.IndexByte(out.Bytes(), 0xff) < 0 {
+		t.Fatalf("Write must preserve a raw 0xFF (IAC), not drop it as C1; got % x", out.Bytes())
+	}
+}
+
 // TestReadLineTabDropped: tab is a control rune and is dropped, per the documented
 // tab decision.
 func TestReadLineTabDropped(t *testing.T) {

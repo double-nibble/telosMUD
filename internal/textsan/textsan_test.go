@@ -66,6 +66,33 @@ func TestCleanMarkupCaps(t *testing.T) {
 	}
 }
 
+// TestCleanMarkupStripsRawC1 is the #156 regression: CleanMarkup (the OUTPUT-bound sanitizer) must DROP raw
+// 8-bit C1 introducers. A lone 0x9B (CSI) / 0x9D (OSC) / 0x9C (ST) is INVALID utf-8 that decodes to a
+// non-control RuneError, so a rune-level strip preserves it verbatim — letting content inject terminal
+// control (screen erase / cursor move, DSR cursor-report INPUT INJECTION, OSC-52 clipboard exfil) straight
+// onto the wire. CleanMarkup drops it; CleanLine (the INPUT edge-parity contract) deliberately preserves it.
+func TestCleanMarkupStripsRawC1(t *testing.T) {
+	for _, b := range []byte{0x9b, 0x9d, 0x9c, 0x90, 0x9f} { // samples across the C1 range 0x80-0x9F
+		in := "hi" + string([]byte{b}) + "2J"
+		got := CleanMarkup(in)
+		if strings.IndexByte(got, b) >= 0 {
+			t.Errorf("CleanMarkup must drop raw C1 byte %#x; got %q", b, got)
+		}
+		if got != "hi2J" {
+			t.Errorf("CleanMarkup(%q) = %q, want %q (C1 dropped, rest intact)", in, got, "hi2J")
+		}
+	}
+	// Valid multibyte text is preserved; only the raw C1 is dropped.
+	if got := CleanMarkup("Élodie" + string([]byte{0x9b}) + "x"); got != "Élodiex" {
+		t.Fatalf("CleanMarkup should drop only the raw C1 and keep valid multibyte text; got %q", got)
+	}
+	// Contrast: CleanLine (the INPUT contract) PRESERVES the same raw byte on its fast path (edge-parity) —
+	// the split is deliberate, so this asymmetry is the point.
+	if raw := "hi" + string([]byte{0x9b}) + "x"; CleanLine(raw) != raw {
+		t.Fatalf("CleanLine should preserve a raw invalid byte (input edge-parity contract); got %q", CleanLine(raw))
+	}
+}
+
 // TestCleanLineCaps proves the byte cap holds at the world's own ingress, mirroring
 // the edge's MaxLineBytes — a producer that skipped the edge cannot deliver an
 // unbounded line.
