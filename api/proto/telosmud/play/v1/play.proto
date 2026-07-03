@@ -93,6 +93,7 @@ message ServerFrame {
     Ping ping = 6;
     Redirect redirect = 7;
     Disconnect disconnect = 8;
+    Screen screen = 10;
   }
   // ack_input_seq piggybacks the world's input high-water mark on EVERY frame: the
   // highest InputLine.seq this shard has applied for the player. The gate prunes its
@@ -129,6 +130,17 @@ message GmcpOut {
 
 message PromptUpdate {
   string markup = 1; // emitted without a trailing newline
+}
+
+// Screen is the TRUSTED full-screen/ANSI output mode (#31): pre-formed raw terminal bytes (cursor
+// positioning, erase, scroll regions — a `telnet towel.blinkenlights.nl`-style animation, a login splash,
+// clear-screen) written VERBATIM to the socket, BYPASSING the gate's output sanitizer and color-token
+// renderer, so terminal control survives. Safety is by PROVENANCE: only trusted producers (engine-owned
+// output, or a trust-gated screen.* content capability) ever emit a Screen frame — player-authored text
+// never reaches it, so cursor/screen control stays out of untrusted hands. The gate still IAC-escapes the
+// bytes (a telnet framing requirement, not terminal sanitization). Orthogonal to the Output markup layer.
+message Screen {
+  bytes data = 1; // raw terminal bytes, written verbatim (IAC-escaped) — never sanitized
 }
 
 message Control {

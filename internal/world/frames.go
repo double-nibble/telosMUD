@@ -24,6 +24,18 @@ func promptFrameMarkup(markup string) *playv1.ServerFrame {
 	}}}
 }
 
+// screenFrame wraps pre-formed raw terminal bytes as a Screen frame (#31): the TRUSTED full-screen/ANSI
+// output mode the gate writes VERBATIM (IAC-escaped, but bypassing the output sanitizer + color renderer).
+// PROVENANCE IS THE CALLER'S CONTRACT: only trusted producers — engine-owned output (a clear/splash/HUD),
+// or a trust-gated screen.* content capability — may build one; player-authored text must never flow into
+// `data`, because the sanitizer that would neutralize a hostile ESC/cursor sequence is exactly what this
+// frame skips. The bytes are a complete screen sequence: no word-wrap, no appended newline downstream.
+func screenFrame(data []byte) *playv1.ServerFrame {
+	return &playv1.ServerFrame{Payload: &playv1.ServerFrame_Screen{Screen: &playv1.Screen{
+		Data: data,
+	}}}
+}
+
 // attachedFrame acknowledges a successful Attach, naming the shard the player
 // landed on. Sent before the join is posted to the zone.
 func attachedFrame(shardID string) *playv1.ServerFrame {

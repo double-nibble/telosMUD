@@ -256,3 +256,41 @@ func TestWriteStripsControlPreservesCRLF(t *testing.T) {
 		t.Fatalf("output did not IAC-escape 0xFF: % x", out.Bytes())
 	}
 }
+
+// TestWriteScreenPreservesRawANSI: the trusted raw path (#31) writes ESC/cursor bytes VERBATIM (unlike
+// Write, which sanitizeOutput would strip), while still escaping IAC so a raw 0xFF can't inject a telnet
+// command.
+func TestWriteScreenPreservesRawANSI(t *testing.T) {
+	var out bytes.Buffer
+	c := NewReadWriter(&bytes.Buffer{}, &out)
+
+	// A clear-screen + cursor-home sequence survives byte-for-byte.
+	seq := "\x1b[2J\x1b[H"
+	if err := c.WriteScreen([]byte(seq)); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != seq {
+		t.Fatalf("WriteScreen = %q; want the raw ANSI %q verbatim (no sanitize)", got, seq)
+	}
+
+	// Contrast: the normal Write path strips the same ESC bytes.
+	out.Reset()
+	if err := c.Write(seq); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(out.Bytes(), []byte{0x1b}) {
+		t.Fatalf("Write must strip raw ESC; got % x", out.Bytes())
+	}
+}
+
+// TestWriteScreenEscapesIAC: a raw 0xFF in screen data is doubled (telnet framing), even on the raw path.
+func TestWriteScreenEscapesIAC(t *testing.T) {
+	var out bytes.Buffer
+	c := NewReadWriter(&bytes.Buffer{}, &out)
+	if err := c.WriteScreen([]byte{0x1b, iac, 'x'}); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.Bytes(); !bytes.Equal(got, []byte{0x1b, iac, iac, 'x'}) {
+		t.Fatalf("WriteScreen = % x; want ESC IAC IAC x", got)
+	}
+}

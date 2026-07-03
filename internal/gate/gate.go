@@ -840,6 +840,14 @@ func (s *Server) renderFrame(log *slog.Logger, c *connState, f *playv1.ServerFra
 		default:
 			log.Debug("gmcp frame dropped: package not advertised", "pkg", pkg)
 		}
+	case *playv1.ServerFrame_Screen:
+		// Trusted full-screen/ANSI output (#31): write the raw bytes VERBATIM (IAC-escaped, but NOT
+		// sanitized or color-rendered) so cursor/erase/scroll control survives. Provenance is the world's
+		// responsibility — only engine-owned output or a trust-gated screen.* capability emits this frame,
+		// so player text never reaches the raw path. No word-wrap, no trailing newline (the bytes are a
+		// complete screen sequence).
+		log.Debug("frame rendered", "frame", "screen", "bytes", len(pl.Screen.GetData()))
+		return tc.WriteScreen(pl.Screen.GetData())
 	case *playv1.ServerFrame_Disconnect:
 		log.Debug("frame rendered", "frame", "disconnect", "reason", pl.Disconnect.GetReason())
 		return tc.Write("\r\n" + pl.Disconnect.GetReason() + "\r\n")
