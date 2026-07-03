@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 )
 
 // luascreen_test.go — #31 Slice 5: the `screen` sandbox capability (luascreen.go). Covers the builder API
@@ -22,6 +23,42 @@ func runScreen(t *testing.T, script string) string {
 		t.Fatalf("script errored: %v", err)
 	}
 	return drainForScreen(t, player)
+}
+
+// TestScreenProvenanceNormalSendCannotEmitRawANSI pins the OTHER half of the raw-ANSI provenance boundary
+// (#31): the trusted screen.* path (screenShow -> screenFrame) is the ONLY producer of a raw Screen frame,
+// the one output the gate writes verbatim without sanitizing. The sibling tests prove the screen.* API
+// itself is safe-by-construction; this guards the complementary seam — that UNTRUSTED content routing text
+// through the NORMAL output op (self:send) cannot smuggle raw ANSI. Even carrying a full-screen clear +
+// reset, self:send must go through textsan.CleanMarkup and arrive as an ordinary Output frame with the ESC
+// stripped — never a Screen frame. A regression that let content emit raw terminal control through the
+// normal path (cursor moves, OSC clipboard writes, screen wipes) would be caught here.
+func TestScreenProvenanceNormalSendCannotEmitRawANSI(t *testing.T) {
+	z := newZone("screen")
+	player := makeRoomPlayer(z, "Viewer")
+	room := player.entity.location
+	z.rooms[room.proto] = room
+
+	// Content sends text carrying a raw full-screen clear and a raw SGR reset through the normal op.
+	if err := z.lua.runChunkWithSelf(t.Name(), `self:send("\x1b[2J danger \x1b[0m")`, player.entity); err != nil {
+		t.Fatalf("script errored: %v", err)
+	}
+
+	select {
+	case f := <-player.out:
+		if sc := f.GetScreen(); sc != nil {
+			t.Fatalf("content self:send produced a raw Screen frame — provenance boundary breached: %q", sc.GetData())
+		}
+		out := f.GetOutput()
+		if out == nil {
+			t.Fatalf("content self:send should produce an ordinary Output frame, got payload %T", f.GetPayload())
+		}
+		if strings.ContainsRune(out.GetMarkup(), 0x1b) {
+			t.Fatalf("content output must be ESC-sanitized (only the trusted screen path emits raw ANSI); leaked: %q", out.GetMarkup())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no frame emitted from self:send")
+	}
 }
 
 // TestScreenBuildsSafeANSI: the primitives render to the expected bounded ANSI (erase, cursor move, SGR
