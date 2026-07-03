@@ -101,4 +101,29 @@ func TestHandleTierCommand(t *testing.T) {
 	if strings.Contains(out, "connection refused") {
 		t.Fatalf("the raw transport error must NOT be leaked to the player: %q", out)
 	}
+
+	// Intercept boundary: only the EXACT verbs `promote`/`demote` are gate-owned. A look-alike prefix
+	// (`promotexyz`) must NOT be intercepted — it falls through to the world untouched. Guards against a
+	// future refactor to prefix-matching that would silently swallow a bogus command.
+	if h, _ := run(&tierFakeAccount{}, "promotexyz Bob admin"); h {
+		t.Fatal("a look-alike prefix (`promotexyz`) must not be intercepted as a tier verb")
+	}
+
+	// `demote` with wrong arity → usage, no RPC (symmetric with the promote arity case).
+	fa = &tierFakeAccount{}
+	_, out = run(fa, "demote")
+	if fa.called != 0 || !strings.Contains(out, "Usage:") {
+		t.Fatalf("bad demote arity should print usage without calling the service; out=%q calls=%d", out, fa.called)
+	}
+
+	// Empty actor passthrough: the dev-autoauth path yields accountID=="" and the account SERVICE rejects it
+	// (InvalidArgument). The edge must forward the empty actor VERBATIM — never synthesize/fill in an identity —
+	// so the authority can reject it. Here we assert the forwarding (the fake can't replicate the real
+	// service's rejection): actor is passed through unchanged and the service is still called.
+	var out2 bytes.Buffer
+	faEmpty := &tierFakeAccount{ok: false, reason: "not authorized"}
+	handleTierCommand(context.Background(), telnet.NewReadWriter(&bytes.Buffer{}, &out2), faEmpty, "", "promote Bob admin", discardLogger())
+	if faEmpty.called != 1 || faEmpty.gotActor != "" {
+		t.Fatalf("empty actor must be forwarded verbatim (never synthesized): gotActor=%q calls=%d", faEmpty.gotActor, faEmpty.called)
+	}
 }
