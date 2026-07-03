@@ -44,16 +44,12 @@ type trustLadder struct {
 	byName map[string]trustTier
 }
 
-// defaultTrustLadder is the engine's built-in ladder: the round-8 player/builder/admin mapping, expressed
-// as ranks + granted flags. player is the un-elevated baseline (rank 0, no flags); builder + admin carry
-// holylight (see-all) so they can see what they build; admin adds the admin flag. Ranks leave gaps (10/30)
-// so a pack can slot moderator/architect between them without renumbering.
+// defaultTrustLadder is the engine's built-in ladder: the round-8 player/builder/admin mapping. It is
+// SOURCED from content.DefaultTrustTiers() — the single default shared with telos-account (content/
+// trusttier.go) — so the world and the account authority never drift on the default ranks/flags. Its flag
+// names ("holylight"/"builder"/"admin") equal the world reserved-flag constants by value.
 func defaultTrustLadder() *trustLadder {
-	return &trustLadder{byName: map[string]trustTier{
-		tierPlayer:  {rank: 0},
-		tierBuilder: {rank: 20, flags: []string{flagHolylight, flagBuilder}},
-		tierAdmin:   {rank: 40, flags: []string{flagHolylight, flagBuilder, flagAdmin}},
-	}}
+	return buildTrustLadder(content.DefaultTrustTiers())
 }
 
 // rank returns the ordinal rank of tier `name`. An empty, "player", or ANY unknown/drifted value maps to

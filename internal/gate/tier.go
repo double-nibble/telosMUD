@@ -28,7 +28,9 @@ func handleTierCommand(ctx context.Context, tc *telnet.Conn, ac AccountClient, a
 	switch strings.ToLower(fields[0]) {
 	case "promote":
 		if len(fields) != 3 {
-			_ = tc.Write("Usage: promote <character> <player|builder|admin>\r\n")
+			// Tiers are content-defined (#29): the edge does not enumerate them. An unknown tier is refused
+			// by the account service with the known-tier list, so the authoritative vocabulary lives there.
+			_ = tc.Write("Usage: promote <character> <tier>\r\n")
 			return true
 		}
 		target, tier = fields[1], strings.ToLower(fields[2])

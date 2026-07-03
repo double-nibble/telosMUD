@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -68,6 +69,11 @@ type Service struct {
 	verifyBaseURL string
 	// maxCharacters caps how many characters an account may own (Phase 15.4, configurable; default below).
 	maxCharacters int
+	// trustTiers is the resolved content trust ladder (#27/#29 Slice 0b): SetAccountTier validates the
+	// requested tier and authorizes the actor against it (rank + the manage-tiers capability). nil until
+	// WithTrustLadder; trustLadder() substitutes the default ladder (player/builder/admin) so a service
+	// built without content authorizes promotes exactly as round-8 did.
+	trustTiers *content.TrustLadder
 }
 
 // defaultMaxCharacters is the per-account character cap when none is configured.
@@ -110,6 +116,23 @@ func (s *Service) WithChargen(flow content.ChargenDTO, options []content.Chargen
 // renders its chargen prompts from these).
 func (s *Service) ChargenFlow() (content.ChargenDTO, []content.ChargenBundleOption, bool) {
 	return s.chargenFlow, s.chargenOptions, s.chargenOK
+}
+
+// WithTrustLadder wires the content-defined trust ladder (#27/#29 Slice 0b): SetAccountTier validates the
+// requested tier + authorizes the actor against it. An empty/absent ladder falls back to the built-in
+// player/builder/admin ladder, preserving round-8 promote authz.
+func (s *Service) WithTrustLadder(tiers []content.TrustTierDTO) *Service {
+	s.trustTiers = content.NewTrustLadder(tiers)
+	return s
+}
+
+// trustLadder returns the resolved ladder, defaulting to the built-in ladder when none was wired (so a
+// service constructed without content still authorizes promotes as round-8 did).
+func (s *Service) trustLadder() *content.TrustLadder {
+	if s.trustTiers != nil {
+		return s.trustTiers
+	}
+	return content.NewTrustLadder(nil)
 }
 
 // BuildCharacter validates a chargen submission (name + the flow's picks/allocations) and creates the
@@ -301,33 +324,48 @@ func (s *Service) IssueSessionAssertion(ctx context.Context, req *accountv1.Issu
 	return &accountv1.IssueSessionAssertionResponse{Assertion: tok}, nil
 }
 
-// validTiers is the set of assignable trust tiers (#27) — mirrors the accounts.tier CHECK (migration 00019).
-var validTiers = map[string]bool{store.TierPlayer: true, store.TierBuilder: true, store.TierAdmin: true}
-
-// SetAccountTier is the promote/demote authority (#27). AUTHZ IS HERE, not the edge: it reads the ACTOR's
-// tier from the store and refuses unless the actor is an admin — so a compromised/forged edge request from a
-// non-admin account cannot elevate anyone. It resolves the target character to its account, writes the new
-// tier + an audit row (actor recorded), and returns the previous tier. The change takes effect on the
-// target's NEXT login (the assertion re-reads the tier). A user-facing refusal rides ok=false + reason (the
-// gate prints it); only unexpected I/O is a gRPC error.
+// SetAccountTier is the promote/demote authority (#27; content-tier-aware since #29 Slice 0b). AUTHZ IS
+// HERE, not the edge: it reads the ACTOR's tier from the store and resolves it against the content trust
+// ladder, so a compromised/forged edge request from an under-privileged account cannot elevate anyone. The
+// rank model (replacing the round-8 hardcoded actor==admin gate):
+//
+//   - the actor's current tier must grant the manage-tiers capability (content.FlagAdmin) — content decides
+//     which tiers are admin-capable (the default ladder: only "admin");
+//   - the requested tier must be a DEFINED tier in the ladder;
+//   - CEILING: the actor may not grant a tier ranked ABOVE its own standing, nor change the tier of an
+//     account that OUTRANKS it — so no one can mint a peer/superior or demote someone above them.
+//
+// For the default ladder this is byte-for-byte round-8 (admin, the top rank, may set any of the three
+// tiers on anyone). It resolves the target character to its account, writes the new tier + an audit row,
+// and returns the previous tier. Effect on the target's NEXT login. A user-facing refusal rides ok=false +
+// reason; only unexpected I/O is a gRPC error. Authz runs BEFORE tier/target validation so the tier
+// vocabulary and character existence are never disclosed to an unauthorized actor.
 func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountTierRequest) (*accountv1.SetAccountTierResponse, error) {
 	if req.GetActorAccountId() == "" || req.GetTargetCharacter() == "" {
 		return nil, status.Error(codes.InvalidArgument, "actor_account_id and target_character required")
 	}
-	// AUTHZ FIRST (before any other validation): the actor must be an admin, per the authoritative store
-	// (never the edge's word). Checking this before tier/target validation avoids disclosing the tier
-	// vocabulary or probing character existence to a non-admin.
+	ladder := s.trustLadder()
+	// AUTHZ FIRST: the actor's current tier must grant the manage-tiers capability, per the authoritative
+	// store (never the edge's word).
 	actorTier, found, err := s.store.AccountTier(ctx, req.GetActorAccountId())
 	if err != nil {
 		s.log.Error("SetAccountTier: actor tier", "actor", req.GetActorAccountId(), "err", err)
 		return nil, status.Error(codes.Internal, "tier lookup failed")
 	}
-	if !found || actorTier != store.TierAdmin {
-		s.log.Warn("SetAccountTier refused: actor not admin", "actor", req.GetActorAccountId(), "actor_tier", actorTier)
+	if !found || !ladder.GrantsFlag(actorTier, content.FlagAdmin) {
+		s.log.Warn("SetAccountTier refused: actor lacks manage-tiers capability",
+			"actor", req.GetActorAccountId(), "actor_tier", actorTier)
 		return &accountv1.SetAccountTierResponse{Reason: "You are not authorized to change trust tiers."}, nil
 	}
-	if !validTiers[req.GetNewTier()] {
-		return &accountv1.SetAccountTierResponse{Reason: "Unknown tier (use player, builder, or admin)."}, nil
+	// The requested tier must be a defined tier in the content ladder.
+	if !ladder.Has(req.GetNewTier()) {
+		names := ladder.Names()
+		sort.Strings(names)
+		return &accountv1.SetAccountTierResponse{Reason: "Unknown tier (known: " + strings.Join(names, ", ") + ")."}, nil
+	}
+	// Ceiling: the actor may not grant a tier ranked above its own standing.
+	if ladder.Rank(req.GetNewTier()) > ladder.Rank(actorTier) {
+		return &accountv1.SetAccountTierResponse{Reason: "You cannot grant a tier above your own standing."}, nil
 	}
 	// Resolve the target character to its owning account.
 	target, found, err := s.store.AccountByCharacterName(ctx, req.GetTargetCharacter())
@@ -337,6 +375,18 @@ func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountT
 	}
 	if !found {
 		return &accountv1.SetAccountTierResponse{Reason: "No such character."}, nil
+	}
+	// Ceiling: the actor may not change the tier of an account that outranks it. A target with no tier row
+	// (not found) reads as the rank-0 baseline via Rank(""), which no authorized actor outranks — so the
+	// found flag is deliberately ignored (defense-in-depth: the guard degrades to "allow the baseline",
+	// never to "skip the check").
+	targetTier, _, err := s.store.AccountTier(ctx, target)
+	if err != nil {
+		s.log.Error("SetAccountTier: target tier", "target", target, "err", err)
+		return nil, status.Error(codes.Internal, "tier lookup failed")
+	}
+	if ladder.Rank(targetTier) > ladder.Rank(actorTier) {
+		return &accountv1.SetAccountTierResponse{Reason: "You cannot change the tier of someone above your own standing."}, nil
 	}
 	old, err := s.store.SetAccountTier(ctx, req.GetActorAccountId(), target, req.GetNewTier())
 	if err != nil {

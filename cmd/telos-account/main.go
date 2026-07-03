@@ -68,14 +68,24 @@ func main() {
 
 	svc.WithMaxCharacters(cfg.MaxCharacters)
 
-	// Chargen (Phase 14.8/15.4): load the pack's content once and hand the service the chargen flow + bundle
-	// options, so the gate can render + validate prompt-driven creation. A content reload needs a restart to
-	// take effect here. No content => no create-character flow.
-	if flow, options, ok := loadChargen(ctx, pool); ok {
+	// Content (Phase 14.8/15.4 + #27/#29): load the pack once — it feeds BOTH the chargen flow and the trust
+	// ladder (tier validation + promote authz). A content reload needs a restart to take effect here.
+	lc, err := content.Load(ctx, pool, []string{content.DemoPack})
+	if err != nil {
+		slog.Warn("content load failed; using defaults (no chargen flow, built-in trust ladder)", "err", err)
+		lc = &content.LoadedContent{}
+	}
+	if flow, options, ok := chargenFrom(lc); ok {
 		svc.WithChargen(flow, options)
 		slog.Info("chargen flow loaded", "steps", len(flow.Steps), "bundle_options", len(options))
 	} else {
 		slog.Warn("no chargen flow in content: the gate offers no create-character flow")
+	}
+	// Trust ladder (#27/#29 Slice 0b): SetAccountTier validates + authorizes promotes against it. An empty
+	// content ladder falls back to the built-in player/builder/admin ladder (round-8 authz).
+	svc.WithTrustLadder(lc.TrustTiers)
+	if n := len(lc.TrustTiers); n > 0 {
+		slog.Info("content trust ladder loaded", "tiers", n)
 	}
 
 	// Redis backs the Phase-15 device-auth sessions (the terminal OAuth bridge). Without Redis the device
@@ -163,11 +173,11 @@ func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer)
 	})
 }
 
-// loadChargen loads the pack content and returns the chargen flow + the selectable bundle options (race/class/
-// …) the gate's prompt-driven chargen renders. ok=false when content is absent or defines no chargen flow.
-func loadChargen(ctx context.Context, pool *store.Pool) (content.ChargenDTO, []content.ChargenBundleOption, bool) {
-	lc, err := content.Load(ctx, pool, []string{content.DemoPack})
-	if err != nil || lc == nil || len(lc.Chargens) == 0 {
+// chargenFrom extracts the chargen flow + the selectable bundle options (race/class/…) the gate's
+// prompt-driven chargen renders from already-loaded content. ok=false when content is absent or defines no
+// chargen flow. Pure (no I/O) so the caller loads the pack once and feeds both chargen and the trust ladder.
+func chargenFrom(lc *content.LoadedContent) (content.ChargenDTO, []content.ChargenBundleOption, bool) {
+	if lc == nil || len(lc.Chargens) == 0 {
 		return content.ChargenDTO{}, nil, false
 	}
 	flow := lc.Chargens[0] // one flow per pack by convention
