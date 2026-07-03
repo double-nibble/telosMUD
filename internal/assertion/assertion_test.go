@@ -1,6 +1,7 @@
 package assertion
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -72,11 +73,11 @@ func TestVerifyRejectsTamperedPayload(t *testing.T) {
 	}
 }
 
-// TestVerifyRejectsForgedTierElevation (#27 security): the trust tier lives INSIDE the signed payload, so an
-// attacker who keeps every other claim but flips only the tier (player -> admin) and reattaches the original
-// signature is rejected. This is distinct from TestVerifyRejectsTamperedPayload (which forges the account) —
-// it pins the ELEVATION-forge vector specifically, the exact attack the signed-tier design (#27) exists to
-// stop. If a refactor ever moved the tier out of the signed bytes, this fails.
+// TestVerifyRejectsForgedTierElevation (#27 security): a dedicated NEGATIVE guard for the elevation-forge
+// vector — keep every other claim, flip only the tier (player -> admin), reattach the original signature ->
+// rejected. Distinct from TestVerifyRejectsTamperedPayload (which forges the account). (The complementary
+// POSITIVE property — that the tier is actually inside the signed bytes — is pinned by TestSignVerifyRoundTrip,
+// which signs Tier:"admin" and asserts it round-trips.)
 func TestVerifyRejectsForgedTierElevation(t *testing.T) {
 	pub, priv := mustKeys(t)
 	now := time.Unix(1000, 0)
@@ -89,6 +90,43 @@ func TestVerifyRejectsForgedTierElevation(t *testing.T) {
 	forged := b64.EncodeToString(fb) + "." + sigB64
 	if _, err := Verify(pub, forged, now); err != ErrSignature {
 		t.Fatalf("forged tier elevation: err = %v, want ErrSignature", err)
+	}
+}
+
+// TestVerifyRejectsDuplicateKeyTierElevation (#27 security) locks the SIGN==VERIFY byte-identity property:
+// Verify checks the signature over the raw payload bytes and unmarshals THOSE SAME bytes, so there is no
+// canonicalization seam an attacker can wedge between "what was signed" and "what is read". The attack it
+// guards: take a legitimately-signed player token and append a DUPLICATE `"tier":"admin"` key — Go's
+// encoding/json is last-key-wins, so a naive reader would see admin. Because the bytes now differ from what
+// was signed (and the attacker cannot re-sign), Verify must reject with ErrSignature. A future refactor that
+// canonicalized/normalized the payload BEFORE checking the signature (then unmarshalled the raw form) would
+// silently reopen this; this test fails the moment that happens.
+func TestVerifyRejectsDuplicateKeyTierElevation(t *testing.T) {
+	pub, priv := mustKeys(t)
+	now := time.Unix(1000, 0)
+	tok, _ := Sign(priv, Claims{Account: "acct-1", Session: "s", Tier: "player", Expires: now.Add(time.Minute).Unix()})
+
+	payloadB64, sigB64, _ := strings.Cut(tok, ".")
+	raw, err := b64.DecodeString(payloadB64)
+	if err != nil {
+		t.Fatalf("decode signed payload: %v", err)
+	}
+	// Inject a duplicate tier key so a last-key-wins unmarshal would read admin.
+	forgedRaw := bytes.Replace(raw, []byte(`"tier":"player"`), []byte(`"tier":"player","tier":"admin"`), 1)
+	if bytes.Equal(forgedRaw, raw) {
+		t.Fatal("precondition: expected to find and duplicate the tier key in the signed payload")
+	}
+
+	// Precondition: the forged bytes REALLY do decode to admin (so it's the signature check, not JSON
+	// semantics, that saves us — otherwise this test would be vacuous).
+	var c Claims
+	if err := json.Unmarshal(forgedRaw, &c); err != nil || c.Tier != "admin" {
+		t.Fatalf("precondition: duplicate-key payload should unmarshal to admin, got tier=%q err=%v", c.Tier, err)
+	}
+
+	forged := b64.EncodeToString(forgedRaw) + "." + sigB64
+	if _, err := Verify(pub, forged, now); err != ErrSignature {
+		t.Fatalf("duplicate-key tier elevation: err = %v, want ErrSignature", err)
 	}
 }
 
