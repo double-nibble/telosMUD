@@ -25,8 +25,8 @@ func TestTwoPlayerFanout(t *testing.T) {
 
 	// Unique, capitalized names (the act render initial-caps $n; a capitalized name renders unchanged, so the
 	// asserted strings are exact). <=20 runes, leading letter, no dot — the gate's login constraints.
-	nameA := fmt.Sprintf("Alpha%d", time.Now().UnixNano()%1_000_000)
-	nameB := fmt.Sprintf("Bravo%d", time.Now().UnixNano()%1_000_000)
+	nameA := fmt.Sprintf("Alpha%d", time.Now().UnixNano()%1_000_000_000)
+	nameB := fmt.Sprintf("Bravo%d", time.Now().UnixNano()%1_000_000_000)
 
 	// Both log in and land in the same room (the temple). A logs in first so it is already present when B
 	// arrives; both are confirmed spawned before A acts, so B is guaranteed in the room for the broadcasts.
