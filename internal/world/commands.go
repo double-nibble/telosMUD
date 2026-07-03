@@ -69,6 +69,9 @@ func registerCommands() []*Command {
 	// Mail (Phase 8.7): the durable inbox. Registered last with the other comms commands so it never
 	// shadows a movement/look/say verb.
 	base = append(base, mailCommands()...)
+	// Screen utilities (#31): `clear` — engine-owned raw-ANSI output, universal. Low-priority so `cl` still
+	// abbreviates to `close`.
+	base = append(base, screenCommands()...)
 	// Staff verbs (#29 stat, #30 view toggles): registered LAST (lowest priority) and each carries a
 	// positive MinRank, so a staff verb is both invisible below that rank (dispatch gate) and never wins an
 	// abbreviation against a mortal verb.

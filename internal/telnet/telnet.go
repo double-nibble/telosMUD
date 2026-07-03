@@ -37,6 +37,7 @@ package telnet
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"log/slog"
 	"strings"
@@ -421,6 +422,21 @@ func sanitizeOutput(s string) string {
 		i += size
 	}
 	return b.String()
+}
+
+// WriteScreen sends pre-formed raw terminal bytes (a TRUSTED full-screen/ANSI sequence: cursor
+// positioning, erase, scroll regions, a clear) STRAIGHT to the socket, BYPASSING sanitizeOutput and the
+// color-token renderer — so the terminal control survives instead of being stripped (the whole point of
+// #31). It is the trusted output mode: the CALLER guarantees provenance (engine-owned output, or a
+// trust-gated screen.* capability); player-authored text must NEVER reach here, because sanitizeOutput —
+// the guard that neutralizes hostile ESC/cursor injection — is exactly what this skips. IAC (0xFF) IS still
+// escaped: that is a telnet framing requirement (a raw 0xFF must not be misread as a telnet command), NOT
+// terminal sanitization, so it does not defeat the raw ANSI. Mutex + write deadline are honored like Write.
+func (c *Conn) WriteScreen(b []byte) error {
+	if bytes.IndexByte(b, iac) >= 0 {
+		b = bytes.ReplaceAll(b, []byte{iac}, []byte{iac, iac})
+	}
+	return c.writeRaw(b)
 }
 
 // writeRaw writes b to the underlying connection under the write mutex, so the
