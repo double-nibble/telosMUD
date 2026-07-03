@@ -43,10 +43,19 @@ const (
 // registration from the table's declared order (see registerCommands), so it is stable
 // and data-driven, not scattered across handlers.
 type Command struct {
-	Name     string
-	Aliases  []string
-	MinPos   int     // minimum Living.position to run; shape only this slice (MUDLIB §6)
-	Level    int     // minimum level / admin gate; shape only this slice
+	Name    string
+	Aliases []string
+	MinPos  int // minimum Living.position to run; shape only this slice (MUDLIB §6)
+	Level   int // minimum level / admin gate; shape only this slice
+	// MinRank is the minimum TRUST rank (content-defined ladder, #29) required to run the command. 0 = no
+	// trust gate (the default — every mortal verb). A positive value gates a STAFF verb: dispatch resolves
+	// the actor's account tier to a rank via the zone's trust ladder and, if it is below MinRank, treats
+	// the verb as NON-EXISTENT — the resolve falls through to the unknown-verb path, indistinguishable from
+	// "Huh?", so the command's existence never leaks to a mortal (the classic wiz-command posture). Because
+	// the ladder is content-defined, MinRank=1 means "any tier above the baseline" (any staff), independent
+	// of the pack's specific tier names. Staff verbs register at LOW priority so they never win an
+	// abbreviation against a mortal verb.
+	MinRank  int
 	Flags    CmdFlag // modifiers; shape only this slice
 	Run      func(*Context) error
 	priority int // abbreviation tie-break; set by the registry, lower wins
@@ -189,6 +198,14 @@ func (z *Zone) dispatch(s *session, line string) {
 	z.clearAFKOnInput(s, lower)
 
 	cmd, ok := baseTable.resolve(lower)
+	// Trust-rank gate (#29): a staff verb (MinRank > 0) is INVISIBLE to anyone below that rank — treat it
+	// as unresolved so the unknown-verb fallthrough runs (ability/custom/channel/"Huh?"), never leaking
+	// that the verb exists nor which fallthrough it displaced. The actor's rank comes from the account tier
+	// on the session (applied from the VERIFIED assertion) resolved through the zone's content trust
+	// ladder. Checked here, once, so "gated + hidden" is a single MinRank declaration.
+	if ok && cmd.MinRank > 0 && z.trustLadder().rank(s.tier) < cmd.MinRank {
+		cmd, ok = nil, false
+	}
 	if !ok {
 		// Not a built-in verb: try a content-defined ability command (Phase 5.3). The ability table is
 		// consulted AFTER the baseTable so a content ability never shadows a core verb. A match enters
