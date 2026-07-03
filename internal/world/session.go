@@ -45,6 +45,12 @@ type session struct {
 	// and entity together on a transfer, so only one zone goroutine ever touches the pair.
 	entity *Entity
 
+	// tier is the account trust tier (#27) from the VERIFIED session assertion, set on fresh-login attach.
+	// player/builder/admin; "" (== player) on the dev/unverified path. It is a LOGIN-TIME input the zone
+	// uses to apply the matching builder/admin flags on spawn (Slice 3) — NOT runtime state (the applied
+	// flags, which ride the entity across a handoff, are the source of truth after spawn). Zone-goroutine-owned.
+	tier string
+
 	// lastVitals / lastStatus are the last GMCP Char.Vitals / Char.Status payloads emitted to this
 	// session (Phase 9.2). sendPrompt re-emits a HUD frame only when its payload CHANGED, so an
 	// unchanging vitals line isn't re-sent on every prompt. Zone-goroutine-owned (set only in

@@ -24,7 +24,7 @@ func mustKeys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 func TestSignVerifyRoundTrip(t *testing.T) {
 	pub, priv := mustKeys(t)
 	now := time.Unix(1000, 0)
-	claims := Claims{Account: "acct-1", Character: "Aragorn", Session: "sess-9", Expires: now.Add(time.Minute).Unix()}
+	claims := Claims{Account: "acct-1", Character: "Aragorn", Session: "sess-9", Expires: now.Add(time.Minute).Unix(), Tier: "admin"}
 
 	tok, err := Sign(priv, claims)
 	if err != nil {

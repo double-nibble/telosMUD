@@ -35,6 +35,8 @@ type CharStore interface {
 	CreateAccountCharacter(ctx context.Context, accountID, name, zoneRef, roomRef string, state, chargen []byte) (string, error)
 	// CreateCharacterWithChargen (Phase 14.8) creates a character carrying the first-spawn chargen marker.
 	CreateCharacterWithChargen(ctx context.Context, accountID, name, zoneRef, roomRef string, bundles []string, attrs map[string]float64) (string, error)
+	// AccountTier (#27) returns the account's trust tier — signed into the session assertion.
+	AccountTier(ctx context.Context, accountID string) (string, bool, error)
 }
 
 // Service implements the Account gRPC server. It is transport-thin: validation + a store call + a mapping to
@@ -266,18 +268,27 @@ func (s *Service) WithSigningKey(priv ed25519.PrivateKey) *Service {
 // IssueSessionAssertion mints a short-lived signed assertion binding {account, character, session} (Phase
 // 14.3). The gate calls it after login; the world verifies it offline on Attach. With no signing key the
 // assertion is empty (auth disabled) — the response is still OK so the gate's flow is unconditional.
-func (s *Service) IssueSessionAssertion(_ context.Context, req *accountv1.IssueSessionAssertionRequest) (*accountv1.IssueSessionAssertionResponse, error) {
+func (s *Service) IssueSessionAssertion(ctx context.Context, req *accountv1.IssueSessionAssertionRequest) (*accountv1.IssueSessionAssertionResponse, error) {
 	if req.GetAccountId() == "" || req.GetSessionId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "account_id and session_id required")
 	}
 	if s.signKey == nil {
 		return &accountv1.IssueSessionAssertionResponse{}, nil // assertions disabled
 	}
+	// The trust tier (#27) is signed INTO the assertion so the world trusts it offline (no per-connect RPC).
+	// FAIL SAFE: a read error / unknown account degrades to player — an error must never elevate a tier.
+	tier := store.TierPlayer
+	if t, found, err := s.store.AccountTier(ctx, req.GetAccountId()); err != nil {
+		s.log.Error("IssueSessionAssertion: tier read (defaulting to player)", "account", req.GetAccountId(), "err", err)
+	} else if found {
+		tier = t
+	}
 	tok, err := assertion.Sign(s.signKey, assertion.Claims{
 		Account:   req.GetAccountId(),
 		Character: req.GetCharacterId(),
 		Session:   req.GetSessionId(),
 		Expires:   s.now().Add(assertionTTL).Unix(),
+		Tier:      tier,
 	})
 	if err != nil {
 		s.log.Error("IssueSessionAssertion: sign", "account", req.GetAccountId(), "err", err)

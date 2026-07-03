@@ -89,6 +89,12 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// account's public key — OFFLINE, no per-connect RPC. A handoff re-dial is trusted via its handoff token
 	// (and the short assertion TTL would falsely reject a late cross-shard walk), so it is NOT re-verified.
 	// When no verify key is configured the shard trusts the gate's asserted identity directly (dev/pre-14.3).
+	// loginTier is the account trust tier (#27) from the VERIFIED assertion, carried to the session so the
+	// zone can apply the matching builder/admin flags on spawn (Slice 3). Empty on the dev/unverified path
+	// and on a handoff re-dial (token != "" — the tier's applied flags ride the entity snapshot, not this
+	// claim), which correctly means "player, unless the verified claim elevated it". Never trusted from an
+	// unverified source: only a signature-checked claim sets it.
+	var loginTier string
 	if token == "" && s.shard.verifyKey != nil {
 		claims, err := assertion.Verify(s.shard.verifyKey, attach.GetSessionAssertion(), time.Now())
 		if err != nil {
@@ -102,6 +108,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 				"claim_session", claims.Session, "claim_character", claims.Character)
 			return status.Error(codes.Unauthenticated, "session assertion mismatch")
 		}
+		loginTier = claims.Tier
 	}
 
 	// Decide which hosted zone this connection starts in: a handoff re-dial binds to
@@ -198,6 +205,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		inputSeq:    attach.GetInputSeq(),
 		loaded:      loaded,
 		loadedOK:    loadedOK,
+		tier:        loginTier,
 	})
 	s.log.Debug("player stream ready", "character", character, "zone", zone.id)
 
