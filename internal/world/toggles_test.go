@@ -96,3 +96,79 @@ func TestRollsToggleUpgradesDefaultHiddenCheck(t *testing.T) {
 		t.Fatalf("rolls on must not override an explicit content visHide, got %v", out)
 	}
 }
+
+// TestWizinvisHidesFromLowerRank: a staff member with wizinvis is concealed from a strictly-lower-rank
+// viewer (a mortal), but visible to an equal/higher rank, to a holylight viewer, and to themselves.
+func TestWizinvisHidesFromLowerRank(t *testing.T) {
+	z, staff := abilityTestZone(t)
+	staff.tier = tierBuilder // rank 20
+	setFlag(staff.entity, flagWizinvis, true)
+
+	mortal := makePlayerTargetInRoom(z, staff.entity, "Pleb") // tier "" => rank 0
+	admin := makePlayerTargetInRoom(z, staff.entity, "Boss")
+	admin.tier = tierAdmin // rank 40
+
+	if visibleTo(mortal.entity, staff.entity) {
+		t.Error("a mortal (rank 0) must not see a wizinvis builder (rank 20)")
+	}
+	if !visibleTo(admin.entity, staff.entity) {
+		t.Error("an admin (rank 40) must still see a wizinvis builder (equal/higher rank)")
+	}
+	if !visibleTo(staff.entity, staff.entity) {
+		t.Error("a wizinvis staffer must always see themselves")
+	}
+	// A holylight viewer sees everyone regardless.
+	setFlag(mortal.entity, flagHolylight, true)
+	if !visibleTo(mortal.entity, staff.entity) {
+		t.Error("a holylight viewer must see a wizinvis staffer")
+	}
+}
+
+// TestWizinvisCommandGateAndToggle: a player can neither see nor run `wizinvis`; a staff member flips it.
+func TestWizinvisCommandGateAndToggle(t *testing.T) {
+	z, staff := abilityTestZone(t)
+	staff.tier = tierBuilder
+	z.dispatch(staff, "wizinvis on")
+	if !hasFlag(staff.entity, flagWizinvis) {
+		t.Fatal("wizinvis on should set the flag for a staff member")
+	}
+	z.dispatch(staff, "wizinvis off")
+	if hasFlag(staff.entity, flagWizinvis) {
+		t.Fatal("wizinvis off should clear the flag")
+	}
+
+	z2, player := abilityTestZone(t)
+	z2.dispatch(player, "wizinvis on")
+	if !drainContains(t, player, "Huh?") {
+		t.Fatal("a player typing `wizinvis` must get the unknown-verb response (staff verb is invisible)")
+	}
+	if hasFlag(player.entity, flagWizinvis) {
+		t.Fatal("a player must not be able to set wizinvis")
+	}
+}
+
+// TestWizinvisIsReserved: wizinvis is content-unsettable and CLEARED at login (session-scoped reset), like
+// the elevation flags — so a relog drops it and content can never self-conceal a mortal.
+func TestWizinvisIsReserved(t *testing.T) {
+	if !reservedFlag(flagWizinvis) {
+		t.Fatal("wizinvis must be a reserved flag")
+	}
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+
+	// Content set_flag of wizinvis is refused (a mortal can't self-conceal).
+	c := seededCtx(z, e, e, dispHelpful)
+	if err := opSetFlag(c, &effectOp{flag: flagWizinvis}); err != nil {
+		t.Fatalf("opSetFlag: %v", err)
+	}
+	if hasFlag(e, flagWizinvis) {
+		t.Error("content set_flag must not set the reserved wizinvis flag")
+	}
+
+	// Set it via the trusted path, then a fresh-login reconcile clears it (no tier grants wizinvis).
+	setFlag(e, flagWizinvis, true)
+	applyTierFlags(e, "admin") // admin grants holylight/builder/admin — but never wizinvis
+	if hasFlag(e, flagWizinvis) {
+		t.Error("applyTierFlags at login must clear wizinvis (session-scoped, no tier grants it)")
+	}
+}

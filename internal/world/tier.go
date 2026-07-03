@@ -44,13 +44,16 @@ type trustLadder struct {
 	byName map[string]trustTier
 }
 
-// defaultTrustLadder is the engine's built-in ladder: the round-8 player/builder/admin mapping. It is
-// SOURCED from content.DefaultTrustTiers() — the single default shared with telos-account (content/
-// trusttier.go) — so the world and the account authority never drift on the default ranks/flags. Its flag
-// names ("holylight"/"builder"/"admin") equal the world reserved-flag constants by value.
-func defaultTrustLadder() *trustLadder {
-	return buildTrustLadder(content.DefaultTrustTiers())
-}
+// defaultLadder is the engine's built-in ladder, built ONCE at init from content.DefaultTrustTiers() — the
+// single default shared with telos-account (content/trusttier.go) — so the world and the account authority
+// never drift on the default ranks/flags. Its flag names ("holylight"/"builder"/"admin") equal the world
+// reserved-flag constants by value. It is immutable (read-only after construction), so every zone with no
+// content trust_tiers shares this one instance; memoizing it keeps the hot-ish callers (the dispatch MinRank
+// gate, visibleTo's wizinvis rule) from rebuilding a map + slices per call.
+var defaultLadder = buildTrustLadder(content.DefaultTrustTiers())
+
+// defaultTrustLadder returns the shared built-in ladder (see defaultLadder).
+func defaultTrustLadder() *trustLadder { return defaultLadder }
 
 // rank returns the ordinal rank of tier `name`. An empty, "player", or ANY unknown/drifted value maps to
 // rank 0 — the fail-safe baseline (a garbage tier can never read as elevation; mirrors the Slice-2 posture).
@@ -107,14 +110,23 @@ func applyTierFlags(e *Entity, tier string) {
 	}
 }
 
-// reservedFlags are the TRUST/ELEVATION flags that ONLY the tier-application path (applyTierFlags) may set.
-// Content's set_flag / clear_flag ops refuse them — this closes the #28 audit gap where a builder pack could
-// grant itself see-all. NOTE: flagDetectInvis is deliberately NOT reserved — it is a bounded game mechanic
-// (a detect-invisibility spell/racial), not a trust capability like see-all / builder / admin.
+// reservedFlags are the ENGINE-MANAGED trust flags content may not set and persistence may not carry — the
+// tier-application path (applyTierFlags) and the staff toggle commands are their only writers. Being reserved
+// buys four behaviors at once, all keyed off this one set: content's set_flag/clear_flag ops refuse them
+// (effect_op_grant, closing the #28 audit gap where a builder pack could grant itself see-all); dumpFlags
+// omits them from the save; applyStateComponents skips them on restore (H-1: a forged snapshot can't inject
+// one); and applyTierFlags reconciles them at login (set the tier's granted set, CLEAR the rest).
+//
+// The set holds the three ELEVATION flags (holylight/builder/admin, granted by a tier) AND flagWizinvis, a
+// staff CONCEALMENT (#30): no tier grants wizinvis, so the login reconcile always CLEARS it — which is
+// exactly the session-scoped reset it wants (a relog drops wizinvis), while keeping it un-settable by content
+// (a mortal must not self-conceal) and off the persistence boundary. NOTE: flagDetectInvis is deliberately
+// NOT reserved — it is a bounded game mechanic (a detect-invisibility spell/racial), not an engine capability.
 var reservedFlags = map[string]bool{
 	flagHolylight: true,
 	flagBuilder:   true,
 	flagAdmin:     true,
+	flagWizinvis:  true,
 }
 
 // reservedFlag reports whether name is a reserved trust flag content may not set via an effect op.

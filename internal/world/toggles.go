@@ -14,17 +14,45 @@ import "strings"
 //     cannot self-elevate. Uses the TRUSTED setFlag path (content's set_flag can't touch reserved flags).
 //   - rolls on|off — surface the actor's OWN check roll math the engine would otherwise hide by default
 //     (check.go emitCheck reads session.showRolls). A pure session pref; content's explicit hide is kept.
+//   - wizinvis on|off — staff invisibility: hide from anyone of LOWER trust rank (visibility.go visibleTo).
+//     flagWizinvis is reserved (tier.go), so it is content-unsettable, un-persisted, and CLEARED at login
+//     (session-scoped — a relog drops it). Its POWER scales with rank: a higher-rank staffer hides from
+//     more, so no per-tier cap is needed (unlike holylight); the rank comparison IS the gate.
 //
-// Deferred to Slice 3 (each its own mechanic): wizinvis (staff invisibility — needs rank-aware visibleTo,
-// distinct from the game flagInvisible) and verbose debug echoes.
+// Deferred (its own design pass): verbose debug echoes — needs a per-session debug-event surface.
 
 // staffToggleCommands returns the staff view-toggle verbs (#30). Registered LAST (low priority) with the
 // other staff verbs; each carries MinRank=rankStaff so a player can neither see nor run them.
 func staffToggleCommands() []*Command {
 	return []*Command{
 		{Name: "holylight", MinRank: rankStaff, Flags: CmdHidden, Run: cmdHolylight},
+		{Name: "wizinvis", MinRank: rankStaff, Flags: CmdHidden, Run: cmdWizinvis},
 		{Name: "rolls", MinRank: rankStaff, Flags: CmdHidden, Run: cmdRolls},
 	}
+}
+
+// cmdWizinvis toggles staff invisibility (flagWizinvis). Bare `wizinvis` reports; `wizinvis on|off` sets it.
+// No tier-grant cap: any staff member may hide, and visibleTo conceals them only from STRICTLY lower ranks,
+// so the concealment's reach is bounded by the actor's own rank. Reserved flag => the trusted setFlag path.
+func cmdWizinvis(c *Context) error {
+	arg := strings.ToLower(strings.TrimSpace(c.Rest()))
+	switch arg {
+	case "":
+		if hasFlag(c.Actor, flagWizinvis) {
+			c.Send("Wizinvis is ON — you are hidden from anyone of lower trust rank.")
+		} else {
+			c.Send("Wizinvis is OFF — you are visible to all. Use `wizinvis on` to hide from lower ranks.")
+		}
+	case "on", "enable":
+		setFlag(c.Actor, flagWizinvis, true)
+		c.Send("Wizinvis ON — hidden from lower trust ranks.")
+	case "off", "disable":
+		setFlag(c.Actor, flagWizinvis, false)
+		c.Send("Wizinvis OFF — now visible to all.")
+	default:
+		c.Send("Usage: wizinvis on|off")
+	}
+	return nil
 }
 
 // cmdHolylight toggles the actor's see-all (holylight). Bare `holylight` reports; `holylight on|off` sets
