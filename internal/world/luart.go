@@ -370,6 +370,11 @@ func (rt *luaRuntime) installSandbox() {
 	// banners, rows, spans) content display templates render sheets with. No world state / no harm.
 	rt.installUITable()
 
+	// Register the `screen` builder (luascreen.go, #31): the trusted full-screen/ANSI capability. Curated
+	// SAFE-BY-CONSTRUCTION primitives (clear/at/color/write) render to a bounded ANSI subset and flush to a
+	// player as one Screen frame — no raw-bytes surface, so no report-query/OSC/exfil sequence is reachable.
+	rt.installScreenTable()
+
 	// Register the `gmcp` custom-frame handle (luagmcp.go, #51): gmcp.send(player, pkg, table) emits a
 	// content-namespaced (Mud.*) GMCP frame to a rich client, guarded by a fail-closed namespace allowlist
 	// (content can't spoof Char.*/Core.*) + a bounded payload encoder. The gate's outbound support filter
