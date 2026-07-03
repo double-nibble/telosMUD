@@ -109,6 +109,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM chargen_defs WHERE pack=$1`,
 		// Display templates: same strips-and-replaces idempotency.
 		`DELETE FROM display_defs WHERE pack=$1`,
+		// Trust tiers (#27/#29): same strips-and-replaces idempotency. No FK into the zone tree.
+		`DELETE FROM trust_tier_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -464,6 +466,19 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO display_defs (surface, pack, body) VALUES ($1,$2,$3)`, dd.Surface, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert display_def %s: %w", dd.Surface, err)
+		}
+	}
+	// Trust tiers (#27/#29, Round 9 Slice 0): (pack, name) PK + first-class rank, the granted-flag list in
+	// the JSONB body.
+	for _, tt := range pk.TrustTiers {
+		body, err := json.Marshal(trustTierBody{Flags: tt.Flags})
+		if err != nil {
+			return fmt.Errorf("store: marshal trust_tier %s body: %w", tt.Name, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO trust_tier_defs (name, pack, rank, body) VALUES ($1,$2,$3,$4)`,
+			tt.Name, pk.Pack, tt.Rank, body); err != nil {
+			return fmt.Errorf("store: insert trust_tier %s: %w", tt.Name, err)
 		}
 	}
 	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so

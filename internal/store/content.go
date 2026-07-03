@@ -523,6 +523,12 @@ type displayDefBody struct {
 	Render string `json:"render,omitempty"`
 }
 
+// trustTierBody is the JSONB-tail shape for a trust_tier_defs row (#27/#29, Round 9 Slice 0): the granted
+// reserved-flag list, everything but the (pack, name) PK and the first-class rank column.
+type trustTierBody struct {
+	Flags []string `json:"flags,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
 // just default_combat — the combat profile a player fights with when its prototype names none). One
 // row per pack; a future pack-level scalar is a content write here, not a migration.
@@ -1071,6 +1077,37 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	ddRows.Close()
+
+	// Trust tiers (#27/#29, Round 9 Slice 0): (pack, name) first-class + rank column, the granted-flag list
+	// in the JSONB body. Ordered by (pack, rank, name) for deterministic load; the loader's per-pack
+	// accumulation applies last-write-wins by name.
+	ttRows, err := p.pool.Query(ctx,
+		`SELECT name, pack, rank, body FROM trust_tier_defs WHERE pack = ANY($1) ORDER BY pack, rank, name`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query trust_tier_defs: %w", err)
+	}
+	for ttRows.Next() {
+		var tt content.TrustTierDTO
+		var pk string
+		var body []byte
+		if err := ttRows.Scan(&tt.Name, &pk, &tt.Rank, &body); err != nil {
+			ttRows.Close()
+			return fmt.Errorf("store: scan trust_tier_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b trustTierBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				ttRows.Close()
+				return fmt.Errorf("store: trust_tier_def %s body: %w", tt.Name, err)
+			}
+			tt.Flags = b.Flags
+		}
+		pack(pk).TrustTiers = append(pack(pk).TrustTiers, tt)
+	}
+	if err := ttRows.Err(); err != nil {
+		return err
+	}
+	ttRows.Close()
 
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).

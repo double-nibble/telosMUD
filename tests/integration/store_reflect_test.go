@@ -114,6 +114,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 	fillOneDef(&pk.Recipes, &counter)
 	fillOneDef(&pk.Chargens, &counter)
 	fillOneDef(&pk.DisplayDefs, &counter)
+	fillOneDef(&pk.TrustTiers, &counter)
 
 	require.NoError(t, p.ImportPack(ctx, pk), "import synthetic reflect-fill pack")
 	lc, err := content.Load(ctx, p, []string{pk.Pack})
@@ -140,6 +141,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 		{"recipes", pk.Recipes, lc.Recipes},
 		{"chargens", pk.Chargens, lc.Chargens},
 		{"display_defs", pk.DisplayDefs, lc.DisplayDefs},
+		{"trust_tiers", pk.TrustTiers, lc.TrustTiers},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,6 +162,7 @@ var reflectNetCovered = map[string]bool{
 	"Abilities": true, "CombatProfiles": true, "Channels": true, "Regions": true,
 	"Tracks": true, "Bundles": true, "RarityTiers": true, "LootTables": true,
 	"SpawnSchedules": true, "Recipes": true, "Chargens": true, "DisplayDefs": true,
+	"TrustTiers": true,
 }
 
 // reflectNetExcluded lists the content.Pack def-slice fields deliberately NOT in the reflect net, each with
