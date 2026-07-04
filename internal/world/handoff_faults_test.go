@@ -127,8 +127,7 @@ func TestHandoffCASConflictAbortsAndThaws(t *testing.T) {
 	// ownership CAS below, after B has rehydrated a pending copy.
 	lisB := bufconn.Listen(1 << 20)
 	bShard := NewShard("darkwood", "addr-b", dir, nil)
-	bPlay := serveShard(t, bShard, lisB)
-	_ = bPlay
+	serveShard(t, bShard, lisB) // B is reached only via the handoff peer dialer; its Play client is unused here
 
 	peers := func(addr string) (handoffv1.HandoffClient, error) {
 		if addr != "addr-b" {
@@ -186,6 +185,11 @@ func TestHandoffCASConflictAbortsAndThaws(t *testing.T) {
 	// the copy B rehydrated. The Abort enqueues abortPendingMsg on B's inbox BEFORE the Abort RPC
 	// returns — which precedes the "barred" thaw the player observed above — so this presenceMsg,
 	// FIFO after it on B's inbox, sees the discard with no sleep.
+	//
+	// LOAD-BEARING ASSUMPTION: this no-sleep determinism rests on handoffServer.Abort completing
+	// its z.post(abortPendingMsg) synchronously, ON the handler's call stack, before the Abort RPC
+	// returns (handoff_server.go:93-102). If Abort is ever made fire-and-forget, this probe races
+	// and must gain an eventually-consistent poll.
 	bZone := bShard.zoneByID("darkwood")
 	probe := make(chan presence, 1)
 	bZone.inbox <- presenceMsg{id: "Racer", reply: probe}
