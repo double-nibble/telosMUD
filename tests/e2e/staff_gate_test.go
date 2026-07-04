@@ -17,6 +17,11 @@ import (
 // generic "Huh?" — the command's existence never leaks (the classic wiz-command posture) and it certainly
 // never executes. This is drivable with the default dev-autoauth login (every demo player is rank 0), so it
 // needs NO staff-rank fixture; the positive/elevated side is an integration concern (#133).
+//
+// Scope note: the "Huh?" arm assumes the loaded pack defines no ability/custom-Lua/channel verb literally
+// named stat/wizinvis/holylight/rolls (the demo pack does not). If one ever did, a mortal would land on that
+// content handler instead of "Huh?" and this test would FAIL LOUDLY on the first assertion — a fail-loud
+// coupling to the pack, not a silent gap.
 func TestMortalCannotReachStaffVerbs(t *testing.T) {
 	addr := helpers.E2EAddr(t) // SKIPs cleanly when the gate is not reachable.
 
