@@ -123,3 +123,40 @@ func TestWhoLocalOmitsInvisiblePlayer(t *testing.T) {
 		t.Fatal("a holylight viewer should see an invisible player in who")
 	}
 }
+
+// TestWizinvisHiddenInLookAndWho pins the RENDER-CONSUMER half of the wizinvis rank gate (#30/#133):
+// TestWizinvisHidesFromLowerRank (toggles_test) covers the visibleTo PREDICATE, and the lookRoom/whoLocal
+// omissions are covered for flagInvisible — but the wizinvis + multi-tier COMBINATION through the actual
+// render path was untested. A wizinvis staffer is OMITTED from a strictly-lower-rank viewer's look + who,
+// and SHOWN to an equal/higher-rank viewer, through the same chokepoint the predicate test exercises.
+func TestWizinvisHiddenInLookAndWho(t *testing.T) {
+	z, _, room := harmZone(t)
+	mortal := harmPlayer(z, room, "Pleb")   // session tier "" => rank 0
+	staff := harmPlayer(z, room, "Staffer") // the wizinvis staffer
+	admin := harmPlayer(z, room, "Boss")
+	z.players["Staffer"].tier = tierBuilder // rank 20
+	z.players["Boss"].tier = tierAdmin      // rank 40
+	setFlag(staff, flagWizinvis, true)
+
+	// A strictly-lower-rank viewer (mortal, rank 0) sees the wizinvis staffer in NEITHER look nor who.
+	ms := z.players["Pleb"]
+	clearOut(ms)
+	z.lookRoom(ms)
+	if out := drainText(t, ms.out); strings.Contains(out, "Staffer") {
+		t.Fatalf("a mortal's lookRoom leaked a wizinvis staffer: %q", out)
+	}
+	if out := z.whoLocal(mortal); strings.Contains(out, "Staffer") {
+		t.Fatalf("a mortal's who listed a wizinvis staffer: %q", out)
+	}
+
+	// An equal/higher-rank viewer (admin, rank 40) sees the staffer in BOTH.
+	as := z.players["Boss"]
+	clearOut(as)
+	z.lookRoom(as)
+	if out := drainText(t, as.out); !strings.Contains(out, "Staffer") {
+		t.Fatalf("an admin's lookRoom should show a wizinvis staffer: %q", out)
+	}
+	if out := z.whoLocal(admin); !strings.Contains(out, "Staffer") {
+		t.Fatalf("an admin's who should list a wizinvis staffer: %q", out)
+	}
+}
