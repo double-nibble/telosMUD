@@ -3,6 +3,7 @@ package scopebus
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -239,4 +240,54 @@ func TestScopeBusDurableKeysAreMonotonic(t *testing.T) {
 		}
 	}
 	assert.Equal(t, []string{"run1:1", "run1:2"}, got, "keys advance monotonically per process")
+}
+
+// TestScopeBusDurableConsumerDedupsRedelivery pins the CONSUMER-SIDE idempotency contract every durable
+// subscriber depends on but nothing pinned before: JetStream is at-least-once, so an ack lost AFTER a state
+// mutation redelivers the SAME key. A consumer that dedups on the key (apply a key only once) must therefore
+// apply EXACTLY ONCE despite >=2 deliveries. TestScopeBusDurableNakRedelivers proves the redelivery happens
+// and TestScopeBusDurableKeysAreMonotonic proves the key is stable across it; this proves the dedup a
+// consumer BUILDS on those — the whole point of the <source>:<seq> idempotency key.
+func TestScopeBusDurableConsumerDedupsRedelivery(t *testing.T) {
+	b, _ := durableBus(t, "run1")
+	ctx := context.Background()
+
+	var deliveries atomic.Int32
+	var mu sync.Mutex
+	appliedKeys := map[string]bool{}
+	applied := 0
+	var keys []string
+	done := make(chan struct{})
+	cons, err := b.SubscribeDurable(World(), "world-dir", func(ev DurableEvent) bool {
+		n := deliveries.Add(1)
+		mu.Lock()
+		keys = append(keys, ev.Key)
+		// The idempotent-consumer pattern: apply a key only once, even if it is redelivered.
+		if !appliedKeys[ev.Key] {
+			appliedKeys[ev.Key] = true
+			applied++
+		}
+		mu.Unlock()
+		if n == 1 {
+			return false // ack lost AFTER the (already-applied) mutation -> JetStream redelivers the SAME key
+		}
+		close(done)
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	require.NoError(t, b.SignalDurable(ctx, World(), "ev", json.RawMessage(`{"n":1}`)))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the NAK'd event was not redelivered")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.GreaterOrEqual(t, deliveries.Load(), int32(2), "the event should be delivered at least twice (apply, then redelivery after the lost ack)")
+	require.GreaterOrEqual(t, len(keys), 2, "expected at least two deliveries")
+	assert.Equal(t, keys[0], keys[1], "a redelivery must carry the SAME idempotency key (so the consumer can dedup it)")
+	assert.Equal(t, 1, applied, "the idempotent consumer must apply the key EXACTLY ONCE despite the redelivery")
 }
