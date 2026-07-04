@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/double-nibble/telosmud/internal/world"
 	"github.com/double-nibble/telosmud/tests/helpers"
 	"github.com/stretchr/testify/require"
 )
@@ -37,6 +38,11 @@ func TestCharacterProgressionSubtreesRoundTrip(t *testing.T) {
 	snap.State.Attributes = map[string]float64{"strength": 16, "constitution": 14}
 	snap.State.LootPity = map[string]int{"rare_sword": 12}
 	snap.State.Cooldowns = map[string]int{"fireball": 30}
+	// The remaining pure-DATA subtrees the store round-trips verbatim (the world-side clamp/re-attach on
+	// load is NOT on the store path, so require.Equal is faithful here). Affects is a NESTED struct — a
+	// dropped inner tag would slip past both TestCharacterCRUD and the def-slice reflect-net.
+	snap.State.Resources = map[string]world.ResourceJSON{"hp": {Cur: 42}, "mana": {Cur: 17}}
+	snap.State.Affects = []world.AffectJSON{{ID: "poison", Remaining: 30, Mag: 2.5, Stacks: 3}}
 
 	_, ok, err := pool.SaveCharacter(ctx, snap)
 	require.NoError(t, err)
@@ -53,4 +59,6 @@ func TestCharacterProgressionSubtreesRoundTrip(t *testing.T) {
 	require.Equal(t, snap.State.Attributes, reloaded.State.Attributes, "attribute base overrides dropped in the PG round-trip")
 	require.Equal(t, snap.State.LootPity, reloaded.State.LootPity, "loot pity dropped in the PG round-trip")
 	require.Equal(t, snap.State.Cooldowns, reloaded.State.Cooldowns, "armed cooldowns dropped in the PG round-trip")
+	require.Equal(t, snap.State.Resources, reloaded.State.Resources, "resource pools dropped in the PG round-trip")
+	require.Equal(t, snap.State.Affects, reloaded.State.Affects, "active affects (nested struct) dropped in the PG round-trip")
 }
