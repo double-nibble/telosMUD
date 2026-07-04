@@ -113,3 +113,58 @@ func TestKeptItemDeltaRoundTrips(t *testing.T) {
 		t.Fatal("the kept flag was dropped in the item-delta round-trip")
 	}
 }
+
+// TestItemDeltaFamilyRoundTrips extends the Kept guard above to the WHOLE item-delta family (#87): an item
+// carrying quality (level + affixes) AND bound AND a partial stack AND kept must dump to itemDeltaJSON and
+// re-load with every field intact. dump/load share itemDeltaJSON, so this catches a mistyped tag or a
+// dump/load asymmetry on ANY of the four fields — the hermetic counterpart to the real-PG round-trip in
+// tests/integration (TestCharacterItemDeltaRoundTrip).
+func TestItemDeltaFamilyRoundTrips(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	item := z.spawn(ProtoRef("midgaard:obj:torch"))
+	Add(item, &Quality{Level: 5, Affixes: map[string]float64{"fire": 2, "keen": 1}})
+	bindItem(item)
+	setItemStackCount(item, 7)
+	keepItem(item)
+
+	delta := dumpItemDelta(item)
+	if len(delta) == 0 {
+		t.Fatal("a fully-populated item produced no delta")
+	}
+
+	item2 := z.spawn(ProtoRef("midgaard:obj:torch"))
+	loadItemDelta(item2, delta)
+
+	q, ok := Get[*Quality](item2)
+	if !ok || q.Level != 5 {
+		t.Fatalf("quality dropped/altered in the delta round-trip: ok=%v q=%+v", ok, q)
+	}
+	if q.Affixes["fire"] != 2 || q.Affixes["keen"] != 1 {
+		t.Fatalf("quality affixes dropped in the delta round-trip: %+v", q.Affixes)
+	}
+	if !isBound(item2) {
+		t.Fatal("the bound flag was dropped in the delta round-trip")
+	}
+	if s, ok := Get[*Stack](item2); !ok || s.count != 7 {
+		t.Fatalf("the stack count was dropped/altered: ok=%v s=%+v", ok, s)
+	}
+	if !isKept(item2) {
+		t.Fatal("the kept flag was dropped in the delta round-trip")
+	}
+}
+
+// TestItemDeltaAffixOrderStable guards a LOAD-BEARING invariant: dumpItemDelta bytes are used as an item
+// COALESCING GROUP KEY (coalesceItemLines in commands.go + the Char.Items GMCP grouping in gmcp.go), so two
+// items with the SAME quality affixes must serialize to IDENTICAL bytes regardless of the affix map's
+// construction — else identical items would fail to coalesce. encoding/json sorts map keys, so this holds
+// today; the guard catches a future switch to a non-sorting serializer of the delta.
+func TestItemDeltaAffixOrderStable(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	a := z.spawn(ProtoRef("midgaard:obj:torch"))
+	Add(a, &Quality{Level: 3, Affixes: map[string]float64{"fire": 2, "keen": 1, "sharp": 4}})
+	b := z.spawn(ProtoRef("midgaard:obj:torch"))
+	Add(b, &Quality{Level: 3, Affixes: map[string]float64{"sharp": 4, "fire": 2, "keen": 1}})
+	if da, db := string(dumpItemDelta(a)), string(dumpItemDelta(b)); da != db {
+		t.Fatalf("item delta bytes must be affix-order-stable (they are a coalescing group key):\n a=%s\n b=%s", da, db)
+	}
+}
