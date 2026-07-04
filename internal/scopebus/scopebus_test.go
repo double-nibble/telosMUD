@@ -269,9 +269,12 @@ func TestScopeBusDurableConsumerDedupsRedelivery(t *testing.T) {
 		}
 		mu.Unlock()
 		if n == 1 {
-			return false // ack lost AFTER the (already-applied) mutation -> JetStream redelivers the SAME key
+			// SIMULATE a lost ack: a real idempotent consumer acks (return true) after applying, and the
+			// redelivery it must survive comes from an ack lost in flight. A NAK produces the identical
+			// observable input (the same key delivered again), so it is a faithful stand-in for that here.
+			return false
 		}
-		close(done)
+		close(done) // deterministic: deliverBounded stops the instant this ack lands, so exactly-2 deliveries
 		return true
 	})
 	require.NoError(t, err)
