@@ -15,6 +15,11 @@ import (
 // player-visible RENDER (the act-template item-name substitution + the identical-item coalescing) was
 // untested end-to-end: #36's drop-refuses-worn and the keep/unkeep no-drop flag, plus the "(N)" coalescing.
 // It uses the market's FLOOR items (an iron helmet + wooden torches, reachable via one `north`, no combat).
+//
+// CI is deterministic (fresh stack = a full floor of 1 helmet + 5 torches; e2e tests run sequentially and no
+// other test depletes the market floor). Like combat_death_test's goblin, a fast LOCAL re-run can race a
+// not-yet-repopped floor (a crashed prior run carried the helmet off; each run spends 2 of 5 torches) —
+// space local reruns by the ~90s reset_secs stride or restart world-midgaard to force a repop.
 func TestInventoryWearKeepCoalesce(t *testing.T) {
 	addr := helpers.E2EAddr(t) // SKIPs cleanly when the gate is not reachable.
 
@@ -60,8 +65,8 @@ func TestInventoryWearKeepCoalesce(t *testing.T) {
 		"dropping a KEPT item must be refused; transcript:\n%s", c.Transcript())
 	from = c.Len()
 	c.Send("unkeep helmet")
-	require.Truef(t, c.ExpectFrom(from, "keep", 10*time.Second),
-		"`unkeep helmet` gave no confirmation; transcript:\n%s", c.Transcript())
+	require.Truef(t, c.ExpectFrom(from, "You no longer keep an iron helmet.", 10*time.Second),
+		"`unkeep helmet` did not confirm the flag was cleared; transcript:\n%s", c.Transcript())
 	from = c.Len()
 	c.Send("drop helmet")
 	require.Truef(t, c.ExpectFrom(from, "You drop an iron helmet.", 10*time.Second),
