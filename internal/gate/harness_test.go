@@ -461,6 +461,35 @@ func (term *terminal) expectCount(t *testing.T, substr string, n int) {
 	}
 }
 
+// expectGMCPPayload blocks until a COMPLETE GMCP frame for pkg — IAC SB 201 "<pkg> " <json> IAC SE —
+// has arrived on the wire, then returns the <json> payload. Unlike expectBytes (which returns the
+// instant a substring appears), it reads through the frame's closing IAC SE, so an ABSENCE assertion
+// on the payload — a field the gate/world filter must have DROPPED — is airtight: the whole framed
+// payload is guaranteed present before the caller inspects it.
+func (term *terminal) expectGMCPPayload(t *testing.T, pkg string) string {
+	t.Helper()
+	header := string([]byte{255, 250, 201}) + pkg + " " // IAC SB GMCP "<pkg> "
+	const iacSE = "\xff\xf0"                            // IAC SE
+	deadline := time.After(10 * time.Second)
+	for {
+		acc := term.acc.String()
+		if i := strings.Index(acc, header); i >= 0 {
+			if j := strings.Index(acc[i+len(header):], iacSE); j >= 0 {
+				return acc[i+len(header) : i+len(header)+j]
+			}
+		}
+		select {
+		case b, ok := <-term.bytes:
+			if !ok {
+				t.Fatalf("socket closed waiting for a complete %s GMCP frame; got %q", pkg, term.acc.String())
+			}
+			term.acc.WriteByte(b)
+		case <-deadline:
+			t.Fatalf("timed out waiting for a complete %s GMCP frame; got %q", pkg, term.acc.String())
+		}
+	}
+}
+
 // expectClose asserts the gate closed the socket (the reader saw EOF) within a deadline
 // — the observable a player gets when the connection is dropped. It drains any trailing
 // bytes so a final message (e.g. a disconnect notice) still lands in acc for inspection.

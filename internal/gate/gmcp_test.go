@@ -404,10 +404,15 @@ func TestGMCPNotSentToUnsubscribedClient(t *testing.T) {
 // IAC SB 201 "Char.Items.Update" …. Asserting both the package header AND the count:3 payload on the
 // wire proves the incremental delta (not a full List re-send or a Remove+Add churn) reaches the client.
 //
-// The other three #142 sub-cases are already covered where their logic lives and are not re-asserted
-// here: the gauge-leak filter by world.TestHUDResourceRefsGaugeFilter, token-stripping by
-// world.TestGMCPPayloadsStripColorTokens + TestDeliverChannelGMCPStripsColorTokens, and the
-// Comm.Channel.Text rendered/raw split by TestDeliverChannelEmitsGMCP.
+// The remaining #142 sub-cases: the gauge-leak filter is pinned ON THE WIRE by
+// TestGMCPCharVitalsGaugeFilterOnWire (below); the Comm.Channel.Text rendered/raw split and its
+// {{token}} stripping are gate-level covered by TestDeliverChannelEmitsGMCP +
+// TestDeliverChannelGMCPStripsColorTokens. The Room.Info NAME {{token}} strip is covered at the
+// world-unit tier (world.TestGMCPPayloadsStripColorTokens) rather than end-to-end: the demo ships no
+// room whose display name carries a {{token}}, so a gate-wire version would need a synthetic content
+// fixture — disproportionate given the gate's GMCP framing is package-agnostic (proven by the
+// ...ReachesClient tests + TestRenderFrameGMCPFilter), so what it frames is exactly the world's
+// already-stripped payload.
 func TestGMCPCharItemsUpdateReachesClient(t *testing.T) {
 	h := newHarness(t)
 	const addr = "addr-a"
@@ -436,5 +441,38 @@ func TestGMCPCharItemsUpdateReachesClient(t *testing.T) {
 	// The incremental delta framed onto the wire: a Char.Items.Update carrying the group at count 3.
 	term.expectBytes(t, []byte("Char.Items.Update "))
 	term.expectBytes(t, []byte(`"count":3`))
+	term.close(t)
+}
+
+// TestGMCPCharVitalsGaugeFilterOnWire pins the #50 gauge filter AT THE GATE-WIRE tier issue #142
+// asks for (the world-unit filter is proven by world.TestHUDResourceRefsGaugeFilter; this proves the
+// already-filtered payload survives the gate's GMCP framing onto a real client). The demo flags hp+mana
+// gauge:true and leaves the internal per-round `reactions` pool unflagged, so the Char.Vitals the world
+// emits on the login prompt must show hp but never leak the reaction budget to a rich client's gauges.
+//
+// The absence assertion is airtight because expectGMCPPayload reads the COMPLETE Char.Vitals frame
+// (through its closing IAC SE) before we inspect it, and it scopes to that frame's payload — so a later
+// unrelated byte can neither satisfy nor mask the "no reactions" check.
+func TestGMCPCharVitalsGaugeFilterOnWire(t *testing.T) {
+	h := newHarness(t)
+	const addr = "addr-a"
+	h.addShard("midgaard", addr, nil, nil)
+	h.serveGate(directory.Static{Addr: addr})
+
+	term := h.dial(t)
+	term.expectBytes(t, []byte{255, 251, 201})                        // gate offers IAC WILL GMCP
+	if _, err := term.conn.Write([]byte{255, 253, 201}); err != nil { // client IAC DO GMCP
+		t.Fatal(err)
+	}
+	term.sendGMCP(t, "Core.Supports.Set", `["Char 1"]`) // advertise Char (Char.Vitals is under it)
+	term.login(t, "Gauger")
+
+	payload := term.expectGMCPPayload(t, "Char.Vitals")
+	if !strings.Contains(payload, `"hp"`) {
+		t.Fatalf("Char.Vitals wire payload missing the gauged hp pool: %q", payload)
+	}
+	if strings.Contains(payload, "reactions") {
+		t.Fatalf("Char.Vitals leaked the un-gauged internal reactions pool onto the wire: %q", payload)
+	}
 	term.close(t)
 }
