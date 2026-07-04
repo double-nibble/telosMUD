@@ -393,3 +393,48 @@ func TestGMCPNotSentToUnsubscribedClient(t *testing.T) {
 	}
 	term.close(t)
 }
+
+// TestGMCPCharItemsUpdateReachesClient closes the one wire-level gap issue #142 flagged that the
+// world-unit and generic-framing tests don't compose end-to-end: an INCREMENTAL Char.Items delta —
+// specifically the count-bump Char.Items.Update — framed onto a real GMCP client's wire, not just
+// the login Char.Items.List snapshot (TestGMCPCharItemsReachesClient). The market floor resets five
+// identical torches (demo.yaml); picking up a third coalesces the carried group to count 3, which the
+// world emits as a same-id Char.Items.Update (world/gmcp.go — payload proven exact, incl. the stable
+// g<hash> id and count:3, by world.TestCharItemsCoalescesCount) and the gate frames as
+// IAC SB 201 "Char.Items.Update" …. Asserting both the package header AND the count:3 payload on the
+// wire proves the incremental delta (not a full List re-send or a Remove+Add churn) reaches the client.
+//
+// The other three #142 sub-cases are already covered where their logic lives and are not re-asserted
+// here: the gauge-leak filter by world.TestHUDResourceRefsGaugeFilter, token-stripping by
+// world.TestGMCPPayloadsStripColorTokens + TestDeliverChannelGMCPStripsColorTokens, and the
+// Comm.Channel.Text rendered/raw split by TestDeliverChannelEmitsGMCP.
+func TestGMCPCharItemsUpdateReachesClient(t *testing.T) {
+	h := newHarness(t)
+	const addr = "addr-a"
+	h.addShard("midgaard", addr, nil, nil)
+	h.serveGate(directory.Static{Addr: addr})
+
+	term := h.dial(t)
+	term.expectBytes(t, []byte{255, 251, 201})                        // gate offers IAC WILL GMCP
+	if _, err := term.conn.Write([]byte{255, 253, 201}); err != nil { // client IAC DO GMCP
+		t.Fatal(err)
+	}
+	term.sendGMCP(t, "Core.Supports.Set", `["Char 1"]`) // advertise the Char package (Char.Items.* is under it)
+
+	term.login(t, "Stacker")
+	term.expect(t, "Temple Square")
+	term.send(t, "north")
+	term.expect(t, "Market Square")
+
+	// Pick up three of the five identical market torches. Each get flushes an inventory delta on the
+	// prompt; the third bumps the coalesced group to count 3. Sends are paced by the synchronous
+	// net.Pipe (each blocks until the gate reads it), so they reach the world in order.
+	for i := 0; i < 3; i++ {
+		term.send(t, "get torch")
+	}
+
+	// The incremental delta framed onto the wire: a Char.Items.Update carrying the group at count 3.
+	term.expectBytes(t, []byte("Char.Items.Update "))
+	term.expectBytes(t, []byte(`"count":3`))
+	term.close(t)
+}
