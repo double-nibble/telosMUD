@@ -85,60 +85,67 @@ func TestSetAccountTierValidation(t *testing.T) {
 	}
 }
 
-// TestSetAccountTierCeilings covers the two RANK-CEILING guards (service.go: "grant a tier above your own
-// standing" / "change the tier of someone above your own standing") that had ZERO coverage. They are only
-// reachable with a CONTENT ladder where an admin-granting tier ranks BELOW another admin-granting tier — the
-// default ladder can't express "an actor below the tier it could otherwise grant", so a custom WithTrustLadder
-// is load-bearing here: `gm` (rank 30) grants FlagAdmin (passes the manage-tiers gate) but sits under `admin`
-// (rank 40).
-func TestSetAccountTierCeilings(t *testing.T) {
+// TestSetAccountTierAuthzEdges covers the escalation-adjacent SetAccountTier edges NOT already pinned by
+// TestSetAccountTierRankCeiling (service_test.go, which covers grant-above-own + change-above-you): (1) SELF-
+// targeting — there is no special self-path, so the grant ceiling still blocks a self-promote-above, while a
+// self-DEMOTE is allowed (pinning the current behavior: no self-demote guard); (2) the CHANGE-side EQUAL-rank
+// positive control (an admin may manage a peer admin — guards a `>`→`>=` tightening); and (3) the "target has
+// no tier row → rank-0 baseline" degradation (the `found` flag is deliberately ignored). Each sub-scenario
+// uses its own fake store so mutations don't couple. `gm` (rank 30, FlagAdmin) under `admin` (rank 40) is the
+// load-bearing custom ladder.
+func TestSetAccountTierAuthzEdges(t *testing.T) {
 	tiers := []content.TrustTierDTO{
 		{Name: "player", Rank: 0},
-		{Name: "builder", Rank: 20, Flags: []string{content.FlagBuilder}},
 		{Name: "gm", Rank: 30, Flags: []string{content.FlagAdmin}},
-		{Name: "admin", Rank: 40, Flags: []string{content.FlagHolylight, content.FlagBuilder, content.FlagAdmin}},
+		{Name: "admin", Rank: 40, Flags: []string{content.FlagAdmin}},
 	}
-	fs := newFakeStore()
-	fs.tiers["acct-gm"] = "gm"
-	fs.tiers["acct-admin"] = "admin"
-	fs.tiers["acct-lo"] = "player"
-	fs.tiers["acct-peer"] = "player"
-	fs.charAccount["Lowly"] = "acct-lo"
-	fs.charAccount["Highness"] = "acct-admin" // an admin-tier target that OUTRANKS gm
-	fs.charAccount["Peer"] = "acct-peer"
-	svc := newTestService(fs).WithTrustLadder(tiers)
+	newSvc := func(fs *fakeStore) *Service { return newTestService(fs).WithTrustLadder(tiers) }
 
-	// Ceiling 1 — grant-above-own: gm passes the manage-tiers gate (grants FlagAdmin) but may not grant a
-	// tier ranked above its own standing (admin, rank 40 > gm's 30).
-	if resp, _ := setTier(svc, "acct-gm", "Lowly", "admin"); resp.GetOk() || !strings.Contains(resp.GetReason(), "above your own standing") {
-		t.Fatalf("gm granting admin must be refused 'above your own standing', got %+v", resp)
-	}
-	if fs.tiers["acct-lo"] != "player" {
-		t.Fatalf("a refused grant must not change the tier, got %q", fs.tiers["acct-lo"])
+	// (1a) SELF escalation: gm may not self-promote ABOVE its own rank — the grant ceiling applies to self.
+	{
+		fs := newFakeStore()
+		fs.tiers["gm"] = "gm"
+		fs.charAccount["Self"] = "gm"
+		if resp, _ := setTier(newSvc(fs), "gm", "Self", "admin"); resp.GetOk() || !strings.Contains(resp.GetReason(), "above your own standing") {
+			t.Fatalf("gm must not self-promote to admin, got %+v", resp)
+		}
+		if fs.tiers["gm"] != "gm" {
+			t.Fatalf("a refused self-promote must not change the tier, got %q", fs.tiers["gm"])
+		}
 	}
 
-	// Ceiling 2 — change-above-you: gm may not change an account (Highness = admin, rank 40) that outranks
-	// it, even to a LOW tier (the guard fires on the target's rank, not the requested one).
-	if resp, _ := setTier(svc, "acct-gm", "Highness", "player"); resp.GetOk() || !strings.Contains(resp.GetReason(), "above your own standing") {
-		t.Fatalf("gm changing an admin must be refused 'above your own standing', got %+v", resp)
-	}
-	if fs.tiers["acct-admin"] != "admin" {
-		t.Fatalf("a refused change must not change the tier, got %q", fs.tiers["acct-admin"])
-	}
-
-	// Positive control A: gm MAY grant a tier at or below its own standing (builder, rank 20 <= 30).
-	if resp, _ := setTier(svc, "acct-gm", "Lowly", "builder"); !resp.GetOk() {
-		t.Fatalf("gm should be able to grant builder (<= its own rank), got %+v", resp)
-	}
-	if fs.tiers["acct-lo"] != "builder" {
-		t.Fatalf("gm's builder grant did not apply, got %q", fs.tiers["acct-lo"])
+	// (1b) SELF de-escalation: an admin MAY self-demote (rank(target)==rank(actor), not above) — pins the
+	// CURRENT behavior that no self-demote guard exists (an admin can strip its own admin).
+	{
+		fs := newFakeStore()
+		fs.tiers["adm"] = "admin"
+		fs.charAccount["Self"] = "adm"
+		if resp, _ := setTier(newSvc(fs), "adm", "Self", "player"); !resp.GetOk() || fs.tiers["adm"] != "player" {
+			t.Fatalf("an admin should be able to self-demote (equal rank), got resp=%+v tier=%q", resp, fs.tiers["adm"])
+		}
 	}
 
-	// Positive control B: admin MAY grant admin (rank 40 == its own standing — equal is NOT "above").
-	if resp, _ := setTier(svc, "acct-admin", "Peer", "admin"); !resp.GetOk() {
-		t.Fatalf("admin should be able to grant admin (== its own rank), got %+v", resp)
+	// (2) CHANGE-side EQUAL-rank positive control: an admin MAY change a same-rank admin (the change ceiling
+	// is strictly-greater) — guards against a `>`→`>=` tightening breaking admins-managing-peers.
+	{
+		fs := newFakeStore()
+		fs.tiers["a1"] = "admin"
+		fs.tiers["a2"] = "admin"
+		fs.charAccount["Peer"] = "a2"
+		if resp, _ := setTier(newSvc(fs), "a1", "Peer", "player"); !resp.GetOk() || fs.tiers["a2"] != "player" {
+			t.Fatalf("an admin should be able to change a same-rank admin, got resp=%+v tier=%q", resp, fs.tiers["a2"])
+		}
 	}
-	if fs.tiers["acct-peer"] != "admin" {
-		t.Fatalf("admin's admin grant did not apply, got %q", fs.tiers["acct-peer"])
+
+	// (3) TARGET-BASELINE degradation: a target whose account has NO tier row reads as the rank-0 baseline
+	// (Rank("")==0), which gm outranks — so the change is ALLOWED. The guard degrades to "allow the baseline",
+	// never "skip the check" (the `found` flag is deliberately ignored).
+	{
+		fs := newFakeStore()
+		fs.tiers["gm"] = "gm"
+		fs.charAccount["NoTier"] = "acct-notier" // resolves, but has no fs.tiers entry
+		if resp, _ := setTier(newSvc(fs), "gm", "NoTier", "player"); !resp.GetOk() || fs.tiers["acct-notier"] != "player" {
+			t.Fatalf("gm should be able to change a no-tier-row target (rank-0 baseline), got resp=%+v tier=%q", resp, fs.tiers["acct-notier"])
+		}
 	}
 }
