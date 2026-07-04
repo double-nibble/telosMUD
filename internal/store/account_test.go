@@ -185,6 +185,60 @@ func TestSetAccountTierAndResolve(t *testing.T) {
 	assert.Equal(t, TierBuilder, newTier)
 }
 
+// TestSetAccountTierAuditTrail (#130) covers the promote->demote round-trip + full audit-row CONTENTS + the
+// APPEND semantics that TestSetAccountTierAndResolve leaves open (it asserts only actor+new_tier of a single
+// promote): each SetAccountTier returns the tier it replaced AND writes exactly one account_role_audit row
+// capturing actor/target/old/new; a subsequent DEMOTE appends a SECOND row (old=builder,new=player), so the
+// audit is an ordered append log and the tier + audit write atomically (in one transaction).
+func TestSetAccountTierAuditTrail(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	actor := uuid.NewString()
+	target := uuid.NewString()
+	for _, id := range []string{actor, target} {
+		_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status, tier) VALUES ($1, 'active', 'player')`, id)
+		require.NoError(t, err)
+	}
+	t.Cleanup(func() {
+		ids := []string{actor, target}
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_role_audit WHERE target_account = ANY($1) OR actor_account = ANY($1)`, ids)
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = ANY($1)`, ids)
+	})
+
+	// Promote player -> builder, then demote builder -> player: each returns the tier it REPLACED.
+	old, err := p.SetAccountTier(ctx, actor, target, TierBuilder)
+	require.NoError(t, err)
+	assert.Equal(t, TierPlayer, old, "promote should report the player tier it replaced")
+	old, err = p.SetAccountTier(ctx, actor, target, TierPlayer)
+	require.NoError(t, err)
+	assert.Equal(t, TierBuilder, old, "demote should report the builder tier it replaced")
+	// SetAccountTier is UNCONDITIONAL — a same-tier set still writes an audit row (the contract is "audit
+	// every WRITE", not only real transitions), and reports the unchanged tier as old.
+	old, err = p.SetAccountTier(ctx, actor, target, TierPlayer)
+	require.NoError(t, err)
+	assert.Equal(t, TierPlayer, old, "a no-op set reports the unchanged tier")
+
+	// The audit log APPENDED exactly one row per SetAccountTier call — incl. the no-op — with full old->new
+	// contents. Order-independent (the `at` DEFAULT now() could tie for rapid ops) — assert the SET.
+	type auditRow struct{ Actor, Target, Old, New string }
+	rows, err := p.pool.Query(ctx,
+		`SELECT actor_account, target_account, old_tier, new_tier FROM account_role_audit WHERE target_account = $1`, target)
+	require.NoError(t, err)
+	defer rows.Close()
+	var got []auditRow
+	for rows.Next() {
+		var r auditRow
+		require.NoError(t, rows.Scan(&r.Actor, &r.Target, &r.Old, &r.New))
+		got = append(got, r)
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, got, 3, "exactly one audit row per SetAccountTier call, including the no-op")
+	assert.Contains(t, got, auditRow{actor, target, TierPlayer, TierBuilder}, "the promote audit row (old=player,new=builder)")
+	assert.Contains(t, got, auditRow{actor, target, TierBuilder, TierPlayer}, "the demote audit row (old=builder,new=player)")
+	assert.Contains(t, got, auditRow{actor, target, TierPlayer, TierPlayer}, "the no-op audit row (audit every write)")
+}
+
 // TestPendingChargenRoundTrip (Phase 14.8) proves the first-spawn chargen marker survives create -> load, and
 // that the FIRST save clears it (chargen = NULL) — so the world applies the build exactly once.
 func TestPendingChargenRoundTrip(t *testing.T) {
