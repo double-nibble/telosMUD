@@ -123,3 +123,65 @@ func TestWhoLocalOmitsInvisiblePlayer(t *testing.T) {
 		t.Fatal("a holylight viewer should see an invisible player in who")
 	}
 }
+
+// TestWizinvisHiddenInLookAndWho pins the RENDER-CONSUMER half of the wizinvis rank gate (#30/#133):
+// TestWizinvisHidesFromLowerRank (toggles_test) covers the visibleTo PREDICATE, and the lookRoom/whoLocal
+// omissions are covered for flagInvisible — but the wizinvis + multi-tier COMBINATION through the actual
+// render path was untested. A wizinvis staffer is OMITTED from a strictly-lower-rank viewer's look + who,
+// and SHOWN to an equal/higher-rank viewer, through the same chokepoint the predicate test exercises.
+func TestWizinvisHiddenInLookAndWho(t *testing.T) {
+	z, _, room := harmZone(t)
+	mortal := harmPlayer(z, room, "Pleb")   // session tier "" => rank 0
+	staff := harmPlayer(z, room, "Staffer") // the wizinvis staffer
+	admin := harmPlayer(z, room, "Boss")
+	z.players["Staffer"].tier = tierBuilder // rank 20
+	z.players["Boss"].tier = tierAdmin      // rank 40
+	setFlag(staff, flagWizinvis, true)
+
+	// A strictly-lower-rank viewer (mortal, rank 0) sees the wizinvis staffer in NEITHER look nor who.
+	ms := z.players["Pleb"]
+	clearOut(ms)
+	z.lookRoom(ms)
+	if out := drainText(t, ms.out); strings.Contains(out, "Staffer") {
+		t.Fatalf("a mortal's lookRoom leaked a wizinvis staffer: %q", out)
+	}
+	if out := z.whoLocal(mortal); strings.Contains(out, "Staffer") {
+		t.Fatalf("a mortal's who listed a wizinvis staffer: %q", out)
+	}
+
+	// An equal/higher-rank viewer (admin, rank 40) sees the staffer in BOTH.
+	as := z.players["Boss"]
+	clearOut(as)
+	z.lookRoom(as)
+	if out := drainText(t, as.out); !strings.Contains(out, "Staffer") {
+		t.Fatalf("an admin's lookRoom should show a wizinvis staffer: %q", out)
+	}
+	if out := z.whoLocal(admin); !strings.Contains(out, "Staffer") {
+		t.Fatalf("an admin's who should list a wizinvis staffer: %q", out)
+	}
+
+	// GMCP Room.Players is a PARALLEL presence-disclosure surface (rich clients) that also routes through
+	// canSee — assert the wizinvis staffer is likewise omitted for the mortal and shown for the admin, so a
+	// dropped canSee filter there can't silently leak the staffer to a GMCP client while look/who stay clean.
+	if s := string(z.roomPlayersJSON(mortal)); strings.Contains(s, "Staffer") {
+		t.Fatalf("a mortal's Room.Players GMCP leaked a wizinvis staffer: %s", s)
+	}
+	if s := string(z.roomPlayersJSON(admin)); !strings.Contains(s, "Staffer") {
+		t.Fatalf("an admin's Room.Players GMCP should include a wizinvis staffer: %s", s)
+	}
+
+	// EQUAL-rank boundary (the strict-less-than `<` guard, not `<=`): a second builder (rank 20) still SEES a
+	// rank-20 wizinvis staffer — equal rank is not lower. This nails the off-by-one the concealment hinges on
+	// through the render path (the predicate test only checks the higher-rank admin side).
+	peer := harmPlayer(z, room, "Peer")
+	z.players["Peer"].tier = tierBuilder // rank 20 == the staffer's rank
+	ps := z.players["Peer"]
+	clearOut(ps)
+	z.lookRoom(ps)
+	if out := drainText(t, ps.out); !strings.Contains(out, "Staffer") {
+		t.Fatalf("an equal-rank builder's lookRoom should show a wizinvis staffer (rank == rank is not lower): %q", out)
+	}
+	if out := z.whoLocal(peer); !strings.Contains(out, "Staffer") {
+		t.Fatalf("an equal-rank builder's who should list a wizinvis staffer: %q", out)
+	}
+}
