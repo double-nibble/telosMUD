@@ -152,3 +152,19 @@ func TestItemDeltaFamilyRoundTrips(t *testing.T) {
 		t.Fatal("the kept flag was dropped in the delta round-trip")
 	}
 }
+
+// TestItemDeltaAffixOrderStable guards a LOAD-BEARING invariant: dumpItemDelta bytes are used as an item
+// COALESCING GROUP KEY (coalesceItemLines in commands.go + the Char.Items GMCP grouping in gmcp.go), so two
+// items with the SAME quality affixes must serialize to IDENTICAL bytes regardless of the affix map's
+// construction — else identical items would fail to coalesce. encoding/json sorts map keys, so this holds
+// today; the guard catches a future switch to a non-sorting serializer of the delta.
+func TestItemDeltaAffixOrderStable(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	a := z.spawn(ProtoRef("midgaard:obj:torch"))
+	Add(a, &Quality{Level: 3, Affixes: map[string]float64{"fire": 2, "keen": 1, "sharp": 4}})
+	b := z.spawn(ProtoRef("midgaard:obj:torch"))
+	Add(b, &Quality{Level: 3, Affixes: map[string]float64{"sharp": 4, "fire": 2, "keen": 1}})
+	if da, db := string(dumpItemDelta(a)), string(dumpItemDelta(b)); da != db {
+		t.Fatalf("item delta bytes must be affix-order-stable (they are a coalescing group key):\n a=%s\n b=%s", da, db)
+	}
+}
