@@ -49,6 +49,11 @@ type effectCtx struct {
 	// castAbility so a NAME-RESOLVING op (craft_recipe with no fixed ref — `craft <name>`, #34) can
 	// resolve its subject from what the player typed. "" for event/tick/AoE ctx (no invocation tail).
 	arg string
+	// suppressSkillUse lets an op that REFUSED (did no work) cancel the ability's step-10 OnSkillUse fire
+	// (#38 slice B): a salvage/craft that was gated (skill too low, wrong tag, blocked…) must NOT advance the
+	// very skill that gates it, else a player trains past the gate by spamming a refused action. The op sets
+	// it true up front and clears it only on the success path; commitAbility skips OnSkillUse when it stays set.
+	suppressSkillUse bool
 	// depth is how many EVENT-fires deep this resolution is (event.go re-entrancy guard). A command/
 	// cast/tick ctx is depth 0; fireEvent runs handlers at depth+1 and refuses past maxEventDepth.
 	depth int

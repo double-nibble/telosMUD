@@ -92,6 +92,10 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 	if c.actor == nil {
 		return fmt.Errorf("salvage_item: no actor")
 	}
+	// #38 slice B: default to SUPPRESSING the ability's OnSkillUse — a gated/failed disenchant must not
+	// advance the salvaging skill that gates it. Cleared only on the success path (just before consume), so
+	// every refuse/error return below leaves the skill un-advanced.
+	c.suppressSkillUse = true
 	// Two authoring shapes: FIXED proto (op.item set — the Phase-13.4 form) OR OBJECT-TARGETED (op.item
 	// empty — `disenchant <item>`, #38), where the player's typed argument resolves a held item by keyword.
 	var src *Entity
@@ -178,6 +182,8 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 			}
 		}
 	}
+	// All gates passed — this is a real salvage: allow the ability's OnSkillUse to fire (advance the skill).
+	c.suppressSkillUse = false
 	// Consume the source FIRST: destruction of an owned item ignores the bound state (a bound epic is
 	// deconstructable by its owner, §1). A material source decrements one; a unique item despawns.
 	if isMaterial(src) && itemStackCount(src) > 1 {
@@ -186,13 +192,24 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 		Move(src, nil)
 	}
 	// Roll the salvage table into components (the loot resolver), delivering each to the actor. Over-skill
-	// runs the table `passes` times (base 1 + bonus rolls), each an independent weighted draw.
+	// runs the table `passes` times (base 1 + bonus rolls). The bonus passes roll ONLY the non-guaranteed
+	// (chance) rolls: a GUARANTEED roll — e.g. a bound top-tier essence sink — is minted exactly once (the
+	// base pass), so over-skill rewards extra FILLER without N-multiplying a scarce/bound component (#38 slice
+	// B review). A table of only guaranteed rolls therefore yields no over-skill bonus, by design.
 	rng := c.rng
 	if rng == nil {
 		rng = rand.New(rand.NewSource(rand.Int63())) //nolint:gosec // gameplay roll, not security
 	}
 	for p := 0; p < passes; p++ {
 		for i := range table.rolls {
+			// A bonus pass re-rolls ONLY probabilistic ("chance") rolls; guaranteed/weighted rolls (which
+			// always yield — loot.go) are minted once on the base pass, so a bound sink is never multiplied.
+			// NOTE (tracked follow-up): a chance roll that also carries a PITY spec mutates the looter's pity
+			// counter per pass, so an over-skilled salvage compounds pity N-fold. Latent today (no salvage
+			// table uses pity); if one does, gate pity out of the bonus passes.
+			if p > 0 && table.rolls[i].kind != "chance" {
+				continue
+			}
 			for _, entry := range c.z.resolveRoll(c.actor, &table.rolls[i], rng) {
 				c.z.deliverComponent(c.actor, entry, rng)
 			}

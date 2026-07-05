@@ -290,9 +290,9 @@ func TestSalvageSkillGateRefusesLowSkill(t *testing.T) {
 	}
 }
 
-// TestSalvageOverSkillBonus: far exceeding the skill requirement yields BONUS table rolls (extra components).
-// The rare tier's salvage_bonus_step is 3, so skill 9 over a level-0 requirement (0) grants 3 bonus rolls
-// (capped) — 4 total passes of the guaranteed-2-item disenchant_arms table.
+// TestSalvageOverSkillBonus: far exceeding the skill requirement yields BONUS rolls of the table's CHANCE
+// filler (a common torch), while the GUARANTEED components (the tradeable leather + the bound epic essence
+// SINK) are minted exactly ONCE — over-skill rewards filler without N-multiplying the scarce/bound sink.
 func TestSalvageOverSkillBonus(t *testing.T) {
 	e := newCmdEnv(t)
 	actor := e.actor.entity
@@ -309,13 +309,49 @@ func TestSalvageOverSkillBonus(t *testing.T) {
 	if err := opSalvageItem(c, op); err != nil {
 		t.Fatalf("over-skill salvage: %v", err)
 	}
-	// disenchant_arms yields 1 leather + 1 essence per pass; base 1 + capped 3 bonus = 4 passes => 4 leather.
-	// Leather is a stackable material, so count the stack.
-	leather := findHeldByProto(actor, "midgaard:obj:leather")
-	if leather == nil {
-		t.Fatal("over-skill salvage should still yield leather")
+	// The GUARANTEED bound essence sink is minted once — NOT multiplied by over-skill.
+	if got := heldQuantity(actor, "midgaard:obj:essence"); got != 1 {
+		t.Fatalf("over-skill essence = %d, want 1 (a guaranteed bound sink must not multiply)", got)
 	}
-	if got := itemStackCount(leather); got != 1+maxSalvageBonus {
-		t.Fatalf("over-skill leather count = %d, want %d (base 1 + %d capped bonus rolls)", got, 1+maxSalvageBonus, maxSalvageBonus)
+	// The GUARANTEED leather is likewise once.
+	if got := heldQuantity(actor, "midgaard:obj:leather"); got != 1 {
+		t.Fatalf("over-skill leather = %d, want 1 (guaranteed, not multiplied)", got)
+	}
+	// The CHANCE filler (torch) IS multiplied: base 1 + the capped bonus passes.
+	if got := heldQuantity(actor, "midgaard:obj:torch"); got != 1+maxSalvageBonus {
+		t.Fatalf("over-skill filler torches = %d, want %d (base 1 + %d capped bonus rolls)", got, 1+maxSalvageBonus, maxSalvageBonus)
+	}
+}
+
+// TestSalvageRefuseDoesNotAdvanceSkill: a skill-gated REFUSE suppresses the ability's OnSkillUse, so a player
+// can't train the salvaging skill by spamming a disenchant they're too unskilled to complete (#38 review #1).
+// A SUCCESSFUL salvage leaves the hook enabled.
+func TestSalvageRefuseDoesNotAdvanceSkill(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	sword := e.z.spawn(ProtoRef("midgaard:obj:sword"))
+	Add(sword, &Quality{Level: 5, Affixes: map[string]float64{}}) // rare level 5 => min skill 5
+	Move(sword, actor)
+
+	op := &effectOp{kind: "salvage_item", tag: "salvageable", skill: "leatherworking"}
+
+	// Below the requirement: refused, and OnSkillUse is suppressed.
+	setAttrBase(actor, "leatherworking", 0)
+	cRefuse := &effectCtx{z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral, arg: "sword"}
+	if err := opSalvageItem(cRefuse, op); err != nil {
+		t.Fatalf("gated salvage: %v", err)
+	}
+	if !cRefuse.suppressSkillUse {
+		t.Fatal("a skill-gated refuse must suppress OnSkillUse (no training past your own gate)")
+	}
+
+	// At/above the requirement: succeeds, and the hook is NOT suppressed.
+	setAttrBase(actor, "leatherworking", 5)
+	cOK := &effectCtx{z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral, arg: "sword", rng: rand.New(rand.NewSource(1))}
+	if err := opSalvageItem(cOK, op); err != nil {
+		t.Fatalf("successful salvage: %v", err)
+	}
+	if cOK.suppressSkillUse {
+		t.Fatal("a successful salvage should allow OnSkillUse to fire")
 	}
 }

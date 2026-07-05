@@ -910,7 +910,9 @@ loot_tables:
   # disenchant_arms: a SALVAGE table (Phase 13.4) — the salvage_item op rolls it after consuming a source
   # weapon. Two guaranteed rolls: a tradeable mid-tier leather component (uncommon, unbound — feeds the
   # market) + a top-tier arcane essence (epic, which binds on creation via the tier's binds flag — the
-  # no-trade sink). Reuses the Phase-12 loot resolver; deterministic under a seeded roll.
+  # no-trade sink). The chance FILLER roll (a common wrapping-cloth torch) is what the #38 over-skill bonus
+  # re-rolls: bonus passes multiply this filler, NEVER the guaranteed bound essence sink. Deterministic under
+  # a seeded roll.
   - ref: disenchant_arms
     rolls:
       - kind: guaranteed
@@ -919,6 +921,10 @@ loot_tables:
       - kind: guaranteed
         pool:
           - {item: midgaard:obj:essence, tier: epic}
+      - kind: chance
+        chance: 1.0 # always yields on the base pass; over-skill bonus passes re-roll ONLY this filler
+        pool:
+          - {item: midgaard:obj:torch, tier: common}
 
 # spawn_schedules: long-timer bosses the director spawns on a schedule (Phase 12.4), distinct from per-zone
 # resets. The Warden respawns a week after it dies; if its window passed while the director was down, it
