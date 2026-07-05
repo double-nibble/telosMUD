@@ -292,10 +292,14 @@ func invItems(e *Entity) []gmcpItem {
 }
 
 func roomItems(e *Entity) []gmcpItem {
-	// VISIBILITY (#28): this needs no canSee filter TODAY because concealment (flagInvisible) is Living-
-	// scoped and this list excludes all Living occupants — so no concealed entity can appear here. If
-	// item-level invisibility is ever added, this walk MUST gain a z.canSee(e, occ) filter (like lookRoom).
-	if e.location == nil {
+	// VISIBILITY: entity-level concealment (flagInvisible) is Living-scoped and this list excludes all Living
+	// occupants, so no concealed CREATURE can appear here. But ROOM-level darkness (#99) conceals the whole
+	// room — ground loot included — so this walk must respect it, or a GMCP client would receive Char.Items
+	// frames naming floor loot a light-blind player can't see (a text-vs-GMCP parity break, the exact leak
+	// lookRoom's pitch-black short-circuit closes on the telnet path). Returning empty here lets diffItems
+	// emit Remove frames on entering the dark and a full re-list on relighting. If item-level invisibility is
+	// ever added, this walk MUST also gain a per-item z.canSee(e, occ) filter (like lookRoom).
+	if e.location == nil || !canSeeRoomContents(e) {
 		return []gmcpItem{}
 	}
 	ground := make([]*Entity, 0, len(e.location.contents))

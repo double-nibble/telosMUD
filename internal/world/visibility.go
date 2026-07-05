@@ -21,6 +21,15 @@ const (
 	flagDetectInvis = "detect_invis" // viewer: pierces flagInvisible
 	flagHolylight   = "holylight"    // viewer: sees everything (the elevated end — builders/immortals, #28)
 	flagWizinvis    = "wizinvis"     // target: a STAFF member hidden from LOWER trust ranks (#30, rank-aware)
+
+	// Room darkness model (#99). A room authored with flagDark is unlit: an ordinary viewer standing in it
+	// perceives nothing but itself, UNLESS the room holds a light source or the viewer can see in the dark.
+	// All three tokens are open-set flags/tags content sets and the engine reads (the pillar) — no schema
+	// change: flagDark rides the room's namedFlags (content_map.go), flagInfravision the viewer's Living
+	// flags (a racial/effect grant), and a light source is any co-located entity that emitsLight.
+	flagDark        = "dark"        // ROOM: unlit — occupants concealed from ordinary viewers (namedFlags)
+	flagInfravision = "infravision" // viewer: sees in an unlit room (a racial / detect-effect grant)
+	flagLight       = "light"       // light source: a Living glow flag (a light spell) OR an item ItemMeta tag
 )
 
 // SECURITY POSTURE (#28, updated once the builder trust tier #27 landed): holylight is now a RESERVED trust
@@ -43,10 +52,23 @@ const (
 // nil/absent-light case — such a mechanic must make its OWN decision here, not inherit this early return.
 func visibleTo(viewer, target *Entity) bool {
 	if viewer == nil || target == nil || viewer == target {
-		return true // no perspective, or looking at yourself — never concealed
+		// No perspective, or looking at yourself — never concealed. This early return is ALSO correct for
+		// room darkness (#99): a nil viewer is a system render with no one to blind, a nil target is nothing
+		// to see, and you always perceive yourself regardless of light. Darkness makes its OWN decision below
+		// (a co-located viewer/target reaching the dark check) rather than inheriting this return blindly.
+		return true
 	}
 	if hasFlag(viewer, flagHolylight) {
-		return true // see-all: the elevated end of the chokepoint (#28)
+		return true // see-all: the elevated end of the chokepoint (#28) — pierces invisibility AND darkness
+	}
+	// Room darkness (#99): a viewer in an unlit dark room perceives no other occupant OF THAT ROOM. Checked
+	// here, at the chokepoint, so every co-located canSee consumer (targeting, act() messaging, lookRoom, GMCP
+	// occupants) inherits it uniformly. Darkness is a PER-ROOM property, so it is gated on co-location: the
+	// one zone-WIDE caller (whoLocal walks every player in the zone, not just the viewer's room) must not have
+	// its whole roster blanked just because the viewer stands in the dark. infravision (cheap flag, checked
+	// first) and holylight (above) are the two ways to see without light.
+	if !hasFlag(viewer, flagInfravision) && viewer.location == target.location && roomIsDark(viewer.location) {
+		return false
 	}
 	// Staff wizinvis (#30): a concealed staff member is hidden from any viewer of STRICTLY LOWER trust rank
 	// (resolved through the zone's content ladder). Equal/higher rank still see them (and holylight, above,
@@ -65,4 +87,58 @@ func visibleTo(viewer, target *Entity) bool {
 		return false
 	}
 	return true
+}
+
+// roomIsDark reports whether room is currently UNLIT (#99): it carries the authored flagDark AND no light
+// source is present to dispel it. A non-room entity, a room without flagDark, or a dark room holding a light
+// source is not dark. This is the room-level counterpart to the entity-level concealment flags above — the
+// perception locale's own decision (visibleTo consults it for the VIEWER's room), never inherited from an
+// early return. A nil room (a viewer with no location — mid-handoff, a container) is treated as not dark:
+// darkness is a room property and there is no room to be dark.
+func roomIsDark(room *Entity) bool {
+	if room == nil || !roomFlag(room, flagDark) {
+		return false
+	}
+	return !roomIsLit(room)
+}
+
+// roomIsLit reports whether any entity in room emits light (#99). It scans the room's immediate contents —
+// each occupant (a Living carrying the flagLight glow, or a light-source item lying on the ground) and each
+// occupant's OWN immediate contents (a carried/worn torch) — and short-circuits on the first light found.
+// One level of nesting deep: a lit torch works in hand or on the ground, not buried inside a closed bag.
+// Called only for a dark room with a light-blind viewer (roomIsDark gates it), so the scan is a cold path.
+func roomIsLit(room *Entity) bool {
+	for _, occ := range room.contents {
+		if emitsLight(occ) {
+			return true
+		}
+		for _, held := range occ.contents {
+			if emitsLight(held) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// canSeeRoomContents reports whether viewer can perceive its current room at all (#99) — its description,
+// exits, and occupants. False ONLY when the viewer stands in an unlit dark room with no way to see: lookRoom
+// uses it to render the pitch-black notice in place of the room. holylight and infravision both see; a light
+// source in the room (incl. one the viewer carries) makes roomIsDark false, so it sees too.
+func canSeeRoomContents(viewer *Entity) bool {
+	if viewer == nil {
+		return true
+	}
+	if hasFlag(viewer, flagHolylight) || hasFlag(viewer, flagInfravision) {
+		return true
+	}
+	return !roomIsDark(viewer.location)
+}
+
+// emitsLight reports whether entity e is itself a light source (#99): a Living carrying the flagLight glow
+// (a light spell / luminous creature) or an item whose ItemMeta bears the flagLight tag (a torch/lantern).
+// The two carriers share the one token so content authors a single "light" concept on either an effect or
+// an item. It never recurses — roomIsLit handles the one level of container nesting.
+func emitsLight(e *Entity) bool {
+	return hasFlag(e, flagLight) || hasItemTag(e, flagLight)
 }
