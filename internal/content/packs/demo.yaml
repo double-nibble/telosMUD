@@ -554,6 +554,9 @@ abilities:
   # gear carrying that tag may be broken down; a per-item `no_salvage` block or `salvage_table` override is
   # honored by the op. The source is CONSUMED even when BOUND (owner deconstruction, §1); disenchant_arms yields
   # a tradeable leather component (uncommon, unbound) + a bound arcane essence (the epic tier binds, D1).
+  # NOTE: targeting.mode is `none` (the op reads the verb's raw argument itself for object resolution — the
+  # arg is threaded to the op independently of targeting mode); a worn/wielded or `keep`-flagged source is
+  # refused up front (salvage honors the drop-guards, #36).
   - ref: disenchant
     name: Disenchant
     invocation: command

@@ -93,6 +93,19 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 	if !guardCrossPlayerWrite(c, c.actor) {
 		return nil
 	}
+	// Gate: a WORN/wielded or keep-flagged source must be taken off / unkept first. Salvage is destructive —
+	// more so than drop, which already refuses a worn (equippedBlocked) or kept (keptBlocked) item (#36) — so
+	// it honors the same guards up front rather than vaporizing equipped or explicitly-kept gear from under
+	// the player. (The consume below goes through Move, which also unequips a worn source as a #35 backstop,
+	// but the refusal here is the player-facing guard.)
+	if wr, ok := Get[*Wearer](c.actor); ok && wr.slotOf(src) != WearLocNone {
+		salvageRefuse(c.actor, "You must remove it before you can salvage it.")
+		return nil
+	}
+	if isKept(src) {
+		salvageRefuse(c.actor, "It is marked keep; `unkeep` it before salvaging.")
+		return nil
+	}
 	// Gate: a per-item BLOCK flag refuses the verb (a super-rare metal / quest item can't be broken down).
 	if itemNoSalvage(src) {
 		salvageRefuse(c.actor, "That cannot be salvaged.")

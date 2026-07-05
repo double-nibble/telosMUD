@@ -145,6 +145,44 @@ func TestDisenchantBlockedItemRefused(t *testing.T) {
 	}
 }
 
+// TestDisenchantWornItemRefused: salvage is destructive, so a WORN/wielded source is refused up front (the
+// player must `remove` it first — the same guard drop honors, #36) and is NOT consumed.
+func TestDisenchantWornItemRefused(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	applyBundleTo(e.z, actor, "leatherworking")
+	sword := addTestItem(e.z, actor, "a steel sword", []string{"sword"},
+		wearableFor(WearLocWield), &Weapon{diceNum: 1, diceSize: 8, damageType: "slash"},
+		&ItemMeta{tags: []string{"salvageable"}})
+	e.run("wield sword")
+
+	aout, _ := e.run("disenchant sword")
+	if !has(aout, "must remove it") {
+		t.Fatalf("disenchanting a wielded item should be refused; got %v", aout)
+	}
+	if wr, _ := Get[*Wearer](actor); wr.slotOf(sword) == WearLocNone {
+		t.Fatal("a refused disenchant must not have unequipped/consumed the worn sword")
+	}
+}
+
+// TestDisenchantKeptItemRefused: a keep-flagged source is refused (unkeep first) and not consumed.
+func TestDisenchantKeptItemRefused(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	applyBundleTo(e.z, actor, "leatherworking")
+	relic := addTestItem(e.z, actor, "a prized relic", []string{"relic"},
+		&ItemMeta{tags: []string{"salvageable"}})
+	keepItem(relic)
+
+	aout, _ := e.run("disenchant relic")
+	if !has(aout, "marked keep") {
+		t.Fatalf("disenchanting a kept item should be refused; got %v", aout)
+	}
+	if findHeldByProto(actor, string(relic.proto)) == nil && relic.location != actor {
+		t.Fatal("a refused disenchant must not consume the kept item")
+	}
+}
+
 // TestSalvagePerItemOverrideTable: an item's own salvage_table wins over the op's default table.
 func TestSalvagePerItemOverrideTable(t *testing.T) {
 	e := newCmdEnv(t)
