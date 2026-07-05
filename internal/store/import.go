@@ -405,7 +405,10 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	// Rarity tiers + loot tables (Phase 12.1): ref+pack PK, the shape in the JSONB body. Round-trip into
 	// the same DTOs the embedded YAML produces.
 	for _, rt := range pk.RarityTiers {
-		body, err := json.Marshal(rarityTierBody{Order: rt.Order, Weight: rt.Weight, Color: rt.Color, Binds: rt.Binds})
+		body, err := json.Marshal(rarityTierBody{
+			Order: rt.Order, Weight: rt.Weight, Color: rt.Color, Binds: rt.Binds,
+			SalvageTable: rt.SalvageTable, SalvageSkill: rt.SalvageSkill, SalvageBonusStep: rt.SalvageBonusStep,
+		})
 		if err != nil {
 			return fmt.Errorf("store: marshal rarity_tier %s body: %w", rt.Ref, err)
 		}

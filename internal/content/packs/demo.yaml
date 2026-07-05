@@ -561,6 +561,9 @@ abilities:
     name: Disenchant
     invocation: command
     words: [disenchant]
+    # skill: leatherworking_skill fires OnSkillUse on each successful disenchant, advancing the leatherworking
+    # TRACK (Phase 11) — salvaging IS a first-class progression skill, practiced through use.
+    skill: leatherworking_skill
     targeting: {mode: none, scope: room, range: 0, disposition: neutral}
     requires:
       profession: leatherworking
@@ -568,7 +571,10 @@ abilities:
       actor: "You unravel the weave binding the blade and draw out its essence."
       room: "$n unravels a blade into glittering motes of light."
     on_resolve:
-      - {op: salvage_item, table: disenchant_arms, tag: salvageable}
+      # #38 slice B: NO fixed table — the yield DERIVES from the item's rarity tier (rare -> disenchant_arms).
+      # `skill: leatherworking` gates on the leatherworking level (scaled by the item's tier+level) and drives
+      # the over-skill bonus rolls. `tag: salvageable` restricts the verb to gear tagged for it.
+      - {op: salvage_item, tag: salvageable, skill: leatherworking}
 
   # forge_vest: a RECIPE-DRIVEN craft verb (Phase 13.5). Gated on requires.profession (leatherworking) at the
   # verb level; its on_resolve runs craft_recipe(craft:leather_vest), which re-checks the recipe's own gates
@@ -862,7 +868,10 @@ chargens:
 rarity_tiers:
   - {ref: common,   order: 0, weight: 100, color: white}
   - {ref: uncommon, order: 1, weight: 30,  color: green}
-  - {ref: rare,     order: 2, weight: 5,   color: blue}
+  # rare tier carries the #38 slice-B DERIVED salvage rule: disenchanting a rare item rolls disenchant_arms
+  # (no per-item override needed), requires a base salvaging skill of 0 (item LEVEL adds to it — a level-5
+  # rare needs skill 5), and every 3 skill points ABOVE the requirement grant a bonus table roll (over-skill).
+  - {ref: rare,     order: 2, weight: 5,   color: blue, salvage_table: disenchant_arms, salvage_skill: 0, salvage_bonus_step: 3}
   # epic is the TOP tier + the Phase-13.4 bind threshold (D1, binds: true): a salvage component of this tier
   # is bound on creation — the legendary-essence sink that keeps the top end un-buyable. Lower tiers stay
   # tradeable (binds defaults false), feeding the component market.
@@ -901,7 +910,9 @@ loot_tables:
   # disenchant_arms: a SALVAGE table (Phase 13.4) — the salvage_item op rolls it after consuming a source
   # weapon. Two guaranteed rolls: a tradeable mid-tier leather component (uncommon, unbound — feeds the
   # market) + a top-tier arcane essence (epic, which binds on creation via the tier's binds flag — the
-  # no-trade sink). Reuses the Phase-12 loot resolver; deterministic under a seeded roll.
+  # no-trade sink). The chance FILLER roll (a common wrapping-cloth torch) is what the #38 over-skill bonus
+  # re-rolls: bonus passes multiply this filler, NEVER the guaranteed bound essence sink. Deterministic under
+  # a seeded roll.
   - ref: disenchant_arms
     rolls:
       - kind: guaranteed
@@ -910,6 +921,10 @@ loot_tables:
       - kind: guaranteed
         pool:
           - {item: midgaard:obj:essence, tier: epic}
+      - kind: chance
+        chance: 1.0 # always yields on the base pass; over-skill bonus passes re-roll ONLY this filler
+        pool:
+          - {item: midgaard:obj:torch, tier: common}
 
 # spawn_schedules: long-timer bosses the director spawns on a schedule (Phase 12.4), distinct from per-zone
 # resets. The Warden respawns a week after it dies; if its window passed while the director was down, it

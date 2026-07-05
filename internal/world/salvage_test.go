@@ -213,15 +213,145 @@ func TestSalvagePerItemOverrideTable(t *testing.T) {
 func TestSalvageUnknownTableErrors(t *testing.T) {
 	e := newCmdEnv(t)
 	actor := e.actor.entity
-	sword := e.z.spawn(ProtoRef("midgaard:obj:sword"))
-	Move(sword, actor)
+	// An UNTIERED item (a torch), so the op's (bogus) table is the only source — a rare/tiered item would
+	// derive its tier's salvage_table instead (#38 slice B) and never reach the unknown-table path.
+	torch := e.z.spawn(ProtoRef("midgaard:obj:torch"))
+	Move(torch, actor)
 
 	c := &effectCtx{z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral}
-	op := &effectOp{kind: "salvage_item", item: "midgaard:obj:sword", table: "nonexistent"}
+	op := &effectOp{kind: "salvage_item", item: "midgaard:obj:torch", table: "nonexistent"}
 	if err := opSalvageItem(c, op); err == nil {
 		t.Fatal("salvage_item with an unknown table should error")
 	}
-	if findHeldByProto(actor, "midgaard:obj:sword") == nil {
+	if findHeldByProto(actor, "midgaard:obj:torch") == nil {
 		t.Fatal("a salvage that errors on the table must not have consumed the source")
+	}
+}
+
+// TestSalvageDerivesTableFromTier: with no per-item override and no op table, the yield derives from the
+// item's rarity TIER (the demo rare tier -> disenchant_arms) — the #38 slice-B derivation.
+func TestSalvageDerivesTableFromTier(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	sword := e.z.spawn(ProtoRef("midgaard:obj:sword")) // tier: rare, tagged salvageable
+	Move(sword, actor)
+
+	c := &effectCtx{
+		z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral,
+		arg: "sword", rng: rand.New(rand.NewSource(1)),
+	}
+	// No fixed item, NO table, NO override — the table must derive from the rare tier's salvage_table.
+	op := &effectOp{kind: "salvage_item", tag: "salvageable", skill: "leatherworking"}
+	if err := opSalvageItem(c, op); err != nil {
+		t.Fatalf("derived salvage: %v", err)
+	}
+	if findHeldByProto(actor, "midgaard:obj:sword") != nil {
+		t.Fatal("the tier-derived salvage should have consumed the sword")
+	}
+	if findHeldByProto(actor, "midgaard:obj:essence") == nil {
+		t.Fatal("the rare tier's derived disenchant_arms table should yield an essence")
+	}
+}
+
+// TestSalvageSkillGateRefusesLowSkill: the skill requirement scales with the item's LEVEL; below it the actor
+// is refused and the item is untouched. Above it, the salvage proceeds.
+func TestSalvageSkillGateRefusesLowSkill(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	// A rare sword rolled to LEVEL 5 => min skill 5 (rare base 0 + level 5).
+	sword := e.z.spawn(ProtoRef("midgaard:obj:sword"))
+	Add(sword, &Quality{Level: 5, Affixes: map[string]float64{}})
+	Move(sword, actor)
+
+	newCtx := func() *effectCtx {
+		return &effectCtx{
+			z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral,
+			arg: "sword", rng: rand.New(rand.NewSource(1)),
+		}
+	}
+	op := &effectOp{kind: "salvage_item", tag: "salvageable", skill: "leatherworking"}
+
+	// Skill 0 < required 5 => refused, sword untouched.
+	setAttrBase(actor, "leatherworking", 0)
+	if err := opSalvageItem(newCtx(), op); err != nil {
+		t.Fatalf("low-skill salvage: %v", err)
+	}
+	if findHeldByProto(actor, "midgaard:obj:sword") == nil {
+		t.Fatal("a below-requirement salvage must not consume the item")
+	}
+
+	// Skill 5 >= required 5 => proceeds.
+	setAttrBase(actor, "leatherworking", 5)
+	if err := opSalvageItem(newCtx(), op); err != nil {
+		t.Fatalf("at-requirement salvage: %v", err)
+	}
+	if findHeldByProto(actor, "midgaard:obj:sword") != nil {
+		t.Fatal("an at-requirement salvage should consume the item")
+	}
+}
+
+// TestSalvageOverSkillBonus: far exceeding the skill requirement yields BONUS rolls of the table's CHANCE
+// filler (a common torch), while the GUARANTEED components (the tradeable leather + the bound epic essence
+// SINK) are minted exactly ONCE — over-skill rewards filler without N-multiplying the scarce/bound sink.
+func TestSalvageOverSkillBonus(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	setAttrBase(actor, "leatherworking", 30) // deep over-skill => the bonus cap applies
+
+	sword := e.z.spawn(ProtoRef("midgaard:obj:sword")) // rare, level 0 => min skill 0
+	Move(sword, actor)
+
+	c := &effectCtx{
+		z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral,
+		arg: "sword", rng: rand.New(rand.NewSource(1)),
+	}
+	op := &effectOp{kind: "salvage_item", tag: "salvageable", skill: "leatherworking"}
+	if err := opSalvageItem(c, op); err != nil {
+		t.Fatalf("over-skill salvage: %v", err)
+	}
+	// The GUARANTEED bound essence sink is minted once — NOT multiplied by over-skill.
+	if got := heldQuantity(actor, "midgaard:obj:essence"); got != 1 {
+		t.Fatalf("over-skill essence = %d, want 1 (a guaranteed bound sink must not multiply)", got)
+	}
+	// The GUARANTEED leather is likewise once.
+	if got := heldQuantity(actor, "midgaard:obj:leather"); got != 1 {
+		t.Fatalf("over-skill leather = %d, want 1 (guaranteed, not multiplied)", got)
+	}
+	// The CHANCE filler (torch) IS multiplied: base 1 + the capped bonus passes.
+	if got := heldQuantity(actor, "midgaard:obj:torch"); got != 1+maxSalvageBonus {
+		t.Fatalf("over-skill filler torches = %d, want %d (base 1 + %d capped bonus rolls)", got, 1+maxSalvageBonus, maxSalvageBonus)
+	}
+}
+
+// TestSalvageRefuseDoesNotAdvanceSkill: a skill-gated REFUSE suppresses the ability's OnSkillUse, so a player
+// can't train the salvaging skill by spamming a disenchant they're too unskilled to complete (#38 review #1).
+// A SUCCESSFUL salvage leaves the hook enabled.
+func TestSalvageRefuseDoesNotAdvanceSkill(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	sword := e.z.spawn(ProtoRef("midgaard:obj:sword"))
+	Add(sword, &Quality{Level: 5, Affixes: map[string]float64{}}) // rare level 5 => min skill 5
+	Move(sword, actor)
+
+	op := &effectOp{kind: "salvage_item", tag: "salvageable", skill: "leatherworking"}
+
+	// Below the requirement: refused, and OnSkillUse is suppressed.
+	setAttrBase(actor, "leatherworking", 0)
+	cRefuse := &effectCtx{z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral, arg: "sword"}
+	if err := opSalvageItem(cRefuse, op); err != nil {
+		t.Fatalf("gated salvage: %v", err)
+	}
+	if !cRefuse.suppressSkillUse {
+		t.Fatal("a skill-gated refuse must suppress OnSkillUse (no training past your own gate)")
+	}
+
+	// At/above the requirement: succeeds, and the hook is NOT suppressed.
+	setAttrBase(actor, "leatherworking", 5)
+	cOK := &effectCtx{z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral, arg: "sword", rng: rand.New(rand.NewSource(1))}
+	if err := opSalvageItem(cOK, op); err != nil {
+		t.Fatalf("successful salvage: %v", err)
+	}
+	if cOK.suppressSkillUse {
+		t.Fatal("a successful salvage should allow OnSkillUse to fire")
 	}
 }

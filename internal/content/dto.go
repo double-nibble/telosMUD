@@ -240,6 +240,14 @@ type RarityTierDTO struct {
 	// bought), while low/mid tiers stay tradeable to feed the market. false (the default) for every
 	// tradeable tier; existing tiers are unchanged.
 	Binds bool `json:"binds,omitempty" yaml:"binds,omitempty"`
+	// SalvageTable/SalvageSkill/SalvageBonusStep are the #38 slice-B DERIVED salvage yield for this tier:
+	// the default salvage table a disenchant rolls for an item of this tier (when it declares no per-item
+	// override), the base salvaging skill the tier requires (item level adds to it), and the skill points
+	// above the requirement per bonus table roll (0 => no over-skill bonus). All optional; "" / 0 leave the
+	// tier without a derived salvage rule (the verb's default table, if any, is then the only source).
+	SalvageTable     string `json:"salvage_table,omitempty" yaml:"salvage_table,omitempty"`
+	SalvageSkill     int    `json:"salvage_skill,omitempty" yaml:"salvage_skill,omitempty"`
+	SalvageBonusStep int    `json:"salvage_bonus_step,omitempty" yaml:"salvage_bonus_step,omitempty"`
 }
 
 // LootTableDTO is one content-defined loot table (Phase 12.1): a list of INDEPENDENT rolls a mob drops

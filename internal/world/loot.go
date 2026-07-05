@@ -25,6 +25,13 @@ type rarityTierDef struct {
 	weight float64
 	color  string
 	binds  bool // Phase 13.4 (D1): items of this tier bind on creation (the top-tier no-trade sink)
+	// #38 slice B: the DERIVED salvage yield for items of this tier. salvageTable is the default table a
+	// disenchant rolls when the item declares no per-item override; salvageSkill is the base skill this tier
+	// requires (the rarity component of the requirement — item level adds to it); salvageBonusStep is the
+	// skill points ABOVE the requirement per bonus table roll (0 => no over-skill bonus).
+	salvageTable     string
+	salvageSkill     int
+	salvageBonusStep int
 }
 
 type lootTableDef struct {
@@ -70,7 +77,10 @@ type lootPity struct {
 }
 
 func buildRarityTierDef(d content.RarityTierDTO) *rarityTierDef {
-	return &rarityTierDef{ref: d.Ref, order: d.Order, weight: d.Weight, color: d.Color, binds: d.Binds}
+	return &rarityTierDef{
+		ref: d.Ref, order: d.Order, weight: d.Weight, color: d.Color, binds: d.Binds,
+		salvageTable: d.SalvageTable, salvageSkill: d.SalvageSkill, salvageBonusStep: d.SalvageBonusStep,
+	}
 }
 
 // affixDef is the runtime form of a content AffixDefDTO (#37): a NAMED affix (attr + roll range) a loot

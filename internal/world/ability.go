@@ -267,7 +267,9 @@ func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, arg st
 	// Phase 11.3: a SKILL ability also fires OnSkillUse about the user, so a use-based track can advance on
 	// use ("advance-through-use" — LP/Discworld/BRP) decoupled from the skill's primary effect. The skill
 	// improvement (a chance to gain) is a content handler on OnSkillUse; the engine only fires the hook.
-	if def.skill != "" {
+	// #38 slice B: an op that REFUSED (suppressSkillUse) cancels the fire — a gated action that did no work
+	// must not advance the skill that gates it (else a player trains past the gate by spamming a refusal).
+	if def.skill != "" && !c.suppressSkillUse {
 		z.fireEvent(c, evOnSkillUse, actor, target, 1)
 	}
 }

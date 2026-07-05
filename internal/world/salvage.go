@@ -32,6 +32,23 @@ func itemSalvageTable(item *Entity) string {
 	return ""
 }
 
+// itemTier returns the item's rarity tier ref (#38 slice B — the salvage-derivation key), or "" if untiered.
+func itemTier(item *Entity) string {
+	if m, ok := Get[*ItemMeta](item); ok {
+		return m.tier
+	}
+	return ""
+}
+
+// itemLevel returns the item's rolled per-instance Quality LEVEL (#38 slice B — the salvage-skill scaler), or
+// 0 for an un-rolled prototype item.
+func itemLevel(item *Entity) int {
+	if q, ok := Get[*Quality](item); ok {
+		return q.Level
+	}
+	return 0
+}
+
 // hasItemTag reports whether the item carries content tag `tag` (#38 tag gate). An empty tag matches anything
 // (no gate); an item with no ItemMeta has no tags.
 func hasItemTag(item *Entity, tag string) bool {
@@ -75,6 +92,10 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 	if c.actor == nil {
 		return fmt.Errorf("salvage_item: no actor")
 	}
+	// #38 slice B: default to SUPPRESSING the ability's OnSkillUse — a gated/failed disenchant must not
+	// advance the salvaging skill that gates it. Cleared only on the success path (just before consume), so
+	// every refuse/error return below leaves the skill un-advanced.
+	c.suppressSkillUse = true
 	// Two authoring shapes: FIXED proto (op.item set — the Phase-13.4 form) OR OBJECT-TARGETED (op.item
 	// empty — `disenchant <item>`, #38), where the player's typed argument resolves a held item by keyword.
 	var src *Entity
@@ -117,18 +138,52 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 		salvageRefuse(c.actor, "You can't salvage that.")
 		return nil
 	}
-	// The table: a per-item OVERRIDE (salvageTable) wins over the verb's default (op.table).
-	tableRef := op.table
-	if ov := itemSalvageTable(src); ov != "" {
-		tableRef = ov
+	// Table DERIVATION (#38 slice B): a per-item OVERRIDE wins, else the item's rarity TIER default (derived
+	// from tier+level), else the verb's fixed default table. An empty source is a clean refuse (the player
+	// picked an item that yields nothing); a NON-empty ref that names no table is a content error.
+	tier := c.z.rarityTierDefs().get(itemTier(src))
+	tableRef := itemSalvageTable(src)
+	if tableRef == "" && tier != nil {
+		tableRef = tier.salvageTable
 	}
 	if tableRef == "" {
-		return fmt.Errorf("salvage_item: no table")
+		tableRef = op.table
+	}
+	if tableRef == "" {
+		salvageRefuse(c.actor, "You don't know how to salvage that.")
+		return nil
 	}
 	table := c.z.lootTableDefs().get(tableRef)
 	if table == nil {
 		return fmt.Errorf("salvage_item: unknown table %q", tableRef)
 	}
+	// Skill gate + over-skill bonus (#38 slice B). The requirement scales with the item's tier (base) + its
+	// rolled LEVEL; below it the actor can't break the item down. Far EXCEEDING it yields bonus table rolls
+	// (extra mats). No op.skill => no skill gate and no bonus (the Phase-13.4 fixed form is unchanged).
+	minSkill := itemLevel(src)
+	bonusStep := 0
+	if tier != nil {
+		minSkill += tier.salvageSkill
+		bonusStep = tier.salvageBonusStep
+	}
+	passes := 1
+	if op.skill != "" {
+		skillVal := int(attr(c.actor, op.skill))
+		if skillVal < minSkill {
+			salvageRefuse(c.actor, "Your skill is not yet equal to breaking that down.")
+			return nil
+		}
+		if bonusStep > 0 {
+			if extra := (skillVal - minSkill) / bonusStep; extra > 0 {
+				if extra > maxSalvageBonus {
+					extra = maxSalvageBonus
+				}
+				passes += extra
+			}
+		}
+	}
+	// All gates passed — this is a real salvage: allow the ability's OnSkillUse to fire (advance the skill).
+	c.suppressSkillUse = false
 	// Consume the source FIRST: destruction of an owned item ignores the bound state (a bound epic is
 	// deconstructable by its owner, §1). A material source decrements one; a unique item despawns.
 	if isMaterial(src) && itemStackCount(src) > 1 {
@@ -136,18 +191,36 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 	} else {
 		Move(src, nil)
 	}
-	// Roll the salvage table into components (the loot resolver), delivering each to the actor.
+	// Roll the salvage table into components (the loot resolver), delivering each to the actor. Over-skill
+	// runs the table `passes` times (base 1 + bonus rolls). The bonus passes roll ONLY the non-guaranteed
+	// (chance) rolls: a GUARANTEED roll — e.g. a bound top-tier essence sink — is minted exactly once (the
+	// base pass), so over-skill rewards extra FILLER without N-multiplying a scarce/bound component (#38 slice
+	// B review). A table of only guaranteed rolls therefore yields no over-skill bonus, by design.
 	rng := c.rng
 	if rng == nil {
 		rng = rand.New(rand.NewSource(rand.Int63())) //nolint:gosec // gameplay roll, not security
 	}
-	for i := range table.rolls {
-		for _, entry := range c.z.resolveRoll(c.actor, &table.rolls[i], rng) {
-			c.z.deliverComponent(c.actor, entry, rng)
+	for p := 0; p < passes; p++ {
+		for i := range table.rolls {
+			// A bonus pass re-rolls ONLY probabilistic ("chance") rolls; guaranteed/weighted rolls (which
+			// always yield — loot.go) are minted once on the base pass, so a bound sink is never multiplied.
+			// NOTE (tracked follow-up): a chance roll that also carries a PITY spec mutates the looter's pity
+			// counter per pass, so an over-skilled salvage compounds pity N-fold. Latent today (no salvage
+			// table uses pity); if one does, gate pity out of the bonus passes.
+			if p > 0 && table.rolls[i].kind != "chance" {
+				continue
+			}
+			for _, entry := range c.z.resolveRoll(c.actor, &table.rolls[i], rng) {
+				c.z.deliverComponent(c.actor, entry, rng)
+			}
 		}
 	}
 	return nil
 }
+
+// maxSalvageBonus caps the number of BONUS table rolls over-skill can grant (#38 slice B), so an absurdly
+// high salvaging skill can't farm unbounded mats from one item.
+const maxSalvageBonus = 3
 
 // deliverComponent spawns one salvage component, rolls its quality (Phase 12.3), applies TIER-DEPENDENT
 // binding (D1 — a binds-tier component is bound on creation), and delivers it to the actor, merging into an

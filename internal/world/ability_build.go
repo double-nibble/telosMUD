@@ -208,6 +208,7 @@ func parseOp(v any) (effectOp, error) {
 	op.profession = mapStr(m, "profession")    // Phase 13.3: learn_profession target
 	op.table = mapStr(m, "table")              // Phase 13.4: salvage_item loot/salvage table
 	op.tag = mapStr(m, "tag")                  // #38: salvage_item object-target item-tag gate
+	op.skill = mapStr(m, "skill")              // #38 slice B: salvage_item salvaging-skill attribute
 	op.recipe = mapStr(m, "recipe")            // Phase 13.5: craft_recipe target recipe
 	op.amount = mapFloat(m, "amount")
 	op.duration = int(mapFloat(m, "duration"))
