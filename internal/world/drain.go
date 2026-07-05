@@ -23,7 +23,11 @@ func (z *Zone) initiateHandoff(s *session, from *Entity, destZone string, destRo
 	s.frozenFrom = from
 	s.handedOff = false
 	if departMsg != "" {
-		z.act(departMsg, s.entity, nil, nil, "", "", ToRoom)
+		// Presence concealment (#100): route the cross-shard departure through actConceal like every other
+		// departure/arrival announce, so a hidden/sneaking or dark-room mover is silent to viewers who can't
+		// see them — not a leaky "Someone departs east." The empty-departMsg DRAIN caller stays silent (the
+		// guard above), and actConceal is equivalent to act for a non-concealed mover.
+		z.actConceal(departMsg, s.entity, ToRoom)
 	}
 	Move(s.entity, nil) // detach from the room so they don't linger as a ghost during the in-flight handoff
 	z.log.Debug("handoff initiated", "player", s.character, "dest_zone", destZone, "dest_room", destRoom, "epoch", s.epoch)

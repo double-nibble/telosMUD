@@ -38,8 +38,11 @@ const (
 	// The perception CONTEST (viewer skill vs target stealth) is authored as CONTENT (a hide ability runs a
 	// contested `check` op and, on success, applies flagHidden; a keen-eyed viewer carries flagSenseHidden
 	// from a passive-perception affect) — the engine supplies the concealment primitive + chokepoint wiring,
-	// not a hardcoded skill, exactly as it did for flagInvisible/detect_invis. A hidden mover also SNEAKS for
-	// free: presence lines (act.go actConceal) suppress entirely for any viewer this predicate hides them from.
+	// not a hardcoded skill, exactly as it did for flagInvisible/detect_invis. A hidden mover also moves
+	// SILENTLY: presence lines (act.go actConceal) suppress entirely for any viewer this predicate hides them
+	// from. NOTE this is presence-LINE stealth only — like flagInvisible, it does not evade an aggressive mob's
+	// aggroOnEntry (that mob still attacks; aggro-evasion, if ever wanted, is a separate deliberate choice for
+	// BOTH hidden and invisible). Bystanders still see the ensuing combat as "Someone" (nameFor via canSee).
 	flagHidden      = "hidden"       // target: mundanely concealed (a hide/sneak skill) — pierced by sense_hidden
 	flagSenseHidden = "sense_hidden" // viewer: perceives a flagHidden target (a spot/perception capability)
 )
