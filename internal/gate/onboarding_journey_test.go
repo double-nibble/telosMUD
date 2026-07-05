@@ -104,13 +104,13 @@ func TestItemInteractionActJourney(t *testing.T) {
 	actor.expect(t, "<wielded> a steel longsword")
 	actor.expect(t, "<head> an iron helmet")
 
-	// --- inventory reflects the COMPLEMENT: both items are equipped (excluded from the carried list
-	//     by slotOf), so the carried list is now empty ("Nothing."). This proves the equip really moved
-	//     them from inventory to the slot view (a regression that left a wielded item ALSO in inventory
-	//     would render it here instead of "Nothing."). ---
+	// --- inventory now FOLDS the worn items in, flagged by slot (#85): the carried list shows both
+	//     equipped items under their slot tags ("<wielded> ...", "<worn on head> ...") rather than hiding
+	//     them. This proves the equip is reflected in the inventory view via the worn-slot flag. ---
 	actor.send(t, "inventory")
 	actor.expect(t, "You are carrying:")
-	actor.expect(t, "Nothing.")
+	actor.expect(t, "<wielded> a steel longsword")
+	actor.expect(t, "<worn on head> an iron helmet")
 
 	actor.close(t)
 	watcher.close(t)

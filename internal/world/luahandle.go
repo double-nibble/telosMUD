@@ -81,12 +81,13 @@ func (rt *luaRuntime) installHandleType() {
 		"has_flag":         rt.hHasFlag,
 		"room":             rt.hRoom,
 		// 7.3a traversal (handle-returning / bool reads)
-		"contents":  rt.hContents,
-		"equipment": rt.hEquipment,
-		"group":     rt.hGroup,
-		"is_enemy":  rt.hIsEnemy,
-		"distance":  rt.hDistance,
-		"can_see":   rt.hCanSee,
+		"contents":        rt.hContents,
+		"equipment":       rt.hEquipment,
+		"equipment_slots": rt.hEquipmentSlots,
+		"group":           rt.hGroup,
+		"is_enemy":        rt.hIsEnemy,
+		"distance":        rt.hDistance,
+		"can_see":         rt.hCanSee,
 		// 7.3a comms (message via the existing act()/send — no harm)
 		"send":  rt.hSend,
 		"act":   rt.hAct,
@@ -338,6 +339,41 @@ func (rt *luaRuntime) hEquipment(l *lua.LState) int {
 		return rt.pushHandleList(l, nil)
 	}
 	return rt.pushHandleList(l, equipmentItems(e))
+}
+
+// hEquipmentSlots returns the entity's worn items WITH their slot labels (#85), so a display template can
+// render "<worn on head> an iron helmet" — the bare `equipment()` list can't. The result is an array (content
+// slot order) of records: {slot=<label>, flag=<"<worn on head>">, item=<handle>}. `flag` is the ready-made
+// inventory tag; `slot` is the raw label for a template that wants to format it itself. A non-wearer /
+// unresolved handle yields an empty table.
+func (rt *luaRuntime) hEquipmentSlots(l *lua.LState) int {
+	t := l.NewTable()
+	e := resolveHandle(l, 1)
+	if e == nil || e.zone == nil {
+		l.Push(t)
+		return 1
+	}
+	wr, ok := Get[*Wearer](e)
+	if !ok {
+		l.Push(t)
+		return 1
+	}
+	vocab := e.zone.wearSlots()
+	n := 0
+	for _, loc := range vocab.orderedRefs() {
+		item := wr.worn[loc]
+		if item == nil {
+			continue
+		}
+		n++
+		rec := l.NewTable()
+		rec.RawSetString("slot", lua.LString(vocab.label(loc)))
+		rec.RawSetString("flag", lua.LString(vocab.wornFlag(loc)))
+		rec.RawSetString("item", rt.newHandle(item))
+		t.RawSetInt(n, rec)
+	}
+	l.Push(t)
+	return 1
 }
 
 // hGroup returns the entity's party/group members as handles. The engine has NO party/group
