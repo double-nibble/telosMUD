@@ -112,6 +112,7 @@ type effectOp struct {
 	profession string  // profession ref (learn_profession — Phase 13.3 trade membership)
 	table      string  // loot/salvage table ref (salvage_item — Phase 13.4 deconstruction)
 	tag        string  // required item tag gate (salvage_item object-target — #38; "" = no tag gate)
+	skill      string  // salvaging skill attribute (salvage_item — #38 slice B; "" = no skill gate)
 	recipe     string  // recipe ref (craft_recipe — Phase 13.5 recipe-driven crafting)
 	amount     float64 // a flat amount (heal/damage/modify_resource delta; modify_attribute_base delta)
 	diceNum    int     // dice count (deal_damage <N>d<S>)

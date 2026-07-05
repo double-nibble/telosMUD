@@ -486,6 +486,10 @@ type rarityTierBody struct {
 	Weight float64 `json:"weight,omitempty"`
 	Color  string  `json:"color,omitempty"`
 	Binds  bool    `json:"binds,omitempty"` // Phase 13.4 (D1): a binds tier's items bind on creation (the no-trade sink)
+	// #38 slice B: the tier's derived salvage rule (default table + skill requirement + over-skill step).
+	SalvageTable     string `json:"salvage_table,omitempty"`
+	SalvageSkill     int    `json:"salvage_skill,omitempty"`
+	SalvageBonusStep int    `json:"salvage_bonus_step,omitempty"`
 }
 
 type lootTableBody struct {
@@ -945,6 +949,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				return fmt.Errorf("store: rarity_tier_def %s body: %w", rt.Ref, err)
 			}
 			rt.Order, rt.Weight, rt.Color, rt.Binds = b.Order, b.Weight, b.Color, b.Binds
+			rt.SalvageTable, rt.SalvageSkill, rt.SalvageBonusStep = b.SalvageTable, b.SalvageSkill, b.SalvageBonusStep
 		}
 		pack(pk).RarityTiers = append(pack(pk).RarityTiers, rt)
 	}
