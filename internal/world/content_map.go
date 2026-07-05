@@ -206,26 +206,26 @@ func buildCombatProfile(d content.CombatProfileDTO) *combatProfile {
 	return p
 }
 
-// wearLocByName resolves a content wear-location NAME to the internal WearLoc slot. The names
-// are the human labels (the inverse of wearLocName), so content authors never see the enum.
-var wearLocByName = map[string]WearLoc{
-	"head":    WearLocHead,
-	"body":    WearLocBody,
-	"hands":   WearLocHands,
-	"feet":    WearLocFeet,
-	"wield":   WearLocWield,
-	"wielded": WearLocWield, // accept the display label too
-	"hold":    WearLocHold,
+// wearSlotAliases normalizes a couple of legacy DISPLAY labels to their slot refs for authoring convenience
+// (#35). Since WearLoc is now the slot ref itself, an authored wearable names refs directly ("head", "wield",
+// a content-defined "waist"); only the two default hand slots have a label ("wielded"/"held") that differs
+// from the ref, so those are accepted here. Any other name is taken as a ref verbatim.
+var wearSlotAliases = map[string]WearLoc{
+	"wielded": WearLocWield,
 	"held":    WearLocHold,
 }
 
-// wearableFromNames builds a *Wearable advertising exactly the named slots. An unknown name
-// is ignored (content-lint would flag it); the demo uses only "head" and "wield".
+// wearableFromNames builds a *Wearable advertising exactly the named slot refs (#35). A legacy label is
+// normalized to its ref; every other name is the ref verbatim (a content slot names itself). An item that
+// advertises a ref no vocab defines simply never matches a wearable slot (it can't be worn) — no build-time
+// validation needed here, where the vocab may not yet be built.
 func wearableFromNames(names []string) *Wearable {
-	var locs []WearLoc
+	locs := make([]WearLoc, 0, len(names))
 	for _, n := range names {
-		if loc, ok := wearLocByName[n]; ok {
+		if loc, ok := wearSlotAliases[n]; ok {
 			locs = append(locs, loc)
+		} else {
+			locs = append(locs, WearLoc(n))
 		}
 	}
 	return wearableFor(locs...)

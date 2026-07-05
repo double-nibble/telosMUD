@@ -105,6 +105,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM spawn_schedule_defs WHERE pack=$1`,
 		// Recipes (Phase 13.5): same strips-and-replaces idempotency.
 		`DELETE FROM recipe_defs WHERE pack=$1`,
+		// Wear slots (#35): same strips-and-replaces idempotency.
+		`DELETE FROM wear_slot_defs WHERE pack=$1`,
 		// Chargens (Phase 14.8): same strips-and-replaces idempotency.
 		`DELETE FROM chargen_defs WHERE pack=$1`,
 		// Display templates: same strips-and-replaces idempotency.
@@ -445,6 +447,17 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO recipe_defs (ref, pack, body) VALUES ($1,$2,$3)`, rc.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert recipe %s: %w", rc.Ref, err)
+		}
+	}
+	// Wear slots (#35): ref+pack PK, the label/order/kind in the JSONB body.
+	for _, ws := range pk.WearSlots {
+		body, err := json.Marshal(wearSlotBody{Label: ws.Label, Order: ws.Order, Kind: ws.Kind})
+		if err != nil {
+			return fmt.Errorf("store: marshal wear_slot %s body: %w", ws.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO wear_slot_defs (ref, pack, body) VALUES ($1,$2,$3)`, ws.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert wear_slot %s: %w", ws.Ref, err)
 		}
 	}
 	// Chargens (Phase 14.8): ref+pack PK, the step list in the JSONB body.

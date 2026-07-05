@@ -176,6 +176,9 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	// Trust ladder (#27/#29, Round 9 Slice 0): build the content-defined tier→rank+flags ladder. An empty
 	// list leaves d.trust nil so z.trustLadder() falls back to the engine default (round-8 mapping).
 	d.trust = buildTrustLadder(lc.TrustTiers)
+	// Wear-slot vocabulary (#35): build the content-defined equipment slot set. An empty list leaves
+	// d.wearSlots nil so z.wearSlots() falls back to the engine default (the classic Diku slots).
+	d.wearSlots = buildWearVocab(lc.WearSlots)
 	// Custom Lua commands (7.4e): register each verb + its aliases into the per-shard custom-command
 	// table by EXACT word. Skips a word that collides with a BUILT-IN verb (a custom command may never
 	// shadow a core/movement verb); logs the skip loudly. dispatch consults this table last + exact.

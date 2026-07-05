@@ -298,8 +298,23 @@ func TestRecipeBodyTrackRoundTrips(t *testing.T) {
 	if out.Name != "Leather Vest" || len(out.Aliases) != 2 {
 		t.Fatalf("#34 recipe name/aliases dropped in body round-trip: name=%q aliases=%v", out.Name, out.Aliases)
 	}
+}
+
+// TestWearSlotBodyRoundTrips pins that the #35 wear-slot label/order/kind survive the wear_slot_defs JSONB
+// body round-trip — the same hermetic field-drop guard as the recipe body (the import marshal + export
+// unmarshal share this struct, so a mistyped/missing json tag shows here).
+func TestWearSlotBodyRoundTrips(t *testing.T) {
+	in := wearSlotBody{Label: "wielded", Order: 50, Kind: "wield"}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out wearSlotBody
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
 	if !reflect.DeepEqual(in, out) {
-		t.Fatalf("recipeBody round-trip changed the value: %+v -> %+v", in, out)
+		t.Fatalf("wearSlotBody round-trip changed the value: %+v -> %+v", in, out)
 	}
 }
 

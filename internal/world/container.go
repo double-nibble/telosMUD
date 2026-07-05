@@ -97,14 +97,15 @@ func cmdEquipment(c *Context) error {
 	b.WriteString("You are using:")
 	n := 0
 	if ok {
-		for _, loc := range wornOrder {
+		vocab := c.z.wearSlots()
+		for _, loc := range vocab.orderedRefs() {
 			item := wr.worn[loc]
 			if item == nil {
 				continue
 			}
 			b.WriteByte('\n')
 			b.WriteString("  <")
-			b.WriteString(wearLocName[loc])
+			b.WriteString(vocab.label(loc))
 			b.WriteString("> ")
 			b.WriteString(item.Name())
 			n++
@@ -329,22 +330,21 @@ func cmdWear(c *Context) error {
 		c.z.act("You can't wear $p.", c.Actor, target, nil, "", "", ToActor)
 		return nil
 	}
-	// Pick the first legal slot that ISN'T wield/hold (those are the wield/hold verbs) and
-	// is currently free.
+	// Pick the first free legal WORN-kind slot in CONTENT order (#35): wield/hold slots belong to the
+	// wield/hold verbs, so `wear` skips them; the content vocab order (not the item's authoring order)
+	// decides which of several legal slots fills first.
 	wr := actorWearer(c.Actor)
-	for _, loc := range w.slots() {
-		if loc == WearLocWield || loc == WearLocHold {
-			continue
-		}
-		if wr.worn[loc] != nil {
+	vocab := c.z.wearSlots()
+	for _, loc := range vocab.orderedRefs() {
+		if !vocab.isWorn(loc) || !w.canWear(loc) || wr.worn[loc] != nil {
 			continue
 		}
 		wr.worn[loc] = target
 		bindOnEquip(target)        // Phase 13.1: a bind_on_equip item binds when worn
 		applyWornMods(c.Actor, wr) // #35: the item's rolled affixes now modify the wearer's attributes
-		c.z.act("You wear $p on your $t.", c.Actor, target, nil, wearLocName[loc], "", ToActor)
+		c.z.act("You wear $p on your $t.", c.Actor, target, nil, vocab.label(loc), "", ToActor)
 		c.z.act("$n wears $p.", c.Actor, target, nil, "", "", ToRoom)
-		c.z.log.Debug("cmd wear", "player", c.s.character, "item", target.proto, "slot", wearLocName[loc])
+		c.z.log.Debug("cmd wear", "player", c.s.character, "item", target.proto, "slot", string(loc))
 		return nil
 	}
 	c.z.act("You can't wear $p.", c.Actor, target, nil, "", "", ToActor)
@@ -364,17 +364,18 @@ func cmdWield(c *Context) error {
 		c.Send("You aren't carrying that.")
 		return nil
 	}
+	slot := c.z.wieldSlot() // #35: the weapon-hand slot ref, resolved by kind from the content vocab
 	w, ok := Get[*Wearable](target)
-	if !ok || !w.canWear(WearLocWield) {
+	if !ok || !w.canWear(slot) {
 		c.z.act("You can't wield $p.", c.Actor, target, nil, "", "", ToActor)
 		return nil
 	}
 	wr := actorWearer(c.Actor)
-	if wr.worn[WearLocWield] != nil {
+	if wr.worn[slot] != nil {
 		c.Send("You are already wielding something.")
 		return nil
 	}
-	wr.worn[WearLocWield] = target
+	wr.worn[slot] = target
 	bindOnEquip(target)        // Phase 13.1: a bind_on_equip weapon binds when wielded
 	applyWornMods(c.Actor, wr) // #35: a wielded weapon's rolled affixes modify the wielder's attributes
 	c.z.act("You wield $p.", c.Actor, target, nil, "", "", ToActor)
@@ -395,17 +396,18 @@ func cmdHold(c *Context) error {
 		c.Send("You aren't carrying that.")
 		return nil
 	}
+	slot := c.z.holdSlot() // #35: the off-hand slot ref, resolved by kind from the content vocab
 	w, ok := Get[*Wearable](target)
-	if !ok || !w.canWear(WearLocHold) {
+	if !ok || !w.canWear(slot) {
 		c.z.act("You can't hold $p.", c.Actor, target, nil, "", "", ToActor)
 		return nil
 	}
 	wr := actorWearer(c.Actor)
-	if wr.worn[WearLocHold] != nil {
+	if wr.worn[slot] != nil {
 		c.Send("You are already holding something.")
 		return nil
 	}
-	wr.worn[WearLocHold] = target
+	wr.worn[slot] = target
 	applyWornMods(c.Actor, wr) // #35: a held item's rolled affixes modify the holder's attributes
 	c.z.act("You hold $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n holds $p.", c.Actor, target, nil, "", "", ToRoom)
@@ -439,7 +441,7 @@ func cmdRemove(c *Context) error {
 	applyWornMods(c.Actor, wr) // #35: removing the item drops its affix contribution from the wearer
 	c.z.act("You stop using $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n stops using $p.", c.Actor, target, nil, "", "", ToRoom)
-	c.z.log.Debug("cmd remove", "player", c.s.character, "item", target.proto, "slot", wearLocName[loc])
+	c.z.log.Debug("cmd remove", "player", c.s.character, "item", target.proto, "slot", string(loc))
 	return nil
 }
 

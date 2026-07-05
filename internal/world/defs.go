@@ -126,6 +126,11 @@ type defRegistries struct {
 	// Set once at construction, then read-only (like defaultCombat).
 	trust *trustLadder
 
+	// wearSlots is the pack's content-defined equipment vocabulary (#35): the ordered wear-slot set (built
+	// from lc.WearSlots). nil => the engine default set (the classic Diku slots); z.wearSlots() substitutes
+	// the default so reads never nil-deref. Set once at construction, then read-only.
+	wearSlots *wearSlotVocab
+
 	// defaultCombat is the pack's player-default combat profile ref (Phase 6.3a): the profile a player
 	// entity fights with when its own (none — players aren't prototyped) declares none. newPlayerEntity
 	// stamps it onto the player's Living.combatRef so a player `kill` runs the same content pipeline as a

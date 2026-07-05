@@ -196,67 +196,49 @@ func (*Container) componentKind() Kind { return KindContainer }
 // currently holds (n). A capacity of 0 is unbounded (no authored limit).
 func (c *Container) hasRoom(n int) bool { return c.capacity == 0 || n < c.capacity }
 
-// WearLoc is a wear-location slot (MUDLIB §3). A Wearable advertises which of these slots it
-// can occupy; a slot maps a worn item to a body location on the wearer. Held/wielded are slots
-// too (the hands), which is why wield/hold share the worn-slot machinery. The set is the classic
-// Diku core; content extends it later. Each is a distinct slot index (NOT a bitmask position)
-// used as the Wearer map key and the Wearable.locations bit shift.
-type WearLoc int
+// WearLoc is a wear-location slot REF (MUDLIB §3, #35). It was an engine-fixed int enum; it is now the
+// stable string id of a content-defined slot (a `wear_slot` ref — head/body/…/a new "waist"), used as the
+// Wearer map key and the token a Wearable's `locs` names. The slot's label/order/kind live in the content
+// vocab (wearslot.go); WearLoc is just the identity. The constants below are the engine-default refs.
+type WearLoc string
 
-// WearLoc values: the worn-equipment slots. WearLocNone is the not-wearable sentinel.
+// WearLoc default refs: the engine's built-in slots (content.DefaultWearSlots mirrors these). WearLocNone is
+// the empty/not-wearable sentinel. Content may define more slots and relabel/reorder these, but the wield/hold
+// verbs and combat resolve their slot by KIND (z.wieldSlot/holdSlot), so a renamed hand slot still works.
 const (
-	WearLocNone  WearLoc = iota // sentinel: not wearable anywhere
-	WearLocHead                 // a helmet
-	WearLocBody                 // armor on the torso
-	WearLocHands                // gloves
-	WearLocFeet                 // boots
-	WearLocWield                // primary weapon hand
-	WearLocHold                 // off-hand held item (light, shield-substitute, focus)
-	wearLocCount                // table size; keep last
+	WearLocNone  WearLoc = ""      // sentinel: not worn anywhere
+	WearLocHead  WearLoc = "head"  // a helmet
+	WearLocBody  WearLoc = "body"  // armor on the torso
+	WearLocHands WearLoc = "hands" // gloves
+	WearLocFeet  WearLoc = "feet"  // boots
+	WearLocWield WearLoc = "wield" // primary weapon hand
+	WearLocHold  WearLoc = "hold"  // off-hand held item (light, shield-substitute, focus)
 )
 
-// wearLocName is the human label for a slot, used in the equipment list and act() lines
-// ("You wear $p on your head.").
-var wearLocName = map[WearLoc]string{
-	WearLocHead:  "head",
-	WearLocBody:  "body",
-	WearLocHands: "hands",
-	WearLocFeet:  "feet",
-	WearLocWield: "wielded",
-	WearLocHold:  "held",
-}
-
-// Wearable grants wear locations: the set of slots this item can occupy (MUDLIB §3).
-// locations is a bitmask of (1 << WearLoc) bits. Functional in slice 4: wear/wield/hold
-// consult it to pick a legal slot; remove returns the item to inventory.
+// Wearable grants wear locations: the set of slot refs this item can occupy (MUDLIB §3). Functional in
+// slice 4: wear/wield/hold consult it to pick a legal slot; remove returns the item to inventory.
 type Wearable struct {
-	locations uint64 // bitmask of valid wear slots: bit (1<<loc) set == may occupy loc
+	locs []WearLoc // the slot refs this item may occupy (as authored)
 }
 
 func (*Wearable) componentKind() Kind { return KindWearable }
 
 // canWear reports whether this item may occupy slot loc.
-func (w *Wearable) canWear(loc WearLoc) bool { return w.locations&(1<<loc) != 0 }
-
-// slots returns the wearable's legal slots in WearLoc order, so a generic `wear` (no
-// explicit slot) can pick the first free legal one.
-func (w *Wearable) slots() []WearLoc {
-	var out []WearLoc
-	for loc := WearLocHead; loc < wearLocCount; loc++ {
-		if w.canWear(loc) {
-			out = append(out, loc)
+func (w *Wearable) canWear(loc WearLoc) bool {
+	for _, l := range w.locs {
+		if l == loc {
+			return true
 		}
 	}
-	return out
+	return false
 }
+
+// (The generic `wear` verb picks a slot by iterating the CONTENT vocab order — z.wearSlots — and checking
+// canWear, so slot order is content's, not the item's authoring order; there is no item-side slots() list.)
 
 // wearableFor builds a Wearable advertising exactly the given slots (authoring helper).
 func wearableFor(locs ...WearLoc) *Wearable {
-	var bits uint64
-	for _, l := range locs {
-		bits |= 1 << l
-	}
-	return &Wearable{locations: bits}
+	return &Wearable{locs: append([]WearLoc(nil), locs...)}
 }
 
 // Wearer holds the equipment state for a living entity: which item occupies each worn

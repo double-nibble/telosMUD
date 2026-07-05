@@ -548,9 +548,9 @@ func dumpInventory(e *Entity) []ItemJSON {
 	return out
 }
 
-// dumpEquipment renders the player's worn items keyed by their wear-slot NAME (the content label,
-// wearLocName) so the on-disk form never exposes the internal WearLoc enum (mirrors the DTO
-// boundary in content_map.go). Empty when the player wears nothing.
+// dumpEquipment renders the player's worn items keyed by their wear-slot REF (#35 — the stable content slot
+// id, WearLoc). The ref is the durable key (a slot's LABEL may be re-authored; its ref is its identity), and
+// the load path resolves legacy label keys back for backward compatibility. Empty when the player wears nothing.
 func dumpEquipment(e *Entity) map[string]ItemJSON {
 	wr, ok := Get[*Wearer](e)
 	if !ok || len(wr.worn) == 0 {
@@ -558,11 +558,10 @@ func dumpEquipment(e *Entity) map[string]ItemJSON {
 	}
 	out := make(map[string]ItemJSON, len(wr.worn))
 	for loc, item := range wr.worn {
-		name := wearLocName[loc]
-		if name == "" {
+		if loc == WearLocNone {
 			continue
 		}
-		out[name] = dumpItem(item)
+		out[string(loc)] = dumpItem(item)
 	}
 	return out
 }
@@ -784,8 +783,9 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 	// max-raising piece must be worn BEFORE the resource clamp below.
 	if len(st.Equipment) > 0 {
 		wr := actorWearer(e)
+		vocab := z.wearSlots()
 		for slotName, it := range st.Equipment {
-			loc, ok := wearLocByName[slotName]
+			loc, ok := vocab.resolveKey(slotName) // #35: ref, or a legacy label key, resolved to a content slot
 			if !ok {
 				z.log.Warn("character load: unknown wear slot, item dropped", "player", s.character, "slot", slotName)
 				droppedItems++
