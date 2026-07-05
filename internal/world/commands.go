@@ -296,6 +296,21 @@ func (z *Zone) lookRoom(s *session) {
 	e := s.entity
 	r := e.location // the room entity
 	room := r.room  // its Room component (direct-pointer hot path, MUDLIB §3)
+
+	// Room darkness (#99): a viewer in an unlit dark room sees nothing — not the name, desc, exits, or any
+	// occupant. Short-circuit to the pitch-black notice before rendering anything. The occupant loop below
+	// already drops individually-concealed occupants via canSee; this handles the room-wide case in one place
+	// (and is what carrying/dropping a light source toggles). GMCP Room.Info is still emitted so a rich
+	// client's minimap tracks position even when the player can't read the room.
+	if !canSeeRoomContents(e) {
+		s.send(textFrame("It is pitch black — you can see nothing."))
+		if rm := z.roomInfoJSON(r); !bytes.Equal(rm, s.lastRoom) {
+			s.lastRoom = rm
+			s.send(gmcpFrame("Room.Info", rm))
+		}
+		return
+	}
+
 	var b strings.Builder
 	b.WriteString(r.Name())
 	b.WriteByte('\n')
