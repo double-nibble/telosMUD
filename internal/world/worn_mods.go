@@ -39,6 +39,26 @@ func recomputeWornMods(e *Entity, wr *Wearer) {
 	markAttrsDirty(e)
 }
 
+// unequipFromWearer clears item from holder's worn slots (if it occupies one) and re-sums the gear bonus,
+// BEFORE the item leaves the holder's containment. It is the destroy/transfer safety hook (#35): a worn item
+// stays in the wearer's contents (equipped is a state over a carried item), so a path that destroys or moves
+// it out — salvage/disenchant, consume-in-a-recipe, a corpse transfer — would otherwise leave wr.worn[loc]
+// dangling at a gone entity AND leave its affix bonus summed into the wearer forever (a stat-inflation
+// exploit once gear is a live modSource). Called from Move, the single containment chokepoint, so no
+// destruction path can forget it. A no-op when holder has no Wearer or item isn't worn. Zone goroutine.
+func unequipFromWearer(holder, item *Entity) {
+	wr, ok := Get[*Wearer](holder)
+	if !ok {
+		return
+	}
+	loc := wr.slotOf(item)
+	if loc == WearLocNone {
+		return
+	}
+	delete(wr.worn, loc)
+	applyWornMods(holder, wr)
+}
+
 // applyWornMods is the shared post-equip hook the wear/wield/hold/remove verbs (and the load path) call:
 // ensure the gear modSource is registered, then recompute the summed bonus. Keeping it one call means no
 // equip path can forget either half (register-once + recompute).

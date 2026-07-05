@@ -348,8 +348,8 @@ func rollItemQuality(item *Entity, spec *qualitySpec, rng *rand.Rand) {
 
 // Quality is a dropped item's per-instance loot quality (Phase 12.3): a rolled item Level + a set of
 // rolled Affixes (attr -> value). It is the per-instance DELTA over the shared prototype — two drops of
-// the same item differ only here. Persisted in ItemJSON.Delta. The stat EFFECT of a worn affix (the
-// wearer's bonus) is a gear-modifier follow-up (the existing addModSource seam); v1 rolls + stores it.
+// the same item differ only here. Persisted in ItemJSON.Delta. A worn affix's stat EFFECT is applied by the
+// Wearer gear modSource (#35, worn_mods.go): wearing the item sums its Affixes into the wearer's attributes.
 type Quality struct {
 	Level   int
 	Affixes map[string]float64

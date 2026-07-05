@@ -169,11 +169,10 @@ func setAttrBase(e *Entity, name string, base float64) {
 }
 
 // modSources returns every modifier source for entity e (gear + affects). The derivation sums
-// flatMod / multiplies mulMod across the returned list (resolveAttr). Coarse this phase: gear is a
-// stub (no Armor/affix component wired yet) and affects arrive in 5.2 — but the PLUMBING is live.
-// 5.2's Affected runtime registers its modifier view via addModSource (and dirties the cache); a
-// gear-change hook does the same. With no source registered the list is empty and derivation is
-// base-only — the bare-engine behaviour.
+// flatMod / multiplies mulMod across the returned list (resolveAttr). Two sources register here: the 5.2
+// Affected runtime (its affect-summed modifier view) and, since #35, the Wearer (its worn-gear affix sum) —
+// each via addModSource, each dirtying the cache on change. With no source registered the list is empty and
+// derivation is base-only — the bare-engine behaviour.
 func (e *Entity) modSources() []modSource {
 	if e.living == nil {
 		return nil

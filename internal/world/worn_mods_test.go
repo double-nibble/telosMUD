@@ -95,6 +95,51 @@ func TestWieldedAffixModifiesAttribute(t *testing.T) {
 	}
 }
 
+// TestDestroyingWornItemDropsItsBonus: destroying a worn item (Move to nil — the salvage/consume path) must
+// clear the slot AND drop its affix bonus, not leave a phantom permanent stat (the review-#1 exploit).
+func TestDestroyingWornItemDropsItsBonus(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	base := wornStrength(actor)
+
+	helm := addTestItem(e.z, actor, "an iron helmet", []string{"helmet"},
+		wearableFor(WearLocHead), &Quality{Affixes: map[string]float64{"strength": 10}})
+	e.run("wear helmet")
+	if got := wornStrength(actor); got != base+10 {
+		t.Fatalf("precondition: strength worn = %v, want %v", got, base+10)
+	}
+
+	// Destroy the still-worn item the way salvage_item/consume_item do.
+	Move(helm, nil)
+
+	if got := wornStrength(actor); got != base {
+		t.Fatalf("strength after destroying the worn item = %v, want %v (no phantom bonus)", got, base)
+	}
+	if wr, _ := Get[*Wearer](actor); wr.slotOf(helm) != WearLocNone || wr.worn[WearLocHead] != nil {
+		t.Fatal("the worn slot must be cleared when the item is destroyed")
+	}
+}
+
+// TestAugmentWornItemAppliesLive: augmenting an item while it is worn takes effect immediately (review-#2).
+func TestAugmentWornItemAppliesLive(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	base := wornStrength(actor)
+
+	helm := addTestItem(e.z, actor, "an iron helmet", []string{"helmet"},
+		wearableFor(WearLocHead), &Quality{Affixes: map[string]float64{"strength": 1}})
+	e.run("wear helmet")
+
+	// Augment the worn item's strength affix by +4 through the op (as a content enchant verb would).
+	c := &effectCtx{z: e.z, actor: actor, source: actor}
+	if err := opAugmentItem(c, &effectOp{item: string(helm.proto), attr: "strength", amount: 4}); err != nil {
+		t.Fatalf("augment_item: %v", err)
+	}
+	if got := wornStrength(actor); got != base+5 {
+		t.Fatalf("strength after augmenting a worn item by +4 (from +1) = %v, want %v (live)", got, base+5)
+	}
+}
+
 // TestWornItemNoQualityNoBonus: a worn item with no rolled Quality contributes nothing (an un-rolled
 // prototype piece is inert, not a crash).
 func TestWornItemNoQualityNoBonus(t *testing.T) {
