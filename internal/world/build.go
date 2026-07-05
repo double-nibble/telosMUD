@@ -161,12 +161,18 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		}
 		d.bundle.register(bn.Ref, def)
 	}
-	// Loot (Phase 12.1): rarity tiers + loot tables into the per-shard registries.
+	// Loot (Phase 12.1): rarity tiers + named affixes + loot tables into the per-shard registries. Affixes
+	// (#37) MUST register BEFORE loot tables: buildLootTableDef resolves each pool's `ref` affix against the
+	// affix registry, so the referenced defs have to be present first.
 	for _, rt := range lc.RarityTiers {
 		d.rarity.register(rt.Ref, buildRarityTierDef(rt))
 	}
+	for _, af := range lc.Affixes {
+		d.affix.register(af.Ref, buildAffixDef(af))
+	}
 	for _, lt := range lc.LootTables {
-		d.loot.register(lt.Ref, buildLootTableDef(lt))
+		lintAffixRefs(lt, d.affix) // #37: boot-time warn if a quality pool names an unknown affix_def
+		d.loot.register(lt.Ref, buildLootTableDef(lt, d.affix))
 	}
 	// Recipes (Phase 13.5): crafting recipes into the per-shard registry.
 	for _, rc := range lc.Recipes {

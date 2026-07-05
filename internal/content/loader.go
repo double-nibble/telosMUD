@@ -79,7 +79,10 @@ type LoadedContent struct {
 	// RarityTiers + LootTables are the pack-global loot definitions (Phase 12.1), same last-write-wins
 	// override rule keyed by ref. The world side registers them into the per-shard loot registries; the
 	// resolver runs a loot table per eligible looter on death.
-	RarityTiers    []RarityTierDTO
+	RarityTiers []RarityTierDTO
+	// Affixes are the pack-global named affixes (#37), accumulated last-write-wins by ref. The world builds a
+	// per-shard registry the loot-table builder resolves AffixRollDTO.Ref against. Empty => inline-only pools.
+	Affixes        []AffixDefDTO
 	LootTables     []LootTableDTO
 	SpawnSchedules []SpawnScheduleDTO
 	// Recipes are the pack-global crafting recipes (Phase 13.5), same last-write-wins by ref. The world side
@@ -146,6 +149,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	trackIdx := make(map[string]int)
 	bundleIdx := make(map[string]int)
 	rarityIdx := make(map[string]int)
+	affixIdx := make(map[string]int)
 	lootIdx := make(map[string]int)
 	schedIdx := make(map[string]int)
 	recipeIdx := make(map[string]int)
@@ -263,6 +267,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				rarityIdx[rt.Ref] = len(lc.RarityTiers)
 				lc.RarityTiers = append(lc.RarityTiers, rt)
+			}
+		}
+		for _, af := range p.Affixes {
+			if idx, ok := affixIdx[af.Ref]; ok {
+				lc.Affixes[idx] = af
+			} else {
+				affixIdx[af.Ref] = len(lc.Affixes)
+				lc.Affixes = append(lc.Affixes, af)
 			}
 		}
 		for _, lt := range p.LootTables {

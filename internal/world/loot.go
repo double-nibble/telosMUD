@@ -1,6 +1,7 @@
 package world
 
 import (
+	"log/slog"
 	"math/rand"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -72,7 +73,26 @@ func buildRarityTierDef(d content.RarityTierDTO) *rarityTierDef {
 	return &rarityTierDef{ref: d.Ref, order: d.Order, weight: d.Weight, color: d.Color, binds: d.Binds}
 }
 
-func buildLootTableDef(d content.LootTableDTO) *lootTableDef {
+// affixDef is the runtime form of a content AffixDefDTO (#37): a NAMED affix (attr + roll range) a loot
+// entry's quality pool references by ref, resolved into an inline affixRoll at build time.
+type affixDef struct {
+	ref      string
+	attr     string
+	min, max float64
+}
+
+func buildAffixDef(d content.AffixDefDTO) *affixDef {
+	return &affixDef{ref: d.Ref, attr: d.Attr, min: d.Min, max: d.Max}
+}
+
+// buildLootTableDef maps a content loot table onto its runtime form (#37: affixes resolves each pool affix —
+// a `ref` entry is looked up in the shared affix registry, an inline entry uses its own attr/min/max). The
+// resolution happens once when the shard BUILDS its content (defineGlobals), so an authored affix_def is the
+// single source of truth in the pack and an edit applies to every referencing pool the next time the shard
+// rebuilds its content — NOT live: loot tables are not hot-reloaded (a pre-#37 Phase-12 limitation), so a
+// running shard keeps the boot-time values until it restarts. affixes may be nil (no affix_defs loaded): a
+// ref-entry then resolves to an empty (no-op) affix.
+func buildLootTableDef(d content.LootTableDTO, affixes *defRegistry[*affixDef]) *lootTableDef {
 	def := &lootTableDef{ref: d.Ref, onRoll: d.OnRoll}
 	for _, r := range d.Rolls {
 		roll := lootRoll{kind: r.Kind, chance: r.Chance, n: r.N, qualityFloor: r.QualityFloor}
@@ -81,7 +101,7 @@ func buildLootTableDef(d content.LootTableDTO) *lootTableDef {
 			if e.Quality != nil {
 				qs := &qualitySpec{count: e.Quality.Count, levelMin: e.Quality.LevelMin, levelMax: e.Quality.LevelMax}
 				for _, a := range e.Quality.Affixes {
-					qs.affixes = append(qs.affixes, affixRoll{attr: a.Attr, min: a.Min, max: a.Max})
+					qs.affixes = append(qs.affixes, resolveAffixRoll(a, affixes))
 				}
 				entry.quality = qs
 			}
@@ -93,6 +113,42 @@ func buildLootTableDef(d content.LootTableDTO) *lootTableDef {
 		def.rolls = append(def.rolls, roll)
 	}
 	return def
+}
+
+// lintAffixRefs warns (once per build) about any quality pool naming an affix `ref` that no loaded affix_def
+// provides (#37 review): such a ref resolves to an inert empty affix, silently costing the drop an affix slot,
+// so an operator gets a boot-time signal instead of an invisible dud. Content-lint discipline (like the
+// unknown-proto/bundle warnings) — the malformed table still loads. Runs on the build path (defineGlobals).
+func lintAffixRefs(lt content.LootTableDTO, affixes *defRegistry[*affixDef]) {
+	for _, r := range lt.Rolls {
+		for _, e := range r.Pool {
+			if e.Quality == nil {
+				continue
+			}
+			for _, a := range e.Quality.Affixes {
+				if a.Ref != "" && !affixes.has(a.Ref) {
+					slog.Warn("content: loot quality references an unknown affix_def; it will roll inert",
+						"loot_table", lt.Ref, "item", e.Item, "affix_ref", a.Ref)
+				}
+			}
+		}
+	}
+}
+
+// resolveAffixRoll turns one content affix entry into a runtime affixRoll (#37). A `ref` entry is resolved
+// from the shared affix registry (the normalized form: edit-once propagates); an inline entry (no ref) uses
+// its own attr/min/max (the pre-#37 form). A ref that names no loaded affix_def resolves to an empty affix
+// (attr ""), which rollItemQuality treats as a no-op — a misauthored ref degrades to nothing, never a panic.
+func resolveAffixRoll(a content.AffixRollDTO, affixes *defRegistry[*affixDef]) affixRoll {
+	if a.Ref != "" {
+		if affixes != nil {
+			if def := affixes.get(a.Ref); def != nil {
+				return affixRoll{attr: def.attr, min: def.min, max: def.max}
+			}
+		}
+		return affixRoll{} // unknown ref => inert affix (content-lint concern, not a crash)
+	}
+	return affixRoll{attr: a.Attr, min: a.Min, max: a.Max}
 }
 
 // --- the resolver ------------------------------------------------------------------------------

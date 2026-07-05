@@ -318,6 +318,23 @@ func TestWearSlotBodyRoundTrips(t *testing.T) {
 	}
 }
 
+// TestAffixBodyRoundTrips pins that the #37 named-affix attr/min/max survive the affix_defs JSONB body
+// round-trip — the hermetic field-drop guard (import marshal + export unmarshal share this struct).
+func TestAffixBodyRoundTrips(t *testing.T) {
+	in := affixBody{Attr: "strength", Min: 1, Max: 5}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out affixBody
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Fatalf("affixBody round-trip changed the value: %+v -> %+v", in, out)
+	}
+}
+
 // TestBundleBodyUncappedRoundTrips pins that the profession `uncapped` flag survives the bundle_defs JSONB
 // body round-trip (docs/REMAINING.md §4) — the store field-drop class. Import (marshal) + export (unmarshal)
 // share this bundleBody, so pinning its round-trip catches a mistyped/missing json tag.

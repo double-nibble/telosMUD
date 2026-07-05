@@ -866,6 +866,14 @@ rarity_tiers:
 
 # loot_tables: independent rolls a mob drops from on death (Phase 12.1). goblin_loot gives a guaranteed
 # common torch to every eligible looter plus an independent 25% chance at a rare sword (personal loot).
+# affix_defs: content-defined NAMED affixes (#37). A shared affix is authored once here and referenced by ref
+# from a loot entry's quality pool (below), so editing the range propagates to every drop on reload — instead
+# of the value being baked into each inline pool. `of_the_bear` is referenced by the goblin sword; `of_the_owl`
+# stands alone (a pool may reference it later). A pool that inlines attr/min/max still works (the pre-#37 form).
+affix_defs:
+  - {ref: of_the_bear, attr: strength,  min: 1, max: 5}
+  - {ref: of_the_owl,  attr: intellect, min: 1, max: 4}
+
 loot_tables:
   - ref: goblin_loot
     rolls:
@@ -876,7 +884,8 @@ loot_tables:
         chance: 0.25
         pool:
           # the rare sword rolls a per-instance quality (Phase 12.3): an item level + 1 strength affix, so
-          # two dropped swords differ while the prototype stays shared.
+          # two dropped swords differ while the prototype stays shared. #37: the affix is now a REF to the
+          # shared `of_the_bear` def (resolves to the same strength 1-5 roll) instead of an inline attr/range.
           - item: midgaard:obj:sword
             tier: rare
             quality:
@@ -884,7 +893,7 @@ loot_tables:
               level_min: 1
               level_max: 10
               affixes:
-                - {attr: strength, min: 1, max: 5}
+                - {ref: of_the_bear}
   # disenchant_arms: a SALVAGE table (Phase 13.4) — the salvage_item op rolls it after consuming a source
   # weapon. Two guaranteed rolls: a tradeable mid-tier leather component (uncommon, unbound — feeds the
   # market) + a top-tier arcane essence (epic, which binds on creation via the tier's binds flag — the

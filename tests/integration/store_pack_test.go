@@ -230,6 +230,7 @@ func TestStorePackRoundTrip(t *testing.T) {
 		{"tracks", fromDB.Tracks, fromYAML.Tracks},
 		{"bundles", fromDB.Bundles, fromYAML.Bundles},
 		{"rarity_tiers", fromDB.RarityTiers, fromYAML.RarityTiers},
+		{"affix_defs", fromDB.Affixes, fromYAML.Affixes},
 		{"loot_tables", fromDB.LootTables, fromYAML.LootTables},
 		{"spawn_schedules", fromDB.SpawnSchedules, fromYAML.SpawnSchedules},
 		{"recipes", fromDB.Recipes, fromYAML.Recipes},
