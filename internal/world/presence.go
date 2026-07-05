@@ -248,6 +248,12 @@ func concealedForRoster(e *Entity) bool {
 // have changed (an effect op set/cleared invisible/hidden, or a staffer toggled wizinvis), so the `who`
 // roster reflects the new state without waiting for a re-login. A no-op for a non-player entity or a bare/
 // disabled shard. Mirrors republishCommsOnAccessChange (the comms-hearing analog). Zone goroutine only.
+//
+// INVARIANT (keep the roster bit fresh): every mutation of a concealment flag (isConcealmentFlag) MUST be
+// followed by this call. Today the only writers are opSetFlag/opClearFlag (invisible/hidden — reserved
+// wizinvis is refused there) and cmdWizinvis, and all three call it. If concealment ever becomes affect-
+// native (an affect that grants/strips invisible on apply/expire), those sites must call this too — else a
+// stale roster bit would leak or over-hide a player in cross-shard `who` until their next login/heartbeat.
 func (z *Zone) republishPresenceOnConcealChange(e *Entity) {
 	if e == nil {
 		return
