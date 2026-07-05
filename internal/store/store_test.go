@@ -316,9 +316,6 @@ func TestWearSlotBodyRoundTrips(t *testing.T) {
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("wearSlotBody round-trip changed the value: %+v -> %+v", in, out)
 	}
-	if !reflect.DeepEqual(in, out) {
-		t.Fatalf("recipeBody round-trip changed the value: %+v -> %+v", in, out)
-	}
 }
 
 // TestBundleBodyUncappedRoundTrips pins that the profession `uncapped` flag survives the bundle_defs JSONB
