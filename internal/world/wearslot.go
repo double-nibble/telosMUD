@@ -95,6 +95,19 @@ func (v *wearSlotVocab) kindOf(ref WearLoc) string {
 // so container.go picks a `wear` target without importing the content kind constants.
 func (v *wearSlotVocab) isWorn(ref WearLoc) bool { return v.kindOf(ref) == content.WearKindWorn }
 
+// wornFlag is the inventory slot tag for a worn item (#85): "<worn on head>" for a body slot, or the bare
+// label "<wielded>"/"<held>" for a hand slot (where "worn on wielded" would read awkwardly). Content owns the
+// label, so a new slot renders as "<worn on waist>" with no engine change.
+func (v *wearSlotVocab) wornFlag(ref WearLoc) string {
+	label := v.label(ref)
+	switch v.kindOf(ref) {
+	case content.WearKindWield, content.WearKindHold:
+		return "<" + label + ">"
+	default:
+		return "<worn on " + label + ">"
+	}
+}
+
 // orderedRefs returns every slot ref in display/selection order — the successor to the old package `wornOrder`
 // var, now content-driven. Used by the equipment list, the inventory-by-slot render (#85), and ScopeEquipment.
 func (v *wearSlotVocab) orderedRefs() []WearLoc {

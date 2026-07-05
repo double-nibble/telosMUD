@@ -147,10 +147,10 @@ func TestWearAndRemove(t *testing.T) {
 	if !has(eq, "head") || !has(eq, "an iron helmet") {
 		t.Errorf("equipment output = %v", eq)
 	}
-	// inventory no longer lists the worn item (it's shown by equipment).
+	// #85: inventory now FOLDS the worn item in, flagged by its slot ("<worn on head> an iron helmet").
 	inv, _ := e.run("inventory")
-	if has(inv, "an iron helmet") {
-		t.Errorf("worn item still in inventory listing: %v", inv)
+	if !has(inv, "<worn on head> an iron helmet") {
+		t.Errorf("worn item not folded into inventory with its slot flag: %v", inv)
 	}
 
 	// remove returns it to inventory.

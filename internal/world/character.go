@@ -600,12 +600,14 @@ func wornSet(e *Entity) map[*Entity]bool {
 // handle layer's h:equipment() traversal. A non-wearer / empty wearer returns nil. Read-only.
 func equipmentItems(e *Entity) []*Entity {
 	wr, ok := Get[*Wearer](e)
-	if !ok || len(wr.worn) == 0 {
+	if !ok || len(wr.worn) == 0 || e.zone == nil {
 		return nil
 	}
+	// Iterate the CONTENT slot order (#35/#85) so the list is deterministic and agrees with the equipment/
+	// inventory-by-slot render — not the Wearer map's random iteration order.
 	items := make([]*Entity, 0, len(wr.worn))
-	for _, item := range wr.worn {
-		if item != nil {
+	for _, loc := range e.zone.wearSlots().orderedRefs() {
+		if item := wr.worn[loc]; item != nil {
 			items = append(items, item)
 		}
 	}

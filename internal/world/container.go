@@ -61,23 +61,41 @@ func cmdInventory(c *Context) error {
 		return nil
 	}
 	wr, _ := Get[*Wearer](c.Actor)
+	vocab := c.z.wearSlots()
+	var b strings.Builder
+	b.WriteString("You are carrying:")
+	n := 0
+	// #85: fold WORN items into the inventory, flagged + grouped by slot in content order ("<worn on head>
+	// an iron helmet"), rather than hiding them (they used to show only under `equipment`).
+	if wr != nil {
+		for _, loc := range vocab.orderedRefs() {
+			item := wr.worn[loc]
+			if item == nil {
+				continue
+			}
+			b.WriteString("\n  ")
+			b.WriteString(vocab.wornFlag(loc))
+			b.WriteString(" ")
+			b.WriteString(item.Name())
+			n++
+		}
+	}
+	// Loose-carried items (not in a worn slot), coalesced to "<Name> (N)" (Track 1); materials/containers
+	// list individually.
 	var held []*Entity
 	for _, item := range c.Actor.contents {
 		if wr != nil && wr.slotOf(item) != WearLocNone {
-			continue // shown under equipment
+			continue // already listed above under its worn slot
 		}
 		held = append(held, item)
 	}
-	var b strings.Builder
-	b.WriteString("You are carrying:")
-	if len(held) == 0 {
+	for _, line := range coalesceItemLines(held, (*Entity).Name) {
+		b.WriteString("\n  ")
+		b.WriteString(line)
+		n++
+	}
+	if n == 0 {
 		b.WriteString("\n  Nothing.")
-	} else {
-		// Identical items coalesce to "<Name> (N)" (Track 1); materials/containers list individually.
-		for _, line := range coalesceItemLines(held, (*Entity).Name) {
-			b.WriteString("\n  ")
-			b.WriteString(line)
-		}
 	}
 	c.Send(b.String())
 	return nil
