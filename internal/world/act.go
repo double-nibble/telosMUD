@@ -94,12 +94,30 @@ const (
 // recipient gets the template rendered from ITS perspective: $n becomes "You" for the
 // actor, "Someone" for an observer who can't see the actor, the name otherwise.
 func (z *Zone) act(tmpl string, actor, obj, vict *Entity, t1, t2 string, to ActTo) {
-	z.act2(tmpl, actor, obj, nil, vict, t1, t2, to)
+	z.actCore(tmpl, actor, obj, nil, vict, t1, t2, to, false)
 }
 
 // act2 is act with an explicit second object referent obj2 ($P) — used by the container
 // verbs ("You get $p from $P.", "You put $p in $P."). Everything else is identical to act.
 func (z *Zone) act2(tmpl string, actor, obj, obj2, vict *Entity, t1, t2 string, to ActTo) {
+	z.actCore(tmpl, actor, obj, obj2, vict, t1, t2, to, false)
+}
+
+// actConceal is act() for PRESENCE lines — arrivals and departures (#100). Unlike a plain act(), a room
+// recipient who CANNOT SEE the actor receives NOTHING at all, rather than the leaky "Someone arrives."/
+// "Someone leaves." that merely masks the name while still disclosing that *something* concealed is present.
+// So a hidden/sneaking actor, or one moving through a room a viewer can't see into (darkness), moves silently
+// to those it is concealed from — the highest-impact residual leak from the #28 visibility audit. It carries
+// no obj/vict referents (a presence line is about the actor alone) and is only meaningful for the ToRoom sets.
+func (z *Zone) actConceal(tmpl string, actor *Entity, to ActTo) {
+	z.actCore(tmpl, actor, nil, nil, nil, "", "", to, true)
+}
+
+// actCore is the shared implementation behind act/act2/actConceal. When conceal is true, a ToRoom recipient
+// who cannot see the actor (z.canSee(occ, actor) — the same chokepoint targeting/lookRoom use) is SKIPPED
+// entirely instead of receiving a "Someone" render; when false, the classic behavior holds (the render's
+// nameFor substitutes "Someone" for an unseen actor, so the line is still delivered).
+func (z *Zone) actCore(tmpl string, actor, obj, obj2, vict *Entity, t1, t2 string, to ActTo, conceal bool) {
 	room := actor.location
 	switch to {
 	case ToActor:
@@ -123,6 +141,9 @@ func (z *Zone) act2(tmpl string, actor, obj, obj2, vict *Entity, t1, t2 string, 
 			}
 			if to == ToRoomExceptActor && occ == vict {
 				continue
+			}
+			if conceal && !z.canSee(occ, actor) {
+				continue // full presence concealment (#100): no line at all to a viewer who can't see the actor
 			}
 			pc, ok := sessionOf(occ)
 			if !ok {

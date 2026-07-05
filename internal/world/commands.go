@@ -471,9 +471,9 @@ func (z *Zone) move(s *session, dir string) bool {
 	// Lua `leave` trigger (7.4c): fire on the FROM room BEFORE the move detaches the leaver, so
 	// the room can still see them. nil-safe / no-op when the room carries no script.
 	z.fireRoomLeave(s.entity, from)
-	z.act("$n leaves "+dir+".", s.entity, nil, nil, "", "", ToRoom) // announced from `from`
+	z.actConceal("$n leaves "+dir+".", s.entity, ToRoom) // announced from `from`; #100: silent to those who can't see the mover
 	Move(s.entity, to)
-	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom) // announced from `to`
+	z.actConceal("$n arrives.", s.entity, ToRoom) // announced from `to`; #100: silent to those who can't see the mover
 	z.lookRoom(s)
 	z.log.Debug("player moved", "player", s.character, "dir", dir, "from", from.proto, "to", destRoom)
 	// [G13] room-scoped affects: a creature entering a web/darkness/silence-field room gets it on
@@ -515,7 +515,7 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 	// owned *Entity that dest's round driver would deref), and an opponent left behind must not stay
 	// posFighting at a now-departed target. The room scan still finds opponents here (pre-detach).
 	z.disengage(s.entity)
-	z.act("$n leaves "+dir+".", s.entity, nil, nil, "", "", ToRoom)
+	z.actConceal("$n leaves "+dir+".", s.entity, ToRoom) // #100: silent to those who can't see the mover
 	Move(s.entity, nil) // detach from the source room before handing off
 	z.delPlayer(s.character)
 	// Forward in-flight input to dest until the reader loop observes the new
