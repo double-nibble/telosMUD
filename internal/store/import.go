@@ -100,6 +100,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM bundle_defs WHERE pack=$1`,
 		// Loot (Phase 12.1): rarity tiers + loot tables, same strips-and-replaces idempotency.
 		`DELETE FROM rarity_tier_defs WHERE pack=$1`,
+		// Named affixes (#37): same strips-and-replaces idempotency.
+		`DELETE FROM affix_defs WHERE pack=$1`,
 		`DELETE FROM loot_table_defs WHERE pack=$1`,
 		// Spawn schedules (Phase 12.4): same strips-and-replaces idempotency.
 		`DELETE FROM spawn_schedule_defs WHERE pack=$1`,
@@ -408,6 +410,17 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO rarity_tier_defs (ref, pack, body) VALUES ($1,$2,$3)`, rt.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert rarity_tier %s: %w", rt.Ref, err)
+		}
+	}
+	// Named affixes (#37): ref+pack PK, the attr + roll range in the JSONB body.
+	for _, af := range pk.Affixes {
+		body, err := json.Marshal(affixBody{Attr: af.Attr, Min: af.Min, Max: af.Max})
+		if err != nil {
+			return fmt.Errorf("store: marshal affix %s body: %w", af.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO affix_defs (ref, pack, body) VALUES ($1,$2,$3)`, af.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert affix %s: %w", af.Ref, err)
 		}
 	}
 	for _, lt := range pk.LootTables {

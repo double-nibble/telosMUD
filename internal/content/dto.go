@@ -80,6 +80,10 @@ type Pack struct {
 	// LootTables are pack-GLOBAL loot tables (Phase 12.1): a list of independent rolls a mob drops from on
 	// death. A mob prototype references one by ref (LivingDTO.LootTable). Same last-write-wins rule.
 	LootTables []LootTableDTO `json:"loot_tables" yaml:"loot_tables"`
+	// Affixes are pack-GLOBAL named affixes (#37): reusable attribute+range rolls a loot entry's quality pool
+	// references by ref (AffixRollDTO.Ref), so a shared affix is authored once. Pure CONTENT; same
+	// last-write-wins override-by-ref rule. Empty => pools inline their affixes (the pre-#37 form).
+	Affixes []AffixDefDTO `json:"affix_defs" yaml:"affix_defs"`
 
 	// SpawnSchedules are pack-GLOBAL scheduled spawns (Phase 12.4): long-timer boss spawns the DIRECTOR
 	// owns (a weekly world boss), distinct from per-zone resets. Pure CONTENT; same last-write-wins rule.
@@ -289,12 +293,28 @@ type QualitySpecDTO struct {
 	LevelMax int            `json:"level_max,omitempty" yaml:"level_max,omitempty"`
 }
 
-// AffixRollDTO is one affix in a quality pool: the Attr it modifies and the [Min, Max] range its rolled
-// value falls in. A legendary's richer pool is just a longer Affixes list with a higher Count.
+// AffixRollDTO is one affix in a quality pool. TWO shapes (#37): INLINE — Attr + the [Min, Max] range its
+// rolled value falls in — OR a Ref naming a shared affix_def (AffixDefDTO), from which Attr/Min/Max are
+// resolved at build time. Ref takes precedence when set, so an edit to the affix_def propagates to every pool
+// that references it on the next reload (the normalization win). A legendary's richer pool is just a longer
+// Affixes list with a higher Count.
 type AffixRollDTO struct {
+	Ref  string  `json:"ref,omitempty" yaml:"ref,omitempty"` // #37: name a shared affix_def instead of inlining
+	Attr string  `json:"attr,omitempty" yaml:"attr,omitempty"`
+	Min  float64 `json:"min,omitempty" yaml:"min,omitempty"`
+	Max  float64 `json:"max,omitempty" yaml:"max,omitempty"`
+}
+
+// AffixDefDTO is one content-defined NAMED affix (#37, docs/LOOT-AND-SPAWNS.md §3): a reusable
+// attribute + [Min, Max] roll range referenced by ref from a loot entry's quality pool (AffixRollDTO.Ref),
+// so a shared affix ("of the bear" = +str) is authored once and reused across many drops. A first-class def
+// table (like recipe_defs / rarity_tier_defs): edit the def, and every pool that references it changes on
+// reload — instead of the value being baked into each inline pool.
+type AffixDefDTO struct {
+	Ref  string  `json:"ref" yaml:"ref"`
 	Attr string  `json:"attr" yaml:"attr"`
-	Min  float64 `json:"min" yaml:"min"`
-	Max  float64 `json:"max" yaml:"max"`
+	Min  float64 `json:"min,omitempty" yaml:"min,omitempty"`
+	Max  float64 `json:"max,omitempty" yaml:"max,omitempty"`
 }
 
 // LootPityDTO is a chance roll's bad-luck-protection spec (Phase 12.2): each miss nudges the effective

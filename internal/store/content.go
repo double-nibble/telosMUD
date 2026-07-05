@@ -500,6 +500,14 @@ type spawnScheduleBody struct {
 
 // recipeBody is the JSONB-tail shape for a recipe_defs row (Phase 13.5): everything but the ref/pack PK —
 // the recipe's profession/skill gate, station flag, inputs, output, and quality band, all content.
+// affixBody is the JSONB-tail shape for an affix_defs row (#37): everything but the ref/pack PK — the named
+// affix's target attribute and its roll [min, max] range.
+type affixBody struct {
+	Attr string  `json:"attr,omitempty"`
+	Min  float64 `json:"min,omitempty"`
+	Max  float64 `json:"max,omitempty"`
+}
+
 // wearSlotBody is the JSONB-tail shape for a wear_slot_defs row (#35): everything but the ref/pack PK — the
 // slot's display label, its display/selection order, and its equip-verb kind (worn/wield/hold).
 type wearSlotBody struct {
@@ -938,6 +946,35 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	rtRows.Close()
+
+	// Named affixes (#37): ref+pack first-class, the attr + roll range in the JSONB body.
+	afRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM affix_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query affix_defs: %w", err)
+	}
+	for afRows.Next() {
+		var af content.AffixDefDTO
+		var pk string
+		var body []byte
+		if err := afRows.Scan(&af.Ref, &pk, &body); err != nil {
+			afRows.Close()
+			return fmt.Errorf("store: scan affix_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b affixBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				afRows.Close()
+				return fmt.Errorf("store: affix_def %s body: %w", af.Ref, err)
+			}
+			af.Attr, af.Min, af.Max = b.Attr, b.Min, b.Max
+		}
+		pack(pk).Affixes = append(pack(pk).Affixes, af)
+	}
+	if err := afRows.Err(); err != nil {
+		return err
+	}
+	afRows.Close()
 
 	// Loot tables (Phase 12.1): ref+pack first-class, the rolls in the JSONB body.
 	ltRows, err := p.pool.Query(ctx,

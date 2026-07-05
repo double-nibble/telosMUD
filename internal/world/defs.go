@@ -117,6 +117,7 @@ type defRegistries struct {
 	track   *defRegistry[*trackDef]      // Phase 11.2 advancement tracks
 	bundle  *defRegistry[*bundleDef]     // Phase 11.4b class/race/feat bundles
 	rarity  *defRegistry[*rarityTierDef] // Phase 12.1 rarity tiers
+	affix   *defRegistry[*affixDef]      // #37 named affixes (referenced by loot quality pools)
 	loot    *defRegistry[*lootTableDef]  // Phase 12.1 loot tables
 	recipe  *defRegistry[*recipeDef]     // Phase 13.5 crafting recipes
 
@@ -176,6 +177,7 @@ func newDefRegistries() *defRegistries {
 		track:       newDefRegistry[*trackDef](),
 		bundle:      newDefRegistry[*bundleDef](),
 		rarity:      newDefRegistry[*rarityTierDef](),
+		affix:       newDefRegistry[*affixDef](),
 		loot:        newDefRegistry[*lootTableDef](),
 		recipe:      newDefRegistry[*recipeDef](),
 		abilityCmds: map[string]*abilityDef{},

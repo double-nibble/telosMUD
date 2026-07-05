@@ -109,6 +109,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 	fillOneDef(&pk.Tracks, &counter)
 	fillOneDef(&pk.Bundles, &counter)
 	fillOneDef(&pk.RarityTiers, &counter)
+	fillOneDef(&pk.Affixes, &counter)
 	fillOneDef(&pk.LootTables, &counter)
 	fillOneDef(&pk.SpawnSchedules, &counter)
 	fillOneDef(&pk.Recipes, &counter)
@@ -137,6 +138,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 		{"tracks", pk.Tracks, lc.Tracks},
 		{"bundles", pk.Bundles, lc.Bundles},
 		{"rarity_tiers", pk.RarityTiers, lc.RarityTiers},
+		{"affix_defs", pk.Affixes, lc.Affixes},
 		{"loot_tables", pk.LootTables, lc.LootTables},
 		{"spawn_schedules", pk.SpawnSchedules, lc.SpawnSchedules},
 		{"recipes", pk.Recipes, lc.Recipes},
@@ -162,7 +164,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 var reflectNetCovered = map[string]bool{
 	"Attributes": true, "Resources": true, "DamageTypes": true, "Affects": true,
 	"Abilities": true, "CombatProfiles": true, "Channels": true, "Regions": true,
-	"Tracks": true, "Bundles": true, "RarityTiers": true, "LootTables": true,
+	"Tracks": true, "Bundles": true, "RarityTiers": true, "Affixes": true, "LootTables": true,
 	"SpawnSchedules": true, "Recipes": true, "WearSlots": true, "Chargens": true,
 	"DisplayDefs": true, "TrustTiers": true,
 }

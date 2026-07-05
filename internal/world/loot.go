@@ -72,7 +72,23 @@ func buildRarityTierDef(d content.RarityTierDTO) *rarityTierDef {
 	return &rarityTierDef{ref: d.Ref, order: d.Order, weight: d.Weight, color: d.Color, binds: d.Binds}
 }
 
-func buildLootTableDef(d content.LootTableDTO) *lootTableDef {
+// affixDef is the runtime form of a content AffixDefDTO (#37): a NAMED affix (attr + roll range) a loot
+// entry's quality pool references by ref, resolved into an inline affixRoll at build time.
+type affixDef struct {
+	ref      string
+	attr     string
+	min, max float64
+}
+
+func buildAffixDef(d content.AffixDefDTO) *affixDef {
+	return &affixDef{ref: d.Ref, attr: d.Attr, min: d.Min, max: d.Max}
+}
+
+// buildLootTableDef maps a content loot table onto its runtime form (#37: affixes resolves each pool affix —
+// a `ref` entry is looked up in the shared affix registry, an inline entry uses its own attr/min/max). The
+// resolution happens at build/reload time, so an edited affix_def propagates to every referencing pool on the
+// next reload. affixes may be nil (no affix_defs loaded): a ref-entry then resolves to an empty (no-op) affix.
+func buildLootTableDef(d content.LootTableDTO, affixes *defRegistry[*affixDef]) *lootTableDef {
 	def := &lootTableDef{ref: d.Ref, onRoll: d.OnRoll}
 	for _, r := range d.Rolls {
 		roll := lootRoll{kind: r.Kind, chance: r.Chance, n: r.N, qualityFloor: r.QualityFloor}
@@ -81,7 +97,7 @@ func buildLootTableDef(d content.LootTableDTO) *lootTableDef {
 			if e.Quality != nil {
 				qs := &qualitySpec{count: e.Quality.Count, levelMin: e.Quality.LevelMin, levelMax: e.Quality.LevelMax}
 				for _, a := range e.Quality.Affixes {
-					qs.affixes = append(qs.affixes, affixRoll{attr: a.Attr, min: a.Min, max: a.Max})
+					qs.affixes = append(qs.affixes, resolveAffixRoll(a, affixes))
 				}
 				entry.quality = qs
 			}
@@ -93,6 +109,22 @@ func buildLootTableDef(d content.LootTableDTO) *lootTableDef {
 		def.rolls = append(def.rolls, roll)
 	}
 	return def
+}
+
+// resolveAffixRoll turns one content affix entry into a runtime affixRoll (#37). A `ref` entry is resolved
+// from the shared affix registry (the normalized form: edit-once propagates); an inline entry (no ref) uses
+// its own attr/min/max (the pre-#37 form). A ref that names no loaded affix_def resolves to an empty affix
+// (attr ""), which rollItemQuality treats as a no-op — a misauthored ref degrades to nothing, never a panic.
+func resolveAffixRoll(a content.AffixRollDTO, affixes *defRegistry[*affixDef]) affixRoll {
+	if a.Ref != "" {
+		if affixes != nil {
+			if def := affixes.get(a.Ref); def != nil {
+				return affixRoll{attr: def.attr, min: def.min, max: def.max}
+			}
+		}
+		return affixRoll{} // unknown ref => inert affix (content-lint concern, not a crash)
+	}
+	return affixRoll{attr: a.Attr, min: a.Min, max: a.Max}
 }
 
 // --- the resolver ------------------------------------------------------------------------------
