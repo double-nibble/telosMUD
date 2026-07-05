@@ -232,7 +232,7 @@ func (z *Zone) scopeCandidates(actor *Entity, scopes ...Scope) []*Entity {
 			// scope set that matches their semantics (remove searches equipment; get-from-
 			// floor never does).
 			if wr, ok := Get[*Wearer](actor); ok {
-				for _, loc := range wornOrder {
+				for _, loc := range z.wearSlots().orderedRefs() {
 					if e := wr.worn[loc]; e != nil {
 						out = append(out, e)
 					}
@@ -248,15 +248,9 @@ func (z *Zone) scopeCandidates(actor *Entity, scopes ...Scope) []*Entity {
 	return out
 }
 
-// wornOrder is the deterministic slot order ScopeEquipment surfaces worn items in, so
-// `remove 2.ring`-style selection and the equipment list agree on ordering.
-var wornOrder = func() []WearLoc {
-	out := make([]WearLoc, 0, wearLocCount)
-	for loc := WearLocHead; loc < wearLocCount; loc++ {
-		out = append(out, loc)
-	}
-	return out
-}()
+// The deterministic slot order ScopeEquipment surfaces worn items in (so `remove 2.ring`-style selection and
+// the equipment list agree) is now the CONTENT wear-slot order — z.wearSlots().orderedRefs() (#35), replacing
+// the old fixed-enum package var.
 
 // resolveInContainer searches an opened container's contents for spec, applying the same
 // visibility filter and Diku selection as Resolve (MUDLIB §7). It is the explicit-container

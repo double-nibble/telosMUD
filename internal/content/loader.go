@@ -85,6 +85,9 @@ type LoadedContent struct {
 	// Recipes are the pack-global crafting recipes (Phase 13.5), same last-write-wins by ref. The world side
 	// registers them into the per-shard recipe registry; the craft op reads one by ref.
 	Recipes []RecipeDTO
+	// WearSlots is the pack-global content-defined equipment vocabulary (#35), accumulated last-write-wins by
+	// slot ref. The world builds its runtime wear-slot vocab from it; an empty list => the engine default set.
+	WearSlots []WearSlotDTO
 	// Chargens are the pack-global character-generation flows (Phase 14.8), same last-write-wins by ref.
 	// telos-account reads them (not the world) to render + validate the signup form.
 	Chargens []ChargenDTO
@@ -146,6 +149,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	lootIdx := make(map[string]int)
 	schedIdx := make(map[string]int)
 	recipeIdx := make(map[string]int)
+	wearSlotIdx := make(map[string]int)
 	chargenIdx := make(map[string]int)
 	trustIdx := make(map[string]int)
 	for _, p := range packs {
@@ -283,6 +287,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				recipeIdx[rc.Ref] = len(lc.Recipes)
 				lc.Recipes = append(lc.Recipes, rc)
+			}
+		}
+		for _, ws := range p.WearSlots {
+			if idx, ok := wearSlotIdx[ws.Ref]; ok {
+				lc.WearSlots[idx] = ws
+			} else {
+				wearSlotIdx[ws.Ref] = len(lc.WearSlots)
+				lc.WearSlots = append(lc.WearSlots, ws)
 			}
 		}
 		for _, cg := range p.Chargens {

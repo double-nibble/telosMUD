@@ -572,8 +572,8 @@ func combatProfileFor(e *Entity) *combatProfile {
 // is authored directly on its prototype). nil when the attacker has neither (an unarmed player: the
 // content unarmed dice ride the bonus formula / the swing deals bonus-only damage). Zone-goroutine read.
 func wieldedWeapon(attacker *Entity) *Weapon {
-	if w, ok := Get[*Wearer](attacker); ok {
-		if item := w.worn[WearLocWield]; item != nil {
+	if w, ok := Get[*Wearer](attacker); ok && attacker.zone != nil {
+		if item := w.worn[attacker.zone.wieldSlot()]; item != nil { // #35: weapon slot by kind, not a fixed ref
 			if wp, ok := Get[*Weapon](item); ok {
 				return wp
 			}

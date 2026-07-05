@@ -500,6 +500,14 @@ type spawnScheduleBody struct {
 
 // recipeBody is the JSONB-tail shape for a recipe_defs row (Phase 13.5): everything but the ref/pack PK —
 // the recipe's profession/skill gate, station flag, inputs, output, and quality band, all content.
+// wearSlotBody is the JSONB-tail shape for a wear_slot_defs row (#35): everything but the ref/pack PK — the
+// slot's display label, its display/selection order, and its equip-verb kind (worn/wield/hold).
+type wearSlotBody struct {
+	Label string `json:"label,omitempty"`
+	Order int    `json:"order,omitempty"`
+	Kind  string `json:"kind,omitempty"`
+}
+
 type recipeBody struct {
 	Name        string                   `json:"name,omitempty"`    // #34 discovery display name
 	Aliases     []string                 `json:"aliases,omitempty"` // #34 `craft <name>` short names
@@ -1021,6 +1029,35 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	rcRows.Close()
+
+	// Wear slots (#35): ref+pack first-class, the label/order/kind in the JSONB body.
+	wsRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM wear_slot_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query wear_slot_defs: %w", err)
+	}
+	for wsRows.Next() {
+		var ws content.WearSlotDTO
+		var pk string
+		var body []byte
+		if err := wsRows.Scan(&ws.Ref, &pk, &body); err != nil {
+			wsRows.Close()
+			return fmt.Errorf("store: scan wear_slot_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b wearSlotBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				wsRows.Close()
+				return fmt.Errorf("store: wear_slot_def %s body: %w", ws.Ref, err)
+			}
+			ws.Label, ws.Order, ws.Kind = b.Label, b.Order, b.Kind
+		}
+		pack(pk).WearSlots = append(pack(pk).WearSlots, ws)
+	}
+	if err := wsRows.Err(); err != nil {
+		return err
+	}
+	wsRows.Close()
 
 	// Chargens (Phase 14.8): ref+pack first-class, the step list in the JSONB body.
 	cgRows, err := p.pool.Query(ctx,

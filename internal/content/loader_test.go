@@ -41,11 +41,12 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if mid.StartRoom != "midgaard:room:temple" {
 		t.Fatalf("midgaard start_room = %q", mid.StartRoom)
 	}
-	// midgaard expanded to 4 rooms (temple/market/guildhall/smithy) and 10 item prototypes
+	// midgaard expanded to 4 rooms (temple/market/guildhall/smithy) and 13 item prototypes
 	// (the original torch/helmet/sword/chest + the smithy gear: warhammer/frostbrand/vest/
-	// gloves/boots/shield). The crypt zone proves multi-zone-per-shard.
-	if len(mid.Rooms) != 4 || len(mid.Items) != 12 {
-		t.Fatalf("midgaard rooms=%d items=%d, want 4/12", len(mid.Rooms), len(mid.Items))
+	// gloves/boots/shield + the #35 leather belt in the content-defined "waist" slot). The crypt
+	// zone proves multi-zone-per-shard.
+	if len(mid.Rooms) != 4 || len(mid.Items) != 13 {
+		t.Fatalf("midgaard rooms=%d items=%d, want 4/13", len(mid.Rooms), len(mid.Items))
 	}
 	if crypt := lc.Zone("crypt"); crypt == nil {
 		t.Fatal("crypt zone missing (multi-zone-per-shard expansion)")

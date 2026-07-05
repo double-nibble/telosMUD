@@ -88,6 +88,12 @@ type Pack struct {
 	// flag) gating the consume-inputs/produce-output a `craft` ability runs. Pure CONTENT; same rule.
 	Recipes []RecipeDTO `json:"recipes" yaml:"recipes"`
 
+	// WearSlots is the pack-GLOBAL content-defined equipment vocabulary (#35): the ordered set of wear
+	// locations an item may occupy (head/body/…/a new "waist"), replacing the engine-fixed slot enum. Pure
+	// CONTENT; same last-write-wins override-by-ref rule. Empty => the engine's DEFAULT slot set (the classic
+	// Diku core), so the bare engine and any pack that declares none behave exactly as before.
+	WearSlots []WearSlotDTO `json:"wear_slots" yaml:"wear_slots"`
+
 	// Chargens are pack-GLOBAL character-generation flows (Phase 14.8): an ordered list of chargen STEPS the
 	// website walks (pick a race/class bundle, allocate attributes by point-buy, …). Pure CONTENT — content
 	// drives HOW generation works, the engine knows only the step KINDS. One flow per pack by convention;
@@ -800,6 +806,18 @@ type PhysicalDTO struct {
 // slots and packs the bitmask, keeping the slot enum an internal detail.
 type WearableDTO struct {
 	Locations []string `json:"locations" yaml:"locations"`
+}
+
+// WearSlotDTO is one content-defined equipment slot (#35, docs/MUDLIB.md §3): a wear location an item may
+// occupy. Ref is the stable slot id (the token an item's `wearable.locations` names and the Wearer map key);
+// Label is the human word act() shows ("head", "wielded"); Order fixes the deterministic display/selection
+// order (the `equipment` list + the `N.` ordinal agree on it); Kind routes the equip verb — "worn" (the
+// generic `wear`), "wield" (the `wield` verb / the combat weapon slot), or "hold" (the off-hand `hold` verb).
+type WearSlotDTO struct {
+	Ref   string `json:"ref" yaml:"ref"`
+	Label string `json:"label,omitempty" yaml:"label,omitempty"`
+	Order int    `json:"order,omitempty" yaml:"order,omitempty"`
+	Kind  string `json:"kind,omitempty" yaml:"kind,omitempty"` // "worn" (default) | "wield" | "hold"
 }
 
 // WeaponDTO mirrors world.Weapon (damage dice + type + class + attack verb).
