@@ -121,9 +121,9 @@ func cmdFlee(c *Context) error {
 	// link at it, so no fighting pointer survives the room change.
 	c.z.disengage(c.Actor)
 	c.z.act("You flee "+dir+"!", c.Actor, nil, nil, "", "", ToActor)
-	c.z.act("$n flees "+dir+"!", c.Actor, nil, nil, "", "", ToRoom)
+	c.z.actConceal("$n flees "+dir+"!", c.Actor, ToRoom) // #100: silent to those who can't see the fleer
 	Move(c.Actor, c.z.rooms[destRoom])
-	c.z.act("$n arrives, panting.", c.Actor, nil, nil, "", "", ToRoom)
+	c.z.actConceal("$n arrives, panting.", c.Actor, ToRoom) // #100: silent to those who can't see the fleer
 	// Arrival hooks: a webbed destination roots the entrant; an aggressive mob there re-engages.
 	applyRoomAffectsTo(c.Actor)
 	c.z.aggroOnEntry(c.Actor, c.z.rooms[destRoom])

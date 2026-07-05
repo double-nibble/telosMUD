@@ -30,6 +30,21 @@ const (
 	flagDark        = "dark"        // ROOM: unlit — occupants concealed from ordinary viewers (namedFlags)
 	flagInfravision = "infravision" // viewer: sees in an unlit room (a racial / detect-effect grant)
 	flagLight       = "light"       // light source: a Living glow flag (a light spell) OR an item ItemMeta tag
+
+	// Hidden/sneak model (#100). flagHidden conceals a target from an ordinary viewer the same way
+	// flagInvisible does, but it is the MUNDANE-stealth carrier (a hide/sneak skill), pierced by a distinct
+	// sense — flagSenseHidden (a perception/spot capability) — rather than detect-invisibility. Keeping them
+	// separate lets content model "I can see the invisible but still miss the sneak-thief" and vice-versa.
+	// The perception CONTEST (viewer skill vs target stealth) is authored as CONTENT (a hide ability runs a
+	// contested `check` op and, on success, applies flagHidden; a keen-eyed viewer carries flagSenseHidden
+	// from a passive-perception affect) — the engine supplies the concealment primitive + chokepoint wiring,
+	// not a hardcoded skill, exactly as it did for flagInvisible/detect_invis. A hidden mover also moves
+	// SILENTLY: presence lines (act.go actConceal) suppress entirely for any viewer this predicate hides them
+	// from. NOTE this is presence-LINE stealth only — like flagInvisible, it does not evade an aggressive mob's
+	// aggroOnEntry (that mob still attacks; aggro-evasion, if ever wanted, is a separate deliberate choice for
+	// BOTH hidden and invisible). Bystanders still see the ensuing combat as "Someone" (nameFor via canSee).
+	flagHidden      = "hidden"       // target: mundanely concealed (a hide/sneak skill) — pierced by sense_hidden
+	flagSenseHidden = "sense_hidden" // viewer: perceives a flagHidden target (a spot/perception capability)
 )
 
 // SECURITY POSTURE (#28, updated once the builder trust tier #27 landed): holylight is now a RESERVED trust
@@ -39,7 +54,9 @@ const (
 // gates PERCEPTION ONLY — never harm/authz (the harm gate is guardHarmful, separate), so piercing invisibility
 // is a pure information capability that cannot bypass the hostility gate; and (b) detect_invis pierces only
 // flagInvisible, never a staff member's flagWizinvis (a distinct trust-rank branch in visibleTo below). See
-// #27/#97.
+// #27/#97. flagSenseHidden (#100) is the same safe shape as detect_invis — a plain gameplay perception flag
+// that pierces only flagHidden (mundane stealth), never wizinvis; and flagHidden itself is a plain gameplay
+// concealment flag (a hide/sneak skill), NOT a trust flag, so it grants no elevation and gates perception only.
 
 // visibleTo reports whether target is perceivable by viewer under the concealment flags above. It is the
 // single rule canSee delegates to (kept here beside the flag names so the visibility policy lives in one
@@ -84,6 +101,11 @@ func visibleTo(viewer, target *Entity) bool {
 		}
 	}
 	if hasFlag(target, flagInvisible) && !hasFlag(viewer, flagDetectInvis) {
+		return false
+	}
+	// Mundane stealth (#100): a hidden target is concealed unless the viewer can spot the hidden. Distinct
+	// from invisibility (magical) and its detect — a separate sense so content can grant one without the other.
+	if hasFlag(target, flagHidden) && !hasFlag(viewer, flagSenseHidden) {
 		return false
 	}
 	return true

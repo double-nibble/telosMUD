@@ -758,7 +758,7 @@ func (z *Zone) join(s *session, room ProtoRef) {
 	z.setPlayer(s.character, s)
 	delete(z.forwarding, s.character) // present here again; no stale forward
 	Move(s.entity, r)
-	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
+	z.actConceal("$n arrives.", s.entity, ToRoom) // #100: silent to those who can't see the arriver
 	z.lookRoom(s)
 	z.sendPrompt(s)
 	// Publish to the cross-shard `who` roster: this shard now hosts the player (8.4). Off the zone
@@ -831,7 +831,7 @@ func (z *Zone) leave(id string) {
 		}
 	}
 	if r := s.entity.location; r != nil {
-		z.act("$n leaves.", s.entity, nil, nil, "", "", ToRoom)
+		z.actConceal("$n leaves.", s.entity, ToRoom) // #100: silent to those who can't see the leaver
 		Move(s.entity, nil)
 	}
 	// Drop the player's in-memory Lua self.state entry (it was just dumped to durable JSONB above,
@@ -908,7 +908,7 @@ func (z *Zone) transferIn(m transferInMsg) {
 		s.currentZone.Store(z)
 	}
 	Move(s.entity, r)
-	z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
+	z.actConceal("$n arrives.", s.entity, ToRoom) // #100: silent to those who can't see the arriver
 	z.lookRoom(s)
 	// [G13] room-scoped affects land on an entrant arriving via an intra-shard transfer too — the
 	// destination room is THIS zone's, the entity is now ours (single-writer), so this is safe here.
@@ -979,8 +979,8 @@ func (z *Zone) attach(m attachMsg) {
 			r = z.resolveRoom(s.entity.location.proto)
 		}
 		if r != nil {
-			Move(s.entity, r) // only now does the player become visible in the room
-			z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
+			Move(s.entity, r)                             // only now does the player become visible in the room
+			z.actConceal("$n arrives.", s.entity, ToRoom) // #100: silent to those who can't see the arriver
 			// Arrival-hook parity (distsys 6.4a SC1/SC2): a player arriving via a CROSS-SHARD handoff
 			// must land in active room affects (a web/darkness field snares them on arrival, not only on
 			// the next room tick) and trigger an aggressive mob — same as the local-move and intra-shard
@@ -1418,7 +1418,7 @@ func (z *Zone) freezeExpire(id string, gen uint64) {
 	z.stopFight(s.entity)
 	if s.frozenFrom != nil {
 		Move(s.entity, s.frozenFrom)
-		z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
+		z.actConceal("$n arrives.", s.entity, ToRoom) // #100: silent to those who can't see the arriver
 		s.frozenFrom = nil
 	}
 	s.send(textFrame("The way is barred. (handoff timed out)"))
@@ -1580,7 +1580,7 @@ func (z *Zone) handoffFailed(v handoffFailMsg) {
 	z.stopFight(s.entity)
 	if s.frozenFrom != nil {
 		Move(s.entity, s.frozenFrom)
-		z.act("$n arrives.", s.entity, nil, nil, "", "", ToRoom)
+		z.actConceal("$n arrives.", s.entity, ToRoom) // #100: silent to those who can't see the arriver
 		s.frozenFrom = nil
 	}
 	z.log.Debug("handoff failed, thawing player", "player", v.id, "reason", v.reason)
