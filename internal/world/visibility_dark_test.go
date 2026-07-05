@@ -144,6 +144,51 @@ func TestLookRoomPitchBlack(t *testing.T) {
 	}
 }
 
+// TestDarkRoomOnlyConcealsCoLocated: darkness is a PER-ROOM property, so it conceals only occupants of the
+// viewer's own room. A player in a different room stays visible — guarding the zone-wide `who` roster (whoLocal)
+// from being blanked just because the viewer stands in the dark.
+func TestDarkRoomOnlyConcealsCoLocated(t *testing.T) {
+	z, _, room := harmZone(t)
+	viewer := harmPlayer(z, room, "Viewer")
+	other := z.newEntity("harm:room:cellar")
+	Add(other, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["harm:room:cellar"] = other
+	distant := harmPlayer(z, other, "Distant")
+
+	markRoomFlag(room, flagDark)
+	if !visibleTo(viewer, distant) {
+		t.Fatal("darkness must not conceal a player in a DIFFERENT room (who-roster leak guard)")
+	}
+	roomie := harmPlayer(z, room, "Roomie")
+	if visibleTo(viewer, roomie) {
+		t.Fatal("darkness must still conceal a co-located occupant")
+	}
+}
+
+// TestDarkRoomHidesGroundItemsFromGMCP pins the text-vs-GMCP parity fix: the GMCP room-items walk (roomItems)
+// bypasses the per-occupant canSee filter, so it must honor room darkness itself — else a rich client sees
+// floor loot a light-blind player can't. Empty in the dark; the item reappears when the room is lit.
+func TestDarkRoomHidesGroundItemsFromGMCP(t *testing.T) {
+	z, _, room := harmZone(t)
+	viewer := harmPlayer(z, room, "Viewer")
+	loot := z.newEntity("harm:obj:sword")
+	loot.setShort("a sword")
+	Move(loot, room) // on the ground
+
+	if got := roomItems(viewer); len(got) != 1 {
+		t.Fatalf("a lit room should list the ground item over GMCP, got %d items", len(got))
+	}
+	markRoomFlag(room, flagDark)
+	if got := roomItems(viewer); len(got) != 0 {
+		t.Fatalf("a dark room must not leak ground loot over GMCP, got %d items", len(got))
+	}
+	// A light source restores the GMCP listing (and the light item itself is now also on the ground).
+	lightItem(z, room)
+	if got := roomItems(viewer); len(got) == 0 {
+		t.Fatal("a lit dark room should re-list ground items over GMCP")
+	}
+}
+
 // TestRoomIsDarkNilAndUnflagged pins the two non-dark fast paths: a nil room (a viewer with no location) and a
 // room without the dark flag are never dark, so the scan never runs for them.
 func TestRoomIsDarkNilAndUnflagged(t *testing.T) {

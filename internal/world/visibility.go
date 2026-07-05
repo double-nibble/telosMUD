@@ -61,11 +61,13 @@ func visibleTo(viewer, target *Entity) bool {
 	if hasFlag(viewer, flagHolylight) {
 		return true // see-all: the elevated end of the chokepoint (#28) — pierces invisibility AND darkness
 	}
-	// Room darkness (#99): a viewer in an unlit dark room perceives no other occupant. Checked here, at the
-	// chokepoint, so every canSee consumer (targeting, act() messaging, lookRoom, GMCP occupants) inherits it
-	// uniformly. canSee is only ever called for co-located viewer/target, so the perception locale is the
-	// viewer's room; infravision (cheap flag) and holylight (above) are the two ways to see without light.
-	if !hasFlag(viewer, flagInfravision) && roomIsDark(viewer.location) {
+	// Room darkness (#99): a viewer in an unlit dark room perceives no other occupant OF THAT ROOM. Checked
+	// here, at the chokepoint, so every co-located canSee consumer (targeting, act() messaging, lookRoom, GMCP
+	// occupants) inherits it uniformly. Darkness is a PER-ROOM property, so it is gated on co-location: the
+	// one zone-WIDE caller (whoLocal walks every player in the zone, not just the viewer's room) must not have
+	// its whole roster blanked just because the viewer stands in the dark. infravision (cheap flag, checked
+	// first) and holylight (above) are the two ways to see without light.
+	if !hasFlag(viewer, flagInfravision) && viewer.location == target.location && roomIsDark(viewer.location) {
 		return false
 	}
 	// Staff wizinvis (#30): a concealed staff member is hidden from any viewer of STRICTLY LOWER trust rank
