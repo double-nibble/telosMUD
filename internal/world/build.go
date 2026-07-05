@@ -171,6 +171,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		d.affix.register(af.Ref, buildAffixDef(af))
 	}
 	for _, lt := range lc.LootTables {
+		lintAffixRefs(lt, d.affix) // #37: boot-time warn if a quality pool names an unknown affix_def
 		d.loot.register(lt.Ref, buildLootTableDef(lt, d.affix))
 	}
 	// Recipes (Phase 13.5): crafting recipes into the per-shard registry.

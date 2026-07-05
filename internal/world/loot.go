@@ -1,6 +1,7 @@
 package world
 
 import (
+	"log/slog"
 	"math/rand"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -86,8 +87,11 @@ func buildAffixDef(d content.AffixDefDTO) *affixDef {
 
 // buildLootTableDef maps a content loot table onto its runtime form (#37: affixes resolves each pool affix —
 // a `ref` entry is looked up in the shared affix registry, an inline entry uses its own attr/min/max). The
-// resolution happens at build/reload time, so an edited affix_def propagates to every referencing pool on the
-// next reload. affixes may be nil (no affix_defs loaded): a ref-entry then resolves to an empty (no-op) affix.
+// resolution happens once when the shard BUILDS its content (defineGlobals), so an authored affix_def is the
+// single source of truth in the pack and an edit applies to every referencing pool the next time the shard
+// rebuilds its content — NOT live: loot tables are not hot-reloaded (a pre-#37 Phase-12 limitation), so a
+// running shard keeps the boot-time values until it restarts. affixes may be nil (no affix_defs loaded): a
+// ref-entry then resolves to an empty (no-op) affix.
 func buildLootTableDef(d content.LootTableDTO, affixes *defRegistry[*affixDef]) *lootTableDef {
 	def := &lootTableDef{ref: d.Ref, onRoll: d.OnRoll}
 	for _, r := range d.Rolls {
@@ -109,6 +113,26 @@ func buildLootTableDef(d content.LootTableDTO, affixes *defRegistry[*affixDef]) 
 		def.rolls = append(def.rolls, roll)
 	}
 	return def
+}
+
+// lintAffixRefs warns (once per build) about any quality pool naming an affix `ref` that no loaded affix_def
+// provides (#37 review): such a ref resolves to an inert empty affix, silently costing the drop an affix slot,
+// so an operator gets a boot-time signal instead of an invisible dud. Content-lint discipline (like the
+// unknown-proto/bundle warnings) — the malformed table still loads. Runs on the build path (defineGlobals).
+func lintAffixRefs(lt content.LootTableDTO, affixes *defRegistry[*affixDef]) {
+	for _, r := range lt.Rolls {
+		for _, e := range r.Pool {
+			if e.Quality == nil {
+				continue
+			}
+			for _, a := range e.Quality.Affixes {
+				if a.Ref != "" && !affixes.has(a.Ref) {
+					slog.Warn("content: loot quality references an unknown affix_def; it will roll inert",
+						"loot_table", lt.Ref, "item", e.Item, "affix_ref", a.Ref)
+				}
+			}
+		}
+	}
 }
 
 // resolveAffixRoll turns one content affix entry into a runtime affixRoll (#37). A `ref` entry is resolved

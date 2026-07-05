@@ -295,9 +295,10 @@ type QualitySpecDTO struct {
 
 // AffixRollDTO is one affix in a quality pool. TWO shapes (#37): INLINE — Attr + the [Min, Max] range its
 // rolled value falls in — OR a Ref naming a shared affix_def (AffixDefDTO), from which Attr/Min/Max are
-// resolved at build time. Ref takes precedence when set, so an edit to the affix_def propagates to every pool
-// that references it on the next reload (the normalization win). A legendary's richer pool is just a longer
-// Affixes list with a higher Count.
+// resolved when the shard builds its content. Ref takes precedence when set (inline fields are ignored), so
+// the affix_def is the single source of truth — an edit applies to every referencing pool the next time
+// content is (re)built (loot tables are not live-hot-reloaded; see buildLootTableDef). A legendary's richer
+// pool is just a longer Affixes list with a higher Count.
 type AffixRollDTO struct {
 	Ref  string  `json:"ref,omitempty" yaml:"ref,omitempty"` // #37: name a shared affix_def instead of inlining
 	Attr string  `json:"attr,omitempty" yaml:"attr,omitempty"`
@@ -308,8 +309,8 @@ type AffixRollDTO struct {
 // AffixDefDTO is one content-defined NAMED affix (#37, docs/LOOT-AND-SPAWNS.md §3): a reusable
 // attribute + [Min, Max] roll range referenced by ref from a loot entry's quality pool (AffixRollDTO.Ref),
 // so a shared affix ("of the bear" = +str) is authored once and reused across many drops. A first-class def
-// table (like recipe_defs / rarity_tier_defs): edit the def, and every pool that references it changes on
-// reload — instead of the value being baked into each inline pool.
+// table (like recipe_defs / rarity_tier_defs): edit the def, and every pool that references it picks up the
+// change the next time content is (re)built — instead of the value being duplicated into each inline pool.
 type AffixDefDTO struct {
 	Ref  string  `json:"ref" yaml:"ref"`
 	Attr string  `json:"attr" yaml:"attr"`

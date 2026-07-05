@@ -6,8 +6,9 @@
 -- and reused across many drops instead of being inlined into every pool. Like every other def table it is
 -- pure CONTENT: a (pack, ref) PK + a JSONB `body` tail (the target attribute + the roll [min, max] range).
 -- The world resolves an entry's `ref` against these at loot-table build time, so editing an affix_def
--- propagates to every referencing pool on the next reload (the normalization win). An empty pack ships no
--- rows => pools inline their affixes (the pre-#37 form) — the bare engine is unchanged.
+-- applies to every referencing pool the next time content is (re)built (the normalization win; loot tables
+-- are not live-hot-reloaded). An empty pack ships no rows => pools inline their affixes (the pre-#37 form) —
+-- the bare engine is unchanged.
 CREATE TABLE affix_defs (
   ref  TEXT NOT NULL,                -- the stable affix id ("of_the_bear")
   pack TEXT NOT NULL,
