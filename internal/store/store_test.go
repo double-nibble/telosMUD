@@ -280,7 +280,10 @@ func roomForWriter(i int) string {
 // the reflect-walk DTO round-trip test in §7 will generalize). The import (marshal) and export (unmarshal)
 // paths share this recipeBody, so pinning its round-trip catches a mistyped/missing json tag.
 func TestRecipeBodyTrackRoundTrips(t *testing.T) {
-	in := recipeBody{Profession: "smith", Track: "smithing", Skill: "raw", MinSkill: 3, Station: "forge", QualityBase: 5}
+	in := recipeBody{
+		Name: "Leather Vest", Aliases: []string{"vest", "leather vest"}, // #34 discovery/alias fields
+		Profession: "smith", Track: "smithing", Skill: "raw", MinSkill: 3, Station: "forge", QualityBase: 5,
+	}
 	b, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -291,6 +294,9 @@ func TestRecipeBodyTrackRoundTrips(t *testing.T) {
 	}
 	if out.Track != "smithing" {
 		t.Fatalf("recipe track dropped in body round-trip: got %q", out.Track)
+	}
+	if out.Name != "Leather Vest" || len(out.Aliases) != 2 {
+		t.Fatalf("#34 recipe name/aliases dropped in body round-trip: name=%q aliases=%v", out.Name, out.Aliases)
 	}
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("recipeBody round-trip changed the value: %+v -> %+v", in, out)

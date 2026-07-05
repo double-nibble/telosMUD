@@ -16,11 +16,13 @@ import (
 // recipeDef is the runtime form of a content RecipeDTO.
 type recipeDef struct {
 	ref         string
-	profession  string // required profession membership ("" = none)
-	track       string // skill TRACK whose level_attr gates + scales ("" = use `skill` directly)
-	skill       string // skill LEVEL attribute (fallback when `track` is unset; "" = no skill gate)
-	minSkill    int    // minimum skill level required
-	station     string // required room flag, D3 ("" = craft anywhere)
+	name        string   // display name for discovery listings ("" => ref)
+	aliases     []string // builder-declared short names a player types after `craft` (#34; isname-resolved)
+	profession  string   // required profession membership ("" = none)
+	track       string   // skill TRACK whose level_attr gates + scales ("" = use `skill` directly)
+	skill       string   // skill LEVEL attribute (fallback when `track` is unset; "" = no skill gate)
+	minSkill    int      // minimum skill level required
+	station     string   // required room flag, D3 ("" = craft anywhere)
 	inputs      []recipeInput
 	output      recipeOutput
 	qualityBase int
@@ -54,7 +56,8 @@ type recipeOutput struct {
 // buildRecipeDef maps a content RecipeDTO onto the runtime recipeDef (qty defaults to 1).
 func buildRecipeDef(d content.RecipeDTO) *recipeDef {
 	def := &recipeDef{
-		ref: d.Ref, profession: d.Profession, track: d.Track, skill: d.Skill, minSkill: d.MinSkill,
+		ref: d.Ref, name: d.Name, aliases: append([]string(nil), d.Aliases...),
+		profession: d.Profession, track: d.Track, skill: d.Skill, minSkill: d.MinSkill,
 		station: d.Station, qualityBase: d.QualityBase,
 		output: recipeOutput{item: d.Output.Item, qty: max1(d.Output.Qty), bind: d.Output.Bind},
 	}
@@ -81,12 +84,19 @@ func opCraftRecipe(c *effectCtx, op *effectOp) error {
 	if c.actor == nil {
 		return fmt.Errorf("craft_recipe: no actor")
 	}
-	if op.recipe == "" {
-		return fmt.Errorf("craft_recipe: no recipe")
-	}
-	def := c.z.recipeDefs().get(op.recipe)
-	if def == nil {
-		return fmt.Errorf("craft_recipe: unknown recipe %q", op.recipe)
+	// Two authoring shapes: a FIXED recipe ref (op.recipe set — one verb, one recipe) OR name-resolved
+	// (op.recipe empty — `craft <name>`, #34), where the player's typed argument selects the recipe from
+	// the ones they can craft via the Diku alias grammar. A name that matches nothing is a clean refuse.
+	var def *recipeDef
+	if op.recipe != "" {
+		if def = c.z.recipeDefs().get(op.recipe); def == nil {
+			return fmt.Errorf("craft_recipe: unknown recipe %q", op.recipe)
+		}
+	} else {
+		if def = c.z.resolveRecipe(c.actor, c.arg); def == nil {
+			craftRefuse(c.actor, "You don't know how to craft that.")
+			return nil
+		}
 	}
 	if !guardCrossPlayerWrite(c, c.actor) {
 		return nil

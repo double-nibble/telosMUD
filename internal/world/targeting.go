@@ -142,6 +142,14 @@ func atoiBounded(s string) (int, bool) {
 // bare "all" (no keywords) matches everything. Case-insensitive; spec keywords are
 // already lower-cased by parseTargetSpec.
 func (ts TargetSpec) matches(e *Entity) bool {
+	return ts.matchesKeywords(e.keywordList())
+}
+
+// matchesKeywords is the isname core (MUDLIB §7) over a raw keyword list, factored out of matches so
+// NON-entity targets (a content recipe's alias tokens, #34) resolve by the SAME grammar the item/mob
+// resolver uses: every typed word must prefix-match one of the candidate's keywords. A bare "all"
+// matches everything; an empty spec matches nothing.
+func (ts TargetSpec) matchesKeywords(kws []string) bool {
 	if ts.bare {
 		return true
 	}
@@ -150,7 +158,7 @@ func (ts TargetSpec) matches(e *Entity) bool {
 	}
 	for _, word := range ts.keywords {
 		hit := false
-		for _, kw := range e.keywordList() {
+		for _, kw := range kws {
 			if len(word) <= len(kw) && strings.EqualFold(kw[:len(word)], word) {
 				hit = true
 				break

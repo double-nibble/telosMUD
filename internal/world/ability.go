@@ -74,14 +74,14 @@ func (z *Zone) castAbility(s *session, def *abilityDef, arg string, rng *rand.Ra
 	// reserved-but-not-yet-paid; they are paid at commit. An interrupt before completion refunds
 	// (nothing was paid, so a refund is a no-op this phase — the hook is here for the interrupt path).
 	if def.castTime > 0 {
-		z.scheduleCast(s, def, target, rng)
+		z.scheduleCast(s, def, target, arg, rng)
 		s.send(textFrame("You begin casting..."))
 		z.log.Debug("ability lifecycle: cast time started", "ability", def.ref, "pulses", def.castTime)
 		return
 	}
 
 	// Instant cast: commit + resolve now.
-	z.commitAbility(s, def, target, rng)
+	z.commitAbility(s, def, target, arg, rng)
 }
 
 // castTarget is the STABLE IDENTITY of a deferred cast's target — captured by id, NEVER by a raw
@@ -164,7 +164,7 @@ func (ct castTarget) resolve(z *Zone, caster *Entity) (*Entity, bool) {
 // ABORTED too — the same contract the affect tick honors. This keeps every write the deferred cast
 // performs (and any tick ensureTick arms) on entities THIS zone owns, never reaching across the zone
 // boundary. Single-writer: the callback fires on the zone loop.
-func (z *Zone) scheduleCast(s *session, def *abilityDef, target *Entity, rng *rand.Rand) {
+func (z *Zone) scheduleCast(s *session, def *abilityDef, target *Entity, arg string, rng *rand.Rand) {
 	id := s.character
 	ct := captureCastTarget(s.entity, target)
 	z.pulses.after(pulseCount(def.castTime), func(_ uint64) bool {
@@ -185,7 +185,7 @@ func (z *Zone) scheduleCast(s *session, def *abilityDef, target *Entity, rng *ra
 			z.log.Debug("cast aborted: target left mid-cast (resolve-by-id)", "ability", def.ref, "id", id)
 			return false
 		}
-		z.commitAbility(live, def, tgt, rng)
+		z.commitAbility(live, def, tgt, arg, rng)
 		return false
 	})
 }
@@ -194,7 +194,7 @@ func (z *Zone) scheduleCast(s *session, def *abilityDef, target *Entity, rng *ra
 // (step 8), then emit (step 9) and fire the reserved events (step 10). It is reached either instantly
 // (cast_time 0) or from the cast-time callback (after the resolve-by-id check). Single-writer: zone
 // goroutine.
-func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, rng *rand.Rand) {
+func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, arg string, rng *rand.Rand) {
 	actor := s.entity
 
 	// --- BeforeCastCommit checkpoint ([G9], event.go): an ability is about to commit. It fires as a
@@ -239,7 +239,7 @@ func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, rng *r
 	// The source IS the actor for a cast (a DoT's source differs — see runAffectTickOps).
 	c := &effectCtx{
 		z: z, actor: actor, source: actor, target: target,
-		mag: 1, disp: def.disposition, rng: rng,
+		mag: 1, disp: def.disposition, rng: rng, arg: arg,
 	}
 	runOps(c, def.ops)
 	// Lua on_resolve (slice 7.4b): a content Lua body that composes effect ops via the 7.3
