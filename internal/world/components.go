@@ -271,9 +271,23 @@ func wearableFor(locs ...WearLoc) *Wearable {
 // rest. remove just clears the slot, leaving the item carried.
 type Wearer struct {
 	worn map[WearLoc]*Entity
+	// mods is the SUMMED flat attribute bonus contributed by every currently-worn item's rolled
+	// Quality affixes (#35 — gear confers stats). It is the Wearer's modSource view: recomputed by
+	// recomputeWornMods on every wear/remove, read O(1) by flatMod during attribute derivation. This
+	// mirrors the Affected pattern (affected.go): register the source ONCE, recompute on change.
+	mods map[string]float64
+	// registered records that this Wearer has already been addModSource'd onto its entity, so a second
+	// actorWearer/equip never double-registers (which would double-count the gear bonus).
+	registered bool
 }
 
 func (*Wearer) componentKind() Kind { return KindWearable } // shares the wearable kind tag
+
+// flatMod / mulMod implement modSource (attributes.go §1.1): the Wearer contributes each worn item's
+// rolled affix as an ADDITIVE attribute bonus, summed across all worn gear (recomputeWornMods). Gear is
+// purely additive for now, so mulMod is the identity. Read on the zone goroutine during derivation.
+func (w *Wearer) flatMod(ref string) float64 { return w.mods[ref] }
+func (w *Wearer) mulMod(string) float64      { return 1 }
 
 // slotOf returns the slot an item currently occupies on this wearer, or WearLocNone.
 func (w *Wearer) slotOf(item *Entity) WearLoc {

@@ -797,6 +797,9 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 				wr.worn[loc] = item
 			}
 		}
+		// #35: register + sum the worn affix bonus now, so the resource clamp below sees the gear-boosted
+		// derived max (the ordering the comment above depends on).
+		applyWornMods(e, wr)
 	}
 
 	// FINALLY install resource CURRENTS, clamped to the now-final derived max (after attributes +

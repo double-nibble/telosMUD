@@ -340,7 +340,8 @@ func cmdWear(c *Context) error {
 			continue
 		}
 		wr.worn[loc] = target
-		bindOnEquip(target) // Phase 13.1: a bind_on_equip item binds when worn
+		bindOnEquip(target)        // Phase 13.1: a bind_on_equip item binds when worn
+		applyWornMods(c.Actor, wr) // #35: the item's rolled affixes now modify the wearer's attributes
 		c.z.act("You wear $p on your $t.", c.Actor, target, nil, wearLocName[loc], "", ToActor)
 		c.z.act("$n wears $p.", c.Actor, target, nil, "", "", ToRoom)
 		c.z.log.Debug("cmd wear", "player", c.s.character, "item", target.proto, "slot", wearLocName[loc])
@@ -374,7 +375,8 @@ func cmdWield(c *Context) error {
 		return nil
 	}
 	wr.worn[WearLocWield] = target
-	bindOnEquip(target) // Phase 13.1: a bind_on_equip weapon binds when wielded
+	bindOnEquip(target)        // Phase 13.1: a bind_on_equip weapon binds when wielded
+	applyWornMods(c.Actor, wr) // #35: a wielded weapon's rolled affixes modify the wielder's attributes
 	c.z.act("You wield $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n wields $p.", c.Actor, target, nil, "", "", ToRoom)
 	c.z.log.Debug("cmd wield", "player", c.s.character, "item", target.proto)
@@ -404,6 +406,7 @@ func cmdHold(c *Context) error {
 		return nil
 	}
 	wr.worn[WearLocHold] = target
+	applyWornMods(c.Actor, wr) // #35: a held item's rolled affixes modify the holder's attributes
 	c.z.act("You hold $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n holds $p.", c.Actor, target, nil, "", "", ToRoom)
 	c.z.log.Debug("cmd hold", "player", c.s.character, "item", target.proto)
@@ -433,6 +436,7 @@ func cmdRemove(c *Context) error {
 		return nil
 	}
 	delete(wr.worn, loc)
+	applyWornMods(c.Actor, wr) // #35: removing the item drops its affix contribution from the wearer
 	c.z.act("You stop using $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n stops using $p.", c.Actor, target, nil, "", "", ToRoom)
 	c.z.log.Debug("cmd remove", "player", c.s.character, "item", target.proto, "slot", wearLocName[loc])

@@ -135,7 +135,8 @@ func applyProduceBind(item *Entity, bind string) {
 // STAT-BUMP STUB for v1 (the rich affix/socket catalog stays deferred). It bumps a named affix on the held
 // item's per-instance Quality delta (Phase 12.3) by `amount` (default +1), creating the Quality component if
 // absent. Because the bump rides the EXISTING item-instance delta it persists across a reload for free; the
-// affix's worn stat EFFECT is the same gear-modifier follow-up 12.3 already owes. `attr` names the stat
+// affix's worn stat EFFECT is applied by the Wearer gear modSource (#35) — and if the item is already worn,
+// this op re-sums it live. `attr` names the stat
 // (default "power"). The target is the actor's first held `item`.
 func opAugmentItem(c *effectCtx, op *effectOp) error {
 	if c.actor == nil {
@@ -167,5 +168,10 @@ func opAugmentItem(c *effectCtx, op *effectOp) error {
 		bump = 1
 	}
 	q.Affixes[attr] += bump
+	// #35: if the augmented item is currently worn, re-sum the wearer's gear bonus so the bump takes effect
+	// live (not only after a remove/re-wear). Harmless no-op for a carried-but-unworn item.
+	if wr, ok := Get[*Wearer](c.actor); ok && wr.slotOf(it) != WearLocNone {
+		recomputeWornMods(c.actor, wr)
+	}
 	return nil
 }

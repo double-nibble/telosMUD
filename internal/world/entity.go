@@ -139,6 +139,10 @@ func (e *Entity) RuntimeID() RuntimeID { return e.rid }
 // through the inbox and the destination goroutine then Moves it into the dest room.
 func Move(e, dest *Entity) {
 	if e.location != nil {
+		// #35: if e is currently WORN by its holder, unequip it (clear the slot + re-sum gear mods) before
+		// it leaves — otherwise a destroyed/transferred worn item leaves a dangling slot and a phantom,
+		// permanent stat bonus. Cheap: a no-op unless e.location has a Wearer that has e in a worn slot.
+		unequipFromWearer(e.location, e)
 		e.location.removeContent(e)
 	}
 	e.location = dest
