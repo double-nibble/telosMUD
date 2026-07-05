@@ -19,6 +19,11 @@ type ItemMeta struct {
 	// instances merge up to maxStack; matType is a free-form category content groups by. 0 => not a material.
 	maxStack int
 	matType  string
+	// salvageTable / noSalvage are the #38 salvaging rules: salvageTable is a per-item OVERRIDE table a
+	// disenchant rolls instead of the verb default ("" => use the default); noSalvage marks the item
+	// un-salvageable (the disenchant verb refuses it). Proto data, immutable at runtime.
+	salvageTable string
+	noSalvage    bool
 }
 
 func (*ItemMeta) componentKind() Kind { return KindItemMeta }

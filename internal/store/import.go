@@ -196,6 +196,8 @@ func insertProtos(ctx context.Context, tx pgx.Tx, table, pack, zoneRef string, p
 			Lua:    d.Lua,    // the prototype's trigger/scripted Lua source (Phase 7.4c) rides the body JSONB too
 			// Item-economy fields (Phase 13.1/13.2): bind rule, rarity tier, tags, material spec.
 			Bind: d.Bind, Tier: d.Tier, Tags: d.Tags, Material: d.Material,
+			// #38 salvaging: per-item override table + un-salvageable block.
+			SalvageTable: d.SalvageTable, NoSalvage: d.NoSalvage,
 		})
 		if err != nil {
 			return fmt.Errorf("store: marshal %s %s body: %w", table, d.Ref, err)

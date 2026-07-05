@@ -76,9 +76,10 @@ func protoComponents(p content.ProtoDTO) componentSet {
 	}
 	// Item crafting/economy metadata (Phase 13.1/13.2): bind rule + rarity tier + tags + the material/stack
 	// spec. Attached only when the prototype sets any of them, so a plain item carries no ItemMeta.
-	if p.Bind != "" || p.Tier != "" || len(p.Tags) > 0 || p.Material != nil {
+	if p.Bind != "" || p.Tier != "" || len(p.Tags) > 0 || p.Material != nil || p.SalvageTable != "" || p.NoSalvage {
 		meta := &ItemMeta{
 			bindRule: p.Bind, tier: p.Tier, tags: append([]string(nil), p.Tags...),
+			salvageTable: p.SalvageTable, noSalvage: p.NoSalvage,
 		}
 		if m := p.Material; m != nil {
 			meta.maxStack = m.MaxStack

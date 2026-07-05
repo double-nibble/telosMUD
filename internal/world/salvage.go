@@ -15,6 +15,48 @@ import (
 //     legendary-essence sink) is bound on creation (can't be sold), while low/mid components stay tradeable.
 // Single-writer: the zone goroutine, like every other effect op.
 
+// itemNoSalvage reports whether the item is flagged UN-SALVAGEABLE (#38): the disenchant verb refuses it.
+func itemNoSalvage(item *Entity) bool {
+	if m, ok := Get[*ItemMeta](item); ok {
+		return m.noSalvage
+	}
+	return false
+}
+
+// itemSalvageTable returns the item's per-item OVERRIDE salvage table ref (#38), or "" when it has none (the
+// caller then falls back to the verb's default table).
+func itemSalvageTable(item *Entity) string {
+	if m, ok := Get[*ItemMeta](item); ok {
+		return m.salvageTable
+	}
+	return ""
+}
+
+// hasItemTag reports whether the item carries content tag `tag` (#38 tag gate). An empty tag matches anything
+// (no gate); an item with no ItemMeta has no tags.
+func hasItemTag(item *Entity, tag string) bool {
+	if tag == "" {
+		return true
+	}
+	m, ok := Get[*ItemMeta](item)
+	if !ok {
+		return false
+	}
+	for _, t := range m.tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// salvageRefuse sends a refusal line to a player actor (a mob salvager gets nothing — no session).
+func salvageRefuse(actor *Entity, msg string) {
+	if s, ok := sessionOf(actor); ok {
+		s.send(textFrame(msg))
+	}
+}
+
 // tierBinds reports whether items of rarity tier ref bind on creation (D1). An unknown/empty tier never binds.
 func (z *Zone) tierBinds(ref string) bool {
 	if ref == "" {
@@ -33,22 +75,59 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 	if c.actor == nil {
 		return fmt.Errorf("salvage_item: no actor")
 	}
-	if op.item == "" {
-		return fmt.Errorf("salvage_item: no item")
-	}
-	if op.table == "" {
-		return fmt.Errorf("salvage_item: no table")
-	}
-	src := findHeldByProto(c.actor, op.item)
-	if src == nil {
-		return fmt.Errorf("salvage_item: actor holds no %s", op.item)
-	}
-	table := c.z.lootTableDefs().get(op.table)
-	if table == nil {
-		return fmt.Errorf("salvage_item: unknown table %q", op.table)
+	// Two authoring shapes: FIXED proto (op.item set — the Phase-13.4 form) OR OBJECT-TARGETED (op.item
+	// empty — `disenchant <item>`, #38), where the player's typed argument resolves a held item by keyword.
+	var src *Entity
+	if op.item != "" {
+		if src = findHeldByProto(c.actor, op.item); src == nil {
+			return fmt.Errorf("salvage_item: actor holds no %s", op.item)
+		}
+	} else {
+		hits := c.z.Resolve(c.actor, parseTargetSpec(c.arg), ScopeInventory)
+		if len(hits) == 0 {
+			salvageRefuse(c.actor, "You aren't carrying that.")
+			return nil
+		}
+		src = hits[0]
 	}
 	if !guardCrossPlayerWrite(c, c.actor) {
 		return nil
+	}
+	// Gate: a WORN/wielded or keep-flagged source must be taken off / unkept first. Salvage is destructive —
+	// more so than drop, which already refuses a worn (equippedBlocked) or kept (keptBlocked) item (#36) — so
+	// it honors the same guards up front rather than vaporizing equipped or explicitly-kept gear from under
+	// the player. (The consume below goes through Move, which also unequips a worn source as a #35 backstop,
+	// but the refusal here is the player-facing guard.)
+	if wr, ok := Get[*Wearer](c.actor); ok && wr.slotOf(src) != WearLocNone {
+		salvageRefuse(c.actor, "You must remove it before you can salvage it.")
+		return nil
+	}
+	if isKept(src) {
+		salvageRefuse(c.actor, "It is marked keep; `unkeep` it before salvaging.")
+		return nil
+	}
+	// Gate: a per-item BLOCK flag refuses the verb (a super-rare metal / quest item can't be broken down).
+	if itemNoSalvage(src) {
+		salvageRefuse(c.actor, "That cannot be salvaged.")
+		return nil
+	}
+	// Gate: an item-TAG requirement (op.tag) — only items carrying the tag may be disenchanted (e.g. only
+	// gear tagged `salvageable`). Empty op.tag => no tag gate.
+	if !hasItemTag(src, op.tag) {
+		salvageRefuse(c.actor, "You can't salvage that.")
+		return nil
+	}
+	// The table: a per-item OVERRIDE (salvageTable) wins over the verb's default (op.table).
+	tableRef := op.table
+	if ov := itemSalvageTable(src); ov != "" {
+		tableRef = ov
+	}
+	if tableRef == "" {
+		return fmt.Errorf("salvage_item: no table")
+	}
+	table := c.z.lootTableDefs().get(tableRef)
+	if table == nil {
+		return fmt.Errorf("salvage_item: unknown table %q", tableRef)
 	}
 	// Consume the source FIRST: destruction of an owned item ignores the bound state (a bound epic is
 	// deconstructable by its owner, §1). A material source decrements one; a unique item despawns.

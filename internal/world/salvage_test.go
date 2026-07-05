@@ -69,8 +69,8 @@ func TestDisenchantRefusedWithoutProfession(t *testing.T) {
 	}
 }
 
-// TestDisenchantVerbAfterLearning: once leatherworking is learned, the disenchant verb runs the salvage,
-// consuming the sword and yielding the components (the end-to-end content path).
+// TestDisenchantVerbAfterLearning: once leatherworking is learned, the OBJECT-TARGETED disenchant verb (#38)
+// resolves the held item by keyword, consuming the sword and yielding the components (the end-to-end path).
 func TestDisenchantVerbAfterLearning(t *testing.T) {
 	e := newCmdEnv(t)
 	actor := e.actor.entity
@@ -79,13 +79,132 @@ func TestDisenchantVerbAfterLearning(t *testing.T) {
 	Move(sword, actor)
 
 	applyBundleTo(e.z, actor, "leatherworking")
-	e.run("disenchant")
+	e.run("disenchant sword") // #38: name the held item to disenchant
 
 	if findHeldByProto(actor, "midgaard:obj:sword") != nil {
-		t.Fatal("disenchant should consume the sword")
+		t.Fatal("disenchant should consume the resolved sword")
 	}
 	if findHeldByProto(actor, "midgaard:obj:essence") == nil {
 		t.Fatal("disenchant should yield an arcane essence")
+	}
+}
+
+// TestDisenchantNoArgRefuses: the object-targeted verb with no item names nothing — a clean refuse, no consume.
+func TestDisenchantNoArgRefuses(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	sword := e.z.spawn(ProtoRef("midgaard:obj:sword"))
+	Move(sword, actor)
+	applyBundleTo(e.z, actor, "leatherworking")
+
+	aout, _ := e.run("disenchant")
+	if !has(aout, "aren't carrying that") {
+		t.Fatalf("bare disenchant should refuse (name no item); got %v", aout)
+	}
+	if findHeldByProto(actor, "midgaard:obj:sword") == nil {
+		t.Fatal("a refused disenchant must not consume anything")
+	}
+}
+
+// TestDisenchantTagGateRefusesUntagged: the demo verb gates on `tag: salvageable`; an item lacking the tag is
+// refused (and untouched), even held by a trained crafter.
+func TestDisenchantTagGateRefusesUntagged(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	applyBundleTo(e.z, actor, "leatherworking")
+	// A plain torch (no `salvageable` tag) in hand.
+	torch := addTestItem(e.z, actor, "a pine torch", []string{"torch"})
+	_ = torch
+
+	aout, _ := e.run("disenchant torch")
+	if !has(aout, "can't salvage that") {
+		t.Fatalf("an untagged item should be refused by the tag gate; got %v", aout)
+	}
+	if len(actor.contents) == 0 {
+		t.Fatal("a tag-refused disenchant must not consume the item")
+	}
+}
+
+// TestDisenchantBlockedItemRefused: a per-item un-salvageable (no_salvage) block refuses the verb outright,
+// ahead of the tag gate.
+func TestDisenchantBlockedItemRefused(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	applyBundleTo(e.z, actor, "leatherworking")
+	// A salvageable-tagged but explicitly-blocked relic.
+	relic := addTestItem(e.z, actor, "a mithril relic", []string{"relic"},
+		&ItemMeta{tags: []string{"salvageable"}, noSalvage: true})
+	_ = relic
+
+	aout, _ := e.run("disenchant relic")
+	if !has(aout, "cannot be salvaged") {
+		t.Fatalf("a no_salvage item should be refused; got %v", aout)
+	}
+	if len(actor.contents) == 0 {
+		t.Fatal("a blocked disenchant must not consume the item")
+	}
+}
+
+// TestDisenchantWornItemRefused: salvage is destructive, so a WORN/wielded source is refused up front (the
+// player must `remove` it first — the same guard drop honors, #36) and is NOT consumed.
+func TestDisenchantWornItemRefused(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	applyBundleTo(e.z, actor, "leatherworking")
+	sword := addTestItem(e.z, actor, "a steel sword", []string{"sword"},
+		wearableFor(WearLocWield), &Weapon{diceNum: 1, diceSize: 8, damageType: "slash"},
+		&ItemMeta{tags: []string{"salvageable"}})
+	e.run("wield sword")
+
+	aout, _ := e.run("disenchant sword")
+	if !has(aout, "must remove it") {
+		t.Fatalf("disenchanting a wielded item should be refused; got %v", aout)
+	}
+	if wr, _ := Get[*Wearer](actor); wr.slotOf(sword) == WearLocNone {
+		t.Fatal("a refused disenchant must not have unequipped/consumed the worn sword")
+	}
+}
+
+// TestDisenchantKeptItemRefused: a keep-flagged source is refused (unkeep first) and not consumed.
+func TestDisenchantKeptItemRefused(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	applyBundleTo(e.z, actor, "leatherworking")
+	relic := addTestItem(e.z, actor, "a prized relic", []string{"relic"},
+		&ItemMeta{tags: []string{"salvageable"}})
+	keepItem(relic)
+
+	aout, _ := e.run("disenchant relic")
+	if !has(aout, "marked keep") {
+		t.Fatalf("disenchanting a kept item should be refused; got %v", aout)
+	}
+	if findHeldByProto(actor, string(relic.proto)) == nil && relic.location != actor {
+		t.Fatal("a refused disenchant must not consume the kept item")
+	}
+}
+
+// TestSalvagePerItemOverrideTable: an item's own salvage_table wins over the op's default table.
+func TestSalvagePerItemOverrideTable(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	// An item that overrides the salvage table to disenchant_arms (which yields leather + essence).
+	widget := addTestItem(e.z, actor, "a broken widget", []string{"widget"},
+		&ItemMeta{tags: []string{"salvageable"}, salvageTable: "disenchant_arms"})
+
+	c := &effectCtx{
+		z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral,
+		arg: "widget", rng: rand.New(rand.NewSource(1)),
+	}
+	// The op names NO fixed item (object-target) and a BOGUS default table; the per-item override is used.
+	op := &effectOp{kind: "salvage_item", table: "no_such_default", tag: "salvageable"}
+	if err := opSalvageItem(c, op); err != nil {
+		t.Fatalf("override salvage: %v", err)
+	}
+	if widget.location == actor { // still held => not consumed
+		t.Fatal("the override salvage should consume the widget")
+	}
+	if findHeldByProto(actor, "midgaard:obj:essence") == nil {
+		t.Fatal("the per-item override table (disenchant_arms) should have yielded an essence")
 	}
 }
 
