@@ -45,9 +45,11 @@ func cmdWizinvis(c *Context) error {
 		}
 	case "on", "enable":
 		setFlag(c.Actor, flagWizinvis, true)
+		c.z.republishPresenceOnConcealChange(c.Actor) // #98: drop from cross-shard who for lower ranks
 		c.Send("Wizinvis ON — hidden from lower trust ranks.")
 	case "off", "disable":
 		setFlag(c.Actor, flagWizinvis, false)
+		c.z.republishPresenceOnConcealChange(c.Actor) // #98: reappear in cross-shard who
 		c.Send("Wizinvis OFF — now visible to all.")
 	default:
 		c.Send("Usage: wizinvis on|off")

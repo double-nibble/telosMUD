@@ -47,7 +47,7 @@ func (r *Redis) prefix() string             { return r.ns + ":presence:" }
 // EVALSHA could NOSCRIPT mid-pipeline. Sending the source is one round-trip for the whole heartbeat batch.
 //
 //	KEYS[1]=presence key
-//	ARGV[1]=shardID  ARGV[2]=name  ARGV[3]=afk(0/1)  ARGV[4]=seen_ms  ARGV[5]=ttl_ms
+//	ARGV[1]=shardID  ARGV[2]=name  ARGV[3]=afk(0/1)  ARGV[4]=seen_ms  ARGV[5]=ttl_ms  ARGV[6]=conceal(0/1)
 const setPresenceSrc = `
 local owner = redis.call('HGET', KEYS[1], 'shard')
 if owner and owner ~= ARGV[1] then
@@ -55,7 +55,7 @@ if owner and owner ~= ARGV[1] then
     return 0
   end
 end
-redis.call('HSET', KEYS[1], 'shard', ARGV[1], 'name', ARGV[2], 'afk', ARGV[3], 'seen', ARGV[4])
+redis.call('HSET', KEYS[1], 'shard', ARGV[1], 'name', ARGV[2], 'afk', ARGV[3], 'seen', ARGV[4], 'conceal', ARGV[6])
 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
 return 1
 `
@@ -75,12 +75,16 @@ func (r *Redis) Set(ctx context.Context, shardID string, entries []Entry, ttl ti
 		if e.AFK {
 			afk = "1"
 		}
+		conceal := "0"
+		if e.Concealed {
+			conceal = "1"
+		}
 		seen := e.LastSeen
 		if seen.IsZero() {
 			seen = time.Now()
 		}
 		cmds[i] = pipe.Eval(ctx, setPresenceSrc, []string{r.key(e.PlayerID)},
-			shardID, e.Name, afk, seen.UnixMilli(), ttl.Milliseconds())
+			shardID, e.Name, afk, seen.UnixMilli(), ttl.Milliseconds(), conceal)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		// Pipeline-level error: surface it. (Per-command refusals are not pipeline errors; they are read
@@ -129,7 +133,7 @@ func (r *Redis) List(ctx context.Context) ([]Entry, error) {
 			return nil, err
 		}
 		for _, k := range keys {
-			vals, err := r.rdb.HMGet(ctx, k, "name", "shard", "afk", "seen").Result()
+			vals, err := r.rdb.HMGet(ctx, k, "name", "shard", "afk", "seen", "conceal").Result()
 			if err != nil {
 				return nil, err
 			}
@@ -140,13 +144,15 @@ func (r *Redis) List(ctx context.Context) ([]Entry, error) {
 			shard, _ := vals[1].(string)
 			afkStr, _ := vals[2].(string)
 			seenStr, _ := vals[3].(string)
+			concealStr, _ := vals[4].(string)
 			seenMs, _ := strconv.ParseInt(seenStr, 10, 64)
 			out = append(out, Entry{
-				PlayerID: strings.TrimPrefix(k, prefix),
-				Name:     name,
-				ShardID:  shard,
-				AFK:      afkStr == "1",
-				LastSeen: time.UnixMilli(seenMs),
+				PlayerID:  strings.TrimPrefix(k, prefix),
+				Name:      name,
+				ShardID:   shard,
+				AFK:       afkStr == "1",
+				Concealed: concealStr == "1",
+				LastSeen:  time.UnixMilli(seenMs),
 			})
 		}
 		if next == 0 {

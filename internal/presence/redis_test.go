@@ -68,6 +68,37 @@ func TestSetAndListCrossShard(t *testing.T) {
 	}
 }
 
+// TestEntryFieldsRoundTrip guards the store field-drop trap (#98): the Redis roster marshals Entry
+// field-by-field (a Lua HSET + HMGET), so a newly-added field must be threaded through BOTH the write and the
+// read. Set an entry carrying every non-default flag and assert List returns them intact on both impls.
+func TestEntryFieldsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range eachRoster(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.r.Set(ctx, "shard-a", []Entry{
+				{PlayerID: "Sneak", Name: "Sneak", AFK: true, Concealed: true},
+				{PlayerID: "Plain", Name: "Plain"}, // both flags default false
+			}, DefaultTTL); err != nil {
+				t.Fatal(err)
+			}
+			got, err := tc.r.List(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			byID := map[string]Entry{}
+			for _, e := range got {
+				byID[e.PlayerID] = e
+			}
+			if !byID["Sneak"].Concealed || !byID["Sneak"].AFK {
+				t.Fatalf("Concealed/AFK flags dropped in round-trip: %+v", byID["Sneak"])
+			}
+			if byID["Plain"].Concealed || byID["Plain"].AFK {
+				t.Fatalf("default flags spuriously set in round-trip: %+v", byID["Plain"])
+			}
+		})
+	}
+}
+
 // TestWriteAuthority is the P8-A4 security test: a shard cannot write or evict a player a DIFFERENT live
 // shard owns.
 func TestWriteAuthority(t *testing.T) {

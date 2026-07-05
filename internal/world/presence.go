@@ -98,11 +98,11 @@ func (p *presenceTracker) enabled() bool {
 // join records that this shard now hosts playerID (a fresh login or a cross-shard handoff arrival) and
 // eagerly writes its presence so the player appears in `who` immediately, not only on the next heartbeat.
 // Concurrency-safe; called from a zone goroutine. The blocking write happens on the background loop.
-func (p *presenceTracker) join(playerID, name string, afk bool) {
+func (p *presenceTracker) join(playerID, name string, afk, concealed bool) {
 	if !p.enabled() {
 		return
 	}
-	e := roster.Entry{PlayerID: playerID, Name: name, ShardID: p.shardID, AFK: afk}
+	e := roster.Entry{PlayerID: playerID, Name: name, ShardID: p.shardID, AFK: afk, Concealed: concealed}
 	p.mu.Lock()
 	p.residents[playerID] = e
 	p.mu.Unlock()
@@ -225,7 +225,42 @@ func (z *Zone) presenceJoin(s *session) {
 	if z.shard == nil || z.shard.presence == nil || s == nil || s.entity == nil {
 		return
 	}
-	z.shard.presence.join(s.character, s.entity.Name(), playerAFK(s))
+	z.shard.presence.join(s.character, s.entity.Name(), playerAFK(s), concealedForRoster(s.entity))
+}
+
+// concealedForRoster reports whether entity e should be marked CONCEALED in the cross-shard presence roster
+// (#98) — i.e. omitted from an ordinary viewer's `who`. It is the roster counterpart to the zone-local canSee
+// filter: a player is concealed if they carry any target-side concealment an ordinary viewer can't pierce —
+// magical invisibility, mundane hiding, or staff wizinvis. (A holylight viewer still sees them; renderWho
+// takes a seeAll flag for that.) Read on the zone goroutine, where the flags are single-writer-owned; the
+// resulting bit rides the roster Entry so the off-goroutine `who` reader never has to touch live entity state.
+//
+// COARSENING NOTE (wizinvis): local visibleTo hides wizinvis only from STRICTLY-lower ranks, but the roster
+// Entry carries neither the bearer's rank nor the reader's, so the cross-shard bit is binary: a wizinvis
+// staffer is concealed from everyone-but-holylight in cross-shard `who`. That is the FAIL-SAFE direction — it
+// never leaks a hidden builder to a mortal on another shard (the leak this issue closes); the only cost is
+// that an equal/higher-rank peer must use holylight to see them cross-shard, which staff already carry.
+func concealedForRoster(e *Entity) bool {
+	return hasFlag(e, flagInvisible) || hasFlag(e, flagHidden) || hasFlag(e, flagWizinvis)
+}
+
+// republishPresenceOnConcealChange refreshes e's cross-shard roster entry after its concealment flags may
+// have changed (an effect op set/cleared invisible/hidden, or a staffer toggled wizinvis), so the `who`
+// roster reflects the new state without waiting for a re-login. A no-op for a non-player entity or a bare/
+// disabled shard. Mirrors republishCommsOnAccessChange (the comms-hearing analog). Zone goroutine only.
+//
+// INVARIANT (keep the roster bit fresh): every mutation of a concealment flag (isConcealmentFlag) MUST be
+// followed by this call. Today the only writers are opSetFlag/opClearFlag (invisible/hidden — reserved
+// wizinvis is refused there) and cmdWizinvis, and all three call it. If concealment ever becomes affect-
+// native (an affect that grants/strips invisible on apply/expire), those sites must call this too — else a
+// stale roster bit would leak or over-hide a player in cross-shard `who` until their next login/heartbeat.
+func (z *Zone) republishPresenceOnConcealChange(e *Entity) {
+	if e == nil {
+		return
+	}
+	if s, ok := sessionOf(e); ok && s != nil {
+		z.presenceJoin(s)
+	}
 }
 
 // presenceLeave records that this zone no longer hosts the player (clean quit/leave or handed-off orphan
@@ -280,10 +315,18 @@ func (p *presenceTracker) cachedList(ctx context.Context) ([]roster.Entry, bool)
 // renderWho formats the cross-shard presence roster as the player-visible `who` list. Same shape as the
 // zone-local who (a "Players online:" header + one indented name per player), extended for 8.4: an AFK
 // player is marked. Sorted by name for a stable, readable list across shards.
-func renderWho(entries []roster.Entry) string {
+//
+// Concealment (#98): an Entry the hosting shard marked Concealed (invisible/hidden/wizinvis) is OMITTED for
+// an ordinary viewer — the cross-shard counterpart to the zone-local canSee filter (whoLocal), which the
+// roster path previously couldn't honor. seeAll is the viewer's own see-all capability (holylight), computed
+// on the zone goroutine before this off-goroutine render: a holylight staffer still sees concealed players.
+func renderWho(entries []roster.Entry, seeAll bool) string {
 	names := make([]string, 0, len(entries))
 	afk := map[string]bool{}
 	for _, e := range entries {
+		if e.Concealed && !seeAll {
+			continue // concealed from an ordinary cross-shard viewer
+		}
 		display := e.Name
 		if display == "" {
 			display = e.PlayerID

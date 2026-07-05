@@ -43,13 +43,18 @@ const DefaultTTL = 30 * time.Second
 const DefaultHeartbeat = 10 * time.Second
 
 // Entry is one player's presence as it appears in `who`: the display name, the shard that hosts them,
-// the AFK flag (8.4 carries the field; the `afk` command is 8.6), and a server-stamped last-seen.
+// the AFK flag (8.4 carries the field; the `afk` command is 8.6), a concealment bit, and a server-stamped
+// last-seen. Concealed (#98) is set by the hosting shard when the player is invisible/hidden/wizinvis, so
+// the cross-shard `who` reader (renderWho) can omit them from an ordinary viewer's roster — the roster
+// counterpart to the zone-local canSee filter (which the cross-shard path could not previously honor because
+// the Entry carried no concealment state).
 type Entry struct {
-	PlayerID string
-	Name     string
-	ShardID  string
-	AFK      bool
-	LastSeen time.Time
+	PlayerID  string
+	Name      string
+	ShardID   string
+	AFK       bool
+	Concealed bool
+	LastSeen  time.Time
 }
 
 // Roster is the cross-shard presence store. A shard SET/REMOVEs its own residents (write authority keyed

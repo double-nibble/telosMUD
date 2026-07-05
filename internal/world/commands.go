@@ -182,6 +182,9 @@ func cmdWho(c *Context) error {
 		z.who(c.s) // zone-local fallback (no roster): unchanged output
 		return nil
 	}
+	// #98: capture the viewer's see-all (holylight) ON the zone goroutine — the roster render runs off it and
+	// must not touch live entity flags. A holylight staffer sees concealed players in cross-shard `who` too.
+	seeAll := hasFlag(c.s.entity, flagHolylight)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), presenceIOTimeout)
 		defer cancel()
@@ -192,7 +195,7 @@ func cmdWho(c *Context) error {
 			z.post(whoFallbackMsg{out: out, viewer: c.s.entity})
 			return
 		}
-		writeFrameTo(out, textFrame(renderWho(entries)))
+		writeFrameTo(out, textFrame(renderWho(entries, seeAll)))
 	}()
 	return nil
 }

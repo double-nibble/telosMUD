@@ -58,6 +58,9 @@ func opSetFlag(c *effectCtx, op *effectOp) error {
 	}
 	setFlag(c.target, op.flag, true)
 	c.z.republishCommsOnAccessChange(c.target) // a require_flag channel may now be hearable (see modify_attribute_base)
+	if isConcealmentFlag(op.flag) {
+		c.z.republishPresenceOnConcealChange(c.target) // #98: a now-invisible/hidden player drops from cross-shard who
+	}
 	return nil
 }
 
@@ -80,6 +83,9 @@ func opClearFlag(c *effectCtx, op *effectOp) error {
 	}
 	setFlag(c.target, op.flag, false)
 	c.z.republishCommsOnAccessChange(c.target) // a require_flag channel may no longer be hearable — the guild-leave case
+	if isConcealmentFlag(op.flag) {
+		c.z.republishPresenceOnConcealChange(c.target) // #98: a now-revealed player reappears in cross-shard who
+	}
 	return nil
 }
 
