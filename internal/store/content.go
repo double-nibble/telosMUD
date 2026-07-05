@@ -501,6 +501,8 @@ type spawnScheduleBody struct {
 // recipeBody is the JSONB-tail shape for a recipe_defs row (Phase 13.5): everything but the ref/pack PK —
 // the recipe's profession/skill gate, station flag, inputs, output, and quality band, all content.
 type recipeBody struct {
+	Name        string                   `json:"name,omitempty"`    // #34 discovery display name
+	Aliases     []string                 `json:"aliases,omitempty"` // #34 `craft <name>` short names
 	Profession  string                   `json:"profession,omitempty"`
 	Track       string                   `json:"track,omitempty"`
 	Skill       string                   `json:"skill,omitempty"`
@@ -1009,6 +1011,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				rcRows.Close()
 				return fmt.Errorf("store: recipe_def %s body: %w", rc.Ref, err)
 			}
+			rc.Name, rc.Aliases = b.Name, b.Aliases
 			rc.Profession, rc.Track, rc.Skill, rc.MinSkill, rc.Station = b.Profession, b.Track, b.Skill, b.MinSkill, b.Station
 			rc.Inputs, rc.Output, rc.QualityBase = b.Inputs, b.Output, b.QualityBase
 		}

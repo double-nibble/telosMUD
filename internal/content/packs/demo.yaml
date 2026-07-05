@@ -583,6 +583,31 @@ abilities:
     on_resolve:
       - {op: craft_recipe, recipe: "craft:leather_vest"}
 
+  # make: a NAME-RESOLVED craft verb (#34). Unlike forge_vest (one verb -> one fixed recipe), `make <name>`
+  # runs craft_recipe with NO fixed ref, so the op resolves the recipe from the player's typed argument via
+  # the Diku alias grammar against the recipes they can craft (`make vest` / `make leather vest`). A name that
+  # matches nothing is a clean refuse. The mechanism is verb-agnostic — a pack could bind it to `craft`.
+  - ref: make_by_name
+    name: Make
+    invocation: command
+    words: [make]
+    requires:
+      profession: leatherworking
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    on_resolve:
+      - {op: craft_recipe}
+
+  # recipes: the DISCOVERY listing (#34). It prints the recipes the actor can craft with the exact names
+  # `make <name>` accepts (display name + aliases), so a player never has to guess. Pairs with `make` — the
+  # discoverability pillar: what it prints is what you type.
+  - ref: list_recipes
+    name: Recipes
+    invocation: command
+    words: [recipes]
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    on_resolve:
+      - {op: list_recipes}
+
   # mute: a DEBUFF/CC — applies `silence` (prevents the verbal tag) to an enemy. Harmful disposition, so
   # the PvP harm gate guards it vs a non-consenting player (the harm-gate exercise the brief asks for).
   - ref: mute
@@ -891,6 +916,10 @@ spawn_schedules:
 # salvaged from an epic feeds straight into this recipe.
 recipes:
   - ref: craft:leather_vest
+    # #34: name + aliases make this recipe targetable by phrase — `craft vest` / `craft leather vest`
+    # resolve here via the Diku isname grammar, and the `recipes` discovery verb prints these exact names.
+    name: Leather Vest
+    aliases: [vest, "leather vest"]
     profession: leatherworking
     # track resolves the skill gate/scaling from leatherworking_skill's level_attr (=leatherworking) live, so
     # the recipe follows the track rather than duplicating the attr; skill stays as the raw-attr fallback.

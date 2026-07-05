@@ -435,6 +435,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	// Recipes (Phase 13.5): ref+pack PK, the recipe shape in the JSONB body.
 	for _, rc := range pk.Recipes {
 		body, err := json.Marshal(recipeBody{
+			Name: rc.Name, Aliases: rc.Aliases,
 			Profession: rc.Profession, Track: rc.Track, Skill: rc.Skill, MinSkill: rc.MinSkill, Station: rc.Station,
 			Inputs: rc.Inputs, Output: rc.Output, QualityBase: rc.QualityBase,
 		})

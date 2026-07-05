@@ -45,6 +45,10 @@ type effectCtx struct {
 	mag  float64 // magnitude scale (an affect's stacks*magnitude; 1 for a plain cast; event mag)
 	disp abilityDisposition
 	rng  *rand.Rand // deterministic-injectable; nil => the package default
+	// arg is the raw target argument the command-invocation carried (the verb's tail), threaded from
+	// castAbility so a NAME-RESOLVING op (craft_recipe with no fixed ref — `craft <name>`, #34) can
+	// resolve its subject from what the player typed. "" for event/tick/AoE ctx (no invocation tail).
+	arg string
 	// depth is how many EVENT-fires deep this resolution is (event.go re-entrancy guard). A command/
 	// cast/tick ctx is depth 0; fireEvent runs handlers at depth+1 and refuses past maxEventDepth.
 	depth int
@@ -198,6 +202,8 @@ func init() {
 		"salvage_item": opSalvageItem,
 		// Phase 13.5 recipes: run a content recipe (profession/skill/station gates + consume inputs/produce output).
 		"craft_recipe": opCraftRecipe,
+		// #34 discovery: list the recipes the actor can craft, printing the exact names `craft <name>` accepts.
+		"list_recipes": opListRecipes,
 	}
 }
 

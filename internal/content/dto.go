@@ -323,8 +323,14 @@ type SpawnScheduleDTO struct {
 // the components consumed; Output is the produced item. QualityBase is the coarse output-quality band base —
 // the crafted item's level is QualityBase + the actor's skill level (the rich affix roll stays §10-deferred).
 type RecipeDTO struct {
-	Ref        string `json:"ref" yaml:"ref"`
-	Profession string `json:"profession,omitempty" yaml:"profession,omitempty"`
+	Ref string `json:"ref" yaml:"ref"`
+	// Name is the recipe's display name for discovery listings ("what can I craft?", #34). "" => the ref
+	// is shown. Aliases are the builder-declared SHORT names a player types after `craft` — isname/prefix
+	// resolved (like item keywords) so `craft vest` finds `craft:leather_vest`. The ref's own leaf token
+	// is always an implicit alias, so a recipe is craftable-by-ref even with no explicit aliases.
+	Name       string   `json:"name,omitempty" yaml:"name,omitempty"`
+	Aliases    []string `json:"aliases,omitempty" yaml:"aliases,omitempty"`
+	Profession string   `json:"profession,omitempty" yaml:"profession,omitempty"`
 	// Track, when set, names the skill TRACK whose level_attr gates + scales this recipe — the engine resolves
 	// the attribute live from the track_def, so the recipe follows the track's level_attr instead of duplicating
 	// it (docs/REMAINING.md §4). Skill is the raw-attribute fallback used when Track is unset (a level-less or
