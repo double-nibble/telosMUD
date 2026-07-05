@@ -259,6 +259,11 @@ func cloneComponent(c Component) Component {
 		for loc, e := range v.worn {
 			cp.worn[loc] = e
 		}
+		// #35: the clone is a distinct entity — it has NOT registered its own gear modSource yet, and its
+		// summed bonus is recomputed on first equip/apply. Reset both so it never inherits the prototype's
+		// registration (which would point modSrcs at the prototype's Wearer) or a stale bonus map.
+		cp.registered = false
+		cp.mods = nil
 		return &cp
 	default:
 		panic("world: cloneComponent missing case for " + reflect.TypeOf(c).String() +
