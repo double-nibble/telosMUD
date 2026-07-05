@@ -775,6 +775,12 @@ type ProtoDTO struct {
 	// Tags are open-set item tags (Phase 13.1): "material", "magical", a profession tag — content rules
 	// (recipe inputs, salvage requirements) match on them. The engine names no tag.
 	Tags []string `json:"tags,omitempty" yaml:"tags,omitempty"`
+	// SalvageTable is a per-item OVERRIDE salvage table (#38): a disenchant of this item rolls THIS table
+	// instead of the verb's default. "" => use the default the salvage op names (later: the tier+level
+	// derived table). NoSalvage marks the item UN-SALVAGEABLE (a super-rare metal, a quest token): the
+	// disenchant verb refuses it regardless of any tag gate.
+	SalvageTable string `json:"salvage_table,omitempty" yaml:"salvage_table,omitempty"`
+	NoSalvage    bool   `json:"no_salvage,omitempty" yaml:"no_salvage,omitempty"`
 	// Material, when present, makes this item a STACKABLE material (Phase 13.2): identical stacks merge on
 	// pickup, bounded by MaxStack. nil => a normal (non-stacking) item.
 	Material *MaterialDTO `json:"material,omitempty" yaml:"material,omitempty"`

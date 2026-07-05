@@ -56,6 +56,10 @@ type protoBody struct {
 	Tier     string               `json:"tier,omitempty"`
 	Tags     []string             `json:"tags,omitempty"`
 	Material *content.MaterialDTO `json:"material,omitempty"`
+	// SalvageTable/NoSalvage are the #38 salvaging rules (per-item override table + un-salvageable block).
+	// They ride the same body JSONB; without them a DB round-trip would drop a quest item's no-salvage flag.
+	SalvageTable string `json:"salvage_table,omitempty"`
+	NoSalvage    bool   `json:"no_salvage,omitempty"`
 }
 
 // LoadPacks implements content.Source: it reads every loaded definition for the enabled packs
@@ -214,6 +218,7 @@ func (p *Pool) loadProtoDefinition(ctx context.Context, table, kind, ref, pack s
 		d.Living = b.Living
 		d.Lua = b.Lua
 		d.Bind, d.Tier, d.Tags, d.Material = b.Bind, b.Tier, b.Tags, b.Material
+		d.SalvageTable, d.NoSalvage = b.SalvageTable, b.NoSalvage
 	}
 	return content.Definition{Kind: kind, Ref: ref, Found: true, Proto: d}, nil
 }
@@ -343,6 +348,7 @@ func (p *Pool) loadPrototypes(ctx context.Context, enabled []string, zones map[s
 				d.Living = b.Living
 				d.Lua = b.Lua
 				d.Bind, d.Tier, d.Tags, d.Material = b.Bind, b.Tier, b.Tags, b.Material
+				d.SalvageTable, d.NoSalvage = b.SalvageTable, b.NoSalvage
 			}
 			z := zones[zoneRef]
 			if z == nil {

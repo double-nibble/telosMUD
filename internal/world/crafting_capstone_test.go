@@ -30,8 +30,9 @@ func TestCraftingCapstoneDisenchantToCraftSurvivesRestart(t *testing.T) {
 		t.Fatal("the bound sword should still be held after a blocked drop")
 	}
 
-	// But the OWNER may DECONSTRUCT it: disenchant breaks the bound epic into components.
-	e.run("disenchant")
+	// But the OWNER may DECONSTRUCT it: disenchant breaks the bound epic into components. #38: the verb is
+	// object-targeted, so name the held sword.
+	e.run("disenchant sword")
 	if findHeldByProto(actor, "midgaard:obj:sword") != nil {
 		t.Fatal("disenchant should consume the bound epic")
 	}

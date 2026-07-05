@@ -548,11 +548,12 @@ abilities:
       - {op: consume_item, item: midgaard:obj:leather, amount: 2}
       - {op: produce_item, item: midgaard:obj:leather-gloves, bind: bound}
 
-  # disenchant: a SALVAGE verb (Phase 13.4). Gated on requires.profession (leatherworking) — a non-member is
-  # refused at step-3. On resolve it salvage_item's a held steel longsword: the source is CONSUMED even when
-  # BOUND (owner deconstruction, §1) and the disenchant_arms table yields a tradeable leather component
-  # (uncommon, unbound) + a bound arcane essence (the epic tier binds, D1). No requires_grant — learning the
-  # profession alone unlocks the verb.
+  # disenchant: a SALVAGE verb (Phase 13.4 / #38). Gated on requires.profession (leatherworking) — a non-member
+  # is refused at step-3. It is OBJECT-TARGETED (#38): `disenchant <item>` resolves a HELD item by keyword
+  # (salvage_item with NO fixed `item`, so it reads the typed argument). The `tag: salvageable` gate means only
+  # gear carrying that tag may be broken down; a per-item `no_salvage` block or `salvage_table` override is
+  # honored by the op. The source is CONSUMED even when BOUND (owner deconstruction, §1); disenchant_arms yields
+  # a tradeable leather component (uncommon, unbound) + a bound arcane essence (the epic tier binds, D1).
   - ref: disenchant
     name: Disenchant
     invocation: command
@@ -564,7 +565,7 @@ abilities:
       actor: "You unravel the weave binding the blade and draw out its essence."
       room: "$n unravels a blade into glittering motes of light."
     on_resolve:
-      - {op: salvage_item, item: midgaard:obj:sword, table: disenchant_arms}
+      - {op: salvage_item, table: disenchant_arms, tag: salvageable}
 
   # forge_vest: a RECIPE-DRIVEN craft verb (Phase 13.5). Gated on requires.profession (leatherworking) at the
   # verb level; its on_resolve runs craft_recipe(craft:leather_vest), which re-checks the recipe's own gates
@@ -1048,10 +1049,11 @@ zones:
         physical: {weight: 5, material: steel}
         wearable: {locations: [wield]}
         weapon: {dice_num: 2, dice_size: 6, damage_type: slash, class: sword, attack_verb: slash}
-        # Phase 13.1: the rare loot sword binds to its looter (BoP) + is tagged magical for disenchant (13.4).
+        # Phase 13.1: the rare loot sword binds to its looter (BoP) + is tagged magical. #38: `salvageable`
+        # lets the object-targeted disenchant verb (tag: salvageable) accept it.
         bind: bind_on_pickup
         tier: rare
-        tags: [magical]
+        tags: [magical, salvageable]
       # A stackable crafting material (Phase 13.2): leather scraps merge up to 20 per stack. Disenchant/
       # salvage (13.4) produce these; recipes (13.5) consume them.
       - ref: midgaard:obj:leather
