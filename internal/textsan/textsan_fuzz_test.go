@@ -21,10 +21,13 @@ import (
 //   - IDEMPOTENT: Clean(Clean(x)) == Clean(x) — the output is a fixed point (re-cleaning is a no-op),
 //     the property that lets the world re-apply the cap+strip at its boundary without drift.
 //
-// NOTE on invalid UTF-8: CleanLine/CleanMarkup deliberately PRESERVE a lone invalid byte verbatim on the
-// fast path (documented in textsan.go), so output is NOT guaranteed valid UTF-8 — we do not assert that.
-// Ranging such output decodes the byte to U+FFFD (printable, non-control), so the control-free assertion
-// still holds.
+// NOTE on invalid UTF-8: the two paths diverge (#119/#156). CleanLine (the INPUT edge-parity path) deliberately
+// PRESERVES a lone invalid byte verbatim, so its output is NOT guaranteed valid UTF-8 — we do not assert that.
+// CleanMarkup (the OUTPUT path) DROPS raw invalid bytes, because a lone 8-bit C1 introducer (0x9B CSI / 0x9D OSC
+// / 0x9C ST) is invalid UTF-8 that a rune-level scan judges non-control (it decodes to U+FFFD) yet is a live
+// terminal-injection vector on the wire. The rune-level control-free assertion below is BLIND to that survival
+// (U+FFFD is printable, non-control), so CleanMarkup additionally gets a byte-level utf8.ValidString invariant —
+// the property that a raw C1 byte can never reach a player client through the normal output path.
 func FuzzTextsan(f *testing.F) {
 	seeds := []struct {
 		s string
@@ -77,6 +80,12 @@ func FuzzTextsan(f *testing.F) {
 			if unicode.IsControl(r) {
 				t.Fatalf("CleanMarkup left a control rune %U in %q", r, markup)
 			}
+		}
+		// C1 SURVIVAL (#119/#156): the rune-range control check above is blind to a raw 8-bit C1 byte (it
+		// decodes to non-control U+FFFD), so assert at the byte level that CleanMarkup output is valid UTF-8 —
+		// stripOutputControl drops every raw invalid byte, so no 0x80-0x9F C1 introducer can survive to the wire.
+		if !utf8.ValidString(markup) {
+			t.Fatalf("CleanMarkup left a raw invalid byte (C1-survival vector) in %q", markup)
 		}
 		for _, r := range name {
 			if unicode.IsControl(r) || !unicode.IsPrint(r) {
