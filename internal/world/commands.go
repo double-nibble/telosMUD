@@ -516,7 +516,7 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 	// posFighting at a now-departed target. The room scan still finds opponents here (pre-detach).
 	z.disengage(s.entity)
 	z.actConceal("$n leaves "+dir+".", s.entity, ToRoom) // #100: silent to those who can't see the mover
-	Move(s.entity, nil) // detach from the source room before handing off
+	Move(s.entity, nil)                                  // detach from the source room before handing off
 	z.delPlayer(s.character)
 	// Forward in-flight input to dest until the reader loop observes the new
 	// currentZone (which dest.transferIn Stores). dest dedups by appliedSeq.

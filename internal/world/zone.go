@@ -979,7 +979,7 @@ func (z *Zone) attach(m attachMsg) {
 			r = z.resolveRoom(s.entity.location.proto)
 		}
 		if r != nil {
-			Move(s.entity, r) // only now does the player become visible in the room
+			Move(s.entity, r)                             // only now does the player become visible in the room
 			z.actConceal("$n arrives.", s.entity, ToRoom) // #100: silent to those who can't see the arriver
 			// Arrival-hook parity (distsys 6.4a SC1/SC2): a player arriving via a CROSS-SHARD handoff
 			// must land in active room affects (a web/darkness field snares them on arrival, not only on
