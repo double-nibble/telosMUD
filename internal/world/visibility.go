@@ -58,6 +58,15 @@ const (
 // that pierces only flagHidden (mundane stealth), never wizinvis; and flagHidden itself is a plain gameplay
 // concealment flag (a hide/sneak skill), NOT a trust flag, so it grants no elevation and gates perception only.
 
+// isConcealmentFlag reports whether name is a TARGET-side concealment flag — one whose set/clear changes
+// whether an ordinary viewer can perceive the bearer (#98). Used to trigger a cross-shard presence republish
+// only when a flag change actually affects `who` visibility, rather than on every set_flag. Kept beside the
+// flag constants so the set stays in one place; the viewer-side pierce flags (detect_invis/sense_hidden) and
+// room-level darkness are deliberately excluded (they don't change the BEARER's roster concealment).
+func isConcealmentFlag(name string) bool {
+	return name == flagInvisible || name == flagHidden || name == flagWizinvis
+}
+
 // visibleTo reports whether target is perceivable by viewer under the concealment flags above. It is the
 // single rule canSee delegates to (kept here beside the flag names so the visibility policy lives in one
 // place). Self and a nil perspective are always visible; holylight sees all; an invisible target is hidden
