@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -561,4 +562,55 @@ func TestReloadCommandAddsReachableRoomEndToEnd(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatal("builder never reached the newly-added room after `reload`")
+}
+
+// TestReloadCommandRejectsBrokenPackEndToEnd is the #192 full-path proof: a builder runs `reload` after the
+// source was edited into DEFINITIVELY-broken content (an attribute cycle). The command must publish NOTHING
+// to the fleet and tell the builder the reload was REJECTED — the whole gate under a live zone loop,
+// observed via the output channel + a bus spy (race-free).
+func TestReloadCommandRejectsBrokenPackEndToEnd(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+	s := newReloadShard(t, src, bus)
+	z := s.Zone()
+
+	// Spy: count any invalidation that reaches the bus — a rejected reload must publish ZERO.
+	var published int64
+	spy, err := bus.Subscribe(func(contentbus.Invalidation) { atomic.AddInt64(&published, 1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = spy.Unsubscribe() }()
+
+	builder := &session{character: "Builder", tier: tierBuilder, out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(builder, "Builder")
+	z.players["Builder"] = builder
+	Move(builder.entity, z.rooms["rt:room:hall"])
+	setFlag(builder.entity, flagBuilder, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go z.Run(ctx)
+
+	// Break the source pack with an attribute cycle, then reload.
+	broken := reloadTestPack()
+	broken.Attributes = []content.AttributeDTO{
+		{Ref: "a", DefaultBase: content.BaseSpecDTO{Expr: []any{"attr", "b"}}},
+		{Ref: "b", DefaultBase: content.BaseSpecDTO{Expr: []any{"attr", "a"}}},
+	}
+	src.SetPack(broken)
+
+	z.post(inputMsg{id: "Builder", line: "reload", seq: 1})
+
+	// The builder must get a REJECTED readout...
+	if !drainContains(t, builder, "REJECTED") {
+		t.Fatal("builder never received a rejection readout for a broken pack")
+	}
+	// ...and NOTHING may have hit the bus (give any erroneous publish a beat first).
+	time.Sleep(50 * time.Millisecond)
+	if n := atomic.LoadInt64(&published); n != 0 {
+		t.Fatalf("a rejected reload published %d invalidations; it must publish none", n)
+	}
 }
