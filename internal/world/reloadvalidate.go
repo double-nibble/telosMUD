@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -26,9 +27,11 @@ import (
 // a rolling reboot), so they are a pack-HEALTH proxy ("is this pack sound to push?"). validateChannels
 // (#197 slice 1) adds real PAYLOAD validation for the FIRST propagated kind: channels DO hot-swap here
 // (reloadChannel/buildChannelDef), so a structurally-dead channel is rejected against the same build path.
-// The remaining propagated kinds (rooms/items/mobs) have no clean error surface at boot yet — growing
-// coverage to them (dangling exits, prototype buildability) is the rest of #197. The framework here —
-// collect problems -> gate the publish -> report to the builder — is what each new check slots into.
+// validateRoomExits (#197 slice 2) adds the FIRST room-graph payload check: a dangling exit — one pointing
+// to a room that provably does not exist. Rooms also hot-swap here (the per-ref applier + resyncRoom, #191),
+// so an edit that adds a room with a broken exit is caught before it propagates. Remaining #197 work: item/
+// mob prototype buildability and a full-graph dry-run for cross-pack cycles a scoped reload misses. The
+// framework here — collect problems -> gate the publish -> report to the builder — is what each check slots into.
 //
 // Validation is PURE over the parsed DTOs (it reuses parseAttributeBase + lintAttributeCycles and builds a
 // THROWAWAY attributeDef map — never the shard's live registries), so it is safe on the off-zone-goroutine
@@ -71,9 +74,76 @@ func validatePacks(loaded []content.Pack) []string {
 	for _, err := range lintAttributeCycles(attrDefs) {
 		problems = append(problems, err.Error())
 	}
-	// Payload validation for the propagated kinds. Channels DO hot-swap on this path, so they are checked
-	// against the same build path boot uses (#197 slice 1).
+	// Payload validation for the propagated kinds. Channels and rooms DO hot-swap on this path, so they are
+	// checked against the same build path boot uses (#197 slices 1 + 2).
 	problems = append(problems, validateChannels(loaded)...)
+	problems = append(problems, validateRoomExits(loaded)...)
+	return problems
+}
+
+// validateRoomExits reports one problem per room exit that PROVABLY points nowhere in the re-read content —
+// a dangling exit (RoomDTO.Exits maps a direction to a destination room ref; roomComponents wires it into
+// the live Room graph verbatim, no trimming, so the runtime routes on the raw target). Rooms hot-swap on
+// this path (the per-ref applier + resyncRoom, #191), so a reload adding a room with a broken exit is caught
+// before it propagates. Boot merely tolerates a dangling exit (the move just fails), but this gate is
+// deliberately stricter — a dangling exit is an authoring error, not an intended degradation.
+//
+// The check holds the NO-FALSE-POSITIVE invariant on a scoped `reload <onepack>`, where the loaded set is a
+// SUBSET of the world's content, by judging only INTRA-ZONE targets. The validator sees the RAW []content.Pack
+// LoadPacks returns (not the content.Load-merged graph), and each pack's zone is already WHOLE: the tree
+// loader unions a zone across its files within the pack (packtree mergeZone) before it leaves the source, so
+// a pack that defines a zone carries that zone's COMPLETE authored room list. Another pack can only REPLACE a
+// zone wholesale (cross-pack merge is whole-zone last-write-wins, loader.go), never add rooms to it — so an
+// intra-zone target absent from its zone is provably dangling regardless of what else the live world holds
+// (worst case across packs is a false NEGATIVE, never a false positive). A CROSS-zone target may resolve to a
+// room in a pack outside this reload's scope, so it is deliberately left to the full merged-graph check (#197
+// slice 3, which loads every pack) rather than risk a false rejection here. An empty/whitespace target is
+// always a dead exit, judged in any scope.
+//
+// This intra-zone judgment assumes a room's ref prefix equals its owning zone — the same convention cross-
+// zone exit routing (parseRef) already load-bears on, and which lintRoomZonePrefixes (build.go) warns about
+// when violated. In a world that trips that lint (a divergent-prefix room authored into another zone in an
+// out-of-scope pack), a target could be flagged though a live room exists; such a world is already mis-
+// authored (its cross-zone exits misroute and a hot-reload ADD skips it), so it is out of scope here.
+func validateRoomExits(loaded []content.Pack) []string {
+	// Every room ref present in the loaded set — the resolution target set.
+	roomRefs := map[string]bool{}
+	for i := range loaded {
+		for _, z := range loaded[i].Zones {
+			for _, r := range z.Rooms {
+				roomRefs[r.Ref] = true
+			}
+		}
+	}
+	var problems []string
+	for i := range loaded {
+		for _, z := range loaded[i].Zones {
+			for _, r := range z.Rooms {
+				// Deterministic readout: map iteration order is random, so sort the directions.
+				dirs := make([]string, 0, len(r.Exits))
+				for dir := range r.Exits {
+					dirs = append(dirs, dir)
+				}
+				sort.Strings(dirs)
+				for _, dir := range dirs {
+					target := r.Exits[dir]
+					if strings.TrimSpace(target) == "" {
+						problems = append(problems, fmt.Sprintf("room %q: exit %q has an empty target", r.Ref, dir))
+						continue
+					}
+					if roomRefs[target] {
+						continue // resolves (raw match, exactly as the runtime routes)
+					}
+					// An INTRA-zone target (same zone prefix as the owning zone) that is absent is provably
+					// dangling: the loaded zone holds that zone's complete room list. A cross-zone target is
+					// left to the full-graph check — its zone may be out of this reload's scope.
+					if tz, _ := parseRef(ProtoRef(target)); tz == z.Ref {
+						problems = append(problems, fmt.Sprintf("room %q: exit %q points to unknown room %q", r.Ref, dir, target))
+					}
+				}
+			}
+		}
+	}
 	return problems
 }
 
