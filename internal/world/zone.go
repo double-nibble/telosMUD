@@ -15,6 +15,7 @@ import (
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/metrics"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
@@ -673,6 +674,11 @@ func (z *Zone) handle(m msg) {
 		z.rehydrateObjects(v)
 	case reloadLuaMsg:
 		z.reloadLua(v.kind, v.ref)
+		if v.kind == content.KindRoom {
+			// A room is a singleton (never re-spawned), so the applier's next-spawn semantics never reach
+			// it; re-sync the live room's authored fields from the swapped prototype here (#191).
+			z.resyncRoom(ProtoRef(v.ref))
+		}
 	case reloadDoneMsg:
 		// Deliver a `reload` fan-out result to the builder if they are still in this zone (single-writer
 		// over z.players); a builder who left mid-reload gets nothing rather than a bad send.

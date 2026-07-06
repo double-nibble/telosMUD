@@ -813,6 +813,43 @@ func (z *Zone) spawnRoom(ref ProtoRef) *Entity {
 	return e
 }
 
+// resyncRoom re-links a live singleton room entity to its freshly hot-reloaded prototype, IN PLACE, on
+// the zone goroutine (#53/#191). It closes a gap the per-ref applier leaves: a room is spawned ONCE at
+// boot and never re-spawned, so the applier's "next spawn uses the edit" semantics never reach it — a
+// builder editing a room's description/exits/flags and running `reload` would see nothing. Here the
+// singleton's short/long/keywords and its Room component (exits/sector/coord/flags) are re-pointed to the
+// new prototype, so the edit takes effect on the live room the builder is standing in.
+//
+// Occupants are untouched — this only refreshes the room's OWN authored fields, never its containment —
+// so no player is moved (the risky add/remove-rooms reconciliation is deferred, #191). Rooms are
+// runtime-immutable (nothing COWs a room's component), so the live entity still aliases the prototype's
+// component; re-pointing to the new prototype's is the same aliasing spawn establishes. A room this zone
+// does not host (nil in z.rooms), or a deleted prototype (removal deferred), is left as-is.
+func (z *Zone) resyncRoom(ref ProtoRef) {
+	e := z.rooms[ref]
+	if e == nil {
+		return // not hosted here
+	}
+	p := z.protos.get(ref)
+	if p == nil {
+		return // definition deleted — live-room removal is the deferred (risky) part of #191
+	}
+	// Re-point the entity at the new prototype AND its components together, exactly as spawn establishes the
+	// aliasing. Keeping e.prototype in lock-step with e.comps matters for COW: mutableComponent decides an
+	// instance already owns a component by comparing it against e.prototype.comps[T] — if e.prototype lagged
+	// the new component, a future live room mutation would be handed the SHARED prototype component to write
+	// in place (cross-instance corruption). No room is COW'd today, but keeping the invariant costs nothing.
+	e.prototype = p
+	e.keywords = p.keywords
+	e.short = p.short
+	e.long = p.long
+	if rc, ok := p.comps[reflect.TypeFor[*Room]()]; ok {
+		e.comps[reflect.TypeFor[*Room]()] = rc
+		e.room = rc.(*Room)
+	}
+	z.log.Debug("hot reload: live room re-synced from new prototype", "ref", ref)
+}
+
 // newDemoZone has moved to build.go: the hand-authored body is GONE (Phase 4.1). It is now a
 // thin wrapper that loads the EMBEDDED demo content pack into the shared per-shard cache and
 // builds the named zone via the content loader, producing byte-identical prototypes. The

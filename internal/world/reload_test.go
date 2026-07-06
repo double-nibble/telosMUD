@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
 )
@@ -325,4 +326,145 @@ func TestBuslessShardHasNoReloader(t *testing.T) {
 	if s2.reloader != nil {
 		t.Fatal("nil source should disable hot reload")
 	}
+}
+
+// TestHotReloadRoomSingletonResync proves the #191 fix: a ROOM is a singleton spawned once at boot and
+// never re-spawned, so the applier's "next spawn uses the edit" path never reaches the live room a player
+// stands in. Editing the room and reloading must update that singleton IN PLACE. (Contrast
+// TestHotReloadRoomLongDesc, which pins the pre-existing NON-singleton instance's old semantics.)
+func TestHotReloadRoomSingletonResync(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+
+	s := newReloadShard(t, src, bus)
+	z := s.Zone()
+
+	room := z.rooms["rt:room:hall"] // the live singleton (what `look` renders)
+	if room == nil {
+		t.Fatal("zone singleton room not built")
+	}
+	if got := room.Long(); got != "An old stone hall." {
+		t.Fatalf("boot long = %q", got)
+	}
+
+	const newLong = "A torch-lit hall, freshly renovated."
+	if err := src.EditRoomLong("reloadtest", "rt:room:hall", newLong); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Publish(context.Background(), contentbus.Invalidation{
+		Kind: content.KindRoom, Ref: "rt:room:hall", Pack: "reloadtest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The prototype cache swaps asynchronously on the subscription goroutine.
+	waitForProto(t, s, "rt:room:hall", func(p *Prototype) bool { return p.long == newLong })
+
+	// The applier posts a reloadLuaMsg to the zone inbox; this harness doesn't run the loop, so drive the
+	// handler directly (it runs on the zone goroutine in production).
+	z.handle(reloadLuaMsg{kind: content.KindRoom, ref: "rt:room:hall"})
+
+	if got := room.Long(); got != newLong {
+		t.Fatalf("live singleton room NOT resynced: long = %q, want %q", got, newLong)
+	}
+}
+
+// TestResyncRoomRepointsWholeComponent proves resyncRoom re-points the ENTIRE room from the new prototype
+// — long, exits, and named flags (the whole *Room component), plus e.prototype (the COW-consistency fix
+// from review) — not just the description. Deterministic: it drives the applier's two on-zone-goroutine
+// steps (cache swap + resync) directly, no running loop.
+func TestResyncRoomRepointsWholeComponent(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+	s := newReloadShard(t, src, bus)
+	z := s.Zone()
+
+	room := z.rooms["rt:room:hall"]
+	if room == nil {
+		t.Fatal("zone singleton room not built")
+	}
+	oldProto := room.prototype
+
+	// Author a new version of the room: new long, a fresh exit, and a named flag.
+	edited := reloadTestPack()
+	for i := range edited.Zones[0].Rooms {
+		if edited.Zones[0].Rooms[i].Ref == "rt:room:hall" {
+			edited.Zones[0].Rooms[i].Long = "A renovated hall."
+			edited.Zones[0].Rooms[i].Exits = map[string]string{"north": "rt:room:hall"}
+			edited.Zones[0].Rooms[i].Flags = []string{"safe"}
+		}
+	}
+	src.SetPack(edited)
+
+	// The applier's two zone-goroutine steps: swap the prototype, then resync the live singleton.
+	def, err := src.LoadDefinition(context.Background(), content.KindRoom, "rt:room:hall", "reloadtest")
+	if err != nil || !def.Found {
+		t.Fatalf("re-read edited room: err=%v found=%v", err, def.Found)
+	}
+	z.protos.reload(ProtoRef("rt:room:hall"), buildPrototype(def))
+	z.resyncRoom(ProtoRef("rt:room:hall"))
+
+	if got := room.Long(); got != "A renovated hall." {
+		t.Fatalf("long not resynced: %q", got)
+	}
+	if got := room.room.exits["north"]; got != ProtoRef("rt:room:hall") {
+		t.Fatalf("exits not resynced: %v", room.room.exits)
+	}
+	if !room.room.namedFlags["safe"] {
+		t.Fatalf("named flags not resynced: %v", room.room.namedFlags)
+	}
+	if room.prototype == oldProto {
+		t.Fatal("e.prototype still points at the OLD prototype (the COW-consistency footgun)")
+	}
+}
+
+// TestReloadCommandResyncsLiveRoomEndToEnd is the full-path proof: a builder standing in a room edits the
+// content source and runs the in-game `reload` command; the whole chain (command → republish → content
+// bus → applier cache swap → reloadLuaMsg → resyncRoom) runs under a LIVE zone loop, and the live room the
+// builder is standing in renders the new description on the next look. All observation is via the session
+// output channel, so it is race-free under -race.
+func TestReloadCommandResyncsLiveRoomEndToEnd(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+	s := newReloadShard(t, src, bus)
+	z := s.Zone()
+
+	// A builder in the hall. The verb has two gates: the dispatch MinRank gate resolves rank from the
+	// SESSION tier (so set tierBuilder → rank >= rankStaff, else the verb is hidden as "Huh?"), and the
+	// handler's capability gate reads flagBuilder off the ENTITY (production reconciles the tier into this
+	// flag; the test sets it directly).
+	builder := &session{character: "Builder", tier: tierBuilder, out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(builder, "Builder")
+	z.players["Builder"] = builder
+	Move(builder.entity, z.rooms["rt:room:hall"])
+	setFlag(builder.entity, flagBuilder, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go z.Run(ctx)
+
+	const newLong = "A torch-lit hall, freshly renovated."
+	if err := src.EditRoomLong("reloadtest", "rt:room:hall", newLong); err != nil {
+		t.Fatal(err)
+	}
+	z.post(inputMsg{id: "Builder", line: "reload", seq: 1})
+
+	// Poll: re-look until the singleton renders the reloaded long (the async chain has landed). Reads are
+	// only through the out channel, never the live entity, so the running loop's writes never race the test.
+	seq := uint64(2)
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		z.post(inputMsg{id: "Builder", line: "look", seq: seq})
+		seq++
+		if drainContains(t, builder, newLong) {
+			return // the live room the builder stands in reflects the reload — end to end
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("live room never rendered the reloaded long after `reload`")
 }
