@@ -72,9 +72,20 @@ func cmdReload(c *Context) error {
 	}
 	c.Send(fmt.Sprintf("reload: propagating a content reload of %s to all shards… (the fan-out completes in the background)", packLabel(packs)))
 	// Off the zone goroutine: each publish flushes to NATS (a per-ref round-trip), so a synchronous loop
-	// here would stall the zone. The applier on every shard (this one included) re-reads and swaps; a
-	// re-read/publish failure is logged by republish, never surfaced to the builder mid-command.
-	go r.republish(context.Background(), packs)
+	// here would stall the zone. Capture the triggering zone + builder id as locals (immutable) so the
+	// goroutine can post the OUTCOME back to be shown on the zone goroutine (reloadDoneMsg) — the applier
+	// on every shard (this one included) re-reads and swaps in the meantime.
+	z, pid, label := c.z, c.s.character, packLabel(packs)
+	go func() {
+		total, failed := r.republish(context.Background(), packs)
+		var summary string
+		if failed {
+			summary = fmt.Sprintf("reload: %s partially propagated — %d definitions published; see the server log for errors.", label, total)
+		} else {
+			summary = fmt.Sprintf("reload: %s propagated — %d definitions pushed to all shards.", label, total)
+		}
+		z.postOrDrop(reloadDoneMsg{player: pid, summary: summary})
+	}()
 	return nil
 }
 
@@ -118,11 +129,15 @@ func (r *reloader) enabledSorted() []string {
 // best-effort, exactly like the seed/OLC publish path. The content source must implement the full
 // content.Source (LoadPacks); both production sources (the pgx store, the embedded pack) do — a source
 // that cannot re-read whole packs disables the command rather than crashing.
-func (r *reloader) republish(ctx context.Context, packs []string) {
+// republish returns the number of invalidations published (total) and whether ANY step failed (failed —
+// a re-read error, a publish error, or the source assertion), so the caller can tell the builder whether
+// the fan-out was clean or partial. All failures are also logged; the reload is best-effort, exactly like
+// the seed/OLC publish path.
+func (r *reloader) republish(ctx context.Context, packs []string) (total int, failed bool) {
 	src, ok := r.src.(content.Source)
 	if !ok {
 		r.log.Warn("reload: content source cannot re-read whole packs; reload skipped", "packs", packs)
-		return
+		return 0, true
 	}
 	// Bound the background work so a wedged Postgres re-read or a hung NATS flush cannot leak this
 	// goroutine indefinitely (mirrors the applier's reloadIOTimeout discipline). The whole re-read +
@@ -132,17 +147,18 @@ func (r *reloader) republish(ctx context.Context, packs []string) {
 	loaded, err := src.LoadPacks(ctx, packs)
 	if err != nil {
 		r.log.Warn("reload: re-read of content packs failed; nothing propagated", "packs", packs, "err", err)
-		return
+		return 0, true
 	}
-	total := 0
 	for _, pk := range loaded {
 		n, perr := contentbus.PublishPack(ctx, r.bus, pk)
 		total += n
 		if perr != nil {
+			failed = true
 			r.log.Warn("reload: publishing invalidations failed (partial)", "pack", pk.Pack, "published", n, "err", perr)
 		}
 	}
-	r.log.Info("reload: content reload propagated across the fleet", "packs", packs, "invalidations", total)
+	r.log.Info("reload: content reload propagated across the fleet", "packs", packs, "invalidations", total, "failed", failed)
+	return total, failed
 }
 
 // packLabel renders a pack-name list for the builder's ack line: `pack "demo"` for one, `packs "a", "b"`

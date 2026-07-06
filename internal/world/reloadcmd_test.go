@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
 )
@@ -61,7 +62,13 @@ func TestReloadRepublish(t *testing.T) {
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 
-	s.reloader.republish(context.Background(), []string{"reloadtest"})
+	total, failed := s.reloader.republish(context.Background(), []string{"reloadtest"})
+	if failed {
+		t.Fatal("republish reported failure over a healthy MemSource/MemBus")
+	}
+	if total != 2 {
+		t.Fatalf("republish returned total=%d, want 2 (room + item)", total)
+	}
 
 	// Delivery is async (a per-subscription drain goroutine); poll until both refs land or time out.
 	deadline := time.Now().Add(2 * time.Second)
@@ -70,5 +77,32 @@ func TestReloadRepublish(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&count); got != 2 {
 		t.Fatalf("republish published %d invalidations, want 2 (room + item)", got)
+	}
+}
+
+// TestReloadDoneDelivery proves the async fan-out readout reaches the builder only while they are still
+// present: a reloadDoneMsg for a resident player is sent to their session; one for an absent player is a
+// safe no-op (the guard that keeps the off-goroutine path from sending to a torn-down session).
+func TestReloadDoneDelivery(t *testing.T) {
+	z := newZone("test")
+	s := &session{character: "Builder", out: make(chan *playv1.ServerFrame, 8), epoch: 1}
+	z.players["Builder"] = s
+
+	z.handle(reloadDoneMsg{player: "Builder", summary: "reload: done."})
+	select {
+	case f := <-s.out:
+		if f == nil {
+			t.Fatal("builder received a nil frame")
+		}
+	default:
+		t.Fatal("resident builder should receive the reload readout")
+	}
+
+	// An absent player id: no delivery, no panic.
+	z.handle(reloadDoneMsg{player: "Ghost", summary: "reload: done."})
+	select {
+	case <-s.out:
+		t.Fatal("readout wrongly delivered for an absent player id")
+	default:
 	}
 }

@@ -461,6 +461,16 @@ type reloadLuaMsg struct {
 	ref  string // the (kind, ref) whose Lua was edited
 }
 
+// reloadDoneMsg reports the outcome of a `reload` command's BACKGROUND fan-out back to the builder who
+// triggered it (reloadcmd.go). The re-read + per-ref publish runs off the zone goroutine, so the result
+// is posted here to be delivered ON the zone goroutine — where z.players is single-writer, so it sends
+// only if the builder is STILL present. A builder who quit/moved mid-reload simply gets no readout rather
+// than a send on a torn-down session (the channel-safety the async path needs).
+type reloadDoneMsg struct {
+	player  string // the character id that ran `reload` (z.players key)
+	summary string // the finished-fan-out line to show them
+}
+
 func (joinMsg) zoneMsg()          {}
 func (attachMsg) zoneMsg()        {}
 func (inputMsg) zoneMsg()         {}
@@ -485,6 +495,7 @@ func (adoptPidMsg) zoneMsg()      {}
 func (presenceMsg) zoneMsg()      {}
 func (loadObjectsMsg) zoneMsg()   {}
 func (reloadLuaMsg) zoneMsg()     {}
+func (reloadDoneMsg) zoneMsg()    {}
 func (whoFallbackMsg) zoneMsg()   {}
 
 func newZone(id string) *Zone {
@@ -662,6 +673,12 @@ func (z *Zone) handle(m msg) {
 		z.rehydrateObjects(v)
 	case reloadLuaMsg:
 		z.reloadLua(v.kind, v.ref)
+	case reloadDoneMsg:
+		// Deliver a `reload` fan-out result to the builder if they are still in this zone (single-writer
+		// over z.players); a builder who left mid-reload gets nothing rather than a bad send.
+		if s, ok := z.players[v.player]; ok {
+			s.send(textFrame(v.summary))
+		}
 	case whoFallbackMsg:
 		writeFrameTo(v.out, textFrame(z.whoLocal(v.viewer)))
 	case tellDeliverMsg:
