@@ -19,6 +19,59 @@ func TestValidateChannelsDemoClean(t *testing.T) {
 	}
 }
 
+// TestValidateRoomExits covers the #197 slice-2 dangling-exit gate: a resolving intra-zone exit validates;
+// an empty target and a dangling INTRA-zone target are rejected; and — the no-false-positive invariant —
+// a cross-zone target (whose zone may be out of a scoped reload's scope) is deliberately NOT judged here,
+// left to the full-graph slice-3 check.
+func TestValidateRoomExits(t *testing.T) {
+	room := func(ref string, exits map[string]string) content.RoomDTO {
+		return content.RoomDTO{Ref: ref, Exits: exits}
+	}
+
+	// Intra-zone exits that resolve validate cleanly (a cross-zone exit is simply not judged here).
+	good := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{Ref: "mid", Rooms: []content.RoomDTO{
+			room("mid:room:1", map[string]string{"north": "mid:room:2", "east": "wood:room:1"}),
+			room("mid:room:2", nil),
+		}},
+		{Ref: "wood", Rooms: []content.RoomDTO{room("wood:room:1", nil)}},
+	}}}
+	if p := validateRoomExits(good); len(p) != 0 {
+		t.Fatalf("sound room graph flagged: %v", p)
+	}
+
+	// An empty exit target is always a dead exit.
+	empty := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{Ref: "mid", Rooms: []content.RoomDTO{room("mid:room:1", map[string]string{"down": "  "})}},
+	}}}
+	if p := validateRoomExits(empty); len(p) != 1 {
+		t.Fatalf("empty exit target: want 1 problem, got %v", p)
+	}
+
+	// An INTRA-zone target that is absent from its (fully-loaded) zone => definitively dangling.
+	dangling := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{Ref: "mid", Rooms: []content.RoomDTO{room("mid:room:1", map[string]string{"north": "mid:room:99"})}},
+	}}}
+	if p := validateRoomExits(dangling); len(p) != 1 {
+		t.Fatalf("dangling intra-zone exit: want 1 problem, got %v", p)
+	}
+
+	// NO FALSE POSITIVE: a cross-zone target is NOT judged here — its zone may be a pack outside a scoped
+	// reload's scope, so even a target absent from a co-loaded zone is left to the full-graph check.
+	crossZone := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{Ref: "mid", Rooms: []content.RoomDTO{room("mid:room:1", map[string]string{"west": "wood:room:99"})}},
+		{Ref: "wood", Rooms: []content.RoomDTO{room("wood:room:1", nil)}},
+	}}}
+	if p := validateRoomExits(crossZone); len(p) != 0 {
+		t.Fatalf("cross-zone exit wrongly judged: %v", p)
+	}
+
+	// The gate rides validatePacks, so a dangling intra-zone exit blocks a publish.
+	if p := validatePacks(dangling); len(p) != 1 {
+		t.Fatalf("validatePacks did not surface the dangling exit: %v", p)
+	}
+}
+
 // TestValidatePacks covers the #192 pre-publish gate: a clean attribute graph validates, a malformed base
 // formula and an attribute reference cycle are both reported (so republish blocks the publish). It reuses
 // the SAME boot functions (parseAttributeBase + lintAttributeCycles), so "validated" == what boot builds.
