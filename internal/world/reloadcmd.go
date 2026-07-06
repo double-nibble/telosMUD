@@ -70,19 +70,27 @@ func cmdReload(c *Context) error {
 		c.Send("reload: this shard's content source cannot re-read packs; reload unavailable.")
 		return nil
 	}
-	c.Send(fmt.Sprintf("reload: propagating a content reload of %s to all shards… (the fan-out completes in the background)", packLabel(packs)))
+	c.Send(fmt.Sprintf("reload: validating and propagating %s… (the result follows in the background)", packLabel(packs)))
 	// Off the zone goroutine: each publish flushes to NATS (a per-ref round-trip), so a synchronous loop
 	// here would stall the zone. Capture the triggering zone + builder id as locals (immutable) so the
 	// goroutine can post the OUTCOME back to be shown on the zone goroutine (reloadDoneMsg) — the applier
 	// on every shard (this one included) re-reads and swaps in the meantime.
 	z, pid, label := c.z, c.s.character, packLabel(packs)
 	go func() {
-		total, failed := r.republish(context.Background(), packs)
+		out := r.republish(context.Background(), packs)
 		var summary string
-		if failed {
-			summary = fmt.Sprintf("reload: %s partially propagated — %d definitions published; see the server log for errors.", label, total)
-		} else {
-			summary = fmt.Sprintf("reload: %s propagated — %d definitions pushed to all shards.", label, total)
+		switch {
+		case len(out.rejected) > 0:
+			// #192: the content did not validate — nothing went to the fleet. Name the problems so the
+			// builder can fix the pack before re-running.
+			summary = fmt.Sprintf("reload: %s REJECTED — content failed validation, nothing propagated:\r\n  - %s",
+				label, strings.Join(out.rejected, "\r\n  - "))
+		case out.failed && out.published == 0:
+			summary = fmt.Sprintf("reload: %s — propagation FAILED, 0 definitions published; see the server log.", label)
+		case out.failed:
+			summary = fmt.Sprintf("reload: %s partially propagated — %d definitions published; see the server log for errors.", label, out.published)
+		default:
+			summary = fmt.Sprintf("reload: %s propagated — %d definitions pushed to all shards.", label, out.published)
 		}
 		z.postOrDrop(reloadDoneMsg{player: pid, summary: summary})
 	}()
@@ -123,42 +131,50 @@ func (r *reloader) enabledSorted() []string {
 	return out
 }
 
-// republish re-reads each pack in packs from the shard's content source and publishes a per-ref
-// invalidation for each (contentbus.PublishPack) so every subscribed shard hot-swaps. It runs OFF the
-// zone goroutine (cmdReload spawns it). Every failure is logged and non-fatal — content reload is
-// best-effort, exactly like the seed/OLC publish path. The content source must implement the full
-// content.Source (LoadPacks); both production sources (the pgx store, the embedded pack) do — a source
-// that cannot re-read whole packs disables the command rather than crashing.
-// republish returns the number of invalidations published (total) and whether ANY step failed (failed —
-// a re-read error, a publish error, or the source assertion), so the caller can tell the builder whether
-// the fan-out was clean or partial. All failures are also logged; the reload is best-effort, exactly like
-// the seed/OLC publish path.
-func (r *reloader) republish(ctx context.Context, packs []string) (total int, failed bool) {
+// republish re-reads each pack from the shard's content source, VALIDATES it (validatePacks — the #192
+// pre-publish gate), and only then publishes a per-ref invalidation for each (contentbus.PublishPack) so
+// every subscribed shard hot-swaps. It runs OFF the zone goroutine (cmdReload spawns it). The returned
+// reloadOutcome distinguishes a clean propagation, a validation REJECTION (nothing published — the content
+// is broken), and a best-effort INFRA failure (a re-read/publish blip). The content source must implement
+// the full content.Source (LoadPacks); both production sources (the pgx store, the embedded pack) do.
+//
+// Validation gates ONLY the publish, never the live cache — a broken pack is simply not propagated, and the
+// per-ref applier's fail-safe (keep last-known on a re-read error) remains the runtime backstop. A re-read
+// failure stays best-effort (failed, logged), NOT a hard content rejection, since it may be transient.
+func (r *reloader) republish(ctx context.Context, packs []string) reloadOutcome {
 	src, ok := r.src.(content.Source)
 	if !ok {
 		r.log.Warn("reload: content source cannot re-read whole packs; reload skipped", "packs", packs)
-		return 0, true
+		return reloadOutcome{failed: true}
 	}
 	// Bound the background work so a wedged Postgres re-read or a hung NATS flush cannot leak this
 	// goroutine indefinitely (mirrors the applier's reloadIOTimeout discipline). The whole re-read +
-	// per-ref publish fan-out for a pack runs under one deadline.
+	// validate + per-ref publish fan-out for a pack runs under one deadline.
 	ctx, cancel := context.WithTimeout(ctx, reloadRepublishTimeout)
 	defer cancel()
 	loaded, err := src.LoadPacks(ctx, packs)
 	if err != nil {
+		// Best-effort infra failure (may be a transient re-read blip), NOT a hard content rejection.
 		r.log.Warn("reload: re-read of content packs failed; nothing propagated", "packs", packs, "err", err)
-		return 0, true
+		return reloadOutcome{failed: true}
 	}
+	// #192 GATE: dry-run validate against the boot builders. Definitively-broken content blocks the publish
+	// fleet-wide (shared-source convergence), so a bad edit never propagates.
+	if problems := validatePacks(loaded); len(problems) > 0 {
+		r.log.Warn("reload: content failed validation; nothing propagated", "packs", packs, "problems", problems)
+		return reloadOutcome{rejected: problems}
+	}
+	out := reloadOutcome{}
 	for _, pk := range loaded {
 		n, perr := contentbus.PublishPack(ctx, r.bus, pk)
-		total += n
+		out.published += n
 		if perr != nil {
-			failed = true
+			out.failed = true
 			r.log.Warn("reload: publishing invalidations failed (partial)", "pack", pk.Pack, "published", n, "err", perr)
 		}
 	}
-	r.log.Info("reload: content reload propagated across the fleet", "packs", packs, "invalidations", total, "failed", failed)
-	return total, failed
+	r.log.Info("reload: content reload propagated across the fleet", "packs", packs, "invalidations", out.published, "failed", out.failed)
+	return out
 }
 
 // packLabel renders a pack-name list for the builder's ack line: `pack "demo"` for one, `packs "a", "b"`

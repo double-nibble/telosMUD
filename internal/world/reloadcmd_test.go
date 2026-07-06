@@ -62,12 +62,12 @@ func TestReloadRepublish(t *testing.T) {
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 
-	total, failed := s.reloader.republish(context.Background(), []string{"reloadtest"})
-	if failed {
-		t.Fatal("republish reported failure over a healthy MemSource/MemBus")
+	out := s.reloader.republish(context.Background(), []string{"reloadtest"})
+	if out.failed || len(out.rejected) > 0 {
+		t.Fatalf("republish over a healthy MemSource/MemBus should succeed: %+v", out)
 	}
-	if total != 2 {
-		t.Fatalf("republish returned total=%d, want 2 (room + item)", total)
+	if out.published != 2 {
+		t.Fatalf("republish published=%d, want 2 (room + item)", out.published)
 	}
 
 	// Delivery is async (a per-subscription drain goroutine); poll until both refs land or time out.
