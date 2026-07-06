@@ -841,6 +841,16 @@ bundles:
       - {op: grant_ability, ability: craft_gloves}
       - {op: grant_track, track: leatherworking_skill}
       - {op: learn_profession, profession: leatherworking}
+  # foraging: an UNCAPPED gathering profession (#55, fork #2 — a profession is a bundle). Unlike leatherworking
+  # (a capped crafting trade that counts against the learned-profession cap), a gathering/utility trade is FREE:
+  # `uncapped: true` is the bundle flag professionIsCapped/uncapped (profession.go) reads so it never consumes a
+  # cap slot. Kept minimal (membership only) — its point in the demo is to be the exemplar that exercises the
+  # `uncapped` bundle flag end to end, incl. the gated Postgres store round-trip (a false default can't drop it).
+  - ref: foraging
+    kind: profession
+    uncapped: true
+    grants:
+      - {op: learn_profession, profession: foraging}
 
 # chargen: the content-defined character-generation flow (Phase 14.8). An ordered list of STEPS the website
 # walks — content drives HOW generation works, the engine knows only the step KINDS. This demo flow is 5e-style:
@@ -936,6 +946,10 @@ spawn_schedules:
     zone: darkwood
     interval_after_death_sec: 604800
     on_missed: spawn_if_overdue
+    # #55: the director broadcasts this on each scheduled spawn; the grove-spirit's on_world("spawn.boss")
+    # handler reacts by doing the actual mud.spawn. (Was previously orphaned on the craft:leather_vest recipe,
+    # where yaml silently ignored it — restored to the schedule it names.)
+    announce: "A great roar echoes across the land — the Warden has returned!"
 
 # recipes: content-defined crafting recipes (Phase 13.5). craft:leather_vest is a leatherworking recipe
 # made at the smithy FORGE station (D3 — the smithy room's `forge` flag): it consumes 3 leather scraps + 1
@@ -975,7 +989,6 @@ recipes:
       - {item: midgaard:obj:leather, qty: 3}
       - {item: midgaard:obj:essence, qty: 1}
     output: {item: midgaard:obj:leather-vest, bind: bound}
-    announce: "A great roar echoes across the land — the Warden has returned!"
 
 # Display templates: content owns the layout of the character sheet. The `score` verb renders this with `self`
 # bound to the viewer; it builds the sheet with the `ui` toolkit (auto-sized columns, color-token markup that
@@ -1313,8 +1326,45 @@ zones:
             soak_slash: 2
             aggressive: 1          # initiates combat on a player entering the room
             max_reactions: 1       # [G9] one reaction/round -> ONE opportunity attack on a fleeing foe
+        # #55 capstone (zone->director half of the boss loop): when the scheduled boss dies, report it UP to
+        # the world scope. on("death") fires on the chief (any killer); signal_world publishes a DURABLE
+        # world-scope event the director / any world consumer reacts to (reset the respawn timer, world news).
+        lua: |
+          on("death", function(ev)
+            -- `ref` is the SCHEDULE ref the world director matches on (director.onBossDied → reschedule the
+            -- weekly timer); boss/zone are extra flavor the director ignores. Without ref the report is a
+            -- no-op and the boss never comes back — the loop must carry the schedule ref, not the mob name.
+            signal_world("boss.died", {ref = "boss:warden", boss = "goblin-chief", zone = "darkwood"})
+          end)
 
       # --- richer-demo darkwood mobs ---------------------------------------------------------------
+
+      # boss-herald: the PERSISTENT world-scope reactor (#55, director->zone half of the boss loop). It carries
+      # no `living:` (non-combat, never dies), so its handler survives the whole zone life. on_world("spawn.boss")
+      # fires when the director broadcasts the scheduled-boss spawn (spawn_schedules boss:warden); the herald does
+      # the actual mud.spawn of the chief into its OWN room — the lair, where it stands (mud.spawn takes a room
+      # HANDLE, and self:room() is a script's handle to where it is). This is the zone-side reactor the director's
+      # remote-effect broadcast needs — the engine schedules + broadcasts; content decides what a "boss spawn"
+      # MEANS (which proto, which room, the flavor).
+      - ref: darkwood:mob:boss-herald
+        keywords: [warstone, herald, stone]
+        short: an ancient warstone
+        long: An ancient warstone hums with a low, waking power, half-sunk in the lair floor.
+        lua: |
+          on_world("spawn.boss", function(ev)
+            -- The world broadcast fans out to EVERY hosted zone; only the scheduled boss's own zone reacts.
+            if ev.zone ~= "darkwood" then return end
+            -- Spawn the SCHEDULED proto (ev.proto) in the herald's room (the lair). mud.spawn needs a room
+            -- HANDLE, and self:room() is this script's handle to where it stands — so the herald is placed in
+            -- the room the boss should appear. Reading ev.proto keeps the reactor general (a second schedule
+            -- for this zone spawns ITS proto, not a hardcoded one).
+            mud.spawn(ev.proto, self:room())
+            -- The schedule's `announce:` is the single source of the flavor line (ev.announce), so a builder
+            -- retunes the herald's cry by editing the schedule, not this script.
+            if ev.announce and ev.announce ~= "" then
+              mud.broadcast(self:room(), ev.announce)
+            end
+          end)
 
       # cave spider: a LUA mob that conjures a ROOM-SCOPED web affect ([G13]) in its tunnel. on("enter")
       # fires when anyone walks in; the spider (self) applies `web` — which opApplyAffect detects as
@@ -1441,6 +1491,9 @@ zones:
       # mob, reset.go), so its corpse holds it. Script order matters — the goblin must spawn first.
       - {op: spawn_item, proto: darkwood:obj:rusty-knife, into: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}
       - {op: spawn_mob, proto: darkwood:mob:goblin-chief, room: darkwood:room:lair, count: 1}
+      # #55: the persistent warstone herald in the lair — holds the on_world("spawn.boss") reactor that spawns
+      # the scheduled boss into its own room.
+      - {op: spawn_mob, proto: darkwood:mob:boss-herald, room: darkwood:room:lair, count: 1}
       # the cave spider that keeps the web tunnel webbed (room-affect demo):
       - {op: spawn_mob, proto: darkwood:mob:spider, room: darkwood:room:webtunnel, count: 1}
       # the warded sanctum's defenders: the Counterspell archmage, the Shield warden, and the holy-vuln wraith:
