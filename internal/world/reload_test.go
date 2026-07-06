@@ -468,3 +468,97 @@ func TestReloadCommandResyncsLiveRoomEndToEnd(t *testing.T) {
 	}
 	t.Fatal("live room never rendered the reloaded long after `reload`")
 }
+
+// TestResyncRoomAddsNewRoom proves the #191 slice-2 ADD path: a room NEW to a zone's graph (present in the
+// reloaded content but not yet in z.rooms) is spawned live when resync sees its swapped prototype — but
+// ONLY for a room this zone owns (by the ref's zone prefix), since the invalidation fans out to every
+// hosted zone. Deterministic: drives the applier's cache-swap + resync steps directly.
+func TestResyncRoomAddsNewRoom(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+	s := newReloadShard(t, src, bus)
+	z := s.Zone()
+
+	// Author a new room in THIS zone (rt:).
+	edited := reloadTestPack()
+	edited.Zones[0].Rooms = append(edited.Zones[0].Rooms, content.RoomDTO{
+		Ref: "rt:room:annex", Name: "The Annex", Long: "A freshly built annex.",
+	})
+	src.SetPack(edited)
+
+	def, err := src.LoadDefinition(context.Background(), content.KindRoom, "rt:room:annex", "reloadtest")
+	if err != nil || !def.Found {
+		t.Fatalf("re-read new room: err=%v found=%v", err, def.Found)
+	}
+	z.protos.reload(ProtoRef("rt:room:annex"), buildPrototype(def))
+	if z.rooms["rt:room:annex"] != nil {
+		t.Fatal("precondition: annex must not exist before resync")
+	}
+	z.resyncRoom(ProtoRef("rt:room:annex"))
+	if z.rooms["rt:room:annex"] == nil {
+		t.Fatal("new same-zone room was not added on resync")
+	}
+	if got := z.rooms["rt:room:annex"].Long(); got != "A freshly built annex." {
+		t.Fatalf("added room long = %q", got)
+	}
+
+	// A new room belonging to ANOTHER zone must be ignored by this zone (the fan-out reaches every zone).
+	foreign := content.Definition{
+		Kind: content.KindRoom, Ref: "other:room:x", Found: true,
+		Room: content.RoomDTO{Ref: "other:room:x", Name: "Elsewhere", Long: "Not here."},
+	}
+	z.protos.reload(ProtoRef("other:room:x"), buildPrototype(foreign))
+	z.resyncRoom(ProtoRef("other:room:x"))
+	if z.rooms["other:room:x"] != nil {
+		t.Fatal("a foreign-zone room was wrongly added to this zone")
+	}
+}
+
+// TestReloadCommandAddsReachableRoomEndToEnd is the full-path proof of the ADD path: a builder edits the
+// source to add a new room AND an exit into it, runs `reload`, and can then WALK into the new room — the
+// whole chain under a live zone loop, observed only via the output channel (race-free).
+func TestReloadCommandAddsReachableRoomEndToEnd(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+	s := newReloadShard(t, src, bus)
+	z := s.Zone()
+
+	builder := &session{character: "Builder", tier: tierBuilder, out: make(chan *playv1.ServerFrame, 512), epoch: 1}
+	z.newPlayerEntity(builder, "Builder")
+	z.players["Builder"] = builder
+	Move(builder.entity, z.rooms["rt:room:hall"])
+	setFlag(builder.entity, flagBuilder, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go z.Run(ctx)
+
+	// Edit the source: add the annex + a north exit from the hall into it.
+	edited := reloadTestPack()
+	edited.Zones[0].Rooms[0].Exits = map[string]string{"north": "rt:room:annex"}
+	edited.Zones[0].Rooms = append(edited.Zones[0].Rooms, content.RoomDTO{
+		Ref: "rt:room:annex", Name: "The Annex", Long: "A freshly built annex.",
+	})
+	src.SetPack(edited)
+
+	z.post(inputMsg{id: "Builder", line: "reload", seq: 1})
+
+	// Poll: once the reload lands, `north` reaches the new room and `look` renders it. Retrying north+look
+	// tolerates the async landing (before it lands, north fails and the annex desc never appears).
+	seq := uint64(2)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		z.post(inputMsg{id: "Builder", line: "north", seq: seq})
+		z.post(inputMsg{id: "Builder", line: "look", seq: seq + 1})
+		seq += 2
+		if drainContains(t, builder, "A freshly built annex.") {
+			return // the builder walked into the newly-added, reloaded room — end to end
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("builder never reached the newly-added room after `reload`")
+}
