@@ -6,6 +6,19 @@ import (
 	"github.com/double-nibble/telosmud/internal/content"
 )
 
+// TestValidateChannelsDemoClean pins that the SHIPPED demo pack validates clean under the new channel gate
+// — the no-false-positive guard against real content (the same "demo pack asserted clean" discipline the
+// content lints use).
+func TestValidateChannelsDemoClean(t *testing.T) {
+	pack, found, err := content.LoadPack(content.DemoPack)
+	if err != nil || !found {
+		t.Fatalf("load demo pack: found=%v err=%v", found, err)
+	}
+	if p := validatePacks([]content.Pack{pack}); len(p) != 0 {
+		t.Fatalf("demo pack flagged by the pre-publish gate: %v", p)
+	}
+}
+
 // TestValidatePacks covers the #192 pre-publish gate: a clean attribute graph validates, a malformed base
 // formula and an attribute reference cycle are both reported (so republish blocks the publish). It reuses
 // the SAME boot functions (parseAttributeBase + lintAttributeCycles), so "validated" == what boot builds.
@@ -46,5 +59,97 @@ func TestValidatePacks(t *testing.T) {
 	}
 	if p := validatePacks(split); len(p) == 0 {
 		t.Fatal("cross-pack attribute cycle not detected")
+	}
+}
+
+// TestValidateChannels covers the #197 slice-1 payload gate for channels — the FIRST propagated kind that
+// actually hot-swaps on the reload path. A sound channel validates; a ref-less channel, a channel with no
+// usable verb, and a format that drops the player's message ($t) are each rejected. It validates through
+// the SAME build path boot uses (buildChannelDef defaults + renderChannelFormat), so a rejection means the
+// content is definitively dead, not merely degraded.
+func TestValidateChannels(t *testing.T) {
+	// A well-formed channel: ref, a verb, and a format that carries $t (empty format => default, also OK).
+	ok := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
+		{Ref: "gossip", Name: "gossip", Words: []string{"gossip", "gos"}, Format: "[$channel] $name: $t"},
+		{Ref: "newbie", Name: "newbie", Words: []string{"newbie"}}, // empty format defaults to one with $t
+	}}}
+	if p := validateChannels(ok); len(p) != 0 {
+		t.Fatalf("sound channels flagged: %v", p)
+	}
+
+	// A ref-less channel can't be keyed/addressed.
+	noRef := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
+		{Name: "orphan", Words: []string{"orphan"}},
+	}}}
+	if p := validateChannels(noRef); len(p) != 1 {
+		t.Fatalf("missing ref: want 1 problem, got %v", p)
+	}
+
+	// No usable verb word (blanks normalize away) => unreachable channel.
+	noVerb := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
+		{Ref: "quiet", Name: "quiet", Words: []string{"", "  "}},
+	}}}
+	if p := validateChannels(noVerb); len(p) != 1 {
+		t.Fatalf("no usable verb: want 1 problem, got %v", p)
+	}
+
+	// A non-empty format with no $t silently swallows every message.
+	dropMsg := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
+		{Ref: "void", Name: "void", Words: []string{"void"}, Format: "[$channel] $name says something"},
+	}}}
+	if p := validateChannels(dropMsg); len(p) != 1 {
+		t.Fatalf("message-dropping format: want 1 problem, got %v", p)
+	}
+
+	// Channels merge across packs last-write-wins by ref: a later pack repairing the verb clears the defect
+	// (only the merged winner is validated).
+	repaired := []content.Pack{
+		{Pack: "a", Channels: []content.ChannelDTO{{Ref: "gossip", Name: "gossip", Words: []string{""}}}},
+		{Pack: "b", Channels: []content.ChannelDTO{{Ref: "gossip", Name: "gossip", Words: []string{"gossip"}}}},
+	}
+	if p := validateChannels(repaired); len(p) != 0 {
+		t.Fatalf("cross-pack repaired channel flagged: %v", p)
+	}
+
+	// The channel gate rides validatePacks, so a broken channel blocks a publish just like a bad attribute.
+	if p := validatePacks(dropMsg); len(p) != 1 {
+		t.Fatalf("validatePacks did not surface the channel defect: %v", p)
+	}
+}
+
+// TestValidateChannelsSubjectSafety covers the ref char-safety half of the P8-A8 subject-injection
+// contract: a ref that builds a malformed/unpublishable NATS subject (whitespace, control byte, wildcard,
+// empty dot-token) is rejected, while legit refs — including dotted ones — pass. It also pins that the
+// merge keys the RAW ref, so a dead channel can't hide behind a whitespace-variant ref that stays a
+// distinct live channel.
+func TestValidateChannelsSubjectSafety(t *testing.T) {
+	subjectUnsafe := []string{"foo bar", "foo\tbar", "a.>", "wild*", ">", "a..b", "a.", ".b", "ctrl\x01"}
+	for _, ref := range subjectUnsafe {
+		pk := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
+			{Ref: ref, Name: "c", Words: []string{"c"}}, // otherwise sound: verb + default format
+		}}}
+		if p := validateChannels(pk); len(p) == 0 {
+			t.Fatalf("subject-unsafe ref %q not rejected", ref)
+		}
+	}
+
+	// Legit refs — plain and dotted — must NOT be flagged (no false positives against good content).
+	safe := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
+		{Ref: "gossip", Name: "gossip", Words: []string{"gossip"}},
+		{Ref: "guild.officer", Name: "officer", Words: []string{"officer"}},
+	}}}
+	if p := validateChannels(safe); len(p) != 0 {
+		t.Fatalf("safe refs flagged: %v", p)
+	}
+
+	// Raw-ref keying: a dead (verb-less) "gossip" and a valid " gossip" (leading space) stay DISTINCT, so
+	// the dead one is still flagged — it can't collapse onto its whitespace-variant sibling. (" gossip" is
+	// itself subject-unsafe, so both are flagged; the point is the dead one is NOT silently merged away.)
+	rawKey := []content.Pack{
+		{Pack: "a", Channels: []content.ChannelDTO{{Ref: "gossip", Name: "gossip", Words: []string{""}}}},
+		{Pack: "b", Channels: []content.ChannelDTO{{Ref: " gossip", Name: "gossip", Words: []string{"gossip"}}}},
+	}
+	if p := validateChannels(rawKey); len(p) < 2 {
+		t.Fatalf("raw-ref keying should flag the dead channel AND the subject-unsafe sibling, got: %v", p)
 	}
 }
