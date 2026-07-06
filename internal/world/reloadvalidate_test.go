@@ -192,6 +192,70 @@ func TestValidateResets(t *testing.T) {
 	}
 }
 
+// TestValidateProtoRefs covers the #197 slice-2c prototype-ref-collision gate: distinct refs validate; an
+// empty ref, a room/item collision within a zone, and a cross-zone collision are each rejected; and — the
+// no-false-positive invariant — a cross-pack WHOLE-ZONE override (both packs define the same zone) is deduped
+// like content.Load, so its identical rooms are NOT seen as collisions.
+func TestValidateProtoRefs(t *testing.T) {
+	// All distinct refs across two zones, all three kinds — clean.
+	good := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{
+			Ref:   "mid",
+			Rooms: []content.RoomDTO{{Ref: "mid:room:1"}, {Ref: "mid:room:2"}},
+			Items: []content.ProtoDTO{{Ref: "mid:obj:torch"}},
+			Mobs:  []content.ProtoDTO{{Ref: "mid:mob:guard"}},
+		},
+		{Ref: "wood", Rooms: []content.RoomDTO{{Ref: "wood:room:1"}}},
+	}}}
+	if p := validateProtoRefs(good); len(p) != 0 {
+		t.Fatalf("distinct refs flagged: %v", p)
+	}
+
+	// An empty ref (here a mob) is unspawnable / collides at "".
+	emptyRef := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{Ref: "mid", Mobs: []content.ProtoDTO{{Ref: ""}}},
+	}}}
+	if p := validateProtoRefs(emptyRef); len(p) != 1 {
+		t.Fatalf("empty ref: want 1 problem, got %v", p)
+	}
+
+	// A room and an item sharing a ref WITHIN one zone collide (both hit the one cache).
+	crossKind := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{
+			Ref:   "mid",
+			Rooms: []content.RoomDTO{{Ref: "mid:x"}},
+			Items: []content.ProtoDTO{{Ref: "mid:x"}},
+		},
+	}}}
+	if p := validateProtoRefs(crossKind); len(p) != 1 {
+		t.Fatalf("cross-kind collision: want 1 problem, got %v", p)
+	}
+
+	// Two zones defining the same ref collide in the shared cache.
+	crossZone := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{Ref: "mid", Rooms: []content.RoomDTO{{Ref: "shared:room:1"}}},
+		{Ref: "wood", Mobs: []content.ProtoDTO{{Ref: "shared:room:1"}}},
+	}}}
+	if p := validateProtoRefs(crossZone); len(p) != 1 {
+		t.Fatalf("cross-zone collision: want 1 problem, got %v", p)
+	}
+
+	// NO FALSE POSITIVE: two packs OVERRIDING the same zone (whole-zone last-write-wins, like content.Load)
+	// must not have their identical rooms read as collisions — the dedup collapses to the one built zone.
+	override := []content.Pack{
+		{Pack: "base", Zones: []content.ZoneDTO{{Ref: "mid", Rooms: []content.RoomDTO{{Ref: "mid:room:1"}, {Ref: "mid:room:2"}}}}},
+		{Pack: "expansion", Zones: []content.ZoneDTO{{Ref: "mid", Rooms: []content.RoomDTO{{Ref: "mid:room:1"}, {Ref: "mid:room:3"}}}}},
+	}
+	if p := validateProtoRefs(override); len(p) != 0 {
+		t.Fatalf("cross-pack whole-zone override wrongly flagged as collision: %v", p)
+	}
+
+	// The gate rides validatePacks, so a collision blocks a publish.
+	if p := validatePacks(crossZone); len(p) != 1 {
+		t.Fatalf("validatePacks did not surface the proto collision: %v", p)
+	}
+}
+
 // TestValidatePacks covers the #192 pre-publish gate: a clean attribute graph validates, a malformed base
 // formula and an attribute reference cycle are both reported (so republish blocks the publish). It reuses
 // the SAME boot functions (parseAttributeBase + lintAttributeCycles), so "validated" == what boot builds.
