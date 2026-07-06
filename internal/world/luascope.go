@@ -173,6 +173,13 @@ func (rt *luaRuntime) fireScopeEvent(kind, event string, payload json.RawMessage
 	if rt == nil || rt.zone == nil {
 		return
 	}
+	// Prime every scripted entity in the zone FIRST (#55): entity scripts are built lazily "at first need"
+	// (luaentry_triggers.go), but a scope broadcast can be the first thing that ever needs a freshly-spawned
+	// mob — and the scan below only visits ALREADY-built entityScripts, so an un-primed mob's on_world/
+	// on_region handler (its whole reason to exist) would silently never fire. Priming here registers those
+	// handlers before the scan. Idempotent (ensureEntityScript builds once) and paid only on a broadcast
+	// (low-rate), so the O(entities-in-zone) tree walk is fine.
+	rt.primeScopeHandlers()
 	key := kind + ":" + event
 	ev := rt.scopeEvTable(payload)
 	// Iterate the live scripted entities; fire those that registered for this scope event. Broadcasts are
@@ -189,6 +196,60 @@ func (rt *luaRuntime) fireScopeEvent(kind, event string, payload json.RawMessage
 			continue
 		}
 		rt.fireTrigger(e, key, rt.rootCtx(e), ev)
+	}
+}
+
+// primeScopeHandlers builds the entity script of every *Scripted entity in the zone (the ROOM entities AND
+// their contents), so its scope handlers (on_world/on_region) are registered before fireScopeEvent scans for
+// them (#55). Without this, a handler on an entity no trigger has yet lazily primed never fires — the very
+// bug this closes. It mirrors the entityByRID containment walk, which treats the room entity itself as a
+// resolvable candidate, so a room-LEVEL on_world handler is covered too, not just a room's occupants.
+//
+// It collects a SNAPSHOT first, then primes: a registration body may mud.spawn/Move into the tree being
+// walked (registration globals like mud.spawn are callable at the top level, not only inside on(...)), and
+// priming over the live tree would append to a slice mid-range — a silently missed prime. The snapshot
+// decouples the mutation from the walk. An entity spawned DURING priming is simply not in this pass (it is
+// primed by its own first trigger or the next broadcast) — the same at-most-once contract as before.
+//
+// COST: this front-loads all deferred priming for the zone into the FIRST broadcast tick after a mass spawn
+// (N registrations back-to-back on the zone goroutine). Each registration is idempotent and runs once per
+// instance (ensureEntityScript early-returns a built script), and broadcasts are low-rate, so it is a bounded
+// one-time spike, not sustained load.
+//
+// The tree walk itself DELIBERATELY runs on every broadcast (not one-shot-latched): a mob spawned AFTER an
+// earlier broadcast — a zone repop, a Lua spawn — must still get its scope handler primed by the next
+// broadcast. A "primed once" latch would silently skip such late arrivals, reopening this very gap. The
+// repeat cost is only the pointer walk + a map probe per entity (no Lua re-runs), which is cheap.
+func (rt *luaRuntime) primeScopeHandlers() {
+	var scripted []*Entity
+	for _, room := range rt.zone.rooms {
+		if room == nil {
+			continue
+		}
+		if Has[*Scripted](room) { // a room-level script can carry on_world/on_region too
+			scripted = append(scripted, room)
+		}
+		collectScripted(room, &scripted)
+	}
+	for _, e := range scripted {
+		rt.ensureEntityScript(e)
+	}
+}
+
+// collectScripted recurses a container's contents (mobs/items, and items nested in containers) and appends
+// each *Scripted entity to out. Read-only walk (the priming that may mutate the tree happens afterwards over
+// this snapshot). A zone holds few entities, so this is cheap.
+func collectScripted(container *Entity, out *[]*Entity) {
+	for _, c := range container.contents {
+		if c == nil {
+			continue
+		}
+		if Has[*Scripted](c) {
+			*out = append(*out, c)
+		}
+		if len(c.contents) > 0 {
+			collectScripted(c, out)
+		}
 	}
 }
 

@@ -122,17 +122,25 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 		t.Fatalf("hero_advancement steps = %d, want 3 (one grant op-list per threshold)", len(tr.Steps))
 	}
 
-	// Bundles (Phase 11.4b): classes fighter+mage, races elf+dwarf, and the leatherworking profession —
-	// each a kind + a grant op-list. Pack globals, loaded onto lc.Bundles. (mage+dwarf were added in 14.8
-	// to give the chargen picker a real choice.)
-	if len(lc.Bundles) != 5 {
-		t.Fatalf("bundles = %d, want 5 (fighter + mage + elf + dwarf + leatherworking)", len(lc.Bundles))
+	// Bundles (Phase 11.4b): classes fighter+mage, races elf+dwarf, the leatherworking profession, and the
+	// uncapped foraging gathering profession (#55) — each a kind + a grant op-list. Pack globals, loaded onto
+	// lc.Bundles. (mage+dwarf were added in 14.8 to give the chargen picker a real choice.)
+	if len(lc.Bundles) != 6 {
+		t.Fatalf("bundles = %d, want 6 (fighter + mage + elf + dwarf + leatherworking + foraging)", len(lc.Bundles))
 	}
-	var fighter *BundleDTO
+	var fighter, foraging *BundleDTO
 	for i := range lc.Bundles {
 		if lc.Bundles[i].Ref == "fighter" {
 			fighter = &lc.Bundles[i]
 		}
+		if lc.Bundles[i].Ref == "foraging" {
+			foraging = &lc.Bundles[i]
+		}
+	}
+	// #55: foraging is the uncapped gathering profession — pin the uncapped flag so a false default regression
+	// (or a store round-trip that drops it) is caught here, not only in the gated Postgres test.
+	if foraging == nil || foraging.Kind != "profession" || !foraging.Uncapped {
+		t.Fatalf("foraging must be an uncapped profession bundle, got %+v", foraging)
 	}
 	if fighter == nil || fighter.Kind != "class" || fighter.Grants == nil {
 		t.Fatalf("fighter bundle = %+v, want kind=class with grants", fighter)

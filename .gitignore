@@ -31,3 +31,7 @@ coverage.*
 .vscode/
 *.swp
 *~
+
+# Local runtime Postgres data dirs (docker/compose volumes) — never commit
+deploy/data/
+deploy/data.old/
