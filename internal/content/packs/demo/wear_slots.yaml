@@ -1,0 +1,9 @@
+wear_slots:
+  - {ref: head,  label: head,    order: 10, kind: worn}
+  - {ref: body,  label: body,    order: 20, kind: worn}
+  - {ref: waist, label: waist,   order: 25, kind: worn}
+  - {ref: hands, label: hands,   order: 30, kind: worn}
+  - {ref: feet,  label: feet,    order: 40, kind: worn}
+  - {ref: wield, label: wielded, order: 50, kind: wield}
+  - {ref: hold,  label: held,    order: 60, kind: hold}
+

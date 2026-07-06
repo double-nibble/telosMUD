@@ -1,0 +1,22 @@
+zones:
+  - ref: midgaard
+    mob_prototypes:
+      # quartermaster: a LUA GREETER mob (Phase 7.4c). on("greet") fires when a player enters its room;
+      # it greets the newcomer BY NAME (ev.actor:name()) and remembers via self.state so it greets each
+      # player only once. Pure content scripting + per-instance state. Stands in the guild hall.
+      - ref: midgaard:mob:quartermaster
+        keywords: [quartermaster, dwarf, smith]
+        short: the guild quartermaster
+        long: A broad-shouldered dwarf in a leather apron looks you over appraisingly.
+        lua: |
+          state.greeted = {}
+          on("greet", function(ev)
+            local id = ev.actor:id()
+            if not state.greeted[id] then
+              state.greeted[id] = true
+              self:say("Welcome, " .. ev.actor:name() .. "! Take what you need from the smithy north.")
+            end
+          end)
+    # Reset placements. PARITY: the market floor placements MUST stay EXACTLY the original 4 ops
+    # (torch x5 + helmet + sword + chest) and the temple MUST stay empty — the instance-placement
+    # parity test asserts both. New gear/mob placements go in the SMITHY / GUILD HALL only.

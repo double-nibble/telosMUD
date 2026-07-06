@@ -1,0 +1,18 @@
+chargens:
+  - ref: demo:chargen
+    steps:
+      - {kind: bundle_choice, id: race,  prompt: "Choose your race",  bundle_kind: race,  pick: 1}
+      - {kind: bundle_choice, id: class, prompt: "Choose your class", bundle_kind: class, pick: 1}
+      - kind: point_buy
+        id: attributes
+        prompt: "Allocate your attributes (27 points)"
+        attributes: [strength, intellect, constitution]
+        points: 27
+        base: 8
+        min: 8
+        max: 15
+        # cost: cumulative points to raise a stat to the target value from base (the 5e point-buy curve).
+        cost: {"8": 0, "9": 1, "10": 2, "11": 3, "12": 4, "13": 5, "14": 7, "15": 9}
+
+# rarity_tiers: the ordered rarity ladder the loot resolver weights + filters by (Phase 12.1). order is
+# the ordinal a roll's quality_floor compares; weight is the tier's default pool weight; color renders it.

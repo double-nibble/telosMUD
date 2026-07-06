@@ -1,0 +1,45 @@
+combat_profiles:
+  - ref: melee
+    # TO-HIT: a d20 attack roll + accuracy vs the target's evasion. Bands (top-down, first match wins):
+    #   nat-20 -> crit (faceEq, independent of total) ; nat-1 -> miss ; margin>=0 -> hit ; else miss.
+    # The engine reads only the band LABEL (crit/miss/hit) — the SHAPE is fully content.
+    to_hit:
+      label: Attack
+      dice: "1d20"
+      bonus: ["attr", "$actor.accuracy"]
+      vs: ["attr", "$target.evasion"]
+      bands:
+        - {face_eq: 20, label: crit}
+        - {face_eq: 1, label: miss}
+        - {margin_min: 0, label: hit}
+        - {label: miss}
+    # AVOIDANCE LADDER ([G-F]): an ordered list of roll-under-skill checks; the FIRST success negates the
+    # swing. A roll-under uses `max: <skill>` (total <= skill => success). A ladder of dodge then parry
+    # then block; a defender whose parry/block derive to 0 auto-fails that rung (roll-under-0 is
+    # impossible on 1d100) — gear-gating with NO engine predicate ([G-C]). Each band's LABEL is the verb
+    # the combat message reads (dodge/parry/block).
+    avoidance:
+      - label: Dodge
+        dice: "1d100"
+        bands:
+          - {max: ["attr", "$actor.dodge"], label: dodge}
+          - {label: fail}
+      - label: Parry
+        dice: "1d100"
+        bands:
+          - {max: ["attr", "$actor.parry"], label: parry}
+          - {label: fail}
+      - label: Block
+        dice: "1d100"
+        bands:
+          - {max: ["attr", "$actor.block"], label: block}
+          - {label: fail}
+    # DAMAGE BONUS ([G-A]): weapon dice (from the wielded Weapon) + strength_bonus + damroll, scoped to
+    # the attacker ($actor). This is what makes a STR-heavy fighter hit harder — as CONTENT, no Lua.
+    damage_bonus: ["+", ["attr", "$actor.strength_bonus"], ["attr", "$actor.damroll"]]
+
+# Comms channels (Phase 8.3, docs/PHASE8-PLAN.md P8-D3) — CONTENT, not engine. The engine names NO
+# channel: `gossip`/`newbie` exist ONLY because this pack defines them; strip the pack (bare-engine
+# boot) and there are no channel verbs at all (the empty-boot invariant). Each channel_def gives its
+# verb(s), a color/format template (the listener line, $-substituted: $channel/$name/$t), an access
+# predicate (who may speak — content, evaluated engine-side against the live entity), and default_on.

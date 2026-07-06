@@ -1,0 +1,4 @@
+affix_defs:
+  - {ref: of_the_bear, attr: strength,  min: 1, max: 5}
+  - {ref: of_the_owl,  attr: intellect, min: 1, max: 4}
+

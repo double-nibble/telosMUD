@@ -1,0 +1,51 @@
+bundles:
+  - ref: fighter
+    kind: class
+    grants:
+      - {op: modify_attribute_base, attr: strength, amount: 3}
+      - {op: set_flag, flag: martial}
+      - {op: grant_track, track: hero_advancement}
+  - ref: elf
+    kind: race
+    grants:
+      - {op: modify_attribute_base, attr: intellect, amount: 2}
+      - {op: set_flag, flag: darkvision}
+  # dwarf + mage give the chargen picker (Phase 14.8) a real choice — a second race + class — so the form
+  # demonstrates content-driven selection (adding one is a content write, no code change).
+  - ref: dwarf
+    kind: race
+    grants:
+      - {op: modify_attribute_base, attr: constitution, amount: 2}
+      - {op: set_flag, flag: stout}
+  - ref: mage
+    kind: class
+    grants:
+      - {op: modify_attribute_base, attr: intellect, amount: 3}
+      - {op: set_flag, flag: arcane}
+      - {op: grant_track, track: hero_advancement}
+  # leatherworking: a PROFESSION bundle (Phase 13.3, fork #2 — a profession is just a bundle, not a new def
+  # table). Learning it grants the craft verb (grant_ability), the use-based skill track (grant_track), and
+  # enrolls the entity in the trade (learn_profession — the membership the requires.profession gate + the D2
+  # cap read). apply_bundle("leatherworking") does all three as a unit.
+  - ref: leatherworking
+    kind: profession
+    grants:
+      - {op: grant_ability, ability: craft_gloves}
+      - {op: grant_track, track: leatherworking_skill}
+      - {op: learn_profession, profession: leatherworking}
+  # foraging: an UNCAPPED gathering profession (#55, fork #2 — a profession is a bundle). Unlike leatherworking
+  # (a capped crafting trade that counts against the learned-profession cap), a gathering/utility trade is FREE:
+  # `uncapped: true` is the bundle flag professionIsCapped/uncapped (profession.go) reads so it never consumes a
+  # cap slot. Kept minimal (membership only) — its point in the demo is to be the exemplar that exercises the
+  # `uncapped` bundle flag end to end, incl. the gated Postgres store round-trip (a false default can't drop it).
+  - ref: foraging
+    kind: profession
+    uncapped: true
+    grants:
+      - {op: learn_profession, profession: foraging}
+
+# chargen: the content-defined character-generation flow (Phase 14.8). An ordered list of STEPS the website
+# walks — content drives HOW generation works, the engine knows only the step KINDS. This demo flow is 5e-style:
+# pick a race, pick a class, then a 27-point point-buy over the three stats. A roll-stats or standard-array MUD
+# would ship a different step list with NO code change. telos-account reads this to render + validate the form;
+# the WORLD applies the result (chosen bundles + bought stats) on the character's first spawn.

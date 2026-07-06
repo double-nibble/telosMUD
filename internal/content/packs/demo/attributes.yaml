@@ -1,0 +1,116 @@
+attributes:
+  # Primary stats: literal-base attributes (point-buy/level bases override these per character).
+  # stat: true surfaces them in the GMCP Char.Stats HUD panel (Phase 9.2); derived/internal attributes
+  # below leave it false so they stay out of the panel.
+  - {ref: strength,     display_name: Strength,     value_kind: int, default_base: {lit: 10}, stat: true}
+  - {ref: intellect,    display_name: Intellect,    value_kind: int, default_base: {lit: 10}, stat: true}
+  - {ref: constitution, display_name: Constitution, value_kind: int, default_base: {lit: 10}, stat: true}
+  - {ref: level,        display_name: Level,         value_kind: int, default_base: {lit: 1}, min: 1, stat: true}
+  # xp is the progress attribute for the hero_advancement track (Phase 11.2): advance_track raises it and
+  # the track machinery levels the character when it crosses a threshold. Just an ordinary attribute.
+  - {ref: xp,           display_name: Experience,    value_kind: int, default_base: {lit: 0}, min: 0}
+  # leatherworking (the skill LEVEL) + leatherworking_xp (its progress) drive the Phase-13.3 use-based
+  # crafting skill track: each craft fires OnSkillUse -> advance_track, raising the xp; crossing a threshold
+  # levels the skill. Ordinary attributes, like xp/level above.
+  - {ref: leatherworking,    display_name: Leatherworking,    value_kind: int, default_base: {lit: 0}, min: 0}
+  - {ref: leatherworking_xp, display_name: Leatherworking XP, value_kind: int, default_base: {lit: 0}, min: 0}
+  # Derived attributes: base is a prefix-AST formula evaluated against OTHER attrs (recursive).
+  #   max_hp   = constitution*10 + level*5
+  #   max_mana = intellect*8 + level*3
+  - ref: max_hp
+    display_name: Maximum Health
+    value_kind: derived
+    default_base:
+      expr: ["+", ["*", ["attr", constitution], 10], ["*", ["attr", level], 5]]
+    min: 1
+  - ref: max_mana
+    display_name: Maximum Mana
+    value_kind: derived
+    default_base:
+      expr: ["+", ["*", ["attr", intellect], 8], ["*", ["attr", level], 3]]
+    min: 0
+
+  # --- Combat attributes (Phase 6.3a, docs/COMBAT.md §4) — the ROM-style conventional set. The ENGINE
+  # names none of these; the swing pipeline runs whatever check/formula the combat profile authored,
+  # and these are the attributes those formulas read. A pack with none = no combat (the bare case).
+  # Offense:
+  - {ref: accuracy,  display_name: Accuracy,  value_kind: int, default_base: {lit: 0}}
+  - {ref: damroll,   display_name: Damage Roll, value_kind: int, default_base: {lit: 0}}
+  - {ref: attacks,   display_name: Attacks per Round, value_kind: int, default_base: {lit: 1}, min: 1}
+  - {ref: crit_mult, display_name: Critical Multiplier, value_kind: float, default_base: {lit: 2}}
+  # unarmed_dice_num / unarmed_dice_size: the dice an entity's BARE-HANDED swing rolls when it wields no
+  # weapon and carries no natural Weapon component (buildSwingDamageOp). A fresh, unarmed player would
+  # otherwise deal bonus-only damage (~0 at STR 10); these give it a real 1d6 punch. CONTENT-OVERRIDABLE
+  # via the normal mod-stack — a monk class / brass-knuckles affect raises them, NO engine predicate. The
+  # engine substitutes a tiny default (1d3) only when a pack defines neither, so a bare pack still hits.
+  - {ref: unarmed_dice_num,  display_name: Unarmed Dice Count, value_kind: int, default_base: {lit: 1}, min: 1}
+  - {ref: unarmed_dice_size, display_name: Unarmed Dice Size,  value_kind: int, default_base: {lit: 6}, min: 1}
+  # strength_bonus = (strength - 10) / 2  (5e-ish ability mod; the [G-A] damage bonus reads it). floor
+  # via the int value_kind truncation in the formula evaluator's consumers; the swing adds it to damage.
+  - ref: strength_bonus
+    display_name: Strength Bonus
+    value_kind: int
+    default_base:
+      expr: ["floor", ["/", ["-", ["attr", strength], 10], 2]]
+  # Defense:
+  - {ref: evasion, display_name: Evasion, value_kind: int, default_base: {lit: 10}}
+  - {ref: dodge,   display_name: Dodge,   value_kind: int, default_base: {lit: 0}}
+  # parry/block GATE on gear (a wielded weapon / a held shield) via deriving to 0 when ungeared ([G-C]);
+  # this demo leaves them as flat content bases (a sword-wielding mob authors a positive parry directly).
+  - {ref: parry, display_name: Parry, value_kind: int, default_base: {lit: 0}}
+  - {ref: block, display_name: Block, value_kind: int, default_base: {lit: 0}}
+  # soak_slash: flat slash-damage reduction ([G-B]). The swing's mitigate() subtracts soak_<type>; armor
+  # would feed this through the mod-stack. A flat base here models a tough hide / worn plate.
+  - {ref: soak_slash, display_name: Slash Soak, value_kind: int, default_base: {lit: 0}}
+  # combat_order: the [G-G] iteration-order key the round driver sorts by (default 0 => simultaneous,
+  # the gather order is preserved). An OnEnterCombat initiative check would write this; the demo leaves
+  # it at 0 (no initiative) — the simultaneous default the acceptance gate validated.
+  - {ref: combat_order, display_name: Combat Order, value_kind: int, default_base: {lit: 0}}
+  # aggressive: a CONTENT flag (a number the engine reads, P6-D6) — a mob with aggressive > 0 initiates
+  # combat on a player entering its room (death.go aggroOnEntry). Default 0 (passive); a mob's Living
+  # block overrides it to 1. The engine never names "aggressive"; it reads whatever this attribute is.
+  - {ref: aggressive, display_name: Aggressive, value_kind: int, default_base: {lit: 0}}
+  # max_reactions: the cap on the per-round REACTION budget ([G9], Phase 6.4b). Default 0 => a creature
+  # has NO reactions (no opportunity attacks); a mob's Living block overrides it (the goblin chief sets 1,
+  # the 5e "one reaction per round" rule). The `reactions` resource's max derives from this — so only a
+  # creature whose content grants reactions gets the OnLeaveRoom opportunity attack. The engine names no
+  # "reactions"; it reads this attribute as the resource cap, exactly like max_hp caps hp.
+  - {ref: max_reactions, display_name: Max Reactions, value_kind: int, default_base: {lit: 0}}
+  # Saving-throw attributes ([G2]/[G12]): a target's DEX save bonus and a caster's spell save DC. These
+  # are what a per-target `check` save (a fireball's save-for-half) reads — `$target.dex_save` vs
+  # `$source.spell_dc`. The engine names neither; the check spec authored on the spell reads them.
+  - ref: dex_save
+    display_name: Dexterity Save
+    value_kind: int
+    default_base:
+      expr: ["floor", ["/", ["-", ["attr", strength], 10], 2]]   # demo: reuse the STR-derived mod shape
+  - {ref: spell_dc, display_name: Spell Save DC, value_kind: int, default_base: {lit: 13}}
+
+  # --- Richer-demo combat/defense attributes (content expansion) ----------------------------------
+  # ac (armor class): the DEFENSE value the Shield reaction (rx:modify "ac") bumps and a future
+  # 5e-style to-hit reads. Flat content base; armor would feed it through the mod-stack (but the equip
+  # mod path is a STUB — see the content NOTE in the docs/report). The guardian Shield reaction below
+  # raises it for one swing.
+  - {ref: ac, display_name: Armor Class, value_kind: int, default_base: {lit: 10}}
+  # soak_fire / soak_cold: per-type flat reduction, the [G-B] twins of soak_slash — a fire/cold-warded
+  # creature subtracts these in mitigate(). A flat base models worn warding; the demo leaves players at 0
+  # (no equip-mod path); a tough creature could author a flat fire/cold soak so a spell barely singes it.
+  - {ref: soak_fire, display_name: Fire Soak, value_kind: int, default_base: {lit: 0}}
+  - {ref: soak_cold, display_name: Cold Soak, value_kind: int, default_base: {lit: 0}}
+  # damroll_bonus: a STR-scaled damage rider an item COULD raise (the "+STR/damroll bonus weapon" the
+  # brief asks for is authored as a weapon whose combat profile damage_bonus reads strength_bonus +
+  # damroll; this extra attr lets a buff stack onto it). Derived from strength so a STR build hits harder.
+  - ref: damroll_bonus
+    display_name: Bonus Damage Roll
+    value_kind: int
+    default_base:
+      expr: ["floor", ["/", ["-", ["attr", strength], 10], 2]]
+  # wisdom: a primary stat a heal scales off (5e-ish), and the floor a guild channel could gate on.
+  - {ref: wisdom, display_name: Wisdom, value_kind: int, default_base: {lit: 10}}
+  # heal_power = wisdom*2 + level: the cure spell's bonus formula reads this (a WIS caster heals more).
+  - ref: heal_power
+    display_name: Heal Power
+    value_kind: int
+    default_base:
+      expr: ["+", ["*", ["attr", wisdom], 2], ["attr", level]]
+

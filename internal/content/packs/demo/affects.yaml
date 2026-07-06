@@ -1,0 +1,145 @@
+affects:
+  # weaken: a -2 strength debuff, refresh-stacking (a re-cast resets the timer). Exercises a modifier
+  # feeding derivation and the refresh stacking mode.
+  - ref: weaken
+    name: Weakened
+    category: curse
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 20
+      modifiers:
+        - {attr: strength, op: add, value: -2}
+
+  # root: a movement-blocking CC. prevents the "move" tag (a tagged `walk` would be blocked at the
+  # lifecycle step-3 gate in 5.3); the prevents-set query is testable standalone this slice.
+  - ref: root
+    name: Rooted
+    category: snare
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 12
+      prevents: [move]
+
+  # web: a ROOM-SCOPED affect ([G13]). It attaches to the ROOM (not a creature), ticks over the room's
+  # occupants, and lands on anyone who walks IN — rooting (prevents the `move` tag, the same tag-CC a
+  # cast root uses) and slowing (-1 dodge) everyone caught in it. scope: room is the only new field; the
+  # Affected runtime hosts it. duration 12 pulses; tick interval 2 re-leases the snare on occupants. A
+  # web is transient (re-applied by content, never snapshotted).
+  - ref: web
+    name: Webbed
+    category: snare
+    scope: room
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 12
+      modifiers:
+        - {attr: dodge, op: add, value: -1}
+      prevents: [move]
+      tick:
+        interval: 2
+
+  # poison: the §5 example — a DoT. stacks up to 5 (magnitude scales), -2 strength while active, and
+  # ticks every 6 pulses. The on_tick deal_damage op-list completes in 5.3 (RESERVED here); the
+  # modifiers + stacking + tick interval are live now. Exercises the stack stacking mode.
+  - ref: poison
+    name: Poisoned
+    category: poison
+    stacking: stack
+    max_stacks: 5
+    stack_scope: source
+    dispellable: true
+    body:
+      duration: 30
+      modifiers:
+        - {attr: strength, op: add, value: -2}
+      tick:
+        interval: 6
+        # The DoT (Phase 5.3): a poison tick is just deal_damage, routed through the SAME gated
+        # mitigation pipeline a cast uses. amount 4; the magnitude (stacks) scales it (effectCtx.mag),
+        # so a 3-stack poison ticks 12. The damage type is "poison" (neutral — no resist matrix entry).
+        on_tick:
+          - {op: deal_damage, type: poison, amount: 4}
+
+  # --- Richer-demo affects (content expansion) ----------------------------------------------------
+
+  # bless: a beneficial stat buff — +2 accuracy, +1 ac. ignore-stacking (re-cast is a no-op while up),
+  # NON-dispellable-by-curse category (blessing). Applied by the `bless` ability (helpful, self/ally).
+  # A genuinely-beneficial affect (only stat-RAISING modifiers, no prevents) — so the harm gate treats
+  # casting it on another player as a HELP, not harm.
+  - ref: bless
+    name: Blessed
+    category: blessing
+    stacking: ignore
+    dispellable: true
+    body:
+      duration: 40
+      modifiers:
+        - {attr: accuracy, op: add, value: 2}
+        - {attr: ac, op: add, value: 1}
+
+  # bear_endurance: THE max-RAISING resource buff ([resource-clamp ordering]). It raises constitution
+  # +4, which feeds the DERIVED max_hp (constitution*10 + level*5), which is the `hp` resource's max_attr
+  # — so this buff RAISES the hp cap. The clamp-ordering fix matters: on apply (and on a persistence
+  # reattach) the new max must land BEFORE hp is clamped, or a full-hp creature would be clipped to the
+  # OLD max. Authored as a buff to exercise exactly that path. Also +1 unarmed dice size (a beefier fist).
+  - ref: bear_endurance
+    name: Bear's Endurance
+    category: blessing
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 50
+      modifiers:
+        - {attr: constitution, op: add, value: 4}    # -> +40 max_hp via the derived formula
+        - {attr: unarmed_dice_size, op: add, value: 1}
+
+  # regen_aura: a HEAL-over-time (the beneficial DoT twin of poison). A positive modify_resource each
+  # tick — routed through the SAME resource path, no harm gate (it RESTORES hp). Exercises the tick
+  # mechanism for a benefit. Applied by the `renew` heal-buff ability.
+  - ref: regen_aura
+    name: Renewing
+    category: blessing
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 24
+      tick:
+        interval: 4
+        on_tick:
+          - {op: heal, resource: hp, amount: 6}
+
+  # frostbite: a DEBUFF DoT — cold damage each tick AND a -2 dodge slow. Harmful: applied via the harm
+  # gate (the `frost` spell's apply_affect harmful:true), so it cannot land on a non-consenting player.
+  # The cold type means a fire creature shrugs the damage (soak_fire is irrelevant; cold vuln applies).
+  - ref: frostbite
+    name: Frostbitten
+    category: curse
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 18
+      modifiers:
+        - {attr: dodge, op: add, value: -2}
+      tick:
+        interval: 3
+        on_tick:
+          - {op: deal_damage, type: cold, amount: 5}
+
+  # silence: a CASTING CC — prevents the `verbal` tag, so any verbal-tagged cast (fireball/frost/smite/
+  # bless are tagged verbal) is BLOCKED at the lifecycle step-3 tag gate while it holds. The mute spell
+  # the brief's "movement/silence CC (a prevents tag)" asks for. Harmful (a debuff).
+  - ref: silence
+    name: Silenced
+    category: curse
+    stacking: refresh
+    dispellable: true
+    body:
+      duration: 16
+      prevents: [verbal]
+
+# Abilities (skills/spells, docs/ABILITIES.md §2). The engine provides the lifecycle + the effect-op
+# vocabulary; THIS data is the whole skill — the engine has never heard of "fireball". Adding one is a
+# content write, zero engine changes.

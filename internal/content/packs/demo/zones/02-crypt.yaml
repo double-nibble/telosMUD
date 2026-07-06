@@ -1,0 +1,85 @@
+zones:
+  - ref: crypt
+    name: The Forgotten Crypt
+    start_room: crypt:room:entrance
+    reset_secs: 90
+    rooms:
+      - ref: crypt:room:entrance
+        name: A Crumbling Stair
+        long: >-
+          Worn steps descend into damp dark. The air is cold and still, and the way up
+          returns to the guild hall above.
+        exits:
+          up: midgaard:room:guildhall   # back to the guild hall (intra-shard transfer when co-hosted)
+          north: crypt:room:ossuary
+      - ref: crypt:room:ossuary
+        name: The Ossuary
+        long: >-
+          Skulls are stacked in niches from floor to ceiling. Something has been feeding
+          here recently.
+        exits:
+          south: crypt:room:entrance
+          north: crypt:room:tomb
+      - ref: crypt:room:tomb
+        name: A Sealed Tomb
+        long: >-
+          A great stone sarcophagus dominates this chamber. Faint holy runes ring its lid,
+          long since cracked.
+        exits:
+          south: crypt:room:ossuary
+    item_prototypes:
+      # the skeleton's loot — a tarnished blade it carries, recovered from its corpse on death.
+      - ref: crypt:obj:bone-blade
+        keywords: [blade, bone, tarnished]
+        short: a tarnished bone blade
+        long: A blade of yellowed bone lies here, edge still keen.
+        physical: {weight: 3, material: bone}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 1, dice_size: 8, damage_type: slash, class: sword, attack_verb: slash}
+    mob_prototypes:
+      # a skeletal guardian — a starter-to-mid combat mob in the ossuary (undead flavor, holy-vuln target).
+      - ref: crypt:mob:skeleton
+        keywords: [skeleton, bony, guardian]
+        short: a skeletal guardian
+        long: A skeletal guardian rattles upright, blade in bony fist.
+        weapon: {dice_num: 1, dice_size: 6, damage_type: slash, class: sword, attack_verb: slash}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 13
+            constitution: 4        # max_hp = 4*10 + 1*5 = 45
+            level: 1
+            accuracy: 3
+            damroll: 1
+            attacks: 1
+            evasion: 8
+            dodge: 8
+            parry: 0
+            block: 0
+            soak_slash: 1
+      # a tomb guardian — the crypt boss, aggressive, with one reaction (an opportunity attack on flee).
+      - ref: crypt:mob:tomb-guardian
+        keywords: [guardian, tomb, ancient]
+        short: an ancient tomb guardian
+        long: An ancient guardian of black iron looms over the sarcophagus, unmoving until disturbed.
+        weapon: {dice_num: 2, dice_size: 6, damage_type: slash, class: sword, attack_verb: cleave}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 17
+            constitution: 9        # max_hp = 9*10 + 1*5 = 95
+            level: 1
+            accuracy: 5
+            damroll: 3
+            attacks: 1
+            evasion: 9
+            dodge: 8
+            parry: 0
+            block: 0
+            soak_slash: 3
+            aggressive: 1
+            max_reactions: 1
+    resets:
+      - {op: spawn_mob, proto: crypt:mob:skeleton, room: crypt:room:ossuary, count: 1}
+      - {op: spawn_item, proto: crypt:obj:bone-blade, into: crypt:mob:skeleton, room: crypt:room:ossuary, count: 1}
+      - {op: spawn_mob, proto: crypt:mob:tomb-guardian, room: crypt:room:tomb, count: 1}

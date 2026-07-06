@@ -1,0 +1,351 @@
+abilities:
+  # fireball: THE Phase 5.3 milestone. A command-invocation spell, targets an enemy, costs 30 mana,
+  # casts instantly (cast_time 0 -> straight to commit), then resolves [deal_damage fire, apply_affect
+  # poison]. Its harmful disposition gates it vs a non-consenting player at BOTH choke points
+  # (lifecycle step 4 + the in-op guard). 8d6 fire damage flows through the shared mitigation pipeline.
+  - ref: fireball
+    name: Fireball
+    invocation: command
+    words: [fireball]
+    # [G12] AoE: targeting.area room makes fireball hit EVERY valid living target in the caster's room
+    # (the caster is excluded — harmful self-exclusion). The engine loops the on_resolve PER TARGET, and
+    # each target funnels guardHarmful INDEPENDENTLY (a consenting foe burns, a non-consenting player in
+    # the room is unharmed). mode: enemy keeps the classic `fireball goblin` working, but with an area
+    # the keyword is optional — a bare `fireball` blankets the room.
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful, area: room}
+    tags: [cast, verbal, somatic, fire]
+    costs:
+      - {resource: mana, amount: 30}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You hurl a roaring fireball into the room!"
+      room: "$n hurls a roaring fireball into the room!"
+    # The whole on_resolve is ONE area-scoped `check` op: per target, roll a DEX save vs the caster's
+    # spell DC; the save HALVES the damage (the half/full bands). Each target rolls its OWN save and its
+    # damage gates on its OWN consent — the Phase-6 milestone "a fireball's save halves its damage across
+    # everyone in the room", entirely from content. apply_affect (burn) on a failed save adds the rider.
+    on_resolve:
+      - op: check
+        check:
+          label: "Dexterity save"
+          dice: "1d20"
+          bonus: ["attr", "$target.dex_save"]
+          vs: ["attr", "$source.spell_dc"]
+          bands:
+            # made the save (total >= DC, margin >= 0): HALF damage, no burn.
+            - margin_min: 0
+              label: save
+              ops:
+                - {op: deal_damage, type: fire, dice: "4d6"}
+            # failed the save: FULL damage + a lingering burn (poison-as-fire DoT rider).
+            - label: fail
+              ops:
+                - {op: deal_damage, type: fire, dice: "8d6"}
+                - {op: apply_affect, affect: poison, harmful: true}
+
+  # web: a command spell that conjures the `web` ROOM-scoped affect ([G13]) in the caster's room. mode
+  # none (no creature target — the field IS the target); the apply_affect op detects the room-scoped def
+  # and attaches it to the room (occupants + entrants get rooted). disposition harmful so the per-occupant
+  # landing funnels the gate. No engine knowledge of "web" — the room affect + this ability are content.
+  - ref: cast_web
+    name: Web
+    invocation: command
+    words: [web]
+    targeting: {mode: none, scope: room, range: 0, disposition: harmful}
+    tags: [cast, somatic]
+    costs:
+      - {resource: mana, amount: 15}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You fling a tangle of sticky webs across the room!"
+      room: "$n flings a tangle of sticky webs across the room!"
+    on_resolve:
+      - {op: apply_affect, affect: web}
+
+  # --- Richer-demo abilities (content expansion) --------------------------------------------------
+
+  # frost: a single-target damage spell — 4d6 COLD + a lingering frostbite DoT. The cold type runs the
+  # resist matrix + the target's soak_cold (the wraith shrugs some); verbal-tagged so a `silence` affect
+  # blocks it. Harmful disposition -> the PvP gate guards it vs a non-consenting player.
+  - ref: frost
+    name: Frost Bolt
+    invocation: command
+    words: [frost]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic, cold]
+    costs:
+      - {resource: mana, amount: 20}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You loose a shard of ice at $N!"
+      room: "$n looses a shard of ice at $N!"
+    on_resolve:
+      - {op: deal_damage, type: cold, dice: "4d6"}
+      - {op: apply_affect, affect: frostbite, harmful: true}
+
+  # smite: a HOLY damage spell with a FORMULA bonus ([G-A]) — 2d8 + the caster's wisdom-derived
+  # heal_power/2. Demonstrates a bonus formula on deal_damage and a damage TYPE (holy) the wraith has no
+  # soak against — it bypasses the wraith's cold warding. Costs mana; verbal/somatic so CC can lock it out.
+  - ref: smite
+    name: Smite
+    invocation: command
+    words: [smite]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic, holy]
+    costs:
+      - {resource: mana, amount: 18}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You call down a searing pillar of light upon $N!"
+      room: "$n calls down a searing pillar of light upon $N!"
+    on_resolve:
+      - {op: deal_damage, type: holy, dice: "2d8", bonus: ["floor", ["/", ["attr", "$source.heal_power"], 2]]}
+
+  # cure: a HEAL (self). HELPFUL disposition (no harm gate). NOTE: the declarative `heal` op only honors a
+  # FLAT `amount` (it does NOT roll dice or evaluate a bonus formula — a real gap, see report). To make
+  # the heal SCALE with the caster's WIS (the brief's "a heal" that's more than a flat number), cure is a
+  # LUA on_resolve: it rolls 2d8 in Lua and adds the caster's heal_power, then restores hp through the
+  # SAME gated heal funnel a declarative heal uses. `cure` with no arg heals self.
+  - ref: cure
+    name: Cure Wounds
+    invocation: command
+    words: [cure]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 15}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You channel a warm, mending light."
+      room: "$n channels a warm, mending light."
+    on_resolve_lua: |
+      -- 2d8 + the caster's WIS-derived heal_power, healed onto the caster (ctx.target == ctx.actor here).
+      local amt = math.random(1, 8) + math.random(1, 8) + ctx.actor:attr("heal_power")
+      ctx.actor:heal("hp", amt)
+
+  # bless: a beneficial BUFF — applies the `bless` affect (+accuracy/+ac) to self or an ally. Helpful, so
+  # casting it on another player is treated as help (not gated). The brief's "a buff (applies a beneficial
+  # affect)". apply_affect on a helpful disposition attaches directly (no debuff path).
+  - ref: bless
+    name: Bless
+    invocation: command
+    words: [bless]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 12}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You trace a sigil of protection."
+      room: "$n traces a sigil of protection."
+    on_resolve:
+      - {op: apply_affect, affect: bless}
+
+  # renew: a heal-over-time buff — applies the `regen_aura` (heals hp every tick). Helpful self/ally.
+  - ref: renew
+    name: Renew
+    invocation: command
+    words: [renew]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 14}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You weave a slow knot of renewing energy."
+      room: "$n weaves a slow knot of renewing energy."
+    on_resolve:
+      - {op: apply_affect, affect: regen_aura}
+
+  # fortify: applies `bear_endurance` — THE max-RAISING buff (raises constitution -> derived max_hp ->
+  # the hp resource cap). A self/ally helpful buff that exercises the resource-clamp ordering.
+  - ref: fortify
+    name: Fortify
+    invocation: command
+    words: [fortify]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 16}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You steel your sinews with the endurance of a bear."
+      room: "$n's frame seems to swell with vigor."
+    on_resolve:
+      - {op: apply_affect, affect: bear_endurance}
+
+  # craft_gloves: a PROFESSION CRAFTING ability (Phase 13.3). Double-gated — requires_grant (ownership) AND
+  # requires.profession (leatherworking membership); the leatherworking bundle grants both. On resolve it
+  # CONSUMES 2 leather scraps and PRODUCES a BOUND pair of leather gloves, and `skill: leatherworking_skill`
+  # fires OnSkillUse so each craft advances the trade skill. A non-leatherworker who types `craft` is refused
+  # at step-3 ("You lack the training for that craft.") — the requires.profession gate under test.
+  - ref: craft_gloves
+    name: Craft Gloves
+    invocation: command
+    words: [craft]
+    requires_grant: true
+    skill: leatherworking_skill
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    requires:
+      profession: leatherworking
+    messages:
+      actor: "You stitch two scraps of leather into a fine pair of gloves."
+      room: "$n stitches together a pair of leather gloves."
+    on_resolve:
+      - {op: consume_item, item: midgaard:obj:leather, amount: 2}
+      - {op: produce_item, item: midgaard:obj:leather-gloves, bind: bound}
+
+  # disenchant: a SALVAGE verb (Phase 13.4 / #38). Gated on requires.profession (leatherworking) — a non-member
+  # is refused at step-3. It is OBJECT-TARGETED (#38): `disenchant <item>` resolves a HELD item by keyword
+  # (salvage_item with NO fixed `item`, so it reads the typed argument). The `tag: salvageable` gate means only
+  # gear carrying that tag may be broken down; a per-item `no_salvage` block or `salvage_table` override is
+  # honored by the op. The source is CONSUMED even when BOUND (owner deconstruction, §1); disenchant_arms yields
+  # a tradeable leather component (uncommon, unbound) + a bound arcane essence (the epic tier binds, D1).
+  # NOTE: targeting.mode is `none` (the op reads the verb's raw argument itself for object resolution — the
+  # arg is threaded to the op independently of targeting mode); a worn/wielded or `keep`-flagged source is
+  # refused up front (salvage honors the drop-guards, #36).
+  - ref: disenchant
+    name: Disenchant
+    invocation: command
+    words: [disenchant]
+    # skill: leatherworking_skill fires OnSkillUse on each successful disenchant, advancing the leatherworking
+    # TRACK (Phase 11) — salvaging IS a first-class progression skill, practiced through use.
+    skill: leatherworking_skill
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    requires:
+      profession: leatherworking
+    messages:
+      actor: "You unravel the weave binding the blade and draw out its essence."
+      room: "$n unravels a blade into glittering motes of light."
+    on_resolve:
+      # #38 slice B: NO fixed table — the yield DERIVES from the item's rarity tier (rare -> disenchant_arms).
+      # `skill: leatherworking` gates on the leatherworking level (scaled by the item's tier+level) and drives
+      # the over-skill bonus rolls. `tag: salvageable` restricts the verb to gear tagged for it.
+      - {op: salvage_item, tag: salvageable, skill: leatherworking}
+
+  # forge_vest: a RECIPE-DRIVEN craft verb (Phase 13.5). Gated on requires.profession (leatherworking) at the
+  # verb level; its on_resolve runs craft_recipe(craft:leather_vest), which re-checks the recipe's own gates
+  # (profession + skill + the forge STATION room flag, D3), consumes 3 leather + 1 essence, and produces a
+  # bound leather vest. Crafting away from the forge — or without the components — is refused by the op.
+  - ref: forge_vest
+    name: Forge Vest
+    invocation: command
+    words: [forge]
+    requires:
+      profession: leatherworking
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    messages:
+      actor: "You work leather and essence over the forge into a fine vest."
+      room: "$n hammers and stitches at the forge."
+    on_resolve:
+      - {op: craft_recipe, recipe: "craft:leather_vest"}
+
+  # make: a NAME-RESOLVED craft verb (#34). Unlike forge_vest (one verb -> one fixed recipe), `make <name>`
+  # runs craft_recipe with NO fixed ref, so the op resolves the recipe from the player's typed argument via
+  # the Diku alias grammar against the recipes they can craft (`make vest` / `make leather vest`). A name that
+  # matches nothing is a clean refuse. The mechanism is verb-agnostic — a pack could bind it to `craft`.
+  - ref: make_by_name
+    name: Make
+    invocation: command
+    words: [make]
+    requires:
+      profession: leatherworking
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    on_resolve:
+      - {op: craft_recipe}
+
+  # recipes: the DISCOVERY listing (#34). It prints the recipes the actor can craft with the exact names
+  # `make <name>` accepts (display name + aliases), so a player never has to guess. Pairs with `make` — the
+  # discoverability pillar: what it prints is what you type.
+  - ref: list_recipes
+    name: Recipes
+    invocation: command
+    words: [recipes]
+    targeting: {mode: none, scope: room, range: 0, disposition: neutral}
+    on_resolve:
+      - {op: list_recipes}
+
+  # mute: a DEBUFF/CC — applies `silence` (prevents the verbal tag) to an enemy. Harmful disposition, so
+  # the PvP harm gate guards it vs a non-consenting player (the harm-gate exercise the brief asks for).
+  - ref: mute
+    name: Silence
+    invocation: command
+    words: [mute]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 14}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You rip the voice from $N's throat!"
+      room: "$n rips the voice from $N's throat!"
+    on_resolve:
+      - {op: apply_affect, affect: silence, harmful: true}
+
+  # lightning: a LUA on_resolve damage spell. The whole effect is a Lua body: it damages the target via
+  # the SAME ctx.target:damage funnel a declarative op uses (so the harm gate + mitigation still apply).
+  # Demonstrates the Lua-scripted ability path (Phase 7) as playable content.
+  - ref: lightning
+    name: Lightning Bolt
+    invocation: command
+    words: [lightning, bolt]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 22}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You hurl a crackling bolt of lightning at $N!"
+      room: "$n hurls a crackling bolt of lightning at $N!"
+    on_resolve_lua: |
+      -- a Lua-scripted spell: roll 5d6 in Lua and deal it through the gated damage funnel.
+      local dmg = 0
+      for i = 1, 5 do dmg = dmg + math.random(1, 6) end
+      ctx.target:damage{amount = dmg, type = "fire"}
+
+  # drain: a LUA on_resolve life-drain — damages the enemy AND heals the caster for half. Demonstrates a
+  # Lua ability that reads ctx.source/ctx.target and composes two funneled effects (damage + heal).
+  - ref: drain
+    name: Life Drain
+    invocation: command
+    words: [drain]
+    targeting: {mode: enemy, scope: room, range: 0, disposition: harmful}
+    tags: [cast, verbal, somatic]
+    costs:
+      - {resource: mana, amount: 20}
+    cast_time: 0
+    lag: 12
+    cooldown: 0
+    messages:
+      actor: "You siphon the life from $N!"
+      room: "$n siphons the life from $N!"
+    on_resolve_lua: |
+      -- deal 4d6 necrotic-ish (fire type, neutral) then heal the caster for half the damage dealt.
+      local dmg = 0
+      for i = 1, 4 do dmg = dmg + math.random(1, 6) end
+      ctx.target:damage{amount = dmg, type = "fire"}
+      ctx.actor:heal("hp", math.floor(dmg / 2))
+
+# Combat profiles (Phase 6.3a, docs/COMBAT.md §3) — the ROM-style to-hit / avoidance / damage SHAPE as
+# pure content. The engine runs the pipeline; THIS data is the whole ruleset. `default_combat` names the
+# profile a player fights with; a mob names its own via its `living.combat_profile`.

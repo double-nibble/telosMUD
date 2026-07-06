@@ -1,0 +1,123 @@
+zones:
+  - ref: midgaard
+    item_prototypes:
+      - ref: midgaard:obj:torch
+        keywords: [torch, wooden]
+        short: a wooden torch
+        long: A wooden torch lies here, its pitch cold.
+        physical: {weight: 2, material: wood}
+      - ref: midgaard:obj:helmet
+        keywords: [helmet, iron]
+        short: an iron helmet
+        long: An iron helmet rests here.
+        physical: {weight: 3, material: iron}
+        wearable: {locations: [head]}
+      - ref: midgaard:obj:sword
+        keywords: [sword, steel, long]
+        short: a steel longsword
+        long: A steel longsword lies here.
+        physical: {weight: 5, material: steel}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 2, dice_size: 6, damage_type: slash, class: sword, attack_verb: slash}
+        # Phase 13.1: the rare loot sword binds to its looter (BoP) + is tagged magical. #38: `salvageable`
+        # lets the object-targeted disenchant verb (tag: salvageable) accept it.
+        bind: bind_on_pickup
+        tier: rare
+        tags: [magical, salvageable]
+      # A stackable crafting material (Phase 13.2): leather scraps merge up to 20 per stack. Disenchant/
+      # salvage (13.4) produce these; recipes (13.5) consume them.
+      - ref: midgaard:obj:leather
+        keywords: [leather, scrap, scraps]
+        short: a pile of leather scraps
+        long: A pile of leather scraps lies here.
+        physical: {weight: 1, material: leather}
+        tags: [material]
+        material: {max_stack: 20, type: leather}
+      # essence: the Phase-13.4 top-tier salvage component (an arcane essence). A stackable material like
+      # leather, but the disenchant_arms table rolls it at the `epic` tier, whose binds flag makes each
+      # essence bind on creation — the no-trade legendary sink (D1). The item proto carries no bind rule of
+      # its own; the binding comes from the salvage tier.
+      - ref: midgaard:obj:essence
+        keywords: [essence, arcane, mote]
+        short: a mote of arcane essence
+        long: A faintly glowing mote of arcane essence hovers here.
+        physical: {weight: 0, material: aether}
+        tags: [material, essence]
+        material: {max_stack: 50, type: essence}
+      - ref: midgaard:obj:chest
+        keywords: [chest, oak, wooden]
+        short: a wooden chest
+        long: A heavy wooden chest sits here.
+        physical: {weight: 40, material: oak}
+        container: {capacity: 10, closed: true}
+
+      # --- richer-demo gear (the smithy stock) ----------------------------------------------------
+      # NOTE (real gap, see report): worn/wielded gear does NOT currently contribute attribute
+      # modifiers — the equip path (cmdWear/cmdWield) is a STUB that sets the slot but adds NO
+      # modSource and fires NO OnEquip event (there is no such event kind). So an item CANNOT raise a
+      # stat / grant an affect / raise a resource max purely by being worn. The gear below carries the
+      # mechanics it CAN express today: a WEAPON's damage dice + type, which DO flow into combat (the
+      # combat profile's damage_bonus already adds strength_bonus + damroll on top). The armor/accessory
+      # stat-mods + the "max-raising buff on equip" + "resistance on equip" are authored as Wearable
+      # flavor PLUS an equivalent ABILITY/affect a player can invoke (fortify = the max-raiser; frost
+      # resist would be a soak attr a future equip-mod feeds). This is the one brief item the content
+      # shapes can't fully express — flagged, not hacked.
+
+      # warhammer: a heavy STR weapon — bigger dice (1d10) than the longsword; its extra punch comes
+      # from the combat profile's damage_bonus (strength_bonus + damroll), so a STR build swings harder.
+      - ref: midgaard:obj:warhammer
+        keywords: [warhammer, hammer, heavy]
+        short: a heavy warhammer
+        long: A heavy iron warhammer leans against the rack.
+        physical: {weight: 12, material: iron}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 1, dice_size: 10, damage_type: slash, class: mace, attack_verb: smash}
+      # frostbrand: a cold-damage sword (its swings deal COLD — a different damage type runs through the
+      # resist matrix + the target's soak_cold — the wraith's cold warding blunts it, others feel it).
+      - ref: midgaard:obj:frostbrand
+        keywords: [frostbrand, sword, icy]
+        short: an icy frostbrand sword
+        long: A longsword rimed with frost rests here, breathing cold.
+        physical: {weight: 5, material: steel}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 2, dice_size: 6, damage_type: cold, class: sword, attack_verb: freeze}
+      # leather armor across MULTIPLE wear slots. NOTE (real gap, see report): the wear-slot enum is a
+      # CLOSED engine set — only head/body/hands/feet/wield/hold exist (no legs/neck/finger/waist/arms).
+      # So "armor pieces across multiple wear slots" spans the THREE armor slots the engine has: body,
+      # hands, feet (+ head, already covered by the original helmet). An accessory `neck`/`finger` slot
+      # is NOT expressible. Stat-mods on equip are the separate equip-mod gap above.
+      - ref: midgaard:obj:leather-vest
+        keywords: [vest, leather, armor]
+        short: a studded leather vest
+        long: A studded leather vest hangs on a peg.
+        physical: {weight: 8, material: leather}
+        wearable: {locations: [body]}
+      - ref: midgaard:obj:leather-gloves
+        keywords: [gloves, leather]
+        short: a pair of leather gloves
+        long: A pair of supple leather gloves lies folded here.
+        physical: {weight: 2, material: leather}
+        wearable: {locations: [hands]}
+      - ref: midgaard:obj:leather-boots
+        keywords: [boots, leather]
+        short: a pair of leather boots
+        long: A pair of scuffed leather boots sits by the forge.
+        physical: {weight: 3, material: leather}
+        wearable: {locations: [feet]}
+      # leather belt: wears in the CONTENT-DEFINED "waist" slot (#35) — a slot the engine's default vocab does
+      # NOT have, proving a pack can add wear locations. The wear_slots section below declares it.
+      - ref: midgaard:obj:leather-belt
+        keywords: [belt, leather]
+        short: a wide leather belt
+        long: A wide leather belt with an iron buckle lies coiled here.
+        physical: {weight: 2, material: leather}
+        wearable: {locations: [waist]}
+      # iron shield: a HELD off-hand shield (the block-avoidance rung gates on a held shield via the
+      # combat profile; today block derives from a flat attr, but the shield is the wearable that a
+      # gear-gated block would key off — the slot mechanism is real).
+      - ref: midgaard:obj:shield
+        keywords: [shield, iron, round]
+        short: a round iron shield
+        long: A round iron shield is propped against the anvil.
+        physical: {weight: 10, material: iron}
+        wearable: {locations: [hold]}

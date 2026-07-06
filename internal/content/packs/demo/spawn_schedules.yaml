@@ -1,0 +1,22 @@
+spawn_schedules:
+  - ref: boss:warden
+    proto: darkwood:mob:goblin-chief
+    zone: darkwood
+    interval_after_death_sec: 604800
+    on_missed: spawn_if_overdue
+    # #55: the director broadcasts this on each scheduled spawn; the grove-spirit's on_world("spawn.boss")
+    # handler reacts by doing the actual mud.spawn. (Was previously orphaned on the craft:leather_vest recipe,
+    # where yaml silently ignored it — restored to the schedule it names.)
+    announce: "A great roar echoes across the land — the Warden has returned!"
+
+# recipes: content-defined crafting recipes (Phase 13.5). craft:leather_vest is a leatherworking recipe
+# made at the smithy FORGE station (D3 — the smithy room's `forge` flag): it consumes 3 leather scraps + 1
+# arcane essence and produces a BOUND leather vest, its quality scaling with the crafter's leatherworking
+# skill (quality_base + skill level). This closes the §9 loop with disenchant — the bound essence a player
+# salvaged from an epic feeds straight into this recipe.
+# wear_slots: the content-defined equipment vocabulary (#35). This re-declares the engine's default Diku core
+# (so the standard head/body/hands/feet/wield/hold behave exactly as before) AND adds a NEW "waist" slot — the
+# leather belt above wears there, proving a pack can extend the slot set the engine ships with. `kind` routes
+# the equip verb (worn = the generic `wear`; wield/hold = the wield/hold verbs + the combat weapon slot);
+# `order` fixes the deterministic `equipment` list + `N.`-ordinal order. A pack that omits this section gets
+# the engine default set unchanged.
