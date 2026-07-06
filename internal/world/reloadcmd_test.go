@@ -62,7 +62,7 @@ func TestReloadRepublish(t *testing.T) {
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 
-	out := s.reloader.republish(context.Background(), []string{"reloadtest"})
+	out := s.reloader.republish(context.Background(), []string{"reloadtest"}, false)
 	if out.failed || len(out.rejected) > 0 {
 		t.Fatalf("republish over a healthy MemSource/MemBus should succeed: %+v", out)
 	}
@@ -104,5 +104,54 @@ func TestReloadDoneDelivery(t *testing.T) {
 	case <-s.out:
 		t.Fatal("readout wrongly delivered for an absent player id")
 	default:
+	}
+}
+
+// TestParseReloadArgs covers the reload arg/flag split: scope in either position, the --check/-n dry-run
+// flag, and the bare (all-packs) form.
+func TestParseReloadArgs(t *testing.T) {
+	cases := []struct {
+		in    string
+		scope string
+		check bool
+	}{
+		{"", "", false},
+		{"demo", "demo", false},
+		{"--check", "", true},
+		{"demo --check", "demo", true},
+		{"--check demo", "demo", true},
+		{"-n demo", "demo", true},
+	}
+	for _, tc := range cases {
+		scope, check := parseReloadArgs(tc.in)
+		if scope != tc.scope || check != tc.check {
+			t.Errorf("parseReloadArgs(%q) = (%q,%v), want (%q,%v)", tc.in, scope, check, tc.scope, tc.check)
+		}
+	}
+}
+
+// TestReloadCheckPublishesNothing proves a --check dry run over a VALID pack validates OK but publishes
+// nothing (the builder's pre-flight; #192 Slice 2).
+func TestReloadCheckPublishesNothing(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	bus := contentbus.NewMemBus()
+	defer func() { _ = bus.Close() }()
+	s := newReloadShard(t, src, bus)
+
+	var count int64
+	sub, err := bus.Subscribe(func(contentbus.Invalidation) { atomic.AddInt64(&count, 1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	out := s.reloader.republish(context.Background(), []string{"reloadtest"}, true) // checkOnly
+	if !out.checkOnly || out.published != 0 || len(out.rejected) > 0 || out.failed {
+		t.Fatalf("check-only over a valid pack should validate + publish nothing: %+v", out)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := atomic.LoadInt64(&count); n != 0 {
+		t.Fatalf("--check published %d invalidations; it must publish none", n)
 	}
 }
