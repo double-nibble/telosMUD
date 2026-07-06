@@ -23,14 +23,13 @@ func main() {
 	}
 	ctx := context.Background()
 
-	data, err := content.DemoPackBytes()
+	pack, found, err := content.LoadPack(content.DemoPack)
 	if err != nil {
-		slog.Error("read embedded demo pack failed", "err", err)
+		slog.Error("load embedded demo pack failed", "err", err)
 		os.Exit(1)
 	}
-	pack, err := content.ParsePack(data)
-	if err != nil {
-		slog.Error("parse demo pack failed", "err", err)
+	if !found {
+		slog.Error("embedded demo pack not found", "pack", content.DemoPack)
 		os.Exit(1)
 	}
 

@@ -13,32 +13,34 @@ import (
 // strip story (DELETE WHERE pack=...) and the demo are independent.
 const DemoPack = "demo"
 
-//go:embed packs/*.yaml
+// The embed covers the whole packs/ tree, so a pack may be a single packs/<name>.yaml file OR a
+// directory packs/<name>/**/*.yaml (the #53 tree layout). `all:` keeps files the default embed
+// would skip (those beginning with `.`/`_`) out of scope only where intended; here the plain form
+// is enough — we only read *.yaml/*.yml.
+//
+//go:embed packs
 var packFS embed.FS
 
-// EmbeddedSource serves content packs compiled into the binary from packs/*.yaml. It is the
+// EmbeddedSource serves content packs compiled into the binary from the packs/ tree. It is the
 // Source unit tests and a bare dev run use, so the test suite has NO Postgres dependency.
 // Production loads from internal/store (Postgres) instead; `make seed` imports these same
 // YAML files into the DB so the two sources agree.
 type EmbeddedSource struct{}
 
-// LoadPacks parses the embedded YAML for each enabled pack name (packs/<name>.yaml) and
-// returns them. A name with no embedded file is skipped (not an error): enabling a pack the
-// binary doesn't carry just contributes nothing, preserving the bare-engine boot.
+// LoadPacks parses the embedded content for each enabled pack name and returns them. Each pack is
+// resolved as either the single-file layout (packs/<name>.yaml) or the directory-tree layout
+// (packs/<name>/**/*.yaml), merged into one Pack (loadPackFS). A name with no embedded file OR
+// directory is skipped (not an error): enabling a pack the binary doesn't carry just contributes
+// nothing, preserving the bare-engine boot.
 func (EmbeddedSource) LoadPacks(_ context.Context, enabled []string) ([]Pack, error) {
 	var out []Pack
 	for _, name := range enabled {
-		data, err := packFS.ReadFile("packs/" + name + ".yaml")
+		p, found, err := loadPackFS(packFS, name)
 		if err != nil {
-			// Not embedded: nothing to contribute. (A Postgres source would 404 the same way.)
-			continue
+			return nil, err
 		}
-		var p Pack
-		if err := yaml.Unmarshal(data, &p); err != nil {
-			return nil, fmt.Errorf("content: parse embedded pack %q: %w", name, err)
-		}
-		if p.Pack == "" {
-			p.Pack = name
+		if !found {
+			continue // not embedded: nothing to contribute (a Postgres source would 404 the same way)
 		}
 		out = append(out, p)
 	}
@@ -51,9 +53,14 @@ func LoadDemoPack() (*LoadedContent, error) {
 	return Load(context.Background(), EmbeddedSource{}, []string{DemoPack})
 }
 
-// DemoPackBytes returns the raw embedded demo YAML, for `make seed` / store import to push
-// into Postgres without re-reading the file from disk.
-func DemoPackBytes() ([]byte, error) { return packFS.ReadFile("packs/" + DemoPack + ".yaml") }
+// LoadPack resolves and merges one embedded pack by name (single-file OR directory-tree layout)
+// into a single Pack, for `make seed` / store import to push into Postgres. It is the tree-aware
+// replacement for the old raw-bytes read: a pack authored as a directory is merged here, so the
+// importer always receives one complete Pack regardless of on-disk shape. found=false means the
+// name is not embedded.
+func LoadPack(name string) (pack Pack, found bool, err error) {
+	return loadPackFS(packFS, name)
+}
 
 // ParsePack parses one pack's YAML bytes (used by the store importer for `make seed`).
 func ParsePack(data []byte) (Pack, error) {

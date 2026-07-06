@@ -26,10 +26,9 @@ func TestChargenAccountJourneyCapstone(t *testing.T) {
 
 	// Seed the demo pack (idempotent strip-and-replace) so this test is self-contained on a fresh CI DB —
 	// it must not depend on another test having imported the content first.
-	data, err := content.DemoPackBytes()
+	pk, found, err := content.LoadPack(content.DemoPack)
 	require.NoError(t, err)
-	pk, err := content.ParsePack(data)
-	require.NoError(t, err)
+	require.True(t, found, "embedded demo pack present")
 	require.NoError(t, p.ImportPack(ctx, pk), "import demo pack")
 
 	// Load the real demo chargen flow + bundle options (exactly as telos-account does at boot).
