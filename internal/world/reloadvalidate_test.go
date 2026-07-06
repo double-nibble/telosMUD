@@ -1,6 +1,7 @@
 package world
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -69,6 +70,125 @@ func TestValidateRoomExits(t *testing.T) {
 	// The gate rides validatePacks, so a dangling intra-zone exit blocks a publish.
 	if p := validatePacks(dangling); len(p) != 1 {
 		t.Fatalf("validatePacks did not surface the dangling exit: %v", p)
+	}
+}
+
+// TestValidateResets covers the #197 slice-2b reset-reference gate: a sound reset validates; an unknown op,
+// an undefined/empty target room (resolved against the reset's OWN zone), and an undefined/empty intra-zone
+// prototype are each rejected; and — the no-false-positive invariant — a cross-ZONE prototype (which may
+// live outside a scoped reload's scope) is deferred, and a spawn into a MOB/container is not judged (the
+// `into` target is a runtime lookup). Faithful to applyReset (reset.go).
+func TestValidateResets(t *testing.T) {
+	// A pack with a room, an item proto and a mob proto, and resets that reference them correctly.
+	packWith := func(resets ...content.ResetDTO) []content.Pack {
+		return []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{{
+			Ref:    "mid",
+			Rooms:  []content.RoomDTO{{Ref: "mid:room:1"}},
+			Items:  []content.ProtoDTO{{Ref: "mid:obj:torch"}},
+			Mobs:   []content.ProtoDTO{{Ref: "mid:mob:guard"}},
+			Resets: resets,
+		}}}}
+	}
+
+	// Sound: both a mob and an item reset resolving to this zone's room + protos.
+	good := packWith(
+		content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:guard", Room: "mid:room:1", Max: 1},
+		content.ResetDTO{Op: "spawn_item", Proto: "mid:obj:torch", Room: "mid:room:1", Max: 2},
+		content.ResetDTO{Op: "", Proto: "mid:obj:torch", Room: "mid:room:1"}, // "" == spawn, valid
+	)
+	if p := validateResets(good); len(p) != 0 {
+		t.Fatalf("sound resets flagged: %v", p)
+	}
+
+	// Unknown op => a dead reset (applyReset warns "op not understood").
+	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_dragon", Proto: "mid:mob:guard", Room: "mid:room:1"})); len(p) != 1 {
+		t.Fatalf("unknown op: want 1 problem, got %v", p)
+	}
+
+	// Target room absent from THIS zone => runtime z.rooms lookup fails.
+	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:guard", Room: "mid:room:99"})); len(p) != 1 {
+		t.Fatalf("unknown room: want 1 problem, got %v", p)
+	}
+	// Empty room.
+	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:guard", Room: "  "})); len(p) != 1 {
+		t.Fatalf("empty room: want 1 problem, got %v", p)
+	}
+
+	// Undefined intra-zone prototype => runtime z.spawn returns nil.
+	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:1"})); len(p) != 1 {
+		t.Fatalf("undefined proto: want 1 problem, got %v", p)
+	}
+	// Empty prototype.
+	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_item", Proto: "", Room: "mid:room:1"})); len(p) != 1 {
+		t.Fatalf("empty proto: want 1 problem, got %v", p)
+	}
+
+	// NO FALSE POSITIVE: a cross-ZONE prototype ref is deferred (its zone may be out of a scoped reload's
+	// scope) even though it isn't in the loaded set.
+	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "other:mob:x", Room: "mid:room:1"})); len(p) != 0 {
+		t.Fatalf("cross-zone proto wrongly flagged: %v", p)
+	}
+
+	// A cross-zone proto that IS present in the loaded set (a second zone) resolves — not flagged.
+	twoZone := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+		{
+			Ref:    "mid",
+			Rooms:  []content.RoomDTO{{Ref: "mid:room:1"}},
+			Resets: []content.ResetDTO{{Op: "spawn_mob", Proto: "wood:mob:elf", Room: "mid:room:1"}},
+		},
+		{Ref: "wood", Mobs: []content.ProtoDTO{{Ref: "wood:mob:elf"}}},
+	}}}
+	if p := validateResets(twoZone); len(p) != 0 {
+		t.Fatalf("resolvable cross-zone proto flagged: %v", p)
+	}
+
+	// The `into` container target is NOT judged (runtime instance lookup) — neither an intra-zone-shaped nor
+	// a garbage/cross-zone `into` blocks, proving the field is skipped regardless of form.
+	for _, into := range []string{"mid:obj:nonexistent", "utter garbage", "other:obj:x"} {
+		reset := packWith(content.ResetDTO{Op: "spawn_item", Proto: "mid:obj:torch", Room: "mid:room:1", Into: into})
+		if p := validateResets(reset); len(p) != 0 {
+			t.Fatalf("into=%q should not be judged: %v", into, p)
+		}
+	}
+
+	// Count/Max/Persistent are DELIBERATELY not judged (they affect the spawn ceiling / durable path, not
+	// whether a ref resolves): a persistent reset with zero count/max but valid refs validates clean.
+	persistent := packWith(content.ResetDTO{Op: "spawn_item", Proto: "mid:obj:torch", Room: "mid:room:1", Persistent: true, Count: 0, Max: 0})
+	if p := validateResets(persistent); len(p) != 0 {
+		t.Fatalf("persistent/zero-count reset with valid refs flagged: %v", p)
+	}
+
+	// A reset naming a ROOM ref as its prototype is degenerate but z.spawn RESOLVES it (rooms share the
+	// proto cache), so it must NOT be flagged (regression guard for the rooms-in-protoRefs fix).
+	roomAsProto := packWith(content.ResetDTO{Op: "spawn_item", Proto: "mid:room:1", Room: "mid:room:1"})
+	if p := validateResets(roomAsProto); len(p) != 0 {
+		t.Fatalf("room-ref-as-proto wrongly flagged (rooms are in the proto cache): %v", p)
+	}
+
+	// Cross-PACK proto resolution: pack A's reset references a proto defined in pack B's zone. The shared
+	// cache spans packs, so protoRefs is global — it resolves, no flag.
+	crossPack := []content.Pack{
+		{Pack: "a", Zones: []content.ZoneDTO{{
+			Ref:    "mid",
+			Rooms:  []content.RoomDTO{{Ref: "mid:room:1"}},
+			Resets: []content.ResetDTO{{Op: "spawn_mob", Proto: "wood:mob:elf", Room: "mid:room:1"}},
+		}}},
+		{Pack: "b", Zones: []content.ZoneDTO{{Ref: "wood", Mobs: []content.ProtoDTO{{Ref: "wood:mob:elf"}}}}},
+	}
+	if p := validateResets(crossPack); len(p) != 0 {
+		t.Fatalf("cross-pack proto resolution flagged: %v", p)
+	}
+
+	// Multiple defects in one reset are each surfaced — assert on CONTENT (which two), not a bare count.
+	multi := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:99"}))
+	joined := strings.Join(multi, " | ")
+	if !strings.Contains(joined, "target room") || !strings.Contains(joined, "not defined") {
+		t.Fatalf("multi-defect reset should surface both the room AND the proto problem, got: %v", multi)
+	}
+
+	// The gate rides validatePacks, so a broken reset blocks a publish.
+	if p := validatePacks(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:1"})); len(p) != 1 {
+		t.Fatalf("validatePacks did not surface the reset defect: %v", p)
 	}
 }
 
