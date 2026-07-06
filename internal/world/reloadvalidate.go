@@ -31,9 +31,10 @@ import (
 // to a room that provably does not exist. Rooms also hot-swap here (the per-ref applier + resyncRoom, #191),
 // so an edit that adds a room with a broken exit is caught before it propagates. validateResets (#197 slice
 // 2b) checks zone reset references (unknown op / undefined target room / undefined prototype) — a pack-HEALTH
-// check (resets don't hot-swap; they run at boot/repop), catching a broken edit before broadcast. Remaining
-// #197 work: item/mob prototype buildability and a full-graph dry-run for cross-pack cycles a scoped reload
-// misses. The framework — collect problems -> gate the publish -> report to the builder — is what each slots into.
+// check (resets don't hot-swap; they run at boot/repop), catching a broken edit before broadcast.
+// validateProtoRefs (#197 slice 2c) rejects a prototype ref collision — two rooms/items/mobs sharing a ref
+// silently collapse to one in the shared cache. Remaining #197 work: a full-graph dry-run for cross-pack
+// cycles a scoped reload misses. The framework — collect problems -> gate the publish -> report — is what each slots into.
 //
 // Validation is PURE over the parsed DTOs (it reuses parseAttributeBase + lintAttributeCycles and builds a
 // THROWAWAY attributeDef map — never the shard's live registries), so it is safe on the off-zone-goroutine
@@ -83,6 +84,62 @@ func validatePacks(loaded []content.Pack) []string {
 	// Reset-reference sanity (#197 slice 2b) — a pack-HEALTH check (resets do NOT hot-swap; they run at
 	// boot/repop), catching a bad edit before it is broadcast rather than at the next reset.
 	problems = append(problems, validateResets(loaded)...)
+	// Prototype ref sanity (#197 slice 2c): a collision silently collapses content in the shared cache.
+	problems = append(problems, validateProtoRefs(loaded)...)
+	return problems
+}
+
+// validateProtoRefs reports a problem per prototype (room/item/mob) that would be SILENTLY DROPPED from the
+// shared per-shard proto cache: an empty ref, or a ref that COLLIDES with another prototype's. defineContent
+// (build.go) registers every loaded zone's rooms, items and mobs into ONE cache via protoCache.define, which
+// does `next[ref] = p` — a last-write-wins overwrite. So two prototypes sharing a ref (a room and an item, a
+// mob in another zone, a copy-paste that forgot to rename) silently collapse to one at boot with NO error;
+// the dropped content just never spawns. This gate rejects that before it is broadcast.
+//
+// Faithful with no false positives. It first mirrors content.Load's cross-pack ZONE dedup (whole-zone
+// last-write-wins by ref — loader.go): the validator sees the raw []content.Pack, so on a bare `reload`
+// two packs that legitimately OVERRIDE the same zone both appear, and their (identical) rooms would look
+// like collisions; deduping zones by ref first collapses the override to the single zone the cache actually
+// builds, exactly as boot does. After dedup, each zone ref appears once (rooms/items/mobs already unioned
+// within a pack by packtree), so a surviving duplicate ref is a genuine cross-zone / cross-kind collision.
+func validateProtoRefs(loaded []content.Pack) []string {
+	// Cross-pack zone dedup: last-write-wins by zone ref, order preserved — the set defineContent builds.
+	zonesByRef := map[string]content.ZoneDTO{}
+	var order []string
+	for i := range loaded {
+		for _, z := range loaded[i].Zones {
+			if _, seen := zonesByRef[z.Ref]; !seen {
+				order = append(order, z.Ref)
+			}
+			zonesByRef[z.Ref] = z
+		}
+	}
+	var problems []string
+	// owner records the first zone that claimed a ref, so a collision names both sides.
+	owner := map[string]string{}
+	check := func(zoneRef, kind, ref string) {
+		if strings.TrimSpace(ref) == "" {
+			problems = append(problems, fmt.Sprintf("zone %q: %s prototype with empty ref", zoneRef, kind))
+			return
+		}
+		if prev, ok := owner[ref]; ok {
+			problems = append(problems, fmt.Sprintf("prototype ref %q is defined more than once (zones %q and %q) — the later one silently overwrites the earlier in the shared cache", ref, prev, zoneRef))
+			return
+		}
+		owner[ref] = zoneRef
+	}
+	for _, zref := range order {
+		z := zonesByRef[zref]
+		for _, r := range z.Rooms {
+			check(zref, "room", r.Ref)
+		}
+		for _, p := range z.Items {
+			check(zref, "item", p.Ref)
+		}
+		for _, p := range z.Mobs {
+			check(zref, "mob", p.Ref)
+		}
+	}
 	return problems
 }
 
