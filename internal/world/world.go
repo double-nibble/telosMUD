@@ -871,6 +871,125 @@ func (z *Zone) resyncRoom(ref ProtoRef) {
 	z.log.Debug("hot reload: live room re-synced from new prototype", "ref", ref)
 }
 
+// removeRoom tears a room that content DELETED out of the live zone (#191), the risky third case the zone-
+// shape reconcile drives when a room ref that was live is no longer in the reloaded content. It runs on the
+// zone goroutine (single-writer over z.rooms / z.players), so nothing races the teardown. It:
+//   - RE-PLACES player occupants to the zone start room via z.relocate (they get the start room's look +
+//     GMCP, never stranded looking at a gone room). A frozen session (mid cross-shard handoff) is skipped —
+//     its entity is being transferred and the destination will place it.
+//   - DESPAWNS ephemeral mobs and items in the room (never relocates them — that would dump every deleted
+//     zone's population into the start room).
+//   - drops the singleton from z.rooms, its Lua script state, and its prototype from the cache.
+//
+// It is IDEMPOTENT: a ref that is not (or no longer) live is a clean no-op, so a re-delivered reconcile or a
+// removal racing an earlier one is harmless. It REFUSES to remove the live start room — deleting the login
+// room out from under players is a content error; the reconcile applies a start_room change BEFORE removals,
+// so repointing start_room first is what makes the old start room removable. Dangling exits from surviving
+// rooms INTO the removed room are left as-is: they fail closed at move time (z.rooms lookup miss), and the
+// exits map is the immutable shared prototype's — mutating a neighbour's exits to "clean up" would COW-
+// corrupt a shared component. A load-time lint for that is a tracked follow-up.
+func (z *Zone) removeRoom(ref ProtoRef) {
+	e := z.rooms[ref]
+	if e == nil {
+		return // never hosted here, or already removed — idempotent no-op
+	}
+	if ref == z.startRoom {
+		z.log.Warn("hot reload: refusing to remove the live zone start room; repoint start_room first",
+			"zone", z.id, "room", ref)
+		return
+	}
+	dest := z.resolveRoom(z.startRoom)
+	if dest == nil || dest == e {
+		// No safe fallback (start room unresolvable — e.g. the whole zone was deleted). Leave the room
+		// rather than strand occupants nowhere; a re-run with a valid start room converges.
+		z.log.Warn("hot reload: no safe fallback room; skipping room removal", "zone", z.id, "room", ref)
+		return
+	}
+	// Snapshot occupants first: relocate/despawn Move()s them, which mutates e.contents underneath a live
+	// range (the same trap the death.go corpse loop guards against).
+	occupants := make([]*Entity, len(e.contents))
+	copy(occupants, e.contents)
+	for _, occ := range occupants {
+		if occ == nil {
+			continue
+		}
+		if s, ok := sessionOf(occ); ok {
+			// Defensive: a frozen session is mid cross-shard handoff. In the normal handoff path its entity
+			// is already Move()d to nil at freeze (drain.go), so it is NOT in this snapshot — but guard anyway
+			// so a future frozen-but-still-placed state can never be yanked out from under an in-flight
+			// transfer (that would race the destination's attach).
+			if s.frozen {
+				continue
+			}
+			z.relocate(s, dest)
+			continue
+		}
+		z.despawnRoomContent(occ) // an ephemeral mob or item: destroy, don't relocate
+	}
+	delete(z.rooms, ref)
+	if z.lua != nil {
+		z.lua.dropEntityScript(e.rid) // the room's own trigger state, if it carried a script
+	}
+	// Drop the prototype (nil == remove). NOTE (writer convention): protoCache is the SHARD-wide cache and
+	// its documented runtime writer is the reload-applier (subscriber) goroutine; here the ZONE goroutine
+	// writes it because in the reconcile model the zone is the authoritative knower of a content-DELETION
+	// (no invalidation names a deleted ref — PublishPack only emits present refs), and the applier cannot
+	// know. protoCache.reload is a mutex-guarded copy-and-swap, so this concurrent writer is memory-safe; PR
+	// 2 (the reconcile that drives this) retires resyncRoom's REMOVE stub and confirms this single owner.
+	z.protos.reload(ref, nil)
+	z.log.Debug("hot reload: live room removed", "zone", z.id, "room", ref)
+}
+
+// relocate forcibly evacuates a live player to dest (#191 room removal) — a directionless move mirroring the
+// ARRIVAL tail of move(): disengage any combat, announce the departure/arrival, Move, then z.lookRoom (the
+// single chokepoint that re-emits the room text AND the change-detected GMCP Room.Info, so the player is not
+// left staring at a room that is gone), room affects, aggro, and a prompt. It deliberately does NOT fire the
+// OnLeaveRoom checkpoint (a forced evacuation of a deleted room grants no opportunity attacks) nor the FROM
+// room's `leave` trigger (that room is being destroyed). Zone goroutine only.
+func (z *Zone) relocate(s *session, dest *Entity) {
+	if s == nil || s.entity == nil || dest == nil {
+		return
+	}
+	z.disengage(s.entity) // sever any combat link before the yank — no fighting pointer survives the move
+	z.actConceal("$n vanishes as the area shifts.", s.entity, ToRoom)
+	s.send(textFrame("The ground shifts and you are swept somewhere safe."))
+	Move(s.entity, dest)
+	z.actConceal("$n arrives.", s.entity, ToRoom)
+	z.lookRoom(s)
+	applyRoomAffectsTo(s.entity) // room-scoped affects land on the arrival, as a normal move does
+	z.aggroOnEntry(s.entity, dest)
+	z.sendPrompt(s)
+}
+
+// despawnRoomContent destroys an ephemeral mob or item that was in a removed room (#191). It severs combat
+// and threat links (a mob fighting a relocated player, a threat-table entry) so no stale pointer survives,
+// detaches from the world tree (Move to nil, which also unequips a worn item), and drops any Lua trigger /
+// spawn-census state so a repop-on-timer zone does not leak an entityScript per destroyed mob. This is a
+// content-deletion despawn, NOT a death — no corpse, loot, or on-kill hook fires. Zone goroutine only.
+func (z *Zone) despawnRoomContent(e *Entity) {
+	if e == nil {
+		return
+	}
+	// Recurse into held/contained entities FIRST (a mob's carried inventory, a container's contents) so
+	// their Lua spawn-census / entityScript state is dropped too — otherwise a destroyed mob's carried
+	// scripted item leaks those map entries. Snapshot first: Move mutates e.contents underneath the range.
+	// Containment is a tree (an entity has one location), so the recursion terminates.
+	held := make([]*Entity, len(e.contents))
+	copy(held, e.contents)
+	for _, c := range held {
+		z.despawnRoomContent(c)
+	}
+	if e.living != nil {
+		z.disengage(e)
+		z.scrubThreat(e)
+	}
+	Move(e, nil)
+	if z.lua != nil {
+		z.lua.dropEntityScript(e.rid)
+		z.lua.dropLuaSpawn(e.rid)
+	}
+}
+
 // newDemoZone has moved to build.go: the hand-authored body is GONE (Phase 4.1). It is now a
 // thin wrapper that loads the EMBEDDED demo content pack into the shared per-shard cache and
 // builds the named zone via the content loader, producing byte-identical prototypes. The
