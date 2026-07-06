@@ -614,3 +614,42 @@ func TestReloadCommandRejectsBrokenPackEndToEnd(t *testing.T) {
 		t.Fatalf("a rejected reload published %d invalidations; it must publish none", n)
 	}
 }
+
+// TestReloadCommandCheckOnlyEndToEnd proves the `reload <pack> --check` pre-flight full path: a builder runs
+// it under a live zone loop, gets a "validated OK" readout, and NOTHING hits the bus (a dry run never
+// propagates). #192 Slice 2.
+func TestReloadCommandCheckOnlyEndToEnd(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+	s := newReloadShard(t, src, bus)
+	z := s.Zone()
+
+	var published int64
+	spy, err := bus.Subscribe(func(contentbus.Invalidation) { atomic.AddInt64(&published, 1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = spy.Unsubscribe() }()
+
+	builder := &session{character: "Builder", tier: tierBuilder, out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(builder, "Builder")
+	z.players["Builder"] = builder
+	Move(builder.entity, z.rooms["rt:room:hall"])
+	setFlag(builder.entity, flagBuilder, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go z.Run(ctx)
+
+	z.post(inputMsg{id: "Builder", line: "reload reloadtest --check", seq: 1})
+
+	if !drainContains(t, builder, "validated OK") {
+		t.Fatal("builder never received a 'validated OK' readout from reload --check")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := atomic.LoadInt64(&published); n != 0 {
+		t.Fatalf("reload --check published %d invalidations; a dry run must publish none", n)
+	}
+}

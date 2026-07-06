@@ -56,9 +56,10 @@ func cmdReload(c *Context) error {
 	}
 	r := sh.reloader
 	// Pack names are content-defined identifiers, NOT verbs — do not case-fold them (a pack "Core" must stay
-	// "Core"); the bare/"all" keyword is matched case-insensitively in scopePacks.
-	arg := strings.TrimSpace(c.Arg(0))
-	packs, msg := r.scopePacks(arg)
+	// "Core"); the bare/"all" keyword is matched case-insensitively in scopePacks. `--check` is a dry-run
+	// flag (validate, report, publish NOTHING) — the builder's pre-flight (#192).
+	scope, checkOnly := parseReloadArgs(c.Rest())
+	packs, msg := r.scopePacks(scope)
 	if msg != "" {
 		c.Send(msg)
 		return nil
@@ -70,14 +71,18 @@ func cmdReload(c *Context) error {
 		c.Send("reload: this shard's content source cannot re-read packs; reload unavailable.")
 		return nil
 	}
-	c.Send(fmt.Sprintf("reload: validating and propagating %s… (the result follows in the background)", packLabel(packs)))
+	if checkOnly {
+		c.Send(fmt.Sprintf("reload: validating %s (check only — nothing will propagate)…", packLabel(packs)))
+	} else {
+		c.Send(fmt.Sprintf("reload: validating and propagating %s… (the result follows in the background)", packLabel(packs)))
+	}
 	// Off the zone goroutine: each publish flushes to NATS (a per-ref round-trip), so a synchronous loop
 	// here would stall the zone. Capture the triggering zone + builder id as locals (immutable) so the
 	// goroutine can post the OUTCOME back to be shown on the zone goroutine (reloadDoneMsg) — the applier
 	// on every shard (this one included) re-reads and swaps in the meantime.
 	z, pid, label := c.z, c.s.character, packLabel(packs)
 	go func() {
-		out := r.republish(context.Background(), packs)
+		out := r.republish(context.Background(), packs, checkOnly)
 		var summary string
 		switch {
 		case len(out.rejected) > 0:
@@ -85,6 +90,8 @@ func cmdReload(c *Context) error {
 			// builder can fix the pack before re-running.
 			summary = fmt.Sprintf("reload: %s REJECTED — content failed validation, nothing propagated:\r\n  - %s",
 				label, strings.Join(out.rejected, "\r\n  - "))
+		case out.checkOnly:
+			summary = fmt.Sprintf("reload --check: %s validated OK — no problems found (nothing propagated).", label)
 		case out.failed && out.published == 0:
 			summary = fmt.Sprintf("reload: %s — propagation FAILED, 0 definitions published; see the server log.", label)
 		case out.failed:
@@ -95,6 +102,24 @@ func cmdReload(c *Context) error {
 		z.postOrDrop(reloadDoneMsg{player: pid, summary: summary})
 	}()
 	return nil
+}
+
+// parseReloadArgs splits the `reload` command tail into the pack-scope arg and the check-only (dry-run)
+// flag. Recognized: `reload`, `reload <pack>`, `reload --check`, `reload <pack> --check` (flag in either
+// position). The scope is the first non-flag token (empty => all loaded packs); a pack name is NOT
+// case-folded (it is a content identifier, not a verb).
+func parseReloadArgs(rest string) (scope string, checkOnly bool) {
+	for _, tok := range strings.Fields(rest) {
+		switch tok {
+		case "--check", "-n":
+			checkOnly = true
+		default:
+			if scope == "" {
+				scope = tok
+			}
+		}
+	}
+	return scope, checkOnly
 }
 
 // scopePacks resolves the command argument to the pack list to republish: empty/"all" => every pack this
@@ -141,7 +166,7 @@ func (r *reloader) enabledSorted() []string {
 // Validation gates ONLY the publish, never the live cache — a broken pack is simply not propagated, and the
 // per-ref applier's fail-safe (keep last-known on a re-read error) remains the runtime backstop. A re-read
 // failure stays best-effort (failed, logged), NOT a hard content rejection, since it may be transient.
-func (r *reloader) republish(ctx context.Context, packs []string) reloadOutcome {
+func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool) reloadOutcome {
 	src, ok := r.src.(content.Source)
 	if !ok {
 		r.log.Warn("reload: content source cannot re-read whole packs; reload skipped", "packs", packs)
@@ -159,10 +184,16 @@ func (r *reloader) republish(ctx context.Context, packs []string) reloadOutcome 
 		return reloadOutcome{failed: true}
 	}
 	// #192 GATE: dry-run validate against the boot builders. Definitively-broken content blocks the publish
-	// fleet-wide (shared-source convergence), so a bad edit never propagates.
+	// fleet-wide (shared-source convergence), so a bad edit never propagates. This runs for BOTH a real
+	// reload and a `--check` dry run.
 	if problems := validatePacks(loaded); len(problems) > 0 {
 		r.log.Warn("reload: content failed validation; nothing propagated", "packs", packs, "problems", problems)
 		return reloadOutcome{rejected: problems}
+	}
+	if checkOnly {
+		// Pre-flight: the content validated, but a dry run deliberately publishes nothing.
+		r.log.Info("reload --check: content validated (dry run, nothing published)", "packs", packs)
+		return reloadOutcome{checkOnly: true}
 	}
 	out := reloadOutcome{}
 	for _, pk := range loaded {

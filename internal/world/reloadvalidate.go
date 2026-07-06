@@ -38,9 +38,10 @@ import (
 // three cases: a clean propagation, a validation REJECTION (nothing published — the content is broken), and
 // a best-effort INFRA failure (a re-read/publish blip; the applier's per-ref fail-safe is the backstop).
 type reloadOutcome struct {
-	published int      // invalidations put on the wire (0 when rejected)
+	published int      // invalidations put on the wire (0 when rejected or check-only)
 	rejected  []string // validation problems; NON-EMPTY => nothing was published (a hard content gate)
 	failed    bool     // an infrastructure failure (re-read/publish error) — logged, best-effort
+	checkOnly bool     // true => a `reload --check` dry run that validated OK and deliberately published nothing
 }
 
 // validatePacks returns one human-readable problem per definitively-broken thing in the re-read packs, or
