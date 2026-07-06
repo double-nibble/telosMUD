@@ -183,10 +183,9 @@ func TestStorePackRoundTrip(t *testing.T) {
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 
-	data, err := content.DemoPackBytes()
+	pk, found, err := content.LoadPack(content.DemoPack)
 	require.NoError(t, err)
-	pk, err := content.ParsePack(data)
-	require.NoError(t, err)
+	require.True(t, found, "embedded demo pack present")
 	require.NoError(t, p.ImportPack(ctx, pk), "import demo pack")
 
 	fromDB, err := content.Load(ctx, p, []string{content.DemoPack})
@@ -279,10 +278,9 @@ func TestImportPackIdempotent(t *testing.T) {
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 
-	data, err := content.DemoPackBytes()
+	pk, found, err := content.LoadPack(content.DemoPack)
 	require.NoError(t, err)
-	pk, err := content.ParsePack(data)
-	require.NoError(t, err)
+	require.True(t, found, "embedded demo pack present")
 
 	require.NoError(t, p.ImportPack(ctx, pk), "first import")
 	// THE REGRESSION: the second import must strip-and-replace, not collide on a duplicate key.
