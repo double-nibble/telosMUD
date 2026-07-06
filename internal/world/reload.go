@@ -46,8 +46,11 @@ type reloader struct {
 	bus   contentbus.Bus           // the invalidation bus
 	sub   contentbus.Subscription  // live subscription; Unsubscribe on stop
 	packs map[string]bool          // packs this shard loads; an edit to another pack is ignored
-	shard *Shard                   // the hosting shard — to post a reloadLuaMsg to each zone (7.7); nil on a bare test
-	log   *slog.Logger
+	// enabled is the same pack set as packs, kept as the ORDERED boot list so the `reload` staff command
+	// (reloadcmd.go) can iterate + display them deterministically. Set once at construction, read-only.
+	enabled []string
+	shard   *Shard // the hosting shard — to post a reloadLuaMsg to each zone (7.7); nil on a bare test
+	log     *slog.Logger
 }
 
 // newReloader wires a reloader over src/cache/bus for the given enabled packs and SUBSCRIBES. A
@@ -58,12 +61,13 @@ func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus
 		return nil
 	}
 	r := &reloader{
-		src:   src,
-		cache: cache,
-		bus:   bus,
-		packs: map[string]bool{},
-		shard: shard,
-		log:   slog.With("component", "contentreload"),
+		src:     src,
+		cache:   cache,
+		bus:     bus,
+		packs:   map[string]bool{},
+		enabled: append([]string(nil), enabledPacks...),
+		shard:   shard,
+		log:     slog.With("component", "contentreload"),
 	}
 	for _, p := range enabledPacks {
 		r.packs[p] = true
