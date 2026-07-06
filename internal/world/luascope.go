@@ -213,7 +213,13 @@ func (rt *luaRuntime) fireScopeEvent(kind, event string, payload json.RawMessage
 //
 // COST: this front-loads all deferred priming for the zone into the FIRST broadcast tick after a mass spawn
 // (N registrations back-to-back on the zone goroutine). Each registration is idempotent and runs once per
-// instance, and broadcasts are low-rate, so it is a bounded one-time spike, not sustained load.
+// instance (ensureEntityScript early-returns a built script), and broadcasts are low-rate, so it is a bounded
+// one-time spike, not sustained load.
+//
+// The tree walk itself DELIBERATELY runs on every broadcast (not one-shot-latched): a mob spawned AFTER an
+// earlier broadcast — a zone repop, a Lua spawn — must still get its scope handler primed by the next
+// broadcast. A "primed once" latch would silently skip such late arrivals, reopening this very gap. The
+// repeat cost is only the pointer walk + a map probe per entity (no Lua re-runs), which is cheap.
 func (rt *luaRuntime) primeScopeHandlers() {
 	var scripted []*Entity
 	for _, room := range rt.zone.rooms {
