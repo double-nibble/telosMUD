@@ -42,6 +42,38 @@ func defineContent(c *protoCache, lc *content.LoadedContent) {
 			c.define(ProtoRef(p.Ref), p.Keywords, p.Short, p.Long, protoComponents(p))
 		}
 	}
+	// Content-lint (#194): warn on any room whose ref prefix != its owning zone. Build-time, non-fatal.
+	for _, m := range lintRoomZonePrefixes(lc) {
+		slog.Warn("content: room ref prefix does not match its owning zone; cross-zone exits will misroute "+
+			"and a hot-reload new-room add (#191) will skip it — author the room as <zone>:...",
+			"room", m.room, "zone", m.zone, "ref_prefix", m.refZone)
+	}
+}
+
+// roomZonePrefixMiss is one content-lint finding: a room whose ref prefix (parseRef's zone) differs from
+// the zone it is authored in.
+type roomZonePrefixMiss struct{ room, zone, refZone string }
+
+// lintRoomZonePrefixes returns a finding for every room whose ref does NOT carry its owning zone's ref as
+// the prefix. Cross-zone exit ROUTING and the hot-reload new-room ownership guard (#191, resyncRoom) both
+// key a room to a zone by that prefix (parseRef), but boot assigns a room to a zone by its content `rooms:`
+// LIST membership — so a divergent ref boots fine yet misroutes cross-zone exits and is skipped by a
+// hot-reload ADD. Build-time only; the caller logs (does not abort boot), like the other content-lints.
+// The demo pack keeps prefix==zone, so it is silent there.
+func lintRoomZonePrefixes(lc *content.LoadedContent) []roomZonePrefixMiss {
+	if lc == nil {
+		return nil
+	}
+	var misses []roomZonePrefixMiss
+	for i := range lc.Zones {
+		z := &lc.Zones[i]
+		for _, r := range z.Rooms {
+			if zoneOf, _ := parseRef(ProtoRef(r.Ref)); zoneOf != z.Ref {
+				misses = append(misses, roomZonePrefixMiss{room: r.Ref, zone: z.Ref, refZone: zoneOf})
+			}
+		}
+	}
+	return misses
 }
 
 // defineGlobals registers every PACK-GLOBAL definition (attributes/resources/damage-types) from lc
