@@ -80,6 +80,44 @@ func TestReloadRepublish(t *testing.T) {
 	}
 }
 
+// TestReloadRejectsBrokenReset proves the #197 pre-publish gate is actually WIRED into republish (the seam
+// a validateResets unit test can't cover): a pack whose zone reset references an undefined intra-zone
+// prototype is REJECTED, so republish publishes NOTHING and ZERO invalidations reach the bus. Without the
+// validatePacks call in republish this test goes red — every other republish test stays green.
+func TestReloadRejectsBrokenReset(t *testing.T) {
+	pack := reloadTestPack()
+	// A reset spawning a prototype the zone does not define — applyReset would log-and-skip it (spawns
+	// nothing), so the gate rejects the pack before broadcasting it.
+	pack.Zones[0].Resets = []content.ResetDTO{
+		{Op: "spawn_mob", Proto: "rt:mob:ghost", Room: "rt:room:hall"},
+	}
+	src := content.NewMemSource()
+	src.SetPack(pack)
+	bus := contentbus.NewMemBus()
+	defer func() { _ = bus.Close() }()
+	s := newReloadShard(t, src, bus)
+
+	var count int64
+	sub, err := bus.Subscribe(func(contentbus.Invalidation) { atomic.AddInt64(&count, 1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	out := s.reloader.republish(context.Background(), []string{"reloadtest"}, false)
+	if len(out.rejected) == 0 {
+		t.Fatalf("republish must REJECT a pack with a dangling reset proto; got %+v", out)
+	}
+	if out.published != 0 || out.failed {
+		t.Fatalf("a rejected pack must publish nothing and not be an infra failure; got %+v", out)
+	}
+	// Give any (erroneous) async fan-out a chance to land, then assert the bus saw NOTHING.
+	time.Sleep(50 * time.Millisecond)
+	if got := atomic.LoadInt64(&count); got != 0 {
+		t.Fatalf("a rejected reload must put ZERO invalidations on the bus; got %d", got)
+	}
+}
+
 // TestReloadDoneDelivery proves the async fan-out readout reaches the builder only while they are still
 // present: a reloadDoneMsg for a resident player is sent to their session; one for an absent player is a
 // safe no-op (the guard that keeps the off-goroutine path from sending to a torn-down session).

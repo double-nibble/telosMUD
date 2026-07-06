@@ -29,9 +29,11 @@ import (
 // (reloadChannel/buildChannelDef), so a structurally-dead channel is rejected against the same build path.
 // validateRoomExits (#197 slice 2) adds the FIRST room-graph payload check: a dangling exit — one pointing
 // to a room that provably does not exist. Rooms also hot-swap here (the per-ref applier + resyncRoom, #191),
-// so an edit that adds a room with a broken exit is caught before it propagates. Remaining #197 work: item/
-// mob prototype buildability and a full-graph dry-run for cross-pack cycles a scoped reload misses. The
-// framework here — collect problems -> gate the publish -> report to the builder — is what each check slots into.
+// so an edit that adds a room with a broken exit is caught before it propagates. validateResets (#197 slice
+// 2b) checks zone reset references (unknown op / undefined target room / undefined prototype) — a pack-HEALTH
+// check (resets don't hot-swap; they run at boot/repop), catching a broken edit before broadcast. Remaining
+// #197 work: item/mob prototype buildability and a full-graph dry-run for cross-pack cycles a scoped reload
+// misses. The framework — collect problems -> gate the publish -> report to the builder — is what each slots into.
 //
 // Validation is PURE over the parsed DTOs (it reuses parseAttributeBase + lintAttributeCycles and builds a
 // THROWAWAY attributeDef map — never the shard's live registries), so it is safe on the off-zone-goroutine
@@ -78,6 +80,89 @@ func validatePacks(loaded []content.Pack) []string {
 	// checked against the same build path boot uses (#197 slices 1 + 2).
 	problems = append(problems, validateChannels(loaded)...)
 	problems = append(problems, validateRoomExits(loaded)...)
+	// Reset-reference sanity (#197 slice 2b) — a pack-HEALTH check (resets do NOT hot-swap; they run at
+	// boot/repop), catching a bad edit before it is broadcast rather than at the next reset.
+	problems = append(problems, validateResets(loaded)...)
+	return problems
+}
+
+// validateResets reports one problem per zone reset that would spawn NOTHING — a reset applyReset (reset.go)
+// silently logs-and-skips: an unknown op, a target room that is not a room of the reset's own zone, or a
+// prototype that is not defined. Resets do NOT hot-swap on the reload path (PublishPack propagates room/
+// item/mob/channel invalidations, never resets — they take effect at boot and on the repop timer), so unlike
+// the channel/room checks this is a pack-HEALTH check (catch a broken edit before broadcasting it), in the
+// same spirit as the attribute checks. It is faithful to applyReset's resolution rules and holds the no-
+// false-positive invariant:
+//
+//   - OP: applyReset understands only {spawn_item, spawn_mob, ""}; any other op is a dead reset (it warns
+//     "op not understood" and spawns nothing). Flagged in any scope — the op vocabulary is engine-fixed.
+//   - ROOM: applyReset resolves the target via z.rooms[ref] — the reset's OWN zone's rooms ONLY (a reset
+//     never places into another zone). So a Room absent from the owning zone's authored room set is provably
+//     dangling in ANY scope (the owning zone is always loaded whole here), regardless of ref prefix — a
+//     cross-zone-looking Room can never resolve at runtime. An empty Room is dead.
+//   - PROTO: applyReset resolves via z.spawn, which reads the SHARED per-shard proto cache. That cache holds
+//     every loaded zone's ROOM, item AND mob prototypes (defineContent registers all three — build.go), so a
+//     reset naming a room ref as its proto is degenerate but still spawns SOMETHING; the resolvable set here
+//     therefore includes rooms too, to avoid a false positive. An intra-zone prototype (its ref prefix == the
+//     reset's zone) absent from the loaded set is provably undefined; a CROSS-zone prototype may live in a
+//     pack outside a scoped reload's scope, so it is deferred (never falsely rejected). An empty Proto is dead.
+//
+// The `into` container target is a RUNTIME instance lookup (intoTargetInRoom finds a live container/mob in
+// the room, dependent on earlier resets' spawn order), so it cannot be judged statically and is deliberately
+// not checked — no false positive.
+func validateResets(loaded []content.Pack) []string {
+	// The shared proto cache z.spawn reads: every loaded zone's ROOM, item AND mob prototype refs
+	// (defineContent registers all three into one cache — build.go). Rooms are included so a reset naming a
+	// room ref as its proto — degenerate, but z.spawn resolves it and applyReset does spawn it — is not a
+	// false positive.
+	protoRefs := map[string]bool{}
+	for i := range loaded {
+		for _, z := range loaded[i].Zones {
+			for _, r := range z.Rooms {
+				protoRefs[r.Ref] = true
+			}
+			for _, p := range z.Items {
+				protoRefs[p.Ref] = true
+			}
+			for _, p := range z.Mobs {
+				protoRefs[p.Ref] = true
+			}
+		}
+	}
+	var problems []string
+	for i := range loaded {
+		for _, z := range loaded[i].Zones {
+			// The reset's target room resolves against THIS zone's rooms only (z.rooms).
+			zoneRooms := make(map[string]bool, len(z.Rooms))
+			for _, r := range z.Rooms {
+				zoneRooms[r.Ref] = true
+			}
+			for ri := range z.Resets {
+				r := &z.Resets[ri]
+				switch r.Op {
+				case "spawn_item", "spawn_mob", "":
+					// understood — check its references below.
+				default:
+					problems = append(problems, fmt.Sprintf("zone %q reset: unknown op %q (understood: spawn_item, spawn_mob)", z.Ref, r.Op))
+					continue // a dead reset; its refs are moot
+				}
+				if strings.TrimSpace(r.Room) == "" {
+					problems = append(problems, fmt.Sprintf("zone %q reset (proto %q): empty target room", z.Ref, r.Proto))
+				} else if !zoneRooms[r.Room] {
+					problems = append(problems, fmt.Sprintf("zone %q reset: target room %q is not a room of this zone", z.Ref, r.Room))
+				}
+				if strings.TrimSpace(r.Proto) == "" {
+					problems = append(problems, fmt.Sprintf("zone %q reset (room %q): empty prototype", z.Ref, r.Room))
+				} else if !protoRefs[r.Proto] {
+					// Undefined only DEFINITIVELY when the proto belongs to a loaded zone: an intra-zone ref
+					// (prefix == this zone) is provably undefined; a cross-zone ref may be out of scope.
+					if pz, _ := parseRef(ProtoRef(r.Proto)); pz == z.Ref {
+						problems = append(problems, fmt.Sprintf("zone %q reset: prototype %q is not defined", z.Ref, r.Proto))
+					}
+				}
+			}
+		}
+	}
 	return problems
 }
 
