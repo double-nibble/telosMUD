@@ -38,6 +38,9 @@ const rankStaff = 1
 func staffCommands() []*Command {
 	return []*Command{
 		{Name: "stat", MinRank: rankStaff, Flags: CmdHidden, Run: cmdStat},
+		// `reload [<pack>]` (#53): propagate a content hot-reload across the fleet (reloadcmd.go). Staff-
+		// gated + hidden like `stat`; registered here so it never shadows/abbreviates a mortal verb.
+		{Name: "reload", MinRank: rankStaff, Flags: CmdHidden, Run: cmdReload},
 	}
 }
 
