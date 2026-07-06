@@ -821,16 +821,37 @@ func (z *Zone) spawnRoom(ref ProtoRef) *Entity {
 // new prototype, so the edit takes effect on the live room the builder is standing in.
 //
 // Occupants are untouched — this only refreshes the room's OWN authored fields, never its containment —
-// so no player is moved (the risky add/remove-rooms reconciliation is deferred, #191). Rooms are
-// runtime-immutable (nothing COWs a room's component), so the live entity still aliases the prototype's
-// component; re-pointing to the new prototype's is the same aliasing spawn establishes. A room this zone
-// does not host (nil in z.rooms), or a deleted prototype (removal deferred), is left as-is.
+// so no player is moved. Rooms are runtime-immutable (nothing COWs a room's component), so the live entity
+// still aliases the prototype's component; re-pointing to the new prototype's is the same aliasing spawn
+// establishes.
+//
+// Three cases by (live entity, new prototype):
+//   - UPDATE (both present): re-point the singleton's fields, below — the common edit.
+//   - ADD (no live entity, prototype present): a room NEW to this zone's graph. Spawn it live so exits INTO
+//     it (resolved by ProtoRef at move time) resolve. Guarded to THIS zone by the ref's zone prefix
+//     (parseRef), since the invalidation fans out to every hosted zone. New rooms have no occupants, so this
+//     is safe; zone resets are NOT re-run (a bare room). CAVEAT: boot assigns a room to a zone by its
+//     content `rooms:` LIST membership (build.go buildZone), not by ref prefix — the prefix==zone rule is
+//     the same one cross-zone exit ROUTING already relies on (parseRef), so it is de-facto load-bearing, but
+//     it is NOT enforced by the loader. A room authored into zone X with a ref prefixed for zone Y would
+//     boot into X yet be skipped by this ADD (its cross-zone exits would already misroute too). A load-time
+//     content-lint enforcing prefix==zone is the proper guard — tracked as a follow-up (#194).
+//   - REMOVE (prototype deleted): left as-is — tearing a live room down means re-placing its occupants, the
+//     risky reconciliation still deferred (#191).
 func (z *Zone) resyncRoom(ref ProtoRef) {
 	e := z.rooms[ref]
-	if e == nil {
-		return // not hosted here
-	}
 	p := z.protos.get(ref)
+	if e == nil {
+		// ADD a brand-new room this zone owns; ignore a new room that belongs to another hosted zone or a
+		// deletion of a non-hosted ref (both p==nil and a foreign zone fall through to no-op).
+		if p != nil {
+			if zoneOf, _ := parseRef(ref); zoneOf == z.id {
+				z.spawnRoom(ref)
+				z.log.Debug("hot reload: new room added to live zone", "ref", ref)
+			}
+		}
+		return
+	}
 	if p == nil {
 		return // definition deleted — live-room removal is the deferred (risky) part of #191
 	}

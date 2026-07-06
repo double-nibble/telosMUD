@@ -236,11 +236,17 @@ func (r *reloader) notifyZones(kind, ref string) {
 		return
 	}
 	for _, z := range r.shard.zonesList() { // mu-guarded: safe against a runtime HostZone (16.4a)
-		// NON-BLOCKING fan-out: the cache is already swapped, so a dropped invalidation just means that zone
-		// recompiles its Lua chunk on the next invalidation/access. A blocking post here would let ONE
-		// saturated zone inbox head-of-line-stall every LATER zone's invalidation shard-wide (distsys review).
+		// NON-BLOCKING fan-out: a blocking post here would let ONE saturated (or wedged) zone inbox
+		// head-of-line-stall every LATER zone's invalidation shard-wide, and a wedged zone would halt hot
+		// reload entirely (distsys review) — so a full inbox DROPS the message. For a Lua/def reload that
+		// self-heals (the next invocation recompiles from the swapped source). For a ROOM it does NOT: a room
+		// is a singleton that never re-spawns, so a dropped room invalidation leaves the live room's resync
+		// (or a new-room add, resyncRoom) UN-applied until another reload of that ref lands — hence the loud
+		// warn, and the operator remedy is to re-run `reload`. Reliable room-reload delivery (bounded retry /
+		// a reconciliation sweep) is a tracked follow-up, #194.
 		if !z.postOrDrop(reloadLuaMsg{kind: kind, ref: ref}) {
-			slog.Warn("hot-reload invalidation dropped (zone inbox full); zone recompiles on next access",
+			slog.Warn("hot-reload invalidation dropped (zone inbox full); a Lua/def reload self-heals on next "+
+				"access, but a ROOM reload is lost until re-run",
 				"zone", z.id, "kind", kind, "ref", ref)
 		}
 	}
