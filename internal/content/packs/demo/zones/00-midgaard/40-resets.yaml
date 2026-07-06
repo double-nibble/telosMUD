@@ -1,0 +1,17 @@
+zones:
+  - ref: midgaard
+    resets:
+      - {op: spawn_item, proto: midgaard:obj:torch,  room: midgaard:room:market, count: 5}
+      - {op: spawn_item, proto: midgaard:obj:helmet, room: midgaard:room:market}
+      - {op: spawn_item, proto: midgaard:obj:sword,  room: midgaard:room:market}
+      - {op: spawn_item, proto: midgaard:obj:chest,  room: midgaard:room:market}
+      # the smithy stock — the new gear, on the smithy floor (look in the smithy to find it):
+      - {op: spawn_item, proto: midgaard:obj:warhammer,        room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:frostbrand,       room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:leather-vest,     room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:leather-gloves,   room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:leather-boots,    room: midgaard:room:smithy, count: 1}
+      - {op: spawn_item, proto: midgaard:obj:shield,           room: midgaard:room:smithy, count: 1}
+      # the guild quartermaster greeter, in the guild hall:
+      - {op: spawn_mob, proto: midgaard:mob:quartermaster, room: midgaard:room:guildhall, count: 1}
+

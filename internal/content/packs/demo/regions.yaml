@@ -1,0 +1,9 @@
+regions:
+  - ref: heartlands
+    name: The Heartlands
+    zones: [midgaard, darkwood]
+
+# tracks: content-defined advancement tracks (Phase 11.2). hero_advancement is an XP→level track: as a
+# character's xp crosses each threshold, the matching step's grant op-list runs once — bumping level + a
+# stat. This is the XP-auto mode (the OnKill→advance_track wiring is 11.3); the same machinery expresses
+# train-at-trainer / point-buy / use-based (11.5) by changing WHICH event feeds advance_track.

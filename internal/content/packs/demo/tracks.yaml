@@ -1,0 +1,23 @@
+tracks:
+  - ref: hero_advancement
+    progress_attr: xp
+    level_attr: level
+    thresholds: [100, 250, 500]
+    steps:
+      - [ {op: modify_attribute_base, attr: level, amount: 1}, {op: modify_attribute_base, attr: strength, amount: 1} ]
+      - [ {op: modify_attribute_base, attr: level, amount: 1}, {op: modify_attribute_base, attr: constitution, amount: 1} ]
+      - [ {op: modify_attribute_base, attr: level, amount: 1}, {op: modify_attribute_base, attr: strength, amount: 2} ]
+  # leatherworking_skill: a USE-BASED crafting track (Phase 13.3). A craft ability tagged `skill:
+  # leatherworking_skill` fires OnSkillUse on each successful craft, advancing leatherworking_xp; crossing a
+  # threshold raises the leatherworking level. The profession bundle grants this track on learn.
+  - ref: leatherworking_skill
+    progress_attr: leatherworking_xp
+    level_attr: leatherworking
+    thresholds: [2, 5]
+    steps:
+      - [ {op: modify_attribute_base, attr: leatherworking, amount: 1} ]
+      - [ {op: modify_attribute_base, attr: leatherworking, amount: 1} ]
+
+# bundles: content-defined class/race templates (Phase 11.4b). A bundle is a set of grants applied as a
+# unit — apply_bundle("fighter") raises stats, sets a flag, and grants the hero_advancement track. Chargen
+# (Phase 14) picks a class+race and applies their bundles; the engine knows only "apply the grants".

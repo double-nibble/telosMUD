@@ -1,0 +1,22 @@
+recipes:
+  - ref: craft:leather_vest
+    # #34: name + aliases make this recipe targetable by phrase — `craft vest` / `craft leather vest`
+    # resolve here via the Diku isname grammar, and the `recipes` discovery verb prints these exact names.
+    name: Leather Vest
+    aliases: [vest, "leather vest"]
+    profession: leatherworking
+    # track resolves the skill gate/scaling from leatherworking_skill's level_attr (=leatherworking) live, so
+    # the recipe follows the track rather than duplicating the attr; skill stays as the raw-attr fallback.
+    track: leatherworking_skill
+    skill: leatherworking
+    min_skill: 0
+    station: forge
+    quality_base: 5
+    inputs:
+      - {item: midgaard:obj:leather, qty: 3}
+      - {item: midgaard:obj:essence, qty: 1}
+    output: {item: midgaard:obj:leather-vest, bind: bound}
+
+# Display templates: content owns the layout of the character sheet. The `score` verb renders this with `self`
+# bound to the viewer; it builds the sheet with the `ui` toolkit (auto-sized columns, color-token markup that
+# renders at the edge). A pack that defines no score template falls back to the engine's minimal built-in sheet.

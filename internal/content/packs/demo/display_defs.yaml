@@ -1,0 +1,16 @@
+display_defs:
+  - surface: score
+    render: |
+      local s = ui.sheet()
+      s:banner("{{FG_CYAN}}" .. self:name() .. "{{RESET}}", "=")
+      s:row({"Level", tostring(self:level())}, {"left", "right"})
+      s:divider("-")
+      s:row({"{{FG_GREEN}}Health{{RESET}}", self:resource("hp") .. "/" .. self:resource_max("hp")}, {"left", "right"})
+      s:row({"{{FG_BLUE}}Mana{{RESET}}",   self:resource("mana") .. "/" .. self:resource_max("mana")}, {"left", "right"})
+      s:divider("-")
+      s:row({"Strength",     tostring(self:attr("strength"))},     {"left", "right"})
+      s:row({"Intellect",    tostring(self:attr("intellect"))},    {"left", "right"})
+      s:row({"Constitution", tostring(self:attr("constitution"))}, {"left", "right"})
+      s:divider("=")
+      return s:render()
+

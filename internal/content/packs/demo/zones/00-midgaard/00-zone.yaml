@@ -1,0 +1,8 @@
+zones:
+  - ref: midgaard
+    name: The City of Midgaard
+    start_room: midgaard:room:temple
+    # Repop cadence (seconds): the zone's reset script re-runs on this stride (reset.go startRepop), so a
+    # picked-up longsword / spent torches respawn. 90s is a sane starter pace — long enough not to dupe
+    # under a player's feet, short enough that the world recovers between visits.
+    reset_secs: 90

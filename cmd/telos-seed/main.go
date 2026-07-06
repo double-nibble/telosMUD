@@ -1,7 +1,7 @@
 // Command telos-seed imports the embedded demo content pack into Postgres (the `make seed`
 // target). It is the "content is data, not a migration" path (decision D4): the same
-// packs/demo.yaml the unit tests load is written into the pack='demo' definition rows for the
-// live stack. Idempotent — re-running replaces the pack's rows.
+// packs/demo/ tree the unit tests load is merged and written into the pack='demo' definition rows
+// for the live stack. Idempotent — re-running replaces the pack's rows.
 package main
 
 import (

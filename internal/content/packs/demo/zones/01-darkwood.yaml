@@ -1,0 +1,289 @@
+zones:
+  - ref: darkwood
+    name: The Darkwood
+    start_room: darkwood:room:grove
+    # Repop cadence (seconds): a killed goblin / goblin-chief and their loot respawn on this stride so the
+    # zone stays playable after a kill (reset.go startRepop re-runs the reset script). 90s starter pace.
+    reset_secs: 90
+    rooms:
+      - ref: darkwood:room:grove
+        name: A Moonlit Grove
+        long: Silver birches ring a still clearing; the air hums with quiet magic.
+        exits:
+          south: midgaard:room:market   # back across the shard boundary
+          north: darkwood:room:hollow
+      - ref: darkwood:room:hollow
+        name: A Dark Hollow
+        long: The trees crowd close and the moonlight fails. Something rustles, unseen.
+        exits:
+          south: darkwood:room:grove
+          north: darkwood:room:lair
+      - ref: darkwood:room:lair
+        name: A Reeking Lair
+        # A builder-authored color example (Track 1 color): {{TOKEN}} markup renders to ANSI at the edge
+        # (a coalesced red+bold warning), or plain text for a `color off` player. Single-quoted so YAML
+        # treats the braces literally.
+        long: 'Bones and gnawed scraps litter a foul den. The {{FG_GREEN}}stench of goblin{{RESET}} is overpowering, and a {{FG_RED}}{{BOLD}}warning{{RESET}} is scrawled in blood on the wall.'
+        # lair is NOT in the content-parity want-map, so adding an east exit here is parity-safe.
+        exits:
+          south: darkwood:room:hollow
+          east: darkwood:room:webtunnel
+      - ref: darkwood:room:webtunnel
+        name: A Web-Choked Tunnel
+        long: >-
+          Thick grey webbing drapes every surface of this cramped tunnel. Pale shapes
+          twitch in the strands overhead.
+        exits:
+          west: darkwood:room:lair
+          east: darkwood:room:sanctum
+      - ref: darkwood:room:sanctum
+        name: A Warded Sanctum
+        long: >-
+          Runes pulse faintly along the walls of this hidden chamber. The air thrums with
+          guarded, watchful magic.
+        exits:
+          west: darkwood:room:webtunnel
+    item_prototypes:
+      # The goblin's loot: a rusty knife it carries (armed via the reset `into` the mob). When the goblin
+      # dies (Phase 6.3b) its inventory flows into its corpse, so `get all corpse` recovers the knife.
+      - ref: darkwood:obj:rusty-knife
+        keywords: [knife, rusty]
+        short: a rusty knife
+        long: A rusty, notched knife lies here.
+        physical: {weight: 1, material: iron}
+        wearable: {locations: [wield]}
+        weapon: {dice_num: 1, dice_size: 4, damage_type: slash, class: knife, attack_verb: stab}
+    # A combat mob (Phase 6.3a/b): the goblin carries a Living block (its stat sheet + the `melee` combat
+    # profile) and a Weapon (its natural attack dice). `kill goblin` runs the full swing pipeline against
+    # it; at 0 hp it dies, drops a lootable corpse holding its rusty knife, and fires OnKill (Phase 6.3b).
+    # The lair goblin sets `aggressive: 1` so it initiates combat the moment a player enters its room.
+    # NOTHING engine-side names "goblin"/"corpse"/"loot" — it is all data, like every item.
+    mob_prototypes:
+      - ref: darkwood:mob:goblin
+        keywords: [goblin, small]
+        short: a small goblin
+        long: A wiry goblin bares its teeth, clutching a rusty knife.
+        weapon: {dice_num: 1, dice_size: 6, damage_type: slash, class: knife, attack_verb: stab}
+        living:
+          combat_profile: melee
+          loot_table: goblin_loot   # Phase 12.1: drops a guaranteed torch + a 25% rare sword on death
+          attributes:
+            # A STARTER mob (the hollow goblin): tuned so a FRESH, unarmed player kills it in ~4-8 rounds
+            # without dying. Low hp (constitution 1 => max_hp 15), no soak, low evasion/dodge so a bare-
+            # handed 1d4 punch reliably connects. The goblin still hits back (str 12, 1d6 natural weapon)
+            # so the death path is exercised, but it is not the over-tuned slog the lair chief is. With the
+            # engine's no-regen-in-combat default (resource regen_in_combat false), its hp no longer claws
+            # back the player's per-round damage mid-fight.
+            strength: 12           # str_bonus +1 on its bite-back
+            constitution: 1        # max_hp = 1*10 + 1*5 = 15
+            level: 1
+            accuracy: 2
+            damroll: 0
+            attacks: 1
+            evasion: 6             # low -> a fresh player's d20 attack lands almost every round
+            dodge: 5              # ~5% dodge on the 1d100 roll-under (a rare whiff, not a slog)
+            parry: 0              # no parry skill -> roll-under-0 auto-fails ([G-C], gear-gated by 0)
+            block: 0              # no shield -> block auto-fails
+            soak_slash: 0         # a STARTER mob: no soak (the longsword/knife bite full damage)
+      # An AGGRESSIVE goblin (Phase 6.3b): `aggressive: 1` is a CONTENT number the engine reads to make
+      # the mob initiate combat on a player entering its room (death.go aggroOnEntry) — no engine flag.
+      - ref: darkwood:mob:goblin-chief
+        keywords: [goblin, chief, large]
+        short: a goblin chief
+        long: A scarred goblin chief looms here, snarling at all who approach.
+        weapon: {dice_num: 1, dice_size: 8, damage_type: slash, class: knife, attack_verb: slash}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 16
+            constitution: 10       # max_hp = 10*10 + 1*5 = 105
+            level: 1
+            accuracy: 4
+            damroll: 2
+            attacks: 1
+            evasion: 8
+            dodge: 10
+            parry: 0
+            block: 0
+            soak_slash: 2
+            aggressive: 1          # initiates combat on a player entering the room
+            max_reactions: 1       # [G9] one reaction/round -> ONE opportunity attack on a fleeing foe
+        # #55 capstone (zone->director half of the boss loop): when the scheduled boss dies, report it UP to
+        # the world scope. on("death") fires on the chief (any killer); signal_world publishes a DURABLE
+        # world-scope event the director / any world consumer reacts to (reset the respawn timer, world news).
+        lua: |
+          on("death", function(ev)
+            -- `ref` is the SCHEDULE ref the world director matches on (director.onBossDied → reschedule the
+            -- weekly timer); boss/zone are extra flavor the director ignores. Without ref the report is a
+            -- no-op and the boss never comes back — the loop must carry the schedule ref, not the mob name.
+            signal_world("boss.died", {ref = "boss:warden", boss = "goblin-chief", zone = "darkwood"})
+          end)
+
+      # --- richer-demo darkwood mobs ---------------------------------------------------------------
+
+      # boss-herald: the PERSISTENT world-scope reactor (#55, director->zone half of the boss loop). It carries
+      # no `living:` (non-combat, never dies), so its handler survives the whole zone life. on_world("spawn.boss")
+      # fires when the director broadcasts the scheduled-boss spawn (spawn_schedules boss:warden); the herald does
+      # the actual mud.spawn of the chief into its OWN room — the lair, where it stands (mud.spawn takes a room
+      # HANDLE, and self:room() is a script's handle to where it is). This is the zone-side reactor the director's
+      # remote-effect broadcast needs — the engine schedules + broadcasts; content decides what a "boss spawn"
+      # MEANS (which proto, which room, the flavor).
+      - ref: darkwood:mob:boss-herald
+        keywords: [warstone, herald, stone]
+        short: an ancient warstone
+        long: An ancient warstone hums with a low, waking power, half-sunk in the lair floor.
+        lua: |
+          on_world("spawn.boss", function(ev)
+            -- The world broadcast fans out to EVERY hosted zone; only the scheduled boss's own zone reacts.
+            if ev.zone ~= "darkwood" then return end
+            -- Spawn the SCHEDULED proto (ev.proto) in the herald's room (the lair). mud.spawn needs a room
+            -- HANDLE, and self:room() is this script's handle to where it stands — so the herald is placed in
+            -- the room the boss should appear. Reading ev.proto keeps the reactor general (a second schedule
+            -- for this zone spawns ITS proto, not a hardcoded one).
+            mud.spawn(ev.proto, self:room())
+            -- The schedule's `announce:` is the single source of the flavor line (ev.announce), so a builder
+            -- retunes the herald's cry by editing the schedule, not this script.
+            if ev.announce and ev.announce ~= "" then
+              mud.broadcast(self:room(), ev.announce)
+            end
+          end)
+
+      # cave spider: a LUA mob that conjures a ROOM-SCOPED web affect ([G13]) in its tunnel. on("enter")
+      # fires when anyone walks in; the spider (self) applies `web` — which opApplyAffect detects as
+      # room-scoped and routes to applyRoomAffect on the spider's OWN room, rooting/slowing the room's
+      # occupants (the per-occupant landing funnels the harm gate, so a non-consenting player is spared
+      # the root). This is how a place stays webbed in PLAYABLE content. It also fights (a weak combatant).
+      - ref: darkwood:mob:spider
+        keywords: [spider, cave, pale]
+        short: a pale cave spider
+        long: A pale, bristling cave spider crouches amid the webbing.
+        weapon: {dice_num: 1, dice_size: 4, damage_type: poison, class: bite, attack_verb: bite}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 10
+            constitution: 3        # max_hp = 3*10 + 1*5 = 35
+            level: 1
+            accuracy: 3
+            damroll: 0
+            attacks: 1
+            evasion: 8
+            dodge: 12
+            parry: 0
+            block: 0
+            soak_slash: 0
+        lua: |
+          on("enter", function(ev)
+            -- (re)web the room whenever something enters; self IS in the tunnel, so the room-scoped
+            -- web attaches to this room and snares its occupants.
+            self:apply_affect("web")
+          end)
+
+      # archmage: a COUNTERSPELL reactor (Phase 7.9). Its on_reaction_lua[BeforeCastCommit] fires when ANY
+      # creature in the room begins a cast; rx:cancel() VETOES the in-flight cast (the caster pays no cost,
+      # resolves no ops). State-gated to ONE counter per combat so it's not an unwinnable wall — after it
+      # spends its counter it lets casts through. This is the reaction-model "Counterspell" as playable
+      # content. (on_reaction_lua lives on a RESOURCE the mob has — here `mana` — so the handler gathers.)
+      - ref: darkwood:mob:archmage
+        keywords: [archmage, mage, robed]
+        short: a robed archmage
+        long: A robed archmage studies you with cold, calculating eyes.
+        weapon: {dice_num: 1, dice_size: 6, damage_type: fire, class: staff, attack_verb: blast}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 10
+            constitution: 5        # max_hp = 5*10 + 1*5 = 55
+            level: 1
+            accuracy: 4
+            damroll: 0
+            attacks: 1
+            evasion: 10
+            dodge: 8
+            parry: 0
+            block: 0
+            soak_slash: 0
+        lua: |
+          on("BeforeCastCommit", function(ev, rx)
+            -- counter the first hostile cast we witness, then rest (state-gated so it isn't a hard wall).
+            if not state.countered then
+              state.countered = true
+              rx:cancel()
+            end
+          end)
+
+      # warden: a SHIELD reactor (Phase 7.9). on_reaction_lua[ToHit] fires right before an incoming swing's
+      # to-hit roll; rx:modify("ac", +5) raises the warden's AC for the TRIGGERING swing only (it does not
+      # persist). State-gated to ONE shield per combat. The reaction-model "Shield" as playable content.
+      - ref: darkwood:mob:warden
+        keywords: [warden, guardian, armored]
+        short: an armored warden
+        long: An armored warden stands guard, shield raised and ready.
+        weapon: {dice_num: 1, dice_size: 8, damage_type: slash, class: sword, attack_verb: slash}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 14
+            constitution: 8        # max_hp = 8*10 + 1*5 = 85
+            level: 1
+            accuracy: 4
+            damroll: 1
+            attacks: 1
+            evasion: 10
+            dodge: 6
+            parry: 0
+            block: 0
+            soak_slash: 3
+            ac: 12
+        lua: |
+          on("ToHit", function(ev, rx)
+            if not state.shielded then
+              state.shielded = true
+              rx:modify("ac", 5)   -- +5 AC for this one swing (does not persist)
+            end
+          end)
+
+      # wraith: an UNDEAD mob that wards COLD (soak_cold 3) but has NO soak against HOLY — so `smite`
+      # (holy) cuts through while `frost` (cold) is blunted. A content-only "undead weak to holy" purely
+      # from which soak attributes it carries. Tough hp, a chilling touch. Aggressive so it engages on entry.
+      - ref: darkwood:mob:wraith
+        keywords: [wraith, undead, shade]
+        short: a hollow wraith
+        long: A hollow wraith drifts here, trailing tatters of cold shadow.
+        weapon: {dice_num: 1, dice_size: 8, damage_type: cold, class: touch, attack_verb: chill}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 13
+            constitution: 7        # max_hp = 7*10 + 1*5 = 75
+            level: 1
+            accuracy: 5
+            damroll: 1
+            attacks: 1
+            evasion: 11
+            dodge: 14
+            parry: 0
+            block: 0
+            soak_slash: 1
+            soak_cold: 3           # resists physical cold; smite (holy) bypasses it
+            aggressive: 1
+    resets:
+      - {op: spawn_mob, proto: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}
+      # Arm the goblin with its rusty knife: the item spawns INTO the goblin's inventory (reset `into` a
+      # mob, reset.go), so its corpse holds it. Script order matters — the goblin must spawn first.
+      - {op: spawn_item, proto: darkwood:obj:rusty-knife, into: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}
+      - {op: spawn_mob, proto: darkwood:mob:goblin-chief, room: darkwood:room:lair, count: 1}
+      # #55: the persistent warstone herald in the lair — holds the on_world("spawn.boss") reactor that spawns
+      # the scheduled boss into its own room.
+      - {op: spawn_mob, proto: darkwood:mob:boss-herald, room: darkwood:room:lair, count: 1}
+      # the cave spider that keeps the web tunnel webbed (room-affect demo):
+      - {op: spawn_mob, proto: darkwood:mob:spider, room: darkwood:room:webtunnel, count: 1}
+      # the warded sanctum's defenders: the Counterspell archmage, the Shield warden, and the holy-vuln wraith:
+      - {op: spawn_mob, proto: darkwood:mob:archmage, room: darkwood:room:sanctum, count: 1}
+      - {op: spawn_mob, proto: darkwood:mob:warden,   room: darkwood:room:sanctum, count: 1}
+      - {op: spawn_mob, proto: darkwood:mob:wraith,   room: darkwood:room:sanctum, count: 1}
+
+  # A THIRD zone (the crypt) — proves multi-zone-per-shard beyond the original two. It hangs off the
+  # midgaard guild hall via a `down` stair (crypt:room:entrance). When a shard hosts midgaard + crypt
+  # together the descent is an INTRA-SHARD transfer (transferIn, no handoff); when they live on
+  # different shards it is the cross-shard hop. Both paths are the SAME `down` exit — placement decides.
