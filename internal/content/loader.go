@@ -140,6 +140,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			"embedded bootstrap pack — rename it out of the core: prefix",
 			"pack", v.Pack, "kind", v.Kind, "ref", v.Ref)
 	}
+	// Content-lint (#66): warn on any identity token (ref/verb/surface) with a character outside the safe
+	// charset — the GMCP strip, comms-subject routing, and targeting tokenizer all assume refs can't carry
+	// braces/dots/whitespace/controls. Non-fatal at boot (the reload gate hard-rejects it).
+	for _, v := range LintRefCharset(packs) {
+		slog.Warn("content: identity token has characters outside the safe charset [A-Za-z0-9_:-]; "+
+			"it can break GMCP keys / comms subjects / the tokenizer — rename it",
+			"pack", v.Pack, "field", v.Field, "value", v.Value)
+	}
 	// Materialize the deduped zone set: a later pack shipping the same zone ref overrides the
 	// earlier one IN PLACE (last write wins; content-lint catches accidental collisions).
 	// Track positions by index, NOT by pointer — appending to lc.Zones reallocates the backing
