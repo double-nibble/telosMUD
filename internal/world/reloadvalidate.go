@@ -94,6 +94,12 @@ func validatePacks(loaded []content.Pack) []string {
 	for _, v := range content.LintReservedCoreRefs(loaded) {
 		problems = append(problems, fmt.Sprintf("pack %q ships %s %q under the reserved core: namespace (would clobber the embedded bootstrap pack)", v.Pack, v.Kind, v.Ref))
 	}
+	// Ref charset (#66): an identity token with a character outside [A-Za-z0-9_:-] can break a GMCP key, a
+	// comms subject, or the targeting tokenizer (all of which assume refs are metacharacter-free). The boot
+	// lint only WARNS; here — the broadcast gate — it is a hard REJECT so a bad token never enters a reload.
+	for _, v := range content.LintRefCharset(loaded) {
+		problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside the safe charset [A-Za-z0-9_:-] (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value))
+	}
 	return problems
 }
 
@@ -378,7 +384,10 @@ func validateChannels(loaded []content.Pack) []string {
 // (* or >), or an empty dot-delimited token yields a subject NATS rejects on publish (or a wildcard the
 // world can't publish to). Either way the channel can never carry a line — it is definitively dead — so
 // the gate rejects it. Legit refs ([a-z0-9_-], optionally dotted) pass untouched, so there is no
-// false-positive risk against good content.
+// false-positive risk against good content. NOTE (#66): the ref-charset lint now runs in this same gate and
+// hard-rejects '.', so a DOTTED channel ref is caught upstream by that stricter, uniform check — this
+// function's dot-tolerance is now effectively moot but kept as the subject-specific belt-and-suspenders
+// (whitespace/control/wildcard/empty-token remain its own to catch).
 func channelRefSubjectProblem(ref string) string {
 	for _, r := range ref {
 		switch {
