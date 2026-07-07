@@ -230,6 +230,54 @@ func TestReloadDoneDelivery(t *testing.T) {
 	}
 }
 
+// TestMintReloadVersion covers the #222 fix: a shard-local reload's version is max(now_nanos, pgVersion+1),
+// so it always advances past the current Postgres content version even when this shard's clock lags the
+// host that minted a just-completed pull (the cross-host clock-skew race that would otherwise drop the
+// reload's zone-shape reconcile as stale).
+func TestMintReloadVersion(t *testing.T) {
+	src := content.NewMemSource()
+	r := &reloader{src: src, log: slog.Default()}
+
+	// PG version well ABOVE now-nanos simulates this shard's clock lagging the puller: the pgVersion+1 floor
+	// must win, so the reload still beats the pull's version.
+	future := uint64(time.Now().UnixNano()) + uint64(time.Hour)
+	src.SetContentVersion(future)
+	if got := r.mintReloadVersion(context.Background()); got != future+1 {
+		t.Fatalf("mint with PG ahead = %d, want pgVersion+1 = %d", got, future+1)
+	}
+
+	// PG version BELOW now-nanos is the common case: wall-clock nanos win, and the stamp still exceeds the
+	// PG version (so the reconcile guard accepts it).
+	src.SetContentVersion(1)
+	before := uint64(time.Now().UnixNano())
+	got := r.mintReloadVersion(context.Background())
+	if got < before {
+		t.Fatalf("mint with PG behind = %d, want >= now-nanos %d (wall clock should win)", got, before)
+	}
+	if got <= 1 {
+		t.Fatalf("mint = %d must exceed the PG version (1)", got)
+	}
+}
+
+// TestMintReloadVersionFallsBackToNanos proves a source that cannot report a content version (no
+// contentVersioner) degrades to bare nanos rather than failing.
+func TestMintReloadVersionFallsBackToNanos(t *testing.T) {
+	r := &reloader{src: noVersionSource{}, log: slog.Default()}
+	before := uint64(time.Now().UnixNano())
+	got := r.mintReloadVersion(context.Background())
+	if got < before {
+		t.Fatalf("fallback mint = %d, want >= now-nanos %d", got, before)
+	}
+}
+
+// noVersionSource is a content.DefinitionSource that deliberately does NOT implement contentVersioner, to
+// exercise mintReloadVersion's bare-nanos fallback. Its methods are never called by the mint path.
+type noVersionSource struct{}
+
+func (noVersionSource) LoadDefinition(context.Context, string, string, string) (content.Definition, error) {
+	return content.Definition{}, nil
+}
+
 // TestParseReloadArgs covers the reload arg/flag split: scope in either position, the --check/-n dry-run
 // flag, and the bare (all-packs) form.
 func TestParseReloadArgs(t *testing.T) {
