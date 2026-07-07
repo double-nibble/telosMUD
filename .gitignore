@@ -5,8 +5,11 @@
 /telos-director
 /telos-gate
 /telos-migrate
+/telos-pull
 /telos-seed
 /telos-world
+/telos-account
+/telos-botswarm
 *.exe
 *.test
 *.out
