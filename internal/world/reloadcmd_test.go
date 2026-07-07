@@ -70,13 +70,15 @@ func TestReloadRepublish(t *testing.T) {
 		t.Fatalf("republish published=%d, want 2 (room + item)", out.published)
 	}
 
-	// Delivery is async (a per-subscription drain goroutine); poll until both refs land or time out.
+	// Delivery is async (a per-subscription drain goroutine); poll until all three land or time out. The
+	// WIRE carries three invalidations — the room, the item, AND a zone-SHAPE invalidation (which drives the
+	// live-room-deletion reconcile, #191) — even though out.published counts only the 2 spawnable prototypes.
 	deadline := time.Now().Add(2 * time.Second)
-	for atomic.LoadInt64(&count) < 2 && time.Now().Before(deadline) {
+	for atomic.LoadInt64(&count) < 3 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := atomic.LoadInt64(&count); got != 2 {
-		t.Fatalf("republish published %d invalidations, want 2 (room + item)", got)
+	if got := atomic.LoadInt64(&count); got != 3 {
+		t.Fatalf("republish delivered %d invalidations, want 3 (room + item + zone-shape)", got)
 	}
 }
 

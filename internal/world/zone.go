@@ -15,7 +15,6 @@ import (
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
-	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/metrics"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
@@ -52,6 +51,12 @@ type Zone struct {
 	rids      ridAllocator         // per-zone RuntimeID source for entities (identity.go)
 	inbox     chan msg             // message queue; the only ingress to zone state
 	log       *slog.Logger         // scoped logger: component=zone, zone=<id>
+
+	// lastReconciledPackVer is the version of the newest zone-SHAPE reconcile this zone has applied
+	// (#191). A reconcileZoneMsg whose version is ≤ this is DROPPED — a racing reload's stale reconcile
+	// must not reorder ahead of a newer one (last-writer-wins by version, not by arrival). Zone-goroutine
+	// state (written only in reconcileZone).
+	lastReconciledPackVer uint64
 
 	// whoCooldown rate-limits `who` PER SESSION (the shared roster cache already collapses concurrent
 	// reads; this blunts a single spammer). Zone-goroutine-read in cmdWho against session.lastWho.
@@ -462,6 +467,28 @@ type reloadLuaMsg struct {
 	ref  string // the (kind, ref) whose Lua was edited
 }
 
+// reconcileZoneMsg tells a zone to converge its live room SHAPE to the reloaded content's DESIRED state
+// (#191): the KindZone invalidation carries that state (rooms + start room + a monotonic version) on the
+// wire, and the reloader hands it here so the diff-and-converge (spawn ADDs, resync UPDATEs, tear down
+// DELETIONs, apply the start_room change) runs ON THE ZONE GOROUTINE (single-writer over z.rooms /
+// z.startRoom / z.players). zoneRef is the zone the reconcile is FOR — the reloader posts only to the
+// matching hosted zone, but the handler re-asserts z.id == zoneRef defensively. version orders reconciles
+// (last-writer-wins by version, not arrival) so a racing reload's stale reconcile is dropped.
+//
+// INVARIANT for the bounded-retry follow-up (#194, PR 3/3): a retry of a DROPPED reconcile MUST re-post
+// this SAME immutable message with its ORIGINAL version — never re-stamp a fresh version. The version
+// guard advances the cursor only when a reconcile APPLIES (world.go reconcileZone), so a dropped message
+// left the cursor untouched and a same-version retry re-applies cleanly; but a re-stamped (higher) version
+// on retry could win last-writer-wins over a genuinely newer concurrent reload and RESURRECT a stale
+// desired state — a split-brain. Retry = re-enqueue this value as-is (it also stays shard-local, off the
+// bus, so it never crosses the wire version's clock-skew boundary).
+type reconcileZoneMsg struct {
+	zoneRef   string   // the zone this reconcile targets (== z.id)
+	version   uint64   // monotonic reload stamp; a reconcile ≤ z.lastReconciledPackVer is dropped
+	rooms     []string // the refs the reloaded content says SHOULD be live in this zone
+	startRoom ProtoRef // the reloaded start/login room (applied before removals)
+}
+
 // reloadDoneMsg reports the outcome of a `reload` command's BACKGROUND fan-out back to the builder who
 // triggered it (reloadcmd.go). The re-read + per-ref publish runs off the zone goroutine, so the result
 // is posted here to be delivered ON the zone goroutine — where z.players is single-writer, so it sends
@@ -496,6 +523,7 @@ func (adoptPidMsg) zoneMsg()      {}
 func (presenceMsg) zoneMsg()      {}
 func (loadObjectsMsg) zoneMsg()   {}
 func (reloadLuaMsg) zoneMsg()     {}
+func (reconcileZoneMsg) zoneMsg() {}
 func (reloadDoneMsg) zoneMsg()    {}
 func (whoFallbackMsg) zoneMsg()   {}
 
@@ -673,11 +701,16 @@ func (z *Zone) handle(m msg) {
 	case loadObjectsMsg:
 		z.rehydrateObjects(v)
 	case reloadLuaMsg:
+		// Recompile the (kind, ref)'s Lua chunk + re-register live instances' handlers from the swapped
+		// source. Room SHAPE (add/update/remove of the room entity + start_room) is NOT handled here — it is
+		// owned by the KindZone reconcile (reconcileZone, #191), the single authoritative zone-shape path;
+		// this only refreshes Lua state, which is orthogonal to shape.
 		z.reloadLua(v.kind, v.ref)
-		if v.kind == content.KindRoom {
-			// A room is a singleton (never re-spawned), so the applier's next-spawn semantics never reach
-			// it; re-sync the live room's authored fields from the swapped prototype here (#191).
-			z.resyncRoom(ProtoRef(v.ref))
+	case reconcileZoneMsg:
+		// Defensive: only reconcile the zone this message targets (the reloader posts to the matching zone,
+		// but a mis-post must never converge another zone against a foreign room set).
+		if v.zoneRef == z.id {
+			z.reconcileZone(v)
 		}
 	case reloadDoneMsg:
 		// Deliver a `reload` fan-out result to the builder if they are still in this zone (single-writer

@@ -105,6 +105,16 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 		return
 	}
 
+	// A `zone` invalidation carries no spawnable prototype — it drives the live-room-SHAPE reconcile
+	// (#191): it carries the zone's DESIRED room set + start room on the wire, so the hosting zone
+	// converges its live room graph (spawn ADDs, resync UPDATEs, tear down DELETIONs) off the
+	// already-swapped cache with no source re-read. It forks off before the prototype path, like the
+	// channel case.
+	if inv.Kind == content.KindZone {
+		r.reconcileZone(inv)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), reloadIOTimeout)
 	defer cancel()
 	def, err := r.src.LoadDefinition(ctx, inv.Kind, inv.Ref, inv.Pack)
@@ -185,6 +195,42 @@ func (r *reloader) reloadChannel(inv contentbus.Invalidation) {
 	r.log.Debug("hot reload: channel swapped", "ref", inv.Ref)
 }
 
+// reconcileZone drives a `zone` content hot reload (#191): the KindZone invalidation carries the zone's
+// DESIRED room-ref set + start room + a monotonic version, so this simply posts that desired state to the
+// hosting zone as a reconcileZoneMsg — the diff-and-converge (spawn ADDs, resync UPDATEs, tear down
+// DELETIONs, apply the start_room change) runs single-writer ON THE ZONE GOROUTINE. It runs OFF every zone
+// goroutine (the content-bus subscription goroutine) and does NO source re-read: the payload travels on
+// the wire, and because the contentbus is a single ordered subject, this shard already applied the pack's
+// per-ref prototype cache swaps (delivered before this trailing KindZone invalidation) — so the zone
+// reconciles ADDs/UPDATEs off the already-swapped cache.
+//
+// Only a shard HOSTING this zone reconciles it (the reconcile is a no-op elsewhere). Delivery is the same
+// non-blocking postOrDrop the rest of hot reload uses — a wedged zone inbox must not head-of-line-stall
+// every later invalidation shard-wide — so a full inbox DROPS the reconcile with a loud warn (a dropped
+// reconcile loses a room add/remove until `reload` re-runs; bounded-reliable delivery is the #194
+// follow-up for this path, PR 3/3). The reconcile is level-triggered + idempotent, so a re-run converges.
+func (r *reloader) reconcileZone(inv contentbus.Invalidation) {
+	if r == nil || r.shard == nil {
+		return
+	}
+	msg := reconcileZoneMsg{
+		zoneRef:   inv.Ref,
+		version:   inv.Version,
+		rooms:     inv.Rooms,
+		startRoom: ProtoRef(inv.StartRoom),
+	}
+	for _, z := range r.shard.zonesList() { // mu-guarded against a runtime HostZone (16.4a)
+		if z.id != inv.Ref {
+			continue
+		}
+		if !z.postOrDrop(msg) {
+			slog.Warn("hot-reload zone-shape reconcile dropped (zone inbox full); a room add/remove is lost until re-run",
+				"zone", inv.Ref)
+		}
+		return // a zone is hosted by at most one shard-local Zone; done once matched
+	}
+}
+
 // reloadLua applies a content Lua hot reload for (kind, ref) ON THE ZONE GOROUTINE (slice 7.7,
 // P7-D7 / §1.1). The shard reloader already swapped the new prototype/def into the shared cache;
 // this re-runs on each hosted zone so the per-zone Lua state (the chunk cache, the LState, the
@@ -238,15 +284,16 @@ func (r *reloader) notifyZones(kind, ref string) {
 	for _, z := range r.shard.zonesList() { // mu-guarded: safe against a runtime HostZone (16.4a)
 		// NON-BLOCKING fan-out: a blocking post here would let ONE saturated (or wedged) zone inbox
 		// head-of-line-stall every LATER zone's invalidation shard-wide, and a wedged zone would halt hot
-		// reload entirely (distsys review) — so a full inbox DROPS the message. For a Lua/def reload that
-		// self-heals (the next invocation recompiles from the swapped source). For a ROOM it does NOT: a room
-		// is a singleton that never re-spawns, so a dropped room invalidation leaves the live room's resync
-		// (or a new-room add, resyncRoom) UN-applied until another reload of that ref lands — hence the loud
-		// warn, and the operator remedy is to re-run `reload`. Reliable room-reload delivery (bounded retry /
-		// a reconciliation sweep) is a tracked follow-up, #194.
+		// reload entirely (distsys review) — so a full inbox DROPS the message. This carries only the LUA
+		// recompile now (chunk re-read + per-instance handler re-register): a shared def (ability/formula)
+		// self-heals on next invocation (chunkFor re-reads the swapped source); a scripted-prototype's live
+		// instances keep their old handler until a reload of that ref lands, so a dropped one loses that
+		// Lua EDIT until re-run — hence the loud warn. Room SHAPE (add/update/remove + start_room) does NOT
+		// ride this message at all — it rides the reconcileZoneMsg (reconcileZone), whose own dropped-delivery
+		// gap is tracked as #194 (PR 3/3, bounded-retry).
 		if !z.postOrDrop(reloadLuaMsg{kind: kind, ref: ref}) {
-			slog.Warn("hot-reload invalidation dropped (zone inbox full); a Lua/def reload self-heals on next "+
-				"access, but a ROOM reload is lost until re-run",
+			slog.Warn("hot-reload Lua invalidation dropped (zone inbox full); a shared def self-heals on next "+
+				"access, but a scripted prototype's live instances keep the old handler until re-run",
 				"zone", z.id, "kind", kind, "ref", ref)
 		}
 	}

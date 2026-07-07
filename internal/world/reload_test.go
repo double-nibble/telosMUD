@@ -331,8 +331,10 @@ func TestBuslessShardHasNoReloader(t *testing.T) {
 
 // TestHotReloadRoomSingletonResync proves the #191 fix: a ROOM is a singleton spawned once at boot and
 // never re-spawned, so the applier's "next spawn uses the edit" path never reaches the live room a player
-// stands in. Editing the room and reloading must update that singleton IN PLACE. (Contrast
-// TestHotReloadRoomLongDesc, which pins the pre-existing NON-singleton instance's old semantics.)
+// stands in. Editing the room and reloading must update that singleton IN PLACE. Room resync is owned by
+// the zone-SHAPE reconcile (reconcileZone) now, not the per-ref applier — the per-ref KindRoom
+// invalidation swaps the cache, then the trailing KindZone reconcile resyncs the live room off it.
+// (Contrast TestHotReloadRoomLongDesc, which pins the pre-existing NON-singleton instance's old semantics.)
 func TestHotReloadRoomSingletonResync(t *testing.T) {
 	src := content.NewMemSource()
 	src.SetPack(reloadTestPack())
@@ -362,9 +364,10 @@ func TestHotReloadRoomSingletonResync(t *testing.T) {
 	// The prototype cache swaps asynchronously on the subscription goroutine.
 	waitForProto(t, s, "rt:room:hall", func(p *Prototype) bool { return p.long == newLong })
 
-	// The applier posts a reloadLuaMsg to the zone inbox; this harness doesn't run the loop, so drive the
-	// handler directly (it runs on the zone goroutine in production).
-	z.handle(reloadLuaMsg{kind: content.KindRoom, ref: "rt:room:hall"})
+	// The zone-SHAPE reconcile owns the live-room resync (#191). This harness doesn't run the loop, so drive
+	// the reconcile directly (it runs on the zone goroutine in production, from the trailing KindZone
+	// invalidation carrying the zone's desired room set).
+	z.reconcileZone(reconcileZoneMsg{zoneRef: z.id, version: 1, rooms: []string{"rt:room:hall"}, startRoom: "rt:room:hall"})
 
 	if got := room.Long(); got != newLong {
 		t.Fatalf("live singleton room NOT resynced: long = %q, want %q", got, newLong)
@@ -424,9 +427,9 @@ func TestResyncRoomRepointsWholeComponent(t *testing.T) {
 
 // TestReloadCommandResyncsLiveRoomEndToEnd is the full-path proof: a builder standing in a room edits the
 // content source and runs the in-game `reload` command; the whole chain (command → republish → content
-// bus → applier cache swap → reloadLuaMsg → resyncRoom) runs under a LIVE zone loop, and the live room the
-// builder is standing in renders the new description on the next look. All observation is via the session
-// output channel, so it is race-free under -race.
+// bus → per-ref cache swap → trailing KindZone reconcile → resyncRoom) runs under a LIVE zone loop, and
+// the live room the builder is standing in renders the new description on the next look. All observation
+// is via the session output channel, so it is race-free under -race.
 func TestReloadCommandResyncsLiveRoomEndToEnd(t *testing.T) {
 	src := content.NewMemSource()
 	src.SetPack(reloadTestPack())

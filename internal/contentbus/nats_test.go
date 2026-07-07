@@ -3,6 +3,7 @@ package contentbus
 import (
 	"context"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -47,7 +48,7 @@ func TestNATSPublishSubscribe(t *testing.T) {
 
 	select {
 	case inv := <-got:
-		if inv != want {
+		if !reflect.DeepEqual(inv, want) {
 			t.Fatalf("received %+v, want %+v", inv, want)
 		}
 	case <-time.After(5 * time.Second):

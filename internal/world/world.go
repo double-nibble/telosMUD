@@ -836,14 +836,20 @@ func (z *Zone) spawnRoom(ref ProtoRef) *Entity {
 //     it is NOT enforced by the loader. A room authored into zone X with a ref prefixed for zone Y would
 //     boot into X yet be skipped by this ADD (its cross-zone exits would already misroute too). A load-time
 //     content-lint enforcing prefix==zone is the proper guard — tracked as a follow-up (#194).
-//   - REMOVE (prototype deleted): left as-is — tearing a live room down means re-placing its occupants, the
-//     risky reconciliation still deferred (#191).
+//   - REMOVE (prototype deleted): NOT driven here. A deleted room's ref is absent from the content, so
+//     PublishPack never emits a per-ref invalidation for it — this path never sees a deletion. Room teardown
+//     is instead driven by the zone-SHAPE reconcile (reconcileZone), which diffs the whole zone's live
+//     room set against the reloaded content. The p==nil case below is a defensive no-op.
 func (z *Zone) resyncRoom(ref ProtoRef) {
 	e := z.rooms[ref]
 	p := z.protos.get(ref)
 	if e == nil {
 		// ADD a brand-new room this zone owns; ignore a new room that belongs to another hosted zone or a
-		// deletion of a non-hosted ref (both p==nil and a foreign zone fall through to no-op).
+		// deletion of a non-hosted ref (both p==nil and a foreign zone fall through to no-op). NOTE: when the
+		// reconcile DESIRES this ref but p==nil, the room's per-ref prototype swap was lost upstream (a dropped
+		// Lua-invalidation cannot cause it — the cache swap is a synchronous subscriber-goroutine write ordered
+		// before the reconcile post — but a LoadDefinition/build failure for that ref would). The ADD then
+		// silently no-ops and the desired room is simply not spawned until the next full reload re-converges.
 		if p != nil {
 			if zoneOf, _ := parseRef(ref); zoneOf == z.id {
 				z.spawnRoom(ref)
@@ -853,7 +859,7 @@ func (z *Zone) resyncRoom(ref ProtoRef) {
 		return
 	}
 	if p == nil {
-		return // definition deleted — live-room removal is the deferred (risky) part of #191
+		return // definition deleted — teardown is driven by reconcileZone, not the per-ref path
 	}
 	// Re-point the entity at the new prototype AND its components together, exactly as spawn establishes the
 	// aliasing. Keeping e.prototype in lock-step with e.comps matters for COW: mutableComponent decides an
@@ -934,10 +940,79 @@ func (z *Zone) removeRoom(ref ProtoRef) {
 	// its documented runtime writer is the reload-applier (subscriber) goroutine; here the ZONE goroutine
 	// writes it because in the reconcile model the zone is the authoritative knower of a content-DELETION
 	// (no invalidation names a deleted ref — PublishPack only emits present refs), and the applier cannot
-	// know. protoCache.reload is a mutex-guarded copy-and-swap, so this concurrent writer is memory-safe; PR
-	// 2 (the reconcile that drives this) retires resyncRoom's REMOVE stub and confirms this single owner.
+	// know. protoCache.reload is a mutex-guarded copy-and-swap, so this concurrent writer is memory-safe. The
+	// zone goroutine is the SOLE driver of a content-deletion (reconcileZone → removeRoom), so no
+	// applier-goroutine writer races it for a deleted ref.
 	z.protos.reload(ref, nil)
 	z.log.Debug("hot reload: live room removed", "zone", z.id, "room", ref)
+}
+
+// reconcileZone is the single authoritative zone-SHAPE path (#191): given the reloaded content's DESIRED
+// state (the zone's full room-ref set + start room + a monotonic version, carried on the KindZone
+// invalidation), it converges the live room graph — spawn/resync every desired room (ADD + UPDATE off the
+// already-swapped prototype cache) and tear down every live room the content no longer defines (removeRoom
+// — re-place occupants, despawn ephemera). It replaces the per-ref room applier's resync (the KindRoom
+// path no longer resyncs, reload.go); a deleted room's ref is absent from the content so no per-ref
+// invalidation names it, and only a whole-zone diff can see the deletion. Runs on the zone goroutine
+// (single-writer over z.rooms / z.startRoom / z.players), driven by a reconcileZoneMsg.
+//
+// VERSION GUARD: a reconcile whose version is ≤ the newest already applied is dropped — a racing reload's
+// stale snapshot must not reorder ahead of a newer one (last-writer-wins by version, not by arrival). A
+// zero version (a hand-published test invalidation) is never guarded.
+//
+// start_room is applied FIRST (before any removal) because removeRoom REFUSES to tear down the live start
+// room — it is the evacuation fallback — so an edit that both moves the start room and deletes the old one
+// only works if the repoint precedes the removals. The repoint is guarded to a room the content actually
+// defines (desired[startRoom]) so a malformed edit can never point new logins at an undefined room; a start
+// room not yet live (its ADD still in flight/dropped) leaves removeRoom without a fallback, which it handles
+// by skipping and converging on a re-run.
+func (z *Zone) reconcileZone(m reconcileZoneMsg) {
+	if len(m.rooms) == 0 {
+		// An empty desired set would make EVERY live room a straggler — a mass teardown from an almost-
+		// certainly malformed or degenerate payload. PublishPack always carries a real zone's full room set,
+		// and a zone genuinely emptied of content emits NO KindZone at all (retiring a whole zone is a
+		// rolling-reboot op, not a hot reload — removeRoom's start-room refusal would leave a stranded husk
+		// anyway). So treat an empty payload as a no-op: skip without even advancing the version cursor,
+		// rather than wipe the zone down to its start room.
+		z.log.Warn("hot reload: zone-shape reconcile with empty room set; skipping (won't mass-teardown a live zone)",
+			"zone", z.id, "version", m.version)
+		return
+	}
+	if m.version != 0 {
+		if m.version <= z.lastReconciledPackVer {
+			z.log.Debug("hot reload: dropping stale zone-shape reconcile", "zone", z.id,
+				"version", m.version, "applied", z.lastReconciledPackVer)
+			return
+		}
+		z.lastReconciledPackVer = m.version
+	}
+	desired := make(map[ProtoRef]bool, len(m.rooms))
+	for _, r := range m.rooms {
+		desired[ProtoRef(r)] = true
+	}
+	if m.startRoom != "" && desired[m.startRoom] {
+		z.startRoom = m.startRoom
+	}
+	// ADD/UPDATE: converge every desired room off the already-swapped cache. resyncRoom is 3-way — it
+	// spawns a room NEW to the graph (guarded internally to refs this zone owns by prefix), re-points a live
+	// room's authored fields from the new prototype (the common UPDATE), and no-ops a ref whose prototype is
+	// absent. Ranging `desired` (a different map) while resyncRoom's ADD writes z.rooms is safe.
+	for ref := range desired {
+		z.resyncRoom(ref)
+	}
+	// REMOVE: any live room no longer desired (z.rooms holds only this zone's rooms). Snapshot the stragglers
+	// before removing — removeRoom deletes from z.rooms, which would mutate the map underneath a live range.
+	var stragglers []ProtoRef
+	for ref := range z.rooms {
+		if !desired[ref] {
+			stragglers = append(stragglers, ref)
+		}
+	}
+	for _, ref := range stragglers {
+		z.removeRoom(ref)
+	}
+	z.log.Debug("hot reload: zone-shape reconciled", "zone", z.id,
+		"desired", len(desired), "removed", len(stragglers), "version", m.version)
 }
 
 // relocate forcibly evacuates a live player to dest (#191 room removal) — a directionless move mirroring the
