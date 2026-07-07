@@ -79,6 +79,20 @@ type Director struct {
 	schedules    []Schedule
 	now          func() time.Time
 	scheduleInit bool // the startup on_missed pass has run this session
+
+	// Coordinated content pull (#212 slice 4 PR E). puller runs the resolve→import→broadcast pipeline for
+	// a `pull <version>` request; nil disables coordinated pulls (a state-only director). pulling
+	// single-flights it so a second request while one is in flight is dropped rather than double-importing.
+	puller  ContentPuller
+	pulling atomic.Bool
+}
+
+// ContentPuller installs a published content version (resolve from the external store → atomic Postgres
+// import → hot-reload broadcast). The concrete implementation lives at the cmd tier (cmd/telos-director,
+// over internal/contentpull) so the director package stays free of the git/store/content dependencies.
+// A nil puller means the director does not run coordinated pulls.
+type ContentPuller interface {
+	Pull(ctx context.Context, version, actor string) error
 }
 
 // New builds a director for a scope. regionID "" makes the WORLD director; a non-empty ref makes that
@@ -111,6 +125,14 @@ func (d *Director) WithNow(now func() time.Time) *Director {
 	if now != nil {
 		d.now = now
 	}
+	return d
+}
+
+// WithContentPuller wires the coordinated-pull executor (#212 slice 4 PR E): the world director runs it
+// on a `content.pull.request` signal to install a published content version. Call before Run. A nil
+// puller (a state-only / region director) leaves coordinated pulls disabled.
+func (d *Director) WithContentPuller(p ContentPuller) *Director {
+	d.puller = p
 	return d
 }
 

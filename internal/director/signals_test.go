@@ -274,3 +274,225 @@ func TestDirectorReloadAuditMalformed(t *testing.T) {
 		t.Fatal("a malformed payload must NOT produce an audit record")
 	}
 }
+
+// fakePuller is a test ContentPuller: it reports each call on calls and can block (block != nil) to hold
+// the single-flight slot while a test fires a second request. The block honors ctx, so a director-side
+// timeout unblocks the pull (used by the timeout-releases-the-slot test) instead of wedging the test.
+type fakePuller struct {
+	calls chan pullArgs
+	block chan struct{}
+	err   error
+}
+
+type pullArgs struct{ version, actor string }
+
+func (p *fakePuller) Pull(ctx context.Context, version, actor string) error {
+	if p.block != nil {
+		select {
+		case <-p.block:
+		case <-ctx.Done():
+			return ctx.Err() // the director's directorPullTimeout fired
+		}
+	}
+	p.calls <- pullArgs{version, actor}
+	return p.err
+}
+
+func pullSignal(t *testing.T, key string, req contentbus.PullRequest) signalMsg {
+	t.Helper()
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signalMsg{event: contentbus.PullRequestEvent, payload: payload, key: key, source: "shard-1", ack: make(chan bool, 1)}
+}
+
+// TestDirectorCoordinatedPull: a content.pull.request signal makes the LEADER director run the puller with
+// the requested version + actor, off the actor goroutine (#212 slice 4 PR E).
+func TestDirectorCoordinatedPull(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1)}
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+	d.leader.Store(true)
+
+	m := pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1.2.3", Actor: "Ada", AtUnixMs: 5})
+	d.handleSignal(context.Background(), m)
+	if !<-m.ack {
+		t.Fatal("pull-request signal was NAK'd (should ack immediately)")
+	}
+	select {
+	case got := <-p.calls:
+		if got.version != "v1.2.3" || got.actor != "Ada" {
+			t.Fatalf("puller called with %+v, want {v1.2.3 Ada}", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the leader director did not run the coordinated pull")
+	}
+}
+
+// TestDirectorPullRequeuedWhenNotLeader: a non-leader director must NOT run the pull AND must NAK the
+// durable message so it REDELIVERS to the live leader (a consume-then-demote handoff must not silently drop
+// the request). It also must not advance the per-source high-water, or the redelivery would be suppressed
+// as "already applied".
+func TestDirectorPullRequeuedWhenNotLeader(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1)}
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+	// leader defaults to false
+
+	m := pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1", Actor: "Ada"})
+	d.handleSignal(context.Background(), m)
+	if <-m.ack {
+		t.Fatal("a non-leader must NAK the pull request (return false) so it redelivers to the leader")
+	}
+	if hw := d.applied["shard-1"]; hw != 0 {
+		t.Fatalf("a NAK'd (unhandled) request must not advance the high-water; applied[shard-1]=%d", hw)
+	}
+	select {
+	case got := <-p.calls:
+		t.Fatalf("a non-leader director must not pull, but it called the puller: %+v", got)
+	case <-time.After(300 * time.Millisecond):
+		// good: no pull ran
+	}
+}
+
+// TestDirectorPullRedeliversToNewLeader: the failover handoff — the SAME request (same source:seq) first
+// lands on a non-leader (NAK, not applied), then redelivers to a director that is now leader, which runs
+// the pull. Proves the NAK path plus the high-water NOT suppressing the redelivery.
+func TestDirectorPullRedeliversToNewLeader(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1)}
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+
+	m := pullSignal(t, "shard-1:7", contentbus.PullRequest{Version: "v9", Actor: "Ada"})
+	// First delivery while NOT leader: NAK'd, nothing applied.
+	d.handleSignal(context.Background(), m)
+	if <-m.ack {
+		t.Fatal("first (non-leader) delivery should NAK")
+	}
+	// Promotion, then redelivery of the same request.
+	d.leader.Store(true)
+	m2 := pullSignal(t, "shard-1:7", contentbus.PullRequest{Version: "v9", Actor: "Ada"})
+	d.handleSignal(context.Background(), m2)
+	if !<-m2.ack {
+		t.Fatal("the redelivered request should ack on the now-leader")
+	}
+	select {
+	case got := <-p.calls:
+		if got.version != "v9" {
+			t.Fatalf("redelivered pull ran with %+v, want v9", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the now-leader did not run the redelivered pull (high-water wrongly suppressed it?)")
+	}
+}
+
+// TestDirectorPullSingleFlight: while one pull is in flight, a second request is dropped (not
+// double-imported).
+func TestDirectorPullSingleFlight(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 2), block: make(chan struct{})}
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+	d.leader.Store(true)
+
+	// First request: acquires the single-flight slot and blocks inside Pull.
+	d.handleSignal(context.Background(), pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1", Actor: "Ada"}))
+	// Give the worker goroutine a moment to reach the block.
+	time.Sleep(50 * time.Millisecond)
+	// Second request while the first is in flight: dropped by the single-flight guard.
+	d.handleSignal(context.Background(), pullSignal(t, "shard-1:2", contentbus.PullRequest{Version: "v2", Actor: "Ben"}))
+
+	close(p.block) // release the first pull
+	select {
+	case got := <-p.calls:
+		if got.version != "v1" {
+			t.Fatalf("first pull was %+v, want v1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first pull never ran")
+	}
+	// The second must NOT have run (dropped while the first held the slot).
+	select {
+	case got := <-p.calls:
+		t.Fatalf("a second concurrent pull ran (%+v) — single-flight failed", got)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+}
+
+// TestDirectorPullNilPullerAndMalformed: no puller wired, or a malformed/empty payload, is dropped
+// cleanly (logged, acked, never a crash).
+func TestDirectorPullNilPullerAndMalformed(t *testing.T) {
+	// Nil puller: a state-only director acks + ignores.
+	d := New("", newMemStore(), slog.Default())
+	d.leader.Store(true)
+	m := pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1", Actor: "Ada"})
+	d.handleSignal(context.Background(), m)
+	if !<-m.ack {
+		t.Fatal("nil-puller pull request should still ack")
+	}
+	// Malformed payload with a puller wired: dropped, no call.
+	p := &fakePuller{calls: make(chan pullArgs, 1)}
+	d2 := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+	d2.leader.Store(true)
+	bad := signalMsg{event: contentbus.PullRequestEvent, payload: []byte("{not json"), key: "shard-1:1", source: "shard-1", ack: make(chan bool, 1)}
+	d2.handleSignal(context.Background(), bad)
+	if !<-bad.ack {
+		t.Fatal("a malformed pull request should ack (a bad payload never parses on redelivery)")
+	}
+	select {
+	case <-p.calls:
+		t.Fatal("a malformed pull request must not call the puller")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestDirectorPullEmptyVersionAcks: an empty-version request (should not happen — the command guards it —
+// but defensive) is dropped-and-ACKED (not NAK'd; a redelivery of the same empty payload never improves).
+func TestDirectorPullEmptyVersionAcks(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1)}
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+	d.leader.Store(true)
+	m := pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "", Actor: "Ada"})
+	d.handleSignal(context.Background(), m)
+	if !<-m.ack {
+		t.Fatal("an empty-version request should ack (drop, not requeue)")
+	}
+	select {
+	case <-p.calls:
+		t.Fatal("an empty-version request must not call the puller")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestDirectorPullTimeoutReleasesSlot: when a pull exceeds directorPullTimeout, the worker's ctx cancels,
+// Pull returns, and the single-flight slot is released — so a subsequent request is not permanently wedged.
+func TestDirectorPullTimeoutReleasesSlot(t *testing.T) {
+	orig := directorPullTimeout
+	directorPullTimeout = 50 * time.Millisecond
+	defer func() { directorPullTimeout = orig }()
+
+	// First pull blocks past the timeout (never released via p.block); the ctx deadline unblocks it.
+	p := &fakePuller{calls: make(chan pullArgs, 1), block: make(chan struct{})}
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+	d.leader.Store(true)
+	d.handleSignal(context.Background(), pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1", Actor: "Ada"}))
+
+	// Wait for the slot to free after the timeout fires (the deferred pulling.Store(false)).
+	deadline := time.Now().Add(2 * time.Second)
+	for d.pulling.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if d.pulling.Load() {
+		t.Fatal("the single-flight slot was not released after the pull timed out")
+	}
+
+	// A subsequent request now proceeds (the slot is free). This puller does not block.
+	p2 := &fakePuller{calls: make(chan pullArgs, 1)}
+	d.puller = p2
+	d.handleSignal(context.Background(), pullSignal(t, "shard-1:2", contentbus.PullRequest{Version: "v2", Actor: "Ben"}))
+	select {
+	case got := <-p2.calls:
+		if got.version != "v2" {
+			t.Fatalf("post-timeout pull ran with %+v, want v2", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a request after a timed-out pull did not proceed (slot still held?)")
+	}
+}

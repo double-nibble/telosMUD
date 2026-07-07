@@ -41,6 +41,9 @@ func staffCommands() []*Command {
 		// `reload [<pack>]` (#53): propagate a content hot-reload across the fleet (reloadcmd.go). Staff-
 		// gated + hidden like `stat`; registered here so it never shadows/abbreviates a mortal verb.
 		{Name: "reload", MinRank: rankStaff, Flags: CmdHidden, Run: cmdReload},
+		// `pull <version>` (#212 slice 4 PR E): request a director-coordinated install of a PUBLISHED
+		// content version from the external store (pullcmd.go). Staff-gated + hidden like the others.
+		{Name: "pull", MinRank: rankStaff, Flags: CmdHidden, Run: cmdPull},
 	}
 }
 
