@@ -4,10 +4,25 @@ import (
 	"context"
 	"testing"
 
+	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
 )
 
 // #212 slice 1: the shard-hosting helpers that make the embedded core pack the login fallback.
+
+func TestEnabledPacksFor(t *testing.T) {
+	// No config => the demo default (bare dev run).
+	if got := enabledPacksFor(config.Config{}); len(got) != 1 || got[0] != content.DemoPack {
+		t.Fatalf("default enabled packs = %v, want [demo]", got)
+	}
+	// Configured => the operator's set (what telos-pull imported).
+	var cfg config.Config
+	cfg.ContentPacks = []string{"mainland", "underdark"}
+	got := enabledPacksFor(cfg)
+	if len(got) != 2 || got[0] != "mainland" || got[1] != "underdark" {
+		t.Fatalf("configured enabled packs = %v, want [mainland underdark]", got)
+	}
+}
 
 func TestWithCoreZone(t *testing.T) {
 	got := withCoreZone([]string{"midgaard", "darkwood"})
