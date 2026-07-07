@@ -75,6 +75,35 @@ func TestZonesDefaultAndEnv(t *testing.T) {
 	}
 }
 
+func TestContentStoreConfig(t *testing.T) {
+	// Default: external store off (empty URL), no content-pack override.
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Content.URL != "" || len(cfg.ContentPacks) != 0 {
+		t.Fatalf("default content store should be off: %+v packs=%v", cfg.Content, cfg.ContentPacks)
+	}
+
+	t.Setenv("TELOS_CONTENT_URL", "https://example.com/org/content.git")
+	t.Setenv("TELOS_CONTENT_VERSION", "v1.4.0")
+	t.Setenv("TELOS_CONTENT_TOKEN", "secret-pat")
+	t.Setenv("TELOS_CONTENT_CACHE", "/var/lib/telos/content")
+	t.Setenv("TELOS_CONTENT_PACKS", "mainland, underdark ,, ")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Content.URL != "https://example.com/org/content.git" || cfg.Content.Version != "v1.4.0" ||
+		cfg.Content.Token != "secret-pat" || cfg.Content.CacheDir != "/var/lib/telos/content" {
+		t.Fatalf("content env not applied: %+v", cfg.Content)
+	}
+	if want := []string{"mainland", "underdark"}; len(cfg.ContentPacks) != len(want) ||
+		cfg.ContentPacks[0] != want[0] || cfg.ContentPacks[1] != want[1] {
+		t.Fatalf("ContentPacks = %v, want %v", cfg.ContentPacks, want)
+	}
+}
+
 func TestEnvOverridesYAML(t *testing.T) {
 	t.Setenv("TELOS_NATS_URL", "nats://example:4222")
 	cfg, err := Load("")
