@@ -81,12 +81,45 @@ type reloader struct {
 	retryInFlight atomic.Int64
 	retryDone     chan struct{}
 	stopOnce      sync.Once
+
+	// Reconcile-on-join (#212 slice 4 PR D): appliedContentVersion is the monotonic content version this
+	// shard's in-memory prototypes reflect (seeded at boot from the version the content was loaded at). On
+	// a bus reconnect, reconcileOnJoin compares it against the CURRENT Postgres content version and, if the
+	// shard fell behind during the gap (a pull it missed), re-applies locally to catch up. reconcileInFlight
+	// single-flights concurrent reconnects.
+	appliedContentVersion atomic.Uint64
+	reconcileInFlight     atomic.Bool
 }
+
+// contentVersioner is the subset of the content source that reports the current Postgres content
+// version — satisfied by *store.Pool in production, absent on the embedded/mem sources (which then
+// skip reconcile-on-join). Kept structural so the world package needs no store import (store imports
+// world, so the reverse would cycle).
+type contentVersioner interface {
+	ContentVersion(ctx context.Context) (uint64, error)
+}
+
+// localApplyBus is a contentbus.Bus whose Publish applies each invalidation to THIS shard directly
+// (r.onInvalidation) instead of broadcasting. reconcileOnJoin feeds a re-read pack through PublishPack
+// over it, reusing the exact per-ref swap + zone-shape reconcile the wire path uses — but LOCAL-only,
+// so a rejoining shard catches itself up without re-broadcasting to (and re-swapping) the whole fleet.
+type localApplyBus struct{ r *reloader }
+
+func (b localApplyBus) Publish(_ context.Context, inv contentbus.Invalidation) error {
+	b.r.onInvalidation(inv)
+	return nil
+}
+
+func (localApplyBus) Subscribe(func(contentbus.Invalidation)) (contentbus.Subscription, error) {
+	return nil, nil // unused: a local-apply bus is never subscribed to
+}
+func (localApplyBus) OnReconnect(func()) {}
+func (localApplyBus) Close() error       { return nil }
 
 // newReloader wires a reloader over src/cache/bus for the given enabled packs and SUBSCRIBES. A
 // nil bus or nil src yields a nil reloader (hot reload disabled). A subscribe failure logs and
 // returns nil — never fatal, so an unreachable/closed bus simply disables hot reload.
-func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus.Bus, enabledPacks []string, shard *Shard) *reloader {
+func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus.Bus, enabledPacks []string, bootVersion uint64, shard *Shard) *reloader {
 	if bus == nil || src == nil || cache == nil {
 		return nil
 	}
@@ -100,6 +133,10 @@ func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus
 		log:       slog.With("component", "contentreload"),
 		retryDone: make(chan struct{}),
 	}
+	// Seed the applied version with the version the boot content was loaded at (read BEFORE the packs
+	// in loadContent, so it is never AHEAD of the loaded content — a pull racing boot fails safe to a
+	// redundant re-apply on the first reconnect, never a missed catch-up).
+	r.appliedContentVersion.Store(bootVersion)
 	for _, p := range enabledPacks {
 		r.packs[p] = true
 	}
@@ -109,8 +146,76 @@ func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus
 		return nil
 	}
 	r.sub = sub
-	r.log.Debug("hot reload enabled", "packs", enabledPacks)
+	// Reconcile-on-join (#212 slice 4 PR D): after a bus reconnect, catch up on any pull missed during
+	// the gap. Off the bus goroutine (reconcileOnJoin does PG I/O), single-flighted.
+	bus.OnReconnect(func() { go r.reconcileOnJoin() })
+	r.log.Debug("hot reload enabled", "packs", enabledPacks, "boot_content_version", bootVersion)
 	return r
+}
+
+// reconcileOnJoin catches this shard up to the current Postgres content version after a bus gap
+// (#212 slice 4 PR D). Core NATS buffers nothing while disconnected, so a pull that broadcast during
+// the gap was missed — the DB rows are current (Model 1) but the in-memory prototypes are stale. It
+// reads the current content version; if the shard is behind, it re-reads its enabled packs from
+// Postgres and applies them LOCALLY (via localApplyBus — no fleet re-broadcast) stamped with that
+// version, exactly as the missed broadcast would have. It NEVER re-pulls (the source is Postgres, not
+// git), NEVER refuses logins, and on a read failure just logs and keeps serving the current content.
+// Single-flighted against concurrent reconnects; runs off the bus goroutine.
+func (r *reloader) reconcileOnJoin() {
+	if !r.reconcileInFlight.CompareAndSwap(false, true) {
+		return // a catch-up is already running (rapid reconnects) — its result covers this one
+	}
+	defer r.reconcileInFlight.Store(false)
+
+	vs, ok := r.src.(contentVersioner)
+	if !ok {
+		return // source can't report a version (embedded/mem dev source): nothing to reconcile
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reloadRepublishTimeout)
+	defer cancel()
+	cur, err := vs.ContentVersion(ctx)
+	if err != nil {
+		r.log.Warn("reconcile-on-join: could not read the content version; serving current content", "err", err)
+		return
+	}
+	applied := r.appliedContentVersion.Load()
+	if cur == 0 || cur <= applied {
+		return // not behind (0 = never imported): the reconnect changed nothing to catch up on
+	}
+	src, ok := r.src.(content.Source)
+	if !ok {
+		return
+	}
+	packs, err := src.LoadPacks(ctx, r.enabled)
+	if err != nil {
+		r.log.Warn("reconcile-on-join: re-read of packs failed; serving current content", "err", err)
+		return
+	}
+	local := localApplyBus{r: r}
+	total := 0
+	for _, pk := range packs {
+		n, _ := contentbus.PublishPack(ctx, local, pk, cur) // applies locally via r.onInvalidation
+		total += n
+	}
+	// advanceApplied (not a raw Store): a wire delivery of a NEWER pull could land on the subscription
+	// goroutine during this reconcile and advance the cursor past `cur` — a hard Store would regress it.
+	r.advanceApplied(cur)
+	r.log.Info("reconcile-on-join: caught up after a content-bus gap",
+		"from_version", applied, "to_version", cur, "definitions_applied", total)
+}
+
+// advanceApplied monotonically raises appliedContentVersion to v (a no-op if v is 0 or not higher),
+// via a CAS loop so a concurrent wire delivery and a reconcile-on-join agree on the maximum.
+func (r *reloader) advanceApplied(v uint64) {
+	for v > 0 {
+		prev := r.appliedContentVersion.Load()
+		if v <= prev {
+			return
+		}
+		if r.appliedContentVersion.CompareAndSwap(prev, v) {
+			return
+		}
+	}
 }
 
 // onInvalidation is the bus handler: it runs OFF every zone goroutine (the bus's subscription
@@ -125,6 +230,17 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 		return
 	}
 	r.log.Debug("invalidation received", "kind", inv.Kind, "ref", inv.Ref, "pack", inv.Pack)
+
+	// The version-complete SENTINEL (#212 slice 4 PR D): a versioned pull's LAST invalidation, carrying
+	// only the version. Advancing appliedContentVersion ONLY here — not on every per-ref message — is what
+	// makes a PARTIALLY-delivered pull safe: a prefix-then-drop never reaches the sentinel, so applied
+	// stays behind and reconcile-on-join re-applies the rest on reconnect. It has no ref to swap. (A
+	// shard-local `reload` / dev seed does NOT emit it, so a hot-edit's nanos version never poisons the
+	// cursor — only a real versioned pull advances it.)
+	if inv.Kind == content.KindVersionComplete {
+		r.advanceApplied(inv.Version)
+		return
+	}
 
 	// Phase 8.3: a `channel` invalidation reloads a pack-GLOBAL channel_def into the per-shard channel
 	// REGISTRY (the atomic-swap defRegistry), not the prototype cache. It is a different swap target

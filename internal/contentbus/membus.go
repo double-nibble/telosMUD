@@ -17,9 +17,10 @@ import (
 // MemBus, and a test (or the seed/publish helper) Publishes to it; every subscriber's handler
 // fires, modelling the cross-shard fan-out a real NATS broker provides.
 type MemBus struct {
-	mu     sync.Mutex
-	closed bool
-	subs   map[*memSub]struct{}
+	mu          sync.Mutex
+	closed      bool
+	subs        map[*memSub]struct{}
+	reconnectCB func() // set by OnReconnect; fired by TriggerReconnect (tests simulate a bus gap)
 }
 
 // NewMemBus returns an empty in-memory bus.
@@ -111,6 +112,25 @@ func (b *MemBus) Close() error {
 		s.stop()
 	}
 	return nil
+}
+
+// OnReconnect records the reconnect callback (the in-memory bus has no real reconnect; a test drives
+// it via TriggerReconnect to simulate a NATS gap + recovery).
+func (b *MemBus) OnReconnect(cb func()) {
+	b.mu.Lock()
+	b.reconnectCB = cb
+	b.mu.Unlock()
+}
+
+// TriggerReconnect invokes the registered reconnect callback synchronously — a test hook that
+// simulates the bus reconnecting after a gap, so reconcile-on-join is exercisable without NATS.
+func (b *MemBus) TriggerReconnect() {
+	b.mu.Lock()
+	cb := b.reconnectCB
+	b.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
 }
 
 // Unsubscribe removes this subscription and stops its delivery goroutine. Idempotent.

@@ -90,3 +90,18 @@ func PublishPack(ctx context.Context, bus Bus, pk content.Pack, version uint64) 
 	}
 	return n, nil
 }
+
+// PublishVersionComplete emits the trailing version-complete SENTINEL (#212 slice 4 PR D): the
+// coordinator (telos-pull / the director) calls it ONCE, AFTER PublishPack'ing every pack of a
+// versioned pull, so it is the very last invalidation on the wire for that version. A subscriber
+// advances its applied content version ONLY on this sentinel — a pull whose broadcast is partially
+// delivered before a bus drop never reaches it, so reconcile-on-join re-applies the rest on reconnect
+// rather than falsely believing it is caught up. It is content-less (no ref/pack); every shard
+// processes it. Best-effort like the rest of the publish path — a failure is returned for the caller
+// to log, never fatal (the rows are already durable).
+func PublishVersionComplete(ctx context.Context, bus Bus, version uint64) error {
+	if bus == nil || version == 0 {
+		return nil
+	}
+	return bus.Publish(ctx, Invalidation{Kind: content.KindVersionComplete, Version: version})
+}

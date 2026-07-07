@@ -61,7 +61,7 @@ func newReloadShard(t *testing.T, src *content.MemSource, bus contentbus.Bus) *S
 		t.Fatalf("boot load: %v", err)
 	}
 	s := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
-		WithHotReload(src, bus, []string{"reloadtest"})
+		WithHotReload(src, bus, []string{"reloadtest"}, 0)
 	if s.reloader == nil {
 		t.Fatal("hot reload not enabled (reloader nil)")
 	}
@@ -122,6 +122,175 @@ func TestHotReloadRoomLongDesc(t *testing.T) {
 	// ...and the PRE-EXISTING instance is unchanged (it still aliases the old prototype, GC-kept).
 	if got := before.Long(); got != "An old stone hall." {
 		t.Fatalf("pre-existing instance long changed to %q; live instances must NOT be retroactively reloaded", got)
+	}
+}
+
+// waitForVersion polls the reloader's applied content version until it reaches want (reconcile-on-join
+// runs on its own goroutine off the reconnect callback).
+func waitForVersion(t *testing.T, r *reloader, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.appliedContentVersion.Load() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("applied content version = %d, want %d", r.appliedContentVersion.Load(), want)
+}
+
+// TestReconcileOnJoin_CatchesUpAfterBusGap: a shard that MISSED a pull's broadcast during a bus gap
+// re-reads Postgres on reconnect and applies the missed content locally (#212 slice 4 PR D).
+func TestReconcileOnJoin_CatchesUpAfterBusGap(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	src.SetContentVersion(1)
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+
+	lc, err := content.Load(context.Background(), src, []string{"reloadtest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
+		WithHotReload(src, bus, []string{"reloadtest"}, 1) // boot at content version 1
+	if s.reloader == nil {
+		t.Fatal("reloader nil")
+	}
+
+	// A pull the shard MISSED during a bus gap: the DB content changed and the version bumped, but no
+	// invalidation was delivered (the shard was disconnected).
+	const newLong = "A hall re-tiled while the shard was offline."
+	if err := src.EditRoomLong("reloadtest", "rt:room:hall", newLong); err != nil {
+		t.Fatal(err)
+	}
+	src.SetContentVersion(2)
+	if p := s.protos.get("rt:room:hall"); p == nil || p.long == newLong {
+		t.Fatal("precondition: the shard should still hold the pre-pull room")
+	}
+
+	// The bus reconnects → reconcile-on-join catches the shard up from Postgres (local-only).
+	bus.TriggerReconnect()
+
+	waitForProto(t, s, "rt:room:hall", func(p *Prototype) bool { return p.long == newLong })
+	waitForVersion(t, s.reloader, 2)
+}
+
+// TestReconcileOnJoin_NotBehindNoOp: a reconnect with no new pull re-reads nothing and re-applies
+// nothing (the applied version already matches Postgres).
+func TestReconcileOnJoin_NotBehindNoOp(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	src.SetContentVersion(5)
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+
+	lc, _ := content.Load(context.Background(), src, []string{"reloadtest"})
+	s := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
+		WithHotReload(src, bus, []string{"reloadtest"}, 5) // already at version 5
+	if s.reloader == nil {
+		t.Fatal("reloader nil")
+	}
+
+	// Change the content but do NOT bump the version (a transient blip, no pull). reconcile-on-join
+	// must NOT apply it (version unchanged => not behind).
+	if err := src.EditRoomLong("reloadtest", "rt:room:hall", "should not be applied"); err != nil {
+		t.Fatal(err)
+	}
+	bus.TriggerReconnect()
+
+	// Give the (no-op) reconcile a moment, then assert the room is unchanged and the version held.
+	time.Sleep(100 * time.Millisecond)
+	if p := s.protos.get("rt:room:hall"); p == nil || p.long != "An old stone hall." {
+		t.Fatalf("a not-behind reconnect must not re-apply content; long=%q", p.long)
+	}
+	if v := s.reloader.appliedContentVersion.Load(); v != 5 {
+		t.Fatalf("applied version drifted to %d, want 5", v)
+	}
+}
+
+// TestReconcileOnJoin_PartialDeliveryThenGap: a pull whose broadcast is only PARTIALLY delivered
+// before a bus drop must NOT mark the shard caught-up (no sentinel arrived) — reconcile-on-join
+// re-applies the un-delivered refs on reconnect. This is the #1 gap the version-complete sentinel closes.
+func TestReconcileOnJoin_PartialDeliveryThenGap(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPackMultiRoom()) // hall + cellar
+	src.SetContentVersion(1)
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+
+	lc, _ := content.Load(context.Background(), src, []string{"reloadtest"})
+	s := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
+		WithHotReload(src, bus, []string{"reloadtest"}, 1)
+	if s.reloader == nil {
+		t.Fatal("reloader nil")
+	}
+
+	// A pull (version 2) changes BOTH rooms in Postgres.
+	const newHall, newCellar = "A renovated hall.", "A drained cellar."
+	if err := src.EditRoomLong("reloadtest", "rt:room:hall", newHall); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.EditRoomLong("reloadtest", "rt:room:cellar", newCellar); err != nil {
+		t.Fatal(err)
+	}
+	src.SetContentVersion(2)
+
+	// The broadcast is only PARTIALLY delivered: the hall invalidation lands, then the bus drops —
+	// the cellar invalidation AND the trailing version-complete sentinel never arrive.
+	if err := bus.Publish(context.Background(), contentbus.Invalidation{
+		Kind: content.KindRoom, Ref: "rt:room:hall", Pack: "reloadtest", Version: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForProto(t, s, "rt:room:hall", func(p *Prototype) bool { return p.long == newHall })
+
+	// Because no sentinel arrived, the shard has NOT marked itself at version 2, and the cellar is stale.
+	if v := s.reloader.appliedContentVersion.Load(); v != 1 {
+		t.Fatalf("a partial delivery (no sentinel) must NOT advance the applied version; got %d, want 1", v)
+	}
+	if p := s.protos.get("rt:room:cellar"); p == nil || p.long == newCellar {
+		t.Fatal("precondition: the cellar edit should not yet be applied (its invalidation was dropped)")
+	}
+
+	// Reconnect → reconcile-on-join catches up the un-delivered cellar.
+	bus.TriggerReconnect()
+	waitForProto(t, s, "rt:room:cellar", func(p *Prototype) bool { return p.long == newCellar })
+	waitForVersion(t, s.reloader, 2)
+}
+
+// TestReconcileOnJoin_SentinelAdvancesNoRedundantReconcile: a FULLY-delivered pull (ending in the
+// version-complete sentinel) marks the shard caught-up, so a later reconnect with nothing new is a no-op.
+func TestReconcileOnJoin_SentinelAdvancesNoRedundantReconcile(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPack())
+	src.SetContentVersion(1)
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+
+	lc, _ := content.Load(context.Background(), src, []string{"reloadtest"})
+	s := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
+		WithHotReload(src, bus, []string{"reloadtest"}, 1)
+
+	// A full pull to version 2: the room invalidation, then the trailing sentinel.
+	src.SetContentVersion(2)
+	if err := bus.Publish(context.Background(), contentbus.Invalidation{
+		Kind: content.KindRoom, Ref: "rt:room:hall", Pack: "reloadtest", Version: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := contentbus.PublishVersionComplete(context.Background(), bus, 2); err != nil {
+		t.Fatal(err)
+	}
+	// The sentinel advances the applied version to 2 (no reconcile-on-join needed).
+	waitForVersion(t, s.reloader, 2)
+
+	// A reconnect now finds nothing new (applied == current), so it does not re-read/re-apply.
+	src.EditRoomLong("reloadtest", "rt:room:hall", "must not be re-applied") //nolint:errcheck // room exists
+	bus.TriggerReconnect()
+	time.Sleep(100 * time.Millisecond)
+	if v := s.reloader.appliedContentVersion.Load(); v != 2 {
+		t.Fatalf("applied version drifted to %d, want 2", v)
 	}
 }
 
@@ -315,7 +484,7 @@ func TestBuslessShardHasNoReloader(t *testing.T) {
 
 	// No bus => disabled.
 	s := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
-		WithHotReload(src, nil, []string{"reloadtest"})
+		WithHotReload(src, nil, []string{"reloadtest"}, 0)
 	if s.reloader != nil {
 		t.Fatal("nil bus should disable hot reload")
 	}
@@ -323,7 +492,7 @@ func TestBuslessShardHasNoReloader(t *testing.T) {
 	bus := contentbus.NewMemBus()
 	defer bus.Close()
 	s2 := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
-		WithHotReload(nil, bus, []string{"reloadtest"})
+		WithHotReload(nil, bus, []string{"reloadtest"}, 0)
 	if s2.reloader != nil {
 		t.Fatal("nil source should disable hot reload")
 	}

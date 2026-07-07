@@ -95,6 +95,23 @@ func (b *NATSBus) Subscribe(handler func(Invalidation)) (Subscription, error) {
 	return &natsSub{sub: sub}, nil
 }
 
+// OnReconnect wires cb to the NATS reconnect handler: it fires each time the connection is
+// re-established after a drop. The subscription auto-resumes on reconnect, but messages published
+// DURING the gap were lost (core NATS), so cb is the shard's chance to catch up (reconcile-on-join).
+func (b *NATSBus) OnReconnect(cb func()) {
+	if b.nc == nil {
+		return
+	}
+	if cb == nil {
+		b.nc.SetReconnectHandler(nil)
+		return
+	}
+	b.nc.SetReconnectHandler(func(_ *nats.Conn) {
+		b.log.Info("content bus reconnected; running catch-up")
+		cb()
+	})
+}
+
 // Close drains and closes the NATS connection. Idempotent.
 func (b *NATSBus) Close() error {
 	if b.nc == nil || b.nc.IsClosed() {

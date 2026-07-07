@@ -228,7 +228,7 @@ func TestChannelHotReload(t *testing.T) {
 	bus := contentbus.NewMemBus()
 	sh := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
 		WithComms(wbus).
-		WithHotReload(src, bus, []string{"rt"})
+		WithHotReload(src, bus, []string{"rt"}, 0)
 	z := sh.Zone()
 	got := subscribeChan(t, gate, commbus.ChanSubject("chat"))
 

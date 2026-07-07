@@ -171,6 +171,11 @@ func broadcast(ctx context.Context, natsURL string, packs []content.Pack, versio
 			slog.Warn("publishing content invalidations failed (partial)", "pack", pk.Pack, "published", n, "err", perr)
 		}
 	}
+	// The trailing version-complete sentinel — LAST on the wire, after every pack — so a subscriber
+	// only marks itself caught-up to this version once it has received the whole pull (reconcile-on-join).
+	if err := contentbus.PublishVersionComplete(ctx, bus, version); err != nil {
+		slog.Warn("publishing the version-complete sentinel failed", "version", version, "err", err)
+	}
 	slog.Info("published content invalidations", "count", total, "version", version)
 }
 

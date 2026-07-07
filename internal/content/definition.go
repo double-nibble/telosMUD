@@ -25,6 +25,12 @@ const (
 	// re-read scans the pack globals, and its hot-reload swaps the channel registry (not the prototype
 	// cache). The world's reloader special-cases this kind (world/reload.go).
 	KindChannel = "channel"
+	// KindVersionComplete is a content-less SENTINEL a versioned pull emits as its VERY LAST invalidation,
+	// after every pack's ref/zone/channel invalidations (#212 slice 4 PR D). It carries only Version and
+	// no Ref/data. A subscriber advances its "applied content version" ONLY on this sentinel — so a pull
+	// whose broadcast is only PARTIALLY delivered before a bus drop never marks the shard caught-up, and
+	// reconcile-on-join re-applies the missed content on reconnect. The applier does no swap for it.
+	KindVersionComplete = "version_complete"
 )
 
 // Definition is the result of a single-ref re-read: exactly one of Room/Proto is set (per Kind),
@@ -128,8 +134,9 @@ func scanZone(kind, ref string, z *ZoneDTO) (Definition, bool) {
 // (or a writer) EDITS — the same concurrent read/write shape the production store handles, so the
 // concurrency test exercises the cache swap, not a test-double data race.
 type MemSource struct {
-	mu    sync.Mutex
-	packs map[string]*Pack
+	mu      sync.Mutex
+	packs   map[string]*Pack
+	version uint64 // the current content version reconcile-on-join reads (#212 slice 4 PR D)
 }
 
 // NewMemSource builds an empty mutable source.
@@ -140,6 +147,22 @@ func (m *MemSource) SetPack(p Pack) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.packs[p.Pack] = &p
+}
+
+// SetContentVersion sets the version ContentVersion reports — a test bumps it to simulate a pull
+// the shard missed during a bus gap (reconcile-on-join, #212 slice 4 PR D).
+func (m *MemSource) SetContentVersion(v uint64) {
+	m.mu.Lock()
+	m.version = v
+	m.mu.Unlock()
+}
+
+// ContentVersion reports the current content version, so a MemSource satisfies the world's
+// contentVersioner and can drive reconcile-on-join in a test (the production impl is *store.Pool).
+func (m *MemSource) ContentVersion(_ context.Context) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.version, nil
 }
 
 // LoadPacks implements Source: returns the named packs (a deep enough copy is unnecessary for
