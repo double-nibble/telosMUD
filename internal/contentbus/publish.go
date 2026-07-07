@@ -2,7 +2,6 @@ package contentbus
 
 import (
 	"context"
-	"time"
 
 	"github.com/double-nibble/telosmud/internal/content"
 )
@@ -21,18 +20,22 @@ import (
 // from individual publishes are returned at the first failure so the caller can log; a partial publish
 // still hot-reloads the refs that made it onto the wire.
 //
-// Every invalidation of one PublishPack call shares one monotonic Version (publish wall-clock nanos), so
-// a zone's reconcile can drop a STALE reconcile a racing reload reordered ahead of a newer one. The
-// KindZone invalidation is emitted LAST per zone and carries that zone's full room-ref set + start room,
-// so the reconcile converges off the already-swapped cache with no source re-read (the contentbus is a
-// single ordered subject — the per-ref cache swaps are delivered before the trailing KindZone reconcile).
-func PublishPack(ctx context.Context, bus Bus, pk content.Pack) (int, error) {
+// version is the AUTHORITATIVE monotonic content version this call carries, supplied by the caller: the
+// PG-minted content_version for a coordinated pull (#212 slice 4), or a wall-clock-nanos stamp for a
+// shard-local `reload` / dev seed. Every invalidation of one call shares it, so a zone's reconcile can
+// drop a STALE reconcile a racing reload reordered ahead of a newer one (the guard is last-writer-wins by
+// this value, not by arrival order). Both sources are nanos-SCALE so they never wedge the guard; the
+// PG-minted value is GREATEST(prev+1, now_nanos) from the PULLER host's clock, while a shard-local reload
+// stamps THIS shard's clock — so a reload racing a pull can be superseded when the shard's clock lags the
+// puller's (a CROSS-HOST clock-skew window, not elapsed time; only the zone-shape reconcile is dropped,
+// per-ref data still applies — documented at the reload call site). The KindZone
+// invalidation is emitted LAST per zone and carries that zone's full room-ref set + start room, so the
+// reconcile converges off the already-swapped cache with no source re-read (the contentbus is a single
+// ordered subject — the per-ref cache swaps are delivered before the trailing KindZone reconcile).
+func PublishPack(ctx context.Context, bus Bus, pk content.Pack, version uint64) (int, error) {
 	if bus == nil {
 		return 0, nil
 	}
-	// One monotonic stamp shared by every invalidation of this reload (the reconcile's version guard is
-	// last-writer-wins by this value, not by arrival order).
-	version := uint64(time.Now().UnixNano())
 	n := 0
 	pub := func(kind, ref string) error {
 		if err := bus.Publish(ctx, Invalidation{Kind: kind, Ref: ref, Pack: pk.Pack, Version: version}); err != nil {

@@ -561,8 +561,8 @@ func TestImportVersion(t *testing.T) {
 	}
 
 	// Version 1: [A, B].
-	v1, pruned, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA), good(packB, zoneB)},
-		VersionMeta{ContentSHA: "sha1", ManifestVersion: "v1", ContentHash: "h1"})
+	v1, pruned, changed1, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA), good(packB, zoneB)},
+		VersionMeta{ContentSHA: "sha1-" + suffix, ManifestVersion: "v1", ContentHash: "h1"})
 	if err != nil {
 		t.Fatalf("import v1: %v", err)
 	}
@@ -572,11 +572,14 @@ func TestImportVersion(t *testing.T) {
 	if len(pruned) != 0 {
 		t.Fatalf("first import should prune nothing, got %v", pruned)
 	}
+	if !changed1 {
+		t.Fatal("a first real import must report changed=true")
+	}
 	info, err := p.CurrentContentVersion(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Version != v1 || info.ContentSHA != "sha1" || info.ManifestVersion != "v1" {
+	if info.Version != v1 || info.ContentSHA != "sha1-"+suffix || info.ManifestVersion != "v1" {
 		t.Fatalf("content_version stamp wrong: %+v (want version=%d sha1 v1)", info, v1)
 	}
 	if !containsAll(info.Packs, packA, packB) || len(info.Packs) != 2 {
@@ -584,8 +587,8 @@ func TestImportVersion(t *testing.T) {
 	}
 
 	// Version 2: [A] — drops B, which must be pruned and its rows gone.
-	v2, pruned, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
-		VersionMeta{ContentSHA: "sha2", ManifestVersion: "v2", ContentHash: "h2"})
+	v2, pruned, changed2, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
+		VersionMeta{ContentSHA: "sha2-" + suffix, ManifestVersion: "v2", ContentHash: "h2"})
 	if err != nil {
 		t.Fatalf("import v2: %v", err)
 	}
@@ -608,8 +611,8 @@ func TestImportVersion(t *testing.T) {
 
 	// Idempotency (the leader-failover invariant): re-importing the SAME SHA is a no-op — the version
 	// must NOT bump and nothing is pruned, so a redelivery can't inflate the version / force a reconcile.
-	v2again, pruned2, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
-		VersionMeta{ContentSHA: "sha2", ManifestVersion: "v2", ContentHash: "h2"})
+	v2again, pruned2, changed2b, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
+		VersionMeta{ContentSHA: "sha2-" + suffix, ManifestVersion: "v2", ContentHash: "h2"})
 	if err != nil {
 		t.Fatalf("idempotent re-import: %v", err)
 	}
@@ -619,14 +622,21 @@ func TestImportVersion(t *testing.T) {
 	if len(pruned2) != 0 {
 		t.Fatalf("idempotent re-import should prune nothing, got %v", pruned2)
 	}
+	if changed2b {
+		t.Fatal("re-importing the same SHA must report changed=false (so the caller skips the broadcast)")
+	}
+
 	// A DIFFERENT SHA for the same pack set DOES bump (content changed even if the pack list didn't).
-	v3, _, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
-		VersionMeta{ContentSHA: "sha3", ManifestVersion: "v3", ContentHash: "h3"})
+	v3, _, changed3, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
+		VersionMeta{ContentSHA: "sha3-" + suffix, ManifestVersion: "v3", ContentHash: "h3"})
 	if err != nil {
 		t.Fatalf("import v3: %v", err)
 	}
 	if v3 <= v2 {
 		t.Fatalf("a new SHA must bump the version: v3=%d <= v2=%d", v3, v2)
+	}
+	if !changed2 || !changed3 {
+		t.Fatalf("real imports must report changed=true (v2=%v v3=%v)", changed2, changed3)
 	}
 }
 
