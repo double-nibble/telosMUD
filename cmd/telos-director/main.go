@@ -26,6 +26,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/contentpull"
 	"github.com/double-nibble/telosmud/internal/director"
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
@@ -122,6 +123,13 @@ func main() {
 	if claimer != nil {
 		world.WithElection(claimer, instanceID)
 	}
+	// Coordinated content pull (#212 slice 4 PR E): wire the puller only when a content store is
+	// configured, so an in-game `pull <version>` installs a published version fleet-wide. Without a
+	// content store the world director simply doesn't run coordinated pulls (the request is logged + dropped).
+	if cfg.Content.URL != "" {
+		world.WithContentPuller(contentPuller{cfg: cfg})
+		slog.Info("coordinated content pull enabled (director)", "content_url", cfg.Content.URL)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -217,4 +225,21 @@ func directorInstanceID(cfg config.Config) string {
 	}
 	host, _ := os.Hostname()
 	return fmt.Sprintf("director-%s-%s", host, uuid.NewString()[:8])
+}
+
+// contentPuller adapts the shared install pipeline (internal/contentpull) to the director's
+// ContentPuller interface (#212 slice 4 PR E): a coordinated `pull <version>` resolves that version from
+// the configured content store and imports it. The requested version overrides the config's pinned one.
+type contentPuller struct{ cfg config.Config }
+
+func (p contentPuller) Pull(ctx context.Context, version, _ string) error {
+	_, err := contentpull.Pull(ctx, contentpull.Options{
+		ContentURL:  p.cfg.Content.URL,
+		Version:     version,
+		Token:       p.cfg.Content.Token,
+		CacheDir:    p.cfg.Content.CacheDir,
+		PostgresDSN: p.cfg.Postgres.DSN,
+		NATSURL:     p.cfg.NATS.URL,
+	})
+	return err
 }

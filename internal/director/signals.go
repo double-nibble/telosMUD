@@ -171,6 +171,17 @@ func (d *Director) handleSignal(ctx context.Context, m signalMsg) {
 	if m.event == contentbus.ReloadAuditEvent {
 		d.recordReloadAudit(m.payload, m.source)
 	}
+	// Coordinated content PULL (#212 slice 4 PR E): a staff `pull <version>` asks the world director to
+	// install a published version. Director-owned (not the content SignalHandler): the actual git+PG work
+	// runs OFF this actor goroutine, leader-only, single-flight.
+	if m.event == contentbus.PullRequestEvent {
+		if !d.handlePullRequest(m.payload, m.source) {
+			// Not leader: NAK so the durable stream redelivers this request to the live leader, and do NOT
+			// advance the high-water below — the request is unhandled here, not applied-once.
+			m.ack <- false
+			return
+		}
+	}
 	if d.handler != nil {
 		d.handler(&API{d: d, ctx: ctx}, m.event, m.payload)
 	}
@@ -194,6 +205,68 @@ func (d *Director) recordReloadAudit(payload json.RawMessage, source string) {
 	d.log.Info("content reload audit",
 		"actor", a.Actor, "packs", a.Packs, "published", a.Published,
 		"outcome", a.Outcome, "at_unix_ms", a.AtUnixMs, "shard", source)
+}
+
+// directorPullTimeout bounds one coordinated pull (git resolve + checkout + Postgres import + broadcast).
+// Generous — a first clone of the content repo can be slow — but finite so a wedged pull cannot pin the
+// single-flight slot forever.
+var directorPullTimeout = 5 * time.Minute
+
+// handlePullRequest runs a coordinated content pull (#212 slice 4 PR E) for a `pull <version>` request.
+// It gates on leadership, parses, and single-flights on the ACTOR goroutine (cheap, non-racing), then hands
+// the heavy git+Postgres work to a WORKER goroutine so the director's ticks/signals are never stalled.
+// Re-running the same version is safe: the import is idempotent by content SHA.
+//
+// It returns ack=true to ACK the durable message — the request was handled here, whether accepted or
+// dropped as nil-puller / malformed / empty / already-in-flight (none of which a redelivery would fix) —
+// and ack=false to NAK it so the at-least-once stream REDELIVERS to the live leader. The leader gate runs
+// HERE on the actor goroutine, BEFORE the ack: a consume-then-demote handoff (a message queued while
+// leader, drained after the lease was lost) must requeue the request for the newly-promoted leader, not
+// ack-and-drop it. Only the heavy git+Postgres work is offloaded to a worker goroutine.
+func (d *Director) handlePullRequest(payload json.RawMessage, source string) (ack bool) {
+	if d.puller == nil {
+		return true // no puller wired (a state-only / region director) — drop-and-ack; coordinated pulls disabled
+	}
+	if !d.leader.Load() {
+		// A standby must not import. NAK so the durable stream redelivers to the newly-promoted leader,
+		// rather than the request being consumed here and silently lost on a failover boundary.
+		d.log.Info("director: not leader; requeueing coordinated pull for the live leader", "source", source)
+		return false
+	}
+	var req contentbus.PullRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		d.log.Warn("director: malformed pull request; dropped", "err", err, "source", source)
+		return true // a bad payload never parses on redelivery — drop-and-ack
+	}
+	if req.Version == "" {
+		d.log.Warn("director: pull request with empty version; dropped", "source", source)
+		return true
+	}
+	// Single-flight: drop a second request while one pull is in flight (the builder can re-run once it
+	// completes) rather than double-importing. Acked — a concurrent pull already owns the slot.
+	if !d.pulling.CompareAndSwap(false, true) {
+		d.log.Warn("director: pull request dropped — a coordinated pull is already in progress",
+			"version", req.Version, "actor", req.Actor)
+		return true
+	}
+	// Hand the heavy work to a worker so the director loop is never stalled for the up-to-5-min pull.
+	// Leadership can flip DURING the pull (a lease expiry mid-clone); the worker does NOT re-check, relying
+	// instead on the two import backstops — the content_version row SELECT ... FOR UPDATE + SHA-idempotency
+	// (store.ImportVersion) and the monotonic, sentinel-gated appliedContentVersion on shards — so a demoted
+	// director racing the promoted one converges to a single effect (decision E: transient dual-writer, safe
+	// by construction rather than by leader-exclusivity).
+	go func() {
+		defer d.pulling.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), directorPullTimeout)
+		defer cancel()
+		d.log.Info("director: coordinated pull starting", "version", req.Version, "actor", req.Actor, "shard", source)
+		if err := d.puller.Pull(ctx, req.Version, req.Actor); err != nil {
+			d.log.Warn("director: coordinated pull failed", "version", req.Version, "actor", req.Actor, "err", err)
+			return
+		}
+		d.log.Info("director: coordinated pull complete", "version", req.Version, "actor", req.Actor)
+	}()
+	return true
 }
 
 // broadcastStateDown publishes a state delta DOWN on this director's scope (the EventStateSet contract the
