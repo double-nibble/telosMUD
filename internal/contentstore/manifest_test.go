@@ -174,6 +174,71 @@ func TestVerifyContentHash(t *testing.T) {
 	}
 }
 
+func TestEmitManifest(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, body string) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("packs/reference/pack.yaml", "pack: reference\n")
+	write("packs/reference/zones/z.yaml", "zones: []\n")
+	write("packs/second/pack.yaml", "pack: second\n")
+
+	m, err := EmitManifest(dir, "v1.0.0", "https://ci/run/1")
+	if err != nil {
+		t.Fatalf("EmitManifest: %v", err)
+	}
+	if m.Version != "v1.0.0" || m.CIRun != "https://ci/run/1" {
+		t.Fatalf("manifest fields wrong: %+v", m)
+	}
+	if len(m.Packs) != 2 || m.Packs[0] != "reference" || m.Packs[1] != "second" {
+		t.Fatalf("emitted packs = %v, want sorted [reference second]", m.Packs)
+	}
+
+	// The written manifest.yaml reads back and its hash verifies over the same tree — the exact
+	// round-trip the importer performs after a git checkout.
+	fsys := os.DirFS(dir)
+	got, err := ReadManifest(fsys)
+	if err != nil {
+		t.Fatalf("ReadManifest of emitted file: %v", err)
+	}
+	if got.Version != "v1.0.0" || got.ContentHash != m.ContentHash {
+		t.Fatalf("round-tripped manifest = %+v, want the emitted one", got)
+	}
+	if err := VerifyContentHash(fsys, got.ContentHash); err != nil {
+		t.Fatalf("emitted content hash must verify over the tree: %v", err)
+	}
+	// Writing the manifest did not change the hash (it is at the root, not under packs/): a second
+	// emit is stable.
+	m2, err := EmitManifest(dir, "v1.0.0", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.ContentHash != m.ContentHash {
+		t.Fatalf("re-emit changed the hash: %s -> %s", m.ContentHash, m2.ContentHash)
+	}
+}
+
+func TestListPacks(t *testing.T) {
+	fsys := fsWith(map[string]string{
+		"packs/alpha/pack.yaml": "pack: alpha\n",
+		"packs/beta.yaml":       "pack: beta\n", // single-file pack
+		"packs/README.md":       "ignored\n",    // not a pack
+	})
+	got, err := ListPacks(fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "alpha" || got[1] != "beta" {
+		t.Fatalf("ListPacks = %v, want [alpha beta]", got)
+	}
+}
+
 func TestComputeContentHash_EmptyTree(t *testing.T) {
 	// No packs/ dir → the empty set, not an error.
 	h, err := ComputeContentHash(fsWith(map[string]string{"manifest.yaml": "version: v1\n"}))

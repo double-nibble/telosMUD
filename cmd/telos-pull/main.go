@@ -29,7 +29,27 @@ import (
 func main() {
 	check := flag.Bool("check", false, "validate the published version without importing or broadcasting (CI merge gate)")
 	flag.BoolVar(check, "n", false, "shorthand for --check")
+	emit := flag.Bool("emit-manifest", false, "compute content_hash + packs over a local content tree and write manifest.yaml (content-repo publish tooling)")
+	dir := flag.String("dir", ".", "the content-repo directory (for --emit-manifest)")
+	manifestVersion := flag.String("manifest-version", "", "the version/tag to stamp into the emitted manifest (for --emit-manifest)")
+	ciRun := flag.String("ci-run", "", "the CI run URL to record in the emitted manifest (for --emit-manifest)")
 	flag.Parse()
+
+	// --emit-manifest operates on a LOCAL content tree (no config, no Postgres, no git) — the content
+	// repo's publish CI runs it to stamp content_hash + packs on a version before tagging.
+	if *emit {
+		if *manifestVersion == "" {
+			slog.Error("--emit-manifest requires --manifest-version")
+			os.Exit(1)
+		}
+		m, err := contentstore.EmitManifest(*dir, *manifestVersion, *ciRun)
+		if err != nil {
+			slog.Error("emit manifest failed", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("wrote manifest", "dir", *dir, "version", m.Version, "content_hash", m.ContentHash, "packs", m.Packs)
+		return
+	}
 
 	cfg, err := config.Load(config.PathFromEnv())
 	if err != nil {
