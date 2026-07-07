@@ -10,17 +10,22 @@ import (
 
 // #212 slice 1: the shard-hosting helpers that make the embedded core pack the login fallback.
 
-func TestEnabledPacksFor(t *testing.T) {
-	// No config => the demo default (bare dev run).
-	if got := enabledPacksFor(config.Config{}); len(got) != 1 || got[0] != content.DemoPack {
+func TestResolveEnabledPacks(t *testing.T) {
+	// Fresh DB (empty registry), no config => the demo default.
+	if got := resolveEnabledPacks(config.Config{}, nil); len(got) != 1 || got[0] != content.DemoPack {
 		t.Fatalf("default enabled packs = %v, want [demo]", got)
 	}
-	// Configured => the operator's set (what telos-pull imported).
-	var cfg config.Config
-	cfg.ContentPacks = []string{"mainland", "underdark"}
-	got := enabledPacksFor(cfg)
+	// Registry populated (a version was pulled), no config override => manifest-driven (the registry).
+	got := resolveEnabledPacks(config.Config{}, []string{"mainland", "underdark"})
 	if len(got) != 2 || got[0] != "mainland" || got[1] != "underdark" {
-		t.Fatalf("configured enabled packs = %v, want [mainland underdark]", got)
+		t.Fatalf("manifest-driven packs = %v, want [mainland underdark]", got)
+	}
+	// Explicit override wins over the registry.
+	var cfg config.Config
+	cfg.ContentPacks = []string{"pinned"}
+	got = resolveEnabledPacks(cfg, []string{"mainland", "underdark"})
+	if len(got) != 1 || got[0] != "pinned" {
+		t.Fatalf("override should win: got %v, want [pinned]", got)
 	}
 }
 

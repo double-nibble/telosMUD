@@ -40,16 +40,19 @@ import (
 	"github.com/double-nibble/telosmud/internal/world"
 )
 
-// enabledPacksFor returns the content packs a world shard loads from Postgres: the operator's
-// configured set (cfg.ContentPacks / TELOS_CONTENT_PACKS — e.g. the packs telos-pull imported for
-// the pinned content version), or the demo pack when none is configured (a bare dev run). The
-// embedded core bootstrap pack is layered under these unconditionally (content.LoadWithCore), so it
-// is never listed here. NOTE (slice 4 / #209): a fully manifest-driven world that auto-serves exactly
-// the pulled version's packs needs a PG pack registry (which doesn't exist yet); until then the
-// operator keeps cfg.ContentPacks in step with what was pulled.
-func enabledPacksFor(cfg config.Config) []string {
+// resolveEnabledPacks picks the content packs a world shard loads from Postgres (#212 slice 4,
+// manifest-driven). Precedence: (1) an explicit operator override (cfg.ContentPacks / TELOS_CONTENT_
+// PACKS) always wins — for pinning to a subset or dev; (2) else the packs the currently imported
+// version REGISTERED (registryPacks, from content_pack_registry) — so the world auto-serves exactly
+// what telos-pull/​the director last imported, with no operator list to keep in sync; (3) else the
+// demo pack (a fresh DB that was never pulled — dev/bootstrap). The embedded core bootstrap pack is
+// layered under these unconditionally (content.LoadWithCore), so it is never listed here.
+func resolveEnabledPacks(cfg config.Config, registryPacks []string) []string {
 	if len(cfg.ContentPacks) > 0 {
 		return cfg.ContentPacks
+	}
+	if len(registryPacks) > 0 {
+		return registryPacks
 	}
 	return []string{content.DemoPack}
 }
@@ -187,8 +190,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// Postgres is unreachable the shard boots EMPTY (the bare-engine invariant), exactly as it
 	// degrades to single-shard when Redis is down. The demo world lives only in the DB/YAML, so
 	// nothing demo is compiled into this path.
-	enabledPacks := enabledPacksFor(cfg)
-	lc := loadContent(ctx, cfg, enabledPacks)
+	lc, enabledPacks := loadContent(ctx, cfg)
 
 	// Open the long-lived Postgres pool (slice 4.2 character ladder + slice 4.3 hot-reload re-read).
 	// It is OPTIONAL: if Postgres is unreachable it stays nil and characters are EPHEMERAL and hot
@@ -406,7 +408,7 @@ func openContentBus(cfg config.Config) contentbus.Bus {
 // database is unreachable it logs a warning and returns EMPTY content — the engine boots with
 // zero rooms (bare-engine invariant), and a login is rejected cleanly rather than panicking.
 // Postgres is the production source; the embedded YAML pack is the unit-test/dev source.
-func loadContent(ctx context.Context, cfg config.Config, enabledPacks []string) *content.LoadedContent {
+func loadContent(ctx context.Context, cfg config.Config) (*content.LoadedContent, []string) {
 	if db.AutoMigrateEnabled() {
 		if err := db.Migrate(ctx, cfg.Postgres.DSN); err != nil {
 			slog.Warn("auto-migrate failed; continuing (boot may be empty)", "err", err)
@@ -420,16 +422,27 @@ func loadContent(ctx context.Context, cfg config.Config, enabledPacks []string) 
 		// a bootstrap start room and a builder can connect, rather than an empty, login-rejecting world.
 		slog.Warn("postgres unavailable; booting bootstrap-only world (embedded core pack)", "err", err)
 		core, _ := content.LoadWithCore(ctx, nil, nil)
-		return core
+		return core, nil
 	}
 	defer pool.Close()
+	// Manifest-driven pack selection (#212 slice 4): serve the packs the currently imported version
+	// registered (content_pack_registry), unless the operator pins an explicit set. A read failure
+	// (fresh DB before the 00024 migration, or a transient error) degrades to the demo/override default.
+	var registryPacks []string
+	if info, verr := pool.CurrentContentVersion(ctx); verr == nil {
+		registryPacks = info.Packs
+	} else {
+		slog.Debug("content version registry unavailable; using configured/default packs", "err", verr)
+	}
+	enabledPacks := resolveEnabledPacks(cfg, registryPacks)
+
 	// LoadWithCore layers the minimal embedded core pack UNDER the real packs read from Postgres, so
 	// the bootstrap zone is ALWAYS present; real content overrides it by ref (#212).
 	lc, err := content.LoadWithCore(ctx, pool, enabledPacks)
 	if err != nil {
 		slog.Warn("content load failed; booting bootstrap-only world (embedded core pack)", "err", err)
 		core, _ := content.LoadWithCore(ctx, nil, nil)
-		return core
+		return core, nil
 	}
 	// lc always carries the core zone now, so lc.Empty() is never true; report on the REAL content.
 	if realZones := len(lc.Zones) - 1; realZones <= 0 {
@@ -437,7 +450,7 @@ func loadContent(ctx context.Context, cfg config.Config, enabledPacks []string) 
 	} else {
 		slog.Info("content loaded from postgres", "packs", enabledPacks, "zones", realZones)
 	}
-	return lc
+	return lc, enabledPacks
 }
 
 // renewShardRegistration heartbeats this shard's id->endpoint registration until ctx is
