@@ -40,9 +40,19 @@ import (
 	"github.com/double-nibble/telosmud/internal/world"
 )
 
-// enabledPacks is the content packs a world shard loads. v1 ships only the demo pack;
-// strip-the-stdlib / per-deploy pack selection (a config field) is a later concern.
-var enabledPacks = []string{content.DemoPack}
+// enabledPacksFor returns the content packs a world shard loads from Postgres: the operator's
+// configured set (cfg.ContentPacks / TELOS_CONTENT_PACKS — e.g. the packs telos-pull imported for
+// the pinned content version), or the demo pack when none is configured (a bare dev run). The
+// embedded core bootstrap pack is layered under these unconditionally (content.LoadWithCore), so it
+// is never listed here. NOTE (slice 4 / #209): a fully manifest-driven world that auto-serves exactly
+// the pulled version's packs needs a PG pack registry (which doesn't exist yet); until then the
+// operator keeps cfg.ContentPacks in step with what was pulled.
+func enabledPacksFor(cfg config.Config) []string {
+	if len(cfg.ContentPacks) > 0 {
+		return cfg.ContentPacks
+	}
+	return []string{content.DemoPack}
+}
 
 func main() {
 	cfg, err := config.Load(config.PathFromEnv())
@@ -177,7 +187,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// Postgres is unreachable the shard boots EMPTY (the bare-engine invariant), exactly as it
 	// degrades to single-shard when Redis is down. The demo world lives only in the DB/YAML, so
 	// nothing demo is compiled into this path.
-	lc := loadContent(ctx, cfg)
+	enabledPacks := enabledPacksFor(cfg)
+	lc := loadContent(ctx, cfg, enabledPacks)
 
 	// Open the long-lived Postgres pool (slice 4.2 character ladder + slice 4.3 hot-reload re-read).
 	// It is OPTIONAL: if Postgres is unreachable it stays nil and characters are EPHEMERAL and hot
@@ -395,7 +406,7 @@ func openContentBus(cfg config.Config) contentbus.Bus {
 // database is unreachable it logs a warning and returns EMPTY content — the engine boots with
 // zero rooms (bare-engine invariant), and a login is rejected cleanly rather than panicking.
 // Postgres is the production source; the embedded YAML pack is the unit-test/dev source.
-func loadContent(ctx context.Context, cfg config.Config) *content.LoadedContent {
+func loadContent(ctx context.Context, cfg config.Config, enabledPacks []string) *content.LoadedContent {
 	if db.AutoMigrateEnabled() {
 		if err := db.Migrate(ctx, cfg.Postgres.DSN); err != nil {
 			slog.Warn("auto-migrate failed; continuing (boot may be empty)", "err", err)
