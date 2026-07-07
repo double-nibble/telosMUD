@@ -528,3 +528,117 @@ func countRows(t *testing.T, p *Pool, table, pack string) int {
 	}
 	return n
 }
+
+// TestImportVersion (gated) exercises the #212 slice-4 versioned import: the monotonic version bump,
+// the pack registry, and orphan pruning across versions.
+func TestImportVersion(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	suffix := time.Now().Format("150405.000000")
+	packA := "vpkA-" + suffix
+	packB := "vpkB-" + suffix
+	zoneA := "vza" + suffix
+	zoneB := "vzb" + suffix
+	t.Cleanup(func() {
+		cctx := context.Background()
+		tx, err := p.pool.Begin(cctx)
+		if err != nil {
+			return
+		}
+		defer tx.Rollback(cctx) //nolint:errcheck
+		for _, pk := range []string{packA, packB} {
+			_ = deletePack(cctx, tx, pk)
+			_, _ = tx.Exec(cctx, `DELETE FROM content_pack_registry WHERE pack=$1`, pk)
+		}
+		_ = tx.Commit(cctx)
+	})
+	good := func(pack, zone string) content.Pack {
+		return content.Pack{Pack: pack, Zones: []content.ZoneDTO{{
+			Ref: zone, Name: "Z", StartRoom: zone + ":room:1",
+			Rooms: []content.RoomDTO{{Ref: zone + ":room:1", Name: "One"}},
+		}}}
+	}
+
+	// Version 1: [A, B].
+	v1, pruned, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA), good(packB, zoneB)},
+		VersionMeta{ContentSHA: "sha1", ManifestVersion: "v1", ContentHash: "h1"})
+	if err != nil {
+		t.Fatalf("import v1: %v", err)
+	}
+	if v1 == 0 {
+		t.Fatal("version must be non-zero after an import")
+	}
+	if len(pruned) != 0 {
+		t.Fatalf("first import should prune nothing, got %v", pruned)
+	}
+	info, err := p.CurrentContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Version != v1 || info.ContentSHA != "sha1" || info.ManifestVersion != "v1" {
+		t.Fatalf("content_version stamp wrong: %+v (want version=%d sha1 v1)", info, v1)
+	}
+	if !containsAll(info.Packs, packA, packB) || len(info.Packs) != 2 {
+		t.Fatalf("registry after v1 = %v, want {%s,%s}", info.Packs, packA, packB)
+	}
+
+	// Version 2: [A] — drops B, which must be pruned and its rows gone.
+	v2, pruned, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
+		VersionMeta{ContentSHA: "sha2", ManifestVersion: "v2", ContentHash: "h2"})
+	if err != nil {
+		t.Fatalf("import v2: %v", err)
+	}
+	if v2 <= v1 {
+		t.Fatalf("version must be monotonic: v2=%d <= v1=%d", v2, v1)
+	}
+	if len(pruned) != 1 || pruned[0] != packB {
+		t.Fatalf("v2 should prune [%s], got %v", packB, pruned)
+	}
+	if n := countRows(t, p, "zones", packB); n != 0 {
+		t.Fatalf("dropped pack B's rows must be pruned, found %d zone rows", n)
+	}
+	if n := countRows(t, p, "zones", packA); n != 1 {
+		t.Fatalf("kept pack A must still be present, found %d zone rows", n)
+	}
+	info, _ = p.CurrentContentVersion(ctx)
+	if len(info.Packs) != 1 || info.Packs[0] != packA || info.Version != v2 {
+		t.Fatalf("registry after v2 = %+v, want {%s} at v2=%d", info, packA, v2)
+	}
+
+	// Idempotency (the leader-failover invariant): re-importing the SAME SHA is a no-op — the version
+	// must NOT bump and nothing is pruned, so a redelivery can't inflate the version / force a reconcile.
+	v2again, pruned2, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
+		VersionMeta{ContentSHA: "sha2", ManifestVersion: "v2", ContentHash: "h2"})
+	if err != nil {
+		t.Fatalf("idempotent re-import: %v", err)
+	}
+	if v2again != v2 {
+		t.Fatalf("re-importing the same SHA must not bump the version: got %d, want %d", v2again, v2)
+	}
+	if len(pruned2) != 0 {
+		t.Fatalf("idempotent re-import should prune nothing, got %v", pruned2)
+	}
+	// A DIFFERENT SHA for the same pack set DOES bump (content changed even if the pack list didn't).
+	v3, _, err := p.ImportVersion(ctx, []content.Pack{good(packA, zoneA)},
+		VersionMeta{ContentSHA: "sha3", ManifestVersion: "v3", ContentHash: "h3"})
+	if err != nil {
+		t.Fatalf("import v3: %v", err)
+	}
+	if v3 <= v2 {
+		t.Fatalf("a new SHA must bump the version: v3=%d <= v2=%d", v3, v2)
+	}
+}
+
+func containsAll(xs []string, want ...string) bool {
+	set := map[string]bool{}
+	for _, x := range xs {
+		set[x] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			return false
+		}
+	}
+	return true
+}

@@ -3,12 +3,34 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/double-nibble/telosmud/internal/content"
 )
+
+// VersionMeta is the published-version identity ImportVersion stamps into content_version (#212
+// slice 4). ContentSHA is the immutable git commit (the true identity); ManifestVersion is the human
+// tag; ContentHash corroborates the tree.
+type VersionMeta struct {
+	ContentSHA      string
+	ManifestVersion string
+	ContentHash     string
+}
+
+// ContentVersionInfo is the content version a database currently serves (the content_version
+// singleton plus the live pack registry set).
+type ContentVersionInfo struct {
+	Version         uint64   // the monotonic logical content version (0 => never imported)
+	ContentSHA      string   // immutable git SHA of the served tree
+	ManifestVersion string   // human manifest tag
+	ContentHash     string   // corroborating content hash
+	Packs           []string // the live registry pack set (sorted)
+}
 
 // ImportPack is the content WRITE path used by `make seed` (cmd/telos-seed): it loads a parsed
 // content.Pack (from the same embedded YAML the tests use) into the definition rows. It is the
@@ -60,6 +82,168 @@ func (p *Pool) ImportPacks(ctx context.Context, packs []content.Pack) error {
 		return fmt.Errorf("store: commit import: %w", err)
 	}
 	return nil
+}
+
+// ImportVersion imports a PUBLISHED content version atomically (#212 slice 4): in ONE transaction it
+// prunes packs the new version drops (present in the registry, absent from packs), strip-replaces each
+// named pack, overwrites the pack registry to exactly this version's packs, and bumps the monotonic
+// content_version singleton — returning the minted version and the pruned pack names.
+//
+// The version is minted as GREATEST(version+1, now_nanos): nanos-scale (never collides with a
+// wall-clock fallback and never wedges the reconcile guard) and monotonic. The critical section is
+// serialized by taking a FOR UPDATE lock on the singleton FIRST, so two concurrent importers (telos-
+// pull + the director) can never interleave their prune/import/registry writes — the whole section is
+// atomic, not just the scalar bump. Because everything is one tx, a crash never leaves rows without a
+// consistent version marker.
+//
+// Re-importing byte-identical content (same ContentSHA) is IDEMPOTENT: it returns the current version
+// without bumping or rewriting, so a leader-failover redelivery of the same published version does not
+// inflate the version or force a spurious fleet-wide reconcile (the key slice-4 invariant).
+//
+// pruned is returned (sorted) so the CALLER can enforce the "don't hot-strip a live-hosted pack"
+// policy (a rolling-reboot concern): this method performs the DB prune; it cannot know the fleet's
+// hosted zones, so the director gates that decision (slice 4 PR E).
+func (p *Pool) ImportVersion(ctx context.Context, packs []content.Pack, meta VersionMeta) (version uint64, pruned []string, err error) {
+	seen := make(map[string]bool, len(packs))
+	newSet := make(map[string]bool, len(packs))
+	for _, pk := range packs {
+		if pk.Pack == "" {
+			return 0, nil, fmt.Errorf("store: import pack with empty name")
+		}
+		if seen[pk.Pack] {
+			return 0, nil, fmt.Errorf("store: duplicate pack %q in import batch", pk.Pack)
+		}
+		seen[pk.Pack] = true
+		newSet[pk.Pack] = true
+	}
+
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return 0, nil, fmt.Errorf("store: begin import tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+
+	// Lock the singleton FIRST — this serializes the ENTIRE prune→import→bump→registry section against
+	// a concurrent importer (not just the scalar bump), and reads the current identity for the
+	// idempotency short-circuit. Self-heal a missing seed row (a hand-mangled DB).
+	var curVersion int64
+	var curSHA string
+	switch err := tx.QueryRow(ctx,
+		`SELECT version, content_sha FROM content_version WHERE id = 1 FOR UPDATE`).Scan(&curVersion, &curSHA); {
+	case errors.Is(err, pgx.ErrNoRows):
+		if _, err := tx.Exec(ctx, `INSERT INTO content_version (id) VALUES (1)`); err != nil {
+			return 0, nil, fmt.Errorf("store: seed content_version: %w", err)
+		}
+		curVersion, curSHA = 0, ""
+	case err != nil:
+		return 0, nil, fmt.Errorf("store: lock content_version: %w", err)
+	}
+
+	// Idempotency: byte-identical content (same non-empty SHA) is already fully imported (imports are
+	// atomic), so re-importing is a no-op — commit to release the lock and return the current version.
+	if meta.ContentSHA != "" && meta.ContentSHA == curSHA {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, nil, fmt.Errorf("store: commit (idempotent re-import): %w", err)
+		}
+		return uint64(curVersion), nil, nil //nolint:gosec // G115: version >= 0, from a bounded nanos column
+	}
+
+	// Prune packs the prior version had that this one drops (the registry is the diff source). NOTE:
+	// deletePack strips a pack's rooms, but a SURVIVING pack's exit whose to_room points INTO a pruned
+	// pack's room would FK-fail the rooms DELETE — which rolls the WHOLE import back (fail-safe, never
+	// torn), since cross-pack exits are unsupported (packs are self-contained worlds, see importPackTx).
+	oldSet, err := registryPacksTx(ctx, tx)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, pack := range oldSet {
+		if !newSet[pack] {
+			if derr := deletePack(ctx, tx, pack); derr != nil {
+				return 0, nil, derr
+			}
+			pruned = append(pruned, pack)
+		}
+	}
+	sort.Strings(pruned)
+
+	// Strip-replace each named pack (same per-pack tx body as ImportPacks).
+	for _, pk := range packs {
+		if err := importPackTx(ctx, tx, pk); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	// Bump the monotonic version + stamp the version identity (under the lock held above).
+	now := time.Now().UnixNano()
+	var ver int64
+	if err := tx.QueryRow(ctx,
+		`UPDATE content_version
+		    SET version = GREATEST(version + 1, $1::bigint),
+		        content_sha = $2, manifest_version = $3, content_hash = $4, imported_at = now()
+		  WHERE id = 1
+		RETURNING version`,
+		now, meta.ContentSHA, meta.ManifestVersion, meta.ContentHash).Scan(&ver); err != nil {
+		return 0, nil, fmt.Errorf("store: bump content_version: %w", err)
+	}
+
+	// Overwrite the registry to exactly this version's packs.
+	if _, err := tx.Exec(ctx, `DELETE FROM content_pack_registry`); err != nil {
+		return 0, nil, fmt.Errorf("store: clear pack registry: %w", err)
+	}
+	for _, pk := range packs {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO content_pack_registry (pack, version) VALUES ($1, $2)`, pk.Pack, ver); err != nil {
+			return 0, nil, fmt.Errorf("store: register pack %s: %w", pk.Pack, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, nil, fmt.Errorf("store: commit import version: %w", err)
+	}
+	// ver is GREATEST(version+1, now_nanos) >= 1, so the widening is always safe.
+	return uint64(ver), pruned, nil //nolint:gosec // G115: ver >= 1 (a positive nanos-scale value), never negative
+}
+
+// CurrentContentVersion reads the content version this database currently serves (the singleton stamp
+// + the live pack registry set) as ONE consistent snapshot — a single query joining the singleton to
+// the registry, so an import committing mid-read can't return a version stamp that disagrees with the
+// pack set. A fresh database (never imported) returns Version 0 with an empty (non-nil) pack list.
+func (p *Pool) CurrentContentVersion(ctx context.Context) (ContentVersionInfo, error) {
+	info := ContentVersionInfo{Packs: []string{}}
+	var ver int64
+	if err := p.pool.QueryRow(ctx,
+		`SELECT cv.version, cv.content_sha, cv.manifest_version, cv.content_hash,
+		        COALESCE(array_agg(r.pack ORDER BY r.pack) FILTER (WHERE r.pack IS NOT NULL), '{}')
+		   FROM content_version cv
+		   LEFT JOIN content_pack_registry r ON TRUE
+		  WHERE cv.id = 1
+		  GROUP BY cv.version, cv.content_sha, cv.manifest_version, cv.content_hash`).
+		Scan(&ver, &info.ContentSHA, &info.ManifestVersion, &info.ContentHash, &info.Packs); err != nil {
+		return ContentVersionInfo{}, fmt.Errorf("store: read content_version: %w", err)
+	}
+	info.Version = uint64(ver) //nolint:gosec // G115: version >= 0 from a bounded nanos column
+	if info.Packs == nil {
+		info.Packs = []string{}
+	}
+	return info, nil
+}
+
+// registryPacksTx reads the registry pack set within a transaction (the pre-prune old set).
+func registryPacksTx(ctx context.Context, tx pgx.Tx) ([]string, error) {
+	rows, err := tx.Query(ctx, `SELECT pack FROM content_pack_registry ORDER BY pack`)
+	if err != nil {
+		return nil, fmt.Errorf("store: read pack registry: %w", err)
+	}
+	defer rows.Close()
+	var packs []string
+	for rows.Next() {
+		var pack string
+		if err := rows.Scan(&pack); err != nil {
+			return nil, fmt.Errorf("store: scan pack registry: %w", err)
+		}
+		packs = append(packs, pack)
+	}
+	return packs, rows.Err()
 }
 
 // importPackTx strips + re-inserts one pack's rows within an existing transaction. It carries no
