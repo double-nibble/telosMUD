@@ -431,3 +431,100 @@ func TestLootTableBodyOnRollRoundTrips(t *testing.T) {
 		t.Fatalf("loot on_roll dropped in body round-trip: got %q", out.OnRoll)
 	}
 }
+
+// TestImportPacksAtomic (gated) proves ImportPacks (#212 slice 3) is CROSS-PACK atomic: importing a
+// batch where a later pack fails rolls back the earlier packs too, so Postgres never lands at a torn
+// half-version. It also confirms a clean multi-pack batch imports both packs.
+func TestImportPacksAtomic(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	suffix := time.Now().Format("150405.000000")
+	packA := "pkA-" + suffix
+	packB := "pkB-" + suffix
+	zoneA := "za" + suffix
+	zoneB := "zb" + suffix
+	t.Cleanup(func() {
+		cctx := context.Background()
+		tx, err := p.pool.Begin(cctx)
+		if err != nil {
+			return
+		}
+		defer tx.Rollback(cctx) //nolint:errcheck // no-op after Commit
+		for _, pk := range []string{packA, packB} {
+			_ = deletePack(cctx, tx, pk)
+		}
+		_ = tx.Commit(cctx)
+	})
+
+	good := func(pack, zone string) content.Pack {
+		lit := 1.0
+		return content.Pack{
+			Pack: pack,
+			Zones: []content.ZoneDTO{{
+				Ref: zone, Name: "Z", StartRoom: zone + ":room:1",
+				Rooms: []content.RoomDTO{{Ref: zone + ":room:1", Name: "One"}},
+			}},
+			// A pack-global def too, so the test proves def-table rows (inserted before a later pack
+			// fails) also roll back — the store field-drop-trap zone this PR defends.
+			Attributes: []content.AttributeDTO{{
+				Ref: zone + ":attr:hp", DisplayName: "HP", ValueKind: "int",
+				DefaultBase: content.BaseSpecDTO{Lit: &lit},
+			}},
+		}
+	}
+	// A pack whose SECOND room duplicates the first room's ref -> the second INSERT violates the rooms
+	// PK, failing importPackTx for this pack AFTER the earlier pack was already inserted in the same tx.
+	broken := content.Pack{Pack: packB, Zones: []content.ZoneDTO{{
+		Ref: zoneB, Name: "Z", StartRoom: zoneB + ":room:1",
+		Rooms: []content.RoomDTO{{Ref: zoneB + ":room:1", Name: "One"}, {Ref: zoneB + ":room:1", Name: "Dup"}},
+	}}}
+
+	// A duplicate pack name in the batch is rejected outright (else the second's delete would silently
+	// drop the first's rows).
+	if err := p.ImportPacks(ctx, []content.Pack{good(packA, zoneA), good(packA, zoneB)}); err == nil {
+		t.Fatal("ImportPacks with a duplicate pack name should be rejected")
+	}
+	if n := countRows(t, p, "zones", packA); n != 0 {
+		t.Fatalf("a rejected duplicate-name batch must write nothing, found %d zone rows", n)
+	}
+
+	// Atomicity: [good A, broken B] must fail AND leave NEITHER pack in the DB — zones AND def rows.
+	if err := p.ImportPacks(ctx, []content.Pack{good(packA, zoneA), broken}); err == nil {
+		t.Fatal("ImportPacks with a broken pack should fail")
+	}
+	if n := countRows(t, p, "zones", packA); n != 0 {
+		t.Fatalf("pack A zones must have rolled back with the failed batch, found %d", n)
+	}
+	if n := countRows(t, p, "attribute_defs", packA); n != 0 {
+		t.Fatalf("pack A def rows must have rolled back with the failed batch, found %d", n)
+	}
+	if n := countRows(t, p, "zones", packB); n != 0 {
+		t.Fatalf("broken pack B must not persist, found %d zone rows", n)
+	}
+
+	// Happy path: a clean multi-pack batch imports both, zones AND def rows.
+	if err := p.ImportPacks(ctx, []content.Pack{good(packA, zoneA), good(packB, zoneB)}); err != nil {
+		t.Fatalf("clean multi-pack import: %v", err)
+	}
+	if n := countRows(t, p, "zones", packA); n != 1 {
+		t.Fatalf("pack A zone missing after clean import, found %d", n)
+	}
+	if n := countRows(t, p, "attribute_defs", packA); n != 1 {
+		t.Fatalf("pack A def row missing after clean import, found %d", n)
+	}
+	if n := countRows(t, p, "zones", packB); n != 1 {
+		t.Fatalf("pack B zone missing after clean import, found %d", n)
+	}
+}
+
+func countRows(t *testing.T, p *Pool, table, pack string) int {
+	t.Helper()
+	var n int
+	// table is a test-controlled literal, never user input.
+	q := "SELECT count(*) FROM " + table + " WHERE pack=$1"
+	if err := p.pool.QueryRow(context.Background(), q, pack).Scan(&n); err != nil {
+		t.Fatalf("count %s for %s: %v", table, pack, err)
+	}
+	return n
+}

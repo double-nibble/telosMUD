@@ -17,8 +17,33 @@ import (
 // `make seed` is safe and a pack edit fully replaces the old content. The whole import runs in
 // one transaction (PERSISTENCE.md §1: strip/replace is one transaction).
 func (p *Pool) ImportPack(ctx context.Context, pk content.Pack) error {
-	if pk.Pack == "" {
-		return fmt.Errorf("store: import pack with empty name")
+	return p.ImportPacks(ctx, []content.Pack{pk})
+}
+
+// ImportPacks imports EVERY pack in a single transaction (#212 slice 3), so a multi-pack version
+// import (cmd/telos-pull) is all-or-nothing: a failure on any pack rolls back the WHOLE batch,
+// never leaving Postgres at a torn half-version that a concurrent content read could serve. Each
+// pack strips-and-replaces its OWN rows (deletePack WHERE pack=$1) and is idempotent.
+//
+// CONSTRAINTS the caller must honor — most zone/room/prototype/def tables key rows by `ref` ALONE
+// (globally unique), NOT by (ref, pack):
+//   - Pack refs must be globally DISJOINT across the batch. A ref shared by two packs collides on the
+//     shared-ref PK and fails the whole import (fail-safe: atomic, never a torn state). Pack-namespaced
+//     refs give this naturally.
+//   - Pack names must be UNIQUE in the batch (enforced below): two same-named entries would otherwise
+//     have the second's deletePack drop the first's just-inserted rows silently.
+//   - Exits are phased per-pack, so a cross-PACK exit (pack A room -> pack B room) is not supported;
+//     packs are self-contained worlds.
+func (p *Pool) ImportPacks(ctx context.Context, packs []content.Pack) error {
+	seen := make(map[string]bool, len(packs))
+	for _, pk := range packs {
+		if pk.Pack == "" {
+			return fmt.Errorf("store: import pack with empty name")
+		}
+		if seen[pk.Pack] {
+			return fmt.Errorf("store: duplicate pack %q in import batch", pk.Pack)
+		}
+		seen[pk.Pack] = true
 	}
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -26,6 +51,20 @@ func (p *Pool) ImportPack(ctx context.Context, pk content.Pack) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
+	for _, pk := range packs {
+		if err := importPackTx(ctx, tx, pk); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: commit import: %w", err)
+	}
+	return nil
+}
+
+// importPackTx strips + re-inserts one pack's rows within an existing transaction. It carries no
+// Begin/Commit so ImportPacks can run many packs atomically in one tx.
+func importPackTx(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	if err := deletePack(ctx, tx, pk.Pack); err != nil {
 		return err
 	}
@@ -53,13 +92,7 @@ func (p *Pool) ImportPack(ctx context.Context, pk content.Pack) error {
 		}
 	}
 	// Pack-GLOBAL defs (Phase 5.1): zone-independent rows, inserted after the zone tree (no FK to it).
-	if err := insertGlobalDefs(ctx, tx, pk); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("store: commit import: %w", err)
-	}
-	return nil
+	return insertGlobalDefs(ctx, tx, pk)
 }
 
 // deletePack removes every definition row belonging to a pack, in FK-safe order, so a re-seed
