@@ -244,6 +244,13 @@ func (r *reloader) reconcileZone(inv contentbus.Invalidation) {
 	if r == nil || r.shard == nil {
 		return
 	}
+	// A local, unleased bootstrap zone (#212 core pack) is embedded-only and never reloaded — never
+	// let a KindZone invalidation naming it drive a shape-reconcile (which tears down rooms not in the
+	// desired set) against the live lobby on every shard. Defense-in-depth on top of the reserved-
+	// namespace lint: a core-namespace ref should never reach the broadcast, but fail safe if one does.
+	if r.shard.isLocalZone(inv.Ref) {
+		return
+	}
 	msg := reconcileZoneMsg{
 		zoneRef:   inv.Ref,
 		version:   inv.Version,

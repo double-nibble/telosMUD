@@ -1,0 +1,17 @@
+# The MINIMAL attribute scaffold (#212 core pack). Just enough that a logged-in player is a
+# coherent entity with a health vital and a prompt that shows something — NOT a full stat
+# system (that is real content, layered on top). A real pack redefines any of these via the
+# normal last-write-wins-by-ref merge (loader.go), so nothing here constrains a real world.
+attributes:
+  # level: the baseline progress stat; max_hp derives off it, and the prompt/GMCP read it.
+  - {ref: level,        display_name: Level,         value_kind: int, default_base: {lit: 1}, min: 1, stat: true}
+  # constitution: the single primary stat max_hp scales off, so the health cap is non-trivial.
+  - {ref: constitution, display_name: Constitution, value_kind: int, default_base: {lit: 10}, stat: true}
+  # max_hp = constitution*10 + level*5 (the same shape the demo uses) — a derived cap so the hp
+  # resource below has a real ceiling. A bootstrap builder stands at 105 hp.
+  - ref: max_hp
+    display_name: Maximum Health
+    value_kind: derived
+    default_base:
+      expr: ["+", ["*", ["attr", constitution], 10], ["*", ["attr", level], 5]]
+    min: 1

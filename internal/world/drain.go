@@ -105,7 +105,17 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 		}
 	}()
 
-	zones := s.zonesList()
+	// Local bootstrap zones (#212 core pack) are hosted unleased on EVERY shard, so there is no
+	// ownership to hand to a peer (the target already built its own copy) — exclude them from the
+	// drain's handoff + redirect accounting. Their players are not redirected (there is nowhere to
+	// redirect them to); a clean shutdown still durably flushes them via s.Drain() below.
+	zones := make([]*Zone, 0)
+	for _, z := range s.zonesList() {
+		if s.isLocalZone(z.id) {
+			continue
+		}
+		zones = append(zones, z)
+	}
 
 	// Snapshot the population BEFORE draining so Redirected = initial - stragglers-at-deadline.
 	initial := int64(0)

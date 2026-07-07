@@ -132,6 +132,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	if err != nil {
 		return nil, fmt.Errorf("content: load packs %v: %w", enabled, err)
 	}
+	// Content-lint (#212): warn on any NON-core pack shipping a world-ref under the reserved core:
+	// namespace, which would clobber the embedded bootstrap room via the last-write-wins merge below.
+	// Non-fatal (the merge still runs), mirroring the world content-lints.
+	for _, v := range LintReservedCoreRefs(packs) {
+		slog.Warn("content: pack ships a ref under the reserved core: namespace; it will clobber the "+
+			"embedded bootstrap pack — rename it out of the core: prefix",
+			"pack", v.Pack, "kind", v.Kind, "ref", v.Ref)
+	}
 	// Materialize the deduped zone set: a later pack shipping the same zone ref overrides the
 	// earlier one IN PLACE (last write wins; content-lint catches accidental collisions).
 	// Track positions by index, NOT by pointer — appending to lc.Zones reallocates the backing

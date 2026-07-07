@@ -36,6 +36,27 @@ func (s *Shard) WithZoneLeasing(leaser ZoneLeaser, shardID string, ttl, renew ti
 	return s
 }
 
+// WithLocalZones marks zone ids as LOCAL, UNLEASED bootstrap zones (#212 embedded core pack): the
+// shard hosts them without renewing a directory lease (every shard hosts its own copy) and never
+// hands them off on a graceful drain. Must be called before Run. Safe to call with ids the shard
+// does not host (they are simply recorded); a nil/empty call is a no-op.
+func (s *Shard) WithLocalZones(ids ...string) *Shard {
+	if len(ids) == 0 {
+		return s
+	}
+	if s.localZones == nil {
+		s.localZones = make(map[string]bool, len(ids))
+	}
+	for _, id := range ids {
+		s.localZones[id] = true
+	}
+	return s
+}
+
+// isLocalZone reports whether zoneID is a local, unleased bootstrap zone. Read-only after
+// construction, so no lock is needed (localZones is set before Run and never mutated after).
+func (s *Shard) isLocalZone(zoneID string) bool { return s.localZones[zoneID] }
+
 // leaseParams returns the effective ttl + renew cadence (applying defaults for zero values).
 func (s *Shard) leaseParams() (ttl, renew time.Duration) {
 	ttl = s.leaseTTL
@@ -54,6 +75,11 @@ func (s *Shard) leaseParams() (ttl, renew time.Duration) {
 // the shard. A no-op when leasing is off. Called from Run (boot zones) and HostZone/adopt (runtime zones).
 func (s *Shard) startZoneRenewal(parent context.Context, zoneID string) {
 	if s.leaser == nil {
+		return
+	}
+	// A local bootstrap zone (#212 core pack) is hosted unleased on every shard — do not renew a
+	// lease it never claimed (which would otherwise contend for a single directory key across shards).
+	if s.isLocalZone(zoneID) {
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)

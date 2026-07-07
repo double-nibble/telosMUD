@@ -145,6 +145,14 @@ type Shard struct {
 	// is going away) while still accepting a handoff BIND, so an in-flight cross-shard move completes. mu.
 	draining bool
 
+	// localZones marks zones this shard hosts LOCALLY and UNLEASED (#212 embedded core bootstrap zone).
+	// A local zone is (a) never lease-renewed — every shard hosts its OWN copy, so there is no single
+	// owner to fence on, and (b) never handed off on a graceful drain — a draining peer's local zone is
+	// not moved (the target shard already built its own). It IS still durably flushed on shutdown like
+	// any zone. Read-only after construction (WithLocalZones, before Run); absent => a normal leased,
+	// drainable zone.
+	localZones map[string]bool
+
 	// handoffSem bounds the number of CONCURRENT in-flight cross-shard handoffs (Prepare RPCs) this shard
 	// runs — so a graceful drain's fan-out over a whole zone doesn't fire N simultaneous Prepares at one
 	// target and stampede it (16.4b review). A normal move (rare) is never throttled by a 32-deep slot pool.

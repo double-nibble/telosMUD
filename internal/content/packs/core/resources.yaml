@@ -1,0 +1,5 @@
+# The MINIMAL resource scaffold (#212 core pack): a single health vital so a bootstrap player
+# has a gauge and the prompt is non-degenerate. No combat/mana/reactions — this is a lobby, not
+# a game system. A real pack's `hp` (or whatever it names its vital) overrides this by ref.
+resources:
+  - {ref: hp, display_name: Health, max_attr: max_hp, vital: true, regen: 1, gauge: true}
