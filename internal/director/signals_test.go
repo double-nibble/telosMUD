@@ -1,14 +1,17 @@
 package director
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
+	"github.com/double-nibble/telosmud/internal/contentbus"
 	"github.com/double-nibble/telosmud/internal/scopebus"
 )
 
@@ -192,5 +195,82 @@ func TestDirectorSignalIdempotent(t *testing.T) {
 	mu.Unlock()
 	if n != 1 {
 		t.Fatalf("boss_slain applied %d times, want exactly 1 (apply-once over at-least-once)", n)
+	}
+}
+
+// captureDirector builds a director whose logger writes into buf (Info+), so a test can assert what the
+// director recorded. No scope bus / Run needed — handleSignal is driven directly.
+func captureDirector(buf *bytes.Buffer) *Director {
+	log := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	return New("", newMemStore(), log)
+}
+
+func auditSignal(t *testing.T, key string, a contentbus.ReloadAudit) signalMsg {
+	t.Helper()
+	payload, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signalMsg{event: contentbus.ReloadAuditEvent, payload: payload, key: key, source: "shard-1", ack: make(chan bool, 1)}
+}
+
+// TestDirectorRecordsReloadAudit proves the #192 S3 native audit: a content.reload.audit signal-up makes
+// the director emit one structured audit-log entry with who/what/outcome — WITHOUT any content
+// SignalHandler wired (audit is director-owned, not script logic).
+func TestDirectorRecordsReloadAudit(t *testing.T) {
+	var buf bytes.Buffer
+	d := captureDirector(&buf) // no WithSignalHandler — audit must still record
+
+	m := auditSignal(t, "shard-1:1", contentbus.ReloadAudit{
+		Actor: "Ada", Packs: []string{"demo"}, Published: 7, Outcome: "propagated", AtUnixMs: 1234,
+	})
+	d.handleSignal(context.Background(), m)
+	if !<-m.ack {
+		t.Fatal("audit signal was NAK'd (should ack)")
+	}
+
+	out := buf.String()
+	for _, want := range []string{"content reload audit", "actor=Ada", "published=7", "outcome=propagated", "shard=shard-1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("audit log missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// TestDirectorReloadAuditDedup proves a REDELIVERED audit (same idempotency key) is recorded once — the
+// apply-once high-water covers the audit exactly as it covers state-changing signals.
+func TestDirectorReloadAuditDedup(t *testing.T) {
+	var buf bytes.Buffer
+	d := captureDirector(&buf)
+	a := contentbus.ReloadAudit{Actor: "Ada", Packs: []string{"demo"}, Published: 3, Outcome: "propagated", AtUnixMs: 9}
+
+	m1 := auditSignal(t, "shard-1:5", a)
+	d.handleSignal(context.Background(), m1)
+	<-m1.ack
+	m2 := auditSignal(t, "shard-1:5", a) // same key => redelivery
+	d.handleSignal(context.Background(), m2)
+	<-m2.ack
+
+	if got := strings.Count(buf.String(), "content reload audit"); got != 1 {
+		t.Fatalf("audit recorded %d times, want 1 (redelivery must dedup)", got)
+	}
+}
+
+// TestDirectorReloadAuditMalformed proves a malformed audit payload is warned and dropped (never a crash),
+// and the signal is still acked (drained, not stuck redelivering).
+func TestDirectorReloadAuditMalformed(t *testing.T) {
+	var buf bytes.Buffer
+	d := captureDirector(&buf)
+
+	m := signalMsg{event: contentbus.ReloadAuditEvent, payload: json.RawMessage(`{not json`), key: "shard-1:1", source: "shard-1", ack: make(chan bool, 1)}
+	d.handleSignal(context.Background(), m)
+	if !<-m.ack {
+		t.Fatal("a malformed audit must still ack (drain), not NAK")
+	}
+	if out := buf.String(); !strings.Contains(out, "malformed content-reload audit") {
+		t.Fatalf("expected a malformed-payload warning; got:\n%s", out)
+	}
+	if strings.Contains(buf.String(), "content reload audit") {
+		t.Fatal("a malformed payload must NOT produce an audit record")
 	}
 }

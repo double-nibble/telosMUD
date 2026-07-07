@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
+	"github.com/double-nibble/telosmud/internal/scopebus"
 )
 
 // reloadRepublishTimeout bounds the whole background re-read + per-ref publish fan-out one `reload`
@@ -83,6 +85,7 @@ func cmdReload(c *Context) error {
 	z, pid, label := c.z, c.s.character, packLabel(packs)
 	go func() {
 		out := r.republish(context.Background(), packs, checkOnly)
+		auditReload(sh, pid, packs, out) // #192 S3: record who/what/when to the world director (fire-and-forget)
 		var summary string
 		switch {
 		case len(out.rejected) > 0:
@@ -206,6 +209,45 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 	}
 	r.log.Info("reload: content reload propagated across the fleet", "packs", packs, "invalidations", out.published, "failed", out.failed)
 	return out
+}
+
+// auditReload fires a fire-and-forget DURABLE signal UP to the world director recording who ran `reload`,
+// which packs, and the outcome (#192 S3, the director-side advisory audit). Called from the background
+// republish goroutine (off the zone goroutine — enqueueSignal is safe there and never blocks). It is
+// best-effort accountability, not a correctness path: a shard with no scoped bus (sh.scopes nil) no-ops,
+// and a dropped/failed signal never affects the reload. A `--check` dry run is NOT audited — it changed
+// nothing on the fleet, so it is not an audit-worthy content event.
+func auditReload(sh *Shard, actor string, packs []string, out reloadOutcome) {
+	if out.checkOnly {
+		return
+	}
+	outcome := "propagated"
+	switch {
+	case len(out.rejected) > 0:
+		outcome = "rejected"
+	case out.failed && out.published == 0:
+		outcome = "failed"
+	case out.failed:
+		outcome = "partial"
+	}
+	payload, err := json.Marshal(contentbus.ReloadAudit{
+		Actor:     actor,
+		Packs:     packs,
+		Published: out.published,
+		Outcome:   outcome,
+		AtUnixMs:  time.Now().UnixMilli(),
+	})
+	if err != nil {
+		sh.reloader.log.Warn("reload: marshal audit payload failed; audit skipped", "err", err)
+		return
+	}
+	// World-scoped: a content reload is a fleet event, so the WORLD director records it. enqueueSignal
+	// tolerates a nil scopeReplication (no scoped bus) and a full queue — both a clean no-op.
+	sh.scopes.enqueueSignal(scopeSignalJob{
+		scope:   scopebus.World(),
+		event:   contentbus.ReloadAuditEvent,
+		payload: payload,
+	})
 }
 
 // packLabel renders a pack-name list for the builder's ack line: `pack "demo"` for one, `packs "a", "b"`

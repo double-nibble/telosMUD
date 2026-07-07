@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/double-nibble/telosmud/internal/contentbus"
 	"github.com/double-nibble/telosmud/internal/scopebus"
 )
 
@@ -163,6 +164,13 @@ func (d *Director) handleSignal(ctx context.Context, m signalMsg) {
 		m.ack <- true // already applied this session — idempotently suppressed
 		return
 	}
+	// Native content-reload AUDIT (#192 S3): record who/what/when for every fleet content change, deduped
+	// apply-once by the high-water above. Independent of the content SignalHandler — audit is an operational
+	// concern the director owns, so it holds even when no director-script is wired. A content handler (if
+	// set) still sees the event below for any custom reaction.
+	if m.event == contentbus.ReloadAuditEvent {
+		d.recordReloadAudit(m.payload, m.source)
+	}
 	if d.handler != nil {
 		d.handler(&API{d: d, ctx: ctx}, m.event, m.payload)
 	}
@@ -170,6 +178,22 @@ func (d *Director) handleSignal(ctx context.Context, m signalMsg) {
 		d.applied[m.source] = seq
 	}
 	m.ack <- true
+}
+
+// recordReloadAudit writes ONE structured audit-log entry for a fleet content reload (#192 S3): who ran
+// it, which packs, the outcome, the definition count, and when. A malformed payload is warned and dropped
+// (never fatal — the audit is best-effort accountability). Runs on the director goroutine, so it does not
+// race the scope state. It logs rather than persisting scope state: an audit is an append-only operational
+// record, not orchestration state a zone read-replica consumes.
+func (d *Director) recordReloadAudit(payload json.RawMessage, source string) {
+	var a contentbus.ReloadAudit
+	if err := json.Unmarshal(payload, &a); err != nil {
+		d.log.Warn("director: malformed content-reload audit payload; dropped", "err", err, "source", source)
+		return
+	}
+	d.log.Info("content reload audit",
+		"actor", a.Actor, "packs", a.Packs, "published", a.Published,
+		"outcome", a.Outcome, "at_unix_ms", a.AtUnixMs, "shard", source)
 }
 
 // broadcastStateDown publishes a state delta DOWN on this director's scope (the EventStateSet contract the
