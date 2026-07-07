@@ -199,8 +199,19 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 		return reloadOutcome{checkOnly: true}
 	}
 	out := reloadOutcome{}
+	// A shard-local `reload` is a staff hot-edit of already-imported rows: it stamps its invalidations
+	// with a wall-clock-nanos version and is deliberately DIRECTOR-INDEPENDENT (never-fatal). This is
+	// nanos-scale like the director-coordinated pull's PG-minted version, so the two interoperate at the
+	// reconcile guard. HAZARD (bounded by CROSS-HOST CLOCK SKEW, not elapsed time): the pull's version is
+	// minted from the PULLER host's clock while this stamp is from THIS shard's clock; if this shard's
+	// clock lags the puller's by more than the real pull→reload gap, a reload right after a pull can have
+	// N < V and its zone-SHAPE reconcile (add/remove/start-room) is dropped by the guard — the per-ref
+	// data swaps still apply. Impact is a lost STAFF shape-edit (re-run to reapply), never data corruption
+	// or a cross-shard issue. Real fix (follow-up #222): mint max(now, pgVersion+1) by reading the
+	// content_version singleton. See contentbus.PublishPack.
+	version := uint64(time.Now().UnixNano())
 	for _, pk := range loaded {
-		n, perr := contentbus.PublishPack(ctx, r.bus, pk)
+		n, perr := contentbus.PublishPack(ctx, r.bus, pk, version)
 		out.published += n
 		if perr != nil {
 			out.failed = true

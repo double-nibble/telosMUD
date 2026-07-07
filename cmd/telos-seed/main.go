@@ -8,6 +8,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
@@ -56,7 +57,9 @@ func main() {
 		return
 	}
 	defer func() { _ = bus.Close() }()
-	n, err := contentbus.PublishPack(ctx, bus, pack)
+	// telos-seed imports the demo pack without a logical content version (ImportPack, not ImportVersion),
+	// so it stamps a wall-clock-nanos version — the dev/seed equivalent of a shard-local reload.
+	n, err := contentbus.PublishPack(ctx, bus, pack, uint64(time.Now().UnixNano()))
 	if err != nil {
 		slog.Warn("publishing content invalidations failed (partial)", "published", n, "err", err)
 		return

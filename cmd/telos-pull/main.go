@@ -98,31 +98,45 @@ func run(ctx context.Context, cfg config.Config, check bool) error {
 		return nil
 	}
 
-	// 6. Import all packs atomically into Postgres. LIMITATION (deferred to slice 4 / #209): this
-	//    strip-and-replaces each NAMED pack, but does NOT prune a pack that a PRIOR version shipped
-	//    and this one drops (version N=[a,b] -> N+1=[a] leaves b's rows live). Safe pruning needs a
-	//    per-version pack-ownership concept (the logical version stamp) and a PG pack registry,
-	//    neither of which exists yet — the director-coordinated pull owns that reconciliation.
+	// 6. Import the version atomically into Postgres: ImportVersion prunes packs a prior version had
+	//    that this one drops, stamps the content_version + registry, and mints the monotonic version —
+	//    all in one tx (#212 slice 4 PR A). Re-importing the same SHA is idempotent (no bump/prune).
 	pool, err := store.Open(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
 	defer pool.Close()
-	if err := pool.ImportPacks(ctx, packs); err != nil {
-		return fmt.Errorf("import packs: %w", err)
+	version, pruned, changed, err := pool.ImportVersion(ctx, packs, store.VersionMeta{
+		ContentSHA: res.SHA, ManifestVersion: manifest.Version, ContentHash: manifest.ContentHash,
+	})
+	if err != nil {
+		return fmt.Errorf("import version: %w", err)
 	}
-	slog.Info("imported content version", "version", manifest.Version, "sha", res.SHA, "packs", packNames)
+	if len(pruned) > 0 {
+		// telos-pull is an uncoordinated CI/ops importer: it cannot check whether a dropped pack is
+		// live-hosted (that gate is the director's job, PR E). Warn loudly — dropping a pack players are
+		// standing in is a rolling-reboot operation, not a hot swap.
+		slog.Warn("pruned packs no longer in this version (dropping a live-hosted pack strands players — treat as a rolling reboot)", "pruned", pruned)
+	}
+	if !changed {
+		// The SHA already matches what Postgres serves — nothing was re-imported. Skip the broadcast: a
+		// re-broadcast of an already-applied version is a needless fleet-wide prototype + Lua re-swap.
+		slog.Info("content already at this version; nothing imported or broadcast", "version", version, "sha", res.SHA)
+		return nil
+	}
+	slog.Info("imported content version", "version", version, "manifest", manifest.Version, "sha", res.SHA, "packs", packNames)
 
-	// 7. Broadcast hot-reload invalidations so running shards pick up the new rows without a restart.
-	//    OPTIONAL + non-fatal (mirrors telos-seed): if NATS is unreachable the rows are still imported;
-	//    running shards just won't hot-reload until their next boot.
-	broadcast(ctx, cfg.NATS.URL, packs)
+	// 7. Broadcast hot-reload invalidations so running shards pick up the new rows without a restart,
+	//    stamped with the AUTHORITATIVE minted version. OPTIONAL + non-fatal (mirrors telos-seed): if
+	//    NATS is unreachable the rows are still imported; running shards hot-reload on their next boot
+	//    (reconcile-on-join, PR D) or reload.
+	broadcast(ctx, cfg.NATS.URL, packs, version)
 	return nil
 }
 
-// broadcast publishes per-ref invalidations for the imported packs. Best-effort: a bus failure is
-// logged, never fatal — the rows are already durably imported.
-func broadcast(ctx context.Context, natsURL string, packs []content.Pack) {
+// broadcast publishes per-ref invalidations for the imported packs, stamped with the authoritative
+// content version. Best-effort: a bus failure is logged, never fatal — the rows are already imported.
+func broadcast(ctx context.Context, natsURL string, packs []content.Pack, version uint64) {
 	bus, err := contentbus.Connect(natsURL)
 	if err != nil {
 		slog.Warn("content bus unreachable; imported but running shards not hot-reloaded", "err", err)
@@ -131,13 +145,13 @@ func broadcast(ctx context.Context, natsURL string, packs []content.Pack) {
 	defer func() { _ = bus.Close() }()
 	total := 0
 	for _, pk := range packs {
-		n, perr := contentbus.PublishPack(ctx, bus, pk)
+		n, perr := contentbus.PublishPack(ctx, bus, pk, version)
 		total += n
 		if perr != nil {
 			slog.Warn("publishing content invalidations failed (partial)", "pack", pk.Pack, "published", n, "err", perr)
 		}
 	}
-	slog.Info("published content invalidations", "count", total)
+	slog.Info("published content invalidations", "count", total, "version", version)
 }
 
 // assertPacksMatchDirs checks the set of pack names present under packs/ (a dir packs/<name>/ or a
