@@ -190,7 +190,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// Postgres is unreachable the shard boots EMPTY (the bare-engine invariant), exactly as it
 	// degrades to single-shard when Redis is down. The demo world lives only in the DB/YAML, so
 	// nothing demo is compiled into this path.
-	lc, enabledPacks := loadContent(ctx, cfg)
+	lc, enabledPacks, bootContentVersion := loadContent(ctx, cfg)
 
 	// Open the long-lived Postgres pool (slice 4.2 character ladder + slice 4.3 hot-reload re-read).
 	// It is OPTIONAL: if Postgres is unreachable it stays nil and characters are EPHEMERAL and hot
@@ -267,7 +267,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		return world.NewShardFromContent(lc, hostZones, hostHome, "", nil, nil).
 			WithLocalZones(content.CoreZone).
 			WithPersistence(charStore, nil).
-			WithHotReload(defSource, bus, enabledPacks).
+			WithHotReload(defSource, bus, enabledPacks, bootContentVersion).
 			WithComms(comms).
 			WithVerifyKey(verifyKey).
 			WithHandoffKeys(handoffSignKey, handoffVerifyKey).
@@ -360,7 +360,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	return world.NewShardFromContent(lc, hostZones, hostHome, cfg.ShardAddr, dir, world.GRPCDialer()).
 		WithLocalZones(content.CoreZone). // the bootstrap zone is hosted unleased on every shard (#212)
 		WithPersistence(charStore, ckpt).
-		WithHotReload(defSource, bus, enabledPacks).
+		WithHotReload(defSource, bus, enabledPacks, bootContentVersion).
 		WithComms(comms).
 		WithVerifyKey(verifyKey).
 		WithHandoffKeys(handoffSignKey, handoffVerifyKey).
@@ -408,7 +408,7 @@ func openContentBus(cfg config.Config) contentbus.Bus {
 // database is unreachable it logs a warning and returns EMPTY content — the engine boots with
 // zero rooms (bare-engine invariant), and a login is rejected cleanly rather than panicking.
 // Postgres is the production source; the embedded YAML pack is the unit-test/dev source.
-func loadContent(ctx context.Context, cfg config.Config) (*content.LoadedContent, []string) {
+func loadContent(ctx context.Context, cfg config.Config) (*content.LoadedContent, []string, uint64) {
 	if db.AutoMigrateEnabled() {
 		if err := db.Migrate(ctx, cfg.Postgres.DSN); err != nil {
 			slog.Warn("auto-migrate failed; continuing (boot may be empty)", "err", err)
@@ -422,15 +422,19 @@ func loadContent(ctx context.Context, cfg config.Config) (*content.LoadedContent
 		// a bootstrap start room and a builder can connect, rather than an empty, login-rejecting world.
 		slog.Warn("postgres unavailable; booting bootstrap-only world (embedded core pack)", "err", err)
 		core, _ := content.LoadWithCore(ctx, nil, nil)
-		return core, nil
+		return core, nil, 0
 	}
 	defer pool.Close()
 	// Manifest-driven pack selection (#212 slice 4): serve the packs the currently imported version
 	// registered (content_pack_registry), unless the operator pins an explicit set. A read failure
 	// (fresh DB before the 00024 migration, or a transient error) degrades to the demo/override default.
+	// The version is read HERE — before the packs below — so the boot content version is never AHEAD of
+	// the loaded content (reconcile-on-join, PR D: a pull racing boot then fails safe, never a miss).
 	var registryPacks []string
+	var bootVersion uint64
 	if info, verr := pool.CurrentContentVersion(ctx); verr == nil {
 		registryPacks = info.Packs
+		bootVersion = info.Version
 	} else {
 		slog.Debug("content version registry unavailable; using configured/default packs", "err", verr)
 	}
@@ -442,15 +446,15 @@ func loadContent(ctx context.Context, cfg config.Config) (*content.LoadedContent
 	if err != nil {
 		slog.Warn("content load failed; booting bootstrap-only world (embedded core pack)", "err", err)
 		core, _ := content.LoadWithCore(ctx, nil, nil)
-		return core, nil
+		return core, nil, 0
 	}
 	// lc always carries the core zone now, so lc.Empty() is never true; report on the REAL content.
 	if realZones := len(lc.Zones) - 1; realZones <= 0 {
 		slog.Warn("no real content loaded (packs absent in DB?); booting bootstrap-only world (embedded core pack)", "packs", enabledPacks)
 	} else {
-		slog.Info("content loaded from postgres", "packs", enabledPacks, "zones", realZones)
+		slog.Info("content loaded from postgres", "packs", enabledPacks, "zones", realZones, "content_version", bootVersion)
 	}
-	return lc, enabledPacks
+	return lc, enabledPacks, bootVersion
 }
 
 // renewShardRegistration heartbeats this shard's id->endpoint registration until ctx is

@@ -233,6 +233,17 @@ func (p *Pool) CurrentContentVersion(ctx context.Context) (ContentVersionInfo, e
 	return info, nil
 }
 
+// ContentVersion reads just the current monotonic content version (the content_version singleton),
+// for the reconcile-on-join check (#212 slice 4 PR D): a shard compares it against the version it
+// last applied to detect that it missed a pull during a bus gap. A fresh DB returns 0.
+func (p *Pool) ContentVersion(ctx context.Context) (uint64, error) {
+	var ver int64
+	if err := p.pool.QueryRow(ctx, `SELECT version FROM content_version WHERE id = 1`).Scan(&ver); err != nil {
+		return 0, fmt.Errorf("store: read content version: %w", err)
+	}
+	return uint64(ver), nil //nolint:gosec // G115: version >= 0 from a bounded nanos column
+}
+
 // registryPacksTx reads the registry pack set within a transaction (the pre-prune old set).
 func registryPacksTx(ctx context.Context, tx pgx.Tx) ([]string, error) {
 	rows, err := tx.Query(ctx, `SELECT pack FROM content_pack_registry ORDER BY pack`)

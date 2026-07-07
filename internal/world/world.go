@@ -451,8 +451,8 @@ func (s *Shard) WithMail(store MailStore) *Shard {
 // shard byte-identical to a pre-4.3 shard. MUST be called before Run (the subscription is torn down
 // at Run end). Returns the shard for chaining. The production constructor wires it; tests inject an
 // in-memory bus + source the same way.
-func (s *Shard) WithHotReload(src content.DefinitionSource, bus contentbus.Bus, enabledPacks []string) *Shard {
-	s.reloader = newReloader(src, s.protos, bus, enabledPacks, s)
+func (s *Shard) WithHotReload(src content.DefinitionSource, bus contentbus.Bus, enabledPacks []string, bootContentVersion uint64) *Shard {
+	s.reloader = newReloader(src, s.protos, bus, enabledPacks, bootContentVersion, s)
 	return s
 }
 

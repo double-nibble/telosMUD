@@ -156,16 +156,18 @@ func (c *protoCache) define(ref ProtoRef, keywords []string, short, long string,
 //
 // Concurrency: this copy-and-swap is writeMu-guarded, so ANY set of concurrent writers is
 // memory-safe (each takes the lock, copies, and Stores; spawn never writes the table, only Loads).
-// There are TWO runtime writers, and they never target the same ref concurrently:
-//   - the shard's single reload applier (the contentbus subscriber goroutine) writes ADDs/UPDATEs of a
-//     ref, serialized per subscription (reload.go onInvalidation);
-//   - a ZONE goroutine writes a ref DELETION (nil p) when reconcileZone → removeRoom tears down a
-//     room the content dropped (world.go), because a deletion emits no per-ref invalidation so the
-//     applier never learns of it — the zone is the sole knower.
-//
-// These two never collide on one ref: a given pack read has a ref either present (applier ADD/UPDATE) or
-// absent (zone DELETE), never both, so the writers partition the ref space. A future edit that adds a
-// SUBSCRIBER-side delete path would reintroduce a same-ref writer race — keep deletions zone-driven.
+// Runtime writers:
+//   - the reload applier (onInvalidation) writes ADDs/UPDATEs of a ref. Normally this is the single
+//     contentbus subscriber goroutine (serialized per subscription), BUT reconcile-on-join (#212 slice 4)
+//     adds a SECOND concurrent ADD/UPDATE writer: on a bus reconnect it re-applies a re-read pack on its
+//     own goroutine, which can race the subscriber goroutine applying a newer pull. This stays correct
+//     NOT because of a single-writer partition but because (a) writeMu makes every swap memory-safe and
+//     (b) onInvalidation ALWAYS re-reads the authoritative def from r.src at apply time (never trusts the
+//     invalidation payload), so the cache tracks Postgres and cannot regress to stale data. A future edit
+//     that makes the subscriber trust the payload instead of re-reading would reintroduce a lost-update race.
+//   - a ZONE goroutine writes a ref DELETION (nil p) when reconcileZone → removeRoom tears down a room
+//     the content dropped (world.go), because a deletion emits no per-ref invalidation so the applier
+//     never learns of it — the zone is the sole knower. Deletions stay zone-driven for that reason.
 func (c *protoCache) reload(ref ProtoRef, p *Prototype) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()

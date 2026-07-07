@@ -92,6 +92,14 @@ type Bus interface {
 	// swap (the world's applier) needs no extra lock.
 	Subscribe(handler func(Invalidation)) (Subscription, error)
 
+	// OnReconnect registers a callback fired AFTER the bus reconnects following a gap (a NATS blip).
+	// Core NATS buffers nothing while disconnected, so a subscriber may have MISSED invalidations
+	// during the gap; the callback lets it self-heal (reconcile-on-join, #212 slice 4). The callback
+	// runs on the bus's own goroutine, so a heavy handler should spawn its own goroutine. At most one
+	// callback is registered (a later call replaces it); nil clears it. A bus with no reconnect
+	// concept (the in-memory test bus) records it for a test to trigger.
+	OnReconnect(cb func())
+
 	// Close releases the bus (the NATS connection / the MemBus subscriber set). Idempotent.
 	Close() error
 }
