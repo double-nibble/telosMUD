@@ -15,6 +15,63 @@ import (
 // live mob-greeting reload (self.state survives), the old-gen mud.after drop, the broken-edit
 // last-good, and the breaker reset.
 
+// TestKeyMatchesRef pins the #57 fix: chunk-cache invalidation matches ref as a whole colon-delimited
+// segment, so it never over-invalidates a longer ref that merely contains the substring.
+func TestKeyMatchesRef(t *testing.T) {
+	cases := []struct {
+		key, ref string
+		want     bool
+	}{
+		// interior segment (the common case: "<kind>:<ref>:<hook>")
+		{"ability:orc:on_resolve", "orc", true},
+		{"affect:orc:tick", "orc", true},
+		{"trigger:midgaard:mob:orc:register", "midgaard:mob:orc", true}, // ref with its own colons
+		{"ability:midgaard:mob:orc:on_resolve", "midgaard:mob:orc", true},
+		// trailing segment ("<kind>:<ref>" with no hook)
+		{"command:orc", "orc", true},
+		// the #57 bug: a longer ref that merely CONTAINS the substring must NOT match
+		{"ability:sorcerer:on_resolve", "orc", false},
+		{"affect:orchard:tick", "orc", false},
+		{"trigger:midgaard:mob:sorcerer:register", "orc", false},
+		// unrelated kind/hook substrings must not match
+		{"formula:force", "orc", false},
+		// exact / empty guards
+		{"orc", "orc", true},
+		{"ability:orc:on_resolve", "", false},
+	}
+	for _, tc := range cases {
+		if got := keyMatchesRef(tc.key, tc.ref); got != tc.want {
+			t.Errorf("keyMatchesRef(%q, %q) = %v, want %v", tc.key, tc.ref, got, tc.want)
+		}
+	}
+}
+
+// TestReloadLuaDoesNotOverInvalidate proves the fix end-to-end at reloadLua: reloading ref "orc" drops the
+// "orc" chunk but LEAVES the "sorcerer" chunk (whose key merely contains the substring "orc") — the pre-#57
+// substring match would have wrongly dropped it, forcing a needless recompile.
+func TestReloadLuaDoesNotOverInvalidate(t *testing.T) {
+	z := newZone("rl")
+	rt := z.lua
+
+	orc := rt.chunkFor("ability:orc:on_resolve", `return 1`)
+	sorc := rt.chunkFor("ability:sorcerer:on_resolve", `return 2`)
+	if orc == nil || sorc == nil {
+		t.Fatal("precondition: both chunks compiled")
+	}
+	if _, ok := rt.chunks["ability:orc:on_resolve"]; !ok {
+		t.Fatal("precondition: orc chunk cached")
+	}
+
+	z.reloadLua("ability", "orc")
+
+	if _, ok := rt.chunks["ability:orc:on_resolve"]; ok {
+		t.Fatal("reloadLua should have invalidated the reloaded ref's chunk")
+	}
+	if _, ok := rt.chunks["ability:sorcerer:on_resolve"]; !ok {
+		t.Fatal("reloadLua over-invalidated 'sorcerer' when reloading 'orc' (the #57 substring bug)")
+	}
+}
+
 // --- the chunkFor source/gen MUST-FIX (the security-critical fix) --------------------------
 
 // TestChunkForRecompilesOnSourceChange asserts a CHANGED source recompiles (the stale-cache no-op

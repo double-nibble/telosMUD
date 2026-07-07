@@ -441,11 +441,12 @@ func (z *Zone) reloadLua(kind, ref string) {
 	rt.chunkGen++ // (1) old-gen mud.after timers drop at fire (P7-D7)
 
 	// (2) Invalidate the shared chunk cache entries that key off this ref, so the next invocation
-	// recompiles from the swapped registry source. Keys are "<area>:<ref>:<hook>" / "<area>:<ref>" /
-	// "formula:<name>" / "pvp_allowed". We drop every cache entry whose key contains the ref (cheap;
-	// the chunk cache is small) plus the global policy/formula keys, and reset their breakers.
+	// recompiles from the swapped registry source. Keys are "<kind>:<ref>:<hook>" / "<kind>:<ref>" /
+	// "formula:<name>" / "pvp_allowed". We drop every cache entry that BELONGS to this ref (matched as a
+	// whole colon-delimited segment, not a raw substring — #57, so reloading "orc" never drops "sorcerer")
+	// plus the global policy/formula keys, and reset their breakers.
 	for key := range rt.chunks {
-		if strings.Contains(key, ref) || key == "pvp_allowed" || strings.HasPrefix(key, "formula:") {
+		if keyMatchesRef(key, ref) || key == "pvp_allowed" || strings.HasPrefix(key, "formula:") {
 			delete(rt.chunks, key)
 			rt.breakerReset(breakerKeyShared(key)) // (4) re-enable a quarantined shared def
 		}
@@ -456,6 +457,23 @@ func (z *Zone) reloadLua(kind, ref string) {
 	rt.reloadEntityScriptsForProto(ProtoRef(ref))
 
 	z.log.Debug("lua hot reload applied", "kind", kind, "ref", ref, "gen", rt.chunkGen)
+}
+
+// keyMatchesRef reports whether a chunk-cache key belongs to content ref — i.e. ref appears in the key as a
+// whole colon-delimited segment run, not merely as a raw substring (#57). Keys are "<kind>:<ref>[:<hook>]"
+// and a ref may ITSELF contain colons (e.g. "midgaard:mob:orc"), so ref is matched bounded by ':' (or a key
+// boundary) on both sides. This stops reloading ref "orc" from over-invalidating "sorcerer"/"orchard" chunk
+// entries (whose keys merely contain the substring "orc"). Keys always carry a "<kind>:" prefix, so in
+// practice ref matches as the interior ":<ref>:" or trailing ":<ref>" run; the bare-equal / leading forms
+// are kept for completeness.
+func keyMatchesRef(key, ref string) bool {
+	if ref == "" {
+		return false
+	}
+	return key == ref ||
+		strings.HasPrefix(key, ref+":") ||
+		strings.HasSuffix(key, ":"+ref) ||
+		strings.Contains(key, ":"+ref+":")
 }
 
 // notifyZones posts a reloadLuaMsg to every hosted zone's inbox so each applies the Lua reload on
