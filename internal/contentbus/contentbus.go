@@ -35,10 +35,30 @@ const Subject = "content.invalidate"
 // key (the prototype/room ref), and pack scopes it to a content pack so a shard can ignore an
 // edit to a pack it does not load. The shard re-reads exactly (kind, ref) from its content source
 // and reloads that one prototype.
+//
+// The zone-SHAPE reconcile (#191) rides a KindZone invalidation that carries its own DESIRED STATE
+// on the wire — Rooms (the zone's full authoritative room-ref set) and StartRoom — so the reconcile
+// converges the live room graph without a source re-read. The contentbus is a single NATS subject,
+// so a pack's per-ref invalidations are delivered in PUBLISH ORDER before the trailing KindZone one;
+// the shard applies the prototype cache swaps first, then the zone reconciles off the already-swapped
+// cache. Version is a monotonic stamp (publish wall-clock nanos, shared by every invalidation of one
+// reload) so a zone drops a STALE reconcile that a racing reload reordered ahead of a newer one
+// (last-writer-wins by version, not by arrival). Rooms/StartRoom are set only for KindZone; Version is
+// set for all. All three are omitempty so a pre-#191 subscriber (or a non-zone kind) is unaffected.
+//
+// Version LIMITATION (known, acceptable for v1): it is the PUBLISHER's wall-clock nanos, so it orders two
+// reloads of one zone only when they share a clock — i.e. the same publisher (the staff `reload` command
+// runs on the hosting world; a `telos-seed` deploy is a separate publisher). Two DIFFERENT publishers
+// racing the same zone can invert under NTP step-back and converge the zone to the lower-versioned desired
+// state until a third, higher reload. Concurrent multi-publisher reloads of one zone are therefore
+// unsupported; the eventual fix is a logical/director-issued monotonic reload sequence (a follow-up).
 type Invalidation struct {
-	Kind string `json:"kind"`
-	Ref  string `json:"ref"`
-	Pack string `json:"pack"`
+	Kind      string   `json:"kind"`
+	Ref       string   `json:"ref"`
+	Pack      string   `json:"pack"`
+	Version   uint64   `json:"version,omitempty"`    // monotonic reload stamp (publish nanos); reconcile version guard
+	Rooms     []string `json:"rooms,omitempty"`      // KindZone: the zone's full authoritative room-ref set
+	StartRoom string   `json:"start_room,omitempty"` // KindZone: the zone's start/login room ref
 }
 
 // marshal/unmarshal keep the wire format in one place so the NATS bus and any future transport

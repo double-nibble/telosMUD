@@ -99,7 +99,7 @@ type protoCache struct {
 	// can't both copy the same base table and clobber each other's update (the atomic Store is
 	// last-writer-wins on a stale copy otherwise). Readers never take it — get/spawn are a pure
 	// atomic.Load. There are TWO runtime writers — the reload applier (ADD/UPDATE, subscriber
-	// goroutine) and a zone goroutine (ref DELETION via reconcileZoneShape → removeRoom) — which
+	// goroutine) and a zone goroutine (ref DELETION via reconcileZone → removeRoom) — which
 	// never target the same ref concurrently (see reload's doc comment); writeMu makes even that
 	// partitioned pair memory-safe, and guards any future writer from silently losing an update.
 	writeMu sync.Mutex
@@ -159,7 +159,7 @@ func (c *protoCache) define(ref ProtoRef, keywords []string, short, long string,
 // There are TWO runtime writers, and they never target the same ref concurrently:
 //   - the shard's single reload applier (the contentbus subscriber goroutine) writes ADDs/UPDATEs of a
 //     ref, serialized per subscription (reload.go onInvalidation);
-//   - a ZONE goroutine writes a ref DELETION (nil p) when reconcileZoneShape → removeRoom tears down a
+//   - a ZONE goroutine writes a ref DELETION (nil p) when reconcileZone → removeRoom tears down a
 //     room the content dropped (world.go), because a deletion emits no per-ref invalidation so the
 //     applier never learns of it — the zone is the sole knower.
 //
