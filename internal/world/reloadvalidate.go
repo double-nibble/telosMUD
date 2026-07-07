@@ -86,6 +86,14 @@ func validatePacks(loaded []content.Pack) []string {
 	problems = append(problems, validateResets(loaded)...)
 	// Prototype ref sanity (#197 slice 2c): a collision silently collapses content in the shared cache.
 	problems = append(problems, validateProtoRefs(loaded)...)
+	// Reserved core: namespace (#212): a real pack shipping a core-namespace world-ref would, on
+	// broadcast, drive a KindZone reconcile against the embedded bootstrap lobby (which reshapes/tears
+	// down rooms) on every shard. The boot lint only WARNS; here — the broadcast gate — it is a hard
+	// REJECT so such a ref can never enter a fleet reload. (Defense-in-depth with the reconcile guard
+	// in reload.go, which fail-safes if one slips through.)
+	for _, v := range content.LintReservedCoreRefs(loaded) {
+		problems = append(problems, fmt.Sprintf("pack %q ships %s %q under the reserved core: namespace (would clobber the embedded bootstrap pack)", v.Pack, v.Kind, v.Ref))
+	}
 	return problems
 }
 

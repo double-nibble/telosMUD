@@ -248,7 +248,11 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		// Redis down: no checkpoint tier, but the Postgres tier (if up) still gives save-on-logout
 		// durability — a character survives a restart, just with a wider crash window.
 		// No directory (single-shard) => no peer to drain onto => nil chooser (BeginDrain degrades to a flush).
-		return world.NewShardFromContent(lc, zones, home, "", nil, nil).
+		// When the configured home has no rooms (bare/unseeded server) host the embedded core bootstrap
+		// zone locally and spawn logins there, so a fresh server still accepts logins (#212).
+		hostZones, hostHome, _ := resolveHosting(lc, zones, home)
+		return world.NewShardFromContent(lc, hostZones, hostHome, "", nil, nil).
+			WithLocalZones(content.CoreZone).
 			WithPersistence(charStore, nil).
 			WithHotReload(defSource, bus, enabledPacks).
 			WithComms(comms).
@@ -284,7 +288,11 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// registered + heartbeating, hosting no zone, ready to take an orphan on the next failure. Decentralized
 	// LIVENESS: this works with no director running. (Live re-claim of an orphan by a standby needs runtime
 	// zone-add — the documented next step; boot-time claim is the slice here.)
-	won, claimErrs := placement.ClaimFromPool(ctx, dir, cfg.ShardID, zones, directory.DefaultZoneLease)
+	// The core bootstrap zone is hosted LOCALLY + unleased on every shard (below), so it must never
+	// be claimed from the pool — a lease we then never renew (WithLocalZones skips renewal) would
+	// leave a stale ShardForZone(core) owner in the directory. Strip it defensively in case an
+	// operator lists it in cfg.Zones (#212).
+	won, claimErrs := placement.ClaimFromPool(ctx, dir, cfg.ShardID, withoutCoreZone(zones), directory.DefaultZoneLease)
 	for zoneID, cerr := range claimErrs {
 		slog.Warn("zone claim error; skipped (left for another server / a retry)", "zone", zoneID, "err", cerr)
 	}
@@ -300,10 +308,17 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	}
 	// The spawn home must be a zone this server actually hosts: keep the configured home if won, else the
 	// first won zone. A standby (won nothing) keeps the configured home unhosted — no login lands here.
-	hostHome := home
+	preferredHome := home
 	if len(won) > 0 && !contains(won, home) {
-		hostHome = won[0]
+		preferredHome = won[0]
 	}
+	// When the preferred home has no rooms (unseeded/empty content) host the embedded core bootstrap
+	// zone LOCALLY (unleased) and spawn logins there (#212) — so even a standby serves the lobby in a
+	// fresh, content-less fleet (the fresh-deploy case). When real content exists the preferred home is
+	// kept verbatim (even if this shard doesn't host it yet — a standby's later adoption then spawns
+	// logins correctly), and the core lobby is NOT hosted at all: no unvisited extra zone, and s.home
+	// is never repointed to the lobby.
+	hostZones, hostHome, _ := resolveHosting(lc, won, preferredHome)
 
 	// chooseDrainTarget selects a live PEER shard to hand this shard's zones + players to on a graceful drain
 	// (Phase 16.4c). Decentralized self-select: the first live shard in the directory that isn't us. Good for
@@ -329,7 +344,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		return "", "", fmt.Errorf("no live peer shard to drain onto")
 	}
 
-	return world.NewShardFromContent(lc, won, hostHome, cfg.ShardAddr, dir, world.GRPCDialer()).
+	return world.NewShardFromContent(lc, hostZones, hostHome, cfg.ShardAddr, dir, world.GRPCDialer()).
+		WithLocalZones(content.CoreZone). // the bootstrap zone is hosted unleased on every shard (#212)
 		WithPersistence(charStore, ckpt).
 		WithHotReload(defSource, bus, enabledPacks).
 		WithComms(comms).
@@ -389,21 +405,26 @@ func loadContent(ctx context.Context, cfg config.Config) *content.LoadedContent 
 	}
 	pool, err := store.Open(ctx, cfg.Postgres.DSN)
 	if err != nil {
-		slog.Warn("postgres unavailable; booting empty world (bare-engine)", "err", err)
-		empty, _ := content.Load(ctx, nil, nil)
-		return empty
+		// Postgres down: still boot the embedded core pack alone (#212) so a fresh/empty server has
+		// a bootstrap start room and a builder can connect, rather than an empty, login-rejecting world.
+		slog.Warn("postgres unavailable; booting bootstrap-only world (embedded core pack)", "err", err)
+		core, _ := content.LoadWithCore(ctx, nil, nil)
+		return core
 	}
 	defer pool.Close()
-	lc, err := content.Load(ctx, pool, enabledPacks)
+	// LoadWithCore layers the minimal embedded core pack UNDER the real packs read from Postgres, so
+	// the bootstrap zone is ALWAYS present; real content overrides it by ref (#212).
+	lc, err := content.LoadWithCore(ctx, pool, enabledPacks)
 	if err != nil {
-		slog.Warn("content load failed; booting empty world", "err", err)
-		empty, _ := content.Load(ctx, nil, nil)
-		return empty
+		slog.Warn("content load failed; booting bootstrap-only world (embedded core pack)", "err", err)
+		core, _ := content.LoadWithCore(ctx, nil, nil)
+		return core
 	}
-	if lc.Empty() {
-		slog.Warn("no content loaded (packs absent in DB?); booting empty world", "packs", enabledPacks)
+	// lc always carries the core zone now, so lc.Empty() is never true; report on the REAL content.
+	if realZones := len(lc.Zones) - 1; realZones <= 0 {
+		slog.Warn("no real content loaded (packs absent in DB?); booting bootstrap-only world (embedded core pack)", "packs", enabledPacks)
 	} else {
-		slog.Info("content loaded from postgres", "packs", enabledPacks, "zones", len(lc.Zones))
+		slog.Info("content loaded from postgres", "packs", enabledPacks, "zones", realZones)
 	}
 	return lc
 }
@@ -441,4 +462,51 @@ func contains(xs []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// withCoreZone returns the hosted zone set with the embedded core bootstrap zone appended (#212).
+// A shard hosts it LOCALLY (unleased); it is a no-op if already present.
+func withCoreZone(zoneIDs []string) []string {
+	if contains(zoneIDs, content.CoreZone) {
+		return zoneIDs
+	}
+	return append(append([]string(nil), zoneIDs...), content.CoreZone)
+}
+
+// resolveHosting decides the hosted zone set + fresh-login home for a shard, given the zones it
+// hosts (bare: the configured set; fleet: what it won) and the PREFERRED home. When that home zone
+// has rooms (real content present), it is kept verbatim — even if this shard does not host it yet
+// (a standby keeps the real home so a later adoption spawns logins correctly). ONLY when the home
+// has no rooms (a fresh/empty server) does the shard host the embedded core bootstrap lobby locally
+// and spawn logins there. So the core zone is hosted exactly in the bootstrap case, never as an
+// unvisited extra zone when real content exists (#212). The bool reports whether core is hosted.
+func resolveHosting(lc *content.LoadedContent, hosted []string, preferredHome string) (zones []string, home string, coreHosted bool) {
+	if zonePopulated(lc, preferredHome) {
+		return hosted, preferredHome, false
+	}
+	return withCoreZone(hosted), content.CoreZone, true
+}
+
+// withoutCoreZone returns zoneIDs with the core bootstrap zone removed — the pool of zones a shard
+// may CLAIM a directory lease on. Core is hosted locally + unleased (#212), never leased, so it
+// must not enter the claim pool even if an operator mislists it in cfg.Zones.
+func withoutCoreZone(zoneIDs []string) []string {
+	out := make([]string, 0, len(zoneIDs))
+	for _, z := range zoneIDs {
+		if z != content.CoreZone {
+			out = append(out, z)
+		}
+	}
+	return out
+}
+
+// zonePopulated reports whether lc carries the named zone WITH at least one room. A configured home
+// zone that is absent/empty (unseeded content) is not a viable spawn — buildShard then falls the
+// login home back to the core bootstrap zone (#212).
+func zonePopulated(lc *content.LoadedContent, zoneRef string) bool {
+	if lc == nil {
+		return false
+	}
+	z := lc.Zone(zoneRef)
+	return z != nil && len(z.Rooms) > 0
 }

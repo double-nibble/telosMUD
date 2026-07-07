@@ -13,6 +13,26 @@ import (
 // strip story (DELETE WHERE pack=...) and the demo are independent.
 const DemoPack = "demo"
 
+// CorePack is the name of the MINIMAL embedded bootstrap pack (#212). It is compiled into the
+// binary and loaded UNDER the real content source on every shard, so a fresh/empty deployment
+// (no seeded content, or Postgres unreachable) still boots at least one start room and a
+// builder can connect and pull real content. See packs/core/pack.yaml.
+const CorePack = "core"
+
+// CoreZone is the ref of the bootstrap lobby zone the core pack ships (packs/core/zones). A
+// shard hosts it locally as a login fallback; CoreStartRoom is its start room. The zone ref is a
+// single canonical segment ("core") and its rooms follow the "core:room:<name>" form so parseRef
+// routes them to this zone (identity.go: the zone is the leading colon-delimited segment).
+const (
+	CoreZone      = "core"
+	CoreStartRoom = "core:room:nexus"
+)
+
+// CoreRefPrefix is the reserved ref namespace the core pack owns. Real packs must not ship refs
+// under it (a load-time lint warns), so real content can never clobber the bootstrap room via
+// the last-write-wins merge. The bare "core" zone ref is reserved too (CoreZone).
+const CoreRefPrefix = "core:"
+
 // The embed covers the whole packs/ tree, so a pack may be a single packs/<name>.yaml file OR a
 // directory packs/<name>/**/*.yaml (the #53 tree layout). `all:` keeps files the default embed
 // would skip (those beginning with `.`/`_`) out of scope only where intended; here the plain form

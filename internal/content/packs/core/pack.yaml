@@ -1,0 +1,21 @@
+# The `core` content pack MANIFEST — the MINIMAL embedded bootstrap pack (#212 slice 1).
+#
+# WHY THIS EXISTS: a fresh/empty deployment (no seeded Postgres content, or Postgres
+# unreachable) would otherwise boot a world with zero rooms and REJECT every login
+# ("This world has no rooms yet", internal/world/zone.go). This pack is compiled into the
+# binary (internal/content/demo.go embeds the whole packs/ tree) and is ALWAYS loaded
+# UNDER the real content source, so a server ALWAYS boots at least one start room and a
+# builder can connect and `pull` real content.
+#
+# DELIBERATELY MINIMAL — this is bootstrap SCAFFOLDING, not authored content: one zone
+# (a lobby with a start room + antechamber), a tiny attribute/resource scaffold so a
+# logged-in player is coherent (has vitals), and nothing else. Real content layers on top
+# via the normal last-write-wins merge (internal/content/loader.go); this pack ships no
+# combat/abilities/loot/etc.
+#
+# RESERVED NAMESPACE: this pack's world zone is the single segment `core` and its rooms live
+# under the `core:` ref prefix. Real packs MUST NOT ship a `core` zone or `core:` refs — a
+# load-time lint (LintReservedCoreRefs, internal/content/loader.go) WARNS at boot, and the
+# reload broadcast gate (internal/world/reloadvalidate.go) hard-REJECTS them, so a real pack can
+# never clobber the bootstrap room via the merge.
+pack: core

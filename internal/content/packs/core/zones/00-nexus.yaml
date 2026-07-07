@@ -1,0 +1,31 @@
+# The bootstrap lobby zone (#212 core pack). ONE zone whose ref is the reserved single segment
+# `core` (parseRef routes a room to the leading colon-delimited segment, so the zone ref must be
+# one token and its rooms follow `core:room:<name>`). It has a start room every fresh login lands
+# in when no real content is present, plus a small antechamber so movement/look are demonstrable.
+# No mobs, no items, no resets — a lobby.
+#
+# This is where a builder connecting to a fresh/empty server arrives: the room text tells them
+# how to install real content. Once real content is seeded/pulled, its own start zone takes
+# over as the login home (cmd/telos-world prefers a populated configured home over this lobby),
+# and the lobby simply goes unvisited.
+zones:
+  - ref: core
+    name: The Nexus
+    start_room: core:room:nexus
+    rooms:
+      - ref: core:room:nexus
+        name: The Nexus Antechamber
+        long: >-
+          A featureless grey chamber of the engine itself, humming with latent potential. This
+          is the bootstrap Nexus: the world has no content loaded yet. A builder connected here
+          can install a content pack and reload it live, and the real world will unfold around
+          this point. A faint archway leads north into the void.
+        exits:
+          north: core:room:void
+      - ref: core:room:void
+        name: The Formless Void
+        long: >-
+          Beyond the antechamber lies only the formless void — the empty space a world is built
+          into. There is nothing here yet. Return south to the Nexus and bring the world into being.
+        exits:
+          south: core:room:nexus
