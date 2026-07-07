@@ -72,6 +72,22 @@ type Config struct {
 	ShardID   string   `yaml:"shard_id"`   // this shard's id, e.g. "shard-a"
 	ShardAddr string   `yaml:"shard_addr"` // public address others dial (gate + peer handoff)
 	Zones     []string `yaml:"zones"`      // zone ids this shard hosts
+
+	// External versioned content store (#212 slice 3): a git repo whose tags/SHAs are published
+	// content versions. Empty Content.URL => embedded/seeded content only (today's behavior).
+	Content ContentStoreConfig `yaml:"content"`
+	// ContentPacks is the world's enabled pack set. Empty => the default (the demo pack for a bare
+	// dev run; a pulled version is manifest-driven, so the importer reads the pack list from there).
+	ContentPacks []string `yaml:"content_packs"`
+}
+
+// ContentStoreConfig configures the external versioned content store (#212 slice 3). An empty URL
+// disables it — the shard keeps loading embedded/seeded content, exactly as before.
+type ContentStoreConfig struct {
+	URL      string `yaml:"url"`       // git remote of the content repo ("" => external store off)
+	Version  string `yaml:"version"`   // the pinned tag/SHA telos-pull imports
+	Token    string `yaml:"token"`     // PAT for a PRIVATE content repo (from a gitignored env; never embed it in URL)
+	CacheDir string `yaml:"cache_dir"` // on-disk checkout cache ("" => a user-cache-dir default)
 }
 
 // PostgresConfig configures the Postgres connection (the content/character store).
@@ -243,6 +259,21 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_ZONES"); ok {
 		c.Zones = splitCSV(v)
+	}
+	if v, ok := os.LookupEnv("TELOS_CONTENT_URL"); ok {
+		c.Content.URL = v
+	}
+	if v, ok := os.LookupEnv("TELOS_CONTENT_VERSION"); ok {
+		c.Content.Version = v
+	}
+	if v, ok := os.LookupEnv("TELOS_CONTENT_TOKEN"); ok {
+		c.Content.Token = v
+	}
+	if v, ok := os.LookupEnv("TELOS_CONTENT_CACHE"); ok {
+		c.Content.CacheDir = v
+	}
+	if v, ok := os.LookupEnv("TELOS_CONTENT_PACKS"); ok {
+		c.ContentPacks = splitCSV(v)
 	}
 }
 
