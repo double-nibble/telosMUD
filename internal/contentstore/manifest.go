@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -32,10 +35,10 @@ type Manifest struct {
 	// version" — the importer loads exactly these, so no out-of-band enabled list is needed.
 	Packs []string `yaml:"packs"`
 	// CreatedAt / CIRun are provenance (RFC3339 timestamp + the CI run URL). Optional.
-	CreatedAt string `yaml:"created_at"`
-	CIRun     string `yaml:"ci_run"`
+	CreatedAt string `yaml:"created_at,omitempty"`
+	CIRun     string `yaml:"ci_run,omitempty"`
 	// EngineMin is an optional minimum engine version that can serve this content (a future gate).
-	EngineMin string `yaml:"engine_min"`
+	EngineMin string `yaml:"engine_min,omitempty"`
 }
 
 // ReadManifest reads and parses ManifestFile from the root of fsys (a checked-out content version's
@@ -110,6 +113,60 @@ func ComputeContentHash(fsys fs.FS) (string, error) {
 		_, _ = h.Write(data)
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ListPacks returns the pack names present under packs/ in fsys — a dir packs/<name>/ or a single
+// file packs/<name>.yaml (mirroring loadPackFS: single-file is .yaml only) — sorted. It is how the
+// manifest emitter learns the version's pack set.
+func ListPacks(fsys fs.FS) ([]string, error) {
+	entries, err := fs.ReadDir(fsys, "packs")
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: read packs/: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+			continue
+		}
+		if strings.HasSuffix(e.Name(), ".yaml") {
+			names = append(names, strings.TrimSuffix(e.Name(), ".yaml"))
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// EmitManifest computes the content hash + pack set over the local content tree rooted at dir and
+// writes a manifest.yaml stamped with version (and optional ciRun) to dir. It is the content-repo
+// PUBLISH tool (telos-pull --emit-manifest): CI runs it to stamp content_hash + packs on a version
+// before tagging. The content hash covers packs/ only, so writing manifest.yaml (at the root) never
+// changes it — no chicken-and-egg. Returns the written manifest.
+func EmitManifest(dir, version, ciRun string) (Manifest, error) {
+	fsys := os.DirFS(dir)
+	packs, err := ListPacks(fsys)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if len(packs) == 0 {
+		return Manifest{}, fmt.Errorf("contentstore: no packs under %s/packs", dir)
+	}
+	hash, err := ComputeContentHash(fsys)
+	if err != nil {
+		return Manifest{}, err
+	}
+	m := Manifest{
+		Version: version, ContentHash: hash, Packs: packs,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), CIRun: ciRun,
+	}
+	data, err := yaml.Marshal(m)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("contentstore: marshal manifest: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ManifestFile), data, 0o600); err != nil {
+		return Manifest{}, fmt.Errorf("contentstore: write manifest: %w", err)
+	}
+	return m, nil
 }
 
 // VerifyContentHash recomputes the packs/ hash of fsys and checks it equals expected (as recorded in
