@@ -30,6 +30,12 @@ type Options struct {
 	PostgresDSN string
 	NATSURL     string
 	Check       bool
+
+	// PruneGuard, when set (the director-coordinated path), is consulted before the import with the packs
+	// this version would PRUNE. A non-empty result REFUSES the pull before any DB change — the veto that
+	// stops hot-stripping a pack players are standing in. nil (telos-pull / CI) skips it: the CLI importer
+	// has no fleet view. See guard.go.
+	PruneGuard PruneGuard
 }
 
 // Result reports what a pull did. On a Check run only SHA/ManifestVersion/Packs are set (Checked=true).
@@ -100,13 +106,37 @@ func Pull(ctx context.Context, opts Options) (Result, error) {
 		return base, nil
 	}
 
-	// 6. Import the version atomically (prune dropped packs + stamp content_version/registry + mint the
-	//    monotonic version, all one tx). Idempotent by SHA (changed=false => no bump/prune).
+	// 6. Open Postgres — the import target and, for the director's guard, the source of the current
+	//    registry + each pack's zones.
 	pool, err := store.Open(ctx, opts.PostgresDSN)
 	if err != nil {
 		return Result{}, fmt.Errorf("connect to postgres: %w", err)
 	}
 	defer pool.Close()
+
+	// 6a. Live-hosted-pack prune guard (director-coordinated path only). Compute the packs this version
+	//     would prune (registry − incoming) and, if any, let the guard veto stripping one that is currently
+	//     hosted. A veto refuses the pull BEFORE any DB change (the import below is what commits the prune).
+	if opts.PruneGuard != nil {
+		cur, err := pool.CurrentContentVersion(ctx)
+		if err != nil {
+			return Result{}, fmt.Errorf("read current content registry: %w", err)
+		}
+		if would := prunePreview(cur.Packs, packNames); len(would) > 0 {
+			blocked, err := opts.PruneGuard(ctx, pool, would)
+			if err != nil {
+				return Result{}, err
+			}
+			if len(blocked) > 0 {
+				return Result{}, fmt.Errorf(
+					"refusing content version %q: it would strip live-hosted pack(s) [%s] — players are in those zones; drain them or roll a reboot before removing the pack(s)",
+					opts.Version, strings.Join(blocked, ", "))
+			}
+		}
+	}
+
+	// 7. Import the version atomically (prune dropped packs + stamp content_version/registry + mint the
+	//    monotonic version, all one tx). Idempotent by SHA (changed=false => no bump/prune).
 	version, pruned, changed, err := pool.ImportVersion(ctx, packs, store.VersionMeta{
 		ContentSHA: res.SHA, ManifestVersion: manifest.Version, ContentHash: manifest.ContentHash,
 	})
@@ -120,7 +150,7 @@ func Pull(ctx context.Context, opts Options) (Result, error) {
 		return base, nil // the SHA already matched Postgres — nothing imported, skip the broadcast
 	}
 
-	// 7. Broadcast the hot-reload (stamped with the authoritative version), then the version-complete
+	// 8. Broadcast the hot-reload (stamped with the authoritative version), then the version-complete
 	//    sentinel. Best-effort — a NATS failure is non-fatal (rows are durable; shards catch up on
 	//    reconnect via reconcile-on-join).
 	base.Published = broadcast(ctx, opts.NATSURL, packs, version)

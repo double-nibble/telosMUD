@@ -244,6 +244,27 @@ func (p *Pool) ContentVersion(ctx context.Context) (uint64, error) {
 	return uint64(ver), nil //nolint:gosec // G115: version >= 0 from a bounded nanos column
 }
 
+// PackZones returns the zone refs a pack owns (the zones rows WHERE pack=$1), sorted. The director's
+// live-hosted-pack prune guard (#212 slice 4 PR E2) maps a would-be-pruned pack to the zones whose live
+// hosting it must check before allowing the strip — so a pull never hot-removes content players are
+// currently standing in. A pack with no zones (a shared-defs-only pack) returns an empty list.
+func (p *Pool) PackZones(ctx context.Context, pack string) ([]string, error) {
+	rows, err := p.pool.Query(ctx, `SELECT ref FROM zones WHERE pack = $1 ORDER BY ref`, pack)
+	if err != nil {
+		return nil, fmt.Errorf("store: read pack zones: %w", err)
+	}
+	defer rows.Close()
+	var zones []string
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			return nil, fmt.Errorf("store: scan pack zone: %w", err)
+		}
+		zones = append(zones, ref)
+	}
+	return zones, rows.Err()
+}
+
 // registryPacksTx reads the registry pack set within a transaction (the pre-prune old set).
 func registryPacksTx(ctx context.Context, tx pgx.Tx) ([]string, error) {
 	rows, err := tx.Query(ctx, `SELECT pack FROM content_pack_registry ORDER BY pack`)

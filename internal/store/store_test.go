@@ -640,6 +640,56 @@ func TestImportVersion(t *testing.T) {
 	}
 }
 
+// TestPackZones (gated) covers the PR-E2 prune-guard lookup: PackZones returns exactly a pack's zone refs
+// (sorted), and an empty list for a pack that owns no zones.
+func TestPackZones(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	suffix := time.Now().Format("150405.000000")
+	pack := "pzpk-" + suffix
+	z1 := "pza" + suffix
+	z2 := "pzb" + suffix
+	t.Cleanup(func() {
+		cctx := context.Background()
+		tx, err := p.pool.Begin(cctx)
+		if err != nil {
+			return
+		}
+		defer tx.Rollback(cctx) //nolint:errcheck
+		_ = deletePack(cctx, tx, pack)
+		_, _ = tx.Exec(cctx, `DELETE FROM content_pack_registry WHERE pack=$1`, pack)
+		_ = tx.Commit(cctx)
+	})
+
+	twoZones := content.Pack{Pack: pack, Zones: []content.ZoneDTO{
+		{Ref: z2, Name: "Two", StartRoom: z2 + ":room:1", Rooms: []content.RoomDTO{{Ref: z2 + ":room:1", Name: "R"}}},
+		{Ref: z1, Name: "One", StartRoom: z1 + ":room:1", Rooms: []content.RoomDTO{{Ref: z1 + ":room:1", Name: "R"}}},
+	}}
+	if _, _, _, err := p.ImportVersion(ctx, []content.Pack{twoZones},
+		VersionMeta{ContentSHA: "pzsha-" + suffix, ManifestVersion: "v1", ContentHash: "pzh"}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	zones, err := p.PackZones(ctx, pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// z1 < z2 lexically (…a… < …b…), so the sorted result is [z1, z2] regardless of authoring order.
+	if len(zones) != 2 || zones[0] != z1 || zones[1] != z2 {
+		t.Fatalf("PackZones(%s) = %v, want sorted [%s %s]", pack, zones, z1, z2)
+	}
+
+	// A pack that was never imported owns no zones.
+	empty, err := p.PackZones(ctx, "no-such-pack-"+suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("PackZones for an unknown pack = %v, want empty", empty)
+	}
+}
+
 func containsAll(xs []string, want ...string) bool {
 	set := map[string]bool{}
 	for _, x := range xs {

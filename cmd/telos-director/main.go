@@ -127,8 +127,13 @@ func main() {
 	// configured, so an in-game `pull <version>` installs a published version fleet-wide. Without a
 	// content store the world director simply doesn't run coordinated pulls (the request is logged + dropped).
 	if cfg.Content.URL != "" {
-		world.WithContentPuller(contentPuller{cfg: cfg})
-		slog.Info("coordinated content pull enabled (director)", "content_url", cfg.Content.URL)
+		// dir (the fleet view) is nil without Redis (single-process dev): the prune guard has no directory
+		// to consult and is skipped. NOTE this is broader than "nothing is hosted" — a single-process
+		// director with configured zones IS a live host of them, just not one recorded in a directory, so a
+		// dev pull CAN hot-strip a pack whose zones this process is serving (surfaced loudly by the reload
+		// path). The guard is a multi-shard-deployment safety, not a dev one.
+		world.WithContentPuller(contentPuller{cfg: cfg, dir: dir})
+		slog.Info("coordinated content pull enabled (director)", "content_url", cfg.Content.URL, "prune_guard", dir != nil)
 	}
 
 	var wg sync.WaitGroup
@@ -230,16 +235,49 @@ func directorInstanceID(cfg config.Config) string {
 // contentPuller adapts the shared install pipeline (internal/contentpull) to the director's
 // ContentPuller interface (#212 slice 4 PR E): a coordinated `pull <version>` resolves that version from
 // the configured content store and imports it. The requested version overrides the config's pinned one.
-type contentPuller struct{ cfg config.Config }
+// dir is the fleet view for the live-hosted-pack prune guard (PR E2); nil (single-process dev, no Redis)
+// disables the guard.
+type contentPuller struct {
+	cfg config.Config
+	dir *directory.Redis
+}
 
 func (p contentPuller) Pull(ctx context.Context, version, _ string) error {
-	_, err := contentpull.Pull(ctx, contentpull.Options{
+	opts := contentpull.Options{
 		ContentURL:  p.cfg.Content.URL,
 		Version:     version,
 		Token:       p.cfg.Content.Token,
 		CacheDir:    p.cfg.Content.CacheDir,
 		PostgresDSN: p.cfg.Postgres.DSN,
 		NATSURL:     p.cfg.NATS.URL,
-	})
+	}
+	// The prune guard needs the fleet directory to know which zones are hosted; without Redis there is no
+	// fleet, so a single-process director prunes freely.
+	if p.dir != nil {
+		opts.PruneGuard = contentpull.FleetPruneGuard(zoneLocator{dir: p.dir})
+	}
+	_, err := contentpull.Pull(ctx, opts)
 	return err
+}
+
+// shardForZoner is the fleet lookup the prune-guard locator needs — satisfied by *directory.Redis. It is
+// an interface so the ErrNotFound→not-hosted / other-error→propagate mapping is unit-testable without Redis.
+type shardForZoner interface {
+	ShardForZone(ctx context.Context, zone string) (string, error)
+}
+
+// zoneLocator adapts the fleet directory to contentpull.ZoneLocator: a zone is "hosted" when the directory
+// has a live shard owning it; the unclaimed sentinel (ErrNotFound) maps to not-hosted, any other error
+// propagates (the guard fails closed on incomplete fleet info).
+type zoneLocator struct{ dir shardForZoner }
+
+func (z zoneLocator) ZoneHosted(ctx context.Context, zone string) (bool, error) {
+	_, err := z.dir.ShardForZone(ctx, zone)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, directory.ErrNotFound) {
+		return false, nil
+	}
+	return false, err
 }
