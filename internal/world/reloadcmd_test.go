@@ -2,6 +2,8 @@ package world
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,7 +11,88 @@ import (
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
+	"github.com/double-nibble/telosmud/internal/scopebus"
 )
+
+// auditScopeShard builds a minimal Shard with a scopeReplication whose signal queue a test can read, to
+// observe what auditReload enqueues without a live scoped bus.
+func auditScopeShard() *Shard {
+	return &Shard{scopes: &scopeReplication{signals: make(chan scopeSignalJob, 4), log: slog.Default()}}
+}
+
+// TestAuditReloadEnqueuesSignal proves a real reload fires a world-scoped content.reload.audit signal-up
+// carrying who/what/outcome (#192 S3).
+func TestAuditReloadEnqueuesSignal(t *testing.T) {
+	sh := auditScopeShard()
+	auditReload(sh, "Ada", []string{"demo"}, reloadOutcome{published: 7})
+
+	select {
+	case j := <-sh.scopes.signals:
+		if j.event != contentbus.ReloadAuditEvent {
+			t.Fatalf("event = %q, want %q", j.event, contentbus.ReloadAuditEvent)
+		}
+		if j.scope.Label() != scopebus.World().Label() {
+			t.Fatalf("scope = %q, want world (a content reload is a fleet event)", j.scope.Label())
+		}
+		var a contentbus.ReloadAudit
+		if err := json.Unmarshal(j.payload, &a); err != nil {
+			t.Fatal(err)
+		}
+		if a.Actor != "Ada" || a.Published != 7 || a.Outcome != "propagated" || len(a.Packs) != 1 || a.AtUnixMs == 0 {
+			t.Fatalf("audit payload = %+v", a)
+		}
+	default:
+		t.Fatal("no audit signal enqueued for a real reload")
+	}
+}
+
+// TestAuditReloadSkipsCheckOnly proves a `--check` dry run is NOT audited (it changed nothing on the fleet).
+func TestAuditReloadSkipsCheckOnly(t *testing.T) {
+	sh := auditScopeShard()
+	auditReload(sh, "Ada", []string{"demo"}, reloadOutcome{checkOnly: true})
+	select {
+	case <-sh.scopes.signals:
+		t.Fatal("a --check dry run must not be audited")
+	default:
+	}
+}
+
+// TestAuditReloadOutcomeMapping pins the reloadOutcome -> audit outcome string mapping.
+func TestAuditReloadOutcomeMapping(t *testing.T) {
+	cases := []struct {
+		out  reloadOutcome
+		want string
+	}{
+		{reloadOutcome{published: 5}, "propagated"},
+		{reloadOutcome{rejected: []string{"bad def"}}, "rejected"},
+		{reloadOutcome{failed: true}, "failed"},
+		{reloadOutcome{failed: true, published: 3}, "partial"},
+	}
+	for _, c := range cases {
+		sh := auditScopeShard()
+		auditReload(sh, "Ada", []string{"demo"}, c.out)
+		j := <-sh.scopes.signals
+		var a contentbus.ReloadAudit
+		if err := json.Unmarshal(j.payload, &a); err != nil {
+			t.Fatal(err)
+		}
+		if a.Outcome != c.want {
+			t.Fatalf("outcome for %+v = %q, want %q", c.out, a.Outcome, c.want)
+		}
+	}
+}
+
+// TestAuditReloadNilScopesNoOp proves a shard with no scoped bus (sh.scopes nil) audits nothing and never
+// panics — the audit is best-effort and must never affect the reload.
+func TestAuditReloadNilScopesNoOp(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("auditReload panicked with no scoped bus: %v", r)
+		}
+	}()
+	sh := &Shard{} // no scoped bus
+	auditReload(sh, "Ada", []string{"demo"}, reloadOutcome{published: 1})
+}
 
 // TestReloadScopePacks covers the `reload` scope resolution: bare/"all" => every loaded pack, a valid
 // name => just it, an unknown name => a loud error (never a silent no-op).
