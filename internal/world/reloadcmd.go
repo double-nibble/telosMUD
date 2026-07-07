@@ -199,17 +199,13 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 		return reloadOutcome{checkOnly: true}
 	}
 	out := reloadOutcome{}
-	// A shard-local `reload` is a staff hot-edit of already-imported rows: it stamps its invalidations
-	// with a wall-clock-nanos version and is deliberately DIRECTOR-INDEPENDENT (never-fatal). This is
-	// nanos-scale like the director-coordinated pull's PG-minted version, so the two interoperate at the
-	// reconcile guard. HAZARD (bounded by CROSS-HOST CLOCK SKEW, not elapsed time): the pull's version is
-	// minted from the PULLER host's clock while this stamp is from THIS shard's clock; if this shard's
-	// clock lags the puller's by more than the real pull→reload gap, a reload right after a pull can have
-	// N < V and its zone-SHAPE reconcile (add/remove/start-room) is dropped by the guard — the per-ref
-	// data swaps still apply. Impact is a lost STAFF shape-edit (re-run to reapply), never data corruption
-	// or a cross-shard issue. Real fix (follow-up #222): mint max(now, pgVersion+1) by reading the
-	// content_version singleton. See contentbus.PublishPack.
-	version := uint64(time.Now().UnixNano())
+	// A shard-local `reload` is a staff hot-edit of already-imported rows: it stamps its invalidations with
+	// a DIRECTOR-INDEPENDENT, nanos-scale version (never-fatal) so it interoperates with the director-
+	// coordinated pull's PG-minted version at the reconcile guard. mintReloadVersion floors that stamp at
+	// pgVersion+1 (#222) so a reload right after a pull always advances past the current content version even
+	// when this shard's clock lags the host that minted the pull — otherwise the reload's zone-SHAPE
+	// reconcile would be silently dropped by the version guard as stale.
+	version := r.mintReloadVersion(ctx)
 	for _, pk := range loaded {
 		n, perr := contentbus.PublishPack(ctx, r.bus, pk, version)
 		out.published += n
@@ -220,6 +216,30 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 	}
 	r.log.Info("reload: content reload propagated across the fleet", "packs", packs, "invalidations", out.published, "failed", out.failed)
 	return out
+}
+
+// mintReloadVersion stamps a shard-local reload's invalidations as max(now_nanos, pgVersion+1): the
+// wall-clock nanos keep it director-independent and nanos-scale, while the pgVersion+1 FLOOR guarantees the
+// stamp always advances past the current Postgres content version — closing the cross-host clock-skew race
+// (#222) where a reload issued right after a director pull, on a shard whose clock lags the puller's, would
+// carry a version below the pull's and have its zone-SHAPE reconcile dropped by the guard as stale. When
+// the PG version can't be read (a source without ContentVersion, or a transient read error), it falls back
+// to bare nanos — the guard degrades to the pre-#222 behavior, never worse.
+func (r *reloader) mintReloadVersion(ctx context.Context) uint64 {
+	now := uint64(time.Now().UnixNano())
+	vs, ok := r.src.(contentVersioner)
+	if !ok {
+		return now
+	}
+	pg, err := vs.ContentVersion(ctx)
+	if err != nil {
+		r.log.Warn("reload: could not read the content version for the mint floor; using bare nanos", "err", err)
+		return now
+	}
+	if floor := pg + 1; floor > now {
+		return floor
+	}
+	return now
 }
 
 // auditReload fires a fire-and-forget DURABLE signal UP to the world director recording who ran `reload`,
