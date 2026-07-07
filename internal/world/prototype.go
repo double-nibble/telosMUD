@@ -98,9 +98,10 @@ type protoCache struct {
 	// writeMu serializes the WRITE path only (define/reload's read-copy-store), so two writers
 	// can't both copy the same base table and clobber each other's update (the atomic Store is
 	// last-writer-wins on a stale copy otherwise). Readers never take it — get/spawn are a pure
-	// atomic.Load. Today there is a single runtime writer (the reload applier), but enforcing it
-	// here structurally rather than by wiring keeps a future second writer (a resync goroutine,
-	// a second subscription) from silently losing an update.
+	// atomic.Load. There are TWO runtime writers — the reload applier (ADD/UPDATE, subscriber
+	// goroutine) and a zone goroutine (ref DELETION via reconcileZoneShape → removeRoom) — which
+	// never target the same ref concurrently (see reload's doc comment); writeMu makes even that
+	// partitioned pair memory-safe, and guards any future writer from silently losing an update.
 	writeMu sync.Mutex
 }
 
@@ -153,9 +154,18 @@ func (c *protoCache) define(ref ProtoRef, keywords []string, short, long string,
 // p (the ref's row was deleted) removes the entry: subsequent spawns of that ref return nil and
 // are logged, exactly like an unknown ref, rather than serving a stale prototype.
 //
-// Concurrency: reload is the only runtime writer of the table and is serialized by the shard's
-// single reload applier (the contentbus subscriber goroutine), so two reloads never race each
-// other's copy; spawn never writes the table, so a reader never races a writer either.
+// Concurrency: this copy-and-swap is writeMu-guarded, so ANY set of concurrent writers is
+// memory-safe (each takes the lock, copies, and Stores; spawn never writes the table, only Loads).
+// There are TWO runtime writers, and they never target the same ref concurrently:
+//   - the shard's single reload applier (the contentbus subscriber goroutine) writes ADDs/UPDATEs of a
+//     ref, serialized per subscription (reload.go onInvalidation);
+//   - a ZONE goroutine writes a ref DELETION (nil p) when reconcileZoneShape → removeRoom tears down a
+//     room the content dropped (world.go), because a deletion emits no per-ref invalidation so the
+//     applier never learns of it — the zone is the sole knower.
+//
+// These two never collide on one ref: a given pack read has a ref either present (applier ADD/UPDATE) or
+// absent (zone DELETE), never both, so the writers partition the ref space. A future edit that adds a
+// SUBSCRIBER-side delete path would reintroduce a same-ref writer race — keep deletions zone-driven.
 func (c *protoCache) reload(ref ProtoRef, p *Prototype) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()

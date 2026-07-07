@@ -13,11 +13,12 @@ import (
 // a later refinement — over-publishing is harmless (each shard re-reads and swaps an identical
 // prototype if nothing changed).
 
-// PublishPack publishes an invalidation for every room, item, and mob prototype in pk on bus. It
-// is the seed/OLC trigger: a running shard subscribed to the bus re-reads and swaps each ref. The
-// zone definition itself is not a spawnable prototype, so it is not published (a zone-shape change
-// is a boot concern). Errors from individual publishes are returned at the first failure so the
-// caller can log; a partial publish still hot-reloads the refs that made it onto the wire.
+// PublishPack publishes an invalidation for every room, item, and mob prototype in pk on bus, plus a
+// zone-SHAPE invalidation per zone (which drives the live-room-deletion reconcile, #191). It is the
+// seed/OLC trigger: a running shard subscribed to the bus re-reads and swaps each ref, then reconciles
+// each zone's room set against the reloaded content. Errors from individual publishes are returned at
+// the first failure so the caller can log; a partial publish still hot-reloads the refs that made it
+// onto the wire.
 func PublishPack(ctx context.Context, bus Bus, pk content.Pack) (int, error) {
 	if bus == nil {
 		return 0, nil
@@ -45,6 +46,16 @@ func PublishPack(ctx context.Context, bus Bus, pk content.Pack) (int, error) {
 			if err := pub(content.KindMob, mb.Ref); err != nil {
 				return n, err
 			}
+		}
+		// A zone-SHAPE invalidation drives the live-room reconcile (#191): each shard hosting this zone
+		// re-reads its room set and TEARS DOWN any room the edit DELETED. The per-ref loop above only
+		// names PRESENT refs, so a deletion emits no per-ref invalidation — the reconcile is the only
+		// signal a shard gets that a live room is gone. Published AFTER this zone's rooms so the per-ref
+		// ADDs/UPDATEs land before the reconcile removes (serial delivery preserves the order). A zone is
+		// not a spawnable prototype, so it is NOT counted in n (the published-definition tally the builder
+		// sees stays a prototype count).
+		if err := bus.Publish(ctx, Invalidation{Kind: content.KindZone, Ref: z.Ref, Pack: pk.Pack}); err != nil {
+			return n, err
 		}
 	}
 	// Pack-GLOBAL channel_defs (Phase 8.3): a re-seed may have edited a channel's color/format/access,

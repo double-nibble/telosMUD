@@ -836,8 +836,10 @@ func (z *Zone) spawnRoom(ref ProtoRef) *Entity {
 //     it is NOT enforced by the loader. A room authored into zone X with a ref prefixed for zone Y would
 //     boot into X yet be skipped by this ADD (its cross-zone exits would already misroute too). A load-time
 //     content-lint enforcing prefix==zone is the proper guard — tracked as a follow-up (#194).
-//   - REMOVE (prototype deleted): left as-is — tearing a live room down means re-placing its occupants, the
-//     risky reconciliation still deferred (#191).
+//   - REMOVE (prototype deleted): NOT driven here. A deleted room's ref is absent from the content, so
+//     PublishPack never emits a per-ref invalidation for it — this path never sees a deletion. Room teardown
+//     is instead driven by the zone-SHAPE reconcile (reconcileZoneShape), which diffs the whole zone's live
+//     room set against the reloaded content. The p==nil case below is a defensive no-op.
 func (z *Zone) resyncRoom(ref ProtoRef) {
 	e := z.rooms[ref]
 	p := z.protos.get(ref)
@@ -853,7 +855,7 @@ func (z *Zone) resyncRoom(ref ProtoRef) {
 		return
 	}
 	if p == nil {
-		return // definition deleted — live-room removal is the deferred (risky) part of #191
+		return // definition deleted — teardown is driven by reconcileZoneShape, not the per-ref path
 	}
 	// Re-point the entity at the new prototype AND its components together, exactly as spawn establishes the
 	// aliasing. Keeping e.prototype in lock-step with e.comps matters for COW: mutableComponent decides an
@@ -934,10 +936,44 @@ func (z *Zone) removeRoom(ref ProtoRef) {
 	// its documented runtime writer is the reload-applier (subscriber) goroutine; here the ZONE goroutine
 	// writes it because in the reconcile model the zone is the authoritative knower of a content-DELETION
 	// (no invalidation names a deleted ref — PublishPack only emits present refs), and the applier cannot
-	// know. protoCache.reload is a mutex-guarded copy-and-swap, so this concurrent writer is memory-safe; PR
-	// 2 (the reconcile that drives this) retires resyncRoom's REMOVE stub and confirms this single owner.
+	// know. protoCache.reload is a mutex-guarded copy-and-swap, so this concurrent writer is memory-safe. The
+	// zone goroutine is the SOLE driver of a content-deletion (reconcileZoneShape → removeRoom), so no
+	// applier-goroutine writer races it for a deleted ref.
 	z.protos.reload(ref, nil)
 	z.log.Debug("hot reload: live room removed", "zone", z.id, "room", ref)
+}
+
+// reconcileZoneShape is the zone-SHAPE reconcile (#191): given the authoritative room set the reloaded
+// content says SHOULD be live (wantRooms) plus its start room, it drives the DELETION case — any room live
+// in z.rooms that the content no longer defines is torn down via z.removeRoom (re-place occupants, despawn
+// ephemera). ADD/UPDATE stay on the per-ref applier (resyncRoom); this closes the gap that path structurally
+// cannot see, because a deleted room's ref is absent from the content so PublishPack never names it. Runs on
+// the zone goroutine (single-writer over z.rooms / z.startRoom / z.players), driven by a reloadZoneMsg.
+//
+// start_room is repointed FIRST (before any removal) because removeRoom REFUSES to tear down the live start
+// room — it is the evacuation fallback — so a content edit that both moves the start room and deletes the old
+// one only works if the repoint precedes the removals. The repoint is guarded to a room the reloaded content
+// actually defines (wantRooms[startRoom]) so a malformed edit can never point new logins at an undefined room;
+// a start room not yet live (its ADD invalidation still in flight or dropped) simply leaves removeRoom without
+// a fallback, which it handles by skipping and converging on a re-run.
+func (z *Zone) reconcileZoneShape(wantRooms map[ProtoRef]bool, startRoom ProtoRef) {
+	if startRoom != "" && wantRooms[startRoom] {
+		z.startRoom = startRoom
+	}
+	// Snapshot the stale refs before removing: removeRoom deletes from z.rooms, which would mutate the map
+	// underneath a live range. A room the content still defines is left to the per-ref UPDATE path.
+	var stale []ProtoRef
+	for ref := range z.rooms {
+		if !wantRooms[ref] {
+			stale = append(stale, ref)
+		}
+	}
+	for _, ref := range stale {
+		z.removeRoom(ref)
+	}
+	if len(stale) > 0 {
+		z.log.Debug("hot reload: zone-shape reconcile removed deleted rooms", "zone", z.id, "removed", len(stale))
+	}
 }
 
 // relocate forcibly evacuates a live player to dest (#191 room removal) — a directionless move mirroring the

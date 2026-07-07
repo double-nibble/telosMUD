@@ -105,6 +105,15 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 		return
 	}
 
+	// A `zone` invalidation carries no spawnable prototype — it drives the live-room-SHAPE reconcile
+	// (#191). Re-read the zone's room set and post a reconcile to the hosting zone so it TEARS DOWN any
+	// room the edit deleted (a deletion emits no per-ref invalidation, so this is the only signal). It
+	// forks off before the prototype path, like the channel case.
+	if inv.Kind == content.KindZone {
+		r.reloadZoneShape(inv)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), reloadIOTimeout)
 	defer cancel()
 	def, err := r.src.LoadDefinition(ctx, inv.Kind, inv.Ref, inv.Pack)
@@ -183,6 +192,91 @@ func (r *reloader) reloadChannel(inv contentbus.Invalidation) {
 	}
 	reg.reload(inv.Ref, buildChannelDef(def.Channel), false)
 	r.log.Debug("hot reload: channel swapped", "ref", inv.Ref)
+}
+
+// reloadZoneShape applies a `zone` content hot reload (#191): it re-reads the whole zone definition and
+// posts a reconcile to the hosting zone so the zone goroutine diffs its live room set against the
+// reloaded content and TEARS DOWN any room the edit DELETED (removeRoom — re-place occupants, despawn
+// ephemera). ADD/UPDATE stay on the per-ref applier (resyncRoom); this closes ONLY the deletion gap the
+// per-ref path structurally cannot see — a deleted room's ref is absent from the content, so PublishPack
+// never names it. Runs OFF every zone goroutine (the content-bus subscription goroutine); the reconcile
+// itself runs single-writer on the zone goroutine via the inbox post.
+//
+// It re-reads the WHOLE pack (LoadPacks) rather than a single ref, because the reconcile needs the zone's
+// full room set (which rooms SHOULD be live), not one prototype — so it requires a source that implements
+// content.Source (all production + embedded sources do). A shard only re-reads for a zone it HOSTS (the
+// host check precedes the re-read), so a fleet of shards each pays only for its own zones. Every failure
+// is non-fatal (logged): the live room set simply stays as-is until a re-run.
+//
+// A zone that VANISHED from content entirely is deliberately NOT reconciled to an empty room set —
+// tearing down every room (including the start/login room) out from under players is a rolling-reboot
+// operation, not a hot reload — so it is skipped with a warning.
+func (r *reloader) reloadZoneShape(inv contentbus.Invalidation) {
+	if r == nil || r.shard == nil {
+		return
+	}
+	src, ok := r.src.(content.Source)
+	if !ok {
+		// A DefinitionSource that cannot re-read whole packs (a bare test double): the per-ref ADD/UPDATE
+		// path still works; only the deletion reconcile is unavailable here.
+		return
+	}
+	// Only a shard HOSTING this zone has a live room set to reconcile; skip (and skip the re-read) otherwise.
+	var target *Zone
+	for _, z := range r.shard.zonesList() { // mu-guarded against a runtime HostZone (16.4a)
+		if z.id == inv.Ref {
+			target = z
+			break
+		}
+	}
+	if target == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reloadIOTimeout)
+	defer cancel()
+	// FOLLOW-UP (scaling, #207): this re-reads the WHOLE pack per KindZone
+	// invalidation, and PublishPack emits one per zone — so a shard hosting M zones of a pack does M full-pack LoadPacks per
+	// reload, serially on this one subscriber goroutine (each discarding the other zones via findZoneDTO).
+	// Gated to hosted zones (the target check above), so a shard pays only for its own zones, but it is
+	// still O(M × full-pack-cost) of redundant Postgres I/O that stacks against every later invalidation.
+	// Fine for v1 (reloads are rare, correctness is unaffected); coalesce KindZones of one pack into a
+	// single read + reconcile-all-hosted-zones before many-zone content-heavy shards.
+	packs, err := src.LoadPacks(ctx, []string{inv.Pack})
+	if err != nil {
+		r.log.Warn("hot reload: zone-shape re-read failed; live room set unchanged", "zone", inv.Ref, "err", err)
+		return
+	}
+	zd := findZoneDTO(packs, inv.Ref)
+	if zd == nil {
+		r.log.Warn("hot reload: zone no longer in content; skipping shape reconcile "+
+			"(removing a whole zone is a rolling-reboot operation, not a hot reload)", "zone", inv.Ref)
+		return
+	}
+	want := make(map[ProtoRef]bool, len(zd.Rooms))
+	for i := range zd.Rooms {
+		want[ProtoRef(zd.Rooms[i].Ref)] = true
+	}
+	msg := reloadZoneMsg{zoneRef: inv.Ref, wantRooms: want, startRoom: ProtoRef(zd.StartRoom)}
+	// NON-BLOCKING post (same drop-vs-block tradeoff as notifyZones): a full zone inbox DROPS the reconcile
+	// rather than head-of-line-stalling every later invalidation. A dropped reconcile LOSES a room DELETION
+	// until `reload` re-runs — so it warns loudly. Bounded-reliable delivery is the tracked follow-up (#194).
+	if !target.postOrDrop(msg) {
+		slog.Warn("hot-reload zone-shape reconcile dropped (zone inbox full); a room DELETION is lost until re-run",
+			"zone", inv.Ref)
+	}
+}
+
+// findZoneDTO returns the zone DTO with ref within packs, or nil if none carries it. A pointer into the
+// re-read slice — the caller only reads it (the room set + start room), never retains it past the post.
+func findZoneDTO(packs []content.Pack, ref string) *content.ZoneDTO {
+	for pi := range packs {
+		for zi := range packs[pi].Zones {
+			if packs[pi].Zones[zi].Ref == ref {
+				return &packs[pi].Zones[zi]
+			}
+		}
+	}
+	return nil
 }
 
 // reloadLua applies a content Lua hot reload for (kind, ref) ON THE ZONE GOROUTINE (slice 7.7,

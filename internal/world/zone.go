@@ -462,6 +462,17 @@ type reloadLuaMsg struct {
 	ref  string // the (kind, ref) whose Lua was edited
 }
 
+// reloadZoneMsg tells a zone to reconcile its live room SHAPE against reloaded content (#191): the shard
+// reloader re-read the whole zone definition off the bus goroutine and hands the authoritative room set
+// (wantRooms) + start room here so the diff-and-teardown runs ON THE ZONE GOROUTINE (single-writer over
+// z.rooms / z.startRoom / z.players). zoneRef is the zone the reconcile is FOR — the reloader posts only
+// to the matching hosted zone, but the handler re-asserts z.id == zoneRef defensively.
+type reloadZoneMsg struct {
+	zoneRef   string            // the zone this reconcile targets (== z.id)
+	wantRooms map[ProtoRef]bool // the refs the reloaded content says SHOULD be live in this zone
+	startRoom ProtoRef          // the reloaded start/login room (repointed before removals)
+}
+
 // reloadDoneMsg reports the outcome of a `reload` command's BACKGROUND fan-out back to the builder who
 // triggered it (reloadcmd.go). The re-read + per-ref publish runs off the zone goroutine, so the result
 // is posted here to be delivered ON the zone goroutine — where z.players is single-writer, so it sends
@@ -496,6 +507,7 @@ func (adoptPidMsg) zoneMsg()      {}
 func (presenceMsg) zoneMsg()      {}
 func (loadObjectsMsg) zoneMsg()   {}
 func (reloadLuaMsg) zoneMsg()     {}
+func (reloadZoneMsg) zoneMsg()    {}
 func (reloadDoneMsg) zoneMsg()    {}
 func (whoFallbackMsg) zoneMsg()   {}
 
@@ -678,6 +690,12 @@ func (z *Zone) handle(m msg) {
 			// A room is a singleton (never re-spawned), so the applier's next-spawn semantics never reach
 			// it; re-sync the live room's authored fields from the swapped prototype here (#191).
 			z.resyncRoom(ProtoRef(v.ref))
+		}
+	case reloadZoneMsg:
+		// Defensive: only reconcile the zone this message targets (the reloader posts to the matching zone,
+		// but a mis-post must never drive another zone's teardown against a foreign room set).
+		if v.zoneRef == z.id {
+			z.reconcileZoneShape(v.wantRooms, v.startRoom)
 		}
 	case reloadDoneMsg:
 		// Deliver a `reload` fan-out result to the builder if they are still in this zone (single-writer
