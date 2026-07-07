@@ -4,10 +4,34 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
+)
+
+// Bounded-retry delivery for a dropped zone-shape reconcile (#191 PR 3/3, the #194 reliability piece for
+// this path). The reconcile fan-out stays NON-BLOCKING (postOrDrop) — a wedged zone inbox must never
+// head-of-line-stall every later invalidation shard-wide — but a dropped reconcileZoneMsg is worse than a
+// dropped Lua reload: a dropped REMOVE leaves an interactive GHOST ROOM that accumulates players and a
+// singleton never self-heals. So on a drop we hand the message to a short-lived retry goroutine that
+// re-posts it with bounded backoff. The retry re-posts the SAME immutable message with its ORIGINAL
+// version (the reconcileZoneMsg invariant): the version guard advances the cursor only on APPLICATION, so
+// a dropped-then-retried reconcile re-applies cleanly, and a retry can never resurrect stale state over a
+// newer reload (a superseding reload advanced the cursor past this version, so the stale retry is dropped
+// by the guard — safe). These are package vars so a test can shrink the timing.
+var (
+	// reconcileRetryAttempts is how many times a dropped reconcile is re-posted before giving up (the
+	// operator remedy is then to re-run `reload`). The inbox is 256-deep and drains fast, so a few paced
+	// attempts cover a transient backlog.
+	reconcileRetryAttempts = 5
+	// reconcileRetryBackoff is the base inter-attempt delay; attempt N waits N×this (linear backoff).
+	reconcileRetryBackoff = 50 * time.Millisecond
+	// maxReconcileRetryGoroutines caps concurrent retry goroutines so a reload storm against a saturated
+	// shard cannot spawn unbounded goroutines; past the cap a drop is logged and abandoned (re-run remedy).
+	maxReconcileRetryGoroutines int64 = 128
 )
 
 // reload.go is the shard-side hot-reload applier (docs/PHASE4-PLAN.md §5). It subscribes to the
@@ -51,6 +75,12 @@ type reloader struct {
 	enabled []string
 	shard   *Shard // the hosting shard — to post a reloadLuaMsg to each zone (7.7); nil on a bare test
 	log     *slog.Logger
+
+	// Bounded-retry delivery of a dropped zone-shape reconcile (#191 PR 3/3). retryInFlight caps concurrent
+	// retry goroutines; retryDone is closed once at stop() to cancel any in-flight retry promptly.
+	retryInFlight atomic.Int64
+	retryDone     chan struct{}
+	stopOnce      sync.Once
 }
 
 // newReloader wires a reloader over src/cache/bus for the given enabled packs and SUBSCRIBES. A
@@ -61,13 +91,14 @@ func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus
 		return nil
 	}
 	r := &reloader{
-		src:     src,
-		cache:   cache,
-		bus:     bus,
-		packs:   map[string]bool{},
-		enabled: append([]string(nil), enabledPacks...),
-		shard:   shard,
-		log:     slog.With("component", "contentreload"),
+		src:       src,
+		cache:     cache,
+		bus:       bus,
+		packs:     map[string]bool{},
+		enabled:   append([]string(nil), enabledPacks...),
+		shard:     shard,
+		log:       slog.With("component", "contentreload"),
+		retryDone: make(chan struct{}),
 	}
 	for _, p := range enabledPacks {
 		r.packs[p] = true
@@ -206,9 +237,9 @@ func (r *reloader) reloadChannel(inv contentbus.Invalidation) {
 //
 // Only a shard HOSTING this zone reconciles it (the reconcile is a no-op elsewhere). Delivery is the same
 // non-blocking postOrDrop the rest of hot reload uses — a wedged zone inbox must not head-of-line-stall
-// every later invalidation shard-wide — so a full inbox DROPS the reconcile with a loud warn (a dropped
-// reconcile loses a room add/remove until `reload` re-runs; bounded-reliable delivery is the #194
-// follow-up for this path, PR 3/3). The reconcile is level-triggered + idempotent, so a re-run converges.
+// every later invalidation shard-wide — but a dropped reconcile is worse than a dropped Lua reload (a lost
+// REMOVE leaves a ghost room), so a drop is handed to bounded-retry delivery (retryReconcile) rather than
+// merely warned. The reconcile is level-triggered + idempotent, so a retry (or a re-run) converges.
 func (r *reloader) reconcileZone(inv contentbus.Invalidation) {
 	if r == nil || r.shard == nil {
 		return
@@ -224,11 +255,42 @@ func (r *reloader) reconcileZone(inv contentbus.Invalidation) {
 			continue
 		}
 		if !z.postOrDrop(msg) {
-			slog.Warn("hot-reload zone-shape reconcile dropped (zone inbox full); a room add/remove is lost until re-run",
-				"zone", inv.Ref)
+			r.retryReconcile(z, msg) // bounded-retry the dropped reconcile off this goroutine (#191 PR 3/3)
 		}
 		return // a zone is hosted by at most one shard-local Zone; done once matched
 	}
+}
+
+// retryReconcile re-posts a DROPPED reconcileZoneMsg to z with bounded linear backoff, on a short-lived
+// goroutine so the subscriber goroutine is never blocked (#191 PR 3/3 / #194). It re-posts the SAME
+// immutable msg (original version) — the version guard makes that safe: a dropped reconcile never advanced
+// z.lastReconciledPackVer, so the retry re-applies, and a retry superseded by a newer reload is harmlessly
+// dropped by the guard. Concurrent retries are capped (maxReconcileRetryGoroutines) so a reload storm on a
+// saturated shard can't spawn unbounded goroutines; past the cap the drop is abandoned (re-run remedy). The
+// goroutine self-terminates on success, on attempt exhaustion, or when the reloader stops (retryDone).
+func (r *reloader) retryReconcile(z *Zone, msg reconcileZoneMsg) {
+	if r.retryInFlight.Add(1) > maxReconcileRetryGoroutines {
+		r.retryInFlight.Add(-1)
+		r.log.Warn("hot-reload zone-shape reconcile dropped (retry budget exhausted); a room add/remove is lost until re-run",
+			"zone", msg.zoneRef)
+		return
+	}
+	go func() {
+		defer r.retryInFlight.Add(-1)
+		for attempt := 1; attempt <= reconcileRetryAttempts; attempt++ {
+			select {
+			case <-r.retryDone:
+				return // reloader stopped — abandon the retry (posting to a torn-down shard is pointless)
+			case <-time.After(reconcileRetryBackoff * time.Duration(attempt)):
+			}
+			if z.postOrDrop(msg) {
+				r.log.Debug("zone-shape reconcile retry delivered", "zone", msg.zoneRef, "attempt", attempt)
+				return
+			}
+		}
+		r.log.Warn("hot-reload zone-shape reconcile retries exhausted; a room add/remove is lost until re-run",
+			"zone", msg.zoneRef, "attempts", reconcileRetryAttempts)
+	}()
 }
 
 // reloadLua applies a content Lua hot reload for (kind, ref) ON THE ZONE GOROUTINE (slice 7.7,
@@ -299,12 +361,18 @@ func (r *reloader) notifyZones(kind, ref string) {
 	}
 }
 
-// stop unsubscribes the reloader from the bus. Idempotent; safe on a nil reloader.
+// stop unsubscribes the reloader from the bus and cancels any in-flight reconcile-retry goroutines.
+// Idempotent (the retryDone close is once-guarded); safe on a nil reloader.
 func (r *reloader) stop() {
 	if r == nil || r.sub == nil {
 		return
 	}
 	_ = r.sub.Unsubscribe()
+	r.stopOnce.Do(func() {
+		if r.retryDone != nil {
+			close(r.retryDone)
+		}
+	})
 }
 
 // buildPrototype turns a single re-read Definition into a fresh *Prototype using the SAME
