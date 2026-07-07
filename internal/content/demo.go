@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"io/fs"
 
 	"gopkg.in/yaml.v3"
 )
@@ -41,30 +42,46 @@ const CoreRefPrefix = "core:"
 //go:embed packs
 var packFS embed.FS
 
+// fsSource serves content packs from any fs.FS presenting a packs/ tree — a compiled-in embed, a
+// checked-out git worktree (internal/contentstore, #212 slice 3), or a testdata dir. Each pack is
+// resolved as either the single-file layout (packs/<name>.yaml) or the directory-tree layout
+// (packs/<name>/**/*.yaml), merged into one Pack (loadPackFS). A name with no file OR directory is
+// skipped (not an error): enabling a pack the tree doesn't carry just contributes nothing,
+// preserving the bare-engine boot.
+type fsSource struct{ fsys fs.FS }
+
+// LoadPacks parses the tree's content for each enabled pack name.
+func (s fsSource) LoadPacks(_ context.Context, enabled []string) ([]Pack, error) {
+	var out []Pack
+	for _, name := range enabled {
+		p, found, err := loadPackFS(s.fsys, name)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue // not present: nothing to contribute (a Postgres source would 404 the same way)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// NewFSSource returns a Source backed by fsys — a filesystem presenting packs/<name> subtrees (or
+// packs/<name>.yaml files) at its root. The external content store (#212 slice 3) wraps a git
+// checkout's os.DirFS with this; the importer then reads packs from it exactly as it would from the
+// embed or Postgres.
+func NewFSSource(fsys fs.FS) Source { return fsSource{fsys} }
+
 // EmbeddedSource serves content packs compiled into the binary from the packs/ tree. It is the
 // Source unit tests and a bare dev run use, so the test suite has NO Postgres dependency.
 // Production loads from internal/store (Postgres) instead; `make seed` imports these same
 // YAML files into the DB so the two sources agree.
 type EmbeddedSource struct{}
 
-// LoadPacks parses the embedded content for each enabled pack name and returns them. Each pack is
-// resolved as either the single-file layout (packs/<name>.yaml) or the directory-tree layout
-// (packs/<name>/**/*.yaml), merged into one Pack (loadPackFS). A name with no embedded file OR
-// directory is skipped (not an error): enabling a pack the binary doesn't carry just contributes
-// nothing, preserving the bare-engine boot.
-func (EmbeddedSource) LoadPacks(_ context.Context, enabled []string) ([]Pack, error) {
-	var out []Pack
-	for _, name := range enabled {
-		p, found, err := loadPackFS(packFS, name)
-		if err != nil {
-			return nil, err
-		}
-		if !found {
-			continue // not embedded: nothing to contribute (a Postgres source would 404 the same way)
-		}
-		out = append(out, p)
-	}
-	return out, nil
+// LoadPacks parses the embedded content for each enabled pack name (delegating to the shared
+// fs.FS-backed implementation over the compiled-in packFS).
+func (EmbeddedSource) LoadPacks(ctx context.Context, enabled []string) ([]Pack, error) {
+	return fsSource{packFS}.LoadPacks(ctx, enabled)
 }
 
 // LoadDemoPack is a convenience for tests and the parity check: load the embedded demo pack
