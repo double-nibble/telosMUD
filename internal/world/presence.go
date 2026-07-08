@@ -318,34 +318,66 @@ func (p *presenceTracker) cachedList(ctx context.Context) ([]roster.Entry, bool)
 //
 // Concealment (#98): an Entry the hosting shard marked Concealed (invisible/hidden/wizinvis) is OMITTED for
 // an ordinary viewer — the cross-shard counterpart to the zone-local canSee filter (whoLocal), which the
-// roster path previously couldn't honor. seeAll is the viewer's own see-all capability (holylight), computed
-// on the zone goroutine before this off-goroutine render: a holylight staffer still sees concealed players.
+// roster path previously couldn't honor. seeAll is the viewer's own see-all capability (holylight), captured
+// on the zone goroutine before the async roster read: a holylight staffer still sees concealed players.
+//
+// This is the built-in FALLBACK shown when a pack defines no `who` display template (#24). It shares the one
+// concealment/sort rule (visibleRosterEntries) with the templated path, so the two can never diverge.
 func renderWho(entries []roster.Entry, seeAll bool) string {
-	names := make([]string, 0, len(entries))
-	afk := map[string]bool{}
-	for _, e := range entries {
-		if e.Concealed && !seeAll {
-			continue // concealed from an ordinary cross-shard viewer
-		}
-		display := e.Name
-		if display == "" {
-			display = e.PlayerID
-		}
-		names = append(names, display)
-		afk[display] = e.AFK
-	}
-	sort.Strings(names)
 	var b strings.Builder
 	b.WriteString("Players online:")
-	for _, n := range names {
+	for _, e := range visibleRosterEntries(entries, seeAll) {
 		b.WriteByte('\n')
 		b.WriteByte(' ')
-		b.WriteString(n)
-		if afk[n] {
+		b.WriteString(e.Name)
+		if e.AFK {
 			b.WriteString(" (AFK)")
 		}
 	}
 	return b.String()
+}
+
+// visibleRosterEntries applies the #98 concealment filter and sorts by display name — the exact rule
+// renderWho renders with, lifted out so the CONTENT `who` template consumes the same already-filtered set.
+// A concealed entry never reaches a template: the filter runs in Go, before any binding (a template that
+// could see a concealed row could leak it, however it chose to render).
+func visibleRosterEntries(entries []roster.Entry, seeAll bool) []roster.Entry {
+	out := make([]roster.Entry, 0, len(entries))
+	for _, e := range entries {
+		if e.Concealed && !seeAll {
+			continue // concealed from an ordinary cross-shard viewer
+		}
+		if e.Name == "" {
+			e.Name = e.PlayerID // the display name, as renderWho computes it
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// renderWhoSheet renders the CONTENT `who` template (surface "who") for viewer, binding `self` to the viewer's
+// handle and `list` to the visible roster rows as plain-data records. Returns ("", false) when the pack defines
+// no `who` template or the body fails — cmdWho then falls back to the built-in renderWho.
+//
+// Roster rows are REMOTE, cross-shard data (a player hosted on another shard has no *Entity here), so each row
+// binds as a snapshot record — {name, shard, afk, concealed} — never as an entity handle (T7).
+//
+// SINGLE-WRITER: this enters the zone's Lua VM, so it MUST run on the zone goroutine. Its one caller is the
+// whoRenderMsg inbox handler, which is exactly where the async roster read posts its result back to.
+func (z *Zone) renderWhoSheet(viewer *Entity, entries []roster.Entry, seeAll bool) (string, bool) {
+	visible := visibleRosterEntries(entries, seeAll)
+	records := make([]*displayRecord, 0, len(visible))
+	for _, e := range visible {
+		records = append(records, newDisplayRecord().
+			str("name", e.Name).
+			str("shard", e.ShardID).
+			boolean("afk", e.AFK).
+			// `concealed` is always false for an ordinary viewer (those rows are filtered out above); a
+			// holylight staffer sees the bit so a staff template can mark who is hiding.
+			boolean("concealed", e.Concealed))
+	}
+	return z.renderDisplayList("who", viewer, records)
 }
 
 // writeFrameTo writes a frame to a session out channel from a NON-zone goroutine (the async `who` read).

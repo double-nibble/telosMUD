@@ -88,6 +88,11 @@ func (rt *luaRuntime) installHandleType() {
 		"is_enemy":        rt.hIsEnemy,
 		"distance":        rt.hDistance,
 		"can_see":         rt.hCanSee,
+		// room-surface reads (#24): the three views a `room` display template needs, meaningful on a ROOM
+		// handle (self:room()). occupants() is VIEWER-FILTERED through canSee — see hOccupants.
+		"exits":      rt.hExits,
+		"occupants":  rt.hOccupants,
+		"room_items": rt.hRoomItems,
 		// 7.3a comms (message via the existing act()/send — no harm)
 		"send":  rt.hSend,
 		"act":   rt.hAct,
@@ -323,6 +328,13 @@ func (rt *luaRuntime) pushHandleList(l *lua.LState, es []*Entity) int {
 // hContents returns a table of handles for the entity's contents (a room's occupants + ground
 // items, a container's items, a mob/player's inventory). A departed/unresolved handle yields
 // an empty table.
+//
+// UNFILTERED, deliberately: contents() is the MECHANICS traversal (an AoE must hit the hidden
+// rogue; a room-scoped affect must land on the invisible mage), so it does NOT consult canSee.
+// It is therefore the WRONG accessor for anything a player reads. A DISPLAY surface must use
+// occupants() / room_items(), which route the visibility chokepoint — see hOccupants. Keep that
+// split: filtering here would silently break room-scoped effects, and using this in a `room`
+// template would disclose concealed occupants.
 func (rt *luaRuntime) hContents(l *lua.LState) int {
 	e := resolveHandle(l, 1)
 	if e == nil {
@@ -370,6 +382,166 @@ func (rt *luaRuntime) hEquipmentSlots(l *lua.LState) int {
 		rec.RawSetString("slot", lua.LString(vocab.label(loc)))
 		rec.RawSetString("flag", lua.LString(vocab.wornFlag(loc)))
 		rec.RawSetString("item", rt.newHandle(item))
+		t.RawSetInt(n, rec)
+	}
+	l.Push(t)
+	return 1
+}
+
+// --- room-surface reads (#24): what a `room` display template needs -------------------------
+
+// viewer returns the entity on whose behalf the current script call is running — the invocation actor, the
+// ENGINE-owned "who is looking" (never a Lua argument, so a script cannot spoof a perspective; P7-D3
+// invariant 1). nil outside any invocation.
+//
+// This is the perspective every VISIBILITY-FILTERED accessor must consult. It is deliberately NOT derivable
+// from the handle receiver: `self:room():occupants()` asks about the ROOM's contents but must answer as the
+// VIEWER, so the receiver is the subject and rt.inv.actor is the perspective.
+//
+// Per entry point:
+//   - a DISPLAY render (renderDisplaySheet/renderDisplayList) sets actor = the viewing player, which is
+//     exactly the perspective a sheet must be rendered from. This is the case that matters for disclosure.
+//   - a TRIGGER/event body inherits the firing cascade's actor (invokeFromCtx), so occupants() answers "as
+//     the acting entity", which may differ from the script-owning entity (`self`). No player-visible surface
+//     reads it that way today; a mob reasoning about who it can see should ask self:can_see(o) explicitly.
+func (rt *luaRuntime) viewer() *Entity {
+	if rt == nil || rt.inv == nil {
+		return nil
+	}
+	return rt.inv.actor
+}
+
+// hExits returns the entity's exits — meaningful on a ROOM handle (self:room():exits()). The result is an
+// array (canonical N/E/S/W/U/D order first, then any other authored direction sorted; see Room.allExits) of
+// read-only records:
+//
+//	{dir="north", ref="midgaard:room:market", to=<room handle> | "midgaard:room:market"}
+//
+// `to` is a validated HANDLE when the destination room lives in THIS zone (the script can walk it: to:name()),
+// and the destination's bare ProtoRef STRING when it does not — a cross-zone exit has no resolvable handle
+// here (T7: no handle ever names a foreign-zone entity), and neither does a dangling ref. `ref` always carries
+// the raw destination ref so a template can render a cross-zone exit without branching on `to`'s type.
+//
+// The enumeration is TOTAL over the room's exit table, so a data-only / non-reciprocal maze exit is included
+// (it is a real edge of the graph). Read-only: the records are fresh tables, mutating them changes nothing.
+// A non-room / unresolved handle yields an empty table.
+func (rt *luaRuntime) hExits(l *lua.LState) int {
+	t := l.NewTable()
+	e := resolveHandle(l, 1)
+	if e == nil || e.room == nil {
+		l.Push(t)
+		return 1
+	}
+	n := 0
+	for _, dir := range e.room.allExits() {
+		ref := e.room.exits[dir]
+		rec := l.NewTable()
+		rec.RawSetString("dir", lua.LString(dir))
+		rec.RawSetString("ref", lua.LString(string(ref)))
+		if dest := localRoomByRef(e.zone, ref); dest != nil {
+			rec.RawSetString("to", rt.newHandle(dest))
+		} else {
+			rec.RawSetString("to", lua.LString(string(ref)))
+		}
+		n++
+		t.RawSetInt(n, rec)
+	}
+	l.Push(t)
+	return 1
+}
+
+// localRoomByRef resolves an exit's destination ProtoRef to a room entity in zone z, or nil when the ref
+// names a DIFFERENT zone (cross-zone: not ours to hand out) or no such room is registered here (a dangling
+// authored ref). Mirrors Zone.move's parseRef routing decision.
+func localRoomByRef(z *Zone, ref ProtoRef) *Entity {
+	if z == nil {
+		return nil
+	}
+	zoneID, roomRef := parseRef(ref)
+	if zoneID != "" && zoneID != z.id {
+		return nil // cross-zone destination: no handle in this zone (T7)
+	}
+	return z.rooms[roomRef]
+}
+
+// hOccupants returns the LIVING occupants (players + mobs) of the entity as handles — meaningful on a ROOM
+// handle (self:room():occupants()). The viewer themselves is excluded, matching `look`'s room listing.
+//
+// SECURITY (#28/#99/#100 — the canSee-BYPASS leak trap): every occupant is routed through the engine's ONE
+// visibility chokepoint (Zone.canSee -> visibleTo) from the VIEWER's perspective, so an occupant the viewer
+// cannot perceive — invisible without detect, mundane-hidden without sense_hidden, wizinvis above the
+// viewer's trust rank, or concealed by an unlit dark room — is OMITTED ENTIRELY. It is never rendered as a
+// leaky "someone". A holylight viewer inherits see-all from the same chokepoint. A room occupant list handed
+// to content is exactly the surface the round-12 work flagged, so it fails CLOSED:
+//
+//   - no invocation actor => no perspective to filter from => the EMPTY list, never the unfiltered contents.
+//     (visibleTo treats a nil viewer as "system render, conceal nothing"; inheriting that here would hand a
+//     template the full occupant set, so this method makes its own decision — the documented obligation in
+//     visibleTo's nil-perspective note.)
+//
+// A non-container / unresolved handle yields an empty table.
+func (rt *luaRuntime) hOccupants(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	if e == nil || e.zone == nil {
+		return rt.pushHandleList(l, nil)
+	}
+	viewer := rt.viewer()
+	if viewer == nil {
+		return rt.pushHandleList(l, nil) // fail closed: no perspective => disclose nothing
+	}
+	var visible []*Entity
+	for _, occ := range e.contents {
+		if occ == viewer || !isCreature(occ) {
+			continue
+		}
+		if !e.zone.canSee(viewer, occ) {
+			continue // THE chokepoint: concealed from this viewer => absent from the list
+		}
+		visible = append(visible, occ)
+	}
+	return rt.pushHandleList(l, visible)
+}
+
+// hRoomItems returns the entity's non-creature contents COALESCED — the ground-item listing `look` renders,
+// in structured form so a template can show "a rusty sword (x3)" its own way. Meaningful on a ROOM handle
+// (self:room():room_items()) but works on any container. The result is an array (first-appearance order) of
+// read-only records:
+//
+//	{item=<handle to the representative>, name="a rusty sword", long="A rusty sword lies here.", count=3}
+//
+// The grouping is coalesceItems — the SAME rule the built-in listings use (prototype + per-instance delta;
+// materials and containers never merge), so a template can never drift from `look`'s counts.
+//
+// Visibility: items are routed through canSee too, so the accessor inherits any future item-level concealment
+// at the one chokepoint. Today no item carries a concealment flag, so this matches `look`'s "ground items
+// always show". Fail-closed on a missing perspective, like hOccupants. A stale handle yields an empty table.
+func (rt *luaRuntime) hRoomItems(l *lua.LState) int {
+	t := l.NewTable()
+	e := resolveHandle(l, 1)
+	if e == nil || e.zone == nil {
+		l.Push(t)
+		return 1
+	}
+	viewer := rt.viewer()
+	if viewer == nil {
+		l.Push(t)
+		return 1
+	}
+	var items []*Entity
+	for _, it := range e.contents {
+		if isCreature(it) || !e.zone.canSee(viewer, it) {
+			continue
+		}
+		items = append(items, it)
+	}
+	n := 0
+	for _, g := range coalesceItems(items) {
+		n++
+		rec := l.NewTable()
+		rec.RawSetString("item", rt.newHandle(g.rep))
+		rec.RawSetString("name", lua.LString(g.rep.Name()))
+		rec.RawSetString("long", lua.LString(g.rep.Long()))
+		rec.RawSetString("count", lua.LNumber(g.n))
 		t.RawSetInt(n, rec)
 	}
 	l.Push(t)

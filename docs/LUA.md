@@ -66,6 +66,11 @@ h:has_affect(id)  h:affect_magnitude(id)  h:has_flag(name)
 h:is_enemy(other)  h:distance(other)  h:can_see(other)
 h:send(markup)  h:act(tmpl, obj, vict, to)  h:say(text)  h:emote(text)
 h:contents()  h:equipment()  h:room()  h:group()  -- traversal (returns handles)
+h:equipment_slots()   -- worn items WITH slot labels: {slot=, flag=, item=<handle>}
+-- room views (meaningful on a room handle, e.g. self:room():exits()):
+h:exits()       -- {dir=, ref=, to=<room handle> | "<cross-zone ref>"}  (all exits, maze ones included)
+h:occupants()   -- living occupants VISIBLE TO THE VIEWER (canSee-filtered), viewer excluded
+h:room_items()  -- coalesced ground items: {item=<handle>, name=, long=, count=}
 -- effect ops (route through mitigation + the hostility gate, ABILITIES.md §3/§7):
 h:damage{amount=, type=, can_avoid=}              -- to this handle as target
 h:heal(resource, amount)   h:modify_resource(resource, delta)   h:drain(resource, amount, to)

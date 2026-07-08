@@ -3,6 +3,7 @@ package world
 import (
 	"bytes"
 	"context"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -148,11 +149,6 @@ func cmdSay(c *Context) error {
 // Redis / single-shard run) it falls back to the zone-local list, so the pre-8.4 behavior — and the
 // existing who tests — are preserved.
 //
-// The roster read is blocking Redis I/O, so it must NEVER run on the zone goroutine. We capture the
-// session's out channel on-goroutine and spawn a short-lived goroutine for the List + render + write — the
-// same off-goroutine discipline the login epoch-resume and async character create use. The async frame is
-// written straight to the out channel (ack 0, like a comms frame), so it does not touch the zone-owned
-// appliedSeq from another goroutine.
 // cmdScore shows the actor their character sheet. The layout is CONTENT: if the pack defines a `score` display
 // template (a Lua render body built with the `ui` toolkit), it renders that with `self` bound to the actor;
 // otherwise it falls back to a minimal built-in sheet (name/level/resources) so the verb works for any pack.
@@ -165,6 +161,23 @@ func cmdScore(c *Context) error {
 	return nil
 }
 
+// cmdWho lists every player online ACROSS ALL SHARDS (docs/PHASE8-PLAN.md slice 8.4). It reads the shared
+// presence roster (every shard's residents), not just this zone's players. When presence is disabled (no
+// Redis / single-shard run) it falls back to the zone-local list, so the pre-8.4 behavior — and the
+// existing who tests — are preserved.
+//
+// SPLIT ACROSS THE GOROUTINE BOUNDARY (the shape #24 depends on):
+//
+//   - The roster read is blocking Redis I/O, so it must NEVER run on the zone goroutine. We capture the
+//     session's out channel + viewer + see-all bit on-goroutine and spawn a short-lived goroutine for the
+//     List — the same off-goroutine discipline the login epoch-resume and async character create use.
+//   - The RENDER, by contrast, must run ON the zone goroutine: a content `who` display template enters the
+//     zone-owned, one-per-zone Lua VM. So the fetcher does I/O ONLY, then posts its result back to the zone
+//     inbox (whoRenderMsg on success, whoFallbackMsg on a read error) and the handler renders + writes there.
+//     No frame is ever rendered in the fetch goroutine.
+//
+// The frame is written straight to the out channel (ack 0, like a comms frame), so it does not touch the
+// zone-owned appliedSeq from another goroutine.
 func cmdWho(c *Context) error {
 	z := c.z
 	// Per-session cooldown (docs/REMAINING.md, scale): the shared roster cache already collapses
@@ -182,9 +195,12 @@ func cmdWho(c *Context) error {
 		z.who(c.s) // zone-local fallback (no roster): unchanged output
 		return nil
 	}
-	// #98: capture the viewer's see-all (holylight) ON the zone goroutine — the roster render runs off it and
-	// must not touch live entity flags. A holylight staffer sees concealed players in cross-shard `who` too.
-	seeAll := hasFlag(c.s.entity, flagHolylight)
+	// Capture every zone-owned read HERE, on the zone goroutine — the fetch goroutine must touch no live
+	// entity state. #98: the viewer's see-all (holylight) gates whether concealed roster rows are disclosed.
+	// The viewer POINTER travels only as the identity the render re-binds on the zone goroutine; the fetch
+	// goroutine never dereferences it.
+	viewer := c.s.entity
+	seeAll := hasFlag(viewer, flagHolylight)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), presenceIOTimeout)
 		defer cancel()
@@ -192,10 +208,12 @@ func cmdWho(c *Context) error {
 		if !ok {
 			// A roster read error degrades to the zone-local list — never an error to the player. We post
 			// a message back to the zone goroutine so the fallback render stays single-writer.
-			z.post(whoFallbackMsg{out: out, viewer: c.s.entity})
+			z.post(whoFallbackMsg{out: out, viewer: viewer})
 			return
 		}
-		writeFrameTo(out, textFrame(renderWho(entries, seeAll)))
+		// Success: hand the (remote, plain-data) roster snapshot back to the zone goroutine, which renders it
+		// — through the content `who` template if the pack defines one, else the built-in renderWho.
+		z.post(whoRenderMsg{out: out, viewer: viewer, entries: entries, seeAll: seeAll})
 	}()
 	return nil
 }
@@ -242,20 +260,26 @@ func cmdQuit(c *Context) error {
 	return nil
 }
 
-// coalesceItemLines renders a list of items as listing lines, GROUPING identical discrete items into ONE line
-// with a " (N)" count (Track 1). `render` maps an item to its base line — `(*Entity).Name` for inventory/
-// container listings, the ground long for lookRoom — and each line is presentation-capped (capitalizeFirst).
-// The group key is the prototype PLUS the per-instance DELTA (bound state + rolled quality, via dumpItemDelta),
-// so a bound or quality-varied item never merges with a plain one (docs/REMAINING.md). Materials (Stack items,
-// which already carry their own count) and containers (chests/corpses, whose hidden contents differ) are NEVER
-// grouped — each lists on its own line. First-appearance order; a single item is uncounted.
-func coalesceItemLines(items []*Entity, render func(*Entity) string) []string {
-	type grp struct {
-		line string
-		n    int
-	}
+// itemGroup is one coalesced run of identical items: a REPRESENTATIVE entity (the first of the run, in
+// appearance order) and how many items merged into it. It is the structured form of a coalesced listing line,
+// so both the built-in renderers (coalesceItemLines) and the room display template (self:room_items(), which
+// wants the count as a number rather than baked into a string) read the SAME grouping rule.
+type itemGroup struct {
+	rep *Entity // the first item of the run — what a listing line names
+	n   int     // how many identical items merged (>= 1)
+}
+
+// coalesceItems GROUPS identical discrete items (Track 1). The group key is the prototype PLUS the
+// per-instance DELTA (bound state + rolled quality, via dumpItemDelta), so a bound or quality-varied item
+// never merges with a plain one (docs/REMAINING.md). Materials (Stack items, which already carry their own
+// count) and containers (chests/corpses, whose hidden contents differ) are NEVER grouped — each gets its own
+// group of one. Groups come back in first-appearance order.
+//
+// This is THE coalescing rule; every ground/inventory/container listing and the room display template's
+// coalesced accessor go through it, so they can never drift apart.
+func coalesceItems(items []*Entity) []itemGroup {
 	order := make([]string, 0, len(items))
-	groups := map[string]*grp{}
+	groups := map[string]*itemGroup{}
 	uniq := 0
 	for _, it := range items {
 		// The delta key is STABLE because dumpItemDelta serializes via encoding/json, which sorts map keys —
@@ -268,21 +292,42 @@ func coalesceItemLines(items []*Entity, render func(*Entity) string) []string {
 		}
 		g := groups[key]
 		if g == nil {
-			g = &grp{line: capitalizeFirst(render(it))}
+			g = &itemGroup{rep: it}
 			groups[key] = g
 			order = append(order, key)
 		}
 		g.n++
 	}
-	out := make([]string, 0, len(order))
+	out := make([]itemGroup, 0, len(order))
 	for _, key := range order {
-		if g := groups[key]; g.n > 1 {
-			out = append(out, g.line+" ("+strconv.Itoa(g.n)+")")
-		} else {
-			out = append(out, groups[key].line)
-		}
+		out = append(out, *groups[key])
 	}
 	return out
+}
+
+// coalesceItemLines renders a list of items as listing lines, GROUPING identical discrete items into ONE line
+// with a " (N)" count (Track 1) via coalesceItems. `render` maps an item to its base line — `(*Entity).Name`
+// for inventory/container listings, the ground long for lookRoom — and each line is presentation-capped
+// (capitalizeFirst). First-appearance order; a single item is uncounted.
+func coalesceItemLines(items []*Entity, render func(*Entity) string) []string {
+	groups := coalesceItems(items)
+	out := make([]string, 0, len(groups))
+	for _, g := range groups {
+		line := capitalizeFirst(render(g.rep))
+		if g.n > 1 {
+			line += " (" + strconv.Itoa(g.n) + ")"
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// isCreature reports whether e is a LIVING thing — a mob (a Living) or a player (PlayerControlled) — as
+// opposed to a ground item / corpse / container. It is the one predicate that splits a room's contents into
+// the two listings `look` renders (occupants vs coalesced ground items), shared with the room display
+// template's self:room():occupants() / :room_items() accessors so the split can never drift.
+func isCreature(e *Entity) bool {
+	return e != nil && (e.living != nil || Has[*PlayerControlled](e))
 }
 
 // colorize wraps s in an engine color token + reset (the internal/telnet/color.go `{{TOKEN}}` vocabulary),
@@ -298,22 +343,32 @@ func colorize(s, token string) string { return "{{" + token + "}}" + s + "{{RESE
 func (z *Zone) lookRoom(s *session) {
 	e := s.entity
 	r := e.location // the room entity
-	room := r.room  // its Room component (direct-pointer hot path, MUDLIB §3)
 
 	// Room darkness (#99): a viewer in an unlit dark room sees nothing — not the name, desc, exits, or any
 	// occupant. Short-circuit to the pitch-black notice before rendering anything. The occupant loop below
 	// already drops individually-concealed occupants via canSee; this handles the room-wide case in one place
 	// (and is what carrying/dropping a light source toggles). GMCP Room.Info is still emitted so a rich
 	// client's minimap tracks position even when the player can't read the room.
+	//
+	// This gate sits ABOVE the content template on purpose: darkness is an ENGINE visibility rule, so no pack
+	// can template its way around the pitch-black room. (Per-occupant concealment is enforced a second time,
+	// independently, inside self:room():occupants() — a template never receives a hidden occupant to render.)
 	if !canSeeRoomContents(e) {
 		s.send(textFrame("It is pitch black — you can see nothing."))
-		if rm := z.roomInfoJSON(r); !bytes.Equal(rm, s.lastRoom) {
-			s.lastRoom = rm
-			s.send(gmcpFrame("Room.Info", rm))
-		}
+		z.emitRoomInfo(s, r)
 		return
 	}
 
+	// Content may template the room sheet (a `render(self)` body reading self:room():exits()/:occupants()/
+	// :room_items()); absent one, fall through to the built-in description below. Same render+fallback shape
+	// as score/inventory/equipment — a broken template fails closed to the built-in, so `look` always works.
+	if sheet, ok := z.renderDisplaySheet("room", e); ok {
+		s.send(textFrame(sheet))
+		z.emitRoomInfo(s, r)
+		return
+	}
+
+	room := r.room // its Room component (direct-pointer hot path, MUDLIB §3)
 	var b strings.Builder
 	b.WriteString(r.Name())
 	b.WriteByte('\n')
@@ -342,10 +397,10 @@ func (z *Zone) lookRoom(s *session) {
 		// Route presence/name disclosure through the canSee chokepoint (#28): an occupant the viewer
 		// can't perceive (invisible, no detect) is OMITTED from the room listing entirely — a builder
 		// with holylight still sees it. Ground items always show (they carry no viewer concealment).
-		if (occ.living != nil || Has[*PlayerControlled](occ)) && !z.canSee(e, occ) {
+		if isCreature(occ) && !z.canSee(e, occ) {
 			continue
 		}
-		if occ.living == nil && !Has[*PlayerControlled](occ) {
+		if !isCreature(occ) {
 			groundItems = append(groundItems, occ) // a dropped item / corpse — coalesced after the creatures
 			continue
 		}
@@ -371,11 +426,16 @@ func (z *Zone) lookRoom(s *session) {
 		b.WriteString(line)
 	}
 	s.send(textFrame(b.String()))
+	z.emitRoomInfo(s, r)
+}
 
-	// GMCP Room.Info (Phase 9.3): emit the structured room data alongside the look text so a rich
-	// client can update its minimap. Change-detected — re-looking the SAME room doesn't re-emit; only a
-	// room CHANGE (movement) does. lookRoom is the single entry/look chokepoint, so this covers arrival,
-	// join/attach, and an explicit look.
+// emitRoomInfo emits GMCP Room.Info (Phase 9.3) for room r: the structured room data alongside the look text
+// so a rich client can update its minimap. Change-detected — re-looking the SAME room doesn't re-emit; only a
+// room CHANGE (movement) does. lookRoom is the single entry/look chokepoint, so this covers arrival,
+// join/attach, and an explicit look, on ALL THREE of its render paths (pitch-black, content template, and the
+// built-in description) — the minimap must track position even when the player can't read the room.
+// Single-writer: zone goroutine (it writes s.lastRoom).
+func (z *Zone) emitRoomInfo(s *session, r *Entity) {
 	if rm := z.roomInfoJSON(r); !bytes.Equal(rm, s.lastRoom) {
 		s.lastRoom = rm
 		s.send(gmcpFrame("Room.Info", rm))
@@ -530,9 +590,60 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 }
 
 // who lists every player currently online in the zone (the zone-local fallback when presence is
-// disabled / a roster read failed). Sends the whoLocal() render to s.
+// disabled / a roster read failed). Sends the whoLocalSheet() render to s.
 func (z *Zone) who(s *session) {
-	s.send(textFrame(z.whoLocal(s.entity)))
+	s.send(textFrame(z.whoLocalSheet(s.entity)))
+}
+
+// whoLocalSheet renders the ZONE-LOCAL who list — through the pack's `who` display template if it defines
+// one, else the built-in whoLocal listing. The template sees the same (self, list) binding as the cross-shard
+// path (#24), so a player's `who` looks the SAME whether the shard reads the presence roster or has degraded
+// to the local list; only the row SET differs. Runs on the zone goroutine (it walks z.players and enters the
+// zone-owned Lua VM), which is where both callers live: cmdWho's presence-disabled branch and the
+// whoFallbackMsg inbox handler.
+//
+// SECURITY: rows are pre-filtered by the canSee chokepoint (whoLocalRecords), exactly like whoLocal — a
+// concealed player never becomes a record, so no template can disclose one.
+func (z *Zone) whoLocalSheet(viewer *Entity) string {
+	if sheet, ok := z.renderDisplayList("who", viewer, z.whoLocalRecords(viewer)); ok {
+		return sheet
+	}
+	return z.whoLocal(viewer)
+}
+
+// whoLocalRecords snapshots this zone's visible players as plain-data `who` rows, in the same shape the
+// cross-shard roster produces (renderWhoSheet): {name, shard, afk, concealed}. The visibility rule is
+// whoLocal's — the viewer always sees themselves, everyone else must pass canSee. Sorted by name so the
+// local and cross-shard lists order identically.
+func (z *Zone) whoLocalRecords(viewer *Entity) []*displayRecord {
+	// shardID is write-once at WithPresence (before any zone goroutine runs), so this is a safe lock-free read.
+	shardID := ""
+	if z.shard != nil && z.shard.presence != nil {
+		shardID = z.shard.presence.shardID
+	}
+	// A slice, not a name-keyed map: two sessions must never collapse into one row just because they render
+	// the same display name (whoLocal lists one line per SESSION).
+	type row struct {
+		name string
+		afk  bool
+	}
+	rows := make([]row, 0, len(z.players))
+	for _, o := range z.players {
+		if o.entity != viewer && !z.canSee(viewer, o.entity) {
+			continue // THE chokepoint (#28): concealed players never become a record
+		}
+		rows = append(rows, row{name: o.entity.Name(), afk: playerAFK(o)})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
+	out := make([]*displayRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, newDisplayRecord().
+			str("name", r.name).
+			str("shard", shardID).
+			boolean("afk", r.afk).
+			boolean("concealed", false)) // a concealed player was filtered out above
+	}
+	return out
 }
 
 // whoLocal builds the zone-local "Players online:" list (this zone's players only), as seen BY viewer. It
