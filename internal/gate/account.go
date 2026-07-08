@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
+	"github.com/double-nibble/telosmud/internal/callerauth"
 	"github.com/double-nibble/telosmud/internal/telnet"
 )
 
@@ -129,9 +130,17 @@ type grpcAccountClient struct {
 
 // DialAccount opens a gRPC client to telos-account at target. The in-cluster hop is insecure transport — the
 // world's trust comes from the signed session assertion (Phase 14.3), not this link; a cluster mTLS posture
-// is a deployment concern, not the gate's.
-func DialAccount(target string) (AccountClient, error) {
-	cc, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+// is a deployment concern, not the gate's. callerToken (#247) authenticates the gate to the account service
+// as an authorized caller: it rides every RPC as per-RPC credentials so the account listener can refuse any
+// UNtrusted principal. An empty token sends nothing (dev / no-auth); telos-account then runs tokenless only in
+// dev.
+func DialAccount(target, callerToken string) (AccountClient, error) {
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if callerToken != "" {
+		// PerRPCCredentials over insecure transport requires the creds to opt in (RequireTransportSecurity=false).
+		opts = append(opts, grpc.WithPerRPCCredentials(callerauth.Credentials{Token: callerToken}))
+	}
+	cc, err := grpc.NewClient(target, opts...)
 	if err != nil {
 		return nil, err
 	}
