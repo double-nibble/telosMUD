@@ -175,7 +175,7 @@ func (d *Director) handleSignal(ctx context.Context, m signalMsg) {
 	// install a published version. Director-owned (not the content SignalHandler): the actual git+PG work
 	// runs OFF this actor goroutine, leader-only, single-flight.
 	if m.event == contentbus.PullRequestEvent {
-		if !d.handlePullRequest(m.payload, m.source) {
+		if !d.handlePullRequest(ctx, m.payload, m.source) {
 			// Not leader: NAK so the durable stream redelivers this request to the live leader, and do NOT
 			// advance the high-water below — the request is unhandled here, not applied-once.
 			m.ack <- false
@@ -212,6 +212,10 @@ func (d *Director) recordReloadAudit(payload json.RawMessage, source string) {
 // single-flight slot forever.
 var directorPullTimeout = 5 * time.Minute
 
+// pullResultBroadcastTimeout bounds the transient result down-broadcast (#230). Short: it is a fast local
+// publish, and it derives from the run ctx so a pull TIMEOUT does not also suppress the failure notice.
+var pullResultBroadcastTimeout = 5 * time.Second
+
 // handlePullRequest runs a coordinated content pull (#212 slice 4 PR E) for a `pull <version>` request.
 // It gates on leadership, parses, and single-flights on the ACTOR goroutine (cheap, non-racing), then hands
 // the heavy git+Postgres work to a WORKER goroutine so the director's ticks/signals are never stalled.
@@ -223,23 +227,27 @@ var directorPullTimeout = 5 * time.Minute
 // HERE on the actor goroutine, BEFORE the ack: a consume-then-demote handoff (a message queued while
 // leader, drained after the lease was lost) must requeue the request for the newly-promoted leader, not
 // ack-and-drop it. Only the heavy git+Postgres work is offloaded to a worker goroutine.
-func (d *Director) handlePullRequest(payload json.RawMessage, source string) (ack bool) {
+func (d *Director) handlePullRequest(ctx context.Context, payload json.RawMessage, source string) (ack bool) {
 	if d.puller == nil {
 		return true // no puller wired (a state-only / region director) — drop-and-ack; coordinated pulls disabled
 	}
 	if !d.leader.Load() {
 		// A standby must not import. NAK so the durable stream redelivers to the newly-promoted leader,
-		// rather than the request being consumed here and silently lost on a failover boundary.
+		// rather than the request being consumed here and silently lost on a failover boundary. No result
+		// is broadcast: the promoted leader owns the request now and will report its outcome.
 		d.log.Info("director: not leader; requeueing coordinated pull for the live leader", "source", source)
 		return false
 	}
 	var req contentbus.PullRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
+		// A bad payload never parses on redelivery — drop-and-ack. The actor is unknown (unparseable), so
+		// there is no one to notify; log only.
 		d.log.Warn("director: malformed pull request; dropped", "err", err, "source", source)
-		return true // a bad payload never parses on redelivery — drop-and-ack
+		return true
 	}
 	if req.Version == "" {
 		d.log.Warn("director: pull request with empty version; dropped", "source", source)
+		d.broadcastPullResult(ctx, req.Version, req.Actor, false, "no version specified")
 		return true
 	}
 	// Single-flight: drop a second request while one pull is in flight (the builder can re-run once it
@@ -247,26 +255,52 @@ func (d *Director) handlePullRequest(payload json.RawMessage, source string) (ac
 	if !d.pulling.CompareAndSwap(false, true) {
 		d.log.Warn("director: pull request dropped — a coordinated pull is already in progress",
 			"version", req.Version, "actor", req.Actor)
+		d.broadcastPullResult(ctx, req.Version, req.Actor, false, "a coordinated pull is already in progress — try again once it finishes")
 		return true
 	}
-	// Hand the heavy work to a worker so the director loop is never stalled for the up-to-5-min pull.
-	// Leadership can flip DURING the pull (a lease expiry mid-clone); the worker does NOT re-check, relying
-	// instead on the two import backstops — the content_version row SELECT ... FOR UPDATE + SHA-idempotency
-	// (store.ImportVersion) and the monotonic, sentinel-gated appliedContentVersion on shards — so a demoted
-	// director racing the promoted one converges to a single effect (decision E: transient dual-writer, safe
-	// by construction rather than by leader-exclusivity).
+	// Hand the heavy work to a worker so the director loop is never stalled for the up-to-5-min pull. The
+	// worker's ctx derives from Run's ctx (#230) so a director shutdown / loop exit cancels an in-flight
+	// clone+import promptly, and d.workers.Wait() bounds shutdown on it. Leadership can flip DURING the pull
+	// (a lease expiry mid-clone); the worker does NOT re-check, relying instead on the two import backstops —
+	// the content_version row SELECT ... FOR UPDATE + SHA-idempotency (store.ImportVersion) and the monotonic,
+	// sentinel-gated appliedContentVersion on shards — so a demoted director racing the promoted one converges
+	// to a single effect (decision E: transient dual-writer, safe by construction, not leader-exclusivity).
+	d.workers.Add(1)
 	go func() {
+		defer d.workers.Done()
 		defer d.pulling.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), directorPullTimeout)
+		pullCtx, cancel := context.WithTimeout(ctx, directorPullTimeout)
 		defer cancel()
 		d.log.Info("director: coordinated pull starting", "version", req.Version, "actor", req.Actor, "shard", source)
-		if err := d.puller.Pull(ctx, req.Version, req.Actor); err != nil {
+		if err := d.puller.Pull(pullCtx, req.Version, req.Actor); err != nil {
 			d.log.Warn("director: coordinated pull failed", "version", req.Version, "actor", req.Actor, "err", err)
+			d.broadcastPullResult(ctx, req.Version, req.Actor, false, err.Error())
 			return
 		}
 		d.log.Info("director: coordinated pull complete", "version", req.Version, "actor", req.Actor)
+		d.broadcastPullResult(ctx, req.Version, req.Actor, true, "")
 	}()
 	return true
+}
+
+// broadcastPullResult tells the fleet how a coordinated pull settled (#230), so the shard hosting the
+// requesting builder can surface pass/fail. Transient world-scope down-broadcast (best-effort — a lost
+// notice is not a correctness problem, the import already committed or didn't). A blank actor has no one
+// to notify, so it is a no-op. Uses a SHORT ctx derived from parent so a pull-timeout does not also
+// suppress the failure notice, while a director shutdown (parent cancelled) does. Safe from the worker
+// goroutine: broadcastDown is a fire-and-forget transient publish that touches no actor-only state.
+func (d *Director) broadcastPullResult(parent context.Context, version, actor string, ok bool, detail string) {
+	if actor == "" {
+		return
+	}
+	payload, err := json.Marshal(contentbus.PullResult{Version: version, Actor: actor, OK: ok, Detail: detail})
+	if err != nil {
+		d.log.Warn("director: could not marshal pull result", "err", err, "actor", actor)
+		return
+	}
+	bctx, cancel := context.WithTimeout(parent, pullResultBroadcastTimeout)
+	defer cancel()
+	d.broadcastDown(bctx, contentbus.PullResultEvent, payload)
 }
 
 // broadcastStateDown publishes a state delta DOWN on this director's scope (the EventStateSet contract the

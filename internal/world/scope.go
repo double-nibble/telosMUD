@@ -3,11 +3,13 @@ package world
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/contentbus"
 	"github.com/double-nibble/telosmud/internal/scopebus"
 )
 
@@ -249,17 +251,52 @@ func (sr *scopeReplication) regionForZone(zoneID string) string {
 // zones' on_world/on_region Lua handlers.
 func (sr *scopeReplication) onScopeEvent(kind, regionID, event string, payload json.RawMessage) {
 	var m msg
-	if event == scopebus.EventStateSet {
+	switch event {
+	case scopebus.EventStateSet:
 		var p scopebus.StatePayload
 		if err := json.Unmarshal(payload, &p); err != nil || p.Key == "" {
 			sr.log.Debug("dropping malformed scope state delta", "kind", kind, "event", event)
 			return
 		}
 		m = scopeDeltaMsg{kind: kind, key: p.Key, value: p.Value}
-	} else {
+	case contentbus.PullResultEvent:
+		// Operator feedback for a coordinated pull (#230): NOT a Lua on_world effect — the shard consumes
+		// it to tell the requesting builder how their `pull` settled, then stops (no on_world fan-out).
+		sr.deliverPullResult(payload)
+		return
+	default:
 		m = scopeEventMsg{kind: kind, event: event, payload: payload}
 	}
 	sr.postToScopeZones(kind, regionID, m)
+}
+
+// deliverPullResult fans a director's pull-outcome broadcast (#230) to hosted zones as a pullResultMsg;
+// the zone that still hosts the requesting builder shows them the pass/fail line, every other zone no-ops.
+// A malformed payload or a blank actor is dropped (nothing to deliver). Runs off the zone goroutine — it
+// only POSTS, matching the golden rule.
+func (sr *scopeReplication) deliverPullResult(payload json.RawMessage) {
+	var r contentbus.PullResult
+	if err := json.Unmarshal(payload, &r); err != nil || r.Actor == "" {
+		sr.log.Debug("dropping malformed pull result", "event", contentbus.PullResultEvent)
+		return
+	}
+	var summary string
+	switch {
+	case r.OK:
+		summary = fmt.Sprintf("pull: content version %q installed and hot-reloaded across the fleet.", r.Version)
+	case r.Version == "":
+		summary = fmt.Sprintf("pull: request rejected — %s", r.Detail)
+	default:
+		summary = fmt.Sprintf("pull: content version %q was not installed — %s", r.Version, r.Detail)
+	}
+	// A pull result is always a WORLD-scope broadcast (the world director owns pulls), so it fans to every
+	// hosted zone; the one hosting the builder delivers. postOrDrop (not the blocking z.post the state/effect
+	// fan-out uses) keeps this best-effort operator notice from ever stalling the bus goroutine on a full
+	// zone inbox — a dropped notice is acceptable (the reload readout it mirrors is best-effort too).
+	m := pullResultMsg{player: r.Actor, summary: summary}
+	for _, z := range sr.shard.zonesList() {
+		z.postOrDrop(m)
+	}
 }
 
 // postToScopeZones posts m to every zone the scope addresses: a world scope to all hosted zones, a region

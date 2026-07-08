@@ -57,6 +57,6 @@ func cmdPull(c *Context) error {
 		event:   contentbus.PullRequestEvent,
 		payload: payload,
 	})
-	c.Send(fmt.Sprintf("pull: requested content version %q — the director will validate, import, and hot-reload the fleet.", version))
+	c.Send(fmt.Sprintf("pull: requested content version %q — the director will validate, import, and hot-reload the fleet; you'll get a pass/fail notice here when it settles.", version))
 	return nil
 }
