@@ -219,6 +219,12 @@ func mustReg(t *testing.T, err error) {
 
 func serveShard(t *testing.T, shard *Shard, lis *bufconn.Listener) playv1.PlayClient {
 	t.Helper()
+	// These cross-shard test rigs run KEYLESS (no handoff keypair). Since #260 a keyless shard refuses inbound
+	// handoffs by default, so mark the served shard as an explicit insecure rig — the test-harness equivalent
+	// of TELOS_ALLOW_INSECURE — so a real gRPC Prepare/AdoptZone across bufconn still exercises the handoff
+	// path. Keyed rigs (WithHandoffKeys) ignore the flag. The keyless-REFUSE behavior itself is asserted in
+	// handoffsig_test.go without this helper.
+	shard.allowInsecureHandoff = true
 	gs := grpc.NewServer()
 	shard.Register(gs)
 	go func() { _ = gs.Serve(lis) }()

@@ -24,11 +24,16 @@ RUN go mod download
 COPY . .
 COPY --from=proto /work/api/gen ./api/gen
 ARG SERVICE
-# TARGETOS/TARGETARCH are provided by buildx from the requested --platform.
+# BUILD_TAGS selects optional build tags. The default (empty) build is the RELEASE build: the
+# TELOS_DEV_AUTOAUTH OAuth bypass is compiled OUT of telos-gate (#96). The dev/smoke/e2e stack sets
+# BUILD_TAGS=telos_devauth on the gate service (deploy/docker-compose.yml) so its headless bare-name login
+# works; a production image builds with no tags and cannot enable the bypass by any env/config.
+ARG BUILD_TAGS=""
+# TARGETOS/TARGETARCH are provided by buildx from the requested --platform (#263 multi-arch cross-compile).
 ARG TARGETOS
 ARG TARGETARCH
 RUN test -n "$SERVICE" && GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
+    go build -trimpath -tags "${BUILD_TAGS}" -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
 
 # Minimal, non-root runtime. The binary is static (CGO disabled).
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime

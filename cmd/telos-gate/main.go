@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -35,6 +36,26 @@ import (
 	"github.com/double-nibble/telosmud/internal/gate"
 	"github.com/double-nibble/telosmud/internal/obs"
 )
+
+// accountAuthGate is the FAIL-CLOSED boot decision for OAuth enforcement (#96, security-review finding 1): a
+// gate with NO account service configured (empty TELOS_ACCOUNT_TARGET) falls back to the bare-name login with
+// no OAuth — a passwordless bypass just as complete as the (now compiled-out) TELOS_DEV_AUTOAUTH path. In a
+// release build that must not happen by an accidental missing config, so refuse to boot unless
+// TELOS_ALLOW_INSECURE explicitly opts in (a no-account dev/test gate). It mirrors the handoff/caller-token/
+// pack-set gates' posture. Factored out so the decision is unit-testable. Returns fatal when account-less and
+// not opted in; a warn when running open under the explicit opt-in; both empty when an account is wired.
+func accountAuthGate(accountTarget string, allowInsecure bool) (warn string, fatal error) {
+	if accountTarget != "" {
+		return "", nil
+	}
+	if !allowInsecure {
+		return "", errors.New("no account service configured (TELOS_ACCOUNT_TARGET) — the gate would accept the " +
+			"UNAUTHENTICATED bare-name login (no OAuth), a passwordless bypass; set an account target, or " +
+			"TELOS_ALLOW_INSECURE=1 on a trusted dev rig")
+	}
+	return "no account service (TELOS_ALLOW_INSECURE): the gate accepts the bare-name login with NO OAuth — " +
+		"anyone who can reach it may log in as any character name", nil
+}
 
 func main() {
 	cfg, err := config.Load(config.PathFromEnv())
@@ -91,6 +112,16 @@ func main() {
 
 	srv.WithWriteTimeout(cfg.GateWriteTimeout) // Phase 16.3: bound writes so a wedged client is reclaimed
 	srv.WithCommsExpected(cfg.NATS.URL != "")  // #61: warn players when a CONFIGURED comms bus is down
+	// #96 (security review): a gate with no account service accepts the bare-name login with NO OAuth. Refuse
+	// to boot in that state unless TELOS_ALLOW_INSECURE explicitly opts in, so a production release can't be
+	// silently downgraded to passwordless login by a missing TELOS_ACCOUNT_TARGET — the same fail-closed
+	// posture as the handoff / caller-token / pack-set gates.
+	if warn, fatal := accountAuthGate(cfg.AccountTarget, cfg.AllowInsecure); fatal != nil {
+		slog.Error("refusing to start", "err", fatal)
+		os.Exit(1)
+	} else if warn != "" {
+		slog.Warn(warn)
+	}
 	// Wire the real telos-account client when an account service is configured (it drives the browser OAuth
 	// device login); otherwise the gate keeps the bare-name dev stub.
 	if cfg.AccountTarget != "" {

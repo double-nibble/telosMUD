@@ -84,7 +84,7 @@ func main() {
 	// reads the registry, resolves via the shared content.ResolveEnabledPacks, and FAILS CLOSED (ladder marked
 	// unavailable → SetAccountTier refuses) on a real content/registry error rather than silently serving a
 	// possibly-divergent default. A content reload still needs a restart here (#248 tracks closing that window).
-	lc, ladderVersion, ladderOK := loadAccountContent(ctx, pool, cfg.ContentPacks)
+	lc, ladderVersion, ladderOK := loadAccountContent(ctx, pool, cfg.ContentPacks, cfg.AllowInsecure)
 	if ladderOK {
 		// Trust ladder (#27/#29 Slice 0b): SetAccountTier validates + authorizes promotes against it. An empty
 		// content ladder falls back to the built-in player/builder/admin ladder (round-8 authz).
@@ -203,6 +203,21 @@ func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer)
 	})
 }
 
+// packSetGate is the FAIL-CLOSED boot decision for the #259 pack-set divergence check (content.
+// CheckPackSetConsistency): an explicit TELOS_CONTENT_PACKS override that disagrees with the published set is
+// fatal unless TELOS_ALLOW_INSECURE was explicitly set, so a telos-account that would authorize promotes
+// against a different trust ladder than the world applies refuses to boot rather than silently diverge.
+// Mirrors cmd/telos-world's gate. Both empty => consistent (or nothing published to compare).
+func packSetGate(divergErr error, allowInsecure bool) (warn string, fatal error) {
+	if divergErr == nil {
+		return "", nil
+	}
+	if !allowInsecure {
+		return "", divergErr
+	}
+	return "insecure content pack-set (TELOS_ALLOW_INSECURE): " + divergErr.Error(), nil
+}
+
 // callerAuthGate is the FAIL-CLOSED boot decision for the account gRPC caller token (#247), factored out of
 // main so it is unit-testable. It returns a fatal error when the API would be OPEN (no caller token) and the
 // insecure mode was NOT explicitly opted into — so a production deploy that merely forgot the token refuses to
@@ -239,7 +254,7 @@ func callerAuthGate(callerToken string, allowInsecure bool) (warn string, fatal 
 // the service, remains the recovery). "Fail closed" = returns ladderOK=false; the caller then marks the ladder
 // unavailable so SetAccountTier refuses every tier change. lc is always non-nil (an empty LoadedContent on
 // failure) so chargen degrades to unconfigured rather than crashing.
-func loadAccountContent(ctx context.Context, pool *store.Pool, packsOverride []string) (lc *content.LoadedContent, version uint64, ladderOK bool) {
+func loadAccountContent(ctx context.Context, pool *store.Pool, packsOverride []string, allowInsecure bool) (lc *content.LoadedContent, version uint64, ladderOK bool) {
 	const attempts = 3
 	var lastErr error
 	for i := 0; i < attempts; i++ {
@@ -264,6 +279,22 @@ func loadAccountContent(ctx context.Context, pool *store.Pool, packsOverride []s
 			lastErr = verr
 			slog.Warn("content version registry read failed; retrying", "attempt", i+1, "err", verr)
 			continue
+		}
+		// #259: on a FRESH DB (nothing published) an explicit override is the legitimate bootstrap path but
+		// cannot be cross-checked against the world — warn so an operator keeps both processes on the SAME set.
+		if len(packsOverride) > 0 && len(registry.Packs) == 0 {
+			slog.Warn("TELOS_CONTENT_PACKS is set but no content is published yet (empty registry) — the pack-set " +
+				"cross-check (#259) cannot run on a fresh DB; ensure telos-world and telos-account pin the SAME set")
+		}
+		// #259: refuse to boot on a pack-set divergence — an explicit TELOS_CONTENT_PACKS that disagrees with
+		// the published set would make this service authorize promotes against a different trust ladder than
+		// the world applies (builder→admin escalation the same-version #248 guard misses). Fail closed unless
+		// TELOS_ALLOW_INSECURE. Checked here where the authoritative registry is in hand.
+		if warn, fatal := packSetGate(content.CheckPackSetConsistency(packsOverride, registry.Packs), allowInsecure); fatal != nil {
+			slog.Error("refusing to start", "err", fatal)
+			os.Exit(1)
+		} else if warn != "" {
+			slog.Warn(warn)
 		}
 		enabled := content.ResolveEnabledPacks(packsOverride, registry.Packs)
 		loaded, lerr := content.LoadWithCore(ctx, pool, enabled)

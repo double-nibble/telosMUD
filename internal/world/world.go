@@ -99,6 +99,16 @@ type Shard struct {
 	handoffSignKey   ed25519.PrivateKey
 	handoffVerifyKey ed25519.PublicKey
 
+	// allowInsecureHandoff permits this shard to ACCEPT inbound cross-shard handoff RPCs (Prepare/AdoptZone)
+	// while KEYLESS — i.e. without a snapshot signature to verify (#260). It defaults FALSE so a keyless world
+	// REFUSES handoffs (fail-closed): a single-shard deployment never legitimately receives one, and an
+	// unauthenticated Prepare on a reachable keyless world port is a known-prototype item-injection vector
+	// (an econ dupe) independent of the peer/discoverability boot guard CheckHandoffAuth adds. It is set true
+	// ONLY under the explicit TELOS_ALLOW_INSECURE opt-in (cmd wires cfg.AllowInsecure), mirroring
+	// CheckHandoffAuth's posture — a trusted local/dev rig that deliberately runs keyless. A shard WITH a
+	// verify key ignores this flag entirely: it always authenticates by signature.
+	allowInsecureHandoff bool
+
 	// sessionLock is the Phase-14.4 cross-shard single-session lock (sessionlock.Lock): on a fresh login the
 	// stream goroutine ACQUIRES it (takeover) and a renewer heartbeats it; a session displaced by a newer
 	// login (anywhere in the fleet) sees its renew fail and self-kicks. nil => not enforced (no Redis / dev).
@@ -366,6 +376,17 @@ func (s *Shard) WithHandoffKeys(priv ed25519.PrivateKey, pub ed25519.PublicKey) 
 	return s
 }
 
+// WithInsecureHandoff opts a KEYLESS shard into ACCEPTING unauthenticated inbound handoffs (#260). Without it
+// a keyless shard REFUSES Prepare/AdoptZone outright (fail-closed) — the correct posture for a single-shard
+// world, which never receives a handoff, and the block against a forged Prepare on a reachable keyless port.
+// cmd/telos-world sets it from cfg.AllowInsecure (the same explicit opt-in that lets a keyless multi-shard
+// rig boot). A shard WITH a handoff verify key ignores it: signatures are always enforced. Must be called
+// before Run.
+func (s *Shard) WithInsecureHandoff(on bool) *Shard {
+	s.allowInsecureHandoff = on
+	return s
+}
+
 // CheckHandoffAuth is the boot-time guard against a MULTI-SHARD deployment running with UNAUTHENTICATED
 // handoffs (#251). A shard that is DISCOVERABLE in the directory (s.dir != nil) can be named as a handoff
 // DESTINATION by a peer (ShardForZone/EndpointForShard resolve it), so its Handoff.Prepare will accept
@@ -381,9 +402,11 @@ func (s *Shard) WithHandoffKeys(priv ed25519.PrivateKey, pub ed25519.PublicKey) 
 // missing key is fine there (dev/demo/tests). Returns an error; the caller (cmd) turns it into a fatal boot
 // failure in production and a loud warning in dev (mirroring the caller-token posture).
 //
-// NOTE (documented, not closed here): Handoff.Prepare is registered on the world port in EVERY mode, so an
-// attacker with direct network reach to a keyless single-shard port could still forge a Prepare (item dupe) —
-// this guard bounds the legitimate peer path, not the raw port, which rests on the trusted-network boundary.
+// The keyless single-shard RESIDUAL this NOTE used to carry (Handoff.Prepare is registered on the world port
+// in EVERY mode, so an attacker with direct reach to a keyless port could forge a Prepare) is now CLOSED by
+// #260: a keyless shard REFUSES inbound Prepare/AdoptZone at request time unless allowInsecureHandoff is set
+// (WithInsecureHandoff, from cfg.AllowInsecure). This boot guard still bounds the legitimate multi-shard peer
+// path (a discoverable shard MUST be keyed); #260 bounds the raw port when keyless.
 func (s *Shard) CheckHandoffAuth() error {
 	if (s.dir != nil || s.peers != nil) && s.handoffVerifyKey == nil {
 		return fmt.Errorf("world: multi-shard deployment (directory/peer configured) has no handoff verify key; " +

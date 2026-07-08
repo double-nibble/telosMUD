@@ -275,8 +275,10 @@ func (g *grpcAccountClient) Close() error { return g.cc.Close() }
 // name" login so a dev gate with no account service still works. The accountID is "" on the legacy path.
 // Returns ok=false when the connection drops or login aborts.
 func (s *Server) login(ctx context.Context, tc *telnet.Conn, log *slog.Logger, remote string, _ bool) (name, accountID string, ok bool) {
-	// No account service, or the dev/test bypass (TELOS_DEV_AUTOAUTH): the bare name login, no OAuth.
-	if !s.accountConfigured || s.devAutoAuth {
+	// No account service, or the dev/test bypass (TELOS_DEV_AUTOAUTH, dev-tagged builds only — #96): the bare
+	// name login, no OAuth. devAuthActive() is a constant false in a release build, so a production gate with
+	// an account service configured ALWAYS runs the OAuth device flow below, whatever the env says.
+	if !s.accountConfigured || s.devAuthActive() {
 		name, ok = loginByName(tc, log)
 		return name, "", ok
 	}

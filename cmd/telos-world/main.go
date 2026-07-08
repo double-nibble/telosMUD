@@ -56,6 +56,21 @@ func handoffAuthGate(shardErr error, allowInsecure bool) (warn string, fatal err
 	return "insecure handoffs (TELOS_ALLOW_INSECURE): a discoverable shard has no handoff verify key: " + shardErr.Error(), nil
 }
 
+// packSetGate is the FAIL-CLOSED boot decision for the #259 pack-set divergence check (content.
+// CheckPackSetConsistency): an explicit TELOS_CONTENT_PACKS override that disagrees with the published set is
+// fatal unless TELOS_ALLOW_INSECURE was explicitly set, so a misconfigured world that would apply a different
+// trust ladder than telos-account refuses to boot rather than silently diverge. Factored out so the decision
+// is unit-testable. Both empty => the pack set is consistent (or there is nothing published to compare).
+func packSetGate(divergErr error, allowInsecure bool) (warn string, fatal error) {
+	if divergErr == nil {
+		return "", nil
+	}
+	if !allowInsecure {
+		return "", divergErr
+	}
+	return "insecure content pack-set (TELOS_ALLOW_INSECURE): " + divergErr.Error(), nil
+}
+
 func main() {
 	cfg, err := config.Load(config.PathFromEnv())
 	if err != nil {
@@ -281,6 +296,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithComms(comms).
 			WithVerifyKey(verifyKey).
 			WithHandoffKeys(handoffSignKey, handoffVerifyKey).
+			WithInsecureHandoff(cfg.AllowInsecure). // #260: a keyless shard refuses handoffs unless opted in
 			WithScopeBus(scopeBus, lc.Regions).
 			WithMail(mailStore).
 			WithTells(tellJS), nil
@@ -374,6 +390,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithComms(comms).
 		WithVerifyKey(verifyKey).
 		WithHandoffKeys(handoffSignKey, handoffVerifyKey).
+		WithInsecureHandoff(cfg.AllowInsecure).           // #260: a keyless shard refuses handoffs unless opted in
 		WithSessionLock(sessionlock.NewRedis(rdb), 0, 0). // Phase 14.4: cross-shard single-session lock (Redis)
 		WithScopeBus(scopeBus, lc.Regions).
 		WithZoneLeasing(dir, cfg.ShardID, directory.DefaultZoneLease, directory.DefaultZoneLease/3, stop).
@@ -447,6 +464,22 @@ func loadContent(ctx context.Context, cfg config.Config) (*content.LoadedContent
 		bootVersion = info.Version
 	} else {
 		slog.Debug("content version registry unavailable; using configured/default packs", "err", verr)
+	}
+	// #259: on a FRESH DB (nothing published yet) the cross-check has no baseline, so an explicit override is
+	// the legitimate bootstrap path but cannot be verified against telos-account — warn so an operator knows
+	// both processes must pin the SAME set until content is published (security-review residual).
+	if len(cfg.ContentPacks) > 0 && len(registryPacks) == 0 {
+		slog.Warn("TELOS_CONTENT_PACKS is set but no content is published yet (empty registry) — the pack-set " +
+			"cross-check (#259) cannot run on a fresh DB; ensure telos-world and telos-account pin the SAME set")
+	}
+	// #259: refuse to boot on a pack-set divergence — an explicit TELOS_CONTENT_PACKS that disagrees with the
+	// published set would make this world apply a different trust ladder than telos-account (builder→admin
+	// escalation the #248 same-version staleness guard misses). Fail closed unless TELOS_ALLOW_INSECURE.
+	if warn, fatal := packSetGate(content.CheckPackSetConsistency(cfg.ContentPacks, registryPacks), cfg.AllowInsecure); fatal != nil {
+		slog.Error("refusing to start", "err", fatal)
+		os.Exit(1)
+	} else if warn != "" {
+		slog.Warn(warn)
 	}
 	enabledPacks := content.ResolveEnabledPacks(cfg.ContentPacks, registryPacks)
 

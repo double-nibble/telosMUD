@@ -96,7 +96,15 @@ the hot path.
 
 `TELOS_DEV_AUTOAUTH` enables a dev/test bypass (`WithDevAutoAuth`): an account-backed gate accepts
 a bare `name` login instead of the browser OAuth flow, so headless smoke/e2e and local dev work
-without a browser. It is **insecure** and gated behind the env flag — never enabled in production.
+without a browser. It is **insecure** — never enabled in production.
+
+Since #96 the bypass is **compiled out of release builds entirely**, not merely gated by the env flag: the
+code lives behind the `telos_devauth` build tag. A default `go build ./cmd/telos-gate` (and the production
+Docker image, which sets no `BUILD_TAGS`) produces a binary where `TELOS_DEV_AUTOAUTH` is inert — the gate
+logs a warning and keeps enforcing OAuth — so a leaked `.env` or a compromised orchestrator cannot re-enable
+it. The smoke/e2e/botswarm stack builds the gate image with `BUILD_TAGS=telos_devauth`
+(`deploy/docker-compose.yml`); CI exercises both variants (`go test` for release, `-tags telos_devauth` for
+the bypass surface — `make test-devauth`).
 
 ## 8. Builder trust tiers & bootstrap admin
 
@@ -138,8 +146,12 @@ top tier is not a capability superset of everything beneath it would strand acco
 > real content/registry read error `telos-account` **fails closed**: `SetAccountTier` returns `Unavailable` and
 > refuses every tier change (the break-glass CLI still works — it bypasses the service). Two operator caveats:
 > - **`TELOS_CONTENT_PACKS` must be identical on the world and telos-account** (or set on neither). The shared
->   resolver makes the *logic* identical, but this explicit override is read from each process's own env — a
->   mismatch re-opens the divergence. Prefer leaving it unset so both follow the registry.
+>   resolver makes the *logic* identical, but this explicit override is read from each process's own env.
+>   Since #259 this is **enforced at boot, not just advised**: each process cross-checks its own explicit
+>   override against the published set in `content_version` and **refuses to start** (fail closed) if the
+>   override diverges from what was published — value or load order — unless `TELOS_ALLOW_INSECURE=1`. A fresh
+>   DB (nothing published yet) and the no-override case both pass. Prefer leaving it unset so both follow the
+>   registry.
 > - A content **reload** still needs a telos-account restart to take effect (the ladder is boot-pinned, #248).
 >
 > The account gRPC listener requires a shared **caller token** (`TELOS_ACCOUNT_CALLER_TOKEN`), sent by the gate,
