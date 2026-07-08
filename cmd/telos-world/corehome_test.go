@@ -4,30 +4,12 @@ import (
 	"context"
 	"testing"
 
-	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
 )
 
 // #212 slice 1: the shard-hosting helpers that make the embedded core pack the login fallback.
-
-func TestResolveEnabledPacks(t *testing.T) {
-	// Fresh DB (empty registry), no config => the demo default.
-	if got := resolveEnabledPacks(config.Config{}, nil); len(got) != 1 || got[0] != content.DemoPack {
-		t.Fatalf("default enabled packs = %v, want [demo]", got)
-	}
-	// Registry populated (a version was pulled), no config override => manifest-driven (the registry).
-	got := resolveEnabledPacks(config.Config{}, []string{"mainland", "underdark"})
-	if len(got) != 2 || got[0] != "mainland" || got[1] != "underdark" {
-		t.Fatalf("manifest-driven packs = %v, want [mainland underdark]", got)
-	}
-	// Explicit override wins over the registry.
-	var cfg config.Config
-	cfg.ContentPacks = []string{"pinned"}
-	got = resolveEnabledPacks(cfg, []string{"mainland", "underdark"})
-	if len(got) != 1 || got[0] != "pinned" {
-		t.Fatalf("override should win: got %v, want [pinned]", got)
-	}
-}
+// (The enabled-pack precedence itself moved to content.ResolveEnabledPacks in #246 so telos-account shares
+// it; it is tested in internal/content/packselect_test.go.)
 
 func TestWithCoreZone(t *testing.T) {
 	got := withCoreZone([]string{"midgaard", "darkwood"})

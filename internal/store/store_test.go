@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"sync"
@@ -855,4 +856,38 @@ func containsAll(xs []string, want ...string) bool {
 		}
 	}
 	return true
+}
+
+// TestCurrentContentVersionNoRow (gated, #246) pins the ErrNoContentVersion sentinel: a database with NO
+// content_version row (a truly fresh/uninitialized state) returns the sentinel — distinct from a real read
+// error — so telos-account can bootstrap on the demo default there yet still fail closed on a genuine error.
+// Gated store tests run serially, and the singleton is restored under defer, so deleting it here is safe.
+func TestCurrentContentVersionNoRow(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	// A migrated DB seeds content_version id=1 (version 0): the normal path returns no error.
+	if _, err := p.CurrentContentVersion(ctx); err != nil {
+		t.Fatalf("a migrated DB has the seeded singleton, want no error, got %v", err)
+	}
+
+	// Snapshot then delete the singleton to exercise the no-row path; restore it afterward for sibling tests.
+	var saved int64
+	if err := p.pool.QueryRow(ctx, `SELECT version FROM content_version WHERE id = 1`).Scan(&saved); err != nil {
+		t.Fatalf("read seeded version: %v", err)
+	}
+	if _, err := p.pool.Exec(ctx, `DELETE FROM content_version WHERE id = 1`); err != nil {
+		t.Fatalf("delete singleton: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `INSERT INTO content_version (id, version) VALUES (1, $1)
+			ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version`, saved)
+	})
+
+	// With no row, the read returns the SENTINEL (not a generic wrapped error), so a caller can tell
+	// "fresh DB, demo is correct" from a real failure.
+	_, err := p.CurrentContentVersion(ctx)
+	if !errors.Is(err, ErrNoContentVersion) {
+		t.Fatalf("no content_version row must return ErrNoContentVersion, got %v", err)
+	}
 }

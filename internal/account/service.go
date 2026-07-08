@@ -80,6 +80,26 @@ type Service struct {
 	// WithTrustLadder; trustLadder() substitutes the default ladder (player/builder/admin) so a service
 	// built without content authorizes promotes exactly as round-8 did.
 	trustTiers *content.TrustLadder
+
+	// ladderUnavailable is set when the process could NOT load the authoritative content ladder (#246): the
+	// pack read errored, so the ladder this service would authorize against might DIVERGE from the one the
+	// world applies as flags. SetAccountTier then FAILS CLOSED — refusing every tier change — rather than
+	// silently authorizing against a possibly-wrong default ladder (which could let a promote through that the
+	// world then applies as a richer flag set). Read-only after construction. The read PATHS (login tier
+	// lookup, assertions) are unaffected; only the WRITE authority is gated, because only it depends on the
+	// ladder matching the world's.
+	ladderUnavailable bool
+
+	// ladderContentVersion / liveContentVersion implement the STALENESS guard (#248): the trust ladder is
+	// pinned at boot, but the world hot-reloads content, so a reload that changes a tier's flag set opens a
+	// window where this service authorizes against a stale ladder while the world applies the fresh flags.
+	// ladderContentVersion is the content_version the ladder was loaded at; liveContentVersion reads the
+	// current one (injected so it is testable without a real store). On each SetAccountTier, if the live
+	// version is AHEAD of the loaded one, the ladder is stale and the write FAILS CLOSED until telos-account
+	// is restarted. nil liveContentVersion disables the guard (a service built without content-version wiring,
+	// e.g. tests) — the #246 boot-time consistency still holds; this only adds mid-lifetime protection.
+	ladderContentVersion uint64
+	liveContentVersion   func(context.Context) (uint64, error)
 }
 
 // defaultMaxCharacters is the per-account character cap when none is configured.
@@ -126,9 +146,29 @@ func (s *Service) ChargenFlow() (content.ChargenDTO, []content.ChargenBundleOpti
 
 // WithTrustLadder wires the content-defined trust ladder (#27/#29 Slice 0b): SetAccountTier validates the
 // requested tier + authorizes the actor against it. An empty/absent ladder falls back to the built-in
-// player/builder/admin ladder, preserving round-8 promote authz.
+// player/builder/admin ladder, preserving round-8 promote authz. Wiring a ladder marks it AVAILABLE (a prior
+// WithTrustLadderUnavailable is cleared) — a successful content load, even one with no trust_tiers, is trusted.
 func (s *Service) WithTrustLadder(tiers []content.TrustTierDTO) *Service {
 	s.trustTiers = content.NewTrustLadder(tiers)
+	s.ladderUnavailable = false
+	return s
+}
+
+// WithContentVersionGuard wires the #248 staleness guard: atLoad is the content_version the ladder was loaded
+// at, and live reads the current version. SetAccountTier then refuses when live > atLoad (the ladder is stale
+// relative to a content reload). A nil live disables the guard.
+func (s *Service) WithContentVersionGuard(atLoad uint64, live func(context.Context) (uint64, error)) *Service {
+	s.ladderContentVersion = atLoad
+	s.liveContentVersion = live
+	return s
+}
+
+// WithTrustLadderUnavailable marks the trust ladder as NOT loaded (#246): the process could not read the
+// authoritative content, so SetAccountTier must fail closed rather than authorize against a possibly-divergent
+// default. Called by telos-account main on a content-load error, INSTEAD of silently falling back to the
+// default ladder. Only the tier-WRITE authority is gated; login tier reads + assertions still work.
+func (s *Service) WithTrustLadderUnavailable() *Service {
+	s.ladderUnavailable = true
 	return s
 }
 
@@ -377,6 +417,32 @@ func (s *Service) IssueSessionAssertion(ctx context.Context, req *accountv1.Issu
 func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountTierRequest) (*accountv1.SetAccountTierResponse, error) {
 	if req.GetActorAccountId() == "" || req.GetTargetCharacter() == "" {
 		return nil, status.Error(codes.InvalidArgument, "actor_account_id and target_character required")
+	}
+	// FAIL CLOSED when the authoritative content ladder could not be loaded (#246): authorizing against a
+	// possibly-divergent default ladder could pass a promote the world then applies as a richer flag set.
+	// Refused as Unavailable (a transient/config condition the operator fixes), not a user error.
+	if s.ladderUnavailable {
+		s.log.Error("SetAccountTier refused: trust ladder unavailable (content did not load); refusing all tier changes",
+			"actor", req.GetActorAccountId())
+		return nil, status.Error(codes.Unavailable, "trust ladder unavailable")
+	}
+	// STALENESS guard (#248): the ladder is pinned at boot, but a content reload may have changed a tier's flag
+	// set since. If the live content_version is ahead of the one the ladder was loaded at, this service would
+	// authorize against a stale ladder while the world applies the fresh flags — fail closed until restart. A
+	// version-read error also fails closed (we cannot confirm freshness), consistent with the #246 posture;
+	// promotes are rare + admin-initiated, and the break-glass CLI bypasses this.
+	if s.liveContentVersion != nil {
+		live, err := s.liveContentVersion(ctx)
+		if err != nil {
+			s.log.Error("SetAccountTier refused: cannot read live content version (freshness unverifiable)",
+				"actor", req.GetActorAccountId(), "err", err)
+			return nil, status.Error(codes.Unavailable, "cannot verify content freshness")
+		}
+		if live > s.ladderContentVersion {
+			s.log.Error("SetAccountTier refused: trust ladder is STALE (content reloaded since boot); restart telos-account",
+				"actor", req.GetActorAccountId(), "ladder_version", s.ladderContentVersion, "live_version", live)
+			return nil, status.Error(codes.Unavailable, "trust ladder stale (content reloaded); restart telos-account")
+		}
 	}
 	ladder := s.trustLadder()
 	// AUTHZ FIRST: the actor's current tier must grant the manage-tiers capability, per the authoritative

@@ -114,3 +114,27 @@ func TestEnvOverridesYAML(t *testing.T) {
 		t.Errorf("NATS.URL = %q, want env override", cfg.NATS.URL)
 	}
 }
+
+// TestAllowInsecureDefaultsFalse (#247/#251) pins the fail-closed-by-default posture: AllowInsecure must be
+// FALSE unless TELOS_ALLOW_INSECURE is explicitly set. The security gates key on this, NOT on Env (which
+// defaults to "dev"), so a production deploy that simply forgot the secret refuses to boot rather than
+// silently serving unauthenticated.
+func TestAllowInsecureDefaultsFalse(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AllowInsecure {
+		t.Fatal("AllowInsecure must default to false (absence of config must fail CLOSED)")
+	}
+	for _, v := range []string{"1", "true", "TRUE"} {
+		t.Setenv("TELOS_ALLOW_INSECURE", v)
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.AllowInsecure {
+			t.Fatalf("TELOS_ALLOW_INSECURE=%q must enable the flag", v)
+		}
+	}
+}

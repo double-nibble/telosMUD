@@ -132,10 +132,23 @@ top tier is not a capability superset of everything beneath it would strand acco
 > capability elevates the entire playerbase and is **rejected** (logged at boot, refused at a fleet reload),
 > as are duplicate ranks and nameless rungs.
 
-> **Ladder consistency.** `telos-account` and the world must load the **same** pack set, or a pack-authored
-> ladder can diverge between the authority (which checks the ceilings) and the world (which applies the
-> flags) — see #246. The account gRPC listener also assumes a trusted network: the acting principal is
-> caller-asserted (#247).
+> **Ladder consistency.** `telos-account` and the world resolve their pack set through the **same** resolver
+> (`content.ResolveEnabledPacks` over the `content_pack_registry`), so for a given DB state they load an
+> identical ladder — closing the divergence that let a pack-authored tier escalate builder→admin (#246). On a
+> real content/registry read error `telos-account` **fails closed**: `SetAccountTier` returns `Unavailable` and
+> refuses every tier change (the break-glass CLI still works — it bypasses the service). Two operator caveats:
+> - **`TELOS_CONTENT_PACKS` must be identical on the world and telos-account** (or set on neither). The shared
+>   resolver makes the *logic* identical, but this explicit override is read from each process's own env — a
+>   mismatch re-opens the divergence. Prefer leaving it unset so both follow the registry.
+> - A content **reload** still needs a telos-account restart to take effect (the ladder is boot-pinned, #248).
+>
+> The account gRPC listener requires a shared **caller token** (`TELOS_ACCOUNT_CALLER_TOKEN`), sent by the gate,
+> so only the gate can reach the privileged RPCs; without it anyone who can dial the port could assert any
+> `actor_account_id` or mint an assertion for any account (#247). It **fails closed by default**: telos-account
+> refuses to boot with no token unless `TELOS_ALLOW_INSECURE=1` is explicitly set (a trusted dev rig — the dev
+> `docker-compose` sets it). The insecure allowance is deliberately NOT keyed on `TELOS_ENV` (which defaults to
+> `dev`), so a production deploy that merely forgot the token still refuses to start rather than serving open.
+> The world's keyless-handoff guard (#251) uses the same `TELOS_ALLOW_INSECURE` opt-in.
 
 > **Last-admin lockout recovery (#108).** There is no self/last-admin demote guard, so an admin *can* demote
 > the last admin. Config-pin (`TELOS_BOOTSTRAP_ADMIN`) does **not** recover this — it applies only at account

@@ -80,6 +80,7 @@ services:
     environment:
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
+      TELOS_ALLOW_INSECURE: "1" # Redis-backed single node is discoverable, so keyless handoffs need the dev opt-in (#251)
       TELOS_WORLD_LISTEN: ":9090"
       TELOS_SHARD_ADDR: world:9090
       TELOS_ZONES: midgaard,darkwood,crypt # <-- (home = midgard)

@@ -94,7 +94,9 @@ func main() {
 	// Wire the real telos-account client when an account service is configured (it drives the browser OAuth
 	// device login); otherwise the gate keeps the bare-name dev stub.
 	if cfg.AccountTarget != "" {
-		ac, err := gate.DialAccount(cfg.AccountTarget)
+		// #247: authenticate to telos-account with the shared caller token so the gate's privileged calls are
+		// accepted (and an untrusted caller's are not). Empty in dev (the account service then runs tokenless).
+		ac, err := gate.DialAccount(cfg.AccountTarget, cfg.AccountCallerToken)
 		if err != nil {
 			slog.Error("account dial failed", "target", cfg.AccountTarget, "err", err)
 			os.Exit(1)

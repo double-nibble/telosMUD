@@ -209,10 +209,17 @@ func (p *Pool) ImportVersion(ctx context.Context, packs []content.Pack, meta Ver
 	return uint64(ver), pruned, true, nil //nolint:gosec // G115: ver >= 1 (a positive nanos-scale value), never negative
 }
 
+// ErrNoContentVersion is returned by CurrentContentVersion when the database has no content_version row — a
+// FRESH DB that was never pulled/imported. It is a distinct, EXPECTED bootstrap state, not a read failure, so
+// a caller that must fail closed on a genuine registry-read error (telos-account, #246) can still bootstrap on
+// a fresh DB by treating this sentinel as "use the demo/override default".
+var ErrNoContentVersion = errors.New("store: no content version registered (fresh database)")
+
 // CurrentContentVersion reads the content version this database currently serves (the singleton stamp
 // + the live pack registry set) as ONE consistent snapshot — a single query joining the singleton to
 // the registry, so an import committing mid-read can't return a version stamp that disagrees with the
-// pack set. A fresh database (never imported) returns Version 0 with an empty (non-nil) pack list.
+// pack set. A fresh database (never imported) returns ErrNoContentVersion (NOT a generic error), so a
+// caller can distinguish "fresh DB, demo is correct" from a real read failure.
 func (p *Pool) CurrentContentVersion(ctx context.Context) (ContentVersionInfo, error) {
 	info := ContentVersionInfo{Packs: []string{}}
 	var ver int64
@@ -224,6 +231,13 @@ func (p *Pool) CurrentContentVersion(ctx context.Context) (ContentVersionInfo, e
 		  WHERE cv.id = 1
 		  GROUP BY cv.version, cv.content_sha, cv.manifest_version, cv.content_hash`).
 		Scan(&ver, &info.ContentSHA, &info.ManifestVersion, &info.ContentHash, &info.Packs); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No content_version row: a FRESH DB that was never pulled. This is a normal bootstrap state, NOT a
+			// read failure — the caller uses the demo/override default and should trust it. Distinguished from a
+			// real read error (below) via the ErrNoContentVersion sentinel so a caller (telos-account, #246) can
+			// fail closed on a genuine error while still bootstrapping on a fresh DB.
+			return ContentVersionInfo{Packs: []string{}}, ErrNoContentVersion
+		}
 		return ContentVersionInfo{}, fmt.Errorf("store: read content_version: %w", err)
 	}
 	info.Version = uint64(ver) //nolint:gosec // G115: version >= 0 from a bounded nanos column

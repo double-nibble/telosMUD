@@ -461,3 +461,76 @@ func TestAccountPrefsValidation(t *testing.T) {
 		t.Fatalf("a store write error should surface as Internal, got %v", err)
 	}
 }
+
+// TestSetAccountTierFailsClosedWhenLadderUnavailable (#246): if the process could not load the authoritative
+// content ladder, SetAccountTier must refuse EVERY tier change with Unavailable — never authorize against a
+// possibly-divergent default ladder (which could pass a promote the world then applies as a richer flag set).
+func TestSetAccountTierFailsClosedWhenLadderUnavailable(t *testing.T) {
+	fs := newFakeStore()
+	fs.tiers["acct-admin"] = "admin"
+	fs.tiers["acct-bob"] = "player"
+	fs.charAccount["Bob"] = "acct-bob"
+	svc := newTestService(fs).WithTrustLadderUnavailable()
+
+	// Even a legitimate admin promote is refused — fail closed, no write, and NOT a user-facing ok=false but a
+	// transport Unavailable (the operator must fix the content read).
+	_, err := svc.SetAccountTier(context.Background(), &accountv1.SetAccountTierRequest{
+		ActorAccountId: "acct-admin", TargetCharacter: "Bob", NewTier: "builder",
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("an unavailable ladder must refuse with codes.Unavailable, got %v", err)
+	}
+	if fs.tiers["acct-bob"] != "player" {
+		t.Fatalf("a fail-closed refusal must not write, got %q", fs.tiers["acct-bob"])
+	}
+
+	// Wiring a ladder clears the unavailable flag — a subsequent load makes the service authorize again.
+	svc.WithTrustLadder(nil) // default ladder
+	if resp, err := svc.SetAccountTier(context.Background(), &accountv1.SetAccountTierRequest{
+		ActorAccountId: "acct-admin", TargetCharacter: "Bob", NewTier: "builder",
+	}); err != nil || !resp.GetOk() {
+		t.Fatalf("once the ladder is available the admin promote must succeed, got resp=%+v err=%v", resp, err)
+	}
+}
+
+// TestSetAccountTierStalenessGuard (#248) pins the content-version staleness guard: after a reload bumps the
+// live content version past the version the ladder was loaded at, SetAccountTier fails closed (Unavailable)
+// until restart — it must not authorize against a stale ladder while the world applies the fresh flags.
+func TestSetAccountTierStalenessGuard(t *testing.T) {
+	fs := newFakeStore()
+	fs.tiers["acct-admin"] = "admin"
+	fs.tiers["acct-bob"] = "player"
+	fs.charAccount["Bob"] = "acct-bob"
+	svc := newTestService(fs).WithTrustLadder(nil)
+
+	live := uint64(5) // the current content version, controllable by the test
+	svc.WithContentVersionGuard(5, func(context.Context) (uint64, error) { return live, nil })
+
+	promote := func() error {
+		_, err := svc.SetAccountTier(context.Background(), &accountv1.SetAccountTierRequest{
+			ActorAccountId: "acct-admin", TargetCharacter: "Bob", NewTier: "builder",
+		})
+		return err
+	}
+
+	// In sync (live == loaded): the promote succeeds.
+	if err := promote(); err != nil {
+		t.Fatalf("an in-sync ladder must authorize, got %v", err)
+	}
+	fs.tiers["acct-bob"] = "player" // reset for the next attempt
+
+	// A reload bumps the live version PAST the loaded one: the ladder is stale → fail closed.
+	live = 6
+	if got := status.Code(promote()); got != codes.Unavailable {
+		t.Fatalf("a stale ladder must refuse with Unavailable, got %v", got)
+	}
+	if fs.tiers["acct-bob"] != "player" {
+		t.Fatalf("a stale-ladder refusal must not write, got %q", fs.tiers["acct-bob"])
+	}
+
+	// A version-read error also fails closed (freshness unverifiable).
+	svc.WithContentVersionGuard(5, func(context.Context) (uint64, error) { return 0, errors.New("db blip") })
+	if got := status.Code(promote()); got != codes.Unavailable {
+		t.Fatalf("an unverifiable version must fail closed, got %v", got)
+	}
+}

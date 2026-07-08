@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	accountv1 "github.com/double-nibble/telosmud/api/gen/telosmud/account/v1"
 	"github.com/double-nibble/telosmud/internal/account"
 	"github.com/double-nibble/telosmud/internal/assertion"
+	"github.com/double-nibble/telosmud/internal/callerauth"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/obs"
@@ -75,24 +77,30 @@ func main() {
 
 	svc.WithMaxCharacters(cfg.MaxCharacters)
 
-	// Content (Phase 14.8/15.4 + #27/#29): load the pack once — it feeds BOTH the chargen flow and the trust
-	// ladder (tier validation + promote authz). A content reload needs a restart to take effect here.
-	lc, err := content.Load(ctx, pool, []string{content.DemoPack})
-	if err != nil {
-		slog.Warn("content load failed; using defaults (no chargen flow, built-in trust ladder)", "err", err)
-		lc = &content.LoadedContent{}
+	// Content (Phase 14.8/15.4 + #27/#29 + #246): load the pack set that feeds BOTH the chargen flow and the
+	// trust ladder. telos-account MUST resolve the SAME pack set the world does — the world applies the content
+	// ladder as engine flags while this service authorizes promotes against it, so a divergent pack set would
+	// let a promote through that the world then applies as a richer flag set (builder→admin). loadAccountContent
+	// reads the registry, resolves via the shared content.ResolveEnabledPacks, and FAILS CLOSED (ladder marked
+	// unavailable → SetAccountTier refuses) on a real content/registry error rather than silently serving a
+	// possibly-divergent default. A content reload still needs a restart here (#248 tracks closing that window).
+	lc, ladderVersion, ladderOK := loadAccountContent(ctx, pool, cfg.ContentPacks)
+	if ladderOK {
+		// Trust ladder (#27/#29 Slice 0b): SetAccountTier validates + authorizes promotes against it. An empty
+		// content ladder falls back to the built-in player/builder/admin ladder (round-8 authz).
+		svc.WithTrustLadder(lc.TrustTiers)
+		// Staleness guard (#248): pin the version the ladder was loaded at + a live reader, so SetAccountTier
+		// fails closed if a content reload bumps the version after boot (the ladder here is not hot-reloaded).
+		svc.WithContentVersionGuard(ladderVersion, pool.ContentVersion)
+		slog.Info("content trust ladder loaded", "tiers", len(lc.TrustTiers), "content_version", ladderVersion)
+	} else {
+		svc.WithTrustLadderUnavailable()
 	}
 	if flow, options, ok := chargenFrom(lc); ok {
 		svc.WithChargen(flow, options)
 		slog.Info("chargen flow loaded", "steps", len(flow.Steps), "bundle_options", len(options))
 	} else {
 		slog.Warn("no chargen flow in content: the gate offers no create-character flow")
-	}
-	// Trust ladder (#27/#29 Slice 0b): SetAccountTier validates + authorizes promotes against it. An empty
-	// content ladder falls back to the built-in player/builder/admin ladder (round-8 authz).
-	svc.WithTrustLadder(lc.TrustTiers)
-	if n := len(lc.TrustTiers); n > 0 {
-		slog.Info("content trust ladder loaded", "tiers", n)
 	}
 
 	// Redis backs the Phase-15 device-auth sessions (the terminal OAuth bridge). Without Redis the device
@@ -122,12 +130,27 @@ func main() {
 		slog.Warn("no signing key configured: session assertions disabled (world runs unverified)")
 	}
 
+	// Caller authentication (#247): require the shared caller token on every RPC so only the trusted gate can
+	// reach the privileged API (SetAccountTier's caller-asserted actor; IssueSessionAssertion's signing
+	// oracle). FAIL CLOSED by default — refuse to serve an OPEN listener — unless TELOS_ALLOW_INSECURE was
+	// explicitly set (a trusted dev rig; the interceptor then no-ops and the TELOS_DEV_AUTOAUTH stub path never
+	// dials gRPC anyway). The decision is factored into callerAuthGate so the fail-closed behavior is testable.
+	if warn, fatal := callerAuthGate(cfg.AccountCallerToken, cfg.AllowInsecure); fatal != nil {
+		slog.Error("refusing to start", "err", fatal)
+		os.Exit(1)
+	} else if warn != "" {
+		slog.Warn(warn)
+	}
+
 	lis, err := net.Listen("tcp", cfg.AccountListen)
 	if err != nil {
 		slog.Error("listen failed", "addr", cfg.AccountListen, "err", err)
 		os.Exit(1)
 	}
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(callerauth.Interceptor(cfg.AccountCallerToken)),
+		grpc.ChainStreamInterceptor(callerauth.StreamInterceptor(cfg.AccountCallerToken)), // can't-forget guard for a future streaming RPC
+	)
 	accountv1.RegisterAccountServer(gs, svc)
 
 	// OAuth broker (Phase 15): served on cfg.WebListen when configured. It needs the device-auth store (Redis)
@@ -178,6 +201,84 @@ func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer)
 		BootstrapAdmin: cfg.BootstrapAdmin,   // config-pin: first account matching this OAuth login → admin (#27)
 		Log:            slog.Default(),
 	})
+}
+
+// callerAuthGate is the FAIL-CLOSED boot decision for the account gRPC caller token (#247), factored out of
+// main so it is unit-testable. It returns a fatal error when the API would be OPEN (no caller token) and the
+// insecure mode was NOT explicitly opted into — so a production deploy that merely forgot the token refuses to
+// boot rather than silently serving unauthenticated. A non-empty warn string means "running open under an
+// explicit TELOS_ALLOW_INSECURE opt-in". Both empty => a token is set and the server starts silently.
+//
+// Crucially the allowance keys on allowInsecure (TELOS_ALLOW_INSECURE, default false), NOT on the environment
+// name — cfg.Env defaults to "dev", so keying off it would make the DEFAULT config select the insecure branch.
+func callerAuthGate(callerToken string, allowInsecure bool) (warn string, fatal error) {
+	if callerToken != "" {
+		return "", nil
+	}
+	if !allowInsecure {
+		return "", errors.New("no account caller token (TELOS_ACCOUNT_CALLER_TOKEN) — the gRPC API would accept " +
+			"UNAUTHENTICATED callers (self-promote / assertion-mint); set a shared token, or TELOS_ALLOW_INSECURE=1 " +
+			"on a trusted dev rig")
+	}
+	return "no account caller token: the gRPC API is OPEN (TELOS_ALLOW_INSECURE) — anyone who can dial it may assert any actor", nil
+}
+
+// loadAccountContent resolves + loads the content pack set telos-account serves (#246), returning the loaded
+// content and whether the trust ladder is TRUSTED (safe to authorize promotes against). It mirrors the world's
+// loadContent resolution so the two services never diverge:
+//
+//   - Read the content-version registry. A CLEAN read (verr==nil) gives the authoritative registered packs; a
+//     FRESH DB (store.ErrNoContentVersion) means "never pulled" — the demo/override default is correct, and
+//     the ladder is trusted. A REAL read error means we cannot know which packs the world loaded → FAIL CLOSED.
+//   - Resolve the enabled packs with the shared content.ResolveEnabledPacks(explicit-override, registry).
+//   - LoadWithCore that set (the same call the world uses, so the effective content matches). A load error →
+//     FAIL CLOSED.
+//
+// Both reads get a bounded retry so a transient Postgres blip at boot doesn't wedge tier management for the
+// process lifetime (a genuine outage still fails closed after the retries — the break-glass CLI, which bypasses
+// the service, remains the recovery). "Fail closed" = returns ladderOK=false; the caller then marks the ladder
+// unavailable so SetAccountTier refuses every tier change. lc is always non-nil (an empty LoadedContent on
+// failure) so chargen degrades to unconfigured rather than crashing.
+func loadAccountContent(ctx context.Context, pool *store.Pool, packsOverride []string) (lc *content.LoadedContent, version uint64, ladderOK bool) {
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				lastErr = ctx.Err()
+				i = attempts // stop retrying on shutdown; fall through to fail-closed
+			case <-time.After(2 * time.Second):
+			}
+			if i >= attempts {
+				break
+			}
+		}
+		registry, verr := pool.CurrentContentVersion(ctx)
+		switch {
+		case verr == nil:
+			// authoritative registry (or a fresh DB's version-0 empty set — demo, correct + trusted).
+		case errors.Is(verr, store.ErrNoContentVersion):
+			// A fresh DB with no version row: demo is the right default; trusted. Not an error to retry.
+		default:
+			lastErr = verr
+			slog.Warn("content version registry read failed; retrying", "attempt", i+1, "err", verr)
+			continue
+		}
+		enabled := content.ResolveEnabledPacks(packsOverride, registry.Packs)
+		loaded, lerr := content.LoadWithCore(ctx, pool, enabled)
+		if lerr != nil {
+			lastErr = lerr
+			slog.Warn("content load failed; retrying", "attempt", i+1, "packs", enabled, "err", lerr)
+			continue
+		}
+		slog.Info("content resolved for telos-account", "packs", enabled, "content_version", registry.Version)
+		return loaded, registry.Version, true
+	}
+	// Exhausted the retries on a real error: refuse to authorize promotes against an unknown ladder.
+	slog.Error("content unavailable after retries; trust-tier changes will be REFUSED until it loads (fail closed) — "+
+		"break-glass recovery: `telos-account set-tier`", "err", lastErr)
+	return &content.LoadedContent{}, 0, false
 }
 
 // chargenFrom extracts the chargen flow + the selectable bundle options (race/class/…) the gate's

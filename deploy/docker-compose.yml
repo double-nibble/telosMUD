@@ -107,6 +107,7 @@ services:
       <<: *otel-env
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
+      TELOS_ALLOW_INSECURE: "1" # dev cluster runs handoffs UNSIGNED (#251); prod sets the handoff keypair instead
       TELOS_WORLD_LISTEN: ":9090"
       TELOS_SHARD_ADDR: world:9090
       TELOS_SHARD_ID: shard-a # MUST be unique per world process (ARCHITECTURE.md §4)
@@ -140,6 +141,7 @@ services:
       <<: *otel-env
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
+      TELOS_ALLOW_INSECURE: "1" # dev cluster runs handoffs UNSIGNED (#251); prod sets the handoff keypair instead
       TELOS_WORLD_LISTEN: ":9090"
       TELOS_SHARD_ADDR: world-darkwood:9090
       TELOS_SHARD_ID: shard-b # distinct id: both worlds defaulting to shard-1 collide
@@ -171,6 +173,7 @@ services:
       <<: *otel-env
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
+      TELOS_ALLOW_INSECURE: "1" # dev cluster runs handoffs UNSIGNED (#251); prod sets the handoff keypair instead
       TELOS_WORLD_LISTEN: ":9090"
       TELOS_SHARD_ADDR: world-crypt:9090
       TELOS_SHARD_ID: shard-c # MUST be unique per world process (ARCHITECTURE.md §4)
@@ -210,6 +213,7 @@ services:
     environment:
       TELOS_SERVICE: telos-account
       TELOS_ENV: dev
+      TELOS_ALLOW_INSECURE: "1" # dev account API runs tokenless (#247); prod sets TELOS_ACCOUNT_CALLER_TOKEN instead
       TELOS_ACCOUNT_LISTEN: ":9100"
       TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
       TELOS_REDIS_ADDR: redis:6379 # link codes + device-auth sessions

@@ -366,6 +366,33 @@ func (s *Shard) WithHandoffKeys(priv ed25519.PrivateKey, pub ed25519.PublicKey) 
 	return s
 }
 
+// CheckHandoffAuth is the boot-time guard against a MULTI-SHARD deployment running with UNAUTHENTICATED
+// handoffs (#251). A shard that is DISCOVERABLE in the directory (s.dir != nil) can be named as a handoff
+// DESTINATION by a peer (ShardForZone/EndpointForShard resolve it), so its Handoff.Prepare will accept
+// incoming snapshots. With no verify key, Prepare skips signature verification, so a reachable inter-shard
+// port lets a forged Prepare inject arbitrary carried state — a KNOWN-prototype item dupe (econ break), and
+// since #106 the destination strips an unsigned carried tier only as defense-in-depth. This is the PRIMARY
+// control on the item-injection half: a cluster that can receive handoffs MUST verify them.
+//
+// The signal is s.dir (discoverability = the RECEIVE capability), not s.peers (the SEND dialer) — the distsys
+// review's correction: a receive-only standby (dir set, no dialer) is a valid handoff destination the peers
+// check would miss. s.peers is kept as belt-and-suspenders (a send-capable shard is also multi-shard). A
+// single-shard deployment (no directory, cross-shard exits sealed) is neither discoverable nor a sender, so a
+// missing key is fine there (dev/demo/tests). Returns an error; the caller (cmd) turns it into a fatal boot
+// failure in production and a loud warning in dev (mirroring the caller-token posture).
+//
+// NOTE (documented, not closed here): Handoff.Prepare is registered on the world port in EVERY mode, so an
+// attacker with direct network reach to a keyless single-shard port could still forge a Prepare (item dupe) —
+// this guard bounds the legitimate peer path, not the raw port, which rests on the trusted-network boundary.
+func (s *Shard) CheckHandoffAuth() error {
+	if (s.dir != nil || s.peers != nil) && s.handoffVerifyKey == nil {
+		return fmt.Errorf("world: multi-shard deployment (directory/peer configured) has no handoff verify key; " +
+			"cross-shard Prepare would accept UNAUTHENTICATED snapshots (item-dupe / elevation vector) — " +
+			"configure the shared handoff keypair (WithHandoffKeys) or run single-shard")
+	}
+	return nil
+}
+
 // Default single-session lock timing (Phase 14.4): the key lives DefaultLockTTL (a crash self-clears after
 // it) and is heartbeated every DefaultLockRenew (also the takeover-detection latency).
 const (
