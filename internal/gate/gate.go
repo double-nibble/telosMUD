@@ -419,6 +419,69 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 		_ = tc.Write("\r\nNotice: chat is currently offline — channels and tells are unavailable until it recovers.\r\n")
 	}
 
+	// Mid-session comms up/down notice (#80): #61 above is a one-shot LOGIN probe — it can't cover a bus that
+	// drops (or recovers) AFTER login. Hook the bus's disconnect/reconnect transitions (driven by the NATS
+	// callbacks, not a poll) so the player learns when chat goes offline or comes back. Gated on commsExpected
+	// (don't nag an unwired dev gate) and on the concrete bus being able to transition (an AvailabilityWatcher
+	// — only the NATS bus; a Mem/Disabled bus never loses/gains its transport, so this is a clean no-op).
+	//
+	// ISOLATION: the transition callback fires on the bus's SHARED NATS-callback goroutine (one per gate
+	// process). It must NOT do the tc.Write there — a slow client's write (bounded only by the 30s
+	// writeTimeout) would head-of-line-stall the notice for EVERY other session and the connection-lifecycle
+	// callbacks, regressing the per-session isolation comms.go guarantees. So the callback does a NON-BLOCKING
+	// COALESCING hand-off to a size-1 channel drained by this session's OWN goroutine, which does the actual
+	// (bounded) write. Coalescing collapses a flap storm to the LATEST state rather than a serialized backlog
+	// of stale booleans. cancelWatch + watchDone tear it all down at session end (same connection scope as the
+	// comms subscription above — a cross-shard re-dial never touches it, so the notice survives a handoff).
+	if s.commsExpected {
+		if w, ok := s.comms.(commbus.AvailabilityWatcher); ok {
+			avail := make(chan bool, 1)
+			watchDone := make(chan struct{})
+			go func() {
+				for {
+					select {
+					case up := <-avail:
+						if up {
+							_ = tc.Write("\r\nNotice: chat is back online.\r\n")
+						} else {
+							_ = tc.Write("\r\nNotice: chat went offline — channels and tells are unavailable until it recovers.\r\n")
+						}
+						// Comm.Status for a client that advertised the umbrella Comm GMCP package. The sibling
+						// Comm.Channel.* emitters gate on their leaf, but clients advertise the umbrella
+						// ("Comm 1"), so "Comm" is the right gate for a new Comm.Status message.
+						if gmcp.supported("Comm") {
+							if up {
+								_ = tc.WriteGMCP("Comm.Status", []byte(`{"available":true}`))
+							} else {
+								_ = tc.WriteGMCP("Comm.Status", []byte(`{"available":false}`))
+							}
+						}
+					case <-watchDone:
+						return
+					}
+				}
+			}()
+			cancelWatch := w.OnAvailabilityChange(func(available bool) {
+				// Non-blocking coalescing push (runs on the shared NATS goroutine): keep only the LATEST state
+				// so a flap can never back up that goroutine.
+				select {
+				case avail <- available:
+				default:
+					select { // full: drop the stale pending state
+					case <-avail:
+					default:
+					}
+					select { // then push the latest (best-effort; only this session pushes here)
+					case avail <- available:
+					default:
+					}
+				}
+			})
+			// Unregister the listener FIRST (no more pushes), THEN stop the drainer.
+			defer func() { cancelWatch(); close(watchDone) }()
+		}
+	}
+
 	// --- directory seam: resolve the initial shard for this character ---
 	addr, ok := s.dir.ShardForCharacter(name)
 	if !ok {

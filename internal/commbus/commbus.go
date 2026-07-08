@@ -308,6 +308,22 @@ type Subscription interface {
 	Unsubscribe() error
 }
 
+// AvailabilityWatcher is the OPTIONAL transition surface (#80): a bus that can cross the
+// available/unavailable boundary MID-CONNECTION exposes it so the gate can tell a live player when chat goes
+// offline or recovers — the transition the point-in-time Available() login probe (#61) cannot cover. Only the
+// NATS bus implements it (an in-process MemBus never loses its transport; a Disabled bus is permanently down),
+// so callers type-assert and simply skip the notice when the concrete bus does not support it. Distinct from
+// Bus so the common interface stays a pure send/receive contract.
+type AvailabilityWatcher interface {
+	// OnAvailabilityChange registers fn to be invoked when the transport crosses the available/unavailable
+	// boundary — fn receives the NEW availability (false on a disconnect, true on a reconnect). It fires only
+	// on an actual transition, never a repeat of the same state, and is driven by the transport's
+	// disconnect/reconnect callbacks, NOT a poll. fn runs on the transport's callback goroutine, so it MUST be
+	// non-blocking (hand off to a channel / do a bounded write). Returns a cancel func that unregisters fn;
+	// callers MUST call it when the consumer (a gate session) ends.
+	OnAvailabilityChange(fn func(available bool)) (cancel func())
+}
+
 // wildcardMatches reports whether a published subject matches a subscription pattern. It supports the
 // single trailing-token wildcard the taxonomy uses (telos.comms.chan.* matches telos.comms.chan.X
 // for any single token X) plus exact match. It deliberately does NOT implement full NATS token

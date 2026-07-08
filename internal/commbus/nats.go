@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -34,6 +35,17 @@ type NATSBus struct {
 	nc   *nats.Conn
 	role Role
 	log  *slog.Logger
+
+	// availability-transition listeners (#80): the disconnect/reconnect handlers fire these so the gate can
+	// surface a mid-session comms up/down to a live player. Guarded because listeners are registered/cancelled
+	// from per-session gate goroutines while the handlers fire on the NATS client goroutine. lastAvailable +
+	// lastSet dedup same-state fires so the AvailabilityWatcher "only on an actual transition" contract holds
+	// even if NATS emits a duplicate (e.g. its Close() path pushes a disconnect callback).
+	mu            sync.Mutex
+	listeners     map[int]func(bool)
+	nextID        int
+	lastAvailable bool
+	lastSet       bool
 }
 
 // NewWorld / NewGate dial url and return a role-scoped NATSBus, or an error if the broker is
@@ -60,7 +72,56 @@ func connect(url string, role Role, name string) (*NATSBus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("commbus: connect %q: %w", url, err)
 	}
-	return &NATSBus{nc: nc, role: role, log: slog.With("component", "commbus", "role", role.String())}, nil
+	b := &NATSBus{
+		nc:        nc,
+		role:      role,
+		log:       slog.With("component", "commbus", "role", role.String()),
+		listeners: map[int]func(bool){},
+	}
+	// #80: surface mid-session comms up/down by firing the availability listeners off the transport's
+	// disconnect/reconnect callbacks (NOT a poll). Set AFTER construction so the handlers can close over b.
+	// A disconnect crosses Available() true→false; a reconnect crosses it false→true (MaxReconnects(-1) keeps
+	// the client reconnecting forever, so these alternate cleanly).
+	nc.SetDisconnectErrHandler(func(_ *nats.Conn, _ error) { b.fireAvailability(false) })
+	nc.SetReconnectHandler(func(_ *nats.Conn) { b.fireAvailability(true) })
+	return b, nil
+}
+
+// OnAvailabilityChange registers fn to be called on an available/unavailable transition (#80,
+// AvailabilityWatcher). Returns a cancel func that unregisters it. fn runs on the NATS client goroutine —
+// keep it non-blocking.
+func (b *NATSBus) OnAvailabilityChange(fn func(available bool)) (cancel func()) {
+	b.mu.Lock()
+	id := b.nextID
+	b.nextID++
+	b.listeners[id] = fn
+	b.mu.Unlock()
+	return func() {
+		b.mu.Lock()
+		delete(b.listeners, id)
+		b.mu.Unlock()
+	}
+}
+
+// fireAvailability invokes every registered listener with the new availability. It snapshots the listener set
+// under the lock and calls them OUTSIDE it, so a listener that cancels itself (or registers another) cannot
+// deadlock, and a slow listener cannot hold the lock against a concurrent register/cancel.
+func (b *NATSBus) fireAvailability(available bool) {
+	b.mu.Lock()
+	if b.lastSet && b.lastAvailable == available {
+		b.mu.Unlock()
+		return // no actual transition — honor the AvailabilityWatcher "never a repeat" contract
+	}
+	b.lastAvailable = available
+	b.lastSet = true
+	fns := make([]func(bool), 0, len(b.listeners))
+	for _, fn := range b.listeners {
+		fns = append(fns, fn)
+	}
+	b.mu.Unlock()
+	for _, fn := range fns {
+		fn(available)
+	}
 }
 
 // Role reports this handle's publish capability.

@@ -120,6 +120,7 @@ exit destinations are stable per-room integer ids mapped from the room's `ProtoR
 | Message              | Dir | Purpose                                          |
 |----------------------|-----|--------------------------------------------------|
 | `Comm.Channel.Text`  | S->C | `{"channel":"gossip","talker":"kurt","text":"hi"}` — mirrors a channel line so a client can route it to a per-channel tab (same hear-set filter as the text line) |
+| `Comm.Status`        | S->C | `{"available":true\|false}` — the comms transport crossed the up/down boundary MID-session (#80): `false` when chat went offline (channels + tells unavailable), `true` on recovery. Paired with a one-line text notice. Emitted on the transition only, not polled; the login-time state rides the text notice (#61). |
 
 ## The `Mud.*` namespace
 
