@@ -45,7 +45,10 @@ type Config struct {
 	Authorizer    DeviceAuthorizer
 	SessionKey    []byte // HMAC key for the signed flow cookie (a stable random key in prod)
 	SecureCookies bool   // set Secure on the cookie (true when served over TLS)
-	Dev           bool   // dev instance: render the -dev logo variant
+	// Env is the deployment environment ("prod"/"staging"/"dev", or anything else). It selects the logo
+	// badge variant (staging→STG, dev→DEV, everything else→unbadged prod) so an operator can tell a
+	// non-prod instance from prod at a glance. Empty/unrecognized falls back to the prod logo.
+	Env string
 	// BootstrapAdmin (config-pin, #27) is the OAuth LOGIN whose FIRST-created account is granted the
 	// admin tier — the way the operator claims the first admin without a connect-race. "" disables it.
 	BootstrapAdmin string
@@ -62,10 +65,7 @@ func New(st Store, cfg Config) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	logoURL := "/assets/telosmud-logo.svg"
-	if cfg.Dev {
-		logoURL = "/assets/telosmud-logo-dev.svg"
-	}
+	logoURL := logoURLForEnv(cfg.Env)
 	tmpl := template.Must(template.New("web").
 		Funcs(template.FuncMap{"logoURL": func() string { return logoURL }}).
 		Parse(pageTemplates))
@@ -78,6 +78,20 @@ func New(st Store, cfg Config) *Server {
 		bootstrapAdmin: strings.TrimSpace(cfg.BootstrapAdmin),
 		tmpl:           tmpl,
 		log:            log,
+	}
+}
+
+// logoURLForEnv picks the logo variant by deployment env: staging and dev get a badged logo (STG / DEV) so an
+// operator can tell a non-prod instance from prod at a glance; every other env (prod, empty, or anything
+// unrecognized) gets the unbadged prod logo. Case- and whitespace-insensitive so "Staging"/" dev " still match.
+func logoURLForEnv(env string) string {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "staging":
+		return "/assets/telosmud-logo-staging.svg"
+	case "dev":
+		return "/assets/telosmud-logo-dev.svg"
+	default:
+		return "/assets/telosmud-logo.svg"
 	}
 }
 

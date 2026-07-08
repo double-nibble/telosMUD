@@ -241,6 +241,26 @@ func TestAssetsServed(t *testing.T) {
 	}
 }
 
+func TestLogoURLForEnv(t *testing.T) {
+	cases := []struct {
+		env  string
+		want string
+	}{
+		{"prod", "/assets/telosmud-logo.svg"},
+		{"", "/assets/telosmud-logo.svg"},
+		{"anything-else", "/assets/telosmud-logo.svg"},
+		{"dev", "/assets/telosmud-logo-dev.svg"},
+		{"staging", "/assets/telosmud-logo-staging.svg"},
+		{" Staging ", "/assets/telosmud-logo-staging.svg"}, // case- and space-insensitive
+		{"DEV", "/assets/telosmud-logo-dev.svg"},
+	}
+	for _, tc := range cases {
+		if got := logoURLForEnv(tc.env); got != tc.want {
+			t.Errorf("logoURLForEnv(%q) = %q, want %q", tc.env, got, tc.want)
+		}
+	}
+}
+
 func readBody(t *testing.T, resp *http.Response) string {
 	t.Helper()
 	defer func() { _ = resp.Body.Close() }()
