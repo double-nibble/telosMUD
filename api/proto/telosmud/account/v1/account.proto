@@ -41,7 +41,39 @@ service Account {
   // unless the actor is an admin — the edge never decides this. The change takes effect on the target's
   // NEXT login (the assertion re-reads + re-signs the tier). Audited (account_role_audit).
   rpc SetAccountTier(SetAccountTierRequest) returns (SetAccountTierResponse);
+
+  // --- #23 cross-session edge preferences (color, and future terminal-only prefs) ---
+
+  // GetAccountPrefs returns an account's persisted EDGE preferences (terminal-only settings the gate applies
+  // at connect, e.g. `color on/off`). Each field is proto3 `optional` for a tri-state: absent = never set (the
+  // gate keeps its default), present = the explicitly-chosen value. The world never calls this — color and its
+  // kin are a purely edge concern, so the gate reads them directly.
+  rpc GetAccountPrefs(GetAccountPrefsRequest) returns (GetAccountPrefsResponse);
+  // SetAccountPrefs persists the edge preferences that are PRESENT in the request; an absent (unset) field is a
+  // NO-OP (it does not clear the stored value). This is how the gate persists a `color on`/`color off` toggle.
+  //
+  // CONTRACT — SELF-SCOPED, NON-PRIVILEGED prefs ONLY. This RPC carries just the subject account_id (no
+  // actor/target split) and does NO server-side actor==target authorization: it trusts the gate to pass the
+  // caller's OWN authenticated account. That is acceptable ONLY because every field here is a cosmetic,
+  // self-affecting terminal preference (a victim self-heals by re-toggling). Any future privilege-BEARING pref
+  // must NOT ride this message — give it a distinct actor+target RPC with an authz check, like SetAccountTier.
+  rpc SetAccountPrefs(SetAccountPrefsRequest) returns (SetAccountPrefsResponse);
 }
+
+// --- #23 edge-preference messages. Deliberately EXTENSIBLE: a future terminal-only preference is just another
+// `optional` field here (with a matching store column), needing no new RPC. Each `optional` scalar carries
+// field presence, so "unset" is distinguishable from false/zero on the wire. ---
+message GetAccountPrefsRequest {
+  string account_id = 1;
+}
+message GetAccountPrefsResponse {
+  optional bool color_enabled = 1; // absent => never set (the gate keeps its default, color ON)
+}
+message SetAccountPrefsRequest {
+  string account_id = 1;
+  optional bool color_enabled = 2; // absent => leave the stored value untouched (no-op), present => persist it
+}
+message SetAccountPrefsResponse {}
 
 // --- #27 trust-tier management ---
 message SetAccountTierRequest {

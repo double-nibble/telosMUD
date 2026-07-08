@@ -278,3 +278,43 @@ func TestPendingChargenRoundTrip(t *testing.T) {
 	require.True(t, found)
 	assert.Nil(t, snap2.PendingChargen, "the first save must clear the chargen marker (one-time application)")
 }
+
+// TestAccountColorPrefRoundTrip (#23) is the gated Postgres round-trip for the terminal color preference: a
+// fresh account has NO stored preference (NULL => set=false, so the gate keeps its default); a write persists
+// true/false; and it survives a read-back (the "reconnect" leg). It uses migration 00026's nullable column.
+func TestAccountColorPrefRoundTrip(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	acct := uuid.NewString()
+	_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status) VALUES ($1, 'active')`, acct)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, acct)
+	})
+
+	// Never set: the column is NULL, so set=false and the gate keeps its default.
+	enabled, set, err := p.AccountColorPref(ctx, acct)
+	require.NoError(t, err)
+	assert.False(t, set, "a fresh account has no stored color preference")
+	assert.False(t, enabled)
+
+	// Persist color OFF, read it back (the reconnect leg): set=true, enabled=false.
+	require.NoError(t, p.SetAccountColorPref(ctx, acct, false))
+	enabled, set, err = p.AccountColorPref(ctx, acct)
+	require.NoError(t, err)
+	assert.True(t, set, "after a write the preference is stored")
+	assert.False(t, enabled, "color off should read back as disabled")
+
+	// Flip to ON: the write overwrites, read-back reflects it.
+	require.NoError(t, p.SetAccountColorPref(ctx, acct, true))
+	enabled, set, err = p.AccountColorPref(ctx, acct)
+	require.NoError(t, err)
+	assert.True(t, set)
+	assert.True(t, enabled, "color on should read back as enabled")
+
+	// An unknown account is a clean miss (set=false, no error) — mirrors the NULL default.
+	_, set, err = p.AccountColorPref(ctx, uuid.NewString())
+	require.NoError(t, err)
+	assert.False(t, set, "an unknown account reports no stored preference")
+}

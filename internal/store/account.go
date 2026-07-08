@@ -238,6 +238,34 @@ func (p *Pool) SetAccountTier(ctx context.Context, actorAccountID, targetAccount
 	return oldTier, nil
 }
 
+// AccountColorPref returns an account's persisted terminal color preference (#23). The column is NULLABLE:
+// set=false means the player has never chosen (NULL) — the gate then keeps its default (color ON). enabled is
+// meaningful only when set=true. Color is an EDGE concern, so only telos-account reads this on the gate's
+// behalf; the world never sees it.
+func (p *Pool) AccountColorPref(ctx context.Context, accountID string) (enabled bool, set bool, err error) {
+	var col *bool
+	err = p.pool.QueryRow(ctx, `SELECT color_enabled FROM accounts WHERE id = $1`, accountID).Scan(&col)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("store: account color pref %s: %w", accountID, err)
+	}
+	if col == nil {
+		return false, false, nil // NULL => never set; the gate keeps its default
+	}
+	return *col, true, nil
+}
+
+// SetAccountColorPref persists an account's terminal color preference (#23). It only ever writes true/false —
+// there is no "clear back to NULL" path (the toggle command is always an explicit on/off).
+func (p *Pool) SetAccountColorPref(ctx context.Context, accountID string, enabled bool) error {
+	if _, err := p.pool.Exec(ctx, `UPDATE accounts SET color_enabled = $1 WHERE id = $2`, enabled, accountID); err != nil {
+		return fmt.Errorf("store: set account color pref %s: %w", accountID, err)
+	}
+	return nil
+}
+
 // AccountDisplayName returns an account's display name (may be empty). found=false for an unknown account.
 func (p *Pool) AccountDisplayName(ctx context.Context, accountID string) (string, bool, error) {
 	var name *string
