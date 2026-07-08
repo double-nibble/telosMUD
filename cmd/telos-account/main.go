@@ -35,6 +35,13 @@ import (
 )
 
 func main() {
+	// Break-glass CLI (#108): `telos-account set-tier ...` runs a one-shot admin write and exits, instead of
+	// serving. It is the sanctioned last-admin-lockout recovery — whoever can run this binary against the DB
+	// already has host/DB access, which IS the authorization, so it bypasses the in-game admin check + ceilings.
+	if len(os.Args) > 1 && os.Args[1] == "set-tier" {
+		os.Exit(runSetTierCLI(os.Args[2:]))
+	}
+
 	cfg, err := config.Load(config.PathFromEnv())
 	if err != nil {
 		slog.Error("config load failed", "err", err)

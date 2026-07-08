@@ -404,9 +404,15 @@ func TestSetAccountTierCASConcurrent(t *testing.T) {
 		switch {
 		case r.err == nil:
 			winners++
+			// The WINNER replaced the 'player' base it expected.
+			assert.Equal(t, TierPlayer, r.old, "the winner's CAS base was player")
 		case errors.Is(r.err, ErrTierConflict):
 			conflicts++
-			assert.Equal(t, TierPlayer, r.old, "the conflict must observe SOME committed tier under the lock")
+			// The LOSER blocked on FOR UPDATE and, after the winner committed, re-read the row under the lock:
+			// it observes the WINNER's tier (builder or admin), NOT the stale 'player' it expected — that
+			// moved base is exactly why its CAS conflicts.
+			assert.Contains(t, []string{TierBuilder, TierAdmin}, r.old,
+				"the conflict must observe the winner's committed tier under the lock, not the stale base")
 		default:
 			t.Fatalf("unexpected error: %v", r.err)
 		}
@@ -422,4 +428,92 @@ func TestSetAccountTierCASConcurrent(t *testing.T) {
 	var n int
 	require.NoError(t, p.pool.QueryRow(ctx, `SELECT count(*) FROM account_role_audit WHERE target_account = $1`, target).Scan(&n))
 	assert.Equal(t, 1, n, "only the winning write may append an audit row")
+}
+
+// TestSetAccountTierSystem (#108) is the break-glass write: it forces the tier unconditionally and audits with
+// a NULL (system) actor — the recovery path from a last-admin lockout. It must land regardless of the current
+// tier and record the change without an actor account (like the bootstrap grant).
+func TestSetAccountTierSystem(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	target := uuid.NewString()
+	_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status, tier) VALUES ($1, 'active', 'player')`, target)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_role_audit WHERE target_account = $1`, target)
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, target)
+	})
+
+	// Force player -> admin (the recovery). Returns the prior tier, writes the new one.
+	old, err := p.SetAccountTierSystem(ctx, target, TierAdmin)
+	require.NoError(t, err)
+	assert.Equal(t, TierPlayer, old)
+	tier, _, err := p.AccountTier(ctx, target)
+	require.NoError(t, err)
+	assert.Equal(t, TierAdmin, tier)
+
+	// The audit row has a NULL actor (system-granted) and the old->new contents.
+	var actor *string
+	var oldTier, newTier string
+	err = p.pool.QueryRow(ctx,
+		`SELECT actor_account, old_tier, new_tier FROM account_role_audit WHERE target_account = $1`,
+		target).Scan(&actor, &oldTier, &newTier)
+	require.NoError(t, err)
+	assert.Nil(t, actor, "a break-glass write must audit with a NULL (system) actor")
+	assert.Equal(t, TierPlayer, oldTier)
+	assert.Equal(t, TierAdmin, newTier)
+
+	// An unknown account is an error (nothing to recover).
+	if _, err := p.SetAccountTierSystem(ctx, uuid.NewString(), TierAdmin); err == nil {
+		t.Fatal("set-tier on an unknown account must error")
+	}
+}
+
+// TestSetAccountTierSystemVsInGameCAS pins the concurrency claim in SetAccountTierSystem's doc comment (#108):
+// the break-glass system write and an in-game SetAccountTier serialize on the row's FOR UPDATE lock, and the
+// recovery is never silently clobbered. Both orderings are exercised.
+func TestSetAccountTierSystemVsInGameCAS(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	mkAccount := func(tier string) string {
+		id := uuid.NewString()
+		_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status, tier) VALUES ($1, 'active', $2)`, id, tier)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_role_audit WHERE target_account = $1`, id)
+			_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, id)
+		})
+		return id
+	}
+	actor := mkAccount(TierAdmin)
+
+	// Ordering 1: the SYSTEM write commits, then an in-game CAS with a now-stale base must conflict (not
+	// clobber the recovery). Model it sequentially — the CAS base is the tier read BEFORE the system write.
+	{
+		target := mkAccount(TierPlayer)
+		staleBase := TierPlayer // what an in-game actor would have read before recovery landed
+		if _, err := p.SetAccountTierSystem(ctx, target, TierAdmin); err != nil {
+			t.Fatalf("system recovery write failed: %v", err)
+		}
+		if _, err := p.SetAccountTier(ctx, actor, target, TierBuilder, staleBase); !errors.Is(err, ErrTierConflict) {
+			t.Fatalf("an in-game CAS on a stale base must conflict after a system write, got %v", err)
+		}
+		tier, _, _ := p.AccountTier(ctx, target)
+		assert.Equal(t, TierAdmin, tier, "the system recovery must survive a losing in-game CAS")
+	}
+
+	// Ordering 2: an in-game promote commits, then the system write forces UNCONDITIONALLY over it.
+	{
+		target := mkAccount(TierPlayer)
+		if _, err := p.SetAccountTier(ctx, actor, target, TierBuilder, TierPlayer); err != nil {
+			t.Fatalf("in-game promote failed: %v", err)
+		}
+		old, err := p.SetAccountTierSystem(ctx, target, TierAdmin)
+		require.NoError(t, err)
+		assert.Equal(t, TierBuilder, old, "the system write observes the in-game tier it forces over")
+		tier, _, _ := p.AccountTier(ctx, target)
+		assert.Equal(t, TierAdmin, tier, "the system write wins unconditionally")
+	}
 }

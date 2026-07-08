@@ -137,11 +137,18 @@ top tier is not a capability superset of everything beneath it would strand acco
 > flags) — see #246. The account gRPC listener also assumes a trusted network: the acting principal is
 > caller-asserted (#247).
 
-> **Last-admin lockout recovery.** There is no self/last-admin demote guard, so an admin *can* demote the
-> last admin. Config-pin (`TELOS_BOOTSTRAP_ADMIN`) does **not** recover this — it applies only at account
-> *creation*, so re-setting it is a no-op for an existing account. Recovery is a direct DB write
-> (`UPDATE accounts SET tier='admin' WHERE id=…`) or the planned break-glass CLI. Treat the pinned owner's
-> account with care.
+> **Last-admin lockout recovery (#108).** There is no self/last-admin demote guard, so an admin *can* demote
+> the last admin. Config-pin (`TELOS_BOOTSTRAP_ADMIN`) does **not** recover this — it applies only at account
+> *creation*, so re-setting it is a no-op for an existing account. The sanctioned recovery is the break-glass
+> CLI, run by whoever has DB/host access (which **is** the authorization):
+>
+> ```
+> telos-account set-tier --character <name> --tier admin
+> ```
+>
+> It forces the tier directly, bypassing the in-game admin check and the promote ceilings, and audits the
+> change with a system (NULL) actor. It validates the tier against the loaded ladder unless `--force yes`.
+> Treat the pinned owner's account with care.
 
 **Bootstrap admin (config-pin).** Set `TELOS_BOOTSTRAP_ADMIN` to your OAuth **login**; the FIRST account
 created for a matching identity is granted `admin` (audited with a NULL actor). The match is **login-only,

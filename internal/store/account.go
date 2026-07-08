@@ -282,6 +282,44 @@ func (p *Pool) SetAccountColorPref(ctx context.Context, accountID string, enable
 	return nil
 }
 
+// SetAccountTierSystem is the BREAK-GLASS tier write (#108): it forces targetAccountID to newTier and audits
+// the change with a NULL actor (system-granted, exactly like the bootstrap admin grant), all in one
+// transaction. Returns the previous tier. It exists for the `telos-account set-tier` CLI — the sanctioned
+// recovery from a last-admin lockout, where whoever runs it has DB/host access (which IS the authorization),
+// so it deliberately bypasses BOTH the in-game admin check and the promote ceilings.
+//
+// Unlike SetAccountTier this is UNCONDITIONAL (no compare-and-set): a recovery operator wants the write to
+// land, not to lose a race against whatever wedged state prompted the recovery. It still locks the row
+// FOR UPDATE so a concurrent in-game SetAccountTier serializes cleanly (its CAS will then observe this write).
+func (p *Pool) SetAccountTierSystem(ctx context.Context, targetAccountID, newTier string) (string, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var oldTier string
+	if err := tx.QueryRow(ctx, `SELECT tier FROM accounts WHERE id = $1 FOR UPDATE`, targetAccountID).Scan(&oldTier); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("store: set tier (system): unknown account %s", targetAccountID)
+		}
+		return "", fmt.Errorf("store: set tier (system) read: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE accounts SET tier = $1 WHERE id = $2`, newTier, targetAccountID); err != nil {
+		return "", fmt.Errorf("store: set tier (system) update: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO account_role_audit (id, actor_account, target_account, old_tier, new_tier)
+		 VALUES ($1, NULL, $2, $3, $4)`,
+		uuid.New(), targetAccountID, oldTier, newTier); err != nil {
+		return "", fmt.Errorf("store: set tier (system) audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("store: commit: %w", err)
+	}
+	return oldTier, nil
+}
+
 // AccountDisplayName returns an account's display name (may be empty). found=false for an unknown account.
 func (p *Pool) AccountDisplayName(ctx context.Context, accountID string) (string, bool, error) {
 	var name *string
