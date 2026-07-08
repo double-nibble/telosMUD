@@ -20,7 +20,7 @@ func TestCallerAuthGate(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fatal, warn := callerAuthGate(tc.token, tc.allowInsecure)
+			warn, fatal := callerAuthGate(tc.token, tc.allowInsecure)
 			if (fatal != nil) != tc.wantFatal {
 				t.Fatalf("fatal = %v, want fatal=%v", fatal, tc.wantFatal)
 			}

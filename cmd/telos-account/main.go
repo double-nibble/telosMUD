@@ -135,7 +135,7 @@ func main() {
 	// oracle). FAIL CLOSED by default — refuse to serve an OPEN listener — unless TELOS_ALLOW_INSECURE was
 	// explicitly set (a trusted dev rig; the interceptor then no-ops and the TELOS_DEV_AUTOAUTH stub path never
 	// dials gRPC anyway). The decision is factored into callerAuthGate so the fail-closed behavior is testable.
-	if fatal, warn := callerAuthGate(cfg.AccountCallerToken, cfg.AllowInsecure); fatal != nil {
+	if warn, fatal := callerAuthGate(cfg.AccountCallerToken, cfg.AllowInsecure); fatal != nil {
 		slog.Error("refusing to start", "err", fatal)
 		os.Exit(1)
 	} else if warn != "" {
@@ -211,16 +211,16 @@ func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer)
 //
 // Crucially the allowance keys on allowInsecure (TELOS_ALLOW_INSECURE, default false), NOT on the environment
 // name — cfg.Env defaults to "dev", so keying off it would make the DEFAULT config select the insecure branch.
-func callerAuthGate(callerToken string, allowInsecure bool) (fatal error, warn string) {
+func callerAuthGate(callerToken string, allowInsecure bool) (warn string, fatal error) {
 	if callerToken != "" {
-		return nil, ""
+		return "", nil
 	}
 	if !allowInsecure {
-		return errors.New("no account caller token (TELOS_ACCOUNT_CALLER_TOKEN) — the gRPC API would accept " +
+		return "", errors.New("no account caller token (TELOS_ACCOUNT_CALLER_TOKEN) — the gRPC API would accept " +
 			"UNAUTHENTICATED callers (self-promote / assertion-mint); set a shared token, or TELOS_ALLOW_INSECURE=1 " +
-			"on a trusted dev rig"), ""
+			"on a trusted dev rig")
 	}
-	return nil, "no account caller token: the gRPC API is OPEN (TELOS_ALLOW_INSECURE) — anyone who can dial it may assert any actor"
+	return "no account caller token: the gRPC API is OPEN (TELOS_ALLOW_INSECURE) — anyone who can dial it may assert any actor", nil
 }
 
 // loadAccountContent resolves + loads the content pack set telos-account serves (#246), returning the loaded

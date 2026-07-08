@@ -24,7 +24,7 @@ func TestHandoffAuthGate(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fatal, warn := handoffAuthGate(tc.shardErr, tc.allowInsecure)
+			warn, fatal := handoffAuthGate(tc.shardErr, tc.allowInsecure)
 			if (fatal != nil) != tc.wantFatal {
 				t.Fatalf("fatal = %v, want fatal=%v", fatal, tc.wantFatal)
 			}

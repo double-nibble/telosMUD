@@ -46,14 +46,14 @@ import (
 // into — so a discoverable production shard that forgot the handoff keypair refuses to boot. A non-empty warn
 // string means "running with unauthenticated handoffs under an explicit TELOS_ALLOW_INSECURE opt-in". Both
 // empty => the shard is either single-shard (never receives a handoff) or properly keyed.
-func handoffAuthGate(shardErr error, allowInsecure bool) (fatal error, warn string) {
+func handoffAuthGate(shardErr error, allowInsecure bool) (warn string, fatal error) {
 	if shardErr == nil {
-		return nil, ""
+		return "", nil
 	}
 	if !allowInsecure {
-		return shardErr, ""
+		return "", shardErr
 	}
-	return nil, "insecure handoffs (TELOS_ALLOW_INSECURE): a discoverable shard has no handoff verify key: " + shardErr.Error()
+	return "insecure handoffs (TELOS_ALLOW_INSECURE): a discoverable shard has no handoff verify key: " + shardErr.Error(), nil
 }
 
 func main() {
@@ -90,7 +90,7 @@ func main() {
 	// unless TELOS_ALLOW_INSECURE explicitly opts in (a trusted local multi-node rig, or a Redis-backed single
 	// node) — the same fail-closed-by-default posture as the account caller token. The decision is factored
 	// into handoffAuthGate so the fail-closed behavior is testable.
-	if fatal, warn := handoffAuthGate(shard.CheckHandoffAuth(), cfg.AllowInsecure); fatal != nil {
+	if warn, fatal := handoffAuthGate(shard.CheckHandoffAuth(), cfg.AllowInsecure); fatal != nil {
 		slog.Error("refusing to start", "err", fatal)
 		os.Exit(1)
 	} else if warn != "" {
