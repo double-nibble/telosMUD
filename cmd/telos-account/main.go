@@ -132,17 +132,14 @@ func main() {
 
 	// Caller authentication (#247): require the shared caller token on every RPC so only the trusted gate can
 	// reach the privileged API (SetAccountTier's caller-asserted actor; IssueSessionAssertion's signing
-	// oracle). FAIL CLOSED outside dev — refuse to serve an OPEN listener in production, mirroring the
-	// signing-key posture — while a dev/local rig may run tokenless (loud warning; the interceptor then no-ops
-	// and the TELOS_DEV_AUTOAUTH stub path never dials gRPC anyway).
-	if cfg.AccountCallerToken == "" {
-		if !cfg.AllowInsecure {
-			slog.Error("refusing to start: no account caller token (TELOS_ACCOUNT_CALLER_TOKEN) — the gRPC API would " +
-				"accept UNAUTHENTICATED callers (self-promote / assertion-mint). Set a shared token, or set " +
-				"TELOS_ALLOW_INSECURE=1 on a trusted dev rig.")
-			os.Exit(1)
-		}
-		slog.Warn("no account caller token: the gRPC API is OPEN (TELOS_ALLOW_INSECURE) — anyone who can dial it may assert any actor")
+	// oracle). FAIL CLOSED by default — refuse to serve an OPEN listener — unless TELOS_ALLOW_INSECURE was
+	// explicitly set (a trusted dev rig; the interceptor then no-ops and the TELOS_DEV_AUTOAUTH stub path never
+	// dials gRPC anyway). The decision is factored into callerAuthGate so the fail-closed behavior is testable.
+	if fatal, warn := callerAuthGate(cfg.AccountCallerToken, cfg.AllowInsecure); fatal != nil {
+		slog.Error("refusing to start", "err", fatal)
+		os.Exit(1)
+	} else if warn != "" {
+		slog.Warn(warn)
 	}
 
 	lis, err := net.Listen("tcp", cfg.AccountListen)
@@ -204,6 +201,26 @@ func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer)
 		BootstrapAdmin: cfg.BootstrapAdmin,   // config-pin: first account matching this OAuth login → admin (#27)
 		Log:            slog.Default(),
 	})
+}
+
+// callerAuthGate is the FAIL-CLOSED boot decision for the account gRPC caller token (#247), factored out of
+// main so it is unit-testable. It returns a fatal error when the API would be OPEN (no caller token) and the
+// insecure mode was NOT explicitly opted into — so a production deploy that merely forgot the token refuses to
+// boot rather than silently serving unauthenticated. A non-empty warn string means "running open under an
+// explicit TELOS_ALLOW_INSECURE opt-in". Both empty => a token is set and the server starts silently.
+//
+// Crucially the allowance keys on allowInsecure (TELOS_ALLOW_INSECURE, default false), NOT on the environment
+// name — cfg.Env defaults to "dev", so keying off it would make the DEFAULT config select the insecure branch.
+func callerAuthGate(callerToken string, allowInsecure bool) (fatal error, warn string) {
+	if callerToken != "" {
+		return nil, ""
+	}
+	if !allowInsecure {
+		return errors.New("no account caller token (TELOS_ACCOUNT_CALLER_TOKEN) — the gRPC API would accept " +
+			"UNAUTHENTICATED callers (self-promote / assertion-mint); set a shared token, or TELOS_ALLOW_INSECURE=1 " +
+			"on a trusted dev rig"), ""
+	}
+	return nil, "no account caller token: the gRPC API is OPEN (TELOS_ALLOW_INSECURE) — anyone who can dial it may assert any actor"
 }
 
 // loadAccountContent resolves + loads the content pack set telos-account serves (#246), returning the loaded

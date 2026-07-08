@@ -40,6 +40,22 @@ import (
 	"github.com/double-nibble/telosmud/internal/world"
 )
 
+// handoffAuthGate is the FAIL-CLOSED boot decision for the keyless-handoff guard (#251), factored out of main
+// so it is unit-testable. shardErr is Shard.CheckHandoffAuth()'s result (non-nil = this shard can receive
+// handoffs but has no verify key). It returns that error as fatal when insecure mode was NOT explicitly opted
+// into — so a discoverable production shard that forgot the handoff keypair refuses to boot. A non-empty warn
+// string means "running with unauthenticated handoffs under an explicit TELOS_ALLOW_INSECURE opt-in". Both
+// empty => the shard is either single-shard (never receives a handoff) or properly keyed.
+func handoffAuthGate(shardErr error, allowInsecure bool) (fatal error, warn string) {
+	if shardErr == nil {
+		return nil, ""
+	}
+	if !allowInsecure {
+		return shardErr, ""
+	}
+	return nil, "insecure handoffs (TELOS_ALLOW_INSECURE): a discoverable shard has no handoff verify key: " + shardErr.Error()
+}
+
 func main() {
 	cfg, err := config.Load(config.PathFromEnv())
 	if err != nil {
@@ -72,14 +88,13 @@ func main() {
 	// Fail loud on an unauthenticated multi-shard deployment (#251): a shard that can receive cross-shard
 	// handoffs MUST have a handoff verify key, or a forged Prepare could inject carried state. Refuse to boot
 	// unless TELOS_ALLOW_INSECURE explicitly opts in (a trusted local multi-node rig, or a Redis-backed single
-	// node) — the same fail-closed-by-default posture as the account caller token. A Redis-backed SINGLE-node
-	// prod deploy is discoverable, so it correctly requires the keypair; generate one (ops).
-	if err := shard.CheckHandoffAuth(); err != nil {
-		if !cfg.AllowInsecure {
-			slog.Error("refusing to start", "err", err)
-			os.Exit(1)
-		}
-		slog.Warn("insecure handoffs (TELOS_ALLOW_INSECURE): a discoverable shard has no handoff verify key", "err", err)
+	// node) — the same fail-closed-by-default posture as the account caller token. The decision is factored
+	// into handoffAuthGate so the fail-closed behavior is testable.
+	if fatal, warn := handoffAuthGate(shard.CheckHandoffAuth(), cfg.AllowInsecure); fatal != nil {
+		slog.Error("refusing to start", "err", fatal)
+		os.Exit(1)
+	} else if warn != "" {
+		slog.Warn(warn)
 	}
 	go shard.Run(worldCtx) // each zone actor loop owns its world state from here on
 
