@@ -17,6 +17,15 @@ import (
 const (
 	sessionOutBuffer      = 256
 	slowClientWedgedDrops = sessionOutBuffer
+
+	// dropRateWindow / dropRateWarnThreshold drive the windowed per-player drop-RATE warn (#46). Over each
+	// window of dropRateWindow send attempts, if the fraction DROPPED reaches the threshold the client is
+	// "limping" — draining some frames but falling behind — which the consecutiveDrops "fully wedged" warn
+	// above never catches (any successful enqueue resets consecutiveDrops). The window is count-based (no
+	// clock read on the hot send path); the warn latches once per limping episode and clears on a healthy
+	// window.
+	dropRateWindow        = 2 * sessionOutBuffer // 512 send attempts per evaluation window
+	dropRateWarnThreshold = 0.5                  // >= 50% of a window dropped => limping
 )
 
 // session is a connected character's connection/handoff state — the Phase-2 exactly-once
@@ -210,6 +219,12 @@ type session struct {
 	// socket. These are zone-owned (send runs on the zone goroutine), so they need no lock.
 	framesDropped    uint64
 	consecutiveDrops int
+	// windowSends / windowDrops / dropRateWarned drive the #46 windowed per-player drop-RATE warn: they count
+	// send attempts + drops within the current dropRateWindow, and latch the warn so a limping client is
+	// flagged once per episode. Zone-owned (send runs on the zone goroutine), so no lock.
+	windowSends    int
+	windowDrops    int
+	dropRateWarned bool
 
 	// pendingNotice is a one-line system message queued while the session is PENDING (the
 	// destination side of a cross-shard handoff, before the gate re-dials and s.out is bound).
@@ -253,10 +268,12 @@ func (z *Zone) newPlayerEntity(s *session, character string) *Entity {
 // DEBUG=1 surfaces client-can't-keep-up situations.
 func (s *session) send(f *playv1.ServerFrame) {
 	f.AckInputSeq = s.appliedSeq
+	s.windowSends++
 	select {
 	case s.out <- f:
 		s.consecutiveDrops = 0 // the writer drained the buffer; the client is keeping up again
 	default:
+		s.windowDrops++
 		s.framesDropped++
 		s.consecutiveDrops++
 		slog.Debug("frame dropped: session out buffer full", "player", s.character,
@@ -265,14 +282,28 @@ func (s *session) send(f *playv1.ServerFrame) {
 		// Phase 16.3: a client that hasn't drained a SINGLE frame for a full buffer's worth of sends is
 		// FULLY wedged (dead/stalled TCP). The zone keeps running (this drop is why it never blocks); the
 		// gate's write-deadline is what actually reclaims the socket+stream. Warn ONCE at the threshold so
-		// ops get a per-player "reclaim incoming" line without one per dropped frame. NOTE: consecutiveDrops
-		// resets on ANY successful enqueue, so this catches only the fully-stalled client — a LIMPING client
-		// (drains a little, drops most) never trips it. That case is covered by the shard-wide FrameDropped
-		// metric above; a windowed per-player drop-rate warn is a deferred refinement (docs/FOLLOW-UPS.md).
+		// ops get a per-player "reclaim incoming" line without one per dropped frame.
 		if s.consecutiveDrops == slowClientWedgedDrops {
 			slog.Warn("slow client wedged: outbound buffer full for a full buffer of frames; "+
 				"gate write-deadline will reclaim the connection",
 				"player", s.character, "drops", s.framesDropped)
 		}
+	}
+	// #46: windowed per-player drop-RATE warn — catches a LIMPING client (drains a little, drops most) that
+	// the consecutiveDrops "fully wedged" warn above misses (any successful enqueue resets consecutiveDrops).
+	// Over each window of dropRateWindow send attempts, warn ONCE if the drop fraction crosses the threshold;
+	// a healthy window clears the latch so a later limping episode warns again. Zone goroutine, no clock read.
+	if s.windowSends >= dropRateWindow {
+		if float64(s.windowDrops) >= dropRateWarnThreshold*float64(s.windowSends) {
+			if !s.dropRateWarned {
+				s.dropRateWarned = true
+				slog.Warn("slow client: high outbound drop rate over the window; the client is falling behind "+
+					"(dropping most or all frames)",
+					"player", s.character, "dropped", s.windowDrops, "of", s.windowSends)
+			}
+		} else {
+			s.dropRateWarned = false // a healthy window: clear the latch
+		}
+		s.windowSends, s.windowDrops = 0, 0
 	}
 }

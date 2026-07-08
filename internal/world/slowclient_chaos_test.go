@@ -44,6 +44,56 @@ func TestSessionSendNeverBlocksAndCountsDrops(t *testing.T) {
 	}
 }
 
+// TestSessionWindowedDropRateWarnCatchesLimpingClient pins #46: a LIMPING client — draining a little but
+// dropping most — trips the windowed per-player drop-RATE warn even though it NEVER hits the fully-wedged
+// consecutiveDrops threshold (which resets on every successful enqueue). This is exactly the case the old
+// consecutive-only signal missed. Driven deterministically: each cycle is 3 drops (buffer full) then a
+// drained success, a 75% drop rate whose consecutive run never climbs past 3.
+func TestSessionWindowedDropRateWarnCatchesLimpingClient(t *testing.T) {
+	s := &session{character: "Limp", out: make(chan *playv1.ServerFrame, 2)}
+	s.send(textFrame("a")) // fill the 2-slot buffer
+	s.send(textFrame("b"))
+
+	maxConsecutive := 0
+	for i := 0; i < 200; i++ { // > dropRateWindow/4 cycles, so it crosses a full window boundary
+		s.send(textFrame("drop")) // buffer full → these 3 drop
+		s.send(textFrame("drop"))
+		s.send(textFrame("drop"))
+		if s.consecutiveDrops > maxConsecutive {
+			maxConsecutive = s.consecutiveDrops
+		}
+		<-s.out                 // drain one slot...
+		s.send(textFrame("ok")) // ...refill it (a success → consecutiveDrops resets to 0)
+	}
+
+	if !s.dropRateWarned {
+		t.Fatal("a limping client (75% drop rate) did not trip the windowed drop-rate warn (#46)")
+	}
+	if maxConsecutive >= slowClientWedgedDrops {
+		t.Fatalf("consecutiveDrops reached %d (>= the fully-wedged threshold) — the test must exercise the "+
+			"LIMPING case the windowed warn UNIQUELY catches, not a fully-stalled client", maxConsecutive)
+	}
+}
+
+// TestSessionWindowedDropRateWarnClearsOnRecovery pins the latch reset: once a client recovers (a full window
+// with a healthy drop rate), the warn latch clears so a LATER limping episode warns again rather than staying
+// silent forever.
+func TestSessionWindowedDropRateWarnClearsOnRecovery(t *testing.T) {
+	s := &session{character: "Recover", out: make(chan *playv1.ServerFrame, 4)}
+	s.dropRateWarned = true // pretend a prior limping episode latched the warn
+
+	for i := 0; i < dropRateWindow; i++ {
+		s.send(textFrame("ok")) // enqueue...
+		select {                // ...and drain immediately so the buffer never fills (no drops)
+		case <-s.out:
+		default:
+		}
+	}
+	if s.dropRateWarned {
+		t.Fatal("a full healthy window did not clear the drop-rate warn latch (#46)")
+	}
+}
+
 // TestZoneServesOthersDespiteAWedgedClient is the Phase-16.3 chaos test: one co-located player whose out
 // channel is NEVER drained (a wedged/dead socket) must not stall the zone or starve other players. A burst
 // of room broadcasts fills the wedged player's buffer (drops pile up) while a healthy player keeps hearing

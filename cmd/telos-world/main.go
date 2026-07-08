@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/double-nibble/telosmud/db"
 	"github.com/double-nibble/telosmud/internal/assertion"
@@ -38,6 +39,20 @@ import (
 	"github.com/double-nibble/telosmud/internal/sessionlock"
 	"github.com/double-nibble/telosmud/internal/store"
 	"github.com/double-nibble/telosmud/internal/world"
+)
+
+// gRPC server keepalive (#46): the world PINGs an idle gate connection every keepaliveTime and closes it if
+// there is no ack within keepaliveTimeout, reclaiming a dead/wedged gate's streams without depending on the
+// gate's own telnet write-deadline. This covers TRANSPORT death (crash/partition/wedged HTTP/2) — it does NOT
+// cover a gate that ACKs pings but stops draining the stream (that residual leak is bounded by part-1 drops +
+// the gate write-deadline; an app-level stream.Send bound is the follow-up, #274). keepaliveMinTime is the
+// enforcement floor: it GOAWAYs a CLIENT that PINGs faster than this. No client (gate pool / handoff dialer)
+// sets client keepalive today, so it never triggers — but this 10s floor is a CONSTRAINT any future gate/peer
+// client keepalive must respect (or the world will GOAWAY it).
+const (
+	keepaliveTime    = 30 * time.Second
+	keepaliveTimeout = 10 * time.Second
+	keepaliveMinTime = 10 * time.Second
 )
 
 // handoffAuthGate is the FAIL-CLOSED boot decision for the keyless-handoff guard (#251), factored out of main
@@ -118,7 +133,22 @@ func main() {
 		slog.Error("listen failed", "addr", cfg.WorldListen, "err", err)
 		os.Exit(1)
 	}
-	gs := grpc.NewServer()
+	// #46: server-side keepalive is the WORLD's own reclaim backstop for a dead/wedged gate connection —
+	// independent of the gate's telnet write-deadline. The server PINGs an idle client every keepaliveTime and
+	// closes the connection if there is no ack within keepaliveTimeout, which cancels every Play stream on it,
+	// unblocking the writer's stream.Send + the reader's stream.Recv so those sessions are reclaimed even if
+	// the gate never tears them down. The enforcement policy permits the gate's own keepalive pings (and
+	// pings with no active stream) so a healthy but briefly-streamless gate is not disconnected.
+	gs := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    keepaliveTime,
+			Timeout: keepaliveTimeout,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             keepaliveMinTime,
+			PermitWithoutStream: true,
+		}),
+	)
 	shard.Register(gs)
 
 	go func() {
