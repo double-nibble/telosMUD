@@ -2,6 +2,7 @@ package content
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -14,7 +15,12 @@ func TestLintRefCharsetClean(t *testing.T) {
 			Ref:  "midgaard",
 			Name: "The City of Midgaard", // a DISPLAY field — spaces are fine, must NOT be flagged
 			Rooms: []RoomDTO{
-				{Ref: "midgaard:room:temple", Name: "The Temple Square"},
+				// Exit-direction keys are DIRECTIONS (dirCharset): letters/digits/`_ -`, no colon. A dotted
+				// VALUE ("far.zone:room") is a target ref that sinks into an equality lookup — never checked.
+				{Ref: "midgaard:room:temple", Name: "The Temple Square", Exits: map[string]string{
+					"north": "midgaard:room:market", "up": "midgaard:room:tower",
+					"north-east": "midgaard:room:gate", "hidden_door": "far.zone:room:vault",
+				}},
 			},
 			Items: []ProtoDTO{{Ref: "midgaard:obj:leather-belt"}}, // hyphen is allowed
 			Mobs:  []ProtoDTO{{Ref: "midgaard:mob:orc"}},
@@ -28,6 +34,8 @@ func TestLintRefCharsetClean(t *testing.T) {
 		// Recipe short-names legitimately carry spaces (multi-word isname/prefix keyword) and must NOT be
 		// flagged — RecipeDTO.Aliases is deliberately excluded from the verb-list charset check.
 		Recipes: []RecipeDTO{{Ref: "recipe:leather-vest", Aliases: []string{"vest", "leather vest"}}},
+		// Trust-tier names are the ladder's identity key (no Ref on TrustTierDTO) — checked with refCharset.
+		TrustTiers: []TrustTierDTO{{Name: "player", Rank: 0}, {Name: "builder", Rank: 10}},
 	}
 	if got := LintRefCharset([]Pack{p}); len(got) != 0 {
 		t.Fatalf("clean pack produced findings: %+v", got)
@@ -74,6 +82,110 @@ func TestLintRefCharsetCatchesBadTokens(t *testing.T) {
 	}
 	if len(got) != 7 {
 		t.Fatalf("expected exactly 7 findings, got %d: %+v", len(got), got)
+	}
+}
+
+// TestLintRefCharsetExitDirectionKeys (#234): an exit-direction map KEY reaches a GMCP JSON key + the
+// movement parser, so a direction with a dot / brace / space / colon is flagged (field "Exits"); a clean
+// direction (incl. hyphen/underscore) is not; and the exit VALUE (a target room ref) is NEVER charset-checked.
+func TestLintRefCharsetExitDirectionKeys(t *testing.T) {
+	p := Pack{
+		Pack: "exits",
+		Zones: []ZoneDTO{{
+			Ref: "maze",
+			Rooms: []RoomDTO{{
+				Ref: "maze:room:1",
+				Exits: map[string]string{
+					"north":          "maze:room:2",     // clean
+					"north-east":     "maze:room:3",     // hyphen ok
+					"hidden_door":    "maze:room:4",     // underscore ok
+					"west":           "far.zone:room:9", // clean KEY, dotted VALUE — value must NOT be flagged
+					"":               "maze:room:0",     // empty key — skipped, like an omitempty ref
+					"hidden.passage": "maze:room:5",     // dot — bad (GMCP/NATS key)
+					"up down":        "maze:room:6",     // space — bad (tokenizer)
+					"portal:x":       "maze:room:7",     // colon — a direction is not a segmented ref, bad
+					"portal*":        "maze:room:8",     // NATS wildcard — bad
+					"orc{}":          "maze:room:9b",    // brace — bad (GMCP JSON / tokenizer)
+				},
+			}},
+		}},
+	}
+	got := LintRefCharset([]Pack{p})
+	bad := map[string]RefCharsetViolation{} // value -> finding
+	for _, v := range got {
+		if v.Pack != "exits" {
+			t.Fatalf("finding attributed to wrong pack: %+v", v)
+		}
+		bad[v.Value] = v
+	}
+	for _, want := range []string{"hidden.passage", "up down", "portal:x", "portal*", "orc{}"} {
+		if bad[want].Field != "Exits" {
+			t.Errorf("expected direction %q flagged as field Exits; got %q (all: %+v)", want, bad[want].Field, got)
+		}
+		if !strings.Contains(bad[want].Charset, "direction") {
+			t.Errorf("direction finding %q must carry the DIRECTION charset label; got %q", want, bad[want].Charset)
+		}
+	}
+	for _, ok := range []string{"north", "north-east", "hidden_door", "west"} {
+		if _, flagged := bad[ok]; flagged {
+			t.Errorf("clean direction %q was flagged: %+v", ok, got)
+		}
+	}
+	// An empty exit-direction key is skipped (the omitempty-ref rule), not flagged.
+	if _, flagged := bad[""]; flagged {
+		t.Errorf("empty exit key should be skipped, not flagged: %+v", got)
+	}
+	// Exit VALUES (target refs) sink into an equality lookup, never a raw subject/key — never charset-checked.
+	if _, flagged := bad["far.zone:room:9"]; flagged {
+		t.Errorf("exit VALUE far.zone:room:9 must not be charset-checked: %+v", got)
+	}
+	if len(got) != 5 {
+		t.Fatalf("expected exactly 5 direction findings, got %d: %+v", len(got), got)
+	}
+}
+
+// TestLintRefCharsetTrustTierName (#234): TrustTierDTO has no Ref — the loader keys tiers by Name and the
+// world derives rank/flags by it, so a tier Name with a bad char is flagged (field "Name"); a clean tier
+// name is not, and the tier's non-identity fields (Flags, a []string not in refListFields) are untouched.
+func TestLintRefCharsetTrustTierName(t *testing.T) {
+	p := Pack{
+		Pack: "tiers",
+		TrustTiers: []TrustTierDTO{
+			{Name: "builder", Rank: 10, Flags: []string{"builder"}}, // clean; Flags not charset-checked
+			{Name: "arch:mage", Rank: 15},                           // colon — CLEAN: tier Name uses refCharset (allows ':'), NOT dirCharset
+			{Name: "", Rank: 5},                                     // empty name — skipped
+			{Name: "super admin", Rank: 20},                         // space — bad
+			{Name: "arch.mage", Rank: 30},                           // dot — bad
+		},
+	}
+	got := LintRefCharset([]Pack{p})
+	bad := map[string]RefCharsetViolation{}
+	for _, v := range got {
+		bad[v.Value] = v
+	}
+	for _, want := range []string{"super admin", "arch.mage"} {
+		if bad[want].Field != "Name" {
+			t.Errorf("expected tier name %q flagged as field Name; got %q (all: %+v)", want, bad[want].Field, got)
+		}
+		// Name is an identity token, judged by refCharset — its finding must NOT carry the direction label.
+		if strings.Contains(bad[want].Charset, "direction") {
+			t.Errorf("tier-name finding %q must use the REF charset (colon-allowing), not the direction charset; got %q", want, bad[want].Charset)
+		}
+	}
+	// The load-bearing distinction: a colon in a tier name is CLEAN (refCharset allows ':'), whereas the same
+	// colon in an exit direction is rejected. This is the only case that pins Name to refCharset, not dirCharset.
+	if _, flagged := bad["arch:mage"]; flagged {
+		t.Errorf("tier name with a colon must be CLEAN (refCharset allows ':'): %+v", got)
+	}
+	if _, flagged := bad["builder"]; flagged {
+		t.Errorf("clean tier name was flagged: %+v", got)
+	}
+	// An empty tier name is skipped (the omitempty-ref rule).
+	if _, flagged := bad[""]; flagged {
+		t.Errorf("empty tier name should be skipped, not flagged: %+v", got)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected exactly 2 tier-name findings, got %d: %+v", len(got), got)
 	}
 }
 

@@ -94,11 +94,12 @@ func validatePacks(loaded []content.Pack) []string {
 	for _, v := range content.LintReservedCoreRefs(loaded) {
 		problems = append(problems, fmt.Sprintf("pack %q ships %s %q under the reserved core: namespace (would clobber the embedded bootstrap pack)", v.Pack, v.Kind, v.Ref))
 	}
-	// Ref charset (#66): an identity token with a character outside [A-Za-z0-9_:-] can break a GMCP key, a
-	// comms subject, or the targeting tokenizer (all of which assume refs are metacharacter-free). The boot
-	// lint only WARNS; here — the broadcast gate — it is a hard REJECT so a bad token never enters a reload.
+	// Ref charset (#66, extended #234): an identity token (ref/verb/surface/tier-name) or an exit-direction
+	// key with a character outside ITS safe charset can break a GMCP key, a comms subject, or the targeting
+	// tokenizer (all of which assume tokens are metacharacter-free). Directions get a colon-excluding charset.
+	// The boot lint only WARNS; here — the broadcast gate — it is a hard REJECT so a bad token never reloads.
 	for _, v := range content.LintRefCharset(loaded) {
-		problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside the safe charset [A-Za-z0-9_:-] (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value))
+		problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside its safe charset %s (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value, v.Charset))
 	}
 	return problems
 }
