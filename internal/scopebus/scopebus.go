@@ -21,8 +21,10 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
+	"github.com/double-nibble/telosmud/internal/metrics"
 )
 
 // SubjectRoot namespaces every scoped-event subject, distinct from the comms namespace (telos.comms.*).
@@ -110,6 +112,27 @@ func validScopeID(id string) bool {
 type scopeMsg struct {
 	Event   string          `json:"event"`
 	Payload json.RawMessage `json:"payload,omitempty"`
+	// PubMillis is the publisher's wall-clock time (Unix ms) stamped at Signal/SignalDurable, used ONLY to
+	// record the publish->deliver latency at the subscriber (metrics.RecordBusLag, #44 piggyback). It is an
+	// observability aid, never a correctness input (ordering/idempotency ride the seq key), and omitempty so
+	// an old/foreign publisher that never set it is simply not measured.
+	PubMillis int64 `json:"t,omitempty"`
+}
+
+// recordBusDeliverLag records the publish->deliver latency for a delivered scoped message, when the
+// publisher stamped a time (#44). Off any correctness path — a pure observability sample. The delta is
+// CLAMPED at 0: cross-host wall-clock skew can make now-PubMillis negative, and a negative sample would drag
+// down the histogram's SUM (poisoning any avg=sum/count dashboard panel) while telling us nothing about
+// delivery latency — clock-skew monitoring is a separate concern, not this metric's job.
+func recordBusDeliverLag(pubMillis int64) {
+	if pubMillis <= 0 {
+		return
+	}
+	lag := time.Now().UnixMilli() - pubMillis
+	if lag < 0 {
+		lag = 0
+	}
+	metrics.RecordBusLag(context.Background(), float64(lag))
 }
 
 // Handler receives one scoped event: the event name, its payload, and the source id (the emitting
@@ -149,7 +172,7 @@ func (b *Bus) Signal(ctx context.Context, scope Scope, event string, payload jso
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(scopeMsg{Event: event, Payload: payload})
+	body, err := json.Marshal(scopeMsg{Event: event, Payload: payload, PubMillis: time.Now().UnixMilli()})
 	if err != nil {
 		return err
 	}
@@ -168,6 +191,7 @@ func (b *Bus) Subscribe(scope Scope, handler Handler) (commbus.Subscription, err
 		if err := json.Unmarshal([]byte(m.Body), &sm); err != nil || sm.Event == "" {
 			return // a malformed scoped message is dropped, never delivered as a bogus event
 		}
+		recordBusDeliverLag(sm.PubMillis) // #44: publish->deliver latency (transient tier)
 		handler(sm.Event, sm.Payload, m.AuthorID)
 	})
 }
@@ -222,7 +246,7 @@ func (b *Bus) SignalDurable(ctx context.Context, scope Scope, event string, payl
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(scopeMsg{Event: event, Payload: payload})
+	body, err := json.Marshal(scopeMsg{Event: event, Payload: payload, PubMillis: time.Now().UnixMilli()})
 	if err != nil {
 		return err
 	}
@@ -253,7 +277,7 @@ func (b *Bus) SubscribeDurable(scope Scope, consumerID string, handler DurableHa
 			return true // a malformed durable message is acked away, not redelivered forever
 		}
 		_, seq, seqOK := commbus.ParseIdempotencyKey(m.IdempotencyKey)
-		return handler(DurableEvent{
+		ack := handler(DurableEvent{
 			Event:   sm.Event,
 			Payload: sm.Payload,
 			Source:  m.AuthorID,
@@ -262,5 +286,13 @@ func (b *Bus) SubscribeDurable(scope Scope, consumerID string, handler DurableHa
 			SeqOK:   seqOK,
 			Backlog: backlog,
 		})
+		// #44: record publish->first-successful-deliver latency for LIVE events only, and only on the ACK.
+		// Skipping backlog excludes downtime catch-up (a separate catch-up-depth metric is #276); recording AFTER a
+		// successful ack means a NAK'd redelivery (a poison message, a transient apply failure + backoff) is
+		// not sampled once per attempt with an ever-growing lag — which would skew the histogram upward.
+		if ack && !backlog {
+			recordBusDeliverLag(sm.PubMillis)
+		}
+		return ack
 	})
 }
