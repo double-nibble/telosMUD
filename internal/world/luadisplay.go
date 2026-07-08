@@ -38,11 +38,14 @@ var consultedDisplaySurfaces = map[string]bool{
 // ROOT invocation (a player-issued display command, not inside a cascade); the viewer is the invocation actor.
 //
 // Output sanitization: the returned sheet is content-authored but is a MULTI-LINE, pre-formatted block whose
-// intended markup includes newlines, `{{TOKEN}}` color, and zero-width bidi controls (Cf). It is deliberately
-// NOT run through textsan.CleanMarkup (which strips EVERY control rune, newlines included, and is for single-line
-// free-text like say/tell). The correct layer is the telnet edge: Write's sanitizeOutput strips raw Cc controls
-// EXCEPT CR/LF while preserving the Cf bidi controls, and renderColor then turns the color tokens into SGR — so
-// a raw ESC a template embeds is stripped at the edge (proven by TestScoreSheetE2E rendering color, not markup).
+// intended markup includes newlines, `{{TOKEN}}` color, and consoleui's zero-width bidi ISOLATE/MARK controls
+// (FSI…PDI + LRM, for RTL column stability). It is deliberately NOT run through textsan.CleanMarkup (which
+// strips EVERY control rune, newlines included, AND the whole bidi subset — it's for single-line free-text like
+// say/tell). The correct layer is the telnet edge: Write's sanitizeOutput strips raw Cc controls EXCEPT CR/LF
+// and the STRONG bidi OVERRIDE block (U+202A–U+202E, isStrongBidiOverride) while PRESERVING consoleui's balanced
+// isolates + LRM (#25b narrowed the edge strip to overrides only, so the sheet's own grid survives); renderColor
+// then turns the color tokens into SGR — so a raw ESC or a smuggled override a template embeds is dropped at the
+// edge (color render proven by TestScoreSheetE2E; isolate survival by TestConsoleUISheetKeepsIsolatesThroughEdge).
 func (z *Zone) renderDisplaySheet(surface string, self *Entity) (string, bool) {
 	if z == nil || z.lua == nil || self == nil {
 		return "", false

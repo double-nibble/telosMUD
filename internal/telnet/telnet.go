@@ -400,7 +400,7 @@ func sanitizeOutput(s string) string {
 	clean := utf8.ValidString(s)
 	if clean {
 		for _, r := range s {
-			if (r != '\r' && r != '\n' && unicode.IsControl(r)) || isBidiOverride(r) {
+			if (r != '\r' && r != '\n' && unicode.IsControl(r)) || isStrongBidiOverride(r) {
 				clean = false
 				break
 			}
@@ -425,7 +425,7 @@ func sanitizeOutput(s string) string {
 			i++
 			continue
 		}
-		if (r != '\r' && r != '\n' && unicode.IsControl(r)) || isBidiOverride(r) {
+		if (r != '\r' && r != '\n' && unicode.IsControl(r)) || isStrongBidiOverride(r) {
 			i += size
 			continue
 		}
@@ -435,16 +435,25 @@ func sanitizeOutput(s string) string {
 	return b.String()
 }
 
-// isBidiOverride reports whether r is an explicit Unicode bidi-override control — the "Trojan Source"
-// visual-spoofing subset (CVE-2021-42574, #22): the embedding/override block U+202A–U+202E (LRE/RLE/PDF/
-// LRO/RLO) and the isolate block U+2066–U+2069 (LRI/RLI/FSI/PDI). These are category Cf, so unicode.IsControl
-// (Cc only) does NOT catch them and sanitizeOutput would otherwise pass them verbatim onto the terminal,
-// letting a player name/message DISPLAY as something other than its bytes. It is a NARROW subset: legitimate
-// implicit bidi marks (LRM/RLM/ALM) and the zero-width joiners (ZWNJ/ZWJ) are Cf too but preserved. The edge
-// keeps its own copy of this predicate rather than importing internal/textsan.IsBidiOverride, so the edge and
-// world trust domains stay independently defensible (the same reason sanitizeLine mirrors, not shares).
-func isBidiOverride(r rune) bool {
-	return (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069)
+// isStrongBidiOverride reports whether r is one of the STRONG Unicode bidi CHARACTER-REVERSAL controls — the
+// embedding/override block U+202A–U+202E (LRE/RLE/PDF/LRO/RLO). These force a character-level direction that
+// can display an arbitrary byte run as a DIFFERENT string (the high-value "Trojan Source" forgery primitive,
+// CVE-2021-42574) and their effect runs to line end, so they can also reorder engine-generated text that
+// FOLLOWS the attacker's token on the same line. They are Cf (unicode.IsControl, Cc-only, misses them), have
+// zero legitimate use in a terminal stream, so sanitizeOutput drops them universally.
+//
+// DELIBERATELY NARROWER than textsan.IsBidiOverride (#25b): this edge predicate does NOT include the isolate
+// block U+2066–U+2069 (LRI/RLI/FSI/PDI). Isolates are the Unicode-recommended SAFE containment mechanism, and
+// internal/consoleui EMITS balanced FSI…PDI around RTL table cells for column stability — output that travels
+// this exact Send→Write path. Stripping them here corrupted the engine's OWN grid. Untrusted player/builder
+// content is separately neutralized of the FULL subset (isolates included) upstream by internal/textsan
+// (CleanMarkup / NeutralizeBidi / stripOutputControl) before it reaches the edge, so isolate spoofing stays
+// closed there; the residual — a player's own free-text isolates weakly reordering that message's line tail —
+// is Low and accepted (names are immune: validateName rejects all Cf). The divergence from textsan is
+// intentional, a provenance split, not drift. The edge keeps its own copy rather than importing textsan so
+// the two trust domains stay independently defensible (as sanitizeLine mirrors, not shares).
+func isStrongBidiOverride(r rune) bool {
+	return r >= 0x202A && r <= 0x202E
 }
 
 // WriteScreen sends pre-formed raw terminal bytes (a TRUSTED full-screen/ANSI sequence: cursor

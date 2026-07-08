@@ -349,15 +349,12 @@ func padVisible(s string, width int, align Align) string {
 }
 
 // truncateVisible truncates s to at most maxCells visible cells, PRESERVING `{{...}}` color tokens and appending
-// an ellipsis "…" (1 cell) when content is dropped. It also tracks bidi-isolate nesting and CLOSES any isolate
-// still open at the cut (before the ellipsis), so truncating an RTL cell never leaves a dangling FSI. maxCells<=0
-// yields "".
-//
-// Known limitation: if truncation cuts before a cell's closing COLOR reset token, that token is dropped and the
-// color can bleed rightward until the edge's end-of-payload reset. This only bites fixed-width overflow of a
-// colored cell; a color-vocabulary-aware reset on truncation is a follow-up (the package intentionally knows the
-// token FORMAT, not the token NAMES, to stay decoupled from the edge's SGR map — unlike the isolate pair, which
-// is this package's own).
+// an ellipsis "…" (1 cell) when content is dropped. It also CLOSES, at the cut, both structural markups a cut
+// could leave dangling: any open COLOR (a synthesized {{RESET}} when a cell's closing reset is beyond the cut,
+// so color can't bleed rightward into the row padding / next column — #25a) and any open bidi ISOLATE (the
+// trailing PDIs). Both closers land in the right order: {{RESET}} then the neutral ellipsis then the PDIs.
+// maxCells<=0 yields "". The color close relies only on the token FORMAT ({{RESET}} = SGR "0"), so the package
+// stays decoupled from the edge's full SGR name map.
 func truncateVisible(s string, maxCells int) string {
 	if maxCells <= 0 {
 		return ""
@@ -366,11 +363,23 @@ func truncateVisible(s string, maxCells int) string {
 	var b strings.Builder
 	vw := 0
 	isolateDepth := 0
-	cut := func() string { return b.String() + "…" + strings.Repeat(pdi, isolateDepth) }
+	colorOpen := false // a color token was set and not yet reset (#25a)
+	// cut closes the cell at the truncation point: it appends a {{RESET}} if a color is still open (so the
+	// cell's color can't BLEED past the truncation into the row's padding/next columns — previously it leaked
+	// until the edge's end-of-frame reset), then the ellipsis (neutral-colored), then the PDIs for any open
+	// bidi isolate. Reset before the ellipsis keeps the truncation marker in the default color.
+	cut := func() string {
+		reset := ""
+		if colorOpen {
+			reset = "{{RESET}}"
+		}
+		return b.String() + reset + "…" + strings.Repeat(pdi, isolateDepth)
+	}
 	for i := 0; i < len(s); {
 		if strings.HasPrefix(s[i:], "{{") {
 			if params, next := colormarkup.ScanTokenRun(s, i); len(params) > 0 {
-				b.WriteString(s[i:next]) // keep the whole (zero-width) known token run
+				b.WriteString(s[i:next])                 // keep the whole (zero-width) known token run
+				colorOpen = params[len(params)-1] != "0" // "0" is RESET; the run's last param sets the state
 				i = next
 				continue
 			}
