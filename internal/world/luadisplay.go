@@ -59,7 +59,7 @@ func (z *Zone) renderDisplaySheet(surface string, self *Entity) (string, bool) {
 		return "", false // no body / compile failed (inert)
 	}
 	binds := map[string]lua.LValue{"self": rt.newHandle(self)}
-	return rt.invokeForString(ch, &luaInvocation{actor: self, display: true}, binds)
+	return rt.invokeForString(ch, &luaInvocation{actor: self, display: true, displayRoom: self.location}, binds)
 }
 
 // displayRecord is ONE plain-data row bound into a collection template's `list`. It is deliberately NOT a
@@ -124,7 +124,7 @@ func (z *Zone) renderDisplayList(surface string, self *Entity, entries []*displa
 		"self": rt.newHandle(self),
 		"list": rt.newRecordList(entries),
 	}
-	return rt.invokeForString(ch, &luaInvocation{actor: self, display: true}, binds)
+	return rt.invokeForString(ch, &luaInvocation{actor: self, display: true, displayRoom: self.location}, binds)
 }
 
 // newRecordList materializes the records as a Lua array VALUE of record tables (1-based, in order). Unlike
