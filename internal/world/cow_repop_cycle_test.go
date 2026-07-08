@@ -31,7 +31,7 @@ import (
 // pulse pacing, no wall clock — the death and the repop are driven explicitly.
 func TestCOWKillRepopRekillCycle(t *testing.T) {
 	z := newDemoZone("darkwood", newProtoCache())
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 
 	// The hollow is where the demo's reset op spawns the goblin (demo.yaml darkwood resets:
 	// {op: spawn_mob, proto: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}).

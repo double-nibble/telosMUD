@@ -152,10 +152,12 @@ type Zone struct {
 	// Zone-owned; only the zone goroutine touches it.
 	combatPulse *pulseHandle
 
-	// testCombatRng is a SEEDED rng a test installs so a whole combat round (to-hit/avoidance/damage)
-	// is deterministic; nil in production (the swing pipeline then uses the package default randIntn).
-	// Zone-owned, set only on a bare test zone before driving rounds. Never set on a live zone.
-	testCombatRng *rand.Rand
+	// combatRand is the zone-owned SEEDED rng the combat resolver draws from (to-hit / avoidance / damage
+	// and in-combat ability rolls). Seeded at newZone from seedFromZoneID(id) so a fight is reproducible
+	// from the zone seed (#58) — production no longer draws combat from the process-global math/rand.
+	// Mutated ONLY on the zone goroutine (single-writer), so it needs no lock. A test overrides it with a
+	// fixed seed for a known sequence; a replay harness can inject a recorded seed the same way.
+	combatRand *rand.Rand
 
 	// repopPulse holds the cancel handle for this zone's repop-cadence pulse callback (reset.go).
 	// nil until startRepop registers it at build time (skipped when reset_secs==0 — no timed
@@ -537,6 +539,13 @@ func newZone(id string) *Zone {
 		persistentDone:    map[string]bool{},
 		pendingFinalFlush: map[string]CharSnapshot{},
 		inbox:             make(chan msg, 256),
+		// Zone-owned combat rng (#58): the combat resolver + player-cast ability rolls draw from THIS
+		// instance instead of the process-global math/rand, so a fight is seedable/replayable. Seeded from
+		// ENTROPY in production, deliberately: a zone-id-derived seed would make live crits predictable
+		// every restart (the id is public) — worse than today's global rand — and would correlate this
+		// stream with z.lua.rng (also id-seeded). A test or a replay harness reassigns z.combatRand with a
+		// FIXED seed for a reproducible sequence. Mutated only on the zone goroutine (single-writer).
+		combatRand: rand.New(rand.NewSource(rand.Int63())), //nolint:gosec // gameplay roll, not security
 		// A private, empty prototype cache by default. A shard-hosted zone has this
 		// replaced with the shared per-shard cache (newShard); a bare test zone keeps its
 		// own so spawn works standalone.

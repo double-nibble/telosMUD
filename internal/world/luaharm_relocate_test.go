@@ -26,7 +26,7 @@ import (
 func relocateZone(t *testing.T) (*Zone, *session, *Entity) {
 	t.Helper()
 	z, fleer, from := reactionZone(t)
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 	return z, fleer, from
 }
 

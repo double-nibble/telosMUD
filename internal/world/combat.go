@@ -647,16 +647,13 @@ func hitOrCrit(crit bool) string {
 	return "hit"
 }
 
-// combatRng returns the rng the round driver feeds swing checks/damage. Production uses the package
-// default (nil ctx rng -> randIntn); a test installs a seeded source via z.testCombatRng for
-// determinism (the d1/size-1 trick + a seeded source make a whole fight reproducible).
-//
-// TODO(reproducibility): production combat draws from the PROCESS-GLOBAL math/rand default, so a live
-// fight isn't replayable from a zone seed. A zone-OWNED seeded *rand.Rand (seeded at zone build, mutated
-// only on this goroutine) would make production fights reproducible for the test-engineer's replay/chaos
-// harness without the test-only field — a small follow-up; deferred to keep 6.3a focused.
+// combatRng returns the zone-owned rng every combat draw routes through (#58): swing to-hit/avoidance/
+// crit + damage dice, player-cast ability rolls, and native affect (DoT) tick damage — so a fight no
+// longer draws from the process-global math/rand and is reproducible when the source is seeded. Seeded
+// from entropy in production (see newZone) and reassigned with a fixed seed by tests / a replay harness.
+// Mutated only on the zone goroutine (single-writer). Never nil — newZone is the sole Zone constructor.
 func (z *Zone) combatRng() *rand.Rand {
-	return z.testCombatRng
+	return z.combatRand
 }
 
 // combatMsg emits the per-stage combat narration (docs/COMBAT.md §3 — each stage emits its own
