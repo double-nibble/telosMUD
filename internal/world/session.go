@@ -46,12 +46,14 @@ type session struct {
 	entity *Entity
 
 	// tier is the account trust tier (#27) from the VERIFIED session assertion, set on fresh-login attach.
-	// player/builder/admin; "" (== player) on the dev/unverified path. It is a LOGIN-TIME input the zone uses
-	// to DERIVE the reserved builder/admin/holylight flags on spawn (applyTierFlags). Those flags are NOT
-	// persisted or carried on the (unauthenticated) handoff snapshot (security-audit H-1) — they are re-
-	// derived from the tier at each fresh login. A cross-shard handoff currently DROPS elevation (fail-closed);
-	// carrying the tier on the signed handoff snapshot to re-derive at the destination is a follow-up.
-	// Zone-goroutine-owned.
+	// player/builder/admin (content-defined ladder); "" (== baseline) on the dev/unverified path. It is the
+	// input the zone uses to DERIVE the reserved builder/admin/holylight flags on spawn (applyTierFlags). The
+	// FLAGS themselves are NOT persisted or carried on the handoff snapshot (security-audit H-1: a flag restore
+	// bypasses the content op guard) — they are re-derived from the tier. The tier IS carried across a
+	// cross-shard handoff, but only on the SIGNED snapshot (#106): it rides the authenticated payload and is
+	// re-derived at the destination, so an admin/builder keeps elevation across a shard walk while a forged
+	// snapshot cannot inject it. A keyless (unverified) shard strips the carried tier at Prepare, so elevation
+	// is applied only from a verified source. Zone-goroutine-owned.
 	tier string
 
 	// lastVitals / lastStatus are the last GMCP Char.Vitals / Char.Status payloads emitted to this

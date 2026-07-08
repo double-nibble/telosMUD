@@ -112,4 +112,13 @@ message PlayerSnapshot {
   // AppliedSeq is NOT routed through this subtree: the handoff seeds it from field 12 (a fresh
   // login restarts the input-dedup fence; a handoff keeps the same gate session).
   string state_json = 15;
+  // tier is the player's account trust tier (#27/#106) — the value the world derives builder/admin/holylight
+  // from. It rides the SIGNED handoff payload (bound by snapshot_sig, see internal/world/handoffsig.go), so it
+  // is as trustworthy as the rest of the snapshot; the destination sets session.tier from it and re-derives the
+  // reserved flags via applyTierFlags on activation. This is the SECURE replacement for carrying the reserved
+  // flags themselves: those were removed from the flags map (H-1) because that map restores via the trusted
+  // setFlag path and is not integrity-checked, so a forged snapshot could inject them; the tier, by contrast,
+  // is only ever trusted from a signed source. Empty for a player at the baseline tier (the common case) — the
+  // destination then applies no elevation, identical to the pre-#106 fail-closed behavior (a dropped tier).
+  string tier = 16;
 }

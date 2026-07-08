@@ -92,6 +92,11 @@ func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 		// Built at the freeze point on the zone goroutine, so the read is race-free and affect/cooldown
 		// remaining values are conserved (the frozen source does not tick). Empty for a bare player.
 		StateJson: dumpStateJSON(s),
+		// Carry the account trust tier (#106) so the destination re-derives builder/admin/holylight there. The
+		// tier rides the SIGNED payload (snapshotSigningInput binds it), so it is trustworthy in a way the raw
+		// reserved FLAGS are not — those were removed from the dump/restore path (H-1) precisely because the
+		// flag-restore bypasses the content op guard. Empty for a baseline player (no elevation to carry).
+		Tier: s.tier,
 	}
 }
 
