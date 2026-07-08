@@ -10,6 +10,7 @@ import (
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/colormarkup"
+	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
 // roomNum maps a room's ProtoRef to the stable integer id GMCP Room.Info uses (`num`, and the exit
@@ -34,10 +35,16 @@ func roomNum(ref ProtoRef) int {
 // structured data a rich client displays raw, so every name-shaped field below goes through gmcpText
 // (JSON-escaping makes a leaked token injection-safe, but the client would SHOW the literal braces).
 
-// gmcpText strips the known {{TOKEN}} color vocabulary from a content-authored display string bound for
-// a GMCP payload. Unknown {{...}} runs stay literal, exactly matching what a color-off telnet client
-// sees (colormarkup.Strip is the shared edge tokenizer, so the two can't drift).
-func gmcpText(s string) string { return colormarkup.Strip(s) }
+// gmcpText sanitizes a content-authored display string bound for a GMCP payload. It (1) strips the known
+// {{TOKEN}} color vocabulary — unknown {{...}} runs stay literal, exactly matching what a color-off telnet
+// client sees (colormarkup.Strip is the shared edge tokenizer, so the two can't drift) — and (2) neutralizes
+// the Trojan-Source bidi-override subset (#22). Step 2 is essential HERE because these frames reach the
+// client via gate.go's verbatim WriteGMCP forward, which BYPASSES telnet.sanitizeOutput (where the telnet
+// text path drops the same subset); JSON-escaping keeps a leaked override wire-safe but NOT display-safe, so
+// a content-authored mob/item/room name could otherwise spoof a rich client. This is the single funnel for
+// every GMCP display name (Char.Status target, Room.Info name/environment, Char.Items/Room.Players names),
+// so both guarantees hold for all of them in one place, and telnet vs GMCP display stays consistent.
+func gmcpText(s string) string { return textsan.NeutralizeBidi(colormarkup.Strip(s)) }
 
 // gmcpFrame wraps a GMCP package name + JSON payload as a world->gate ServerFrame.
 func gmcpFrame(pkg string, payload []byte) *playv1.ServerFrame {

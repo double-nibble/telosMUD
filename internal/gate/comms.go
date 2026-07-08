@@ -59,6 +59,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/colormarkup"
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/telnet"
+	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
 // commsClient is one connection's gate-side comms subscription set + receiver-side filter state. It is
@@ -280,12 +281,16 @@ func (c *commsClient) deliverChannel(msg commbus.Message) {
 	// A channel_def format may carry {{TOKEN}} color markup, which only the telnet Write path renders —
 	// strip it from both here so a rich client doesn't display literal braces (colormarkup.Strip is the
 	// shared edge tokenizer; JSON escaping already made a leaked token injection-safe, this is cosmetic).
+	// This GMCP path BYPASSES telnet.Write's sanitizeOutput, so it must ALSO neutralize the Trojan-Source
+	// bidi-override controls itself (#22): JSON-escaping keeps them wire-safe but not display-safe, so a
+	// rich client rendering the talker/text/msg would otherwise be spoofable. textsan.NeutralizeBidi drops
+	// only the explicit override subset — legitimate Arabic/Hebrew (implicit marks) and emoji ZWJ survive.
 	if c.gmcp.supported("Comm.Channel.Text") {
 		payload, _ := json.Marshal(map[string]string{
 			"channel": strings.TrimPrefix(msg.Subject, commbus.ChanPrefix),
-			"talker":  colormarkup.Strip(msg.AuthorName),
-			"text":    colormarkup.Strip(msg.Body),
-			"msg":     colormarkup.Strip(msg.Text),
+			"talker":  textsan.NeutralizeBidi(colormarkup.Strip(msg.AuthorName)),
+			"text":    textsan.NeutralizeBidi(colormarkup.Strip(msg.Body)),
+			"msg":     textsan.NeutralizeBidi(colormarkup.Strip(msg.Text)),
 		})
 		_ = c.tc.WriteGMCP("Comm.Channel.Text", payload)
 	}

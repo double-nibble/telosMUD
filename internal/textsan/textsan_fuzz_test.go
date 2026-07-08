@@ -38,7 +38,9 @@ func FuzzTextsan(f *testing.F) {
 		{"tab\tand\nnewline\rand a \x00 NUL", 32},
 		{"emoji 🜂 and accents café résumé", 4},
 		{"\xff\xfe invalid utf8 bytes \x80", 10},
-		{"zero\u200bwidth\u200band\ufefffmt", 12}, // non-print, non-control format runes (ZWSP, BOM)
+		{"zero\u200bwidth\u200band\ufefffmt", 12},                                 // non-print, non-control format runes (ZWSP, BOM)
+		{"user\u202eadmin\u2069 \u200emark", 20},                                  // Trojan-Source bidi overrides (#22) + a legit LRM mark
+		{"\u0645\u0631\u062d\u0628\u0627\u200d\U0001F468\u200d\U0001F469 rtl", 8}, // legitimate Arabic + emoji ZWJ (must survive)
 		{"$n waves at $N with {color} markup", 64},
 		{"", 0},
 		{"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 3},
@@ -90,6 +92,16 @@ func FuzzTextsan(f *testing.F) {
 		for _, r := range name {
 			if unicode.IsControl(r) || !unicode.IsPrint(r) {
 				t.Fatalf("CleanName left a non-graphic rune %U in %q", r, name)
+			}
+		}
+		// BIDI-OVERRIDE (#22): no OUTPUT-bound sanitizer may leave a Trojan-Source override control. CleanMarkup
+		// and NeutralizeBidi drop the subset explicitly; CleanName drops it via !IsPrint (Cf is non-graphic).
+		neut := NeutralizeBidi(s)
+		for _, tc := range []struct{ label, out string }{{"CleanMarkup", markup}, {"NeutralizeBidi", neut}, {"CleanName", name}} {
+			for _, r := range tc.out {
+				if IsBidiOverride(r) {
+					t.Fatalf("%s left a bidi-override %U in %q", tc.label, r, tc.out)
+				}
 			}
 		}
 

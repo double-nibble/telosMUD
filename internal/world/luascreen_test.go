@@ -145,6 +145,24 @@ func TestScreenWriteStripsC1Bytes(t *testing.T) {
 	}
 }
 
+// TestScreenWriteStripsBidiOverride is the #22 regression on the sanitizer-BYPASSING screen path: write()
+// runs sanitizeScreenText, which (like sanitizeOutput) gated only on Cc controls and so let the Cf
+// bidi-override subset (RLO U+202E = UTF-8 E2 80 AE, and the isolates) through — a Trojan-Source spoof on a
+// full-screen surface. It must now drop the override subset while preserving legitimate RTL text (Arabic
+// alef U+0627 = D8 A7).
+func TestScreenWriteStripsBidiOverride(t *testing.T) {
+	out := runScreen(t, `screen.frame():write("adm\226\128\174in \216\167"):show(self)`)
+	if strings.ContainsRune(out, 0x202E) {
+		t.Fatalf("write() must strip the RLO bidi-override; got %q", out)
+	}
+	if !strings.Contains(out, "admin") {
+		t.Fatalf("surrounding text should remain (override dropped, not the letters); got %q", out)
+	}
+	if !strings.ContainsRune(out, 0x0627) {
+		t.Fatalf("legitimate Arabic letter stripped (only the OVERRIDE subset should go); got %q", out)
+	}
+}
+
 // TestScreenAtClampsCoords: out-of-range cursor coordinates are clamped to [1, maxScreenCoord], so a script
 // can never emit an absurd ESC[N;NH.
 func TestScreenAtClampsCoords(t *testing.T) {

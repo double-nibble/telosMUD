@@ -104,6 +104,68 @@ func TestCleanLineCaps(t *testing.T) {
 	}
 }
 
+// TestIsBidiOverride pins the exact Trojan-Source override subset (#22): only U+202A–U+202E and
+// U+2066–U+2069 are overrides; the block boundaries and the legitimate implicit marks/joiners are NOT.
+func TestIsBidiOverride(t *testing.T) {
+	override := []rune{0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069}
+	for _, r := range override {
+		if !IsBidiOverride(r) {
+			t.Errorf("IsBidiOverride(%U) = false, want true (it is a Trojan-Source override)", r)
+		}
+	}
+	// Boundaries just outside each block, plus the implicit marks (LRM/RLM/ALM) and joiners (ZWJ/ZWNJ)
+	// that legitimate Arabic/Hebrew/emoji need — none are overrides, all must be preserved.
+	notOverride := []rune{0x2029, 0x202F, 0x2065, 0x206A, 0x200E, 0x200F, 0x061C, 0x200C, 0x200D, 'a', 0x0627 /* Arabic alef */}
+	for _, r := range notOverride {
+		if IsBidiOverride(r) {
+			t.Errorf("IsBidiOverride(%U) = true, want false (legitimate / out-of-range)", r)
+		}
+	}
+}
+
+// TestNeutralizeBidiDropsOverridesKeepsLegit is the #22 core: the explicit bidi-override controls are
+// dropped from OUTPUT while every legitimate rune — implicit marks, zero-width joiners, actual RTL letters —
+// survives, so Arabic/Hebrew/emoji still render and only the spoofing vector is neutralized.
+func TestNeutralizeBidiDropsOverridesKeepsLegit(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"RLO override dropped", "user\u202eadmin", "useradmin"},
+		{"LRO override dropped", "a\u202db", "ab"},
+		{"isolate pair dropped", "\u2066spoof\u2069rest", "spoofrest"},
+		{"all nine dropped", "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069x", "x"},
+		{"legitimate Arabic preserved", "مرحبا hello", "مرحبا hello"},
+		{"implicit LRM/RLM marks preserved", "a\u200e\u200fb", "a\u200e\u200fb"},
+		{"emoji ZWJ sequence preserved", "\U0001F468\u200d\U0001F469", "\U0001F468\u200d\U0001F469"},
+		{"clean passthrough", "just normal text", "just normal text"},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NeutralizeBidi(tt.in); got != tt.want {
+				t.Fatalf("NeutralizeBidi(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCleanMarkupStripsBidiOverride proves the OUTPUT-markup sanitizer (the content->player boundary) also
+// drops the override subset — so script-supplied act() args cannot smuggle a Trojan-Source spoof — while the
+// legitimate RTL text and joiners the same author might use survive.
+func TestCleanMarkupStripsBidiOverride(t *testing.T) {
+	if got := CleanMarkup("Guard\u202e says hi"); got != "Guard says hi" {
+		t.Fatalf("CleanMarkup must drop the RLO override; got %q", got)
+	}
+	if got := CleanMarkup("السلام"); got != "السلام" {
+		t.Fatalf("CleanMarkup must preserve legitimate Arabic; got %q", got)
+	}
+	if got := CleanMarkup("\U0001F468\u200d\U0001F469"); got != "\U0001F468\u200d\U0001F469" {
+		t.Fatalf("CleanMarkup must preserve an emoji ZWJ sequence; got %q", got)
+	}
+}
+
 // TestCleanLineCapNeverSplitsRune confirms the byte cap backs off to a rune boundary
 // rather than slicing a multibyte rune in half (which would corrupt the tail rune).
 func TestCleanLineCapNeverSplitsRune(t *testing.T) {
@@ -120,7 +182,7 @@ func TestCleanLineCapNeverSplitsRune(t *testing.T) {
 
 func TestCleanName(t *testing.T) {
 	const maxLen = 20
-	zwsp := "Wal" + "​" + "ker" //nolint:staticcheck // intentional U+200B zero-width-space fixture for the sanitizer
+	zwsp := "Wal" + "\u200b" + "ker" //nolint:staticcheck // intentional U+200B zero-width-space fixture for the sanitizer
 	tests := []struct {
 		name string
 		in   string

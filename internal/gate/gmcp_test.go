@@ -81,6 +81,42 @@ func TestDeliverChannelGMCPStripsColorTokens(t *testing.T) {
 	}
 }
 
+// TestDeliverChannelGMCPNeutralizesBidi is the #22 regression on the GMCP path: the Comm.Channel.Text
+// mirror BYPASSES telnet.Write's sanitizeOutput, so a Trojan-Source bidi-override control (RLO U+202E and
+// the isolates) in a player's channel message would reach a rich client's display verbatim and spoof it.
+// The gate must neutralize the override subset on every player-text field (talker/text/msg) while leaving
+// legitimate RTL text intact — JSON-escaping alone keeps the bytes wire-safe but not display-safe.
+func TestDeliverChannelGMCPNeutralizesBidi(t *testing.T) {
+	rlo := string(rune(0x202E))
+	pdi := string(rune(0x2069))
+	msg := commbus.Message{
+		Subject:    commbus.ChanSubject("gossip"),
+		AuthorName: "Ev" + rlo + "il",                         // spoofed talker
+		Body:       "[Gossip] " + "Ev" + rlo + "il: مرحبا",    // rendered line, with legit Arabic that must survive
+		Text:       "mo" + rlo + "re" + pdi + " loot for you", // raw msg
+	}
+	var out bytes.Buffer
+	tc := telnet.NewReadWriter(bytes.NewReader([]byte{255, 253, 201}), &out) // IAC DO 201 → GMCP enabled
+	tc.ReadLine()
+	g := newGMCPState()
+	g.setSupports([]string{"Comm"})
+	cc := &commsClient{log: discardLog(), tc: tc, gmcp: g, ignore: map[string]struct{}{}}
+	cc.deliverChannel(msg)
+	got := out.String()
+	if strings.ContainsRune(got, 0x202E) || strings.ContainsRune(got, 0x2069) {
+		t.Fatalf("bidi-override control leaked into the Comm.Channel.Text GMCP payload; out = %q", got)
+	}
+	if !strings.Contains(got, `"talker":"Evil"`) {
+		t.Fatalf("talker not neutralized to plain text; out = %q", got)
+	}
+	if !strings.Contains(got, `"msg":"more loot for you"`) {
+		t.Fatalf("raw msg not neutralized; out = %q", got)
+	}
+	if !strings.Contains(got, "مرحبا") { // legitimate Arabic in the rendered text survives
+		t.Fatalf("legitimate Arabic stripped from the GMCP text field; out = %q", got)
+	}
+}
+
 // TestApplyConfigEmitsChannelList pins Comm.Channel.List (#49): when the world publishes a hear-set, a
 // client that advertised Comm.Channel.List gets a sorted array of its usable channel refs (one tab each);
 // a client that did not advertise it gets none.

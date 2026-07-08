@@ -7,6 +7,8 @@ import (
 	"unicode/utf8"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
 // luascreen.go — the `screen` sandbox module (#31 Slice 5): a curated, SAFE-BY-CONSTRUCTION binding for the
@@ -217,8 +219,8 @@ func sanitizeScreenText(s string) string {
 			i++ // an invalid byte (e.g. a raw 8-bit C1 introducer 0x9B/0x9D/0x9C, or 0xFF) — drop it
 			continue
 		}
-		if !unicode.IsControl(r) {
-			b.WriteString(s[i : i+size])
+		if !unicode.IsControl(r) && !textsan.IsBidiOverride(r) {
+			b.WriteString(s[i : i+size]) // drop bidi-override controls too (#22): this path bypasses sanitizeOutput
 		}
 		i += size
 	}

@@ -164,6 +164,57 @@ func TestWriteStripsControlKeepsAdjacentMultibyte(t *testing.T) {
 	}
 }
 
+// TestWriteStripsBidiOverride is the #22 regression on the universal output sanitizer: an explicit
+// Trojan-Source bidi-override control (RLO U+202E and the isolates) is category Cf — NOT caught by the
+// Cc-only unicode.IsControl — so the pre-#22 sanitizeOutput passed it verbatim, letting a player name or
+// message DISPLAY as something other than its bytes on another player's terminal. sanitizeOutput must now
+// DROP the override subset while preserving the LEGITIMATE bidi a real Arabic/Hebrew/emoji line needs:
+// implicit LRM/RLM marks, the RTL letters themselves, and the ZWJ grapheme glue (all also Cf).
+func TestWriteStripsBidiOverride(t *testing.T) {
+	rlo := string(rune(0x202E)) // RIGHT-TO-LEFT OVERRIDE — the classic Trojan-Source spoof
+	pdi := string(rune(0x2069)) // POP DIRECTIONAL ISOLATE
+	lrm := string(rune(0x200E)) // LEFT-TO-RIGHT MARK — legitimate implicit bidi, must survive
+	zwj := string(rune(0x200D)) // ZWJ grapheme glue, must survive
+	in := "Guard" + rlo + "admin" + pdi + " says " + lrm + "hello مرحبا 👨" + zwj + "👩"
+	want := "Guardadmin says " + lrm + "hello مرحبا 👨" + zwj + "👩" // only RLO + PDI dropped
+
+	var out bytes.Buffer
+	c := NewReadWriter(&bytes.Buffer{}, &out)
+	if err := c.Write(in); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if got != want {
+		t.Fatalf("sanitizeOutput bidi handling wrong:\n got  %q\n want %q", got, want)
+	}
+	if strings.ContainsRune(got, 0x202E) || strings.ContainsRune(got, 0x2069) {
+		t.Fatalf("bidi-override control not stripped: %q", got)
+	}
+	if !strings.ContainsRune(got, 0x200E) {
+		t.Fatalf("legitimate LRM mark stripped (only the OVERRIDE subset should go): %q", got)
+	}
+	if !strings.ContainsRune(got, 0x200D) {
+		t.Fatalf("ZWJ grapheme glue stripped (it is not an override): %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("sanitizeOutput produced invalid UTF-8: % x", out.Bytes())
+	}
+
+	// Drift guard for the edge's LOCAL isBidiOverride mirror: every one of the nine override/isolate runes
+	// must be dropped, so the telnet copy can't silently narrow relative to textsan.IsBidiOverride (both
+	// trust domains pin the full U+202A–U+202E + U+2066–U+2069 set independently).
+	for _, r := range []rune{0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069} {
+		var b bytes.Buffer
+		cc := NewReadWriter(&bytes.Buffer{}, &b)
+		if err := cc.Write("x" + string(r) + "y"); err != nil {
+			t.Fatal(err)
+		}
+		if got := b.String(); got != "xy" {
+			t.Errorf("sanitizeOutput did not drop override %U: got %q", r, got)
+		}
+	}
+}
+
 // TestWriteStripsRawC1Bytes is the #156 regression on the gate's universal output sanitizer. A RAW single-byte
 // 8-bit C1 introducer (0x9B CSI / 0x9D OSC / 0x9C ST) is INVALID utf-8 that decodes to a non-control
 // RuneError, so the old rune-level fast path judged the string "clean" and wrote it verbatim — letting ANY
