@@ -299,6 +299,65 @@ func TestGMCPPayloadsStripColorTokens(t *testing.T) {
 	}
 }
 
+// TestGMCPPayloadsNeutralizeBidi is the #22 regression on the WORLD's structured GMCP emitters: these frames
+// reach the client via gate's verbatim WriteGMCP forward, which BYPASSES telnet.sanitizeOutput, and
+// json.Marshal does NOT escape the bidi-override range — so a content-authored name carrying RLO (U+202E)
+// would spoof a rich client's Room.Info / Char.Items / Char.Status display. gmcpText (the single funnel) must
+// neutralize the override subset while preserving legitimate RTL text. Mirrors TestGMCPPayloadsStripColorTokens
+// across the same three real builders.
+func TestGMCPPayloadsNeutralizeBidi(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	rlo := string(rune(0x202E))
+	arabic := "الحارس" // "the guard" — legitimate RTL, must survive
+
+	// Room name with an embedded RLO override → Room.Info name is neutralized, Arabic preserved.
+	e.location.short = "Guard" + rlo + "Room " + arabic
+	var info struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(z.roomInfoJSON(e.location), &info); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(info.Name, 0x202E) {
+		t.Errorf("Room.Info name leaked a bidi-override: %q", info.Name)
+	}
+	if info.Name != "GuardRoom "+arabic {
+		t.Errorf("Room.Info name = %q, want override dropped + Arabic kept (%q)", info.Name, "GuardRoom "+arabic)
+	}
+
+	// Carried item name with an RLO → Char.Items name neutralized.
+	ruby := z.newEntity("test:ruby")
+	ruby.short = "ru" + rlo + "by"
+	Add(ruby, &Physical{})
+	Move(ruby, e)
+	var inv gmcpItemList
+	if err := json.Unmarshal(charItemsInvJSON(e), &inv); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range inv.Items {
+		if strings.ContainsRune(it.Name, 0x202E) {
+			t.Errorf("Char.Items name leaked a bidi-override: %q", it.Name)
+		}
+	}
+
+	// Combat target name with an RLO → Char.Status target neutralized.
+	mob := makeMobTarget(z, e, "gob"+rlo+"lin")
+	z.startFight(e, mob)
+	var st struct {
+		Target string `json:"target"`
+	}
+	if err := json.Unmarshal(z.charStatusJSON(e), &st); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(st.Target, 0x202E) {
+		t.Errorf("Char.Status target leaked a bidi-override: %q", st.Target)
+	}
+	if st.Target != "goblin" {
+		t.Errorf("Char.Status target = %q, want %q", st.Target, "goblin")
+	}
+}
+
 func TestCharItemsRoomIncludesCorpse(t *testing.T) {
 	z, caster := abilityTestZone(t)
 	e := caster.entity

@@ -138,16 +138,56 @@ func stripControl(s string) string {
 	return b.String()
 }
 
-// stripOutputControl is the OUTPUT-side counterpart of stripControl: it drops every control rune AND every
-// raw invalid byte. It is BYTE-aware, not merely rune-aware: a lone invalid UTF-8 byte — in particular a raw
-// 8-bit C1 introducer (0x9B CSI / 0x9D OSC / 0x9C ST) — decodes to a NON-control RuneError, so a rune-level
-// unicode.IsControl check (as stripControl uses) would let it pass verbatim onto the OUTPUT wire, a
-// sanitizer-bypassing terminal-control-injection vector (#156: 8-bit CSI erase/cursor, DSR/DA cursor-report
-// input-injection, OSC-52 clipboard exfil). The fast path therefore also requires utf8.ValidString, and the
-// rewrite DROPS invalid bytes outright (mirroring world/luascreen.sanitizeScreenText, the byte-aware model
-// on the trusted screen path). The clean common case (valid UTF-8, no control rune) is returned unallocated.
+// IsBidiOverride reports whether r is one of the explicit Unicode bidirectional FORMATTING controls that
+// enable "Trojan Source"-style visual spoofing (CVE-2021-42574, #22): the embedding/override block
+// U+202A–U+202E (LRE/RLE/PDF/LRO/RLO) and the isolate block U+2066–U+2069 (LRI/RLI/FSI/PDI). They reorder
+// the VISUAL run of surrounding text independently of its logical byte order, so a name or message can be
+// made to DISPLAY as something other than what it is. This is deliberately a NARROW subset of category Cf:
+// the IMPLICIT marks legitimate mixed-direction text needs (LRM U+200E, RLM U+200F, ALM U+061C) and the
+// zero-width joiners scripts/emoji need (ZWNJ U+200C, ZWJ U+200D) are Cf too but are NOT spoofing controls,
+// so they are PRESERVED — the fix neutralizes the abuse without breaking legitimate Arabic/Hebrew/emoji.
+func IsBidiOverride(r rune) bool {
+	return (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069)
+}
+
+// NeutralizeBidi drops every explicit bidi-override control (IsBidiOverride) from s, leaving all other runes
+// — including legitimate implicit bidi marks and zero-width joiners — intact. It is for OUTPUT sinks that
+// BYPASS the control-strip chokepoints, notably GMCP JSON payloads: JSON-escaping makes a leaked bidi control
+// wire-safe but does NOT strip its DISPLAY effect, so a rich client rendering Comm.Channel text/talker would
+// still be spoofable (#22). The clean common case is returned unchanged and unallocated. NOTE: when an
+// override IS present (slow path), the rune-range rebuild normalizes any lone invalid UTF-8 byte in s to
+// U+FFFD, so output is not strictly byte-preserving for malformed input — a non-issue for its GMCP callers,
+// whose fields are valid Go strings that json.Marshal normalizes downstream.
+func NeutralizeBidi(s string) string {
+	if !strings.ContainsFunc(s, IsBidiOverride) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if IsBidiOverride(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// badOutputRune is the OUTPUT drop-set: control runes AND the explicit bidi-override subset. Raw invalid
+// bytes are handled separately (byte-level) by stripOutputControl.
+func badOutputRune(r rune) bool { return unicode.IsControl(r) || IsBidiOverride(r) }
+
+// stripOutputControl is the OUTPUT-side counterpart of stripControl: it drops every control rune, every
+// explicit bidi-override control (#22), AND every raw invalid byte. It is BYTE-aware, not merely rune-aware:
+// a lone invalid UTF-8 byte — in particular a raw 8-bit C1 introducer (0x9B CSI / 0x9D OSC / 0x9C ST) —
+// decodes to a NON-control RuneError, so a rune-level unicode.IsControl check (as stripControl uses) would
+// let it pass verbatim onto the OUTPUT wire, a sanitizer-bypassing terminal-control-injection vector (#156:
+// 8-bit CSI erase/cursor, DSR/DA cursor-report input-injection, OSC-52 clipboard exfil). The fast path
+// therefore also requires utf8.ValidString, and the rewrite DROPS invalid bytes outright (mirroring
+// world/luascreen.sanitizeScreenText, the byte-aware model on the trusted screen path). The clean common
+// case (valid UTF-8, no control/bidi-override rune) is returned unallocated.
 func stripOutputControl(s string) string {
-	if utf8.ValidString(s) && !strings.ContainsFunc(s, unicode.IsControl) {
+	if utf8.ValidString(s) && !strings.ContainsFunc(s, badOutputRune) {
 		return s
 	}
 	var b strings.Builder
@@ -158,7 +198,7 @@ func stripOutputControl(s string) string {
 			i++ // a raw invalid byte (8-bit C1 introducer / 0xFF) — drop it; never onto the wire
 			continue
 		}
-		if !unicode.IsControl(r) {
+		if !badOutputRune(r) {
 			b.WriteString(s[i : i+size])
 		}
 		i += size

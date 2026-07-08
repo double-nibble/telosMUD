@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
 // luagmcp.go — the `gmcp` sandbox module (#51): a content/Lua handle to emit CUSTOM GMCP frames to a
@@ -164,7 +166,11 @@ func gmcpValueToGo(l *lua.LState, lv lua.LValue, depth int, nodes *int) (any, er
 	}
 	switch v := lv.(type) {
 	case lua.LString:
-		return string(v), nil
+		// A builder-script string leaf ships into a Mud.* payload delivered to a targeted player's rich
+		// client via s.send -> WriteGMCP, which BYPASSES telnet.sanitizeOutput. Neutralize the Trojan-Source
+		// bidi-override subset so a script cannot spoof another player's client display (#22); JSON-escaping
+		// leaves the override runes intact. Legitimate RTL text and joiners are preserved.
+		return textsan.NeutralizeBidi(string(v)), nil
 	case lua.LNumber:
 		return float64(v), nil
 	case lua.LBool:
