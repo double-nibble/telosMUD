@@ -99,6 +99,20 @@ type contentVersioner interface {
 	ContentVersion(ctx context.Context) (uint64, error)
 }
 
+// contentVersionBumper is the subset of the content source that ATOMICALLY bumps + returns the monotonic
+// Postgres content version — satisfied by *store.Pool, absent on the embedded/mem sources. When present, a
+// shard-local reload mints its bus version by BUMPING the single PG authority (#232) instead of stamping
+// the wall clock, so the version is monotonic fleet-wide (no per-shard clock skew) and the bump is visible
+// to reconcile-on-join. Structural, to keep the world package free of a store import (store imports world).
+//
+// SEAM WARNING: a PRODUCTION source must be a *store.Pool (or a wrapper that FORWARDS BumpContentVersion).
+// A decorator that dropped it would fail this assertion, silently take the wall-clock fallback path in
+// mintReloadVersion, and reintroduce the #222/#232 clock-skew residual — with a green test suite. Same
+// accepted risk as the sibling contentVersioner assertion; keep the live source concrete.
+type contentVersionBumper interface {
+	BumpContentVersion(ctx context.Context) (uint64, error)
+}
+
 // localApplyBus is a contentbus.Bus whose Publish applies each invalidation to THIS shard directly
 // (r.onInvalidation) instead of broadcasting. reconcileOnJoin feeds a re-read pack through PublishPack
 // over it, reusing the exact per-ref swap + zone-shape reconcile the wire path uses — but LOCAL-only,

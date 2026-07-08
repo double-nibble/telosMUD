@@ -602,6 +602,87 @@ func TestImportVersionConcurrentSameSHA(t *testing.T) {
 	}
 }
 
+// TestBumpContentVersion (gated, #232) proves the shard-local reload's DURABLE version mint: each bump
+// atomically increments the single content_version authority (monotonic, no wall clock), CONCURRENT bumps
+// never collide (N goroutines yield N distinct consecutive versions and advance the counter by exactly N —
+// the atomicity a clock-free reload racing a pull relies on), and a bump touches ONLY version, never the
+// published-content identity (content_sha / manifest_version / the pack registry).
+func TestBumpContentVersion(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	base, err := p.ContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1, err := p.BumpContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1 != base+1 {
+		t.Fatalf("first bump = %d, want base+1 = %d", v1, base+1)
+	}
+	if v2, err := p.BumpContentVersion(ctx); err != nil || v2 != base+2 {
+		t.Fatalf("second bump = %d (err %v), want base+2 = %d", v2, err, base+2)
+	}
+
+	// A bump moves ONLY the version — a reload re-materializes the same rows, so the published identity holds.
+	before, err := p.CurrentContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.BumpContentVersion(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, err := p.CurrentContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ContentSHA != before.ContentSHA || after.ManifestVersion != before.ManifestVersion {
+		t.Fatalf("bump changed the content identity: sha %q->%q, manifest %q->%q",
+			before.ContentSHA, after.ContentSHA, before.ManifestVersion, after.ManifestVersion)
+	}
+	if after.Version != before.Version+1 {
+		t.Fatalf("bump version = %d, want %d (+1)", after.Version, before.Version+1)
+	}
+
+	// Concurrency: N atomic bumps yield N DISTINCT consecutive versions and advance by exactly N (no lost
+	// update) — the row-lock serialization a reload racing another reload / a pull depends on.
+	start, err := p.ContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 8
+	var wg sync.WaitGroup
+	got := make([]uint64, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got[i], errs[i] = p.BumpContentVersion(ctx)
+		}(i)
+	}
+	wg.Wait()
+
+	seen := map[uint64]bool{}
+	for i, v := range got {
+		if errs[i] != nil {
+			t.Fatalf("concurrent bump %d errored: %v", i, errs[i])
+		}
+		if v <= start || v > start+n {
+			t.Fatalf("concurrent bump %d = %d, want in (%d, %d]", i, v, start, start+n)
+		}
+		if seen[v] {
+			t.Fatalf("duplicate version %d across concurrent bumps — a lost update / non-atomic increment", v)
+		}
+		seen[v] = true
+	}
+	if final, err := p.ContentVersion(ctx); err != nil || final != start+n {
+		t.Fatalf("after %d concurrent bumps, version = %d (err %v), want %d", n, final, err, start+n)
+	}
+}
+
 // TestImportVersion (gated) exercises the #212 slice-4 versioned import: the monotonic version bump,
 // the pack registry, and orphan pruning across versions.
 func TestImportVersion(t *testing.T) {

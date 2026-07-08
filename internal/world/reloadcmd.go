@@ -200,12 +200,18 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 	}
 	out := reloadOutcome{}
 	// A shard-local `reload` is a staff hot-edit of already-imported rows: it stamps its invalidations with
-	// a DIRECTOR-INDEPENDENT, nanos-scale version (never-fatal) so it interoperates with the director-
-	// coordinated pull's PG-minted version at the reconcile guard. mintReloadVersion floors that stamp at
-	// pgVersion+1 (#222) so a reload right after a pull always advances past the current content version even
-	// when this shard's clock lags the host that minted the pull — otherwise the reload's zone-SHAPE
-	// reconcile would be silently dropped by the version guard as stale.
-	version := r.mintReloadVersion(ctx)
+	// a version minted from the single PG content-version authority (#232) — an atomic bump, monotonic
+	// fleet-wide with no wall clock — so it interoperates with the director-coordinated pull's PG-minted
+	// version at the reconcile guard, and a shard that missed the broadcast reconciles on rejoin. Falls back
+	// to the pre-#232 wall-clock stamp only when the source has no PG authority (embedded/mem) — see
+	// mintReloadVersion.
+	version, ok := r.mintReloadVersion(ctx)
+	if !ok {
+		// A PG-authority bump failed (#232): fail the reload rather than stamp a wall-clock version that
+		// could poison later durable reloads' shape reconciles. Nothing was published; the operator re-runs.
+		r.log.Warn("reload: aborting — could not mint a durable content version (PG bump failed); nothing propagated")
+		return reloadOutcome{failed: true}
+	}
 	for _, pk := range loaded {
 		n, perr := contentbus.PublishPack(ctx, r.bus, pk, version)
 		out.published += n
@@ -218,28 +224,47 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 	return out
 }
 
-// mintReloadVersion stamps a shard-local reload's invalidations as max(now_nanos, pgVersion+1): the
-// wall-clock nanos keep it director-independent and nanos-scale, while the pgVersion+1 FLOOR guarantees the
-// stamp always advances past the current Postgres content version — closing the cross-host clock-skew race
-// (#222) where a reload issued right after a director pull, on a shard whose clock lags the puller's, would
-// carry a version below the pull's and have its zone-SHAPE reconcile dropped by the guard as stale. When
-// the PG version can't be read (a source without ContentVersion, or a transient read error), it falls back
-// to bare nanos — the guard degrades to the pre-#222 behavior, never worse.
-func (r *reloader) mintReloadVersion(ctx context.Context) uint64 {
+// mintReloadVersion mints the version a shard-local reload stamps on its invalidations, returning ok=false
+// to tell the caller to FAIL the reload rather than stamp a poisonous version.
+//
+// DURABLE path (#232), taken whenever the source has a PG authority (a contentVersionBumper — *store.Pool
+// in production): bump the single content-version counter atomically, so the stamp is monotonic FLEET-WIDE
+// with no wall clock. This closes the two residuals #222 left — a clock-AHEAD shard can no longer mint a
+// far-future version that silently drops a later pull's zone-shape reconcile, and the bump is visible to
+// reconcile-on-join so a shard that missed the reload's bus message catches up on rejoin. If the bump
+// ERRORS (a transient PG failure), we return ok=false so the reload FAILS: stamping a current-wall-clock
+// version here would sit ABOVE the (un-bumped) PG counter, so a SUBSEQUENT durable reload minting
+// pgVersion+1 would be below it and have its zone-shape reconcile dropped fleet-wide as stale — the very
+// residual this issue closes. Failing loud (the operator re-runs) is safe; poisoning the cursor is not.
+//
+// FALLBACK path (a source with NO PG authority — the embedded/mem source used in dev/tests): there is no
+// cross-shard clock skew and no reconcile-on-join, so the pre-#222 wall-clock stamp (floored at pgVersion+1
+// when the source reports a version) is fine and ok is always true.
+func (r *reloader) mintReloadVersion(ctx context.Context) (version uint64, ok bool) {
+	// Durable: mint through the PG-monotonic authority — no clock, so no skew poisoning.
+	if b, isBumper := r.src.(contentVersionBumper); isBumper {
+		v, err := b.BumpContentVersion(ctx)
+		if err != nil {
+			r.log.Warn("reload: could not bump the PG content version; FAILING the reload rather than stamping a wall-clock version that could drop later reloads' shape reconciles", "err", err)
+			return 0, false
+		}
+		return v, true
+	}
+	// No PG authority (embedded/mem): the wall-clock stamp is safe (single process, no fleet reconcile).
 	now := uint64(time.Now().UnixNano())
-	vs, ok := r.src.(contentVersioner)
-	if !ok {
-		return now
+	vs, isVersioner := r.src.(contentVersioner)
+	if !isVersioner {
+		return now, true
 	}
 	pg, err := vs.ContentVersion(ctx)
 	if err != nil {
 		r.log.Warn("reload: could not read the content version for the mint floor; using bare nanos", "err", err)
-		return now
+		return now, true
 	}
 	if floor := pg + 1; floor > now {
-		return floor
+		return floor, true
 	}
-	return now
+	return now, true
 }
 
 // auditReload fires a fire-and-forget DURABLE signal UP to the world director recording who ran `reload`,
