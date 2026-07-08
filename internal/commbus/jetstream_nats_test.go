@@ -3,6 +3,7 @@ package commbus
 import (
 	"context"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,4 +74,68 @@ func TestJetStreamRealOfflineThenOnline(t *testing.T) {
 		t.Fatalf("unexpected duplicate delivery: %+v", m)
 	case <-time.After(500 * time.Millisecond):
 	}
+}
+
+// TestJetStreamRealBoundedRedelivery confirms the PRODUCTION redelivery/park config against a REAL broker
+// (#62): a durable tell whose handler always NAKs is redelivered EXACTLY DefaultMaxDeliver times then PARKED,
+// never storming; and a GOOD message published alongside it is delivered PROMPTLY rather than blocked behind
+// the poison. On an explicit NAK real NATS redelivers IMMEDIATELY (no BackOff is configured), so the poison
+// exhausts its attempts fast; the good message still lands promptly because the consumer has MaxAckPending in
+// flight and delivers it concurrently. That concurrent interleaving is the property the MemJetStream stand-in
+// does NOT have (it retries synchronously in-order — see TestMemJetStreamRedeliveryIsSynchronousInOrder),
+// which is exactly why this confirmation runs gated against real NATS. Shrinks MaxDeliver so the bounded run
+// is quick. (AckWait is left at prod: it governs a HUNG handler, not an explicit NAK, so it is irrelevant
+// here — a deliberately-immediate redelivery a live never-lost concern (#266) rests on.)
+func TestJetStreamRealBoundedRedelivery(t *testing.T) {
+	url := natsURL(t)
+	js, err := NewJetStream(url)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = js.Close() })
+
+	// Shrink only MaxDeliver for the test (a package var Consume reads when it builds the consumer). Restore
+	// after so no sibling test sees the shrunk value.
+	oldMax := DefaultMaxDeliver
+	DefaultMaxDeliver = 3
+	t.Cleanup(func() { DefaultMaxDeliver = oldMax })
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	target := "itpoison-" + suffix
+	author := "bob-" + suffix
+	subj := DtellSubject(target)
+	ctx := context.Background()
+
+	require.NoError(t, js.PublishDurable(ctx, subj, Message{
+		AuthorID: author, AuthorName: "Bob", Seq: 1, IdempotencyKey: NewIdempotencyKey(author, 1), Body: "poison",
+	}))
+	require.NoError(t, js.PublishDurable(ctx, subj, Message{
+		AuthorID: author, AuthorName: "Bob", Seq: 2, IdempotencyKey: NewIdempotencyKey(author, 2), Body: "good",
+	}))
+
+	var poisonAttempts atomic.Int64
+	good := make(chan Message, 4)
+	cons, err := js.Consume(subj, target, func(m Message, _ bool) bool {
+		if m.Body == "poison" {
+			poisonAttempts.Add(1)
+			return false // always NAK
+		}
+		good <- m
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	// The good message is delivered PROMPTLY — the consumer delivers it concurrently with the poison's
+	// (immediate) redeliveries rather than blocking behind them, unlike the mem stand-in.
+	select {
+	case m := <-good:
+		assert.Equal(t, "good", m.Body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the good message was blocked behind the poison's redeliveries (real NATS should interleave)")
+	}
+
+	// The poison NAKs redeliver immediately (no BackOff), so a short settle is enough for it to exhaust
+	// MaxDeliver and PARK; confirm it was attempted exactly DefaultMaxDeliver times and never storms further.
+	time.Sleep(2 * time.Second)
+	assert.Equal(t, int64(DefaultMaxDeliver), poisonAttempts.Load(),
+		"real NATS must redeliver a NAKing tell exactly MaxDeliver times, then park")
 }

@@ -149,8 +149,9 @@ func (b *NATSJetStream) PublishDurable(ctx context.Context, subj string, msg Mes
 
 // Consume runs a per-player durable consumer filtered to subj (the player's dtell.<id> subject).
 // consumerID is the durable name (stable per player so a restart resumes from the last ack). handler
-// returns ack=true (Ack) or ack=false (Nak — redelivered with backoff up to MaxDeliver, then parked).
-// The consumer delivers the backlog (DeliverAll) then live messages, in stream order.
+// returns ack=true (Ack) or ack=false (Nak — redelivered IMMEDIATELY up to MaxDeliver, then parked; no
+// BackOff is set, and AckWait covers only a hung/lost-ack handler, not an explicit NAK — see the never-lost
+// caveat on jetstream.go's Consume). The consumer delivers the backlog (DeliverAll) then live, in stream order.
 func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, bool) bool) (Consumer, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()

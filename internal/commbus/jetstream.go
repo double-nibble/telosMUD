@@ -36,10 +36,13 @@ import (
 //
 // # Bounded redelivery (poison-park, P8-A5)
 //
-// A handler that repeatedly fails to deliver (a NAK) is redelivered with backoff up to maxDeliver,
-// then PARKED (never redelivered again) rather than storming a just-logged-in player forever. The
-// real JetStream consumer uses MaxDeliver; the MemJetStream models it with a per-message delivery
-// counter.
+// A handler that repeatedly fails to deliver (a NAK) is redelivered up to maxDeliver times, then PARKED
+// (never redelivered again) rather than storming a just-logged-in player forever. The real JetStream
+// consumer uses MaxDeliver; the MemJetStream models it with a per-message delivery counter. NOTE: an
+// explicit NAK redelivers IMMEDIATELY — no BackOff is configured (jetstream_nats.go), and AckWait governs
+// only a HUNG/lost-ack handler, not a NAK. So a tell that NAKs for a TRANSIENT reason (target mid-handoff,
+// a gate-emit blip) burns all maxDeliver attempts in milliseconds and parks — a live never-lost concern
+// tracked in #266 (the redelivery needs a real backoff to outlive a transient window).
 
 // ErrJetStreamClosed is returned by a closed JetStream's PublishDurable/Consume.
 var ErrJetStreamClosed = errors.New("commbus: jetstream is closed")
@@ -72,7 +75,7 @@ type JetStream interface {
 	// The backlog bool is true for a message that was already stored when the consumer STARTED (the
 	// offline catch-up — the world renders it "while you were away…"), false for a live message (a
 	// real-time tell). handler returns ack=true to advance past the message (delivered or idempotently
-	// suppressed) or ack=false to NAK it (redelivered with backoff up to maxDeliver, then parked). Stop
+	// suppressed) or ack=false to NAK it (redelivered immediately up to maxDeliver, then parked). Stop
 	// tears the consumer down. A Disabled handle returns a no-op Consumer.
 	Consume(subj, consumerID string, handler func(msg Message, backlog bool) bool) (Consumer, error)
 
