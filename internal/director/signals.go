@@ -3,7 +3,6 @@ package director
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"strings"
 	"time"
 
@@ -116,7 +115,7 @@ func (d *Director) syncScopeSubscription(ctx context.Context) {
 func (d *Director) subscribeSignals(ctx context.Context) {
 	cons, err := d.bus.SubscribeDurable(d.scope(), d.consumerID(), func(ev scopebus.DurableEvent) bool {
 		ack := make(chan bool, 1)
-		d.post(signalMsg{event: ev.Event, payload: ev.Payload, key: ev.Key, source: ev.Source, ack: ack})
+		d.post(signalMsg{event: ev.Event, payload: ev.Payload, seq: ev.Seq, seqOK: ev.SeqOK, source: ev.Source, ack: ack})
 		select {
 		case ok := <-ack:
 			return ok
@@ -148,7 +147,8 @@ func (d *Director) unsubscribeSignals() {
 type signalMsg struct {
 	event   string
 	payload json.RawMessage
-	key     string // "<source>:<seq>" idempotency key
+	seq     uint64 // the durable event's parsed sequence (from the "<source>:<seq>" idempotency key)
+	seqOK   bool   // false if the key had no parseable trailing seq (then the dedup high-water is skipped)
 	source  string
 	ack     chan bool
 }
@@ -159,7 +159,7 @@ func (signalMsg) directorMsg() {}
 // at-least-once stream), invoke the handler (which may Set/Broadcast), then advance the per-source
 // high-water and ack. A handler that is not set still acks (the event is drained, not stuck).
 func (d *Director) handleSignal(ctx context.Context, m signalMsg) {
-	seq, hasSeq := parseSeq(m.key)
+	seq, hasSeq := m.seq, m.seqOK
 	if hasSeq && seq <= d.applied[m.source] {
 		m.ack <- true // already applied this session — idempotently suppressed
 		return
@@ -294,18 +294,4 @@ func (d *Director) broadcastDown(ctx context.Context, event string, payload json
 	if err := d.bus.Signal(ctx, d.scope(), event, payload, d.source); err != nil {
 		d.log.Warn("director: remote-effect broadcast failed", "event", event, "err", err)
 	}
-}
-
-// parseSeq splits a "<source>:<seq>" idempotency key into its trailing sequence number. Returns false for
-// a key without a parseable trailing seq (then the dedup high-water is not used for that event).
-func parseSeq(key string) (uint64, bool) {
-	i := strings.LastIndex(key, ":")
-	if i < 0 || i == len(key)-1 {
-		return 0, false
-	}
-	n, err := strconv.ParseUint(key[i+1:], 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
 }

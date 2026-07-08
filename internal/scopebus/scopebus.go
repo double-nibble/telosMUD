@@ -175,13 +175,30 @@ func (b *Bus) Subscribe(scope Scope, handler Handler) (commbus.Subscription, err
 // DurableEvent is one durably-delivered scoped event handed to a DurableHandler. Backlog is true for an
 // event already stored when the subscriber STARTED (the restart catch-up — a director that was down
 // replays the world events it missed), false for a live one. Key is the "<source>:<seq>" idempotency
-// key: because the durable tier is at-least-once, a subscriber that APPLIES state (advances an invasion
-// phase) must dedup on Key — track the highest applied (Source, seq) and suppress a redelivery.
+// key and Seq is that key's parsed sequence (monotonically increasing per Source — the publish-side
+// counter). Because the durable tier is at-least-once, a subscriber that APPLIES state must dedup.
+//
+// TWO dedup strategies, and the watermark's precondition matters:
+//   - O(1) high-water watermark — track the highest applied Seq per Source and suppress any event whose
+//     Seq is not greater (`applied[ev.Source] >= ev.Seq → suppress`). This is ONLY sound for a consumer
+//     that applies events GAP-FREE AND IN ORDER per Source: with out-of-order redelivery (a NAK'd seq N
+//     redelivered AFTER seq N+1 already advanced the watermark) the watermark would silently DROP the
+//     redelivered N. It fits an ordered/serialized consumer (the director actor spine applies one signal
+//     at a time and its payloads are order-insensitive: audit=logging, pull=idempotent-by-SHA).
+//   - Seen-set / gap-tracking cursor — required instead when application is NOT gap-free in order (higher
+//     memory, but tolerates reordering). A consumer that "advances an invasion phase" off out-of-order
+//     deliveries wants this, not the watermark.
+//
+// SeqOK is false only for a malformed key (missing/non-numeric trailing seq) — never produced by this
+// bus's own publisher, so it fires only for a foreign/corrupt key. A consumer that keys dedup on Seq
+// MUST treat SeqOK=false as "cannot dedup" (apply-and-do-not-advance, or reject), never as Seq==0.
 type DurableEvent struct {
 	Event   string
 	Payload json.RawMessage
 	Source  string
 	Key     string
+	Seq     uint64
+	SeqOK   bool
 	Backlog bool
 }
 
@@ -235,11 +252,14 @@ func (b *Bus) SubscribeDurable(scope Scope, consumerID string, handler DurableHa
 		if err := json.Unmarshal([]byte(m.Body), &sm); err != nil || sm.Event == "" {
 			return true // a malformed durable message is acked away, not redelivered forever
 		}
+		_, seq, seqOK := commbus.ParseIdempotencyKey(m.IdempotencyKey)
 		return handler(DurableEvent{
 			Event:   sm.Event,
 			Payload: sm.Payload,
 			Source:  m.AuthorID,
 			Key:     m.IdempotencyKey,
+			Seq:     seq,
+			SeqOK:   seqOK,
 			Backlog: backlog,
 		})
 	})
