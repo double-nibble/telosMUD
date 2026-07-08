@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -242,15 +243,18 @@ func TestMintReloadVersion(t *testing.T) {
 	// must win, so the reload still beats the pull's version.
 	future := uint64(time.Now().UnixNano()) + uint64(time.Hour)
 	src.SetContentVersion(future)
-	if got := r.mintReloadVersion(context.Background()); got != future+1 {
-		t.Fatalf("mint with PG ahead = %d, want pgVersion+1 = %d", got, future+1)
+	if got, ok := r.mintReloadVersion(context.Background()); !ok || got != future+1 {
+		t.Fatalf("mint with PG ahead = %d (ok %v), want pgVersion+1 = %d, ok", got, ok, future+1)
 	}
 
 	// PG version BELOW now-nanos is the common case: wall-clock nanos win, and the stamp still exceeds the
 	// PG version (so the reconcile guard accepts it).
 	src.SetContentVersion(1)
 	before := uint64(time.Now().UnixNano())
-	got := r.mintReloadVersion(context.Background())
+	got, ok := r.mintReloadVersion(context.Background())
+	if !ok {
+		t.Fatal("a mem source (no PG authority) must mint ok=true via the wall-clock fallback")
+	}
 	if got < before {
 		t.Fatalf("mint with PG behind = %d, want >= now-nanos %d (wall clock should win)", got, before)
 	}
@@ -264,7 +268,10 @@ func TestMintReloadVersion(t *testing.T) {
 func TestMintReloadVersionFallsBackToNanos(t *testing.T) {
 	r := &reloader{src: noVersionSource{}, log: slog.Default()}
 	before := uint64(time.Now().UnixNano())
-	got := r.mintReloadVersion(context.Background())
+	got, ok := r.mintReloadVersion(context.Background())
+	if !ok {
+		t.Fatal("a source with no PG authority must mint ok=true (bare nanos), not fail the reload")
+	}
 	if got < before {
 		t.Fatalf("fallback mint = %d, want >= now-nanos %d", got, before)
 	}
@@ -276,6 +283,68 @@ type noVersionSource struct{}
 
 func (noVersionSource) LoadDefinition(context.Context, string, string, string) (content.Definition, error) {
 	return content.Definition{}, nil
+}
+
+// bumpSource is a content.DefinitionSource that implements BOTH contentVersioner and contentVersionBumper,
+// modelling *store.Pool for the #232 durable mint path: BumpContentVersion atomically increments a counter
+// (or returns bumpErr). Its content methods are never called by the mint path.
+type bumpSource struct {
+	ver     uint64
+	bumpErr error
+}
+
+func (*bumpSource) LoadDefinition(context.Context, string, string, string) (content.Definition, error) {
+	return content.Definition{}, nil
+}
+func (b *bumpSource) ContentVersion(context.Context) (uint64, error) { return b.ver, nil }
+func (b *bumpSource) BumpContentVersion(context.Context) (uint64, error) {
+	if b.bumpErr != nil {
+		return 0, b.bumpErr
+	}
+	b.ver++
+	return b.ver, nil
+}
+
+// TestMintReloadVersionBumpsPG covers the #232 DURABLE path: with a PG-authority source, a reload mints via
+// an atomic version bump — a small monotonic counter, NOT wall-clock nanos — so a clock-AHEAD shard can no
+// longer stamp a far-future version. Successive reloads advance monotonically off the single authority.
+func TestMintReloadVersionBumpsPG(t *testing.T) {
+	b := &bumpSource{ver: 5}
+	r := &reloader{src: b, log: slog.Default()}
+	now := uint64(time.Now().UnixNano())
+
+	got, ok := r.mintReloadVersion(context.Background())
+	if !ok || got != 6 {
+		t.Fatalf("bump mint = %d (ok %v), want the atomic PG bump 6 (5+1), ok", got, ok)
+	}
+	// The load-bearing property: the durable path is CLOCK-FREE. A wall-clock stamp would be ~1.7e18; the
+	// bump is a small counter, well below now-nanos — so no clock-ahead poisoning is possible.
+	if got >= now {
+		t.Fatalf("bump mint = %d must be the small PG counter, not wall-clock nanos (%d)", got, now)
+	}
+	if got2, ok := r.mintReloadVersion(context.Background()); !ok || got2 != 7 {
+		t.Fatalf("second reload bump = %d (ok %v), want 7 (monotonic off the PG authority)", got2, ok)
+	}
+}
+
+// TestMintReloadVersionBumpErrorFailsReload proves the #232 fix distsys review found: a PG-authority source
+// whose bump ERRORS must FAIL the reload (ok=false), NOT stamp a wall-clock version — a wall-clock stamp
+// would sit above the un-bumped PG counter and silently drop a later durable reload's shape reconcile
+// fleet-wide. It also pins that the bump was genuinely attempted (the fake returns before incrementing on
+// error, so ver stays 1) — distinguishing "bump failed" from "bump never ran".
+func TestMintReloadVersionBumpErrorFailsReload(t *testing.T) {
+	b := &bumpSource{ver: 1, bumpErr: errors.New("pg unavailable")}
+	r := &reloader{src: b, log: slog.Default()}
+	got, ok := r.mintReloadVersion(context.Background())
+	if ok {
+		t.Fatalf("a bumper's bump error must FAIL the reload (ok=false), got version %d ok=true", got)
+	}
+	if got != 0 {
+		t.Fatalf("a failed mint must return version 0, got %d", got)
+	}
+	if b.ver != 1 {
+		t.Fatalf("the bump must have been ATTEMPTED (fake errors before incrementing); ver=%d, want 1", b.ver)
+	}
 }
 
 // TestParseReloadArgs covers the reload arg/flag split: scope in either position, the --check/-n dry-run

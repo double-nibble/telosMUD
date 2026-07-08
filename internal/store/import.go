@@ -244,6 +244,36 @@ func (p *Pool) ContentVersion(ctx context.Context) (uint64, error) {
 	return uint64(ver), nil //nolint:gosec // G115: version >= 0 from a bounded nanos column
 }
 
+// BumpContentVersion ATOMICALLY increments and returns the monotonic content version — the durable mint a
+// shard-local `reload` uses instead of stamping wall-clock nanos (#232). A single atomic `version = version
+// + 1` on the singleton is monotonic FLEET-WIDE with no per-shard clock, so it closes the two wall-clock
+// residuals #222 left: (1) a clock-AHEAD shard can no longer stamp a far-future version that silently drops
+// a LATER director pull's zone-shape reconcile (both now advance the same PG counter); (2) the bump is
+// visible to reconcile-on-join, so a shard that MISSED the reload's bus message sees the advanced version
+// on (re)join and re-materializes, rather than reading an unchanged version and concluding it is up to date.
+//
+// It bumps ONLY version — content_sha / manifest_version / the pack registry are untouched, because a
+// reload re-materializes the SAME already-imported rows (no content change); the version is the logical
+// "served epoch" marker (#209), not the published-content identity. The row-level UPDATE lock serializes it
+// against a concurrent BumpContentVersion and against ImportVersion's `SELECT ... FOR UPDATE`, so a reload
+// racing a pull converges monotonically (neither loses an increment). Self-heals a missing singleton row.
+//
+// Because a reload does NOT emit the version-complete sentinel, it does not advance any shard's
+// appliedContentVersion — so a reload leaves even the ISSUING shard's applied version one behind the bumped
+// content_version, triggering at most ONE idempotent, level-triggered reconcile-on-join on each shard's
+// next bus reconnect. That redundant-but-safe re-apply is exactly what keeps residual #2 closed (a missed
+// reload is indistinguishable from an applied one at rejoin, so re-materializing is the safe choice).
+func (p *Pool) BumpContentVersion(ctx context.Context) (uint64, error) {
+	var ver int64
+	if err := p.pool.QueryRow(ctx,
+		`INSERT INTO content_version (id, version) VALUES (1, 1)
+		 ON CONFLICT (id) DO UPDATE SET version = content_version.version + 1
+		 RETURNING version`).Scan(&ver); err != nil {
+		return 0, fmt.Errorf("store: bump content version: %w", err)
+	}
+	return uint64(ver), nil //nolint:gosec // G115: version >= 1 after a bump, never negative
+}
+
 // PackZones returns the zone refs a pack owns (the zones rows WHERE pack=$1), sorted. The director's
 // live-hosted-pack prune guard (#212 slice 4 PR E2) maps a would-be-pruned pack to the zones whose live
 // hosting it must check before allowing the strip — so a pull never hot-removes content players are
