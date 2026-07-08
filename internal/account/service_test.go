@@ -2,6 +2,7 @@ package account
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -22,6 +23,9 @@ type fakeStore struct {
 	tiers       map[string]string // accountID -> tier (#27); absent => not found
 	charAccount map[string]string // character name -> owning accountID (#27)
 	tierErr     error             // when set, AccountTier returns this error (fail-safe tests, #27)
+	colorPref   map[string]bool   // accountID -> color preference (#23); absent => never set
+	colorGetErr error             // when set, AccountColorPref returns this error (#23)
+	colorSetErr error             // when set, SetAccountColorPref returns this error (#23)
 }
 
 func newFakeStore() *fakeStore {
@@ -30,7 +34,24 @@ func newFakeStore() *fakeStore {
 		taken:       map[string]bool{},
 		tiers:       map[string]string{},
 		charAccount: map[string]string{},
+		colorPref:   map[string]bool{},
 	}
+}
+
+func (f *fakeStore) AccountColorPref(_ context.Context, accountID string) (bool, bool, error) {
+	if f.colorGetErr != nil {
+		return false, false, f.colorGetErr
+	}
+	v, ok := f.colorPref[accountID]
+	return v, ok, nil
+}
+
+func (f *fakeStore) SetAccountColorPref(_ context.Context, accountID string, enabled bool) error {
+	if f.colorSetErr != nil {
+		return f.colorSetErr
+	}
+	f.colorPref[accountID] = enabled
+	return nil
 }
 
 func (f *fakeStore) AccountTier(_ context.Context, accountID string) (string, bool, error) {
@@ -348,5 +369,82 @@ func TestSetAccountTierUnverifiedActorRefused(t *testing.T) {
 
 	if resp, _ := svc.SetAccountTier(ctx, setTierReq("a-nobody", "Bob", "builder")); resp.GetOk() {
 		t.Fatal("an actor with no tier (baseline) must not be authorized to change tiers")
+	}
+}
+
+// TestAccountPrefsGetSet (#23): GetAccountPrefs reports the tri-state (absent when never set), SetAccountPrefs
+// persists a present field, and an ABSENT field is a NO-OP (it does not clear a stored value).
+func TestAccountPrefsGetSet(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeStore()
+	svc := newTestService(fs)
+
+	// Never set: the color pref is ABSENT (nil optional), so the gate keeps its default.
+	got, err := svc.GetAccountPrefs(ctx, &accountv1.GetAccountPrefsRequest{AccountId: "acct-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ColorEnabled != nil {
+		t.Fatalf("an unset color pref must be absent, got %v", got.GetColorEnabled())
+	}
+
+	// Set color OFF: the field is present + false on read-back.
+	off := false
+	if _, err := svc.SetAccountPrefs(ctx, &accountv1.SetAccountPrefsRequest{AccountId: "acct-1", ColorEnabled: &off}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = svc.GetAccountPrefs(ctx, &accountv1.GetAccountPrefsRequest{AccountId: "acct-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ColorEnabled == nil || got.GetColorEnabled() {
+		t.Fatalf("color pref should be present+false after `color off`, got %v", got.ColorEnabled)
+	}
+
+	// Set color ON: overwrites to present + true.
+	on := true
+	if _, err := svc.SetAccountPrefs(ctx, &accountv1.SetAccountPrefsRequest{AccountId: "acct-1", ColorEnabled: &on}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = svc.GetAccountPrefs(ctx, &accountv1.GetAccountPrefsRequest{AccountId: "acct-1"})
+	if got.ColorEnabled == nil || !got.GetColorEnabled() {
+		t.Fatalf("color pref should be present+true after `color on`, got %v", got.ColorEnabled)
+	}
+
+	// A SetAccountPrefs with NO fields present is a no-op: the stored value is untouched.
+	if _, err := svc.SetAccountPrefs(ctx, &accountv1.SetAccountPrefsRequest{AccountId: "acct-1"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = svc.GetAccountPrefs(ctx, &accountv1.GetAccountPrefsRequest{AccountId: "acct-1"})
+	if got.ColorEnabled == nil || !got.GetColorEnabled() {
+		t.Fatalf("an empty SetAccountPrefs must not clear the stored value, got %v", got.ColorEnabled)
+	}
+}
+
+// TestAccountPrefsValidation (#23): a missing account_id is an InvalidArgument on both RPCs; a store error is
+// surfaced as an Internal gRPC error (not swallowed at the service).
+func TestAccountPrefsValidation(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(newFakeStore())
+
+	if _, err := svc.GetAccountPrefs(ctx, &accountv1.GetAccountPrefsRequest{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("GetAccountPrefs with no account_id should be InvalidArgument, got %v", err)
+	}
+	if _, err := svc.SetAccountPrefs(ctx, &accountv1.SetAccountPrefsRequest{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("SetAccountPrefs with no account_id should be InvalidArgument, got %v", err)
+	}
+
+	// A store read error surfaces as Internal.
+	fsErr := newFakeStore()
+	fsErr.colorGetErr = errors.New("prefs store unavailable")
+	svcErr := newTestService(fsErr)
+	if _, err := svcErr.GetAccountPrefs(ctx, &accountv1.GetAccountPrefsRequest{AccountId: "a"}); status.Code(err) != codes.Internal {
+		t.Fatalf("a store read error should surface as Internal, got %v", err)
+	}
+	// A store write error surfaces as Internal.
+	fsErr.colorSetErr = errors.New("prefs store unavailable")
+	on := true
+	if _, err := svcErr.SetAccountPrefs(ctx, &accountv1.SetAccountPrefsRequest{AccountId: "a", ColorEnabled: &on}); status.Code(err) != codes.Internal {
+		t.Fatalf("a store write error should surface as Internal, got %v", err)
 	}
 }

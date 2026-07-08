@@ -42,6 +42,10 @@ type CharStore interface {
 	AccountByCharacterName(ctx context.Context, name string) (string, bool, error)
 	// SetAccountTier (#27) writes the target's new tier + an audit row; returns the previous tier.
 	SetAccountTier(ctx context.Context, actorAccountID, targetAccountID, newTier string) (string, error)
+	// AccountColorPref (#23) returns the persisted terminal color preference; set=false => never chosen.
+	AccountColorPref(ctx context.Context, accountID string) (enabled bool, set bool, err error)
+	// SetAccountColorPref (#23) persists the terminal color preference (true/false).
+	SetAccountColorPref(ctx context.Context, accountID string, enabled bool) error
 }
 
 // Service implements the Account gRPC server. It is transport-thin: validation + a store call + a mapping to
@@ -396,6 +400,40 @@ func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountT
 	s.log.Info("account tier changed", "actor", req.GetActorAccountId(), "target_character", req.GetTargetCharacter(),
 		"target_account", target, "old_tier", old, "new_tier", req.GetNewTier())
 	return &accountv1.SetAccountTierResponse{Ok: true, OldTier: old}, nil
+}
+
+// GetAccountPrefs returns an account's persisted EDGE preferences (#23). Each pref is an optional proto field
+// so "never set" (absent) is distinguishable from an explicit false — the gate keeps its default when absent.
+// Color is a purely edge concern, so only the gate reads this; the world never sees it.
+func (s *Service) GetAccountPrefs(ctx context.Context, req *accountv1.GetAccountPrefsRequest) (*accountv1.GetAccountPrefsResponse, error) {
+	if req.GetAccountId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "account_id required")
+	}
+	resp := &accountv1.GetAccountPrefsResponse{}
+	enabled, set, err := s.store.AccountColorPref(ctx, req.GetAccountId())
+	if err != nil {
+		s.log.Error("GetAccountPrefs: color", "account", req.GetAccountId(), "err", err)
+		return nil, status.Error(codes.Internal, "read prefs failed")
+	}
+	if set {
+		resp.ColorEnabled = &enabled // absent stays absent => the gate keeps its default
+	}
+	return resp, nil
+}
+
+// SetAccountPrefs persists the edge preferences PRESENT in the request (#23). An absent field is a NO-OP (it
+// does not clear the stored value), so a caller updating one pref never disturbs another.
+func (s *Service) SetAccountPrefs(ctx context.Context, req *accountv1.SetAccountPrefsRequest) (*accountv1.SetAccountPrefsResponse, error) {
+	if req.GetAccountId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "account_id required")
+	}
+	if req.ColorEnabled != nil {
+		if err := s.store.SetAccountColorPref(ctx, req.GetAccountId(), req.GetColorEnabled()); err != nil {
+			s.log.Error("SetAccountPrefs: color", "account", req.GetAccountId(), "err", err)
+			return nil, status.Error(codes.Internal, "write prefs failed")
+		}
+	}
+	return &accountv1.SetAccountPrefsResponse{}, nil
 }
 
 // ListCharacters returns the characters owned by an account (the select menu).

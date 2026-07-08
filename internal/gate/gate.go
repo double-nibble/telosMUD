@@ -386,6 +386,23 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 		assertion = tok
 	}
 
+	// --- restore the persisted terminal color preference (#23): color is an EDGE concern, so the gate reads
+	// it DIRECTLY from telos-account (never through the world) and applies it BEFORE the first world frame is
+	// rendered. Only the real account path carries a preference; the stub / dev-autoauth path (account=="")
+	// reports "never set" and keeps the gate's default (color ON). A read failure is non-fatal — the session
+	// simply keeps the default rather than dropping the login over a terminal cosmetic.
+	if s.accountConfigured && account != "" {
+		pctx, pcancel := context.WithTimeout(ctx, 5*time.Second)
+		enabled, set, err := s.account.GetColorPref(pctx, account)
+		pcancel()
+		switch {
+		case err != nil:
+			log.Warn("get color pref failed (keeping default)", "err", err)
+		case set:
+			tc.SetColor(enabled)
+		}
+	}
+
 	// --- open the connection's comms client (Phase 8, P8-D1-B: the gate is the SINK).
 	// This is established at CONNECTION scope — after login (the playerId is now known) and
 	// OUTSIDE the re-dial loop below — and torn down by this single defer on the same return that
@@ -430,7 +447,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 			}
 			// Edge-local commands (color) are a terminal concern, handled here and NOT forwarded to the
 			// world — the gate owns rendering, the world owns game state.
-			if handleColorCommand(tc, line) {
+			if handleColorCommand(ctx, tc, s.account, account, line, log) {
 				continue
 			}
 			// promote/demote (#27): change an account's trust tier via the account service (authz enforced

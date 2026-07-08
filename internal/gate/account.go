@@ -42,6 +42,12 @@ type AccountClient interface {
 	// enforced at the account service (the actor must be an admin per the store), so the gate just passes the
 	// actor's account id. ok=false with a user-facing reason on refusal; oldTier is the prior tier on success.
 	SetAccountTier(ctx context.Context, actorAccountID, targetCharacter, newTier string) (ok bool, reason, oldTier string, err error)
+	// GetColorPref reads the account's persisted terminal color preference (#23). set=false => never chosen, so
+	// the gate keeps its default (on). Color is an EDGE concern: the gate reads/writes it directly here and
+	// never routes it through the world.
+	GetColorPref(ctx context.Context, accountID string) (enabled bool, set bool, err error)
+	// SetColorPref persists the account's terminal color preference (#23) after a `color on`/`color off` toggle.
+	SetColorPref(ctx context.Context, accountID string, enabled bool) error
 	// Close releases any underlying connection (a no-op for the stub).
 	Close() error
 }
@@ -83,6 +89,14 @@ func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string
 func (stubAccountClient) SetAccountTier(_ context.Context, _, _, _ string) (bool, string, string, error) {
 	return false, "Trust tiers require an account service.", "", nil
 }
+
+// GetColorPref/SetColorPref on the stub are no-ops: the bare-name/dev-autoauth path has no account to persist
+// against, so it reports "never set" (the gate keeps its default color) and drops writes.
+func (stubAccountClient) GetColorPref(_ context.Context, _ string) (bool, bool, error) {
+	return false, false, nil
+}
+
+func (stubAccountClient) SetColorPref(_ context.Context, _ string, _ bool) error { return nil }
 
 // StartDeviceAuth/PollDeviceAuth are never reached on the stub (the gate only runs device login when a real
 // account client is wired); they satisfy the interface.
@@ -216,6 +230,28 @@ func (g *grpcAccountClient) SetAccountTier(ctx context.Context, actorAccountID, 
 		return false, "", "", err
 	}
 	return resp.GetOk(), resp.GetReason(), resp.GetOldTier(), nil
+}
+
+// GetColorPref reads the account's persisted color preference (#23). set=false when the account has no stored
+// value (the optional proto field is absent), so the gate keeps its default.
+func (g *grpcAccountClient) GetColorPref(ctx context.Context, accountID string) (bool, bool, error) {
+	resp, err := g.cli.GetAccountPrefs(ctx, &accountv1.GetAccountPrefsRequest{AccountId: accountID})
+	if err != nil {
+		return false, false, err
+	}
+	if resp.ColorEnabled == nil {
+		return false, false, nil
+	}
+	return resp.GetColorEnabled(), true, nil
+}
+
+// SetColorPref persists the account's color preference (#23) via the extensible prefs RPC (only the color
+// field is set, so no other pref is disturbed).
+func (g *grpcAccountClient) SetColorPref(ctx context.Context, accountID string, enabled bool) error {
+	_, err := g.cli.SetAccountPrefs(ctx, &accountv1.SetAccountPrefsRequest{
+		AccountId: accountID, ColorEnabled: &enabled,
+	})
+	return err
 }
 
 // Close releases the gRPC connection.
