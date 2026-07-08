@@ -16,6 +16,7 @@ import (
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/metrics"
+	roster "github.com/double-nibble/telosmud/internal/presence"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
 
@@ -299,6 +300,22 @@ type whoFallbackMsg struct {
 	viewer *Entity // the requester, for the #28 canSee visibility filter (captured at post time)
 }
 
+// whoRenderMsg carries a SUCCESSFUL cross-shard roster read (cmdWho) back onto the zone goroutine so the
+// render happens under single-writer discipline (#24). The blocking Redis read must stay OFF the zone
+// goroutine, but the render must be ON it: a content `who` display template enters the zone's Lua VM, which
+// is one-per-zone and zone-goroutine-owned — rendering it in the async fetch goroutine would be a data race
+// against every other script the zone runs. So the fetcher does I/O only and posts the raw entries here; the
+// inbox handler renders (template, else the built-in renderWho) and writes the frame.
+//
+// entries are REMOTE data (a snapshot of other shards' rosters), not live entities, so carrying them across
+// the goroutine boundary in a message is sound — the message IS the ownership transfer.
+type whoRenderMsg struct {
+	out     chan *playv1.ServerFrame
+	viewer  *Entity        // the requester (the render's `self`), captured at post time
+	entries []roster.Entry // the roster snapshot the async read returned
+	seeAll  bool           // the viewer's holylight, captured ON the zone goroutine before the async read (#98)
+}
+
 // transferInMsg hands an existing session (and its entity) from a sibling zone on the
 // SAME shard (an intra-shard cross-zone walk). The destination zone takes ownership: it
 // Moves the entity into room, Stores itself into the session's currentZone pointer so
@@ -540,6 +557,7 @@ func (reconcileZoneMsg) zoneMsg() {}
 func (reloadDoneMsg) zoneMsg()    {}
 func (pullResultMsg) zoneMsg()    {}
 func (whoFallbackMsg) zoneMsg()   {}
+func (whoRenderMsg) zoneMsg()     {}
 
 func newZone(id string) *Zone {
 	z := &Zone{
@@ -746,7 +764,16 @@ func (z *Zone) handle(m msg) {
 			s.send(textFrame(v.summary))
 		}
 	case whoFallbackMsg:
-		writeFrameTo(v.out, textFrame(z.whoLocal(v.viewer)))
+		writeFrameTo(v.out, textFrame(z.whoLocalSheet(v.viewer)))
+	case whoRenderMsg:
+		// The async roster read landed. Render HERE, on the zone goroutine (single-writer): a content `who`
+		// template enters the zone-owned Lua VM, so it may only run on this goroutine (#24). No template (or a
+		// broken one) falls back to the built-in renderWho — the pre-#24 output, unchanged.
+		if sheet, ok := z.renderWhoSheet(v.viewer, v.entries, v.seeAll); ok {
+			writeFrameTo(v.out, textFrame(sheet))
+		} else {
+			writeFrameTo(v.out, textFrame(renderWho(v.entries, v.seeAll)))
+		}
 	case tellDeliverMsg:
 		v.ack <- z.deliverDrainedTell(v) // drained durable tell: dedup-via-cursor, render+emit, ack/nak
 	case tellCursorProbeMsg:

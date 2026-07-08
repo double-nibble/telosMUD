@@ -14,3 +14,23 @@ display_defs:
       s:divider("=")
       return s:render()
 
+  # `who` is a COLLECTION surface: the engine binds `self` (the viewer) AND `list` — an array of plain-data
+  # roster rows {name=, shard=, afk=, concealed=}. The rows are pre-filtered by the engine (a player concealed
+  # from this viewer is never in `list`), so the template only decides LAYOUT. Same body serves the cross-shard
+  # roster and the degraded zone-local list.
+  - surface: who
+    render: |
+      local s = ui.sheet()
+      s:banner("{{FG_CYAN}}Players online:{{RESET}}", "=")
+      for _, p in ipairs(list) do
+        local tag = ""
+        if p.afk then tag = "{{FG_YELLOW}}(AFK){{RESET}}" end
+        if p.concealed then tag = tag .. " {{FG_MAGENTA}}(hiding){{RESET}}" end
+        s:row({p.name, tag}, {"left", "right"})
+      end
+      if #list == 0 then
+        s:span("Nobody is online.")
+      end
+      s:divider("=")
+      return s:render()
+

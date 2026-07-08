@@ -1,5 +1,7 @@
 package world
 
+import "sort"
+
 // Core component structs (docs/MUDLIB.md §3). Each is a typed struct granting one
 // capability; they are added to entities via Add and read via Get/Must (component.go).
 //
@@ -50,6 +52,33 @@ func (r *Room) sortedExits() []string {
 		}
 	}
 	return out
+}
+
+// isCanonicalDir reports whether d is one of the six dirOrder directions the built-in "Exits:" line renders.
+func isCanonicalDir(d string) bool {
+	for _, c := range dirOrder {
+		if c == d {
+			return true
+		}
+	}
+	return false
+}
+
+// allExits returns EVERY exit direction this room carries, not just the canonical six: the dirOrder
+// directions first (so a listing reads N/E/S/W/U/D), then any other authored direction in sorted order.
+// The tail is what makes the enumeration TOTAL — a data-only, non-reciprocal maze exit (an authored
+// direction the movement registry never binds) is a real edge of the room graph and a room display template
+// must be able to see it. sortedExits stays the canonical-only accessor the built-in look line uses.
+func (r *Room) allExits() []string {
+	out := r.sortedExits()
+	var extra []string
+	for d := range r.exits {
+		if !isCanonicalDir(d) {
+			extra = append(extra, d)
+		}
+	}
+	sort.Strings(extra)
+	return append(out, extra...)
 }
 
 // Living grants "is alive and can act": stats, vitals, position, and a fighting target. Held as a
