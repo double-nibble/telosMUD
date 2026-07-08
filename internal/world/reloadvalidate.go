@@ -3,6 +3,7 @@ package world
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -100,6 +101,21 @@ func validatePacks(loaded []content.Pack) []string {
 	// The boot lint only WARNS; here — the broadcast gate — it is a hard REJECT so a bad token never reloads.
 	for _, v := range content.LintRefCharset(loaded) {
 		problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside its safe charset %s (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value, v.Charset))
+	}
+	// Trust ladder (#111): a baseline tier granting a capability elevates EVERY un-elevated account on the next
+	// login, fleet-wide; a duplicate/nameless rung leaves the promote ceiling's rank ordering ambiguous. The
+	// boot lint only warns (the engine must boot on imperfect content); here — the broadcast gate — the
+	// Reject-severity findings are a hard REJECT so such a ladder can never enter a fleet reload. Warn-severity
+	// findings (un-grantable flags, a non-nested ladder) are authoring noise and do not block a reload.
+	for _, v := range content.LintTrustLadder(loaded) {
+		if v.Severity != content.TrustLadderReject {
+			continue
+		}
+		where := "pack " + strconv.Quote(v.Pack)
+		if v.Tier != "" {
+			where += " tier " + strconv.Quote(v.Tier)
+		}
+		problems = append(problems, fmt.Sprintf("%s trust ladder: %s", where, v.Detail))
 	}
 	return problems
 }

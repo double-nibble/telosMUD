@@ -44,6 +44,18 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 		if err := verifySnapshot(h.shard.handoffVerifyKey, req); err != nil {
 			return nil, status.Error(codes.PermissionDenied, "handoff snapshot authentication failed")
 		}
+	} else if snap.GetTier() != "" {
+		// #106 blast-radius guard: the carried TIER re-derives elevation (holylight/builder/admin) at the
+		// destination, so it must be trusted ONLY from an authenticated snapshot. A keyless shard did not
+		// verify the signature, so an unsigned/forged Prepare could otherwise inject tier="admin" and the
+		// attach path would grant it — turning the pre-existing keyless-misconfig risk (a forged carry can
+		// inject KNOWN item prototypes, an econ dupe) into privilege escalation. Strip the tier here so a
+		// keyless deployment applies NO elevation from a handoff — exactly the pre-#106 fail-closed posture
+		// (a cross-shard walk dropped elevation). Keyless is single-shard by design (which never hands off);
+		// the boot-time guard that a multi-shard deployment MUST configure handoff keys is a separate hardening
+		// follow-up. Signing key present => the signature already bound the tier (verified just above), so a
+		// keyed shard trusts it.
+		snap.Tier = ""
 	}
 	z := h.shard.zoneByID(req.GetTargetZoneId())
 	if z == nil {

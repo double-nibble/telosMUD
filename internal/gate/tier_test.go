@@ -22,14 +22,14 @@ type tierFakeAccount struct {
 	gotActor, gotTarget, gotTier string
 	called                       int
 	ok                           bool
-	reason, oldTier              string
+	reason, oldTier, appliedTier string
 	err                          error // when set, SetAccountTier returns this (RPC/transport failure)
 }
 
-func (f *tierFakeAccount) SetAccountTier(_ context.Context, actor, target, tier string) (bool, string, string, error) {
+func (f *tierFakeAccount) SetAccountTier(_ context.Context, actor, target, tier string) (bool, string, string, string, error) {
 	f.called++
 	f.gotActor, f.gotTarget, f.gotTier = actor, target, tier
-	return f.ok, f.reason, f.oldTier, f.err
+	return f.ok, f.reason, f.oldTier, f.appliedTier, f.err
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -47,8 +47,9 @@ func TestHandleTierCommand(t *testing.T) {
 		t.Fatal("a non-tier line must not be intercepted")
 	}
 
-	// `promote Bob builder` → intercepted, delegated with the actor + target + tier; success line shown.
-	fa := &tierFakeAccount{ok: true, oldTier: "player"}
+	// `promote Bob builder` → intercepted, delegated with the actor + target + tier; success line shows the
+	// applied tier the service reports back (not the requested string).
+	fa := &tierFakeAccount{ok: true, oldTier: "player", appliedTier: "builder"}
 	h, out := run(fa, "promote Bob builder")
 	if !h {
 		t.Fatal("`promote` was not intercepted")
@@ -61,11 +62,15 @@ func TestHandleTierCommand(t *testing.T) {
 		t.Fatalf("success line should show the transition: %q", out)
 	}
 
-	// `demote Bob` → tier "player".
-	fa = &tierFakeAccount{ok: true, oldTier: "admin"}
-	run(fa, "demote Bob")
-	if fa.gotTier != "player" {
-		t.Fatalf("demote should set tier=player, got %q", fa.gotTier)
+	// `demote Bob` → the edge sends the EMPTY baseline sentinel (#112), NOT a hardcoded "player"; the
+	// confirmation shows the service's RESOLVED appliedTier ("mortal" here, a renamed baseline).
+	fa = &tierFakeAccount{ok: true, oldTier: "admin", appliedTier: "mortal"}
+	_, out = run(fa, "demote Bob")
+	if fa.gotTier != "" {
+		t.Fatalf("demote should send the empty baseline sentinel, got %q", fa.gotTier)
+	}
+	if !strings.Contains(out, "admin -> mortal") {
+		t.Fatalf("demote confirmation should show the resolved baseline from the service: %q", out)
 	}
 
 	// A service refusal (non-admin actor) prints the reason, no crash.

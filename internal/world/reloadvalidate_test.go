@@ -390,3 +390,48 @@ func TestValidateChannelsSubjectSafety(t *testing.T) {
 		t.Fatalf("raw-ref keying should flag the dead channel AND the subject-unsafe sibling, got: %v", p)
 	}
 }
+
+// TestValidatePacksTrustLadderReject pins that the reload-broadcast gate HARD-REJECTS a trust-ladder mistake
+// that would elevate the wrong accounts fleet-wide (#111): a baseline tier granting a capability. It also
+// pins that a WARN-severity finding (an un-grantable flag) does NOT block a reload — the gate only stops the
+// Reject-severity ones, matching the boot lint's warn/error split.
+func TestValidatePacksTrustLadderReject(t *testing.T) {
+	// A baseline ("citizen") granting admin — every un-elevated account would become admin on next login.
+	baselineGrant := []content.Pack{{Pack: "evil", TrustTiers: []content.TrustTierDTO{
+		{Name: "citizen", Rank: 0, Flags: []string{content.FlagAdmin}},
+		{Name: "overlord", Rank: 40, Flags: []string{content.FlagAdmin}},
+	}}}
+	probs := validatePacks(baselineGrant)
+	if len(probs) == 0 {
+		t.Fatal("a baseline tier granting a capability must block the reload")
+	}
+	joined := strings.Join(probs, "\n")
+	if !strings.Contains(joined, "BASELINE") || !strings.Contains(joined, "evil") {
+		t.Fatalf("the rejection must name the pack and the baseline problem, got:\n%s", joined)
+	}
+
+	// A duplicate rank also rejects.
+	if p := validatePacks([]content.Pack{{Pack: "dup", TrustTiers: []content.TrustTierDTO{
+		{Name: "player", Rank: 0},
+		{Name: "a", Rank: 30, Flags: []string{content.FlagAdmin}},
+		{Name: "b", Rank: 30, Flags: []string{content.FlagAdmin}},
+	}}}); len(p) == 0 {
+		t.Fatal("a duplicate-rank ladder must block the reload")
+	}
+
+	// A WARN-only finding (un-grantable flag on a non-baseline tier) must NOT block the reload.
+	warnOnly := []content.Pack{{Pack: "typo", TrustTiers: []content.TrustTierDTO{
+		{Name: "player", Rank: 0},
+		{Name: "wizard", Rank: 40, Flags: []string{content.FlagAdmin, "hollylight"}}, // typo, dropped at apply
+	}}}
+	for _, p := range validatePacks(warnOnly) {
+		if strings.Contains(p, "hollylight") {
+			t.Fatalf("a warn-severity ladder finding must not block a reload, got: %s", p)
+		}
+	}
+
+	// The demo pack's ladder (or none) must validate clean — no false positive on real content.
+	if p := validatePacks([]content.Pack{{Pack: "demo", TrustTiers: content.DefaultTrustTiers()}}); len(p) != 0 {
+		t.Fatalf("the default ladder must not be rejected, got: %v", p)
+	}
+}

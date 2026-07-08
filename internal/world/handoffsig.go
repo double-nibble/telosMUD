@@ -65,6 +65,18 @@ func snapshotSigningInput(req *handoffv1.PrepareRequest) []byte {
 	writeU64(snap.GetAppliedSeq())
 	writeStr(snap.GetCommsState())
 	writeStr(snap.GetStateJson())
+	// The account trust tier (#106) is elevation-bearing, so it MUST be bound by the signature — otherwise a
+	// network attacker could flip an in-flight handoff's tier and the destination would re-derive admin from it.
+	// It is appended ONLY WHEN NON-EMPTY: a baseline player (tier=="", the overwhelming common case) then digests
+	// byte-identically to a pre-#106 signer, so a rolling upgrade does not break ordinary handoffs — only an
+	// ELEVATED player (staff, rare) handed off across a mixed-version boundary sees a signature mismatch, which
+	// fails CLOSED (the source keeps them; they retry). This is safe canonicalization, not a length-prefix
+	// footgun: the field's presence is a pure function of the value being authenticated, so a party without the
+	// key cannot make a tier="" and a tier="admin" snapshot collide (the latter includes the extra bytes; the
+	// digest differs), and the same-code verifier always recomputes the identical presence decision.
+	if t := snap.GetTier(); t != "" {
+		writeStr(t)
+	}
 
 	return h.Sum(nil)
 }

@@ -1,5 +1,7 @@
 package world
 
+import "fmt"
+
 // luabreaker.go — the error-budget circuit breaker (slice 7.5, P7-D10, T11). A per-SCRIPT failure
 // counter: each failure adds to a weighted budget; past a threshold the breaker TRIPS and DISABLES
 // that script (its invocations no-op) — never the zone. It resets on a successful hot reload (7.7).
@@ -124,6 +126,11 @@ func (rt *luaRuntime) breakerRecord(key, origin string, kind luaAbortKind) {
 		// stack was already logged by the caller at WARN; this is the trip event.
 		rt.log.Error("lua circuit breaker TRIPPED — script DISABLED until reload (zone unaffected)",
 			"script", key, "origin", origin, "failures", b.failures, "budget", b.budget)
+		// #116: a quarantine is the highest-value debug signal — a builder testing content needs to know their
+		// script is now disabled, not silently inert. Echo it to any staff watching this zone with `debug on`.
+		if rt.zone != nil {
+			rt.zone.echoDebug(fmt.Sprintf("lua script QUARANTINED [%s] after %d failures — disabled until reload", origin, b.failures))
+		}
 	}
 }
 

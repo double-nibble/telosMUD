@@ -205,11 +205,24 @@ func (p *Pool) AccountByCharacterName(ctx context.Context, name string) (string,
 	return *acct, true, nil
 }
 
+// ErrTierConflict is returned by SetAccountTier when the target's tier is not expectedOldTier at write time —
+// a concurrent tier change landed between the caller's authorization checks and this write. The caller (the
+// account Service) evaluates its ceilings against a tier read OUTSIDE the row lock, so this compare-and-set is
+// what makes those checks binding rather than advisory (#165).
+var ErrTierConflict = errors.New("store: account tier changed under the caller's check")
+
 // SetAccountTier changes targetAccountID's tier to newTier and records the change in account_role_audit
 // (actor = actorAccountID), atomically. Returns the target's PREVIOUS tier (for the confirmation line). It
-// does NOT authorize — the caller (the account Service) checks the actor is an admin first; this is the
-// write. The tier CHECK constraint (migration 00019) rejects an invalid newTier at the DB.
-func (p *Pool) SetAccountTier(ctx context.Context, actorAccountID, targetAccountID, newTier string) (string, error) {
+// does NOT authorize — the caller (the account Service) checks the actor is an admin first; this is the write.
+//
+// COMPARE-AND-SET: the write applies only if the target's current tier equals expectedOldTier, the value the
+// caller's ceilings were evaluated against. The row is taken FOR UPDATE and compared inside the transaction,
+// so two concurrent SetAccountTier calls serialize behind the lock and the loser observes the winner's tier
+// (returned alongside ErrTierConflict, which the service logs as observed_tier). Without it, "a gm may not strip
+// a same-rank warden" is a check the caller can simply lose a race against: the gm's promote of Bob (player)
+// passes the ceiling, an admin concurrently makes Bob a warden, and the gm's write lands on a warden anyway.
+// On conflict nothing is written and no audit row is appended.
+func (p *Pool) SetAccountTier(ctx context.Context, actorAccountID, targetAccountID, newTier, expectedOldTier string) (string, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("store: begin: %w", err)
@@ -222,6 +235,9 @@ func (p *Pool) SetAccountTier(ctx context.Context, actorAccountID, targetAccount
 			return "", fmt.Errorf("store: set tier: unknown account %s", targetAccountID)
 		}
 		return "", fmt.Errorf("store: set tier read: %w", err)
+	}
+	if oldTier != expectedOldTier {
+		return oldTier, ErrTierConflict // the base moved; the caller authorized against a stale tier
 	}
 	if _, err := tx.Exec(ctx, `UPDATE accounts SET tier = $1 WHERE id = $2`, newTier, targetAccountID); err != nil {
 		return "", fmt.Errorf("store: set tier update: %w", err)
@@ -264,6 +280,44 @@ func (p *Pool) SetAccountColorPref(ctx context.Context, accountID string, enable
 		return fmt.Errorf("store: set account color pref %s: %w", accountID, err)
 	}
 	return nil
+}
+
+// SetAccountTierSystem is the BREAK-GLASS tier write (#108): it forces targetAccountID to newTier and audits
+// the change with a NULL actor (system-granted, exactly like the bootstrap admin grant), all in one
+// transaction. Returns the previous tier. It exists for the `telos-account set-tier` CLI — the sanctioned
+// recovery from a last-admin lockout, where whoever runs it has DB/host access (which IS the authorization),
+// so it deliberately bypasses BOTH the in-game admin check and the promote ceilings.
+//
+// Unlike SetAccountTier this is UNCONDITIONAL (no compare-and-set): a recovery operator wants the write to
+// land, not to lose a race against whatever wedged state prompted the recovery. It still locks the row
+// FOR UPDATE so a concurrent in-game SetAccountTier serializes cleanly (its CAS will then observe this write).
+func (p *Pool) SetAccountTierSystem(ctx context.Context, targetAccountID, newTier string) (string, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var oldTier string
+	if err := tx.QueryRow(ctx, `SELECT tier FROM accounts WHERE id = $1 FOR UPDATE`, targetAccountID).Scan(&oldTier); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("store: set tier (system): unknown account %s", targetAccountID)
+		}
+		return "", fmt.Errorf("store: set tier (system) read: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE accounts SET tier = $1 WHERE id = $2`, newTier, targetAccountID); err != nil {
+		return "", fmt.Errorf("store: set tier (system) update: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO account_role_audit (id, actor_account, target_account, old_tier, new_tier)
+		 VALUES ($1, NULL, $2, $3, $4)`,
+		uuid.New(), targetAccountID, oldTier, newTier); err != nil {
+		return "", fmt.Errorf("store: set tier (system) audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("store: commit: %w", err)
+	}
+	return oldTier, nil
 }
 
 // AccountDisplayName returns an account's display name (may be empty). found=false for an unknown account.

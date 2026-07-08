@@ -1079,6 +1079,16 @@ func (z *Zone) attach(m attachMsg) {
 		s.pending = false
 		s.frozen = false
 		s.attachGen++
+		// Re-derive the reserved trust flags from the carried tier (#106), mirroring the fresh-login reconcile
+		// (loginRoom). The flags were deliberately NOT carried across the seam (H-1); the SIGNED tier is, so an
+		// admin/builder who walks between shards keeps holylight/builder/admin instead of arriving as a player.
+		// Done BEFORE the arrival look so holylight governs what they see on entry. A baseline (empty) tier
+		// clears every reserved flag — the correct fail-closed default. NOTE: wizinvis is a session concealment,
+		// never tier-grantable (applyTierFlags clears it), so a staffer who was wizinvis on the source arrives
+		// VISIBLE and triggers the "$n arrives." broadcast below — an intended, documented presence flicker (a
+		// cross-shard hop is a session boundary for concealment), not a regression (pre-#106 they de-elevated
+		// fully anyway).
+		applyTierFlags(s.entity, s.tier)
 		s.send(attachedFrame(z.id)) // resume ack = appliedSeq carried in the snapshot
 		// prepare parked the entity's location at the destination room WITHOUT adding it
 		// to the room contents (pending = invisible). Move now makes it visible. Guard the
@@ -1379,6 +1389,13 @@ func (z *Zone) prepare(m prepareMsg) {
 		epoch:        m.epoch,
 		pending:      true,
 		token:        m.token,
+		// Adopt the account trust tier carried on the SIGNED snapshot (#106). The reserved flags themselves are
+		// NOT carried (applyStateComponents skips them — H-1: a flag restore bypasses the content op guard), so
+		// elevation is re-DERIVED from this tier when the session activates (attach), mirroring the fresh-login
+		// reconcile. Empty for a baseline player. Only ever trusted because it rode the verified payload — a
+		// keyless (dev/test) shard that skips signature verification also skips carrying elevation into a trust
+		// boundary, since those deployments are single-shard and never hand off.
+		tier: m.snap.GetTier(),
 	}
 	e := z.newPlayerEntity(s, character)
 	// Rehydrate the receiver-side comms-state subtree carried on the snapshot (Phase 8.6) so toggles/

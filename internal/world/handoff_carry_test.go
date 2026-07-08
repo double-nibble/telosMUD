@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -325,4 +326,90 @@ func TestCrossShardCarryEndToEnd(t *testing.T) {
 	// resumes numbering — seq 5 here.
 	send(t, sB, inputSeq(5, "equipment"))
 	recvUntilOutput(t, sB, "iron helmet")
+}
+
+// TestCrossShardTierCarry pins #106: the account trust tier rides the SIGNED snapshot and the destination
+// re-DERIVES the reserved flags from it — while the flags THEMSELVES are NOT carried (H-1: a flag restore
+// bypasses the content op guard, so a forged snapshot must not be able to inject one). Concretely: a source
+// admin has holylight set; buildSnapshot carries tier="admin" but NOT the flag; prepare parks the pending
+// session with s.tier=="admin" and the entity WITHOUT holylight; applying the tier (as attach does on
+// activation) restores it.
+func TestCrossShardTierCarry(t *testing.T) {
+	src := newDemoZone("midgaard", newProtoCache())
+	dst := newDemoZone("midgaard", newProtoCache())
+
+	s := &session{character: "Wizard", stateVersion: 1}
+	e := src.newPlayerEntity(s, "Wizard")
+	Add(e, &Living{})
+	// The source session is an admin with the derived reserved flags actually set (the login reconcile).
+	s.tier = "admin"
+	applyTierFlags(e, "admin")
+	if !hasFlag(e, flagHolylight) || !hasFlag(e, flagAdmin) {
+		t.Fatal("source admin must hold the reserved flags before the hop")
+	}
+
+	snap := buildSnapshot(s)
+	if snap.GetTier() != "admin" {
+		t.Fatalf("the snapshot must carry the tier, got %q", snap.GetTier())
+	}
+	// The reserved flags must NOT ride the carried state (H-1): dumpFlags omits them.
+	if raw := snap.GetStateJson(); raw != "" {
+		var st StateJSON
+		if err := json.Unmarshal([]byte(raw), &st); err == nil {
+			for _, f := range st.Flags {
+				if reservedFlag(f) {
+					t.Fatalf("a reserved flag %q must never be carried in the handoff state_json (H-1)", f)
+				}
+			}
+		}
+	}
+
+	// Destination prepare parks the pending session carrying the tier but WITHOUT the derived flags yet.
+	reply := make(chan error, 1)
+	dst.prepare(prepareMsg{snap: snap, room: "", epoch: 2, token: "tok", reply: reply})
+	if err := <-reply; err != nil {
+		t.Fatalf("prepare replied error: %v", err)
+	}
+	ds := dst.players["Wizard"]
+	if ds == nil || ds.entity == nil {
+		t.Fatal("prepare did not park a pending entity")
+	}
+	if ds.tier != "admin" {
+		t.Fatalf("the pending session must carry the tier, got %q", ds.tier)
+	}
+	if hasFlag(ds.entity, flagHolylight) || hasFlag(ds.entity, flagAdmin) {
+		t.Fatal("the reserved flags must NOT be present before activation (they are re-derived, not carried)")
+	}
+
+	// Activation (what attach does after s.pending=false) re-derives the flags from the carried tier.
+	applyTierFlags(ds.entity, ds.tier)
+	if !hasFlag(ds.entity, flagHolylight) || !hasFlag(ds.entity, flagAdmin) {
+		t.Fatal("activation must re-derive the reserved flags from the carried tier (elevation survives the hop)")
+	}
+}
+
+// TestCrossShardBaselineTierCarry: a baseline (empty-tier) player carries no elevation and arrives with no
+// reserved flags — the fail-closed default, and the common case that must not regress.
+func TestCrossShardBaselineTierCarry(t *testing.T) {
+	src := newDemoZone("midgaard", newProtoCache())
+	dst := newDemoZone("midgaard", newProtoCache())
+	s := &session{character: "Peon", stateVersion: 1}
+	src.newPlayerEntity(s, "Peon") // no tier, no flags
+
+	snap := buildSnapshot(s)
+	if snap.GetTier() != "" {
+		t.Fatalf("a baseline player must carry an empty tier, got %q", snap.GetTier())
+	}
+	reply := make(chan error, 1)
+	dst.prepare(prepareMsg{snap: snap, room: "", epoch: 2, token: "tok", reply: reply})
+	if err := <-reply; err != nil {
+		t.Fatalf("prepare replied error: %v", err)
+	}
+	ds := dst.players["Peon"]
+	applyTierFlags(ds.entity, ds.tier)
+	for _, f := range []string{flagHolylight, flagBuilder, flagAdmin, flagWizinvis} {
+		if hasFlag(ds.entity, f) {
+			t.Errorf("a baseline player must arrive with no reserved flags, got %q", f)
+		}
+	}
 }

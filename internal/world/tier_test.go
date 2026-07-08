@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
+	"github.com/double-nibble/telosmud/internal/content"
 )
 
 // tier_test.go — #27 Slice 2: a fresh-login attach records the account trust tier (from the VERIFIED session
@@ -209,5 +210,84 @@ func TestAdminLoginAppliesTierFlags(t *testing.T) {
 	plain := spawn("Peasant", "player")
 	if hasFlag(plain, flagHolylight) || hasFlag(plain, flagBuilder) || hasFlag(plain, flagAdmin) {
 		t.Error("a player login must spawn with no elevated flags")
+	}
+}
+
+// TestReservedFlagsMatchContentVocabulary pins the world's reserved-flag set against content's (#165). The two
+// are declared independently by value (the world takes no content dependency for a 4-string set), and three
+// separate behaviors read the CONTENT copy — the ladder lint (#111), the promote ceiling, and applyTierFlags's
+// grant filter. A flag added to one side and not the other silently opens a hole (a capability the ceiling
+// never compares) or creates a dead grant (a flag the engine drops).
+//
+// It iterates the DERIVED sets, never a hardcoded name list: a hardcoded loop is exactly what would still pass
+// after someone adds a reserved flag and forgets the other side.
+func TestReservedFlagsMatchContentVocabulary(t *testing.T) {
+	for f := range reservedFlags {
+		if !content.IsReservedTierFlag(f) {
+			t.Errorf("world reserves %q but content does not — the promote ceiling and the ladder lint will never see it", f)
+		}
+	}
+	for _, f := range content.ReservedTierFlags() {
+		if !reservedFlags[f] {
+			t.Errorf("content reserves %q but the world does not — applyTierFlags would drop it and content's set_flag op could set it", f)
+		}
+	}
+	// Every capability flag must be reserved by the engine: a capability the engine does not reserve could be
+	// set by a content effect op, bypassing the tier entirely.
+	for _, f := range content.TierCapabilityFlags() {
+		if !reservedFlag(f) {
+			t.Errorf("capability flag %q must be reserved by the engine (content's set_flag op could otherwise set it)", f)
+		}
+	}
+	// And the capability set must be a STRICT subset of reserved, differing only by the non-capability flags.
+	// If someone drops wizinvis from nonCapabilityFlags this fails loudly rather than silently changing what a
+	// tier may grant.
+	if got, want := len(content.TierCapabilityFlags()), len(content.ReservedTierFlags())-1; got != want {
+		t.Errorf("capability flags = %v, reserved = %v: expected exactly one reserved non-capability flag (wizinvis)",
+			content.TierCapabilityFlags(), content.ReservedTierFlags())
+	}
+	if content.IsTierCapabilityFlag(flagWizinvis) {
+		t.Error("wizinvis must NOT be a capability: applyTierFlags would then let a ladder confer a rank-blind roster concealment (see presence.go concealedForRoster)")
+	}
+}
+
+// TestApplyTierFlagsNeverGrantsWizinvis pins the invariant the promote ceiling's wizinvis exclusion rests on:
+// a content ladder that NAMES wizinvis must not confer it. Without the capability filter in applyTierFlags, a
+// rank-0 tier granting wizinvis would hide that account from cross-shard `who` for every viewer without
+// holylight (concealedForRoster is rank-BLIND) — an ability the rank-gated `wizinvis` verb could never give it,
+// and one the ceiling deliberately does not compare.
+func TestApplyTierFlagsNeverGrantsWizinvis(t *testing.T) {
+	z := newZone("test")
+	z.defs.trust = buildTrustLadder([]content.TrustTierDTO{
+		{Name: "player", Rank: 0},
+		{Name: "ghost", Rank: 0, Flags: []string{content.FlagWizinvis}},
+		{Name: "admin", Rank: 40, Flags: []string{content.FlagHolylight, content.FlagBuilder, content.FlagAdmin}},
+	})
+	room := z.newEntity(ProtoRef("test:room"))
+	Add(room, &Room{})
+	e := z.newEntity(ProtoRef(""))
+	Add(e, &Living{})
+	Move(e, room)
+
+	applyTierFlags(e, "ghost")
+	if hasFlag(e, flagWizinvis) {
+		t.Fatal("a tier must never confer wizinvis — the ladder is content, and the promote ceiling does not compare it")
+	}
+	// The capability flags a tier DOES grant still apply, and the reconcile still clears the rest.
+	applyTierFlags(e, "admin")
+	for _, f := range []string{flagHolylight, flagBuilder, flagAdmin} {
+		if !hasFlag(e, f) {
+			t.Errorf("admin must still grant %q", f)
+		}
+	}
+	if hasFlag(e, flagWizinvis) {
+		t.Error("wizinvis must stay cleared by the login reconcile (it is session-scoped)")
+	}
+	// A demotion strips every capability.
+	applyTierFlags(e, "player")
+	for _, f := range []string{flagHolylight, flagBuilder, flagAdmin, flagWizinvis} {
+		if hasFlag(e, f) {
+			t.Errorf("demotion to the baseline must clear %q", f)
+		}
 	}
 }

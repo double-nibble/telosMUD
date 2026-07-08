@@ -45,6 +45,11 @@ const (
 	maxScreenBytes = 32 * 1024
 	maxScreenOps   = 4096
 	maxScreenCoord = 999
+	// maxScreenFramesPerPulse bounds how many Screen frames a receiver accepts per zone heartbeat (#120): the
+	// per-frame caps above bound ONE frame, but not show()-per-tick, so a tight loop (via mud.after) could
+	// otherwise clear+repaint a co-located player every pulse. Two frames/pulse leaves room for a
+	// legitimate clear-then-draw pair while turning a flood into at most a slow trickle.
+	maxScreenFramesPerPulse = 2
 )
 
 // screenColors is the fixed name→SGR allowlist the color() primitive maps — no author-supplied byte ever
@@ -200,12 +205,14 @@ func (rt *luaRuntime) screenWrite(l *lua.LState) int {
 }
 
 // sanitizeScreenText returns text safe to place VERBATIM on the sanitizer-BYPASSING screen path: only
-// printable runes survive. It is deliberately BYTE-AWARE where it must be. textsan.CleanMarkup is rune-level
-// and, being blind to invalid-UTF-8 bytes, would let a RAW 8-BIT C1 CONTROL through — 0x9B (8-bit CSI),
-// 0x9D (8-bit OSC), 0x9C (8-bit ST) are all invalid UTF-8, decode to U+FFFD (for which unicode.IsControl is
-// false), and so survive a rune-level filter. On this raw path those bytes are LIVE escape introducers (a
-// DSR/DA cursor-report that injects back into the input stream, or an OSC-52 clipboard exfil) — the exact
-// classes #31's security guardrail said must be unreachable. So here EVERY byte that is not a valid,
+// printable runes survive. It is deliberately BYTE-AWARE, for the same reason textsan.CleanMarkup is (since
+// #156): a RAW 8-BIT C1 CONTROL — 0x9B (8-bit CSI), 0x9D (8-bit OSC), 0x9C (8-bit ST) — is invalid UTF-8 that
+// decodes to U+FFFD (for which unicode.IsControl is false), so a purely rune-level filter would let it survive.
+// On this raw path those bytes are LIVE escape introducers (a DSR/DA cursor-report that injects back into the
+// input stream, or an OSC-52 clipboard exfil) — the exact classes #31's security guardrail said must be
+// unreachable. This function is kept SEPARATE from CleanMarkup (rather than reusing it) because the screen path
+// is the one output the gate writes VERBATIM, so its sanitizer must live next to the frame it guards. So here
+// EVERY byte that is not a valid,
 // printable, non-control rune is DROPPED: an invalid/lone byte (a raw C1 like 0x9B, a stray 0xFF) and every
 // control rune (C0 incl. ESC/BEL, DEL, and the U+0080–U+009F C1 runes) are removed; valid multibyte UTF-8
 // printables (including combining marks/emoji) survive. This makes write() safe by CONSTRUCTION, not by a
@@ -230,6 +237,12 @@ func sanitizeScreenText(s string) string {
 // screenShow flushes the accumulated sequence to a target player as ONE Screen frame (atomic — no flicker
 // or interleave with other output), followed by an SGR reset so color never bleeds past the frame. The
 // target is an entity handle; a non-player / session-less target is a silent no-op.
+//
+// Two anti-griefing bounds (#120/#147): the target must be in the SAME ROOM as the script's subject
+// (rt.inv.actor), not merely the same zone — the cheapest scope on "who a script can repaint" — and each
+// receiver accepts at most maxScreenFramesPerPulse frames per zone heartbeat, so a tight repaint loop can't
+// flood a co-located player's terminal. Both are annoyance-grade caps (the terminal-injection class is already
+// closed by construction: write() is printable-only); they bound the residual "content can be obnoxious" risk.
 func (rt *luaRuntime) screenShow(l *lua.LState) int {
 	s := checkScreen(l, 1)
 	if s == nil {
@@ -239,13 +252,45 @@ func (rt *luaRuntime) screenShow(l *lua.LState) int {
 	if target == nil {
 		return 0
 	}
-	if pc, ok := sessionOf(target); ok {
-		out := make([]byte, 0, len(s.buf)+4)
-		out = append(out, s.buf...)
-		out = append(out, "\x1b[0m"...) // trailing reset
-		pc.send(screenFrame(out))
+	// Same-room scope: only a co-located target may be painted. rt.inv.actor is the script's engine-resolved
+	// subject (the scripted mob / the caster) — never a Lua arg — so a script cannot name a distant player. A
+	// missing invocation/actor or a location-less actor fails closed (no target is co-located with "nowhere").
+	if rt.inv == nil || rt.inv.actor == nil || rt.inv.actor.location == nil || target.location != rt.inv.actor.location {
+		return 0
 	}
+	pc, ok := sessionOf(target)
+	if !ok {
+		return 0
+	}
+	// Per-receiver frame rate limit, keyed on the painting zone's pulse (the target is co-located, so it is in
+	// rt.zone). Drops the frame past the cap rather than queuing it — a dropped repaint is invisible to the
+	// player, whereas queuing would just defer the flood. FAILS CLOSED on a nil zone (drop, don't send): a
+	// zone-less runtime can't rate-limit, and the same-room check above is already fail-closed — a screen frame
+	// should never escape the cap. Unreachable in production (z.lua always has its zone set); the guard keeps
+	// the two bounds consistent.
+	if rt.zone == nil || !pc.admitScreenFrame(rt.zone.pulses.pulse) {
+		return 0
+	}
+	out := make([]byte, 0, len(s.buf)+4)
+	out = append(out, s.buf...)
+	out = append(out, "\x1b[0m"...) // trailing reset
+	pc.send(screenFrame(out))
 	return 0
+}
+
+// admitScreenFrame reports whether this session may accept another Lua Screen frame on the given zone pulse,
+// enforcing maxScreenFramesPerPulse (#120). The per-pulse counter resets lazily when the pulse advances, so
+// no periodic reset callback is needed. Zone-goroutine-owned (the only caller is screenShow).
+func (s *session) admitScreenFrame(pulse uint64) bool {
+	if s.lastScreenPulse != pulse {
+		s.lastScreenPulse = pulse
+		s.screenFramesThisPulse = 0
+	}
+	if s.screenFramesThisPulse >= maxScreenFramesPerPulse {
+		return false
+	}
+	s.screenFramesThisPulse++
+	return true
 }
 
 // clampCoord bounds a cursor row/col to [1, maxScreenCoord].

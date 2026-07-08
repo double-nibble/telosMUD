@@ -40,8 +40,10 @@ type AccountClient interface {
 	CreateChargenCharacter(ctx context.Context, accountID, name string, picks map[string]string, allocs map[string]map[string]int) (characterID, reason string, atCapacity bool, err error)
 	// SetAccountTier is the promote/demote call (#27): change targetCharacter's account tier. Authz is
 	// enforced at the account service (the actor must be an admin per the store), so the gate just passes the
-	// actor's account id. ok=false with a user-facing reason on refusal; oldTier is the prior tier on success.
-	SetAccountTier(ctx context.Context, actorAccountID, targetCharacter, newTier string) (ok bool, reason, oldTier string, err error)
+	// actor's account id. An empty newTier is the demote-to-BASELINE sentinel (#112) the service resolves.
+	// ok=false with a user-facing reason on refusal; on success oldTier is the prior tier and appliedTier is
+	// the tier actually applied (the resolved baseline when the sentinel was sent).
+	SetAccountTier(ctx context.Context, actorAccountID, targetCharacter, newTier string) (ok bool, reason, oldTier, appliedTier string, err error)
 	// GetColorPref reads the account's persisted terminal color preference (#23). set=false => never chosen, so
 	// the gate keeps its default (on). Color is an EDGE concern: the gate reads/writes it directly here and
 	// never routes it through the world.
@@ -86,8 +88,8 @@ func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string
 
 // SetAccountTier on the stub refuses: without an account service there is no tier authority (the dev/no-auth
 // path has no accounts).
-func (stubAccountClient) SetAccountTier(_ context.Context, _, _, _ string) (bool, string, string, error) {
-	return false, "Trust tiers require an account service.", "", nil
+func (stubAccountClient) SetAccountTier(_ context.Context, _, _, _ string) (bool, string, string, string, error) {
+	return false, "Trust tiers require an account service.", "", "", nil
 }
 
 // GetColorPref/SetColorPref on the stub are no-ops: the bare-name/dev-autoauth path has no account to persist
@@ -222,14 +224,14 @@ func (g *grpcAccountClient) CreateChargenCharacter(ctx context.Context, accountI
 }
 
 // SetAccountTier calls the account service's promote/demote RPC (#27). Authz is enforced service-side.
-func (g *grpcAccountClient) SetAccountTier(ctx context.Context, actorAccountID, targetCharacter, newTier string) (bool, string, string, error) {
+func (g *grpcAccountClient) SetAccountTier(ctx context.Context, actorAccountID, targetCharacter, newTier string) (bool, string, string, string, error) {
 	resp, err := g.cli.SetAccountTier(ctx, &accountv1.SetAccountTierRequest{
 		ActorAccountId: actorAccountID, TargetCharacter: targetCharacter, NewTier: newTier,
 	})
 	if err != nil {
-		return false, "", "", err
+		return false, "", "", "", err
 	}
-	return resp.GetOk(), resp.GetReason(), resp.GetOldTier(), nil
+	return resp.GetOk(), resp.GetReason(), resp.GetOldTier(), resp.GetNewTier(), nil
 }
 
 // GetColorPref reads the account's persisted color preference (#23). set=false when the account has no stored

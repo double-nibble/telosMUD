@@ -46,12 +46,14 @@ type session struct {
 	entity *Entity
 
 	// tier is the account trust tier (#27) from the VERIFIED session assertion, set on fresh-login attach.
-	// player/builder/admin; "" (== player) on the dev/unverified path. It is a LOGIN-TIME input the zone uses
-	// to DERIVE the reserved builder/admin/holylight flags on spawn (applyTierFlags). Those flags are NOT
-	// persisted or carried on the (unauthenticated) handoff snapshot (security-audit H-1) — they are re-
-	// derived from the tier at each fresh login. A cross-shard handoff currently DROPS elevation (fail-closed);
-	// carrying the tier on the signed handoff snapshot to re-derive at the destination is a follow-up.
-	// Zone-goroutine-owned.
+	// player/builder/admin (content-defined ladder); "" (== baseline) on the dev/unverified path. It is the
+	// input the zone uses to DERIVE the reserved builder/admin/holylight flags on spawn (applyTierFlags). The
+	// FLAGS themselves are NOT persisted or carried on the handoff snapshot (security-audit H-1: a flag restore
+	// bypasses the content op guard) — they are re-derived from the tier. The tier IS carried across a
+	// cross-shard handoff, but only on the SIGNED snapshot (#106): it rides the authenticated payload and is
+	// re-derived at the destination, so an admin/builder keeps elevation across a shard walk while a forged
+	// snapshot cannot inject it. A keyless (unverified) shard strips the carried tier at Prepare, so elevation
+	// is applied only from a verified source. Zone-goroutine-owned.
 	tier string
 
 	// lastVitals / lastStatus are the last GMCP Char.Vitals / Char.Status payloads emitted to this
@@ -82,6 +84,19 @@ type session struct {
 	// by `rolls on|off`; only staff can reach the verb (MinRank). Session-scoped like vitalsLive (a debug
 	// pref, not persisted); default false. An explicit content visHide is still respected (content intent).
 	showRolls bool
+
+	// debugEchoes is a STAFF debug pref (#116, toggles.go): when true, this staff session receives live
+	// diagnostic echoes for the zone it is in — the first consumer is Lua script errors in that zone
+	// (z.echoDebug, fired from the isolated-error log sites). Set live by `debug on|off`; only staff can
+	// reach the verb (MinRank). Session-scoped like showRolls (a debug pref, not persisted); default false.
+	debugEchoes bool
+
+	// lastScreenPulse / screenFramesThisPulse rate-limit inbound Lua Screen frames (#120): a content script's
+	// screen:show() to this session is capped at maxScreenFramesPerPulse per zone heartbeat, so a tight repaint
+	// loop can't flood the terminal. Zone-goroutine-owned (screenShow runs there); reset lazily when the pulse
+	// advances (admitScreenFrame). Not persisted — a per-tick counter.
+	lastScreenPulse       uint64
+	screenFramesThisPulse int
 
 	// lastWho is when this session last ran `who` — the per-session cooldown mark (cmdWho reads and
 	// writes it against zone.whoCooldown). Zone-goroutine-owned like the HUD buffers above; it rides

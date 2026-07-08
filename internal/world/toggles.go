@@ -1,6 +1,10 @@
 package world
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/double-nibble/telosmud/internal/textsan"
+)
 
 // toggles.go — runtime-tweakable per-staff "view" toggles (#30, Track 2): session-scoped switches a trust-
 // gated staff member flips LIVE to change what they perceive. Registered as staff verbs (MinRank=rankStaff,
@@ -19,16 +23,46 @@ import "strings"
 //     (session-scoped — a relog drops it). Its POWER scales with rank: a higher-rank staffer hides from
 //     more, so no per-tier cap is needed (unlike holylight); the rank comparison IS the gate.
 //
-// Deferred (its own design pass): verbose debug echoes — needs a per-session debug-event surface.
+//   - debug on|off — subscribe this staff session to live DIAGNOSTIC echoes for the zone it is in (#116).
+//     The first (and currently only) consumer is Lua script errors in the zone: the isolated-error log sites
+//     (luaentry.go / luabreaker.go) additionally fan the error to any staff session here with the pref on, via
+//     z.echoDebug. A session pref (session.debugEchoes), not persisted; default off. High-value for a builder
+//     testing content — a broken trigger otherwise only shows up in the ops log they can't see.
 
-// staffToggleCommands returns the staff view-toggle verbs (#30). Registered LAST (low priority) with the
+// staffToggleCommands returns the staff view-toggle verbs (#30, #116). Registered LAST (low priority) with the
 // other staff verbs; each carries MinRank=rankStaff so a player can neither see nor run them.
 func staffToggleCommands() []*Command {
 	return []*Command{
 		{Name: "holylight", MinRank: rankStaff, Flags: CmdHidden, Run: cmdHolylight},
 		{Name: "wizinvis", MinRank: rankStaff, Flags: CmdHidden, Run: cmdWizinvis},
 		{Name: "rolls", MinRank: rankStaff, Flags: CmdHidden, Run: cmdRolls},
+		{Name: "debug", MinRank: rankStaff, Flags: CmdHidden, Run: cmdDebug},
 	}
+}
+
+// cmdDebug toggles the staff live-debug-echo pref (session.debugEchoes). Bare `debug` reports; `debug on|off`
+// sets it. While ON, the session receives diagnostic echoes for its current zone (first consumer: Lua script
+// errors, via z.echoDebug). Purely session-scoped — a relog turns it off.
+func cmdDebug(c *Context) error {
+	s := c.s
+	arg := strings.ToLower(strings.TrimSpace(c.Rest()))
+	switch arg {
+	case "":
+		if s.debugEchoes {
+			c.Send("Debug echoes are ON — you see live diagnostics (e.g. Lua script errors) for this zone.")
+		} else {
+			c.Send("Debug echoes are OFF. Use `debug on` to watch this zone's diagnostics.")
+		}
+	case "on", "enable":
+		s.debugEchoes = true
+		c.Send("Debug echoes ON — live zone diagnostics will be shown to you.")
+	case "off", "disable":
+		s.debugEchoes = false
+		c.Send("Debug echoes OFF.")
+	default:
+		c.Send("Usage: debug on|off")
+	}
+	return nil
 }
 
 // cmdWizinvis toggles staff invisibility (flagWizinvis). Bare `wizinvis` reports; `wizinvis on|off` sets it.
@@ -119,4 +153,26 @@ func tierGrantsFlag(z *Zone, tier, flag string) bool {
 		}
 	}
 	return false
+}
+
+// echoDebug fans a diagnostic line to every STAFF session in this zone that has `debug on` (#116). It is the
+// per-session debug-event surface the staff `debug` toggle subscribes to; the first caller is the Lua
+// isolated-error path (luaentry.go / luabreaker.go), which echoes a script error to any builder watching the
+// zone instead of burying it in the ops log. Called ON the zone goroutine (Lua runs there, and z.players is
+// single-writer there), so iterating z.players is race-free — callers off the goroutine must post a message
+// instead. The line is prefixed so it reads as out-of-band diagnostics, and re-checks the live trust rank so a
+// staffer demoted mid-session (pref still set until relog) stops receiving zone internals immediately.
+func (z *Zone) echoDebug(line string) {
+	for _, s := range z.players {
+		if s == nil || !s.debugEchoes || s.pending {
+			continue
+		}
+		if z.trustLadder().rank(s.tier) < rankStaff {
+			continue // demoted since they toggled it on; the pref is stale until relog
+		}
+		// The diagnostic text is content-author-influenced (a Lua error() message / a compile error carrying
+		// source). Route it through the OUTPUT-side sanitizer so an embedded newline/control can't spoof a
+		// second "[debug]" line or inject terminal control — the trusted prefix is prepended AFTER cleaning.
+		s.send(textFrame("[debug] " + textsan.CleanMarkup(line)))
+	}
 }

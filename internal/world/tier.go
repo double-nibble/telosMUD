@@ -57,7 +57,13 @@ func defaultTrustLadder() *trustLadder { return defaultLadder }
 
 // rank returns the ordinal rank of tier `name`. An empty, "player", or ANY unknown/drifted value maps to
 // rank 0 — the fail-safe baseline (a garbage tier can never read as elevation; mirrors the Slice-2 posture).
+// "" short-circuits before the lookup: it is the value a handoff-arrived or tier-less session carries, and a
+// content ladder with a nameless rung must not turn that degradation into an elevation (#165 F5). The lookup
+// can't see one anyway (buildTrustLadder drops it), but the guarantee lives here, not in the constructor.
 func (l *trustLadder) rank(name string) int {
+	if name == "" {
+		return 0
+	}
 	if t, ok := l.byName[name]; ok {
 		return t.rank
 	}
@@ -76,37 +82,53 @@ func (l *trustLadder) grantedFlags(name string) []string {
 
 // buildTrustLadder converts the content trust-tier DTOs into the runtime ladder (#29, Round 9 Slice 0). An
 // empty/nil list returns nil so the caller (z.trustLadder) falls back to the engine default ladder. The
-// loader already deduped by name; flags are carried verbatim and applyTierFlags filters them to
-// reservedFlags at apply time, so a stray non-reserved flag here is inert.
+// loader already deduped by name; flags are carried verbatim and applyTierFlags filters them to the CAPABILITY
+// set at apply time, so a stray non-reserved (or wizinvis) flag here is inert.
+//
+// A rung with an EMPTY NAME is dropped, mirroring content.NewTrustLadder: "" is the sentinel every fail-safe
+// path degrades to (an unknown tier, a session whose tier did not cross a handoff), so a nameless rung would
+// turn `rank("") == 0` into `rank("") == <that rung's rank>` and pass every MinRank gate (#165 F5).
 func buildTrustLadder(tiers []content.TrustTierDTO) *trustLadder {
 	if len(tiers) == 0 {
 		return nil
 	}
 	l := &trustLadder{byName: make(map[string]trustTier, len(tiers))}
 	for _, t := range tiers {
+		if t.Name == "" {
+			continue // never let the fail-safe baseline sentinel resolve to a defined rung
+		}
 		l.byName[t.Name] = trustTier{rank: t.Rank, flags: t.Flags}
 	}
 	return l
 }
 
-// applyTierFlags reconciles the reserved tier-flags on e to match tier — SETs the reserved flags the tier
+// applyTierFlags reconciles the reserved tier-flags on e to match tier — SETs the CAPABILITY flags the tier
 // grants (per the zone's ladder) and CLEARs every other reserved flag. Called on every fresh login
 // (loginRoom), AFTER the persisted flags load, so a stale elevated flag from a since-demoted session is
 // cleared. Uses setFlag directly (the TRUSTED path); content's set_flag op can't touch these (reservedFlag).
-// A nil / zone-less entity is a no-op. Only RESERVED flags named by the ladder are applied — a ladder that
-// names a non-reserved flag is ignored (the engine never grants an unknown capability via a tier).
+// A nil / zone-less entity is a no-op.
+//
+// The apply filter is content.IsTierCapabilityFlag, NOT reservedFlag — the two differ by flagWizinvis, and
+// the difference is load-bearing (#165). wizinvis is reserved (content-unsettable, un-persisted) but is NOT
+// grantable by a tier: it is a session concealment a staff member sets for itself, and a tier-granted one
+// would be a capability the promote ceiling deliberately does not compare. Concretely, concealedForRoster
+// (presence.go) is rank-BLIND, so a rank-0 tier granting wizinvis would hide that account from cross-shard
+// `who` for every viewer without holylight — an ability the rank-gated `wizinvis` verb could never give it.
+// Filtering here (rather than trusting a lint, which only WARNS at boot) makes the ladder unable to confer it
+// at all, so the ceiling's exclusion of wizinvis is sound by construction. A ladder naming any flag outside
+// the capability set — wizinvis, or an invented name — grants nothing; LintTrustLadder warns on both.
 func applyTierFlags(e *Entity, tier string) {
 	if e == nil || e.zone == nil {
 		return
 	}
 	granted := map[string]bool{}
 	for _, f := range e.zone.trustLadder().grantedFlags(tier) {
-		if reservedFlag(f) {
+		if content.IsTierCapabilityFlag(f) {
 			granted[f] = true
 		}
 	}
 	for f := range reservedFlags {
-		setFlag(e, f, granted[f]) // set the granted reserved flags; clear the rest (demotion strips them)
+		setFlag(e, f, granted[f]) // set the granted capability flags; clear every other reserved flag
 	}
 }
 
@@ -117,11 +139,15 @@ func applyTierFlags(e *Entity, tier string) {
 // omits them from the save; applyStateComponents skips them on restore (H-1: a forged snapshot can't inject
 // one); and applyTierFlags reconciles them at login (set the tier's granted set, CLEAR the rest).
 //
+// The set is mirrored by value in content (content.IsReservedTierFlag) — the ladder lint (#111) and the
+// promote ceiling (#165) read the content copy; TestReservedFlagsMatchContentVocabulary pins them equal.
+//
 // The set holds the three ELEVATION flags (holylight/builder/admin, granted by a tier) AND flagWizinvis, a
-// staff CONCEALMENT (#30): no tier grants wizinvis, so the login reconcile always CLEARS it — which is
-// exactly the session-scoped reset it wants (a relog drops wizinvis), while keeping it un-settable by content
-// (a mortal must not self-conceal) and off the persistence boundary. NOTE: flagDetectInvis is deliberately
-// NOT reserved — it is a bounded game mechanic (a detect-invisibility spell/racial), not an engine capability.
+// staff CONCEALMENT (#30). No tier CAN grant wizinvis — applyTierFlags filters grants to the capability set,
+// which excludes it (#165) — so the login reconcile always CLEARS it: exactly the session-scoped reset it
+// wants (a relog drops wizinvis), while keeping it un-settable by content (a mortal must not self-conceal)
+// and off the persistence boundary. NOTE: flagDetectInvis is deliberately NOT reserved — it is a bounded game
+// mechanic (a detect-invisibility spell/racial), not an engine capability.
 var reservedFlags = map[string]bool{
 	flagHolylight: true,
 	flagBuilder:   true,
