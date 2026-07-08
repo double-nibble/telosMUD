@@ -45,6 +45,23 @@ func Interceptor(token string) grpc.UnaryServerInterceptor {
 	}
 }
 
+// StreamInterceptor is a can't-forget guard for any FUTURE streaming RPC on the account surface (#247, review
+// finding). Every Account method is unary today, so this never fires — but a streaming RPC added later would
+// otherwise be SILENTLY unauthenticated (the unary interceptor does not cover streams). It applies the same
+// token check; an empty configured token disables it (dev), same as the unary path.
+func StreamInterceptor(token string) grpc.StreamServerInterceptor {
+	want := []byte(token)
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if len(want) == 0 {
+			return handler(srv, ss)
+		}
+		if !callerTokenPresent(ss.Context(), want) {
+			return status.Error(codes.Unauthenticated, "caller token required")
+		}
+		return handler(srv, ss)
+	}
+}
+
 // callerTokenPresent reports whether the incoming context carries a metadata token equal to want (constant
 // time). Missing metadata, a missing key, or an empty/mismatched value all fail.
 func callerTokenPresent(ctx context.Context, want []byte) bool {

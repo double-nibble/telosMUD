@@ -50,6 +50,14 @@ type Config struct {
 	// to serve without it); in dev an empty token allows the open listener with a loud warning (local rigs +
 	// the TELOS_DEV_AUTOAUTH stub path, which never dials gRPC anyway).
 	AccountCallerToken string `yaml:"account_caller_token"`
+	// AllowInsecure (#247/#251) explicitly opts INTO running security-sensitive services without their
+	// cluster secrets: telos-account with no caller token (an OPEN gRPC API) and a discoverable world shard
+	// with no handoff verify key (UNAUTHENTICATED Prepare). It defaults FALSE so the ABSENCE of config fails
+	// CLOSED — a production deploy that simply forgot the secret refuses to boot, rather than silently serving
+	// unauthenticated. It is DELIBERATELY separate from Env (which defaults to "dev"): keying the insecure
+	// allowance off Env would make the default env select the insecure branch. Set TELOS_ALLOW_INSECURE=1 only
+	// on a trusted local/dev rig (the dev docker-compose does).
+	AllowInsecure bool `yaml:"allow_insecure"`
 	// Session-assertion keys (Phase 14.3, ACCOUNT.md §9). AccountSigningKey is account's Ed25519 PRIVATE key
 	// (base64; the 64-byte key or the 32-byte seed) used to SIGN assertions; AccountVerifyKey is the matching
 	// PUBLIC key (base64) the WORLD verifies with offline. Both empty => assertions are off (the gate trusts
@@ -214,6 +222,9 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_DEV_AUTOAUTH"); ok {
 		c.DevAutoAuth = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v, ok := os.LookupEnv("TELOS_ALLOW_INSECURE"); ok {
+		c.AllowInsecure = v == "1" || strings.EqualFold(v, "true")
 	}
 	if v, ok := os.LookupEnv("TELOS_DEV_AUTOAUTH_ALLOW_REMOTE_BIND"); ok {
 		c.DevAutoAuthAllowRemoteBind = v == "1" || strings.EqualFold(v, "true")

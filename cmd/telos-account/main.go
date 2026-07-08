@@ -136,12 +136,13 @@ func main() {
 	// signing-key posture — while a dev/local rig may run tokenless (loud warning; the interceptor then no-ops
 	// and the TELOS_DEV_AUTOAUTH stub path never dials gRPC anyway).
 	if cfg.AccountCallerToken == "" {
-		if cfg.Env != "dev" {
+		if !cfg.AllowInsecure {
 			slog.Error("refusing to start: no account caller token (TELOS_ACCOUNT_CALLER_TOKEN) — the gRPC API would " +
-				"accept UNAUTHENTICATED callers (self-promote / assertion-mint). Set a shared token, or run with env=dev.")
+				"accept UNAUTHENTICATED callers (self-promote / assertion-mint). Set a shared token, or set " +
+				"TELOS_ALLOW_INSECURE=1 on a trusted dev rig.")
 			os.Exit(1)
 		}
-		slog.Warn("no account caller token: the gRPC API is OPEN (dev only) — anyone who can dial it may assert any actor")
+		slog.Warn("no account caller token: the gRPC API is OPEN (TELOS_ALLOW_INSECURE) — anyone who can dial it may assert any actor")
 	}
 
 	lis, err := net.Listen("tcp", cfg.AccountListen)
@@ -149,7 +150,10 @@ func main() {
 		slog.Error("listen failed", "addr", cfg.AccountListen, "err", err)
 		os.Exit(1)
 	}
-	gs := grpc.NewServer(grpc.ChainUnaryInterceptor(callerauth.Interceptor(cfg.AccountCallerToken)))
+	gs := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(callerauth.Interceptor(cfg.AccountCallerToken)),
+		grpc.ChainStreamInterceptor(callerauth.StreamInterceptor(cfg.AccountCallerToken)), // can't-forget guard for a future streaming RPC
+	)
 	accountv1.RegisterAccountServer(gs, svc)
 
 	// OAuth broker (Phase 15): served on cfg.WebListen when configured. It needs the device-auth store (Redis)

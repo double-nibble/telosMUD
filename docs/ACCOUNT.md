@@ -142,9 +142,13 @@ top tier is not a capability superset of everything beneath it would strand acco
 >   mismatch re-opens the divergence. Prefer leaving it unset so both follow the registry.
 > - A content **reload** still needs a telos-account restart to take effect (the ladder is boot-pinned, #248).
 >
-> The account gRPC listener requires a shared **caller token** (`TELOS_ACCOUNT_CALLER_TOKEN`), so only the gate
-> can reach the privileged RPCs; without it the listener would accept an unauthenticated `actor_account_id` (or
-> mint an assertion for any account) from anyone who can dial it (#247).
+> The account gRPC listener requires a shared **caller token** (`TELOS_ACCOUNT_CALLER_TOKEN`), sent by the gate,
+> so only the gate can reach the privileged RPCs; without it anyone who can dial the port could assert any
+> `actor_account_id` or mint an assertion for any account (#247). It **fails closed by default**: telos-account
+> refuses to boot with no token unless `TELOS_ALLOW_INSECURE=1` is explicitly set (a trusted dev rig — the dev
+> `docker-compose` sets it). The insecure allowance is deliberately NOT keyed on `TELOS_ENV` (which defaults to
+> `dev`), so a production deploy that merely forgot the token still refuses to start rather than serving open.
+> The world's keyless-handoff guard (#251) uses the same `TELOS_ALLOW_INSECURE` opt-in.
 
 > **Last-admin lockout recovery (#108).** There is no self/last-admin demote guard, so an admin *can* demote
 > the last admin. Config-pin (`TELOS_BOOTSTRAP_ADMIN`) does **not** recover this — it applies only at account

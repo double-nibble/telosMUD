@@ -71,10 +71,15 @@ func main() {
 	shard, chooseTarget := buildShard(worldCtx, stopWorld, cfg, zones)
 	// Fail loud on an unauthenticated multi-shard deployment (#251): a shard that can receive cross-shard
 	// handoffs MUST have a handoff verify key, or a forged Prepare could inject carried state. Refuse to boot
-	// rather than run silently unauthenticated.
+	// unless TELOS_ALLOW_INSECURE explicitly opts in (a trusted local multi-node rig, or a Redis-backed single
+	// node) — the same fail-closed-by-default posture as the account caller token. A Redis-backed SINGLE-node
+	// prod deploy is discoverable, so it correctly requires the keypair; generate one (ops).
 	if err := shard.CheckHandoffAuth(); err != nil {
-		slog.Error("refusing to start", "err", err)
-		os.Exit(1)
+		if !cfg.AllowInsecure {
+			slog.Error("refusing to start", "err", err)
+			os.Exit(1)
+		}
+		slog.Warn("insecure handoffs (TELOS_ALLOW_INSECURE): a discoverable shard has no handoff verify key", "err", err)
 	}
 	go shard.Run(worldCtx) // each zone actor loop owns its world state from here on
 
