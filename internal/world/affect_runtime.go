@@ -354,6 +354,10 @@ func fireOnTick(e *Entity, inst *affectInstance, pulse uint64) {
 	c := &effectCtx{
 		z: e.zone, actor: src, source: src, target: e,
 		mag: float64(maxInt(inst.stacks, 1)), disp: dispHarmful,
+		// Draw a DoT tick's damage dice from the zone combat rng (#58), not the process-global math/rand,
+		// so a poison/bleed tick — and any loot from a DoT killing blow (die reads this ctx's rng) — join
+		// the same reproducible stream as swings. Runs on the zone goroutine, so single-writer holds.
+		rng: e.zone.combatRng(),
 	}
 	runOps(c, inst.def.tickOps)
 }

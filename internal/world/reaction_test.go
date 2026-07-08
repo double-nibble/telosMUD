@@ -89,7 +89,7 @@ func reactorMob(z *Zone, room, fleer *Entity, name string) *Entity {
 // the budget is spent. All from content (the reactions resource + its OnLeaveRoom handler).
 func TestFleeProvokesOpportunityAttackOnce(t *testing.T) {
 	z, fleer, from := reactionZone(t)
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 	mob := reactorMob(z, from, fleer.entity, "goblin")
 	// The fleer is fighting the mob (a real two-sided fight).
 	fleer.entity.living.fighting = mob
@@ -142,7 +142,7 @@ func TestFleeProvokesOpportunityAttackOnce(t *testing.T) {
 // driver's start-of-round topUpReactions refills it, so the NEXT round's flee provokes again.
 func TestReactionBudgetRefreshesNextRound(t *testing.T) {
 	z, fleer, from := reactionZone(t)
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 	mob := reactorMob(z, from, fleer.entity, "goblin")
 
 	z.topUpReactions(mob)
@@ -163,7 +163,7 @@ func TestReactionBudgetRefreshesNextRound(t *testing.T) {
 // granted swing funnels the SAME guardHarmful every harm vector does — no PvP-gate bypass via a reaction).
 func TestOpportunityAttackGatedOnNonConsentingPlayer(t *testing.T) {
 	z, fleer, from := reactionZone(t)
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 
 	// A PLAYER reactor (not a mob) engaged with the player fleer, holding a reaction + a weapon.
 	reactor := makePlayerTargetInRoom(z, fleer.entity, "Reactor")
@@ -189,7 +189,7 @@ func TestOpportunityAttackGatedOnNonConsentingPlayer(t *testing.T) {
 	// With PvP consent on both sides, the SAME OA now lands.
 	_ = from
 	z2, fleer2, from2 := reactionZone(t)
-	z2.testCombatRng = rand.New(rand.NewSource(1))
+	z2.combatRand = rand.New(rand.NewSource(1))
 	reactor2 := makePlayerTargetInRoom(z2, fleer2.entity, "Reactor")
 	setAttrBase(reactor2.entity, "max_reactions", 1)
 	Add(reactor2.entity, &Weapon{diceNum: 1, diceSize: 1, damageType: "slash"})
@@ -217,7 +217,7 @@ func TestOpportunityAttackGatedOnNonConsentingPlayer(t *testing.T) {
 // IN PLACE with no room change and no opportunity attack — the directional-flee provoke is opt-in.
 func TestBareFleeStaysInPlaceNoProvoke(t *testing.T) {
 	z, fleer, from := reactionZone(t)
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 	mob := reactorMob(z, from, fleer.entity, "goblin")
 	fleer.entity.living.fighting = mob
 	setPosition(fleer.entity, posFighting)
@@ -250,7 +250,7 @@ func TestBareFleeStaysInPlaceNoProvoke(t *testing.T) {
 // hypothetical second flee the same round would provoke nothing.
 func TestDemoGoblinChiefOpportunityAttack(t *testing.T) {
 	z := newDemoZone("darkwood", newProtoCache())
-	z.testCombatRng = rand.New(rand.NewSource(7))
+	z.combatRand = rand.New(rand.NewSource(7))
 
 	lair := z.rooms["darkwood:room:lair"]
 	var chief *Entity

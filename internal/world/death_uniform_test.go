@@ -80,7 +80,7 @@ func TestSpellKillDropsCorpse(t *testing.T) {
 // them at the start room (the player twin of the corpse path), through the shared funnel.
 func TestSpellKillRespawnsPlayer(t *testing.T) {
 	z := newDemoZone("midgaard", newProtoCache())
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 
 	market := z.rooms["midgaard:room:market"]
 	s := &session{character: "Victim", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
@@ -150,7 +150,7 @@ func TestDoTTickKills(t *testing.T) {
 // the lethal OA respawned the fleer). Models reaction_test.go's reactionZone/reactorMob.
 func TestFleeIntoLethalOpportunityAttackRespawnsNotTeleports(t *testing.T) {
 	z, fleer, from := reactionZone(t)
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 
 	// A start room the dead fleer respawns into (NOT the flee destination). reactionZone left z.startRoom
 	// unset; register a temple as the start and a separate flee destination ("north" -> test:room:to).

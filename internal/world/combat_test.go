@@ -13,7 +13,7 @@ import (
 // OnHit), [G-B] soak-by-type, [G-H] $swing.index, [G8] cooldown completion, and the END-TO-END "kill a
 // mob through the pipeline" milestone driven entirely by CONTENT profiles. Determinism: the d1/size-1
 // trick (a "1d1" die always rolls 1, face 1) lets a band edge select an EXACT outcome; a seeded
-// z.testCombatRng makes a multi-roll fight reproducible.
+// z.combatRand makes a multi-roll fight reproducible.
 
 // combatZone builds a bare zone with the combat attributes a profile reads. It returns the zone and a
 // player session (in z.players so resolve-by-id works). Profiles + mobs are added per-test so each
@@ -397,7 +397,7 @@ func TestKillNonConsentingPlayerRefused(t *testing.T) {
 // profiles registered like the demo pack. Driven via the pulse so the real round timing is exercised.
 func TestKillEntersCombatAndRoundDriverSwings(t *testing.T) {
 	z, s := combatZone(t)
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 	z.defs.combat.register("melee", autoHitProfile(
 		an("$actor.strength_bonus"), // +2 damage
 	))
@@ -436,6 +436,117 @@ func TestKillEntersCombatAndRoundDriverSwings(t *testing.T) {
 	}
 	if got := resourceCurrent(mob, "hp"); got != startHP-16 {
 		t.Fatalf("after round 2 goblin hp = %d, want %d", got, startHP-16)
+	}
+}
+
+// TestCombatReproducibleFromZoneSeed (#58): combat draws from the zone-OWNED injectable rng (z.combatRand),
+// not the process-global math/rand — so seeding it makes a whole fight reproducible, the replay/chaos
+// property the round driver lacked. A 1d6 weapon makes each swing's damage rng-dependent. runFight injects
+// a FIXED seed (overriding newZone's production entropy seed) and returns per-round damage. Two proofs:
+// same seed => identical fight (+ real variance, so the rng is genuinely consumed); different seed =>
+// different fight (so the SEED drives it — a constant/ignored seed, or a lingering global-rand draw, fails
+// one of these).
+func TestCombatReproducibleFromZoneSeed(t *testing.T) {
+	runFight := func(seed int64) []int {
+		z, s := combatZone(t)
+		z.combatRand = rand.New(rand.NewSource(seed))                                // inject: overrides the entropy seed
+		z.defs.combat.register("melee", autoHitProfile(litNode{v: 0}))               // always hits, +0 bonus
+		s.entity.living.combatRef = "melee"                                          //
+		equipWeapon(s.entity, &Weapon{diceNum: 1, diceSize: 6, damageType: "slash"}) // 1..6/swing, from the rng
+		mob := combatMob(z, s.entity, "goblin", "", 100)
+		ctx := &Context{z: z, s: s, Actor: s.entity, arg: "goblin"}
+		if err := cmdKill(ctx); err != nil {
+			t.Fatalf("cmdKill: %v", err)
+		}
+		var deltas []int
+		prev := resourceCurrent(mob, "hp")
+		for r := 0; r < 8; r++ {
+			for i := uint64(0); i < PULSE_VIOLENCE; i++ {
+				z.pulses.tick()
+			}
+			now := resourceCurrent(mob, "hp")
+			deltas = append(deltas, prev-now)
+			prev = now
+		}
+		return deltas
+	}
+
+	// 1) Same seed => identical fight. If combat still drew from the global rand this would diverge (two
+	// runs advance one shared global stream); it holds only because both draw from the injected seed.
+	a, b := runFight(12345), runFight(12345)
+	if !equalInts(a, b) {
+		t.Fatalf("same seed produced different fights: %v vs %v (combat not reproducible from the seed)", a, b)
+	}
+	// The rng is genuinely consumed: 1d6 damage varies across the fight (not frozen on a constant).
+	varied := false
+	for _, d := range a {
+		if d != a[0] {
+			varied = true
+			break
+		}
+	}
+	if !varied {
+		t.Fatalf("per-round damage never varied (%v) — the 1d6 roll isn't drawing from the seeded rng", a)
+	}
+
+	// 2) Different seed => different fight, proving the SEED drives outcomes (rules out a constant/ignored
+	// seed that would make (1) pass vacuously — the gap a fixed-seed-only test can't see).
+	if c := runFight(999); equalInts(a, c) {
+		t.Fatalf("different seeds produced identical fights (%v) — the seed isn't driving combat", a)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestDoTTickReproducibleFromCombatRng (#58): a native affect (DoT) tick's damage dice draw from the zone
+// combat rng, not the process-global math/rand — so a poison/bleed is reproducible from the seed too (the
+// gap a swing-only fix would leave, since the tick ctx previously carried no rng). Same seed => identical
+// tick damage; per-tick variance proves the 1d6 is genuinely drawn from the rng. A nil source makes it a
+// self-tick (never gated), so the damage lands without a PvP-gate confound.
+func TestDoTTickReproducibleFromCombatRng(t *testing.T) {
+	runDoT := func(seed int64) []int {
+		z, s := combatZone(t)
+		z.combatRand = rand.New(rand.NewSource(seed))
+		z.defs.affect.register("burn", &affectDef{
+			ref: "burn", name: "Burning", stacking: stackRefresh, maxStacks: 1, duration: 1000,
+			hasTick: true, tickInterval: 1,
+			tickOps: []effectOp{{kind: "deal_damage", dmgType: "slash", diceNum: 1, diceSize: 6}},
+		})
+		setResourceCurrent(s.entity, "hp", 100)
+		inst := applyAffect(s.entity, "burn", attachOpts{}, nil) // nil source => self-tick (never gated)
+		var deltas []int
+		prev := resourceCurrent(s.entity, "hp")
+		for i := 0; i < 10; i++ {
+			fireOnTick(s.entity, inst, uint64(i))
+			now := resourceCurrent(s.entity, "hp")
+			deltas = append(deltas, prev-now)
+			prev = now
+		}
+		return deltas
+	}
+	a, b := runDoT(7), runDoT(7)
+	if !equalInts(a, b) {
+		t.Fatalf("same seed DoT diverged: %v vs %v (tick not drawing from the seeded combat rng)", a, b)
+	}
+	varied := false
+	for _, d := range a {
+		if d != a[0] {
+			varied = true
+			break
+		}
+	}
+	if !varied {
+		t.Fatalf("DoT per-tick damage never varied (%v) — the 1d6 tick isn't drawing from the rng", a)
 	}
 }
 
@@ -669,7 +780,7 @@ func TestCooldownPersistenceRoundTrip(t *testing.T) {
 // whole 6.3a surface works from CONTENT with zero engine flavor-hardcoding. Seeded for determinism.
 func TestDemoGoblinKillThroughPipeline(t *testing.T) {
 	z := newDemoZone("darkwood", newProtoCache())
-	z.testCombatRng = rand.New(rand.NewSource(7))
+	z.combatRand = rand.New(rand.NewSource(7))
 
 	// A player in the hollow where the reset placed the goblin.
 	hollow := z.rooms["darkwood:room:hollow"]

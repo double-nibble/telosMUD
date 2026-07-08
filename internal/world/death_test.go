@@ -11,7 +11,7 @@ import (
 // death_test.go exercises Phase 6.3b: the death -> corpse -> OnKill path, the threat list + mob
 // retargeting, assist/consider, aggressive-mob initiation, and the on_depleted hook. Determinism: an
 // auto-hit profile + a fixed weapon (6d1 = always 6) make the killing-blow round exact; the seeded
-// z.testCombatRng makes a driven fight reproducible.
+// z.combatRand makes a driven fight reproducible.
 
 // killShotProfile is an auto-hit profile with a big flat damage bonus so one swing fells a low-hp mob
 // deterministically (no to-hit/avoidance randomness in the death assertions).
@@ -112,7 +112,7 @@ func TestOnVitalDepletedIdempotent(t *testing.T) {
 // the window lapses the corpse decays to a free-for-all any looter can take.
 func TestCorpseLootOwnershipWindow(t *testing.T) {
 	z := newDemoZone("darkwood", newProtoCache())
-	z.testCombatRng = rand.New(rand.NewSource(7))
+	z.combatRand = rand.New(rand.NewSource(7))
 	hollow := z.rooms["darkwood:room:hollow"]
 
 	killer := &session{character: "Hero", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
@@ -190,7 +190,7 @@ func expireCorpseWindow(corpse *Entity) {
 // `get all corpse` then carry the knife. All from content — the engine names no goblin/corpse/loot.
 func TestKillGoblinThroughDemoPipelineDropsLootableCorpse(t *testing.T) {
 	z := newDemoZone("darkwood", newProtoCache())
-	z.testCombatRng = rand.New(rand.NewSource(7))
+	z.combatRand = rand.New(rand.NewSource(7))
 
 	hollow := z.rooms["darkwood:room:hollow"]
 	s := &session{character: "Hero", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
@@ -277,7 +277,7 @@ func TestKillGoblinThroughDemoPipelineDropsLootableCorpse(t *testing.T) {
 // Before these, a bare-handed `kill goblin` ran for minutes and never resolved.
 func TestFreshUnarmedPlayerKillsHollowGoblin(t *testing.T) {
 	z := newDemoZone("darkwood", newProtoCache())
-	z.testCombatRng = rand.New(rand.NewSource(7))
+	z.combatRand = rand.New(rand.NewSource(7))
 
 	hollow := z.rooms["darkwood:room:hollow"]
 	s := &session{character: "Hero", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
@@ -460,7 +460,7 @@ func TestOnDepletedHookRunsBeforeDeath(t *testing.T) {
 // living position with full vitals, and never left wedged dead. Driven mob -> player.
 func TestPlayerDeathRespawns(t *testing.T) {
 	z := newDemoZone("midgaard", newProtoCache())
-	z.testCombatRng = rand.New(rand.NewSource(1))
+	z.combatRand = rand.New(rand.NewSource(1))
 
 	// A player in a non-start room (the market), so respawn must MOVE them.
 	market := z.rooms["midgaard:room:market"]

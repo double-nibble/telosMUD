@@ -213,7 +213,10 @@ func (z *Zone) dispatch(s *session, line string) {
 		// by the lifecycle, so we prompt here on return (it never releases ownership).
 		if def := z.abilityForVerb(lower); def != nil {
 			z.log.Debug("dispatch: ability command", "player", s.character, "verb", lower, "ability", def.ref)
-			z.castAbility(s, def, rest, nil)
+			// Draw from the zone-owned combat rng (#58) so a player-cast ability's rolls join the same
+			// reproducible stream as swing checks/damage, not the process-global math/rand. Applies to
+			// every player ability cast (in or out of combat) — the zone's single gameplay-roll stream.
+			z.castAbility(s, def, rest, z.combatRng())
 			z.sendPrompt(s)
 			return
 		}
