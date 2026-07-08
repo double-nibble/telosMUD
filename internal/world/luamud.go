@@ -102,7 +102,18 @@ func (rt *luaRuntime) resetSpawnBudget() { rt.spawnThisCall = 0 }
 
 // mudRandom mirrors mud.random()/(n)/(m,n) drawing the per-zone seeded RNG (T9). Same
 // semantics + same source as the rebound math.random.
-func (rt *luaRuntime) mudRandom(l *lua.LState) int { return rt.luaMathRandom(l) }
+//
+// #256: FORBIDDEN in a display render. mud.random draws rt.rng — the SAME per-zone entropy-seeded
+// stream Round-15 #58 established for COMBAT REPRODUCIBILITY. A display sheet is player-triggered at
+// arbitrary frequency (look/score spam) and is NOT part of the deterministic sim stream, so letting a
+// render advance rt.rng would let a player DESYNC combat by spamming a display. A pure render needs no
+// entropy; forbid rather than route to an ephemeral RNG.
+func (rt *luaRuntime) mudRandom(l *lua.LState) int {
+	if rt.denyInDisplay(l, "random") {
+		return 0
+	}
+	return rt.luaMathRandom(l)
+}
 
 // mudRoll rolls an engine dice-notation string ("2d6", "4dF", "3d6kh2", "5d10>=7", ...) against
 // the per-zone RNG and returns the integer total (T9). The notation is exactly what
@@ -111,6 +122,9 @@ func (rt *luaRuntime) mudRandom(l *lua.LState) int { return rt.luaMathRandom(l) 
 // builds a minimal effectCtx carrying ONLY the zone + rng (no actor/target/disp) — rollDiceSpec
 // reads only c.rng, so this touches no harm path.
 func (rt *luaRuntime) mudRoll(l *lua.LState) int {
+	if rt.denyInDisplay(l, "roll") { // #256: draws rt.rng — see mudRandom (combat-reproducibility desync)
+		return 0
+	}
 	spec := l.CheckString(1)
 	d, err := parseDiceSpec(spec)
 	if err != nil {
@@ -177,6 +191,9 @@ func (rt *luaRuntime) mudScan(l *lua.LState) int {
 // markup is SCRIPT-SUPPLIED, so it is textsan.CleanMarkup'd at the world boundary (ISSUE-B):
 // control/ESC stripped, legitimate markup/color preserved.
 func (rt *luaRuntime) mudBroadcast(l *lua.LState) int {
+	if rt.denyInDisplay(l, "broadcast") {
+		return 0
+	}
 	room := resolveHandle(l, 1)
 	markup := textsan.CleanMarkup(l.CheckString(2))
 	if room == nil {
@@ -205,6 +222,9 @@ func (rt *luaRuntime) mudBroadcast(l *lua.LState) int {
 // inert session-less shell, but the invariant is made explicit). Neither rejection counts
 // against the spawn budget (like the unknown-proto nil path).
 func (rt *luaRuntime) mudSpawn(l *lua.LState) int {
+	if rt.denyInDisplay(l, "spawn") {
+		return 0
+	}
 	proto := l.CheckString(1)
 	dest := resolveHandle(l, 2)
 	if dest == nil {
@@ -271,6 +291,9 @@ func (rt *luaRuntime) dropLuaSpawn(rid RuntimeID) {
 // COW-aware operation the morph follow-up owns), so it validates the handle and returns it
 // unchanged, never inventing a partial swap. Returns nil for an unresolved handle.
 func (rt *luaRuntime) mudTransform(l *lua.LState) int {
+	if rt.denyInDisplay(l, "transform") {
+		return 0
+	}
 	e := resolveHandle(l, 1)
 	_ = l.CheckString(2) // proto: validated as a string; the swap primitive is a follow-up
 	if e == nil {
@@ -287,6 +310,9 @@ func (rt *luaRuntime) mudTransform(l *lua.LState) int {
 // capability (it can pull a player), so it is deferred to the harm/movement slice rather than
 // landing in the non-harm half. It validates the handle and no-ops. Returns false.
 func (rt *luaRuntime) mudSummon(l *lua.LState) int {
+	if rt.denyInDisplay(l, "summon") {
+		return 0
+	}
 	e := resolveHandle(l, 1)
 	if e == nil {
 		l.Push(lua.LFalse)
@@ -311,6 +337,9 @@ func (rt *luaRuntime) mudSummon(l *lua.LState) int {
 // {durable=true})` exempts a timer from the drop (a state-cleanup finalizer that must complete
 // even across a reload — release a held resource, clear a flag).
 func (rt *luaRuntime) mudAfter(l *lua.LState) int {
+	if rt.denyInDisplay(l, "after") {
+		return 0
+	}
 	pulses := l.CheckInt(1)
 	fn := l.CheckFunction(2)
 	if pulses < 1 {
@@ -363,6 +392,9 @@ func (rt *luaRuntime) mudAfter(l *lua.LState) int {
 // fired handle is a safe no-op. Cancelling an UNFIRED timer frees its live-census slot (the wheel
 // will never fire it, so its decrement must happen here instead).
 func (rt *luaRuntime) mudCancel(l *lua.LState) int {
+	if rt.denyInDisplay(l, "cancel") {
+		return 0
+	}
 	ud, ok := l.Get(1).(*lua.LUserData)
 	if !ok {
 		return 0
@@ -419,6 +451,9 @@ func (rt *luaRuntime) mudPvpAllowed(l *lua.LState) int {
 // (rt.inv with nil eventBudget), z.fireEvent allocates the cascade's root budget. An unresolved
 // subject is a clean no-op. The data table (arg 3, optional) is bound as `ev.data` on the handler.
 func (rt *luaRuntime) mudFire(l *lua.LState) int {
+	if rt.denyInDisplay(l, "fire") {
+		return 0
+	}
 	name := eventKind(l.CheckString(1))
 	subject := resolveHandle(l, 2)
 	// NAMESPACE GATE: only a namespaced custom kind may be fired from content. A bare name is an

@@ -75,6 +75,9 @@ func (rt *luaRuntime) helpfulCtx(target *Entity) *effectCtx {
 // data, never the actor/source/disp — those come from harmCtx). Returns the damage actually
 // applied (0 on a gated block / no target / no invocation).
 func (rt *luaRuntime) hDamage(l *lua.LState) int {
+	if rt.denyInDisplay(l, "damage") {
+		return 0
+	}
 	target := resolveHandle(l, 1)
 	opts := l.CheckTable(2)
 	amount := optTableNumber(opts, "amount", 0)
@@ -96,6 +99,9 @@ func (rt *luaRuntime) hDamage(l *lua.LState) int {
 // drain; that path is modify_resource, which is gated). It routes the existing opHeal handler
 // via a helpful ctx — the only resource-write path.
 func (rt *luaRuntime) hHeal(l *lua.LState) int {
+	if rt.denyInDisplay(l, "heal") {
+		return 0
+	}
 	target := resolveHandle(l, 1)
 	resource := l.CheckString(2)
 	amount := l.CheckNumber(3)
@@ -114,6 +120,9 @@ func (rt *luaRuntime) hHeal(l *lua.LState) int {
 // guardCrossPlayerWrite inside opModifyResource; a self/mob write is ungated. It routes the
 // existing op handler — the only resource-write path.
 func (rt *luaRuntime) hModifyResource(l *lua.LState) int {
+	if rt.denyInDisplay(l, "modify_resource") {
+		return 0
+	}
 	target := resolveHandle(l, 1)
 	resource := l.CheckString(2)
 	delta := l.CheckNumber(3)
@@ -133,6 +142,9 @@ func (rt *luaRuntime) hModifyResource(l *lua.LState) int {
 // is a helpful raise on the recipient (opHeal-style, never gated — you may always give). Both
 // legs route the existing op handlers — no direct write.
 func (rt *luaRuntime) hDrain(l *lua.LState) int {
+	if rt.denyInDisplay(l, "drain") {
+		return 0
+	}
 	from := resolveHandle(l, 1)
 	resource := l.CheckString(2)
 	amount := l.CheckNumber(3)
@@ -167,6 +179,9 @@ func (rt *luaRuntime) hDrain(l *lua.LState) int {
 // the ctx — a `source=` key in the Lua opts table is IGNORED, so a script cannot spoof
 // attribution. duration/magnitude/stacks are op DATA. Routes the existing op handler.
 func (rt *luaRuntime) hApplyAffect(l *lua.LState) int {
+	if rt.denyInDisplay(l, "apply_affect") {
+		return 0
+	}
 	target := resolveHandle(l, 1)
 	affect := l.CheckString(2)
 	var duration int
@@ -199,6 +214,9 @@ func (rt *luaRuntime) hApplyAffect(l *lua.LState) int {
 // ANOTHER player is harm (you can rip a protective buff), so it routes guardCrossPlayerWrite via
 // opRemoveAffect; a self/ally/mob cleanse is ungated. Source-keyed by the invocation actor.
 func (rt *luaRuntime) hRemoveAffect(l *lua.LState) int {
+	if rt.denyInDisplay(l, "remove_affect") {
+		return 0
+	}
 	target := resolveHandle(l, 1)
 	affect := l.CheckString(2)
 	c := rt.harmCtx(target)
@@ -215,6 +233,9 @@ func (rt *luaRuntime) hRemoveAffect(l *lua.LState) int {
 // entity. Dispelling another player's buffs is harm — routes guardCrossPlayerWrite via opDispel;
 // a self/ally/mob cleanse is ungated.
 func (rt *luaRuntime) hDispel(l *lua.LState) int {
+	if rt.denyInDisplay(l, "dispel") {
+		return 0
+	}
 	target := resolveHandle(l, 1)
 	var category string
 	var count float64
@@ -242,6 +263,9 @@ func (rt *luaRuntime) hDispel(l *lua.LState) int {
 // fighting mover, and re-checks liveness — the same combat discipline the move command has.
 // Returns true if the entity moved.
 func (rt *luaRuntime) hMove(l *lua.LState) int {
+	if rt.denyInDisplay(l, "move") {
+		return 0
+	}
 	e := resolveHandle(l, 1)
 	dir := l.CheckString(2)
 	if e == nil || e.location == nil || e.location.room == nil {
@@ -280,6 +304,9 @@ func (rt *luaRuntime) hMove(l *lua.LState) int {
 // the invocation actor itself, a mob, or a consenting/gate-permitted player may be teleported.
 // Returns true if the entity moved.
 func (rt *luaRuntime) hTeleport(l *lua.LState) int {
+	if rt.denyInDisplay(l, "teleport") {
+		return 0
+	}
 	e := resolveHandle(l, 1)
 	dest := resolveHandle(l, 2)
 	if e == nil || dest == nil || !Has[*Room](dest) {
@@ -309,6 +336,9 @@ func (rt *luaRuntime) hTeleport(l *lua.LState) int {
 // this zone only. Same movement-grief gate as teleport: recalling another non-consenting player
 // is harm and is gated. Returns true if the entity moved.
 func (rt *luaRuntime) hRecall(l *lua.LState) int {
+	if rt.denyInDisplay(l, "recall") {
+		return 0
+	}
 	e := resolveHandle(l, 1)
 	if e == nil {
 		l.Push(lua.LFalse)

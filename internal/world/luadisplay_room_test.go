@@ -516,11 +516,14 @@ func TestMechanicsCanStillScanNeighborRoom(t *testing.T) {
 	}
 }
 
-// TestDisplayTeleportCannotUnlockNeighborEnumeration is the #253 TOCTOU closure (empirically PoC'd by the
-// security review): a `room` template can call self:teleport()/move()/recall() mid-render, so if the
-// foreign-room anchor were read LIVE from actor.location a template could relocate the viewer INTO the neighbor,
-// enumerate it, and relocate back — a scry. The anchor is instead the room CAPTURED at render start
-// (inv.displayRoom), so the relocation runs (proven by the changed room name) but cannot unlock enumeration.
+// TestDisplayTeleportCannotUnlockNeighborEnumeration is the #253 TOCTOU closure, now UNDER #256 (which forbids
+// every side-effecting op in a display render). The original scry PoC was: a `room` template calls
+// self:teleport() mid-render to relocate the viewer into a neighbor, enumerate it, and relocate back. #253 first
+// closed it by anchoring the foreign-room check to the room CAPTURED at render start (inv.displayRoom), not the
+// LIVE actor.location. #256 now closes it MORE FUNDAMENTALLY: the mid-render teleport itself RAISES (a display
+// template must be side-effect free), so the render aborts — the viewer never moves and nothing is scried. This
+// asserts the stronger #256 behavior (a superset of the #253 guarantee); the anchor remains defense-in-depth for
+// the exits().to enumeration path (TestDisplayCannotEnumerateNeighborRoom).
 func TestDisplayTeleportCannotUnlockNeighborEnumeration(t *testing.T) {
 	z, _, hall := harmZone(t)
 	viewer := harmPlayer(z, hall, "Viewer")
@@ -533,22 +536,21 @@ func TestDisplayTeleportCannotUnlockNeighborEnumeration(t *testing.T) {
 	rt := z.lua
 	ch := rt.chunkFor("display:room:toctou", `
 		local c = {}
-		self:teleport(dest)                                          -- relocate the viewer into the neighbor
-		c[#c+1] = "NOW:" .. self:room():name()                       -- a prop read (allowed) — proves the move ran
+		self:teleport(dest)                                          -- #256: forbidden in a display render -> raises
+		c[#c+1] = "NOW:" .. self:room():name()                       -- unreachable: the render already aborted
 		for _, o in ipairs(self:room():occupants()) do c[#c+1] = "SCRY:" .. o:name() end
 		return table.concat(c, ",")`)
 	// A display render anchored to the ORIGINAL room (hall), exactly as renderDisplaySheet captures self.location.
 	got, ok := rt.invokeForString(ch, &luaInvocation{actor: viewer, display: true, displayRoom: hall},
 		map[string]lua.LValue{"self": rt.newHandle(viewer), "dest": rt.newHandle(market)})
-	if !ok {
-		t.Fatal("chunk failed to run")
+	if ok {
+		t.Fatalf("#256: a display template's teleport must abort the render (ok=false), got %q", got)
 	}
-	if !strings.Contains(got, "NOW:The Market") {
-		t.Fatalf("the teleport must actually run (non-vacuous) — the viewer should be in the market: %q", got)
+	if viewer.location != hall {
+		t.Fatalf("#256: the forbidden teleport must NOT move the viewer; now at %v", viewer.location)
 	}
 	if strings.Contains(got, "SCRY:Neighbor") {
-		t.Fatalf("#253 TOCTOU: a mid-render teleport unlocked neighbor enumeration — the anchor must be the room "+
-			"captured at render start, not the live viewer.location: %q", got)
+		t.Fatalf("#253/#256: a mid-render teleport must never unlock neighbor enumeration: %q", got)
 	}
 }
 
