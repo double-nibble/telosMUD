@@ -119,7 +119,11 @@ func main() {
 	// in here when director-script content lands). WithSchedules wires the Phase-12.4 boss scheduler.
 	world := director.New("", pool, slog.Default()).
 		WithScopeBus(scopeBus, instanceID).
-		WithSchedules(schedules)
+		WithSchedules(schedules).
+		// #45: the world director periodically reaps dead-letter mail — orphaned mail (to a name that never
+		// logs in) older than 30 days, and any mail older than 180 days (the backstop TTL). Leader-gated, so
+		// only one director in the fleet runs it. Reap once a day.
+		WithMailReaper(pool, 24*time.Hour, 30*24*time.Hour, 180*24*time.Hour)
 	if claimer != nil {
 		world.WithElection(claimer, instanceID)
 	}

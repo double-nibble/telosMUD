@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -185,6 +186,38 @@ func (p *Pool) DeleteMail(ctx context.Context, player string, pos int) (bool, er
 		return false, fmt.Errorf("store: delete mail %d for %q: %w", pos, player, err)
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// ReapDeadLetterMail deletes undeliverable / orphaned mail (#45), returning the number of rows reaped. Two
+// disjoint conditions:
+//
+//   - ORPHANED: a message to a to_player that has NO live character (a name that never logs in — a typo, a
+//     never-created recipient), older than orphanCutoff. The NOT EXISTS spares any name that has (or once
+//     had, unless deleted) a real character until the hard cap, so a message to a real player who simply
+//     hasn't read it is never orphan-reaped.
+//   - HARD DEAD-LETTER TTL: ANY message older than hardCutoff, regardless of recipient — the backstop that
+//     bounds an abandoned inbox's unbounded growth even for a real name (hardCutoff should be well past
+//     orphanCutoff so it only catches genuinely-stale mail).
+//
+// It is a director-owned background reap (leader-gated, off the zone goroutine), so the blocking Exec is
+// fine. Cutoffs are passed as absolute timestamps (computed from the director's clock) so the reap is
+// deterministically testable rather than reading the DB clock.
+//
+// PERF: the sent_at predicate is not covered by mail_to_player_idx (to_player, sent_at DESC), so this is a
+// seq scan on mail + a per-row characters.name unique-index probe — fine for a DAILY reap on an
+// inbox-capped table. If mail grows large, batch it (DELETE ... WHERE id IN (SELECT ... LIMIT N)) and/or add
+// a sent_at partial index to bound the transaction/lock duration.
+func (p *Pool) ReapDeadLetterMail(ctx context.Context, orphanCutoff, hardCutoff time.Time) (int64, error) {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM mail
+		  WHERE (sent_at < $1
+		         AND NOT EXISTS (SELECT 1 FROM characters c WHERE c.name = mail.to_player AND c.deleted_at IS NULL))
+		     OR sent_at < $2`,
+		orphanCutoff, hardCutoff)
+	if err != nil {
+		return 0, fmt.Errorf("store: reap dead-letter mail: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // Compile-time assertion that *Pool satisfies world.MailStore.

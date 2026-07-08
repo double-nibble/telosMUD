@@ -90,6 +90,26 @@ type Director struct {
 	// derives its ctx from Run's ctx, so ctx-cancel aborts an in-flight git clone/import promptly and the
 	// Wait bounds shutdown rather than orphaning the goroutine (previously it used context.Background()).
 	workers sync.WaitGroup
+
+	// Mail dead-letter reaper (#45): a leader-gated, tick-driven periodic reap of undeliverable/orphaned
+	// mail — the director-owned scheduler tick this track exercises, the same shape as the boss scheduler.
+	// nil reaper disables it. reapInterval is the cooldown between reaps; reapOrphanGrace / reapHardTTL are
+	// the two retention windows (see ReapDeadLetterMail). lastReapAt (actor-goroutine only) tracks the last
+	// reap; reapInFlight single-flights the off-actor DELETE so a slow reap can't stall the director loop or
+	// overlap itself.
+	mailReaper      MailReaper
+	reapInterval    time.Duration
+	reapOrphanGrace time.Duration
+	reapHardTTL     time.Duration
+	lastReapAt      time.Time
+	reapInFlight    atomic.Bool
+}
+
+// MailReaper deletes undeliverable/orphaned mail past the given retention cutoffs (satisfied by *store.Pool).
+// It lives here as an interface so the director package stays free of the store dependency, mirroring
+// ContentPuller. A nil reaper disables the periodic reap.
+type MailReaper interface {
+	ReapDeadLetterMail(ctx context.Context, orphanCutoff, hardCutoff time.Time) (int64, error)
 }
 
 // ContentPuller installs a published content version (resolve from the external store → atomic Postgres
@@ -139,6 +159,68 @@ func (d *Director) WithNow(now func() time.Time) *Director {
 func (d *Director) WithContentPuller(p ContentPuller) *Director {
 	d.puller = p
 	return d
+}
+
+// WithMailReaper wires the periodic dead-letter mail reap (#45): the LEADER director reaps undeliverable /
+// orphaned mail every `interval`, deleting orphaned mail older than `orphanGrace` and any mail older than
+// `hardTTL`. Call before Run. A nil reaper (or a non-positive interval) leaves the reap disabled — the
+// standalone/dev default, and every region director (only the world director is wired with it in prod).
+func (d *Director) WithMailReaper(r MailReaper, interval, orphanGrace, hardTTL time.Duration) *Director {
+	if r == nil || interval <= 0 {
+		return d
+	}
+	// The hard TTL is a backstop ABOVE the orphan grace — it must never be SHORTER, or the hard arm would
+	// reap a live player's unread mail younger than the orphan window intended (deleting deliverable mail
+	// early). Clamp a misconfig up to the grace and warn rather than silently over-reaping.
+	if hardTTL < orphanGrace {
+		d.log.Warn("mail reaper hard TTL is shorter than the orphan grace; clamping up to the grace",
+			"hard_ttl", hardTTL, "orphan_grace", orphanGrace)
+		hardTTL = orphanGrace
+	}
+	d.mailReaper = r
+	d.reapInterval = interval
+	d.reapOrphanGrace = orphanGrace
+	d.reapHardTTL = hardTTL
+	return d
+}
+
+// maybeReapMail runs the dead-letter reap when due (#45), on the director tick. It is LEADER-gated by the
+// caller (onTick), so exactly one director reaps fleet-wide. The cooldown (reapInterval) is checked on the
+// actor goroutine against the director clock, and the actual DELETE runs OFF the actor goroutine (a slow
+// reap must not stall the director loop), single-flighted so it never overlaps itself.
+//
+// The reap is NOT lease-fenced: unlike director SCOPE STATE (single-writer, leader-fenced), mail is a global
+// table, so during a failover a resigning leader's in-flight worker and the newly-promoted leader (whose
+// lastReapAt is zero, so it reaps immediately) can briefly BOTH issue a reap. That is harmless because
+// ReapDeadLetterMail is an idempotent `DELETE ... WHERE sent_at < cutoff` — the overlap deletes the same
+// already-eligible rows, never live data. So the reap rests on DELETE idempotency, not the leader lock.
+func (d *Director) maybeReapMail(ctx context.Context) {
+	if d.mailReaper == nil {
+		return
+	}
+	now := d.now()
+	if !d.lastReapAt.IsZero() && now.Sub(d.lastReapAt) < d.reapInterval {
+		return
+	}
+	if !d.reapInFlight.CompareAndSwap(false, true) {
+		return // a prior reap is still running; try again next interval
+	}
+	d.lastReapAt = now
+	orphanCutoff := now.Add(-d.reapOrphanGrace)
+	hardCutoff := now.Add(-d.reapHardTTL)
+	d.workers.Add(1)
+	go func() {
+		defer d.workers.Done()
+		defer d.reapInFlight.Store(false)
+		n, err := d.mailReaper.ReapDeadLetterMail(ctx, orphanCutoff, hardCutoff)
+		if err != nil {
+			d.log.Warn("mail dead-letter reap failed", "err", err)
+			return
+		}
+		if n > 0 {
+			d.log.Info("reaped dead-letter mail", "count", n)
+		}
+	}()
 }
 
 func scopeLabel(regionID string) string {
@@ -203,9 +285,13 @@ func (d *Director) Run(ctx context.Context) {
 // the leader (a standby must not spawn). Runs on the actor goroutine, so it reads/writes scope state
 // single-writer.
 func (d *Director) onTick(ctx context.Context) {
-	if len(d.schedules) > 0 && d.leader.Load() {
+	if !d.leader.Load() {
+		return // only the leader drives scheduled work — one owner fleet-wide
+	}
+	if len(d.schedules) > 0 {
 		d.runSchedules(ctx)
 	}
+	d.maybeReapMail(ctx) // #45: periodic dead-letter mail reap (no-op unless a reaper is wired)
 }
 
 func (d *Director) handle(ctx context.Context, m msg) {

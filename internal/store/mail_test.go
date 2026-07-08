@@ -6,8 +6,72 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/double-nibble/telosmud/internal/world"
 )
+
+// TestReapDeadLetterMail pins the #45 dead-letter reap against real Postgres: orphaned mail (to a name with
+// no live character) past the orphan grace is reaped, and any mail past the hard TTL is reaped, while
+// deliverable mail and recent orphaned mail survive.
+func TestReapDeadLetterMail(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+	stamp := time.Now().Format("150405.000000")
+	realName := "RealMailer-" + stamp // has a live character → deliverable
+	ghost := "GhostMailer-" + stamp   // no character → orphaned
+	charID := uuid.NewString()
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM mail WHERE to_player = ANY($1)`, []string{realName, ghost})
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM characters WHERE id = $1`, charID)
+	})
+
+	// A live character for the deliverable recipient.
+	if _, err := p.pool.Exec(ctx, `INSERT INTO characters (id, name) VALUES ($1, $2)`, charID, realName); err != nil {
+		t.Fatalf("seed character: %v", err)
+	}
+
+	now := time.Now()
+	send := func(to string, age time.Duration) string {
+		id := uuid.NewString()
+		if _, err := p.pool.Exec(ctx,
+			`INSERT INTO mail (id, to_player, from_player, subject, body, sent_at) VALUES ($1,$2,'Sender','s','b',$3)`,
+			id, to, now.Add(-age)); err != nil {
+			t.Fatalf("seed mail: %v", err)
+		}
+		return id
+	}
+	ghostOld := send(ghost, 60*24*time.Hour)    // orphaned + past grace  → REAPED
+	ghostRecent := send(ghost, 10*24*time.Hour) // orphaned but recent    → kept
+	realOld := send(realName, 60*24*time.Hour)  // deliverable, under TTL  → kept
+	realRecent := send(realName, 24*time.Hour)  // deliverable, recent     → kept
+	ancient := send(realName, 200*24*time.Hour) // past the hard TTL       → REAPED (even deliverable)
+
+	orphanCutoff := now.Add(-30 * 24 * time.Hour)
+	hardCutoff := now.Add(-180 * 24 * time.Hour)
+	n, err := p.ReapDeadLetterMail(ctx, orphanCutoff, hardCutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("reaped %d rows, want 2 (orphaned-old + ancient)", n)
+	}
+
+	exists := func(id string) bool {
+		var one int
+		return p.pool.QueryRow(ctx, `SELECT 1 FROM mail WHERE id = $1`, id).Scan(&one) == nil
+	}
+	for _, id := range []string{ghostOld, ancient} {
+		if exists(id) {
+			t.Fatalf("mail %s should have been reaped", id)
+		}
+	}
+	for _, id := range []string{ghostRecent, realOld, realRecent} {
+		if !exists(id) {
+			t.Fatalf("mail %s should have survived the reap", id)
+		}
+	}
+}
 
 // TestMailInboxCapPersists pins the ATOMIC pgx inbox cap (the production path the hermetic MemStore test
 // can't): SendMail refuses once the recipient holds world.MailInboxCap rows (the count subquery + insert are
