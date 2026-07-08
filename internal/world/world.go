@@ -366,6 +366,25 @@ func (s *Shard) WithHandoffKeys(priv ed25519.PrivateKey, pub ed25519.PublicKey) 
 	return s
 }
 
+// CheckHandoffAuth is the boot-time guard against a MULTI-SHARD deployment running with UNAUTHENTICATED
+// handoffs (#251). A shard wired with a peer dialer (s.peers != nil) participates in cross-shard handoff:
+// its Handoff.Prepare will accept incoming snapshots from other shards. With no verify key, Prepare skips
+// signature verification, so a reachable inter-shard port lets a forged Prepare inject arbitrary carried
+// state — a KNOWN-prototype item dupe (econ break), and since #106 the destination also strips an unsigned
+// carried tier only because THIS guard's absence would otherwise let elevation ride in. The per-field strip
+// (#106) is defense-in-depth; this is the primary control: a cluster that can receive handoffs MUST verify
+// them. Returns an error the caller (cmd) turns into a fatal boot failure — fail loud, not silently
+// unauthenticated. A single-shard deployment (s.peers == nil — no directory, cross-shard exits sealed) never
+// receives a handoff, so a missing key is fine there (dev/demo/tests).
+func (s *Shard) CheckHandoffAuth() error {
+	if s.peers != nil && s.handoffVerifyKey == nil {
+		return fmt.Errorf("world: multi-shard deployment (peer dialer configured) has no handoff verify key; " +
+			"cross-shard Prepare would accept UNAUTHENTICATED snapshots (item-dupe / elevation vector) — " +
+			"configure the shared handoff keypair (WithHandoffKeys) or run single-shard")
+	}
+	return nil
+}
+
 // Default single-session lock timing (Phase 14.4): the key lives DefaultLockTTL (a crash self-clears after
 // it) and is heartbeated every DefaultLockRenew (also the takeover-detection latency).
 const (
