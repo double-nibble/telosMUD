@@ -79,6 +79,52 @@ type effectCtx struct {
 	// to-hit DC (the DC IS the defender's AC) so the bump re-classifies hit/miss for THIS swing only and
 	// never persists on the defender. 0 outside the swing's to-hit path (every other check ignores it).
 	reactACBonus float64
+	// commsCoalescing + commsDirty coalesce the mid-session comms republish across an op-list cascade (#77).
+	// A grant op that crosses a channel's hear-access predicate (set_flag / clear_flag / modify_attribute_base)
+	// marks its target dirty here instead of republishing inline; the OUTERMOST runOps flushes ONE republish
+	// per DISTINCT target at op-list end. Without this a bundle of M same-target grants published the player's
+	// config M times, and an AoE grant published once per (op × target) — membus Publish is O(subscriptions)
+	// under a global lock on the zone goroutine, so a large grant bundle could stall it. commsCoalescing is
+	// set only while inside a runOps cascade; a grant op run outside one republishes immediately (markCommsDirty).
+	//
+	// SCOPE: dedup is per ctx's op-list TREE (the outermost runOps + its if/chance/bundle/area nesting). A
+	// FIRED EVENT handler runs under a FRESH ctx (event.go) and flushes independently, so a target granted in
+	// both the outer list AND a fired handler is republished once per window — correct (republish is
+	// idempotent), just not globally deduped. Affect apply/expire still republish inline (affect_runtime.go).
+	commsCoalescing bool
+	commsDirty      []*Entity
+}
+
+// markCommsDirty records that e's comms config needs a mid-session republish (#77). Inside a runOps cascade
+// (commsCoalescing) it dedups e into commsDirty for a single flush at the cascade's end; outside a cascade it
+// republishes immediately, since there is no op-list boundary to coalesce to. nil-safe.
+func (c *effectCtx) markCommsDirty(e *Entity) {
+	if e == nil {
+		return
+	}
+	if !c.commsCoalescing {
+		c.z.republishCommsOnAccessChange(e)
+		return
+	}
+	for _, x := range c.commsDirty {
+		if x == e {
+			return // already marked; the flush republishes it once
+		}
+	}
+	c.commsDirty = append(c.commsDirty, e)
+}
+
+// flushCommsDirty ends the coalescing window and republishes each distinct target's comms config exactly once
+// (#77). Called via defer by the outermost runOps. Order across distinct targets does not matter (each is an
+// independent per-player config publish). republishCommsOnAccessChange re-guards (player + a hear-gating
+// channel), so an entity that quit mid-cascade is a safe no-op.
+func (c *effectCtx) flushCommsDirty() {
+	c.commsCoalescing = false
+	dirty := c.commsDirty
+	c.commsDirty = nil
+	for _, e := range dirty {
+		c.z.republishCommsOnAccessChange(e)
+	}
 }
 
 // rollChance returns true with probability p (clamped to [0,1]). Uses the ctx rng when present so a
@@ -228,6 +274,16 @@ func init() {
 // remaining same-op-list ops on a target that died/respawned mid-list (track the target's pre-op
 // position/identity and bail) — lands WITH respawn-sickness, not here. Not marking it now by design.
 func runOps(c *effectCtx, ops []effectOp) {
+	// #77: the OUTERMOST runOps owns the coalesced comms-republish flush. A grant op marks its target dirty
+	// (markCommsDirty) instead of republishing inline; when this frame is the one that opened the cascade it
+	// flushes ONE republish per distinct target at the end. Nested runOps (if/chance recursion, an area op's
+	// per-target loop) inherit the same ctx and do NOT flush — so a whole grant bundle costs one publish per
+	// distinct player, not one per mutation.
+	flushOwner := !c.commsCoalescing
+	if flushOwner {
+		c.commsCoalescing = true
+		defer c.flushCommsDirty()
+	}
 	for i := range ops {
 		op := &ops[i]
 		h, ok := effectOpHandlers[op.kind]

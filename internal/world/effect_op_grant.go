@@ -34,7 +34,7 @@ func opModifyAttributeBase(c *effectCtx, op *effectOp) error {
 	// Without it a player who drops below (or rises to) a channel's floor keeps a stale subscription
 	// until their next toggle/handoff/relog (security follow-up, round 5). Cheap: no-op unless the
 	// target is a player and some channel actually gates hearing (republishCommsOnAccessChange guards).
-	c.z.republishCommsOnAccessChange(c.target)
+	c.markCommsDirty(c.target)
 	return nil
 }
 
@@ -57,7 +57,7 @@ func opSetFlag(c *effectCtx, op *effectOp) error {
 		return nil
 	}
 	setFlag(c.target, op.flag, true)
-	c.z.republishCommsOnAccessChange(c.target) // a require_flag channel may now be hearable (see modify_attribute_base)
+	c.markCommsDirty(c.target) // a require_flag channel may now be hearable (see modify_attribute_base)
 	if isConcealmentFlag(op.flag) {
 		c.z.republishPresenceOnConcealChange(c.target) // #98: a now-invisible/hidden player drops from cross-shard who
 	}
@@ -82,7 +82,7 @@ func opClearFlag(c *effectCtx, op *effectOp) error {
 		return nil
 	}
 	setFlag(c.target, op.flag, false)
-	c.z.republishCommsOnAccessChange(c.target) // a require_flag channel may no longer be hearable — the guild-leave case
+	c.markCommsDirty(c.target) // a require_flag channel may no longer be hearable — the guild-leave case
 	if isConcealmentFlag(op.flag) {
 		c.z.republishPresenceOnConcealChange(c.target) // #98: a now-revealed player reappears in cross-shard who
 	}
