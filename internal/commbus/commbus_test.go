@@ -290,3 +290,45 @@ func TestNewIdempotencyKey(t *testing.T) {
 	assert.Equal(t, "alice:0", NewIdempotencyKey("alice", 0))
 	assert.Equal(t, "bob:1234567890", NewIdempotencyKey("bob", 1234567890))
 }
+
+// TestParseIdempotencyKey is the inverse contract of NewIdempotencyKey (#169): the durable-dedup
+// watermark relies on recovering <seq> from the key, including when the authorID itself has colons.
+func TestParseIdempotencyKey(t *testing.T) {
+	cases := []struct {
+		key      string
+		wantAuth string
+		wantSeq  uint64
+		wantOK   bool
+	}{
+		{"alice:1", "alice", 1, true},
+		{"alice:0", "alice", 0, true},
+		{"bob:1234567890", "bob", 1234567890, true},
+		{"world-director:run1:42", "world-director:run1", 42, true},         // authorID contains a colon
+		{"18446744073709551615:5", "18446744073709551615", 5, true},         // colon-heavy-ish, still last wins
+		{"alice:18446744073709551615", "alice", 18446744073709551615, true}, // exact uint64 max accepts
+		{"alice:007", "alice", 7, true},                                     // leading zeros accepted (matches strconv)
+		{":7", "", 7, true},                                                 // empty authorID is allowed
+		{":", "", 0, false},                                                 // empty authorID AND empty seq
+		{"noseq", "", 0, false},                                             // no colon at all
+		{"alice:", "", 0, false},                                            // empty seq
+		{"alice:12x", "", 0, false},                                         // non-numeric seq
+		{"alice:-1", "", 0, false},                                          // negative is not a uint
+		{"alice:+5", "", 0, false},                                          // sign-prefixed is not a uint
+		{"alice:18446744073709551616", "", 0, false},                        // overflows uint64 (max+1)
+		{"", "", 0, false},                                                  // empty
+	}
+	for _, tc := range cases {
+		auth, seq, ok := ParseIdempotencyKey(tc.key)
+		assert.Equal(t, tc.wantOK, ok, "ok for %q", tc.key)
+		assert.Equal(t, tc.wantAuth, auth, "authorID for %q", tc.key)
+		assert.Equal(t, tc.wantSeq, seq, "seq for %q", tc.key)
+	}
+
+	// Round-trips for the full uint64 range boundary.
+	for _, seq := range []uint64{0, 1, 42, 1 << 32, 18446744073709551615} {
+		auth, got, ok := ParseIdempotencyKey(NewIdempotencyKey("src", seq))
+		assert.True(t, ok)
+		assert.Equal(t, "src", auth)
+		assert.Equal(t, seq, got, "round-trip seq %d", seq)
+	}
+}

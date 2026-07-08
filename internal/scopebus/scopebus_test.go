@@ -143,6 +143,8 @@ func TestScopeBusDurableRoundTrip(t *testing.T) {
 		assert.JSONEq(t, `{"phase":2}`, string(ev.Payload))
 		assert.Equal(t, "world-director-run1", ev.Source)
 		assert.Equal(t, "world-director-run1:1", ev.Key, "idempotency key is <source>:<seq>")
+		assert.True(t, ev.SeqOK, "the bus's own key parses")
+		assert.Equal(t, uint64(1), ev.Seq, "Seq is the parsed <seq> of the key")
 		assert.False(t, ev.Backlog, "a live event is not backlog")
 	case <-time.After(time.Second):
 		t.Fatal("durable event not delivered")
@@ -219,9 +221,14 @@ func TestScopeBusDurableKeysAreMonotonic(t *testing.T) {
 	b, _ := durableBus(t, "run1")
 	ctx := context.Background()
 
-	keys := make(chan string, 8)
+	type keyed struct {
+		key string
+		seq uint64
+		ok  bool
+	}
+	keys := make(chan keyed, 8)
 	cons, err := b.SubscribeDurable(World(), "world-dir", func(ev DurableEvent) bool {
-		keys <- ev.Key
+		keys <- keyed{ev.Key, ev.Seq, ev.SeqOK}
 		return true
 	})
 	require.NoError(t, err)
@@ -230,7 +237,7 @@ func TestScopeBusDurableKeysAreMonotonic(t *testing.T) {
 	require.NoError(t, b.SignalDurable(ctx, World(), "a", nil))
 	require.NoError(t, b.SignalDurable(ctx, World(), "b", nil))
 
-	var got []string
+	var got []keyed
 	for i := 0; i < 2; i++ {
 		select {
 		case k := <-keys:
@@ -239,7 +246,92 @@ func TestScopeBusDurableKeysAreMonotonic(t *testing.T) {
 			t.Fatal("durable event not delivered")
 		}
 	}
-	assert.Equal(t, []string{"run1:1", "run1:2"}, got, "keys advance monotonically per process")
+	assert.Equal(t, []keyed{{"run1:1", 1, true}, {"run1:2", 2, true}}, got,
+		"keys AND their parsed Seq advance monotonically per process")
+}
+
+// The whole point of exposing Seq (#169): a state-applying consumer can dedup redeliveries with an O(1)
+// highest-applied-seq watermark per source, instead of an unbounded seen-set on the opaque Key string.
+// This mirrors TestScopeBusDurableConsumerDedupsRedelivery (a lost ack redelivers the same event) but
+// dedups via `ev.Seq <= applied[ev.Source]` — proving the watermark the class doc now blesses is real.
+func TestScopeBusDurableSeqEnablesWatermark(t *testing.T) {
+	b, _ := durableBus(t, "run1")
+	ctx := context.Background()
+
+	var deliveries atomic.Int32
+	var mu sync.Mutex
+	watermark := map[string]uint64{} // source -> highest applied seq (O(1) per source)
+	applied := 0
+	done := make(chan struct{})
+	cons, err := b.SubscribeDurable(World(), "world-dir", func(ev DurableEvent) bool {
+		assert.True(t, ev.SeqOK, "the bus's own key always parses to a Seq") // assert, not require: FailNow from a non-test goroutine strands the handler
+		n := deliveries.Add(1)
+		mu.Lock()
+		if ev.Seq > watermark[ev.Source] { // the watermark: apply only strictly-newer seqs
+			watermark[ev.Source] = ev.Seq
+			applied++
+		}
+		mu.Unlock()
+		if n == 1 {
+			return false // simulate a lost ack: the same Seq is redelivered
+		}
+		close(done)
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	require.NoError(t, b.SignalDurable(ctx, World(), "ev", json.RawMessage(`{"n":1}`)))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the NAK'd event was not redelivered")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.GreaterOrEqual(t, deliveries.Load(), int32(2), "the event was delivered at least twice")
+	assert.Equal(t, 1, applied, "the Seq watermark applied the event exactly once despite the redelivery")
+	assert.Equal(t, uint64(1), watermark["run1"], "watermark tracks the highest applied seq per source")
+}
+
+// A durable message whose idempotency key is FOREIGN/malformed (no parseable trailing seq — never minted
+// by this bus's own publisher) must degrade to Seq=0, SeqOK=false so a Seq-dedup consumer can tell "cannot
+// dedup" apart from a real seq 0. We inject one by publishing straight to the underlying JetStream with a
+// hand-set key, bypassing SignalDurable's key mint.
+func TestScopeBusDurableMalformedKeyDegrades(t *testing.T) {
+	b, js := durableBus(t, "run1")
+	ctx := context.Background()
+
+	subj, err := World().Subject()
+	require.NoError(t, err)
+
+	got := make(chan DurableEvent, 4)
+	cons, err := b.SubscribeDurable(World(), "world-dir", func(ev DurableEvent) bool {
+		got <- ev
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	// A valid scopeMsg body, but a key with no trailing "<seq>" segment.
+	body, err := json.Marshal(scopeMsg{Event: "boss.slain"})
+	require.NoError(t, err)
+	require.NoError(t, js.PublishDurable(ctx, subj, commbus.Message{
+		AuthorID:       "foreign-producer",
+		Body:           string(body),
+		IdempotencyKey: "foreign-producer", // no ':' → unparseable
+	}))
+
+	select {
+	case ev := <-got:
+		assert.Equal(t, "boss.slain", ev.Event)
+		assert.False(t, ev.SeqOK, "a malformed key yields SeqOK=false")
+		assert.Equal(t, uint64(0), ev.Seq, "an unparseable key yields Seq=0, not a spurious sequence")
+		assert.Equal(t, "foreign-producer", ev.Key, "the raw key is still surfaced for a seen-set fallback")
+	case <-time.After(time.Second):
+		t.Fatal("durable event with a malformed key was not delivered")
+	}
 }
 
 // TestScopeBusDurableConsumerDedupsRedelivery pins the CONSUMER-SIDE idempotency contract every durable

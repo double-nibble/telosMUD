@@ -199,6 +199,43 @@ func NewIdempotencyKey(authorID string, seq uint64) string {
 	return authorID + ":" + itoa(seq)
 }
 
+// ParseIdempotencyKey is the inverse of NewIdempotencyKey: it splits "<authorID>:<seq>" back into its
+// parts. The authorID may itself contain colons, so the seq is taken as the segment after the LAST
+// colon; ok is false if there is no colon or the trailing segment is not a base-10 uint64. Kept beside
+// NewIdempotencyKey so both sides of the format live in one place (the 8.5 durable dedup depends on it).
+func ParseIdempotencyKey(key string) (authorID string, seq uint64, ok bool) {
+	i := strings.LastIndexByte(key, ':')
+	if i < 0 {
+		return "", 0, false
+	}
+	seq, ok = atou(key[i+1:])
+	if !ok {
+		return "", 0, false
+	}
+	return key[:i], seq, true
+}
+
+// atou parses a non-empty base-10 uint64 without pulling strconv into this package's import set
+// (the itoa mirror). Rejects empty input, non-digits, and overflow.
+func atou(s string) (uint64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	var v uint64
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := uint64(c - '0')
+		if v > (1<<64-1-d)/10 { // would overflow uint64
+			return 0, false
+		}
+		v = v*10 + d
+	}
+	return v, true
+}
+
 // itoa avoids pulling strconv into the hot path's import set for a single use; identical semantics.
 func itoa(v uint64) string {
 	if v == 0 {

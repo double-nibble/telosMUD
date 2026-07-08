@@ -211,7 +211,8 @@ func auditSignal(t *testing.T, key string, a contentbus.ReloadAudit) signalMsg {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return signalMsg{event: contentbus.ReloadAuditEvent, payload: payload, key: key, source: "shard-1", ack: make(chan bool, 1)}
+	_, seq, ok := commbus.ParseIdempotencyKey(key)
+	return signalMsg{event: contentbus.ReloadAuditEvent, payload: payload, seq: seq, seqOK: ok, source: "shard-1", ack: make(chan bool, 1)}
 }
 
 // TestDirectorRecordsReloadAudit proves the #192 S3 native audit: a content.reload.audit signal-up makes
@@ -256,13 +257,46 @@ func TestDirectorReloadAuditDedup(t *testing.T) {
 	}
 }
 
+// TestDirectorSeqlessSignalAppliesUnconditionally proves the SeqOK=false degradation contract (#169): a
+// signal whose idempotency key had no parseable seq CANNOT be deduped, so it is applied on every delivery
+// and never writes the per-source high-water (writing seq 0 there would wrongly suppress a later real
+// seq-1 keyed event from the same source). Foreign/corrupt keys are the only source of SeqOK=false.
+func TestDirectorSeqlessSignalAppliesUnconditionally(t *testing.T) {
+	var calls int
+	d := New("", newMemStore(), slog.Default()).
+		WithSignalHandler(func(_ *API, event string, _ json.RawMessage) {
+			if event == "boss_slain" {
+				calls++
+			}
+		})
+
+	mk := func() signalMsg {
+		return signalMsg{event: "boss_slain", seq: 0, seqOK: false, source: "shard-1", ack: make(chan bool, 1)}
+	}
+	m1 := mk()
+	d.handleSignal(context.Background(), m1)
+	if !<-m1.ack {
+		t.Fatal("a seqless signal should still ack (drain), not NAK")
+	}
+	m2 := mk() // a "redelivery" of the same unparseable key — with no seq there is nothing to dedup on
+	d.handleSignal(context.Background(), m2)
+	<-m2.ack
+
+	if calls != 2 {
+		t.Fatalf("seqless signal applied %d times, want 2 (no dedup possible without a seq)", calls)
+	}
+	if v, ok := d.applied["shard-1"]; ok {
+		t.Fatalf("seqless signal must not write the per-source high-water; got applied[shard-1]=%d", v)
+	}
+}
+
 // TestDirectorReloadAuditMalformed proves a malformed audit payload is warned and dropped (never a crash),
 // and the signal is still acked (drained, not stuck redelivering).
 func TestDirectorReloadAuditMalformed(t *testing.T) {
 	var buf bytes.Buffer
 	d := captureDirector(&buf)
 
-	m := signalMsg{event: contentbus.ReloadAuditEvent, payload: json.RawMessage(`{not json`), key: "shard-1:1", source: "shard-1", ack: make(chan bool, 1)}
+	m := signalMsg{event: contentbus.ReloadAuditEvent, payload: json.RawMessage(`{not json`), seq: 1, seqOK: true, source: "shard-1", ack: make(chan bool, 1)}
 	d.handleSignal(context.Background(), m)
 	if !<-m.ack {
 		t.Fatal("a malformed audit must still ack (drain), not NAK")
@@ -304,7 +338,8 @@ func pullSignal(t *testing.T, key string, req contentbus.PullRequest) signalMsg 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return signalMsg{event: contentbus.PullRequestEvent, payload: payload, key: key, source: "shard-1", ack: make(chan bool, 1)}
+	_, seq, ok := commbus.ParseIdempotencyKey(key)
+	return signalMsg{event: contentbus.PullRequestEvent, payload: payload, seq: seq, seqOK: ok, source: "shard-1", ack: make(chan bool, 1)}
 }
 
 // TestDirectorCoordinatedPull: a content.pull.request signal makes the LEADER director run the puller with
@@ -431,7 +466,7 @@ func TestDirectorPullNilPullerAndMalformed(t *testing.T) {
 	p := &fakePuller{calls: make(chan pullArgs, 1)}
 	d2 := New("", newMemStore(), slog.Default()).WithContentPuller(p)
 	d2.leader.Store(true)
-	bad := signalMsg{event: contentbus.PullRequestEvent, payload: []byte("{not json"), key: "shard-1:1", source: "shard-1", ack: make(chan bool, 1)}
+	bad := signalMsg{event: contentbus.PullRequestEvent, payload: []byte("{not json"), seq: 1, seqOK: true, source: "shard-1", ack: make(chan bool, 1)}
 	d2.handleSignal(context.Background(), bad)
 	if !<-bad.ack {
 		t.Fatal("a malformed pull request should ack (a bad payload never parses on redelivery)")
