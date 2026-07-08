@@ -99,6 +99,14 @@ func Pull(ctx context.Context, opts Options) (Result, error) {
 	if v := content.LintReservedCoreRefs(packs); len(v) > 0 {
 		return Result{}, fmt.Errorf("pack %q ships a reserved core: namespace %s %q", v[0].Pack, v[0].Kind, v[0].Ref)
 	}
+	// Content-lint (#60): WARN on a present-but-empty/partial channel access condition (a typo'd restriction
+	// that silently opens the channel — or a blank flag that makes it unreachable). Non-blocking: the pack is
+	// trusted content. This YAML ingress is where the present-null form is still visible (Postgres normalizes
+	// it to an empty value on import), so it is the correct home for the catch. A Check dry run surfaces it too.
+	for _, v := range content.LintChannelAccess(packs) {
+		slog.Warn("content pull: channel access-condition lint (present-but-empty/partial condition; likely a typo)",
+			"pack", v.Pack, "channel", v.Channel, "field", v.Field, "detail", v.Detail)
+	}
 
 	base := Result{SHA: res.SHA, ManifestVersion: manifest.Version, Packs: packNames}
 	if opts.Check {
