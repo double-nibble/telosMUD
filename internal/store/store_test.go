@@ -529,6 +529,79 @@ func countRows(t *testing.T, p *Pool, table, pack string) int {
 	return n
 }
 
+// TestImportVersionConcurrentSameSHA (gated, #230) pins the leader-failover backstop DIRECTLY: two-plus
+// CONCURRENT ImportVersion calls with the SAME content SHA — a stale director racing the promoted one —
+// serialize on the content_version `SELECT ... FOR UPDATE` lock, so EXACTLY ONE reports changed=true and
+// the version bumps once; the losers see the SHA already present and no-op. TestImportVersion covers the
+// SEQUENTIAL idempotency (a redelivery); this asserts the concurrent race it was only reasoned about.
+func TestImportVersionConcurrentSameSHA(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	suffix := time.Now().Format("150405.000000")
+	pack := "cpk-" + suffix
+	zone := "cz" + suffix
+	t.Cleanup(func() {
+		cctx := context.Background()
+		tx, err := p.pool.Begin(cctx)
+		if err != nil {
+			return
+		}
+		defer tx.Rollback(cctx) //nolint:errcheck
+		_ = deletePack(cctx, tx, pack)
+		_, _ = tx.Exec(cctx, `DELETE FROM content_pack_registry WHERE pack=$1`, pack)
+		_ = tx.Commit(cctx)
+	})
+	good := content.Pack{Pack: pack, Zones: []content.ZoneDTO{{
+		Ref: zone, Name: "Z", StartRoom: zone + ":room:1",
+		Rooms: []content.RoomDTO{{Ref: zone + ":room:1", Name: "One"}},
+	}}}
+	sha := "csha-" + suffix
+
+	const n = 4
+	var wg sync.WaitGroup
+	changed := make([]bool, n)
+	versions := make([]uint64, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release all at once so they contend on the FOR UPDATE lock
+			v, _, ch, err := p.ImportVersion(ctx, []content.Pack{good},
+				VersionMeta{ContentSHA: sha, ManifestVersion: "v1", ContentHash: "h1"})
+			versions[i], changed[i], errs[i] = v, ch, err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	nChanged := 0
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("concurrent import %d errored: %v", i, errs[i])
+		}
+		if changed[i] {
+			nChanged++
+		}
+	}
+	if nChanged != 1 {
+		t.Fatalf("exactly ONE concurrent import of the same SHA must report changed=true, got %d", nChanged)
+	}
+	// Every caller settles on the single committed version: the one importer that bumped it, and the losers
+	// that serialized after and saw the SHA already present.
+	info, err := p.CurrentContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range versions {
+		if v != info.Version {
+			t.Fatalf("import %d returned version %d, want the single settled version %d", i, v, info.Version)
+		}
+	}
+}
+
 // TestImportVersion (gated) exercises the #212 slice-4 versioned import: the monotonic version bump,
 // the pack registry, and orphan pruning across versions.
 func TestImportVersion(t *testing.T) {

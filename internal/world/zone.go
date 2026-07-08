@@ -501,6 +501,17 @@ type reloadDoneMsg struct {
 	summary string // the finished-fan-out line to show them
 }
 
+// pullResultMsg reports the outcome of a director-coordinated `pull <version>` back to the builder who
+// ran it (#230). Unlike reload (whose outcome is local to the issuing shard), a pull runs on the world
+// DIRECTOR, which broadcasts the result DOWN on the world scope; the shard's scope replication fans this
+// message to every hosted zone, and — exactly like reloadDoneMsg — the zone that STILL hosts the builder
+// delivers it (single-writer over z.players). A builder who quit/moved gets no readout rather than a bad
+// send. Every other zone is a clean no-op (the player isn't theirs).
+type pullResultMsg struct {
+	player  string // the builder character id that ran `pull` (z.players key)
+	summary string // the pass/fail line to show them
+}
+
 func (joinMsg) zoneMsg()          {}
 func (attachMsg) zoneMsg()        {}
 func (inputMsg) zoneMsg()         {}
@@ -527,6 +538,7 @@ func (loadObjectsMsg) zoneMsg()   {}
 func (reloadLuaMsg) zoneMsg()     {}
 func (reconcileZoneMsg) zoneMsg() {}
 func (reloadDoneMsg) zoneMsg()    {}
+func (pullResultMsg) zoneMsg()    {}
 func (whoFallbackMsg) zoneMsg()   {}
 
 func newZone(id string) *Zone {
@@ -724,6 +736,12 @@ func (z *Zone) handle(m msg) {
 	case reloadDoneMsg:
 		// Deliver a `reload` fan-out result to the builder if they are still in this zone (single-writer
 		// over z.players); a builder who left mid-reload gets nothing rather than a bad send.
+		if s, ok := z.players[v.player]; ok {
+			s.send(textFrame(v.summary))
+		}
+	case pullResultMsg:
+		// Deliver a coordinated `pull` outcome (#230) to the builder if they are still in this zone; every
+		// other hosted zone the director's world-scope broadcast fanned to is a clean no-op.
 		if s, ok := z.players[v.player]; ok {
 			s.send(textFrame(v.summary))
 		}

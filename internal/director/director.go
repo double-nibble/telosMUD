@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -85,6 +86,10 @@ type Director struct {
 	// single-flights it so a second request while one is in flight is dropped rather than double-importing.
 	puller  ContentPuller
 	pulling atomic.Bool
+	// workers tracks in-flight off-actor pull workers so Run's shutdown WAITS for them (#230). The worker
+	// derives its ctx from Run's ctx, so ctx-cancel aborts an in-flight git clone/import promptly and the
+	// Wait bounds shutdown rather than orphaning the goroutine (previously it used context.Background()).
+	workers sync.WaitGroup
 }
 
 // ContentPuller installs a published content version (resolve from the external store → atomic Postgres
@@ -181,6 +186,7 @@ func (d *Director) Run(ctx context.Context) {
 		case <-ctx.Done():
 			d.log.Debug("director loop stop")
 			d.resign()
+			d.workers.Wait() // #230: bound shutdown on any in-flight pull worker (ctx-cancelled above)
 			return
 		case m := <-d.inbox:
 			d.handle(ctx, m)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -340,6 +341,143 @@ func pullSignal(t *testing.T, key string, req contentbus.PullRequest) signalMsg 
 	}
 	_, seq, ok := commbus.ParseIdempotencyKey(key)
 	return signalMsg{event: contentbus.PullRequestEvent, payload: payload, seq: seq, seqOK: ok, source: "shard-1", ack: make(chan bool, 1)}
+}
+
+// pullResultCapture wires a leader director with a fakePuller and a world-scope subscriber that captures
+// its pull-result down-broadcasts (#230), so a test can assert the outcome the requesting builder is told.
+func pullResultCapture(t *testing.T, p *fakePuller) (*Director, <-chan contentbus.PullResult) {
+	t.Helper()
+	dirBus := scopebus.New(commbus.NewMemBus())
+	results := make(chan contentbus.PullResult, 4)
+	sub, err := dirBus.Subscribe(scopebus.World(), func(event string, payload json.RawMessage, _ string) {
+		if event != contentbus.PullResultEvent {
+			return
+		}
+		var r contentbus.PullResult
+		if json.Unmarshal(payload, &r) == nil {
+			results <- r
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p).WithScopeBus(dirBus, "world-director-1")
+	d.leader.Store(true)
+	return d, results
+}
+
+func awaitPullResult(t *testing.T, results <-chan contentbus.PullResult) contentbus.PullResult {
+	t.Helper()
+	select {
+	case r := <-results:
+		return r
+	case <-time.After(2 * time.Second):
+		t.Fatal("no pull-result broadcast observed")
+		return contentbus.PullResult{}
+	}
+}
+
+// TestDirectorPullBroadcastsSuccess (#230): a successful coordinated pull broadcasts a PullResult{OK:true}
+// DOWN, carrying the version + the actor to notify — so the builder learns their install landed.
+func TestDirectorPullBroadcastsSuccess(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1)}
+	d, results := pullResultCapture(t, p)
+
+	d.handleSignal(context.Background(), pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1.2.3", Actor: "Ada"}))
+	<-p.calls // the worker ran the pull; the result broadcast follows
+	r := awaitPullResult(t, results)
+	if !r.OK || r.Version != "v1.2.3" || r.Actor != "Ada" {
+		t.Fatalf("success broadcast = %+v, want {OK:true v1.2.3 Ada}", r)
+	}
+}
+
+// TestDirectorPullBroadcastsFailure (#230): a puller error broadcasts OK=false with the error detail (the
+// prune-guard refusal / import failure the builder otherwise only saw in the director log).
+func TestDirectorPullBroadcastsFailure(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1), err: errors.New("prune guard refused: pack in use")}
+	d, results := pullResultCapture(t, p)
+
+	d.handleSignal(context.Background(), pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v9", Actor: "Ben"}))
+	<-p.calls
+	r := awaitPullResult(t, results)
+	if r.OK || r.Actor != "Ben" || !strings.Contains(r.Detail, "prune guard refused") {
+		t.Fatalf("failure broadcast = %+v, want {OK:false Ben detail~=prune guard refused}", r)
+	}
+}
+
+// TestDirectorPullBroadcastsSingleFlightDrop (#230): a second pull while one is in flight is dropped — and
+// now the dropped requester is TOLD (OK=false) rather than left waiting on a request that never ran.
+func TestDirectorPullBroadcastsSingleFlightDrop(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1), block: make(chan struct{})}
+	d, results := pullResultCapture(t, p)
+
+	// First request takes and HOLDS the single-flight slot (blocks in Pull).
+	d.handleSignal(context.Background(), pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1", Actor: "Ada"}))
+	// Second request while the first is in flight => dropped => its requester is notified.
+	d.handleSignal(context.Background(), pullSignal(t, "shard-1:2", contentbus.PullRequest{Version: "v2", Actor: "Ben"}))
+	r := awaitPullResult(t, results)
+	if r.OK || r.Actor != "Ben" || r.Version != "v2" {
+		t.Fatalf("single-flight-drop broadcast = %+v, want {OK:false Ben v2}", r)
+	}
+	if !strings.Contains(r.Detail, "already in progress") {
+		t.Fatalf("drop detail = %q, want it to mention a pull already in progress", r.Detail)
+	}
+	// Release the first pull so the worker exits cleanly.
+	close(p.block)
+	<-p.calls
+	awaitPullResult(t, results) // drain the first pull's success broadcast
+}
+
+// TestDirectorPullAbortsAndWaitsOnShutdown (#230): the pull worker's ctx derives from the run ctx and the
+// worker is tracked by d.workers, so cancelling the parent ABORTS an in-flight pull and d.workers.Wait()
+// (which Run calls on ctx.Done) returns bounded rather than orphaning the goroutine. A blocking puller that
+// honors ctx lets us prove both without a real 5-min timeout. Guards against a regression back to
+// context.Background() or dropping the Wait.
+func TestDirectorPullAbortsAndWaitsOnShutdown(t *testing.T) {
+	// block is never closed: fakePuller.Pull blocks until the ctx is cancelled, then returns ctx.Err().
+	p := &fakePuller{calls: make(chan pullArgs, 1), block: make(chan struct{})}
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+	d.leader.Store(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m := pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1", Actor: "Ada"})
+	d.handleSignal(ctx, m) // spawns the worker with parent = ctx; the worker is now blocked in Pull
+	if !<-m.ack {
+		t.Fatal("pull request should ack immediately")
+	}
+
+	cancel() // simulate Run's ctx.Done: the worker's pullCtx cancels, so Pull returns promptly
+
+	done := make(chan struct{})
+	go func() { d.workers.Wait(); close(done) }()
+	select {
+	case <-done:
+		// good: the worker finished after ctx-cancel aborted its blocked Pull, and Wait() is bounded
+	case <-time.After(2 * time.Second):
+		t.Fatal("d.workers.Wait() did not return after ctx cancel — the pull worker isn't bounded by the run ctx")
+	}
+}
+
+// TestDirectorPullNoBroadcastWhenNotLeader (#230): a non-leader NAKs the request (redelivered to the live
+// leader) and must NOT broadcast a result — the promoted leader owns the outcome, so a stray notice from a
+// standby would be wrong.
+func TestDirectorPullNoBroadcastWhenNotLeader(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1)}
+	d, results := pullResultCapture(t, p)
+	d.leader.Store(false) // override the leader default pullResultCapture set
+
+	m := pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1", Actor: "Ada"})
+	d.handleSignal(context.Background(), m)
+	if <-m.ack {
+		t.Fatal("a non-leader must NAK the pull request")
+	}
+	select {
+	case r := <-results:
+		t.Fatalf("a non-leader must not broadcast a pull result, got %+v", r)
+	case <-time.After(200 * time.Millisecond):
+		// good: no result broadcast
+	}
 }
 
 // TestDirectorCoordinatedPull: a content.pull.request signal makes the LEADER director run the puller with
