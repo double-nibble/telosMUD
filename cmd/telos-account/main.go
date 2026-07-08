@@ -197,7 +197,7 @@ func newBroker(cfg config.Config, st web.Store, authorizer web.DeviceAuthorizer)
 		Authorizer:     authorizer,
 		SessionKey:     webSessionKey(cfg.WebSessionKey),
 		SecureCookies:  cfg.WebSecureCookies, // secure-by-default (config); dev over plain http sets TELOS_WEB_SECURE_COOKIES=0
-		Dev:            cfg.Env == "dev",     // renders the -dev logo badge
+		Env:            cfg.Env,              // selects the logo badge variant (staging→STG, dev→DEV, else prod)
 		BootstrapAdmin: cfg.BootstrapAdmin,   // config-pin: first account matching this OAuth login → admin (#27)
 		Log:            slog.Default(),
 	})
