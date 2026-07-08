@@ -85,6 +85,19 @@ type session struct {
 	// pref, not persisted); default false. An explicit content visHide is still respected (content intent).
 	showRolls bool
 
+	// debugEchoes is a STAFF debug pref (#116, toggles.go): when true, this staff session receives live
+	// diagnostic echoes for the zone it is in — the first consumer is Lua script errors in that zone
+	// (z.echoDebug, fired from the isolated-error log sites). Set live by `debug on|off`; only staff can
+	// reach the verb (MinRank). Session-scoped like showRolls (a debug pref, not persisted); default false.
+	debugEchoes bool
+
+	// lastScreenPulse / screenFramesThisPulse rate-limit inbound Lua Screen frames (#120): a content script's
+	// screen:show() to this session is capped at maxScreenFramesPerPulse per zone heartbeat, so a tight repaint
+	// loop can't flood the terminal. Zone-goroutine-owned (screenShow runs there); reset lazily when the pulse
+	// advances (admitScreenFrame). Not persisted — a per-tick counter.
+	lastScreenPulse       uint64
+	screenFramesThisPulse int
+
 	// lastWho is when this session last ran `who` — the per-session cooldown mark (cmdWho reads and
 	// writes it against zone.whoCooldown). Zone-goroutine-owned like the HUD buffers above; it rides
 	// the session across an intra-shard zone transfer, so a cross-zone walk doesn't reset the cooldown.

@@ -49,6 +49,11 @@ func (rt *luaRuntime) compileChunk(origin, src string) (*compiledChunk, error) {
 	if err != nil {
 		// Fail-closed: a syntactically-broken body compiles to nothing; the def stays inert.
 		rt.log.Warn("lua compile failed; def left inert", "origin", origin, "err", err.Error())
+		// #116: a compile error is the highest-value builder signal — the script never runs, so no RUNTIME
+		// error site would ever fire; without this the broken def is silently inert. Echo it to watching staff.
+		if rt.zone != nil {
+			rt.zone.echoDebug(fmt.Sprintf("lua compile error [%s]: %v", origin, err))
+		}
 		return nil, fmt.Errorf("lua compile %s: %w", origin, err)
 	}
 	return &compiledChunk{proto: fn.Proto, origin: origin, gen: rt.chunkGen}, nil
@@ -133,9 +138,22 @@ func (rt *luaRuntime) invoke(ch *compiledChunk, inv *luaInvocation, binds map[st
 		// inside pcallGuarded.
 		rt.log.Warn("lua entry-point error (isolated; action fizzled, zone unaffected)",
 			"origin", ch.origin, "err", err.Error())
+		rt.echoScriptError(ch.origin, err) // #116: mirror to any staff watching this zone with `debug on`
 		return err
 	}
 	return nil
+}
+
+// echoScriptError mirrors an isolated Lua error to any staff session in the runtime's zone that has `debug on`
+// (#116). The raw error still goes to the ops log (the authoritative record); this is the live builder-facing
+// echo so a broken trigger surfaces to whoever is testing content, not only to an operator reading logs. A
+// nil/zone-less runtime (unit tests, pre-attach) is a no-op. It runs on the zone goroutine (Lua executes
+// there), so echoDebug's z.players iteration is race-free.
+func (rt *luaRuntime) echoScriptError(origin string, err error) {
+	if rt == nil || rt.zone == nil || err == nil {
+		return
+	}
+	rt.zone.echoDebug(fmt.Sprintf("lua error [%s]: %v", origin, err))
 }
 
 // invokeFromCtx is the bus/lifecycle entry: it builds the luaInvocation FROM the firing engine
@@ -203,6 +221,7 @@ func (rt *luaRuntime) invokeForNumber(ch *compiledChunk, inv *luaInvocation, bin
 	top := L.GetTop()
 	if err := rt.runGuardedFn(key, ch.origin, fn, 0, 1); err != nil {
 		rt.log.Warn("lua formula error (isolated; using engine default)", "origin", ch.origin, "err", err.Error())
+		rt.echoScriptError(ch.origin, err) // #116
 		L.SetTop(top)
 		return 0, false
 	}
@@ -238,6 +257,7 @@ func (rt *luaRuntime) invokeForString(ch *compiledChunk, inv *luaInvocation, bin
 	top := L.GetTop()
 	if err := rt.runGuardedFn(key, ch.origin, fn, 0, 1); err != nil {
 		rt.log.Warn("lua display template error (isolated; using fallback)", "origin", ch.origin, "err", err.Error())
+		rt.echoScriptError(ch.origin, err) // #116
 		L.SetTop(top)
 		return "", false
 	}
@@ -274,6 +294,7 @@ func (rt *luaRuntime) invokeForBool(ch *compiledChunk, inv *luaInvocation, binds
 	if err := rt.runGuardedFn(key, ch.origin, fn, 0, 1); err != nil {
 		rt.log.Warn("lua pvp_allowed policy error (isolated; FAIL-CLOSED, harm denied)",
 			"origin", ch.origin, "err", err.Error())
+		rt.echoScriptError(ch.origin, err) // #116
 		L.SetTop(top)
 		return false // fail-closed
 	}
@@ -312,6 +333,7 @@ func (rt *luaRuntime) invokeForStringList(ch *compiledChunk, inv *luaInvocation,
 	top := L.GetTop()
 	if err := rt.runGuardedFn(key, ch.origin, fn, 0, 1); err != nil {
 		rt.log.Warn("lua string-list hatch error (isolated; no drops added)", "origin", ch.origin, "err", err.Error())
+		rt.echoScriptError(ch.origin, err) // #116
 		L.SetTop(top)
 		return nil
 	}
