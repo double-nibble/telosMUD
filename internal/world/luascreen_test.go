@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 )
 
 // luascreen_test.go — #31 Slice 5: the `screen` sandbox capability (luascreen.go). Covers the builder API
@@ -197,5 +199,82 @@ func TestScreenOpCapErrors(t *testing.T) {
 	src := `local s = screen.frame(); for i=1,` + itoa(maxScreenOps+10) + ` do s:home() end`
 	if err := z.lua.runChunk(t.Name(), src); err == nil {
 		t.Fatal("exceeding the screen op cap should error")
+	}
+}
+
+// countScreenFrames drains s.out and returns how many Screen frames were emitted (non-blocking).
+func countScreenFrames(s *session) int {
+	n := 0
+	for {
+		select {
+		case f := <-s.out:
+			if f.GetScreen() != nil {
+				n++
+			}
+		default:
+			return n
+		}
+	}
+}
+
+// TestScreenShowSameRoomScope (#120/#147): screen:show(target) may paint only a target in the SAME ROOM as
+// the script's subject (self), not merely the same zone — the cheapest bound on "who a script can redraw".
+func TestScreenShowSameRoomScope(t *testing.T) {
+	z := newZone("screen")
+	actor := makeRoomPlayer(z, "Actor")
+	z.rooms[actor.entity.location.proto] = actor.entity.location
+
+	// A co-located victim IS paintable.
+	near := makePlayerTargetInRoom(z, actor.entity, "Near")
+	z.lua.L.SetGlobal("near", z.lua.newHandle(near.entity))
+	if err := z.lua.runChunkWithSelf(t.Name(), `screen.frame():write("hi"):show(near)`, actor.entity); err != nil {
+		t.Fatalf("script errored: %v", err)
+	}
+	if got := countScreenFrames(near); got != 1 {
+		t.Fatalf("a co-located target must receive the frame, got %d", got)
+	}
+
+	// A victim in a DIFFERENT room (same zone) must NOT be painted — the same-zone-but-not-same-room case #120
+	// tightens.
+	otherRoom := z.newEntity(ProtoRef("test:room2"))
+	Add(otherRoom, &Room{})
+	z.rooms[otherRoom.proto] = otherRoom
+	far := &session{character: "Far", out: make(chan *playv1.ServerFrame, 64), epoch: 1}
+	z.newPlayerEntity(far, "Far")
+	Move(far.entity, otherRoom)
+	z.players["Far"] = far
+	z.lua.L.SetGlobal("far", z.lua.newHandle(far.entity))
+	if err := z.lua.runChunkWithSelf(t.Name(), `screen.frame():write("hi"):show(far)`, actor.entity); err != nil {
+		t.Fatalf("script errored: %v", err)
+	}
+	if got := countScreenFrames(far); got != 0 {
+		t.Fatalf("a target in a DIFFERENT room must NOT be painted, got %d frames", got)
+	}
+}
+
+// TestScreenShowRateLimit (#120): a receiver accepts at most maxScreenFramesPerPulse frames per zone pulse, so
+// a tight repaint loop can't flood a co-located player. All show()s here run in one script invocation (one
+// pulse), so only the first maxScreenFramesPerPulse land.
+func TestScreenShowRateLimit(t *testing.T) {
+	z := newZone("screen")
+	actor := makeRoomPlayer(z, "Actor")
+	z.rooms[actor.entity.location.proto] = actor.entity.location
+
+	// Five paints of self within one invocation (one pulse) => only maxScreenFramesPerPulse accepted.
+	if err := z.lua.runChunkWithSelf(t.Name(),
+		`for i=1,5 do screen.frame():write("x"):show(self) end`, actor.entity); err != nil {
+		t.Fatalf("script errored: %v", err)
+	}
+	if got := countScreenFrames(actor); got != maxScreenFramesPerPulse {
+		t.Fatalf("the per-pulse rate limit must cap frames at %d, got %d", maxScreenFramesPerPulse, got)
+	}
+
+	// After the pulse advances, the budget resets — a later frame is accepted again.
+	z.pulses.pulse++
+	if err := z.lua.runChunkWithSelf(t.Name(), `screen.frame():write("y"):show(self)`, actor.entity); err != nil {
+		t.Fatalf("script errored: %v", err)
+	}
+	if got := countScreenFrames(actor); got != 1 {
+		t.Fatalf("the budget must reset on a new pulse, got %d", got)
 	}
 }
