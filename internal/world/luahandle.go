@@ -353,16 +353,43 @@ func (rt *luaRuntime) hContents(l *lua.LState) int {
 	return rt.pushHandleList(l, e.contents)
 }
 
+// displayReachesForeignRoom reports whether, in a DISPLAY render, e is a ROOM the viewer is NOT standing in —
+// a NEIGHBOR reached via exits().to (hExits hands a display a walkable handle to the destination room). A
+// display's perception is anchored to the viewer's own location, so an enumeration accessor
+// (occupants/room_items/contents/mud.scan) must disclose NOTHING for such a room (#253): otherwise a `room`
+// template could peer into an adjacent room's occupants — which `look` never shows — and the co-location-gated
+// darkness check (visibility.go) would not even conceal them (the viewer isn't co-located). The viewer's own
+// room (e == viewer.location), containers in it, and the viewer's inventory stay reachable (co-located / owned);
+// only a FOREIGN room is blocked, and only in a display render (a mechanics script may still scan any room). It
+// fails CLOSED: a display with no viewer treats every room as foreign. `to` remains a handle so a template can
+// still read the destination's NAME — only enumerating its live occupants is denied.
+func (rt *luaRuntime) displayReachesForeignRoom(e *Entity) bool {
+	if rt.inv == nil || !rt.inv.display || e.room == nil {
+		return false // not a display render, or e is not a room (a chest/inventory — #250 canSee handles it)
+	}
+	// Anchor to the room CAPTURED at render start (displayRoom), not the LIVE actor.location: a template can
+	// teleport the viewer mid-render, and a live anchor would let it relocate into a neighbor, enumerate, and
+	// relocate back — a TOCTOU scry the security review PoC'd (#253). A frozen anchor can't be shifted by the
+	// render. A direct-invocation test may not set displayRoom; fall back to the live location there (tests do
+	// not relocate). Fail closed: no anchor at all => every room is foreign.
+	anchor := rt.inv.displayRoom
+	if anchor == nil && rt.inv.actor != nil {
+		anchor = rt.inv.actor.location
+	}
+	return anchor == nil || e != anchor
+}
+
 // displayVisibleContents is the #250 concealment filter shared by the two DISPLAY-render entity enumerators
 // that would otherwise return a container's raw contents — contents() (hContents) and mud.scan (mudScan). It
 // returns e.contents keeping only the entities the invocation's viewer canSee, so a sheet can't disclose a
-// concealed occupant/item. It fails CLOSED (nil viewer or zoneless container => nothing), matching the
-// hOccupants/hRoomItems posture. Callers invoke it only when rt.inv.display is set AND e is not the viewer
-// (the viewer's own inventory stays raw). Unlike occupants() it does NOT exclude the viewer — contents() is the
-// whole-container list and the viewer canSee's themselves — and unlike room_items() it is not item-restricted.
+// concealed occupant/item; a FOREIGN room (a neighbor via exits()) discloses nothing at all (#253). It fails
+// CLOSED (nil viewer or zoneless container => nothing), matching the hOccupants/hRoomItems posture. Callers
+// invoke it only when rt.inv.display is set AND e is not the viewer (the viewer's own inventory stays raw).
+// Unlike occupants() it does NOT exclude the viewer — contents() is the whole-container list and the viewer
+// canSee's themselves — and unlike room_items() it is not item-restricted.
 func (rt *luaRuntime) displayVisibleContents(e *Entity) []*Entity {
 	viewer := rt.inv.actor
-	if viewer == nil || e.zone == nil {
+	if viewer == nil || e.zone == nil || rt.displayReachesForeignRoom(e) {
 		return nil
 	}
 	var visible []*Entity
@@ -520,6 +547,9 @@ func (rt *luaRuntime) hOccupants(l *lua.LState) int {
 	if viewer == nil {
 		return rt.pushHandleList(l, nil) // fail closed: no perspective => disclose nothing
 	}
+	if rt.displayReachesForeignRoom(e) {
+		return rt.pushHandleList(l, nil) // #253: a display can't perceive a room the viewer isn't standing in
+	}
 	var visible []*Entity
 	for _, occ := range e.contents {
 		if occ == viewer || !isCreature(occ) {
@@ -556,6 +586,10 @@ func (rt *luaRuntime) hRoomItems(l *lua.LState) int {
 	viewer := rt.viewer()
 	if viewer == nil {
 		l.Push(t)
+		return 1
+	}
+	if rt.displayReachesForeignRoom(e) {
+		l.Push(t) // #253: a display can't itemize a room the viewer isn't standing in
 		return 1
 	}
 	var items []*Entity

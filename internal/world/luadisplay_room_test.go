@@ -431,6 +431,127 @@ func TestRoomDisplayTemplateThroughRenderPathFiltersContents(t *testing.T) {
 	}
 }
 
+// TestDisplayCannotEnumerateNeighborRoom is the #253 regression through the REAL look/render path: a `room`
+// template can obtain a walkable handle to an ADJACENT room via exits().to, but a display's perception is
+// anchored to the viewer's OWN room — so occupants()/contents()/room_items()/mud.scan on that neighbor handle
+// must disclose NOTHING, even for a fully-VISIBLE occupant (the darkness check is co-location-gated and would
+// not conceal a neighbor anyway). The handle stays usable for the destination NAME; only enumerating its live
+// occupants/items is denied. The viewer's own room still enumerates normally.
+func TestDisplayCannotEnumerateNeighborRoom(t *testing.T) {
+	z, s := roomTmplZone(t, `
+		local out = {}
+		for _, o in ipairs(self:room():occupants()) do out[#out+1] = "OWN:" .. o:name() end
+		for _, e in ipairs(self:room():exits()) do
+			if type(e.to) ~= "string" then                                  -- a local neighbor room handle
+				out[#out+1] = "NAME:" .. e.to:name()                        -- name still readable
+				for _, o in ipairs(e.to:occupants())  do out[#out+1] = "OCC:"  .. o:name() end
+				for _, o in ipairs(e.to:contents())   do out[#out+1] = "CON:"  .. o:name() end
+				for _, g in ipairs(e.to:room_items()) do out[#out+1] = "ITM:"  .. g.name end
+				for _, o in ipairs(mud.scan(e.to))    do out[#out+1] = "SCAN:" .. o:name() end
+			end
+		end
+		return table.concat(out, "\n")`)
+
+	hall := z.rooms["harm:room:hall"]
+	market := z.newEntity("harm:room:market")
+	market.short = "The Market"
+	Add(market, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["harm:room:market"] = market
+	hall.room.exits["north"] = "harm:room:market"
+
+	// A fully-VISIBLE occupant + an item in the NEIGHBOR room — a display must not reach either.
+	neighbor := newTestPlayerEntity(z, "Neighbor")
+	neighbor.entity.short = "Neighbor"
+	Move(neighbor.entity, market)
+	z.players["Neighbor"] = neighbor
+	addTestItem(z, market, "a neighbor sword", []string{"sword"})
+
+	// A visible occupant in the viewer's OWN room — this must still be listed.
+	local := newTestPlayerEntity(z, "Local")
+	local.entity.short = "Local"
+	Move(local.entity, hall)
+	z.players["Local"] = local
+
+	z.dispatch(s, "look")
+	out := drainAllText(s.out)
+
+	if !strings.Contains(out, "OWN:Local") {
+		t.Fatalf("the viewer's OWN room occupants must still be visible in a display: %q", out)
+	}
+	if !strings.Contains(out, "NAME:The Market") {
+		t.Fatalf("exits().to must remain a handle a template can read the destination NAME from: %q", out)
+	}
+	if strings.Contains(out, "Neighbor") {
+		t.Fatalf("#253: a display enumerated a NEIGHBOR room's occupant (occupants/contents/scan): %q", out)
+	}
+	if strings.Contains(out, "a neighbor sword") {
+		t.Fatalf("#253: a display enumerated a NEIGHBOR room's items (room_items/contents): %q", out)
+	}
+}
+
+// TestMechanicsCanStillScanNeighborRoom pins that #253 restricts ONLY display renders: a MECHANICS invocation
+// (display:false) is not anchored to the viewer's room, so a script scanning a neighbor room still reaches its
+// occupants (an off-room scripted effect is a legitimate mechanic). This guards against over-broadening the fix.
+func TestMechanicsCanStillScanNeighborRoom(t *testing.T) {
+	z, _, hall := harmZone(t)
+	viewer := harmPlayer(z, hall, "Viewer")
+	market := z.newEntity("harm:room:market")
+	Add(market, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["harm:room:market"] = market
+	harmPlayer(z, market, "Neighbor")
+
+	rt := z.lua
+	ch := rt.chunkFor("test:mech-scan", `
+		local c = {}
+		for _, e in ipairs(mud.scan(room))      do c[#c+1] = "S:" .. e:name() end
+		for _, e in ipairs(room:occupants())    do c[#c+1] = "O:" .. e:name() end
+		return table.concat(c, ",")`)
+	got, ok := rt.invokeForString(ch, &luaInvocation{actor: viewer}, // display:false — a mechanics scan
+		map[string]lua.LValue{"room": rt.newHandle(market)})
+	if !ok {
+		t.Fatal("chunk failed to run")
+	}
+	if !strings.Contains(got, "S:Neighbor") || !strings.Contains(got, "O:Neighbor") {
+		t.Fatalf("a MECHANICS scan/occupants of a neighbor room must still reach its occupant (#253 is display-only): %q", got)
+	}
+}
+
+// TestDisplayTeleportCannotUnlockNeighborEnumeration is the #253 TOCTOU closure (empirically PoC'd by the
+// security review): a `room` template can call self:teleport()/move()/recall() mid-render, so if the
+// foreign-room anchor were read LIVE from actor.location a template could relocate the viewer INTO the neighbor,
+// enumerate it, and relocate back — a scry. The anchor is instead the room CAPTURED at render start
+// (inv.displayRoom), so the relocation runs (proven by the changed room name) but cannot unlock enumeration.
+func TestDisplayTeleportCannotUnlockNeighborEnumeration(t *testing.T) {
+	z, _, hall := harmZone(t)
+	viewer := harmPlayer(z, hall, "Viewer")
+	market := z.newEntity("harm:room:market")
+	market.short = "The Market"
+	Add(market, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["harm:room:market"] = market
+	harmPlayer(z, market, "Neighbor")
+
+	rt := z.lua
+	ch := rt.chunkFor("display:room:toctou", `
+		local c = {}
+		self:teleport(dest)                                          -- relocate the viewer into the neighbor
+		c[#c+1] = "NOW:" .. self:room():name()                       -- a prop read (allowed) — proves the move ran
+		for _, o in ipairs(self:room():occupants()) do c[#c+1] = "SCRY:" .. o:name() end
+		return table.concat(c, ",")`)
+	// A display render anchored to the ORIGINAL room (hall), exactly as renderDisplaySheet captures self.location.
+	got, ok := rt.invokeForString(ch, &luaInvocation{actor: viewer, display: true, displayRoom: hall},
+		map[string]lua.LValue{"self": rt.newHandle(viewer), "dest": rt.newHandle(market)})
+	if !ok {
+		t.Fatal("chunk failed to run")
+	}
+	if !strings.Contains(got, "NOW:The Market") {
+		t.Fatalf("the teleport must actually run (non-vacuous) — the viewer should be in the market: %q", got)
+	}
+	if strings.Contains(got, "SCRY:Neighbor") {
+		t.Fatalf("#253 TOCTOU: a mid-render teleport unlocked neighbor enumeration — the anchor must be the room "+
+			"captured at render start, not the live viewer.location: %q", got)
+	}
+}
+
 // --- self:room():room_items() -----------------------------------------------------------------
 
 // TestRoomHandleCoalescedItems pins the coalesced ground-item accessor: identical items merge into ONE record

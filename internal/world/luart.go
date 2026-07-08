@@ -226,6 +226,13 @@ type luaInvocation struct {
 	// contents of a container that is NOT the viewer (a room, a chest), so a sheet can't reveal what the viewer
 	// can't perceive (#250 — the "reach for contents() instead of occupants()" leak trap). `actor` is the viewer.
 	display bool
+	// displayRoom is the viewer's room CAPTURED at the start of a display render — the STABLE anchor
+	// displayReachesForeignRoom (#253) uses to decide "the viewer's own room" vs "a neighbor". It must NOT be
+	// read live from actor.location: a display template can call self:teleport()/move()/recall() mid-render, so
+	// a live anchor would let it relocate the viewer into a neighbor, enumerate it, and relocate back (a TOCTOU
+	// scry the security review PoC'd). Frozen here, the anchor can't be shifted by anything the render does.
+	// Set only on the display path; nil elsewhere (a direct-invocation test falls back to the live location).
+	displayRoom *Entity
 }
 
 // newLuaRuntime builds the per-zone VM and installs the restricted-globals sandbox. The
