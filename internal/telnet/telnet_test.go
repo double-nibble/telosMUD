@@ -164,19 +164,22 @@ func TestWriteStripsControlKeepsAdjacentMultibyte(t *testing.T) {
 	}
 }
 
-// TestWriteStripsBidiOverride is the #22 regression on the universal output sanitizer: an explicit
-// Trojan-Source bidi-override control (RLO U+202E and the isolates) is category Cf — NOT caught by the
-// Cc-only unicode.IsControl — so the pre-#22 sanitizeOutput passed it verbatim, letting a player name or
-// message DISPLAY as something other than its bytes on another player's terminal. sanitizeOutput must now
-// DROP the override subset while preserving the LEGITIMATE bidi a real Arabic/Hebrew/emoji line needs:
-// implicit LRM/RLM marks, the RTL letters themselves, and the ZWJ grapheme glue (all also Cf).
+// TestWriteStripsBidiOverride is the #22/#25b regression on the universal output sanitizer: the STRONG
+// character-reversal controls (the override/embedding block U+202A–U+202E, e.g. RLO) are category Cf — NOT
+// caught by the Cc-only unicode.IsControl — so pre-#22 sanitizeOutput passed them verbatim, letting a message
+// DISPLAY as something other than its bytes. sanitizeOutput must DROP those overrides while PRESERVING (a) the
+// legitimate implicit bidi a real Arabic/Hebrew/emoji line needs (LRM/RLM marks, RTL letters, ZWJ glue) AND
+// (b) the ISOLATE block U+2066–U+2069 (FSI/PDI/…): #25b narrowed the EDGE strip to overrides only, because
+// consoleui emits balanced FSI…PDI for RTL column stability on this exact Send→Write path, and untrusted
+// content is neutralized of isolates upstream by internal/textsan instead.
 func TestWriteStripsBidiOverride(t *testing.T) {
-	rlo := string(rune(0x202E)) // RIGHT-TO-LEFT OVERRIDE — the classic Trojan-Source spoof
-	pdi := string(rune(0x2069)) // POP DIRECTIONAL ISOLATE
+	rlo := string(rune(0x202E)) // RIGHT-TO-LEFT OVERRIDE — the strong Trojan-Source spoof: MUST be stripped
+	fsi := string(rune(0x2068)) // FIRST STRONG ISOLATE — consoleui's containment: MUST survive the edge
+	pdi := string(rune(0x2069)) // POP DIRECTIONAL ISOLATE — MUST survive
 	lrm := string(rune(0x200E)) // LEFT-TO-RIGHT MARK — legitimate implicit bidi, must survive
 	zwj := string(rune(0x200D)) // ZWJ grapheme glue, must survive
-	in := "Guard" + rlo + "admin" + pdi + " says " + lrm + "hello مرحبا 👨" + zwj + "👩"
-	want := "Guardadmin says " + lrm + "hello مرحبا 👨" + zwj + "👩" // only RLO + PDI dropped
+	in := "Guard" + rlo + "admin says " + lrm + fsi + "hello مرحبا" + pdi + " 👨" + zwj + "👩"
+	want := "Guardadmin says " + lrm + fsi + "hello مرحبا" + pdi + " 👨" + zwj + "👩" // only the RLO override dropped
 
 	var out bytes.Buffer
 	c := NewReadWriter(&bytes.Buffer{}, &out)
@@ -187,11 +190,14 @@ func TestWriteStripsBidiOverride(t *testing.T) {
 	if got != want {
 		t.Fatalf("sanitizeOutput bidi handling wrong:\n got  %q\n want %q", got, want)
 	}
-	if strings.ContainsRune(got, 0x202E) || strings.ContainsRune(got, 0x2069) {
-		t.Fatalf("bidi-override control not stripped: %q", got)
+	if strings.ContainsRune(got, 0x202E) {
+		t.Fatalf("strong bidi override (RLO) not stripped: %q", got)
+	}
+	if !strings.ContainsRune(got, 0x2068) || !strings.ContainsRune(got, 0x2069) {
+		t.Fatalf("balanced isolate (FSI/PDI) stripped — #25b requires the edge to preserve consoleui's isolates: %q", got)
 	}
 	if !strings.ContainsRune(got, 0x200E) {
-		t.Fatalf("legitimate LRM mark stripped (only the OVERRIDE subset should go): %q", got)
+		t.Fatalf("legitimate LRM mark stripped (only the OVERRIDE block should go): %q", got)
 	}
 	if !strings.ContainsRune(got, 0x200D) {
 		t.Fatalf("ZWJ grapheme glue stripped (it is not an override): %q", got)
@@ -200,10 +206,10 @@ func TestWriteStripsBidiOverride(t *testing.T) {
 		t.Fatalf("sanitizeOutput produced invalid UTF-8: % x", out.Bytes())
 	}
 
-	// Drift guard for the edge's LOCAL isBidiOverride mirror: every one of the nine override/isolate runes
-	// must be dropped, so the telnet copy can't silently narrow relative to textsan.IsBidiOverride (both
-	// trust domains pin the full U+202A–U+202E + U+2066–U+2069 set independently).
-	for _, r := range []rune{0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069} {
+	// Drift guard: the edge strips EXACTLY the five override/embedding runes (U+202A–U+202E) and KEEPS the four
+	// isolate runes (U+2066–U+2069). This pins the deliberate divergence from textsan.IsBidiOverride (#25b) so
+	// a future edit can't silently re-widen the edge (re-breaking consoleui) or narrow the override set.
+	for _, r := range []rune{0x202A, 0x202B, 0x202C, 0x202D, 0x202E} {
 		var b bytes.Buffer
 		cc := NewReadWriter(&bytes.Buffer{}, &b)
 		if err := cc.Write("x" + string(r) + "y"); err != nil {
@@ -211,6 +217,16 @@ func TestWriteStripsBidiOverride(t *testing.T) {
 		}
 		if got := b.String(); got != "xy" {
 			t.Errorf("sanitizeOutput did not drop override %U: got %q", r, got)
+		}
+	}
+	for _, r := range []rune{0x2066, 0x2067, 0x2068, 0x2069} {
+		var b bytes.Buffer
+		cc := NewReadWriter(&bytes.Buffer{}, &b)
+		if err := cc.Write("x" + string(r) + "y"); err != nil {
+			t.Fatal(err)
+		}
+		if got := b.String(); got != "x"+string(r)+"y" {
+			t.Errorf("sanitizeOutput must PRESERVE isolate %U (consoleui's grid): got %q", r, got)
 		}
 	}
 }

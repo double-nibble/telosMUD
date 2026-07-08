@@ -3,6 +3,8 @@ package consoleui
 import (
 	"strings"
 	"testing"
+
+	"github.com/double-nibble/telosmud/internal/colormarkup"
 )
 
 // TestWhoListExample renders the design's illustrative who-list and pins the exact output, exercising
@@ -109,6 +111,34 @@ func TestTruncatePreservesColorTokens(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("want trailing ellipsis: %q", got)
+	}
+}
+
+// TestTruncateClosesOpenColor is the #25a regression: a cell whose closing {{RESET}} is BEYOND the truncation
+// point must still be color-closed at the cut, so the cell's color cannot bleed into the row's padding / the
+// next column (previously it leaked until the edge's end-of-frame reset). A truncated cell with NO open color
+// must NOT gain a spurious reset.
+func TestTruncateClosesOpenColor(t *testing.T) {
+	// The {{RESET}} sits past the cut, so truncateVisible must synthesize one; it lands BEFORE the ellipsis so
+	// the marker is neutral-colored, and the cell as a whole is color-balanced.
+	got := truncateVisible("{{FG_RED}}hello world{{RESET}}", 6)
+	if !strings.Contains(got, "{{RESET}}") {
+		t.Errorf("truncation dropped the closing reset — color will bleed past the cell: %q", got)
+	}
+	if !strings.HasSuffix(got, "{{RESET}}…") {
+		t.Errorf("reset should close the color right before the ellipsis: %q", got)
+	}
+	// colormarkup.Strip is the edge tokenizer; a balanced cell strips to plain visible text with no leftover.
+	if plain := colormarkup.Strip(got); plain != "hello…" {
+		t.Errorf("stripped cell = %q, want %q", plain, "hello…")
+	}
+	// A truncated cell that opened no color gets NO spurious reset (byte-minimal).
+	if g := truncateVisible("hello world", 6); strings.Contains(g, "{{RESET}}") {
+		t.Errorf("uncolored truncation must not add a reset: %q", g)
+	}
+	// A cell whose color IS already closed before the cut also needs no synthesized reset.
+	if g := truncateVisible("{{FG_RED}}hi{{RESET}} there friend", 6); strings.Count(g, "{{RESET}}") != 1 {
+		t.Errorf("already-closed color must not get a second reset: %q", g)
 	}
 }
 
