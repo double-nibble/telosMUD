@@ -70,6 +70,9 @@ func (rt *luaRuntime) installGMCPTable() {
 // handle. An invalid package name, a spoofed engine namespace, a non-table payload, or an over-budget
 // table each raise a clean Lua error (fail-closed) rather than emitting a partial/unsafe frame.
 func (rt *luaRuntime) gmcpSend(l *lua.LState) int {
+	if rt.denyInDisplay(l, "gmcp.send") {
+		return 0
+	}
 	target := resolveHandle(l, 1)
 	pkg := l.CheckString(2)
 	if !validCustomGMCPPackage(pkg) {

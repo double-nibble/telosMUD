@@ -127,6 +127,9 @@ func (rt *luaRuntime) scopeRegionID(l *lua.LState) int {
 // director. event is the script-named event ("boss_slain"); payload is an optional data table. A no-op
 // (with a debug log) on a region-less zone or a shard without a scoped bus — never an error to the script.
 func (rt *luaRuntime) scopeSignalRegion(l *lua.LState) int {
+	if rt.denyInDisplay(l, "signal_region") {
+		return 0
+	}
 	if rt.zone == nil || rt.zone.scopes == nil || rt.zone.scopes.regionID == "" {
 		rt.log.Debug("signal_region ignored (region-less zone)")
 		return 0
@@ -138,6 +141,9 @@ func (rt *luaRuntime) scopeSignalRegion(l *lua.LState) int {
 // scopeSignalWorld implements signal_world(event, payload?) — a zone reports an event UP to the WORLD
 // director. Always available (every zone is in the world scope).
 func (rt *luaRuntime) scopeSignalWorld(l *lua.LState) int {
+	if rt.denyInDisplay(l, "signal_world") {
+		return 0
+	}
 	rt.enqueueScopeSignal(l, scopebus.World())
 	return 0
 }

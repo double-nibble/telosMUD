@@ -244,6 +244,9 @@ func sanitizeScreenText(s string) string {
 // flood a co-located player's terminal. Both are annoyance-grade caps (the terminal-injection class is already
 // closed by construction: write() is printable-only); they bound the residual "content can be obnoxious" risk.
 func (rt *luaRuntime) screenShow(l *lua.LState) int {
+	if rt.denyInDisplay(l, "screen.show") {
+		return 0
+	}
 	s := checkScreen(l, 1)
 	if s == nil {
 		return 0

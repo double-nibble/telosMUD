@@ -162,6 +162,22 @@ func resolveHandle(l *lua.LState, n int) *Entity {
 	return h.zone.entityByRID(h.rid)
 }
 
+// denyInDisplay raises a clean Lua error (and returns true) when called inside a DISPLAY render
+// (inv.display, set by renderDisplaySheet/renderDisplayList — luadisplay.go). A content sheet
+// template must be a PURE function of world state -> a string: it may NOT mutate the world or emit
+// output (#256). Every side-effecting handle/mud op calls this as its FIRST statement, so the guard
+// fires BEFORE any arg validation or effect — the raised error aborts the render, invokeForString
+// returns ("", false), and the caller falls back to its BUILT-IN sheet with NO partial side effect
+// leaked. Read-only/query ops (name/attr/occupants/…) are NOT gated — they are what a sheet is for.
+// It mirrors the luascreen.go admit() shape: RaiseError, then the caller returns 0.
+func (rt *luaRuntime) denyInDisplay(l *lua.LState, op string) bool {
+	if rt.inv != nil && rt.inv.display {
+		l.RaiseError("%s: not allowed in a display render (a sheet template must be side-effect free)", op)
+		return true
+	}
+	return false
+}
+
 // --- read methods (each: resolve, read, return; no writes, no harm surface) ---------------
 
 // hID returns the entity's RuntimeID as a Lua number. Unlike the other methods it does not
@@ -690,6 +706,9 @@ func (rt *luaRuntime) hCanSee(l *lua.LState) int {
 // control/ESC sequences are stripped (terminal-injection defense for a non-telnet sink) while
 // legitimate markup/color is preserved.
 func (rt *luaRuntime) hSend(l *lua.LState) int {
+	if rt.denyInDisplay(l, "send") {
+		return 0
+	}
 	e := resolveHandle(l, 1)
 	markup := textsan.CleanMarkup(l.CheckString(2))
 	if e == nil {
@@ -708,6 +727,9 @@ func (rt *luaRuntime) hSend(l *lua.LState) int {
 // template is SCRIPT-SUPPLIED, so it is textsan.CleanMarkup'd (ISSUE-B); the '$'-referent
 // tokens are ordinary printable chars and survive, only control/ESC sequences are stripped.
 func (rt *luaRuntime) hAct(l *lua.LState) int {
+	if rt.denyInDisplay(l, "act") {
+		return 0
+	}
 	actor := resolveHandle(l, 1)
 	tmpl := textsan.CleanMarkup(l.CheckString(2))
 	if actor == nil {
@@ -725,6 +747,9 @@ func (rt *luaRuntime) hAct(l *lua.LState) int {
 // script-supplied TEXT is cleaned (ISSUE-B) — the engine-generated template is already safe and
 // is not re-sanitized.
 func (rt *luaRuntime) hSay(l *lua.LState) int {
+	if rt.denyInDisplay(l, "say") {
+		return 0
+	}
 	e := resolveHandle(l, 1)
 	text := textsan.CleanMarkup(l.CheckString(2))
 	if e == nil {
@@ -738,6 +763,9 @@ func (rt *luaRuntime) hSay(l *lua.LState) int {
 // hEmote makes the entity emote text to its room ("$n <text>" to bystanders, "You <text>" to
 // the actor). Message-only. Only the script-supplied text is cleaned (ISSUE-B).
 func (rt *luaRuntime) hEmote(l *lua.LState) int {
+	if rt.denyInDisplay(l, "emote") {
+		return 0
+	}
 	e := resolveHandle(l, 1)
 	text := textsan.CleanMarkup(l.CheckString(2))
 	if e == nil {
