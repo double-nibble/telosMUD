@@ -369,6 +369,9 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM display_defs WHERE pack=$1`,
 		// Trust tiers (#27/#29): same strips-and-replaces idempotency. No FK into the zone tree.
 		`DELETE FROM trust_tier_defs WHERE pack=$1`,
+		// Custom Lua verbs + ruleset formulas (#20): same strips-and-replaces idempotency. No FK into the zone tree.
+		`DELETE FROM command_defs WHERE pack=$1`,
+		`DELETE FROM formula_defs WHERE pack=$1`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s, pack); err != nil {
@@ -767,10 +770,32 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert trust_tier %s: %w", tt.Name, err)
 		}
 	}
-	// Pack-level scalars (Phase 6.3a): default_combat in the pack_meta row. Only written when set, so
-	// a pack that names no player default leaves no row (the loader then leaves DefaultCombat empty).
-	if pk.DefaultCombat != "" {
-		body, err := json.Marshal(packMetaBody{DefaultCombat: pk.DefaultCombat})
+	// Custom Lua verbs (#20, Phase 7.4e): (pack, verb) PK, the alias list + Lua handler in the JSONB body.
+	for _, cmd := range pk.Commands {
+		body, err := json.Marshal(commandBody{Aliases: cmd.Aliases, Lua: cmd.Lua})
+		if err != nil {
+			return fmt.Errorf("store: marshal command %s body: %w", cmd.Verb, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO command_defs (verb, pack, body) VALUES ($1,$2,$3)`, cmd.Verb, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert command %s: %w", cmd.Verb, err)
+		}
+	}
+	// Ruleset-formula overrides (#20, Phase 7.4f): (pack, name) PK, the Lua formula body in the JSONB body.
+	for name, lua := range pk.Formulas {
+		body, err := json.Marshal(formulaBody{Lua: lua})
+		if err != nil {
+			return fmt.Errorf("store: marshal formula %s body: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO formula_defs (name, pack, body) VALUES ($1,$2,$3)`, name, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert formula %s: %w", name, err)
+		}
+	}
+	// Pack-level scalars (Phase 6.3a: default_combat; #20/Phase 7.4f: pvp_lua) in the pack_meta row. Only
+	// written when a scalar is set, so a pack that names none leaves no row (the loader then leaves them empty).
+	if pk.DefaultCombat != "" || pk.PvpLua != "" {
+		body, err := json.Marshal(packMetaBody{DefaultCombat: pk.DefaultCombat, PvpLua: pk.PvpLua})
 		if err != nil {
 			return fmt.Errorf("store: marshal pack_meta %s: %w", pk.Pack, err)
 		}

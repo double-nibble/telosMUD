@@ -20,10 +20,10 @@ import (
 // DTO field then shows as present-in-expected / absent-in-actual — a failing test the moment the field is added,
 // with no per-field maintenance.
 //
-// Scope: the 15 pack-GLOBAL def kinds, which are FK-free (import.go: "no FK into the zone tree") so a synthetic
+// Scope: the pack-GLOBAL def kinds, which are FK-free (import.go: "no FK into the zone tree") so a synthetic
 // pack with no zones imports cleanly. Zone content (rooms/exits carry cross-room FKs; mob/item protos) stays
-// covered by TestStorePackRoundTrip's demo DeepEqual. Commands / PvpLua / Formulas are deliberately excluded —
-// they are NOT persisted through ImportPack/Load today (a separate gap, not a field-drop this net can assert).
+// covered by TestStorePackRoundTrip's demo DeepEqual. Commands / PvpLua / Formulas — persisted since #20 —
+// are now round-tripped here too (Commands as a def slice, PvpLua as a pack scalar, Formulas as a map).
 
 // fillNonZero recursively sets v to a DISTINCTIVE non-zero value so that a field dropped on the store round-trip
 // (which comes back as its zero value) is detectable, and a field SWAP between two same-typed fields is too
@@ -97,7 +97,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 	counter := 0
 	pk := content.Pack{Pack: "reflectprobe"}
 	// One fully-populated synthetic def per persisted global-def kind. (Zones omitted: cross-room exit FKs;
-	// covered by TestStorePackRoundTrip. Commands/PvpLua/Formulas omitted: not DB-persisted.)
+	// covered by TestStorePackRoundTrip.)
 	fillOneDef(&pk.Attributes, &counter)
 	fillOneDef(&pk.Resources, &counter)
 	fillOneDef(&pk.DamageTypes, &counter)
@@ -117,6 +117,18 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 	fillOneDef(&pk.Chargens, &counter)
 	fillOneDef(&pk.DisplayDefs, &counter)
 	fillOneDef(&pk.TrustTiers, &counter)
+	fillOneDef(&pk.Commands, &counter)
+	// DefaultCombat (pack scalar, pack_meta), PvpLua (pack scalar, pack_meta) + Formulas (map, formula_defs)
+	// are not []struct def slices, so fill them directly with distinctive non-zero values; a store-path drop
+	// then shows as sentinel-in-expected / empty-in-actual below. DefaultCombat NAMES a combat profile, so it
+	// points at the synthetic CombatProfiles entry (a valid ref) rather than a bare sentinel.
+	pk.DefaultCombat = pk.CombatProfiles[0].Ref
+	counter++
+	pk.PvpLua = sentinelString(counter)
+	counter++
+	formulaName := sentinelString(counter)
+	counter++
+	pk.Formulas = map[string]string{formulaName: sentinelString(counter)}
 
 	require.NoError(t, p.ImportPack(ctx, pk), "import synthetic reflect-fill pack")
 	lc, err := content.Load(ctx, p, []string{pk.Pack})
@@ -146,6 +158,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 		{"chargens", pk.Chargens, lc.Chargens},
 		{"display_defs", pk.DisplayDefs, lc.DisplayDefs},
 		{"trust_tiers", pk.TrustTiers, lc.TrustTiers},
+		{"commands", pk.Commands, lc.Commands},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -157,6 +170,22 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 					"import/load path (its store body struct likely omits the field)", tc.name)
 		})
 	}
+
+	// DefaultCombat + PvpLua (pack SCALARS, in pack_meta) and Formulas (a map, in formula_defs) are not def
+	// slices, so they are asserted directly — no int/float canonicalize quirk applies to plain strings. A
+	// store-path drop of any shows as the sentinel-vs-empty mismatch here (#20; DefaultCombat is Phase 6.3a).
+	t.Run("default_combat", func(t *testing.T) {
+		require.Equal(t, pk.DefaultCombat, lc.DefaultCombat,
+			"reflect round-trip: DefaultCombat was dropped on the store import/load path (pack_meta body)")
+	})
+	t.Run("pvp_lua", func(t *testing.T) {
+		require.Equal(t, pk.PvpLua, lc.PvpLua,
+			"reflect round-trip: PvpLua was dropped on the store import/load path (pack_meta body)")
+	})
+	t.Run("formulas", func(t *testing.T) {
+		require.Equal(t, pk.Formulas, lc.Formulas,
+			"reflect round-trip: a Formulas entry was dropped on the store import/load path (formula_defs)")
+	})
 }
 
 // reflectNetCovered lists the content.Pack def-slice fields TestStoreDTOReflectRoundTrip fills + round-trips.
@@ -166,14 +195,13 @@ var reflectNetCovered = map[string]bool{
 	"Abilities": true, "CombatProfiles": true, "Channels": true, "Regions": true,
 	"Tracks": true, "Bundles": true, "RarityTiers": true, "Affixes": true, "LootTables": true,
 	"SpawnSchedules": true, "Recipes": true, "WearSlots": true, "Chargens": true,
-	"DisplayDefs": true, "TrustTiers": true,
+	"DisplayDefs": true, "TrustTiers": true, "Commands": true,
 }
 
 // reflectNetExcluded lists the content.Pack def-slice fields deliberately NOT in the reflect net, each with
 // its reason — so an exclusion is a documented choice, not an oversight.
 var reflectNetExcluded = map[string]string{
-	"Zones":    "cross-room exit FKs make an all-non-zero synthetic zone tree un-importable; the zone tree is covered by TestStorePackRoundTrip's demo DeepEqual",
-	"Commands": "custom Lua verbs are NOT persisted through ImportPack/Load today (the Commands/PvpLua/Formulas store gap — see docs/REMAINING.md)",
+	"Zones": "cross-room exit FKs make an all-non-zero synthetic zone tree un-importable; the zone tree is covered by TestStorePackRoundTrip's demo DeepEqual",
 }
 
 // TestStoreReflectNetCoversEveryDefSlice is a hermetic DRIFT GUARD (no Postgres): it asserts the reflect
@@ -201,4 +229,46 @@ func TestStoreReflectNetCoversEveryDefSlice(t *testing.T) {
 		"content.Pack def slice(s) %v are neither exercised by TestStoreDTOReflectRoundTrip nor in "+
 			"reflectNetExcluded — add each to the reflect round-trip net (or exclude it with a reason) so a "+
 			"new def kind cannot silently lose store round-trip coverage", uncovered)
+}
+
+// reflectNetScalarCovered lists the content.Pack NON-slice persisted fields (scalars + maps) that
+// TestStoreDTOReflectRoundTrip round-trips directly — the sibling of reflectNetCovered for the []struct def
+// kinds. These ride pack_meta (DefaultCombat, PvpLua) or a keyed def table (Formulas → formula_defs).
+var reflectNetScalarCovered = map[string]bool{
+	"DefaultCombat": true, "PvpLua": true, "Formulas": true,
+}
+
+// reflectNetScalarExcluded lists content.Pack scalar/map fields deliberately NOT round-tripped, with reasons.
+var reflectNetScalarExcluded = map[string]string{
+	"Pack": "the pack identity/key itself, not a persisted body field — asserted implicitly by every round-trip that loads content back by this pack name",
+}
+
+// TestStoreReflectNetCoversEveryScalarField is the NON-slice sibling of TestStoreReflectNetCoversEveryDefSlice:
+// it asserts every scalar/map field on content.Pack is either round-tripped by TestStoreDTOReflectRoundTrip or
+// explicitly excluded with a reason. The slice guard structurally sees only []struct def kinds, so before #20
+// the persisted pack SCALARS (DefaultCombat, and now PvpLua/Formulas) had NO drift guard at all — their store
+// coverage rested only on a human remembering to hand-write an assertion. The store's own comment invites more
+// ("a future pack-level scalar is a content write here, not a migration"), so the next one would drop silently
+// exactly the way #20's fields did. This closes that recurrence hermetically (no Postgres).
+func TestStoreReflectNetCoversEveryScalarField(t *testing.T) {
+	pt := reflect.TypeOf(content.Pack{})
+	var uncovered []string
+	for i := 0; i < pt.NumField(); i++ {
+		f := pt.Field(i)
+		// This guard owns the NON-slice fields (String, Map); the []struct def kinds are the slice guard's.
+		if f.Type.Kind() != reflect.String && f.Type.Kind() != reflect.Map {
+			continue
+		}
+		if reflectNetScalarCovered[f.Name] {
+			continue
+		}
+		if _, ok := reflectNetScalarExcluded[f.Name]; ok {
+			continue
+		}
+		uncovered = append(uncovered, f.Name)
+	}
+	require.Emptyf(t, uncovered,
+		"content.Pack scalar/map field(s) %v are neither round-tripped by TestStoreDTOReflectRoundTrip nor in "+
+			"reflectNetScalarExcluded — add each to the reflect round-trip net (or exclude it with a reason) so a "+
+			"new persisted pack scalar cannot silently lose store round-trip coverage", uncovered)
 }

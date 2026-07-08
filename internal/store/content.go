@@ -557,11 +557,26 @@ type trustTierBody struct {
 	Flags []string `json:"flags,omitempty"`
 }
 
+// commandBody is the JSONB-tail shape for a command_defs row (#20, Phase 7.4e): the alias list + the Lua
+// handler body, everything but the (pack, verb) PK.
+type commandBody struct {
+	Aliases []string `json:"aliases,omitempty"`
+	Lua     string   `json:"lua,omitempty"`
+}
+
+// formulaBody is the JSONB-tail shape for a formula_defs row (#20, Phase 7.4f): the Lua formula body,
+// everything but the (pack, name) PK.
+type formulaBody struct {
+	Lua string `json:"lua,omitempty"`
+}
+
 // packMetaBody is the JSONB-tail shape for a pack_meta row: a pack's global SCALARS (Phase 6.3a:
-// just default_combat — the combat profile a player fights with when its prototype names none). One
-// row per pack; a future pack-level scalar is a content write here, not a migration.
+// default_combat — the combat profile a player fights with when its prototype names none; #20: pvp_lua —
+// the pack PvP-policy hook, Phase 7.4f). One row per pack; a future pack-level scalar is a content write
+// here, not a migration.
 type packMetaBody struct {
 	DefaultCombat string `json:"default_combat,omitempty"`
+	PvpLua        string `json:"pvp_lua,omitempty"`
 }
 
 // loadGlobalDefs reads the pack-global attribute/resource/damage-type rows for the enabled packs
@@ -1197,6 +1212,68 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 	}
 	ttRows.Close()
 
+	// Custom Lua verbs (#20, Phase 7.4e): (pack, verb) first-class, the alias list + Lua handler in the JSONB
+	// body. Ordered by (pack, verb) for deterministic load; the loader accumulates verbs across packs.
+	cmdRows, err := p.pool.Query(ctx,
+		`SELECT verb, pack, body FROM command_defs WHERE pack = ANY($1) ORDER BY pack, verb`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query command_defs: %w", err)
+	}
+	for cmdRows.Next() {
+		var cmd content.CommandDTO
+		var pk string
+		var body []byte
+		if err := cmdRows.Scan(&cmd.Verb, &pk, &body); err != nil {
+			cmdRows.Close()
+			return fmt.Errorf("store: scan command_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b commandBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				cmdRows.Close()
+				return fmt.Errorf("store: command_def %s body: %w", cmd.Verb, err)
+			}
+			cmd.Aliases = b.Aliases
+			cmd.Lua = b.Lua
+		}
+		pack(pk).Commands = append(pack(pk).Commands, cmd)
+	}
+	if err := cmdRows.Err(); err != nil {
+		return err
+	}
+	cmdRows.Close()
+
+	// Ruleset-formula overrides (#20, Phase 7.4f): (pack, name) first-class, the Lua formula body in the JSONB
+	// body. Ordered by (pack, name) for deterministic load; reconstructed into each pack's Formulas map.
+	fRows, err := p.pool.Query(ctx,
+		`SELECT name, pack, body FROM formula_defs WHERE pack = ANY($1) ORDER BY pack, name`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query formula_defs: %w", err)
+	}
+	for fRows.Next() {
+		var name, pk string
+		var body []byte
+		if err := fRows.Scan(&name, &pk, &body); err != nil {
+			fRows.Close()
+			return fmt.Errorf("store: scan formula_def: %w", err)
+		}
+		var b formulaBody
+		if len(body) > 0 {
+			if err := json.Unmarshal(body, &b); err != nil {
+				fRows.Close()
+				return fmt.Errorf("store: formula_def %s body: %w", name, err)
+			}
+		}
+		if pack(pk).Formulas == nil {
+			pack(pk).Formulas = map[string]string{}
+		}
+		pack(pk).Formulas[name] = b.Lua
+	}
+	if err := fRows.Err(); err != nil {
+		return err
+	}
+	fRows.Close()
+
 	// Pack-level scalars (Phase 6.3a): default_combat from pack_meta, onto its pack. A pack with no
 	// row leaves DefaultCombat empty (the loader's "players have no combat profile" default).
 	mRows, err := p.pool.Query(ctx,
@@ -1217,6 +1294,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				return fmt.Errorf("store: pack_meta %s body: %w", pk, err)
 			}
 			pack(pk).DefaultCombat = b.DefaultCombat
+			pack(pk).PvpLua = b.PvpLua
 		}
 	}
 	return mRows.Err()
