@@ -3,6 +3,7 @@ package textsan
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestCleanLine(t *testing.T) {
@@ -166,6 +167,31 @@ func TestCleanMarkupStripsBidiOverride(t *testing.T) {
 	}
 }
 
+// TestCleanNameCapIsRuneSafeAcrossGraphemes is the docs/REMAINING.md Track-0 (#21 item 4) guarantee for the
+// rune-COUNT cap: CleanName truncates on a RUNE boundary, so its output is always valid UTF-8 even when the
+// cap lands inside a multi-rune GRAPHEME cluster (a base letter + a combining mark). Cutting a grapheme is
+// acceptable for a display-name cap; producing invalid UTF-8 (a split rune) is not. (CleanName strips ZWJ as
+// Cf/non-graphic, so the emoji-cluster case does not apply on the NAME path — see the mail-subject cap test,
+// TestMailCapRunesIsRuneSafeAcrossGraphemes, for the Cf-preserving path where it does.)
+func TestCleanNameCapIsRuneSafeAcrossGraphemes(t *testing.T) {
+	grapheme := "e\u0301" // e + COMBINING ACUTE ACCENT (U+0301): two runes, one grapheme
+	s := grapheme + grapheme + grapheme + "tail"
+	for n := 0; n <= 8; n++ {
+		got := CleanName(s, n)
+		if rc := utf8.RuneCountInString(got); rc > n {
+			t.Fatalf("CleanName cap %d exceeded: %d runes in %q", n, rc, got)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("CleanName cap %d produced invalid UTF-8 (a rune was split): %q", n, got)
+		}
+	}
+	// A cap that lands between the base 'e' and its combining mark drops the mark — a cut grapheme, still
+	// valid UTF-8: the documented, acceptable behavior of a rune-count cap.
+	if got := CleanName(grapheme, 1); got != "e" {
+		t.Fatalf("CleanName(%q,1) = %q; want the combining mark cut (rune-safe grapheme split)", grapheme, got)
+	}
+}
+
 // TestCleanLineCapNeverSplitsRune confirms the byte cap backs off to a rune boundary
 // rather than slicing a multibyte rune in half (which would corrupt the tail rune).
 func TestCleanLineCapNeverSplitsRune(t *testing.T) {
@@ -192,6 +218,8 @@ func TestCleanName(t *testing.T) {
 		{"strips control runes", "Wa\x1blker\x07", "Walker"},
 		{"strips non-printable", zwsp, "Walker"},
 		{"keeps accented letters", "Élodie", "Élodie"},
+		{"drops raw invalid utf8 bytes (#21)", "Wa\xfflke\x80r", "Walker"},
+		{"drops invalid byte, keeps adjacent multibyte (#21)", "\xffÉlodie", "Élodie"},
 		{"caps length", strings.Repeat("x", 50), strings.Repeat("x", maxLen)},
 		{"empty", "", ""},
 	}
