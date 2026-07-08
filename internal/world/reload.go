@@ -350,10 +350,33 @@ func (r *reloader) reloadChannel(inv contentbus.Invalidation) {
 		// The channel was deleted/renamed: remove it so its verb stops resolving.
 		reg.reload(inv.Ref, nil, true)
 		r.log.Debug("hot reload: channel removed (definition deleted)", "ref", inv.Ref)
+		r.republishCommsToZones(inv.Ref) // a removed channel must drop live subscribers' subscriptions (#75)
 		return
 	}
 	reg.reload(inv.Ref, buildChannelDef(def.Channel), false)
 	r.log.Debug("hot reload: channel swapped", "ref", inv.Ref)
+	// #75: the registry now holds the new access/hear_access, but live sessions' hear-sets are PUSHED — a
+	// retightened channel leaves an already-subscribed player over-permissive until their next
+	// toggle/handoff/relog. Fan a republish out to every hosted zone so the gate re-filters now.
+	r.republishCommsToZones(inv.Ref)
+}
+
+// republishCommsToZones fans a republishCommsMsg out to every hosted zone after a channel_def reload, so each
+// zone re-publishes its players' comms config on its own goroutine (#75). Runs OFF every zone goroutine (the
+// content-bus subscriber). The fan-out is NON-BLOCKING (postOrDrop) so one saturated zone can't head-of-line-
+// stall the shard-wide reload — but unlike the Lua reload (notifyZones), a DROPPED comms republish leaves the
+// hear-set PERMANENTLY stale (it is pushed, not pulled) and RE-OPENS the security gap, so a drop is handed to
+// bounded-retry (retryRepublishComms), the same posture the zone-shape reconcile uses (#191). Idempotent +
+// level-triggered, so the retry (or a re-run) always converges to the current state.
+func (r *reloader) republishCommsToZones(ref string) {
+	if r == nil || r.shard == nil {
+		return
+	}
+	for _, z := range r.shard.zonesList() { // mu-guarded: safe against a runtime HostZone (16.4a)
+		if !z.postOrDrop(republishCommsMsg{ref: ref}) {
+			r.retryRepublishComms(z, ref)
+		}
+	}
 }
 
 // reconcileZone drives a `zone` content hot reload (#191): the KindZone invalidation carries the zone's
@@ -427,6 +450,47 @@ func (r *reloader) retryReconcile(z *Zone, msg reconcileZoneMsg) {
 		}
 		r.log.Warn("hot-reload zone-shape reconcile retries exhausted; a room add/remove is lost until re-run",
 			"zone", msg.zoneRef, "attempts", reconcileRetryAttempts)
+	}()
+}
+
+// retryRepublishComms re-posts a DROPPED republishCommsMsg to z with bounded linear backoff on a short-lived
+// goroutine, so the content-bus subscriber goroutine is never blocked (#75). It mirrors retryReconcile's
+// posture because the failure mode is the same class — a dropped push that re-opens a gap (here: a stale,
+// too-permissive hear-set) — but the message is level-triggered + carries no version, so a re-post always
+// republishes the CURRENT config and a retry superseded by a newer channel reload is harmlessly redundant
+// (no version guard needed, unlike reconcile).
+//
+// Retry EXHAUSTION degrades to exactly the pre-fix behavior (the hear-set is re-pushed on the player's next
+// toggle/handoff/relog) — a strict Pareto improvement, never worse than before. Two caveats the distsys
+// review recorded: (a) the operator "re-run the reload" remedy is weaker than reconcile's — re-applying an
+// IDENTICAL edit may emit no KindChannel invalidation, so it can be a no-op; a genuinely stuck hear-set clears
+// only on the player's next toggle/handoff/relog. (b) Unlike reconcile (which retries at most ONE zone per
+// invalidation), a channel reload fans to EVERY hosted zone, so a KindChannel drop-storm consumes the SHARED
+// maxReconcileRetryGoroutines budget 1:Z and can starve concurrent reconcile retries (and vice versa) — the
+// coalescing follow-up #269 bounds this. Past the cap the drop is abandoned with a loud warn. Self-terminates on
+// success, exhaustion, or reloader stop (retryDone).
+func (r *reloader) retryRepublishComms(z *Zone, ref string) {
+	if r.retryInFlight.Add(1) > maxReconcileRetryGoroutines {
+		r.retryInFlight.Add(-1)
+		r.log.Warn("hot-reload comms republish dropped (retry budget exhausted); a channel's hear-set stays stale until re-run",
+			"zone", z.id, "channel", ref)
+		return
+	}
+	go func() {
+		defer r.retryInFlight.Add(-1)
+		for attempt := 1; attempt <= reconcileRetryAttempts; attempt++ {
+			select {
+			case <-r.retryDone:
+				return // reloader stopped — abandon the retry
+			case <-time.After(reconcileRetryBackoff * time.Duration(attempt)):
+			}
+			if z.postOrDrop(republishCommsMsg{ref: ref}) {
+				r.log.Debug("comms republish retry delivered", "zone", z.id, "channel", ref, "attempt", attempt)
+				return
+			}
+		}
+		r.log.Warn("hot-reload comms republish retries exhausted; a channel's hear-set stays stale until re-run",
+			"zone", z.id, "channel", ref, "attempts", reconcileRetryAttempts)
 	}()
 }
 
