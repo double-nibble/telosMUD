@@ -40,8 +40,10 @@ type CharStore interface {
 	AccountTier(ctx context.Context, accountID string) (string, bool, error)
 	// AccountByCharacterName (#27) resolves a character name to its owning account (the promote target).
 	AccountByCharacterName(ctx context.Context, name string) (string, bool, error)
-	// SetAccountTier (#27) writes the target's new tier + an audit row; returns the previous tier.
-	SetAccountTier(ctx context.Context, actorAccountID, targetAccountID, newTier string) (string, error)
+	// SetAccountTier (#27) writes the target's new tier + an audit row; returns the previous tier. The write
+	// is a COMPARE-AND-SET against expectedOldTier (the tier this service's ceilings were evaluated against),
+	// returning store.ErrTierConflict when a concurrent change moved the base (#165).
+	SetAccountTier(ctx context.Context, actorAccountID, targetAccountID, newTier, expectedOldTier string) (string, error)
 	// AccountColorPref (#23) returns the persisted terminal color preference; set=false => never chosen.
 	AccountColorPref(ctx context.Context, accountID string) (enabled bool, set bool, err error)
 	// SetAccountColorPref (#23) persists the terminal color preference (true/false).
@@ -330,20 +332,48 @@ func (s *Service) IssueSessionAssertion(ctx context.Context, req *accountv1.Issu
 
 // SetAccountTier is the promote/demote authority (#27; content-tier-aware since #29 Slice 0b). AUTHZ IS
 // HERE, not the edge: it reads the ACTOR's tier from the store and resolves it against the content trust
-// ladder, so a compromised/forged edge request from an under-privileged account cannot elevate anyone. The
-// rank model (replacing the round-8 hardcoded actor==admin gate):
+// ladder, so a forged edge request from an under-privileged account cannot elevate anyone. (CAVEAT: the
+// acting principal is taken from req.ActorAccountId, and the gRPC listener has no transport authentication —
+// anyone who can dial it may assert any account id. Every ceiling below therefore assumes a trusted network
+// between gate and account service. Tracked in #247.) The model, replacing the round-8 hardcoded
+// actor==admin gate:
 //
 //   - the actor's current tier must grant the manage-tiers capability (content.FlagAdmin) — content decides
 //     which tiers are admin-capable (the default ladder: only "admin");
 //   - the requested tier must be a DEFINED tier in the ladder;
-//   - CEILING: the actor may not grant a tier ranked ABOVE its own standing, nor change the tier of an
-//     account that OUTRANKS it — so no one can mint a peer/superior or demote someone above them.
+//   - CEILING (rank): the actor may not grant a tier ranked ABOVE its own standing, nor change the tier of
+//     an account that OUTRANKS it — so no one can mint a peer/superior or demote someone above them;
+//   - CEILING (capability, #165): the actor may not GRANT a tier holding a capability flag
+//     (holylight/builder/admin) its own tier lacks, nor change the tier of a SAME-RANK account holding one.
+//     Rank and capability are independent axes (see content.TierDominates), so the rank ceiling alone lets
+//     both a same-rank and a lower-rank richer-flagged tier through.
 //
-// For the default ladder this is byte-for-byte round-8 (admin, the top rank, may set any of the three
-// tiers on anyone). It resolves the target character to its account, writes the new tier + an audit row,
-// and returns the previous tier. Effect on the target's NEXT login. A user-facing refusal rides ok=false +
-// reason; only unexpected I/O is a gRPC error. Authz runs BEFORE tier/target validation so the tier
-// vocabulary and character existence are never disclosed to an unauthorized actor.
+// Why the capability ceiling is asymmetric — grant-side unconditional, target-side only at EQUAL rank: the
+// grant side is the escalation path (writing a tier mints its capabilities) and must hold universally. The
+// target side only ever STRIPS capability, so it is policy, not security; applying it across ranks would make
+// accounts permanently unmanageable under a ladder whose top tier is not a capability superset (an
+// archon(50,{admin}) could never demote a builder(20,{holylight,builder}), and the gate offers no other
+// revocation verb). Scoping it to equal rank keeps the classic "a strictly higher rank may always manage a
+// strictly lower one" rule — so revocation is never lost — while still stopping a gm(30,{admin}) from
+// stripping a peer warden(30,{admin,holylight})'s see-all, which is where rank gives no separation at all.
+// A non-nested ladder still cannot CREATE the richer tier (the grant ceiling is unconditional); that is an
+// authoring smell LintTrustLadder warns on, not a lockout.
+//
+// For the default ladder this is byte-for-byte round-8: admin is the top rank AND holds every capability, so
+// both ceilings are vacuous for it and it may set any of the three tiers on anyone.
+//
+// It resolves the target character to its account, writes the new tier + an audit row, and returns the
+// previous tier. The write is a COMPARE-AND-SET against the tier the ceilings were evaluated against, so a
+// concurrent promote cannot land between the check and the write (the ceilings read outside the row lock).
+// Effect on the target's NEXT login. A user-facing refusal rides ok=false + reason; only unexpected I/O is a
+// gRPC error. Authz runs BEFORE tier/target validation so the tier vocabulary and character existence are
+// never disclosed to an unauthorized actor.
+//
+// Refusals are logged at Warn with the same field set as the success line — an attempted escalation by an
+// already-privileged actor is the signal a role-audit trail exists for. They are deliberately NOT persisted:
+// the first refusal branch is reachable by any logged-in mortal, so a refusal table would be a
+// player-controlled unbounded INSERT, and account_role_audit's schema (NOT NULL FK on target_account) cannot
+// represent a refusal that fires before target resolution. See #108 for the persisted-trail discussion.
 func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountTierRequest) (*accountv1.SetAccountTierResponse, error) {
 	if req.GetActorAccountId() == "" || req.GetTargetCharacter() == "" {
 		return nil, status.Error(codes.InvalidArgument, "actor_account_id and target_character required")
@@ -361,15 +391,42 @@ func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountT
 			"actor", req.GetActorAccountId(), "actor_tier", actorTier)
 		return &accountv1.SetAccountTierResponse{Reason: "You are not authorized to change trust tiers."}, nil
 	}
-	// The requested tier must be a defined tier in the content ladder.
-	if !ladder.Has(req.GetNewTier()) {
+	// Resolve the requested tier. An EMPTY new_tier is the demote-to-BASELINE sentinel (#112): the edge's
+	// `demote <char>` sends "" rather than hardcoding "player", which a content pack may rename or omit (making
+	// every demote fail closed with "Unknown tier"). The ladder — which the account service owns — resolves the
+	// baseline (lowest-rank tier). A non-empty tier passes through unchanged. All checks below use this local.
+	newTier := req.GetNewTier()
+	if newTier == "" {
+		newTier = ladder.Baseline()
+	}
+	// refuse logs a refused tier change at Warn with the success line's field set, then renders the reason.
+	// Every ceiling goes through it, so a probe of ANY branch leaves the same shape of trail (M-1/M-2).
+	refuse := func(why, reason string, kv ...any) (*accountv1.SetAccountTierResponse, error) {
+		s.log.Warn("SetAccountTier refused: "+why, append([]any{
+			"actor", req.GetActorAccountId(), "actor_tier", actorTier,
+			"target_character", req.GetTargetCharacter(), "new_tier", newTier,
+		}, kv...)...)
+		return &accountv1.SetAccountTierResponse{Reason: reason}, nil
+	}
+	// The requested tier must be a defined tier in the content ladder. (Baseline() always is, so the demote
+	// sentinel never trips this — unless the ladder is somehow empty, which NewTrustLadder prevents.)
+	if !ladder.Has(newTier) {
 		names := ladder.Names()
 		sort.Strings(names)
 		return &accountv1.SetAccountTierResponse{Reason: "Unknown tier (known: " + strings.Join(names, ", ") + ")."}, nil
 	}
-	// Ceiling: the actor may not grant a tier ranked above its own standing.
-	if ladder.Rank(req.GetNewTier()) > ladder.Rank(actorTier) {
-		return &accountv1.SetAccountTierResponse{Reason: "You cannot grant a tier above your own standing."}, nil
+	// Ceiling (rank): the actor may not grant a tier ranked above its own standing.
+	if ladder.Rank(newTier) > ladder.Rank(actorTier) {
+		return refuse("requested tier outranks the actor", "You cannot grant a tier above your own standing.")
+	}
+	// Ceiling (capability, #165): the actor may not grant a tier holding a capability its OWN tier lacks.
+	// Unconditional — this is the escalation path (writing a tier mints its capabilities on the next login).
+	// Naming the missing capability is not a disclosure: the actor already passed the FlagAdmin gate above,
+	// and the Unknown-tier branch already hands an authorized actor the whole tier vocabulary.
+	if !ladder.TierDominates(actorTier, newTier) {
+		return refuse("requested tier grants a capability the actor lacks",
+			fmt.Sprintf("%s grants %s, which your tier (%s) does not hold.",
+				newTier, joinCaps(ladder.MissingCapabilities(actorTier, newTier)), actorTier))
 	}
 	// Resolve the target character to its owning account.
 	target, found, err := s.store.AccountByCharacterName(ctx, req.GetTargetCharacter())
@@ -380,26 +437,73 @@ func (s *Service) SetAccountTier(ctx context.Context, req *accountv1.SetAccountT
 	if !found {
 		return &accountv1.SetAccountTierResponse{Reason: "No such character."}, nil
 	}
-	// Ceiling: the actor may not change the tier of an account that outranks it. A target with no tier row
-	// (not found) reads as the rank-0 baseline via Rank(""), which no authorized actor outranks — so the
-	// found flag is deliberately ignored (defense-in-depth: the guard degrades to "allow the baseline",
-	// never to "skip the check").
+	// The target's CURRENT tier: both the remaining ceilings' input and the compare-and-set base for the write.
+	// accounts.tier is NOT NULL DEFAULT 'player' (migration 00019) and `target` came from a resolved character
+	// row, so found is always true here; the flag is ignored deliberately, and Rank("")/TierDominates degrade
+	// to the rank-0 baseline rather than skipping a check.
 	targetTier, _, err := s.store.AccountTier(ctx, target)
 	if err != nil {
 		s.log.Error("SetAccountTier: target tier", "target", target, "err", err)
 		return nil, status.Error(codes.Internal, "tier lookup failed")
 	}
-	if ladder.Rank(targetTier) > ladder.Rank(actorTier) {
-		return &accountv1.SetAccountTierResponse{Reason: "You cannot change the tier of someone above your own standing."}, nil
+	// FAIL CLOSED on a stored tier the loaded ladder does not define (#165 F6). accounts.tier is free-form TEXT
+	// since migration 00021 dropped the CHECK, so a renamed/removed rung — or telos-account loading a different
+	// pack set than the world (#246) — leaves rows carrying a tier this service cannot reason about. Rank() and
+	// TierDominates() would both read it as the baseline, silently voiding BOTH ceilings for that account.
+	// An unrecognized stored tier means the operator's ladder is wrong; refuse rather than guess.
+	if targetTier != "" && !ladder.Has(targetTier) {
+		s.log.Error("SetAccountTier refused: target's stored tier is not in the loaded ladder",
+			"actor", req.GetActorAccountId(), "target_account", target, "target_tier", targetTier, "known", ladder.Names())
+		return &accountv1.SetAccountTierResponse{Reason: "That account's current tier is not defined in the loaded content ladder; the server's ladder needs attention."}, nil
 	}
-	old, err := s.store.SetAccountTier(ctx, req.GetActorAccountId(), target, req.GetNewTier())
+	// Ceiling (rank): the actor may not change the tier of an account that outranks it.
+	if ladder.Rank(targetTier) > ladder.Rank(actorTier) {
+		return refuse("target outranks the actor", "You cannot change the tier of someone above your own standing.",
+			"target_account", target, "target_tier", targetTier)
+	}
+	// Ceiling (capability, #165) — EQUAL RANK ONLY. At equal rank the rank ceiling gives no separation, so
+	// without this a gm(30,{admin}) could strip a peer warden(30,{admin,holylight})'s see-all. Above equal rank
+	// the actor already dominates by rank and stripping capability is revocation, not escalation; refusing there
+	// would strand accounts no principal can demote (see the asymmetry note in the doc comment).
+	if ladder.Rank(targetTier) == ladder.Rank(actorTier) && !ladder.TierDominates(actorTier, targetTier) {
+		return refuse("same-rank target holds a capability the actor lacks",
+			fmt.Sprintf("%s holds %s, which your tier (%s) does not; you cannot change their tier.",
+				req.GetTargetCharacter(), joinCaps(ladder.MissingCapabilities(actorTier, targetTier)), actorTier),
+			"target_account", target, "target_tier", targetTier)
+	}
+	// COMPARE-AND-SET on targetTier: the two target-side ceilings above read the tier OUTSIDE the row lock, so
+	// a concurrent promote could otherwise land between the check and the write — e.g. a gm passes the ceiling
+	// against Bob=player, an admin promotes Bob to warden, and the gm's write then strips a warden's holylight.
+	// The store re-reads under FOR UPDATE and refuses when the base moved (#165 F3).
+	old, err := s.store.SetAccountTier(ctx, req.GetActorAccountId(), target, newTier, targetTier)
+	if errors.Is(err, store.ErrTierConflict) {
+		// old carries the tier the store OBSERVED under the row lock (what a concurrent writer set) — the more
+		// useful forensic value than the stale base we expected, so log both.
+		return refuse("target tier changed under the check (CAS conflict)",
+			"That account's tier changed while you were acting on it; try again.",
+			"target_account", target, "expected_tier", targetTier, "observed_tier", old)
+	}
 	if err != nil {
 		s.log.Error("SetAccountTier: write", "target", target, "err", err)
 		return nil, status.Error(codes.Internal, "set tier failed")
 	}
 	s.log.Info("account tier changed", "actor", req.GetActorAccountId(), "target_character", req.GetTargetCharacter(),
-		"target_account", target, "old_tier", old, "new_tier", req.GetNewTier())
-	return &accountv1.SetAccountTierResponse{Ok: true, OldTier: old}, nil
+		"target_account", target, "old_tier", old, "new_tier", newTier)
+	return &accountv1.SetAccountTierResponse{Ok: true, OldTier: old, NewTier: newTier}, nil
+}
+
+// joinCaps renders a capability-name list for a refusal message ("holylight" / "holylight and builder" /
+// "holylight, builder and admin"). Never empty at the call sites: both are reached only when TierDominates
+// returned false, which means at least one capability is missing.
+func joinCaps(caps []string) string {
+	switch len(caps) {
+	case 0:
+		return "capabilities you do not hold" // unreachable; keeps the sentence grammatical
+	case 1:
+		return caps[0]
+	default:
+		return strings.Join(caps[:len(caps)-1], ", ") + " and " + caps[len(caps)-1]
+	}
 }
 
 // GetAccountPrefs returns an account's persisted EDGE preferences (#23). Each pref is an optional proto field

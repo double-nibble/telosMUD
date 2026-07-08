@@ -100,15 +100,42 @@ without a browser. It is **insecure** and gated behind the env flag — never en
 
 ## 8. Builder trust tiers & bootstrap admin
 
-Accounts carry a **tier** — `player < builder < admin` (`accounts.tier`, #27) — the account-level role
-that gates builder/admin powers. `telos-account` is the authority; a later slice signs the tier into
-the session assertion so the world trusts it offline. A promote/demote flow (admin-gated) changes a
-tier; the change takes effect on the target's next login.
+Accounts carry a **tier** — the account-level role that gates builder/admin powers (`accounts.tier`, #27).
+The default ladder is `player < builder < admin`, but the ladder is **content-defined** (#29): a pack may
+declare its own tiers (`trust_tiers`), each with an ordinal **rank** and a set of granted **capability
+flags** (`holylight`, `builder`, `admin`). `telos-account` is the authority and signs the tier into the
+session assertion so the world trusts it offline. A promote/demote flow (admin-gated) changes a tier; the
+change takes effect on the target's next login (the assertion re-signs the tier) and survives a cross-shard
+walk (the tier rides the *signed* handoff snapshot, #106).
 
 **Promote / demote.** An admin changes another account's tier with the edge verbs `promote <character>
-<player|builder|admin>` and `demote <character>` (→ player). Authorization is enforced at the account
-service (the actor's tier is read from the store; a non-admin is refused), never at the edge. The change
-takes effect on the target's **next login** (the assertion re-signs the tier). Every change is audited.
+<tier>` and `demote <character>` (→ the ladder's **baseline**, i.e. its lowest-rank tier — *not* a hardcoded
+`player`, since a pack may rename it, #112). Authorization is enforced at the account service (the actor's
+tier is read from the store; a non-admin is refused), never at the edge. Every change is audited.
+
+**Authorization ceilings (#165).** An actor may act only within its own standing, on **two independent
+axes**:
+
+- **Rank** — may not grant a tier ranked above its own, nor change an account ranked above it.
+- **Capability** — may not **grant** a tier holding a capability its own tier lacks (unconditional — writing
+  a tier mints its capabilities), nor **change a same-rank** account holding one. Rank and capability are
+  independent, so the rank ceiling alone is insufficient: a same-rank tier with a richer flag set, or a
+  lower-rank tier with orthogonal flags, would otherwise let an actor mint a capability it never held.
+
+The capability ceiling is asymmetric by design: the **grant** side is universal, but the **target** side
+fires only at equal rank. A strictly-higher actor may always manage a lower one — otherwise a ladder whose
+top tier is not a capability superset of everything beneath it would strand accounts no one could demote.
+
+> **Authoring constraint (a `LintTrustLadder` guard, #111).** For a ladder to be fully manageable, each
+> admin-capable tier should be a **capability superset** of every tier its rank can reach — else it can
+> *demote* a richer lower tier but never *create* one (the lint warns). A **baseline** tier granting any
+> capability elevates the entire playerbase and is **rejected** (logged at boot, refused at a fleet reload),
+> as are duplicate ranks and nameless rungs.
+
+> **Ladder consistency.** `telos-account` and the world must load the **same** pack set, or a pack-authored
+> ladder can diverge between the authority (which checks the ceilings) and the world (which applies the
+> flags) — see #246. The account gRPC listener also assumes a trusted network: the acting principal is
+> caller-asserted (#247).
 
 > **Last-admin lockout recovery.** There is no self/last-admin demote guard, so an admin *can* demote the
 > last admin. Config-pin (`TELOS_BOOTSTRAP_ADMIN`) does **not** recover this — it applies only at account

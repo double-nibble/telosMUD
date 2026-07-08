@@ -36,17 +36,21 @@ func handleTierCommand(ctx context.Context, tc *telnet.Conn, ac AccountClient, a
 		target, tier = fields[1], strings.ToLower(fields[2])
 	case "demote":
 		if len(fields) != 2 {
-			_ = tc.Write("Usage: demote <character>   (sets the account to player)\r\n")
+			_ = tc.Write("Usage: demote <character>   (sets the account to the baseline tier)\r\n")
 			return true
 		}
-		target, tier = fields[1], "player"
+		// An EMPTY tier is the demote-to-BASELINE sentinel (#112): the account service resolves it to the
+		// ladder's lowest-rank tier. The edge must NOT hardcode "player" — a content pack may rename or omit
+		// that tier, which would make every demote fail closed with "Unknown tier". The gate does not know the
+		// ladder vocabulary; the account service (which owns it) does the resolution.
+		target, tier = fields[1], ""
 	default:
 		return false
 	}
 
 	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	ok, reason, oldTier, err := ac.SetAccountTier(rctx, actorAccount, target, tier)
+	ok, reason, oldTier, appliedTier, err := ac.SetAccountTier(rctx, actorAccount, target, tier)
 	if err != nil {
 		log.Warn("SetAccountTier failed", "target", target, "err", err)
 		_ = tc.Write("The tier service is unavailable right now.\r\n")
@@ -56,6 +60,8 @@ func handleTierCommand(ctx context.Context, tc *telnet.Conn, ac AccountClient, a
 		_ = tc.Write(reason + "\r\n")
 		return true
 	}
-	_ = tc.Write(target + ": " + oldTier + " -> " + tier + " (takes effect on their next login).\r\n")
+	// appliedTier is what the service actually set — for `demote` that is the RESOLVED baseline (the request
+	// sent the empty sentinel), so the confirmation reads the true tier rather than a hardcoded name (#112).
+	_ = tc.Write(target + ": " + oldTier + " -> " + appliedTier + " (takes effect on their next login).\r\n")
 	return true
 }

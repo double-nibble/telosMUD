@@ -79,12 +79,16 @@ message SetAccountPrefsResponse {}
 message SetAccountTierRequest {
   string actor_account_id = 1; // the acting account (the logged-in admin); authz is checked against its stored tier
   string target_character = 2; // the character NAME to (de)promote — resolved to its owning account
-  string new_tier = 3; // "player" | "builder" | "admin"
+  // The target tier name (content-defined; the default ladder is player/builder/admin). EMPTY is the
+  // demote-to-BASELINE sentinel (#112): the service resolves it to the ladder's lowest-rank tier, so the edge
+  // need not know (or hardcode) the baseline's name.
+  string new_tier = 3;
 }
 message SetAccountTierResponse {
   bool ok = 1;
   string reason = 2; // user-facing message on refusal (not admin, unknown target, bad tier)
   string old_tier = 3; // the target's tier before the change (for the confirmation line)
+  string new_tier = 4; // the tier actually applied — the RESOLVED baseline when the request sent the empty sentinel (#112)
 }
 
 // --- Phase 15.4 prompt-driven chargen messages ---

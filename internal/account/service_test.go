@@ -26,6 +26,10 @@ type fakeStore struct {
 	colorPref   map[string]bool   // accountID -> color preference (#23); absent => never set
 	colorGetErr error             // when set, AccountColorPref returns this error (#23)
 	colorSetErr error             // when set, SetAccountColorPref returns this error (#23)
+	// beforeSetTier, when set, runs INSIDE SetAccountTier before the compare-and-set — the seam for driving
+	// the check→write race the CAS exists to close (#165): mutate f.tiers here to simulate a concurrent
+	// promote landing after the service read the target's tier but before it wrote.
+	beforeSetTier func()
 }
 
 func newFakeStore() *fakeStore {
@@ -67,8 +71,17 @@ func (f *fakeStore) AccountByCharacterName(_ context.Context, name string) (stri
 	return a, ok, nil
 }
 
-func (f *fakeStore) SetAccountTier(_ context.Context, _, targetAccountID, newTier string) (string, error) {
+// SetAccountTier mirrors the real store's COMPARE-AND-SET (#165): the write applies only while the target's
+// tier still equals expectedOldTier. beforeSetTier is the hook that lets a test land a concurrent change
+// inside the service's check→write window.
+func (f *fakeStore) SetAccountTier(_ context.Context, _, targetAccountID, newTier, expectedOldTier string) (string, error) {
+	if f.beforeSetTier != nil {
+		f.beforeSetTier()
+	}
 	old := f.tiers[targetAccountID]
+	if old != expectedOldTier {
+		return old, store.ErrTierConflict
+	}
 	f.tiers[targetAccountID] = newTier
 	return old, nil
 }

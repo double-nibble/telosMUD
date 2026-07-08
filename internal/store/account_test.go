@@ -167,8 +167,8 @@ func TestSetAccountTierAndResolve(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, acct, got)
 
-	// Promote player -> builder: returns the previous tier, updates the row.
-	old, err := p.SetAccountTier(ctx, acct, acct, TierBuilder)
+	// Promote player -> builder (CAS base = the current player tier): returns the previous tier, updates the row.
+	old, err := p.SetAccountTier(ctx, acct, acct, TierBuilder, TierPlayer)
 	require.NoError(t, err)
 	assert.Equal(t, TierPlayer, old)
 	tier, _, err := p.AccountTier(ctx, acct)
@@ -206,16 +206,17 @@ func TestSetAccountTierAuditTrail(t *testing.T) {
 		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = ANY($1)`, ids)
 	})
 
-	// Promote player -> builder, then demote builder -> player: each returns the tier it REPLACED.
-	old, err := p.SetAccountTier(ctx, actor, target, TierBuilder)
+	// Promote player -> builder, then demote builder -> player: each returns the tier it REPLACED. The CAS base
+	// is the tier each call expects to find (the prior line's outcome).
+	old, err := p.SetAccountTier(ctx, actor, target, TierBuilder, TierPlayer)
 	require.NoError(t, err)
 	assert.Equal(t, TierPlayer, old, "promote should report the player tier it replaced")
-	old, err = p.SetAccountTier(ctx, actor, target, TierPlayer)
+	old, err = p.SetAccountTier(ctx, actor, target, TierPlayer, TierBuilder)
 	require.NoError(t, err)
 	assert.Equal(t, TierBuilder, old, "demote should report the builder tier it replaced")
-	// SetAccountTier is UNCONDITIONAL — a same-tier set still writes an audit row (the contract is "audit
-	// every WRITE", not only real transitions), and reports the unchanged tier as old.
-	old, err = p.SetAccountTier(ctx, actor, target, TierPlayer)
+	// A same-tier set whose CAS base matches still writes an audit row (the contract is "audit every WRITE",
+	// not only real transitions), and reports the unchanged tier as old.
+	old, err = p.SetAccountTier(ctx, actor, target, TierPlayer, TierPlayer)
 	require.NoError(t, err)
 	assert.Equal(t, TierPlayer, old, "a no-op set reports the unchanged tier")
 
@@ -237,6 +238,45 @@ func TestSetAccountTierAuditTrail(t *testing.T) {
 	assert.Contains(t, got, auditRow{actor, target, TierPlayer, TierBuilder}, "the promote audit row (old=player,new=builder)")
 	assert.Contains(t, got, auditRow{actor, target, TierBuilder, TierPlayer}, "the demote audit row (old=builder,new=player)")
 	assert.Contains(t, got, auditRow{actor, target, TierPlayer, TierPlayer}, "the no-op audit row (audit every write)")
+}
+
+// TestSetAccountTierCASConflict (#165) pins the compare-and-set: a write whose expectedOldTier does NOT match
+// the row's current tier is refused with ErrTierConflict, and it neither changes the tier NOR appends an audit
+// row. This is what makes the account service's ceilings (evaluated against a tier read outside the row lock)
+// binding rather than advisory — a concurrent promote that moved the base cannot be overwritten blind.
+func TestSetAccountTierCASConflict(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	actor := uuid.NewString()
+	target := uuid.NewString()
+	for _, id := range []string{actor, target} {
+		_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status, tier) VALUES ($1, 'active', 'player')`, id)
+		require.NoError(t, err)
+	}
+	t.Cleanup(func() {
+		ids := []string{actor, target}
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_role_audit WHERE target_account = ANY($1) OR actor_account = ANY($1)`, ids)
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = ANY($1)`, ids)
+	})
+
+	// The target is 'player'. A write that expects 'builder' (a stale base) must conflict and no-op.
+	observed, err := p.SetAccountTier(ctx, actor, target, TierBuilder, TierBuilder)
+	require.ErrorIs(t, err, ErrTierConflict)
+	assert.Equal(t, TierPlayer, observed, "the conflict returns the tier actually observed under the lock")
+
+	tier, _, err := p.AccountTier(ctx, target)
+	require.NoError(t, err)
+	assert.Equal(t, TierPlayer, tier, "a CAS conflict must not change the tier")
+
+	var n int
+	require.NoError(t, p.pool.QueryRow(ctx, `SELECT count(*) FROM account_role_audit WHERE target_account = $1`, target).Scan(&n))
+	assert.Zero(t, n, "a CAS conflict must not append an audit row")
+
+	// With the correct base the same write succeeds — proving the conflict was the base, not the request.
+	old, err := p.SetAccountTier(ctx, actor, target, TierBuilder, TierPlayer)
+	require.NoError(t, err)
+	assert.Equal(t, TierPlayer, old)
 }
 
 // TestPendingChargenRoundTrip (Phase 14.8) proves the first-spawn chargen marker survives create -> load, and
@@ -317,4 +357,69 @@ func TestAccountColorPrefRoundTrip(t *testing.T) {
 	_, set, err = p.AccountColorPref(ctx, uuid.NewString())
 	require.NoError(t, err)
 	assert.False(t, set, "an unknown account reports no stored preference")
+}
+
+// TestSetAccountTierCASConcurrent is the test that actually PROTECTS the FOR UPDATE serialization (#165): two
+// goroutines race to change the SAME target from the SAME base tier. Exactly one must win; the other must get
+// ErrTierConflict observing the winner's tier, and the audit log must hold exactly one row. A sequential
+// base-mismatch test (TestSetAccountTierCASConflict) passes even if FOR UPDATE is deleted — this one does not,
+// because without the lock both reads would see 'player' and both writes would land.
+func TestSetAccountTierCASConcurrent(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	actor := uuid.NewString()
+	target := uuid.NewString()
+	for _, id := range []string{actor, target} {
+		_, err := p.pool.Exec(ctx, `INSERT INTO accounts (id, status, tier) VALUES ($1, 'active', 'player')`, id)
+		require.NoError(t, err)
+	}
+	t.Cleanup(func() {
+		ids := []string{actor, target}
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM account_role_audit WHERE target_account = ANY($1) OR actor_account = ANY($1)`, ids)
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = ANY($1)`, ids)
+	})
+
+	// Both goroutines expect base 'player' but write DIFFERENT tiers, so the winner is identifiable.
+	type res struct {
+		old string
+		err error
+	}
+	start := make(chan struct{})
+	results := make(chan res, 2)
+	for _, newTier := range []string{TierBuilder, TierAdmin} {
+		newTier := newTier
+		go func() {
+			<-start // barrier: maximize the odds both reach the SELECT together
+			old, err := p.SetAccountTier(ctx, actor, target, newTier, TierPlayer)
+			results <- res{old, err}
+		}()
+	}
+	close(start)
+	r1, r2 := <-results, <-results
+
+	// Exactly one NoError and one ErrTierConflict.
+	winners, conflicts := 0, 0
+	for _, r := range []res{r1, r2} {
+		switch {
+		case r.err == nil:
+			winners++
+		case errors.Is(r.err, ErrTierConflict):
+			conflicts++
+			assert.Equal(t, TierPlayer, r.old, "the conflict must observe SOME committed tier under the lock")
+		default:
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+	}
+	assert.Equal(t, 1, winners, "exactly one writer may win the CAS race")
+	assert.Equal(t, 1, conflicts, "the other writer must lose with ErrTierConflict (FOR UPDATE serialization)")
+
+	// The row holds the winner's tier, and the audit log has exactly ONE row (the loser wrote nothing).
+	tier, _, err := p.AccountTier(ctx, target)
+	require.NoError(t, err)
+	assert.Contains(t, []string{TierBuilder, TierAdmin}, tier)
+
+	var n int
+	require.NoError(t, p.pool.QueryRow(ctx, `SELECT count(*) FROM account_role_audit WHERE target_account = $1`, target).Scan(&n))
+	assert.Equal(t, 1, n, "only the winning write may append an audit row")
 }

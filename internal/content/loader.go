@@ -148,6 +148,18 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			"it can break GMCP keys / comms subjects / the tokenizer — rename it",
 			"pack", v.Pack, "field", v.Field, "value", v.Value, "allowed", v.Charset)
 	}
+	// Content-lint (#111): trust-ladder footguns — a baseline tier granting a capability (elevates the whole
+	// playerbase), duplicate/nameless rungs, un-grantable flags. Non-fatal at boot (the reload gate hard-rejects
+	// the Reject-severity ones), but logged at Error so a REJECT can never scroll past as routine noise.
+	for _, v := range LintTrustLadder(packs) {
+		msg := "content: trust-ladder lint"
+		attrs := []any{"pack", v.Pack, "tier", v.Tier, "severity", v.Severity.String(), "detail", v.Detail}
+		if v.Severity == TrustLadderReject {
+			slog.Error(msg+" REJECT — this ladder will be refused by a fleet reload; fix it before it elevates the wrong accounts", attrs...)
+			continue
+		}
+		slog.Warn(msg, attrs...)
+	}
 	// Materialize the deduped zone set: a later pack shipping the same zone ref overrides the
 	// earlier one IN PLACE (last write wins; content-lint catches accidental collisions).
 	// Track positions by index, NOT by pointer — appending to lc.Zones reallocates the backing
