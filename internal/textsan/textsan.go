@@ -51,7 +51,9 @@ func CleanLine(s string) string {
 
 // CleanName makes an externally-sourced display name (e.g. a cross-shard handoff
 // snapshot's Name) safe to render and to use as a targeting keyword: it drops every
-// control and non-graphic rune and caps the result at maxRunes. It is the world-side
+// control and non-graphic rune AND every raw invalid UTF-8 byte (#21 — so the name is
+// always valid UTF-8 for its render/targeting/NATS-subject sinks) and caps the result
+// at maxRunes on a rune boundary (a multi-rune grapheme may be cut, a rune never is). It is the world-side
 // mirror of the gate's validateName, but it *sanitizes* rather than *rejects* — at a
 // handoff there is no user to re-prompt, so dropping the offending runes is the
 // behavior-preserving choice. Grammar-level rules the gate also enforces (no leading
@@ -206,21 +208,31 @@ func stripOutputControl(s string) string {
 	return b.String()
 }
 
-// stripNonGraphic drops every control OR non-printable rune from s — the same reject
-// set the gate's validateName uses (unicode.IsControl || !unicode.IsPrint), applied
-// here as a filter. UTF-8 aware; the clean common case is returned unallocated.
+// stripNonGraphic drops every control OR non-printable rune from s — the same reject set the gate's
+// validateName uses (unicode.IsControl || !unicode.IsPrint) — AND every raw invalid UTF-8 byte. It is
+// BYTE-aware, not merely rune-aware (the #156 split, applied to the name path): a lone invalid byte decodes
+// to U+FFFD, which IS printable, so a rune-level filter (`for _, r := range s`) would judge the string clean
+// and PRESERVE the raw byte verbatim (#21 found this via the fuzz). A display name feeds output sinks that
+// must be valid UTF-8 — the telnet/GMCP render and the tell NATS-subject token — so the fast path now
+// requires utf8.ValidString and the rewrite drops raw invalid bytes outright. The clean common case (valid
+// UTF-8, all-graphic) is returned unallocated.
 func stripNonGraphic(s string) string {
 	bad := func(r rune) bool { return unicode.IsControl(r) || !unicode.IsPrint(r) }
-	if !strings.ContainsFunc(s, bad) {
+	if utf8.ValidString(s) && !strings.ContainsFunc(s, bad) {
 		return s
 	}
 	var b strings.Builder
 	b.Grow(len(s))
-	for _, r := range s {
-		if bad(r) {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++ // a raw invalid byte — drop it; a display name must be valid UTF-8
 			continue
 		}
-		b.WriteRune(r)
+		if !bad(r) {
+			b.WriteString(s[i : i+size])
+		}
+		i += size
 	}
 	return b.String()
 }

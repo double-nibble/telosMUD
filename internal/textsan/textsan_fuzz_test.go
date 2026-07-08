@@ -94,6 +94,11 @@ func FuzzTextsan(f *testing.F) {
 				t.Fatalf("CleanName left a non-graphic rune %U in %q", r, name)
 			}
 		}
+		// #21: the rune-count cap truncates on a rune boundary, so a capped name is ALWAYS valid UTF-8 (a
+		// grapheme cluster may be cut, but never a rune) — the render-path guarantee for a display name.
+		if !utf8.ValidString(name) {
+			t.Fatalf("CleanName produced invalid UTF-8 (a rune was split by the cap) in %q", name)
+		}
 		// BIDI-OVERRIDE (#22): no OUTPUT-bound sanitizer may leave a Trojan-Source override control. CleanMarkup
 		// and NeutralizeBidi drop the subset explicitly; CleanName drops it via !IsPrint (Cf is non-graphic).
 		neut := NeutralizeBidi(s)
