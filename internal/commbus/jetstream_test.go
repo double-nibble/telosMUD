@@ -129,6 +129,72 @@ func TestJetStreamBoundedRedelivery(t *testing.T) {
 	assert.Equal(t, int64(3), poisonAttempts.Load(), "poison redelivered exactly maxDeliver times then parked")
 }
 
+// TestDurableRedeliveryProdConfig pins the PRODUCTION durable-tell redelivery config against regression
+// (#62): the real NATS consumer (jetstream_nats.go Consume) is built with MaxDeliver=DefaultMaxDeliver and
+// AckWait=jsAckWait, so lowering MaxDeliver PARKS (loses) a tell after fewer attempts. NOTE on AckWait: it is
+// the broker's wait for a RESPONSE before redelivering a message whose handler neither Ack'd nor Nak'd within
+// the window (a hung/crashed consumer, a lost ack) — it is NOT the interval between explicit NAK
+// redeliveries. An explicit m.Nak() (jetstream_nats.go) redelivers IMMEDIATELY, because no ConsumerConfig
+// BackOff is set. That immediate redelivery is a live never-lost concern (a transient NAK burns MaxDeliver in
+// milliseconds and parks) tracked in #266; this test only guards the two config values from silent drift.
+// These tests mutate the DefaultMaxDeliver/jsAckWait package globals, so they must stay NON-parallel (no
+// t.Parallel) or this assertion could observe another test's shrunk values.
+func TestDurableRedeliveryProdConfig(t *testing.T) {
+	assert.Equal(t, 5, DefaultMaxDeliver, "prod durable-tell MaxDeliver must be 5 (bounded redelivery before park)")
+	assert.Equal(t, 30*time.Second, jsAckWait, "prod durable-tell AckWait must be 30s (no-response redelivery timeout)")
+}
+
+// TestMemJetStreamRedeliveryIsSynchronousInOrder pins the MemJetStream ↔ real-NATS DIVERGENCE the durable
+// tests rest on (#62). MemJetStream.deliverBounded retries a NAK SYNCHRONOUSLY and IN STREAM ORDER on the
+// single consumer goroutine: all attempts for one message run back-to-back, so a poison message is fully
+// redelivered-then-parked BEFORE the next message is ever delivered. Real NATS also redelivers a NAK
+// immediately (no backoff), but its consumer has MaxAckPending in flight, so a later message is delivered
+// CONCURRENTLY — a good message lands promptly instead of waiting behind the poison's retries. The test
+// asserts the deterministic Mem order — [poison ×maxDeliver, then good] — which is exactly the in-order
+// blocking that does NOT hold on a real broker; any interleaving assertion must use the gated real-NATS test,
+// never this stand-in.
+func TestMemJetStreamRedeliveryIsSynchronousInOrder(t *testing.T) {
+	js := NewMemJetStream()
+	t.Cleanup(func() { _ = js.Close() })
+	subj := DtellSubject("alice")
+	ctx := context.Background()
+
+	old := DefaultMaxDeliver
+	DefaultMaxDeliver = 3
+	t.Cleanup(func() { DefaultMaxDeliver = old })
+
+	var mu sync.Mutex
+	var order []string
+	done := make(chan struct{})
+	cons, err := js.Consume(subj, "alice", func(m Message, _ bool) bool {
+		mu.Lock()
+		order = append(order, m.Body)
+		mu.Unlock()
+		if m.Body == "poison" {
+			return false // always NAK — parks after DefaultMaxDeliver synchronous attempts
+		}
+		close(done)
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	require.NoError(t, js.PublishDurable(ctx, subj, Message{AuthorID: "bob", Seq: 1, IdempotencyKey: "bob:1", Body: "poison"}))
+	require.NoError(t, js.PublishDurable(ctx, subj, Message{AuthorID: "bob", Seq: 2, IdempotencyKey: "bob:2", Body: "good"}))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the good message was never delivered")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// The Mem divergence: the poison's 3 synchronous attempts ALL precede the good delivery.
+	assert.Equal(t, []string{"poison", "poison", "poison", "good"}, order,
+		"MemJetStream redelivers synchronously in-order (poison parks before good); real NATS would interleave")
+}
+
 // TestJetStreamConsumerRestartIdempotent proves the JetStream-level guarantee that a consumer restart
 // resumes from its cursor: messages drained-and-acked before the restart are NOT redelivered to a new
 // consumer with the SAME id. (The world adds a second belt — the character-state cursor — for the case

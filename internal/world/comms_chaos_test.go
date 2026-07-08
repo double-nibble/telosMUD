@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
 )
@@ -26,6 +27,12 @@ type flakyBus struct {
 	// This models a delivery-time broker blip scoped to tells, so a redelivery test can fail the first
 	// emit attempt and let the bounded-redelivery loop succeed on retry without racing a manual flag.
 	failTellN atomic.Int64
+	// failSubject, when set, fails publishes to EXACTLY that subject (and counts them). Models a blip
+	// scoped to one target's subject — used to fail an AFK auto-reply (published to the SENDER's tell
+	// subject) while the primary tell to the TARGET's subject still succeeds, proving the auto-reply is
+	// best-effort and its failure never loses the tell (#62).
+	failSubject     atomic.Pointer[string]
+	failSubjectHits atomic.Int64
 }
 
 func (b *flakyBus) Role() commbus.Role { return b.inner.Role() }
@@ -33,6 +40,10 @@ func (b *flakyBus) Role() commbus.Role { return b.inner.Role() }
 func (b *flakyBus) Publish(ctx context.Context, subj string, msg commbus.Message) error {
 	if b.fail.Load() {
 		return errors.New("injected: comms bus publish failure")
+	}
+	if fs := b.failSubject.Load(); fs != nil && subj == *fs {
+		b.failSubjectHits.Add(1)
+		return errors.New("injected: comms bus publish failure (targeted subject)")
 	}
 	if strings.HasPrefix(subj, commbus.TellPrefix) && b.failTellN.Load() > 0 {
 		b.failTellN.Add(-1)
@@ -111,9 +122,11 @@ func TestZoneSurvivesCommsBusPublishFailure(t *testing.T) {
 // untouched and a later redelivery is NOT suppressed-as-already-delivered (which would silently lose the
 // tell). The test re-presents the same message DIRECTLY (a tellDeliverMsg post) to model what a
 // redelivery feeds back in; it deliberately bypasses the Consume/deliverBounded redelivery MACHINERY
-// (that bounded-retry loop is a separate concern — see docs/FOLLOW-UPS.md for the Consume-driven
-// end-to-end recover-within-maxDeliver test and the MemJetStream park-at-maxDeliver divergence from
-// NATS). What is pinned here is the cursor-after-emit ordering, the actual safety invariant.
+// (that bounded-retry loop is a separate concern — the Consume-driven end-to-end recover-within-maxDeliver
+// path is TestDurableTellRedeliversWithinMaxDeliver, and the MemJetStream park-at-maxDeliver divergence from
+// real NATS is pinned in commbus.TestMemJetStreamRedeliveryIsSynchronousInOrder +
+// TestJetStreamRealBoundedRedelivery, #62). What is pinned here is the cursor-after-emit ordering, the
+// actual safety invariant.
 func TestDurableTellNotLostOnEmitFailure(t *testing.T) {
 	core := commbus.NewMemBus()
 	t.Cleanup(func() { _ = core.Close() })
@@ -198,5 +211,154 @@ func TestDurableTellRedeliversWithinMaxDeliver(t *testing.T) {
 	waitTellCursor(t, z, bob, "Alice", 1) // cursor advanced once, after the successful retry
 	if n := flaky.failTellN.Load(); n != 0 {
 		t.Fatalf("the injected tell-emit failure was never consumed (%d left) — the redelivery path was not exercised", n)
+	}
+}
+
+// TestAFKAutoReplyFailureDoesNotLoseTell pins the BEST-EFFORT contract of the AFK auto-reply (#62): a live
+// tell to an AFK target both delivers the tell AND fires a one-line "X is AFK: …" back to the sender. The
+// auto-reply is a separate publish whose result is deliberately ignored (tell.go) — so if IT fails (a blip on
+// the sender's subject), the PRIMARY tell must still be delivered exactly once and its per-sender cursor must
+// still advance. If the auto-reply failure leaked into the deliver result it would NAK the tell (redelivery /
+// duplicate) or block the cursor. We fail only the auto-reply's subject (the sender's) and confirm the tell
+// is unaffected.
+func TestAFKAutoReplyFailureDoesNotLoseTell(t *testing.T) {
+	core := commbus.NewMemBus()
+	t.Cleanup(func() { _ = core.Close() })
+	js := commbus.NewMemJetStream()
+	t.Cleanup(func() { _ = js.Close() })
+	dir := newFakeLocator("Alice", "Bob")
+
+	flaky := &flakyBus{inner: core.WorldHandle()}
+	z := tellShard(t, flaky, js, dir)
+	bobInbox := subscribeTell(t, core.GateHandle(), "Bob")
+
+	joinTellPlayer(t, z, "Alice")
+	bob := joinTellPlayer(t, z, "Bob")
+
+	// Bob goes AFK (drives the real `afk` command on the zone goroutine — no state race).
+	z.post(inputMsg{id: "Bob", line: "afk lunch"})
+
+	// Fail ONLY the auto-reply, which publishes to the SENDER's (Alice's) tell subject. The primary tell to
+	// Bob's subject is untouched.
+	replySubj := commbus.TellSubject("Alice")
+	flaky.failSubject.Store(&replySubj)
+
+	z.post(inputMsg{id: "Alice", line: "tell Bob you there?"})
+
+	// The primary tell is delivered to Bob exactly once despite the auto-reply failing.
+	if m := recvTell(t, bobInbox); !strings.Contains(m.Body, "you there?") {
+		t.Fatalf("primary tell not delivered: %q", m.Body)
+	}
+	assertNoTell(t, bobInbox) // exactly once — no redelivery from a leaked auto-reply failure
+	// The primary tell's delivered-cursor advanced despite the auto-reply failure. The cursor lives on the
+	// RECIPIENT's session (Bob) keyed by the SENDER (Alice); a leaked auto-reply error would have NAK'd the
+	// tell and left it unadvanced (Seq 0).
+	waitTellCursor(t, z, bob, "Alice", 1)
+
+	// The auto-reply WAS attempted (and failed) — proving we exercised the best-effort branch, not skipped it.
+	if hits := flaky.failSubjectHits.Load(); hits == 0 {
+		t.Fatal("the AFK auto-reply was never attempted — the best-effort failure path was not exercised")
+	}
+}
+
+// droppyBus wraps a Bus and, while dropDeliveries is set, silently DROPS messages on the SUBSCRIBE (delivery)
+// side — the handler is never invoked, though the publish itself succeeded. This is the complement of
+// flakyBus, which only fails the PUBLISH side (#62): it models a delivery-side outage (the transport loses a
+// message after a successful publish, or a subscriber that falls behind and misses a transient line). Publish
+// and the rest delegate to the inner bus.
+type droppyBus struct {
+	inner          commbus.Bus
+	dropDeliveries atomic.Bool
+	dropped        atomic.Int64
+}
+
+func (b *droppyBus) Role() commbus.Role { return b.inner.Role() }
+
+func (b *droppyBus) Publish(ctx context.Context, subj string, msg commbus.Message) error {
+	return b.inner.Publish(ctx, subj, msg)
+}
+
+func (b *droppyBus) Subscribe(subj string, handler func(commbus.Message)) (commbus.Subscription, error) {
+	return b.inner.Subscribe(subj, func(m commbus.Message) {
+		if b.dropDeliveries.Load() {
+			b.dropped.Add(1)
+			return // delivery dropped: the subscriber never sees this message
+		}
+		handler(m)
+	})
+}
+
+func (b *droppyBus) Available() bool { return b.inner.Available() }
+
+func (b *droppyBus) Close() error { return b.inner.Close() }
+
+// TestSubscribeSideDeliveryDrop exercises the subscribe-side failure double (#62): a TRANSIENT channel line
+// published while the subscriber is dropping deliveries is silently MISSED (transient comms are fire-and-
+// forget — a missed line is acceptable degradation, never a crash or a hang), and once the drop clears the
+// subscriber receives subsequent lines normally. This is the delivery-side path flakyBus (publish-only)
+// could not reach.
+func TestSubscribeSideDeliveryDrop(t *testing.T) {
+	core := commbus.NewMemBus()
+	t.Cleanup(func() { _ = core.Close() })
+
+	// The world is the comms SOURCE (a player's `gossip` publishes a channel line); the gate is the SINK
+	// (subscribes + renders). Wrap the GATE's subscription in droppyBus so we can drop DELIVERIES to it while
+	// the world keeps publishing — the delivery-side outage flakyBus (publish-only) cannot model.
+	droppy := &droppyBus{inner: core.GateHandle()}
+	got := make(chan commbus.Message, 8)
+	sub, err := droppy.Subscribe(commbus.ChanSubject("gossip"), func(m commbus.Message) { got <- m })
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	// A live zone driving the REAL channel-publish path (channel.go), publishing over the paired world handle.
+	sh := NewDemoShard().WithComms(core.WorldHandle())
+	z := sh.Zone()
+	alice := newTestPlayerEntity(z, "Alice")
+	Move(alice.entity, z.rooms[z.startRoom])
+	drain := func() []string { return drainCombat(alice) }
+	has := func(lines []string, sub string) bool {
+		for _, l := range lines {
+			if strings.Contains(l, sub) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// DROP armed: Alice gossips. The world's publish SUCCEEDS (so she gets NO "temporarily offline" notice —
+	// this is a delivery-side loss, not a publish failure), but the line is dropped at the gate subscriber.
+	droppy.dropDeliveries.Store(true)
+	z.dispatch(alice, "gossip lost line")
+	if has(drain(), "temporarily offline") {
+		t.Fatal("a subscribe-side drop wrongly produced a publish-side offline notice")
+	}
+	select {
+	case m := <-got:
+		t.Fatalf("a dropped delivery still reached the gate subscriber: %q", m.Body)
+	case <-time.After(150 * time.Millisecond):
+		// correct: the transient line was silently missed (fire-and-forget)
+	}
+	if n := droppy.dropped.Load(); n == 0 {
+		t.Fatal("the delivery-drop double never dropped anything")
+	}
+
+	// THE ZONE STILL SERVES after a subscriber lost a line — a normal command round-trips (never-fatal).
+	z.dispatch(alice, "look")
+	if !has(drain(), "Exits:") {
+		t.Fatal("the zone stopped serving after a subscribe-side delivery drop")
+	}
+
+	// DROP cleared: a subsequent gossip reaches the gate subscriber (recovered, no wedge).
+	droppy.dropDeliveries.Store(false)
+	z.dispatch(alice, "gossip back online")
+	select {
+	case m := <-got:
+		if !strings.Contains(m.Body, "back online") {
+			t.Fatalf("got %q, want the recovered gossip line", m.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the gate subscriber did not recover after the delivery drop cleared")
 	}
 }
