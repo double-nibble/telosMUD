@@ -14,6 +14,12 @@
 // dependency is one-directional (world -> content) and there is no cycle.
 package content
 
+import (
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
 // Pack is the top-level shape of a content pack file (one pack = one YAML document, or the
 // rows of one `pack` column value). A pack ships one or more whole zones AND the pack-GLOBAL,
 // zone-independent definition kinds (attributes/resources/damage-types — and, in 5.2/5.3,
@@ -441,6 +447,81 @@ type ChannelAccessDTO struct {
 	// MinAttr, if non-nil, requires the speaker's named attribute to be >= the value (e.g. a level
 	// floor on a channel). Both Attr and Min must be set to take effect.
 	MinAttr *MinAttrDTO `json:"min_attr" yaml:"min_attr"`
+
+	// emptyConds records CONDITION keys that were PRESENT in the source YAML but left empty/null (e.g.
+	// `require_flag:` or `min_attr:` with no value). At the decoded-struct level a present-null key is
+	// indistinguishable from an absent one (both give the zero value / a nil pointer), so this is captured
+	// from the raw node in UnmarshalYAML and read by LintChannelAccess (#60) to warn on a typo'd restriction
+	// that silently opens the channel. minAttrMissingMin flags the other min_attr footgun invisible to the
+	// struct: `min_attr: {attr: X}` with the `min` key OMITTED (which decodes to Min==0, indistinguishable
+	// from an explicit `min: 0` a builder may legitimately want on a signed attribute). Both are unexported +
+	// untagged: never serialized; only the YAML authoring path populates them (a PG/JSON reload carries the
+	// already-normalized value — the mistake was caught at import/boot/reload, all of which re-parse YAML).
+	emptyConds        []string
+	minAttrMissingMin bool
+}
+
+// UnmarshalYAML decodes a ChannelAccessDTO normally AND records which condition keys were present-but-empty
+// in the source (#60). The decoded struct cannot tell `require_flag:` (present, null) from an absent key —
+// both yield RequireFlag=="" — nor `min_attr:` (present, null) from an absent one, nor a `min_attr` mapping
+// that omits `min` from one that sets `min: 0`. A builder who typos any of these silently gets the open
+// channel shape. We inspect the raw mapping node to catch it; the normal fields decode via an alias (no
+// recursion).
+func (a *ChannelAccessDTO) UnmarshalYAML(node *yaml.Node) error {
+	type rawAccess ChannelAccessDTO // alias without this method, so Decode does not recurse
+	var r rawAccess
+	if err := node.Decode(&r); err != nil {
+		return err
+	}
+	*a = ChannelAccessDTO(r)
+	a.emptyConds = nil
+	a.minAttrMissingMin = false
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, val := node.Content[i].Value, node.Content[i+1]
+		// A present-but-empty condition KEY (`require_flag:` / `min_attr:` with a null or `{}` value) means
+		// "I meant to restrict but left it blank" — the footgun, invisible to the decoded struct.
+		if (key == "require_flag" || key == "min_attr") && yamlNodeIsBlank(val) {
+			a.emptyConds = append(a.emptyConds, key)
+			continue
+		}
+		// A min_attr mapping that names `attr` but OMITS the `min` key: Min decodes to 0 either way, so only
+		// the raw node reveals the omission (vs an explicit `min: 0`, which a builder may want on a signed
+		// attribute). An omitted min is the "forgot the floor" footgun.
+		if key == "min_attr" && val.Kind == yaml.MappingNode {
+			var hasAttr, hasMin bool
+			for j := 0; j+1 < len(val.Content); j += 2 {
+				switch val.Content[j].Value {
+				case "attr":
+					hasAttr = !yamlNodeIsBlank(val.Content[j+1])
+				case "min":
+					hasMin = true // the key's PRESENCE is intent, even `min: 0`
+				}
+			}
+			if hasAttr && !hasMin {
+				a.minAttrMissingMin = true
+			}
+		}
+	}
+	return nil
+}
+
+// yamlNodeIsBlank reports whether a YAML value node carries no meaningful content: an explicit null, an
+// empty/whitespace-only scalar, or an empty mapping/sequence (`{}` / `[]`). Used to detect a present-but-empty
+// access condition (#60).
+func yamlNodeIsBlank(n *yaml.Node) bool {
+	if n == nil || n.Tag == "!!null" {
+		return true
+	}
+	if n.Kind == yaml.ScalarNode {
+		return strings.TrimSpace(n.Value) == ""
+	}
+	if n.Kind == yaml.MappingNode || n.Kind == yaml.SequenceNode {
+		return len(n.Content) == 0
+	}
+	return false
 }
 
 // MinAttrDTO is one attribute-floor condition: the speaker's Attr (a content attribute ref) must

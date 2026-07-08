@@ -41,6 +41,14 @@ func main() {
 	}
 	defer pool.Close()
 
+	// Content-lint (#60): WARN on a present-but-empty/partial channel access condition before import. This is
+	// the embedded-YAML ingress where a present-null require_flag/min_attr is still visible (Postgres
+	// normalizes it away on import). Non-blocking — the pack is trusted content.
+	for _, v := range content.LintChannelAccess([]content.Pack{pack}) {
+		slog.Warn("seed: channel access-condition lint (present-but-empty/partial condition; likely a typo)",
+			"pack", v.Pack, "channel", v.Channel, "field", v.Field, "detail", v.Detail)
+	}
+
 	if err := pool.ImportPack(ctx, pack); err != nil {
 		slog.Error("import demo pack failed", "err", err)
 		os.Exit(1)

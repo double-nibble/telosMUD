@@ -193,6 +193,15 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 		r.log.Warn("reload: content failed validation; nothing propagated", "packs", packs, "problems", problems)
 		return reloadOutcome{rejected: problems}
 	}
+	// Content-lint (#60): WARN (non-blocking) on a present-but-empty/partial channel access condition so a
+	// staff hot-edit that typos a channel restriction is surfaced in the reload readout, not only at next
+	// boot. The struct-level checks (a whitespace-only flag, a min on an unnamed attribute) fire on the PG
+	// re-read here; the present-null require_flag/min_attr catch needs the YAML ingress (import/seed), where
+	// it is also wired. WARN not reject — a too-open channel is authoring noise, not fleet-state corruption.
+	for _, v := range content.LintChannelAccess(loaded) {
+		r.log.Warn("reload: channel access-condition lint (present-but-empty/partial condition; likely a typo)",
+			"pack", v.Pack, "channel", v.Channel, "field", v.Field, "detail", v.Detail)
+	}
 	if checkOnly {
 		// Pre-flight: the content validated, but a dry run deliberately publishes nothing.
 		r.log.Info("reload --check: content validated (dry run, nothing published)", "packs", packs)

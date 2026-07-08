@@ -160,6 +160,15 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 		}
 		slog.Warn(msg, attrs...)
 	}
+	// Content-lint (#60): a comms channel's access/hear_access predicate that LOOKS restrictive but resolves
+	// to open because a condition was left blank (`require_flag:` present-but-null, a half-specified min_attr).
+	// Non-fatal (the channel is trusted content and the engine boots to the open shape) — warned so a builder's
+	// typo doesn't silently leave a restricted channel world-readable.
+	for _, v := range LintChannelAccess(packs) {
+		slog.Warn("content: channel access-condition lint — a present-but-empty/partial condition (likely a typo); "+
+			"the channel may be unintentionally open or unreachable",
+			"pack", v.Pack, "channel", v.Channel, "field", v.Field, "detail", v.Detail)
+	}
 	// Materialize the deduped zone set: a later pack shipping the same zone ref overrides the
 	// earlier one IN PLACE (last write wins; content-lint catches accidental collisions).
 	// Track positions by index, NOT by pointer — appending to lc.Zones reallocates the backing
