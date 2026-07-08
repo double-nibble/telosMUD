@@ -329,18 +329,49 @@ func (rt *luaRuntime) pushHandleList(l *lua.LState, es []*Entity) int {
 // items, a container's items, a mob/player's inventory). A departed/unresolved handle yields
 // an empty table.
 //
-// UNFILTERED, deliberately: contents() is the MECHANICS traversal (an AoE must hit the hidden
-// rogue; a room-scoped affect must land on the invisible mage), so it does NOT consult canSee.
-// It is therefore the WRONG accessor for anything a player reads. A DISPLAY surface must use
-// occupants() / room_items(), which route the visibility chokepoint — see hOccupants. Keep that
-// split: filtering here would silently break room-scoped effects, and using this in a `room`
-// template would disclose concealed occupants.
+// PERCEPTION vs MECHANICS split, resolved by the INVOCATION context (#250):
+//   - In a MECHANICS invocation (the default), contents() is UNFILTERED — an AoE must hit the hidden
+//     rogue; a room-scoped affect must land on the invisible mage. It does NOT consult canSee.
+//   - In a DISPLAY invocation (renderDisplaySheet/renderDisplayList set inv.display), contents() of a
+//     container that is NOT the viewer (a room, a chest) is canSee-FILTERED, so a `room` template that
+//     reaches for contents() instead of occupants()/room_items() can no longer disclose concealed
+//     occupants — the leak trap this closes. self:contents() (the viewer's OWN inventory: e is the
+//     invocation actor) stays raw, so a player always sees their own items (even an invisible one).
+//     Fails CLOSED: a display read with no viewer/zone discloses nothing.
+//
+// occupants() / room_items() remain the INTENT-revealing accessors a display surface should use (they are
+// canSee-filtered unconditionally and, for occupants, exclude the viewer); this is defense in depth for the
+// author who reaches for the general contents() instead.
 func (rt *luaRuntime) hContents(l *lua.LState) int {
 	e := resolveHandle(l, 1)
 	if e == nil {
 		return rt.pushHandleList(l, nil)
 	}
+	if rt.inv != nil && rt.inv.display && e != rt.inv.actor {
+		return rt.pushHandleList(l, rt.displayVisibleContents(e))
+	}
 	return rt.pushHandleList(l, e.contents)
+}
+
+// displayVisibleContents is the #250 concealment filter shared by the two DISPLAY-render entity enumerators
+// that would otherwise return a container's raw contents — contents() (hContents) and mud.scan (mudScan). It
+// returns e.contents keeping only the entities the invocation's viewer canSee, so a sheet can't disclose a
+// concealed occupant/item. It fails CLOSED (nil viewer or zoneless container => nothing), matching the
+// hOccupants/hRoomItems posture. Callers invoke it only when rt.inv.display is set AND e is not the viewer
+// (the viewer's own inventory stays raw). Unlike occupants() it does NOT exclude the viewer — contents() is the
+// whole-container list and the viewer canSee's themselves — and unlike room_items() it is not item-restricted.
+func (rt *luaRuntime) displayVisibleContents(e *Entity) []*Entity {
+	viewer := rt.inv.actor
+	if viewer == nil || e.zone == nil {
+		return nil
+	}
+	var visible []*Entity
+	for _, occ := range e.contents {
+		if e.zone.canSee(viewer, occ) { // THE chokepoint: concealed from this viewer => absent
+			visible = append(visible, occ)
+		}
+	}
+	return visible
 }
 
 // hEquipment returns a table of handles for the entity's WORN items (the Wearer component's

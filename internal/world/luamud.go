@@ -155,10 +155,19 @@ func (rt *luaRuntime) mudLog(l *lua.LState) int {
 
 // mudScan returns a table of handles for the occupants + contents of the given room handle
 // (mud.scan(room)). An unresolved/non-room handle yields an empty table.
+//
+// #250: mud.scan is the global sibling of contents() — it, too, returns a container's RAW contents. In a
+// MECHANICS invocation that is correct (a script scanning a room must reach a hidden entity). But in a DISPLAY
+// render it is the same concealment leak a `room` template could reach through (mud.scan(self:room())), so it
+// is canSee-filtered there via the shared displayVisibleContents guard, exactly like contents(). A scan of the
+// viewer themselves (room == actor) stays raw, mirroring self:contents().
 func (rt *luaRuntime) mudScan(l *lua.LState) int {
 	room := resolveHandle(l, 1)
 	if room == nil {
 		return rt.pushHandleList(l, nil)
+	}
+	if rt.inv != nil && rt.inv.display && room != rt.inv.actor {
+		return rt.pushHandleList(l, rt.displayVisibleContents(room))
 	}
 	return rt.pushHandleList(l, room.contents)
 }

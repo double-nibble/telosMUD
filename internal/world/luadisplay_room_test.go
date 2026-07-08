@@ -264,15 +264,16 @@ func TestRoomOccupantsFailClosedWithoutViewer(t *testing.T) {
 	}
 }
 
-// TestContentsStaysUnfilteredOccupantsIsFiltered pins the DELIBERATE split between the two traversals, in one
-// place, so neither is "fixed" into the other:
+// TestContentsStaysUnfilteredOccupantsIsFiltered pins the split in a MECHANICS invocation (the default —
+// inv.display is false here):
 //
 //   - contents() is the MECHANICS traversal and stays UNFILTERED (an AoE must hit the hidden rogue; a
 //     room-scoped affect must land on the invisible mage). Filtering it would silently break those.
 //   - occupants() is the PERCEPTION traversal and is canSee-filtered — the accessor a display surface uses.
 //
-// The consequence, stated so it is a choice and not an accident: a `room` template that reaches for contents()
-// instead of occupants() CAN enumerate concealed occupants. That is why occupants() exists.
+// #250 additionally closes the leak the OLD comment documented as accepted ("a room template reaching for
+// contents() CAN enumerate concealed occupants"): in a DISPLAY invocation contents() of a non-viewer container
+// is now canSee-filtered too (TestContentsFilteredInDisplayContext below). This test holds the MECHANICS half.
 func TestContentsStaysUnfilteredOccupantsIsFiltered(t *testing.T) {
 	z, _, room := harmZone(t)
 	viewer := harmPlayer(z, room, "Viewer")
@@ -285,6 +286,7 @@ func TestContentsStaysUnfilteredOccupantsIsFiltered(t *testing.T) {
 		for _, e in ipairs(self:contents())  do c[#c+1] = e:name() end
 		for _, e in ipairs(self:occupants()) do o[#o+1] = e:name() end
 		return "C[" .. table.concat(c, ",") .. "] O[" .. table.concat(o, ",") .. "]"`)
+	// display:false (a mechanics invocation) — contents() must be raw.
 	got, ok := rt.invokeForString(ch, &luaInvocation{actor: viewer},
 		map[string]lua.LValue{"self": rt.newHandle(room)})
 	if !ok {
@@ -296,6 +298,136 @@ func TestContentsStaysUnfilteredOccupantsIsFiltered(t *testing.T) {
 	if !strings.Contains(got, "O[]") {
 		t.Fatalf("occupants() must be canSee-FILTERED (perception: the hidden player is omitted; the viewer "+
 			"excludes themselves, so the list is empty): %q", got)
+	}
+}
+
+// TestContentsFilteredInDisplayContext is the #250 regression: in a DISPLAY invocation (inv.display=true, set
+// by renderDisplaySheet/renderDisplayList), contents() of a container that is NOT the viewer is canSee-filtered,
+// so a `room` template that reaches for self:room():contents() instead of occupants()/room_items() can no
+// longer enumerate a concealed occupant. Same fixture as the mechanics test above; only the invocation context
+// differs — proving the split is the CONTEXT, not the accessor.
+func TestContentsFilteredInDisplayContext(t *testing.T) {
+	z, _, room := harmZone(t)
+	viewer := harmPlayer(z, room, "Viewer")
+	sneak := harmPlayer(z, room, "Sneak")
+	setFlag(sneak, flagHidden, true)
+
+	rt := z.lua
+	ch := rt.chunkFor("display:room:leak", `
+		local c = {}
+		for _, e in ipairs(self:contents()) do c[#c+1] = e:name() end
+		return "C[" .. table.concat(c, ",") .. "]"`)
+	// display:true (a display render) — the hidden Sneak must be absent from a NON-viewer container's contents.
+	got, ok := rt.invokeForString(ch, &luaInvocation{actor: viewer, display: true},
+		map[string]lua.LValue{"self": rt.newHandle(room)})
+	if !ok {
+		t.Fatal("chunk failed to run")
+	}
+	if strings.Contains(got, "Sneak") {
+		t.Fatalf("#250: a DISPLAY render's contents() of the ROOM leaked a concealed occupant: %q", got)
+	}
+	if !strings.Contains(got, "Viewer") {
+		t.Fatalf("the viewer (who canSee themselves) must still appear in the room's display contents: %q", got)
+	}
+
+	// The fail-closed guard: a display render with no viewer perspective discloses nothing.
+	got2, ok := rt.invokeForString(ch, &luaInvocation{actor: nil, display: true},
+		map[string]lua.LValue{"self": rt.newHandle(room)})
+	if !ok {
+		t.Fatal("chunk failed to run (nil-viewer)")
+	}
+	if got2 != "C[]" {
+		t.Fatalf("#250 fail-closed: a display contents() with no viewer must disclose nothing; got %q", got2)
+	}
+}
+
+// TestDisplayContentsOfSelfInventoryStaysRaw guards the inventory template against over-filtering: in a DISPLAY
+// render, self:contents() (the viewer's OWN inventory: the container IS the viewer) stays RAW — a player always
+// sees their own carried items, even an INVISIBLE one that canSee would hide in a room. Only a NON-viewer
+// container is filtered (#250). Without the `e != viewer` guard this would silently drop a player's own
+// invisible item from their inventory sheet.
+func TestDisplayContentsOfSelfInventoryStaysRaw(t *testing.T) {
+	z, _, room := harmZone(t)
+	viewer := harmPlayer(z, room, "Viewer")
+	ring := addTestItem(z, viewer, "an invisible ring", []string{"ring"})
+	setFlag(ring, flagInvisible, true) // the viewer has no detect-invis; canSee(viewer, ring) would be false
+
+	rt := z.lua
+	ch := rt.chunkFor("display:inventory:self", `
+		local c = {}
+		for _, e in ipairs(self:contents()) do c[#c+1] = e:name() end
+		return "C[" .. table.concat(c, ",") .. "]"`)
+	got, ok := rt.invokeForString(ch, &luaInvocation{actor: viewer, display: true},
+		map[string]lua.LValue{"self": rt.newHandle(viewer)})
+	if !ok {
+		t.Fatal("chunk failed to run")
+	}
+	if !strings.Contains(got, "an invisible ring") {
+		t.Fatalf("#250: self:contents() (own inventory) must stay RAW in a display — the player's own invisible "+
+			"item was wrongly filtered out: %q", got)
+	}
+}
+
+// TestMudScanFilteredInDisplayContext is the #250 sibling for the GLOBAL scan primitive: mud.scan(room) also
+// returns a room's RAW contents, so a display template reaching mud.scan(self:room()) must be canSee-filtered
+// exactly like self:room():contents() — else the leak reopens through the other door. A mechanics scan stays raw.
+func TestMudScanFilteredInDisplayContext(t *testing.T) {
+	z, _, room := harmZone(t)
+	viewer := harmPlayer(z, room, "Viewer")
+	sneak := harmPlayer(z, room, "Sneak")
+	setFlag(sneak, flagHidden, true)
+
+	rt := z.lua
+	ch := rt.chunkFor("test:scan", `
+		local c = {}
+		for _, e in ipairs(mud.scan(self:room())) do c[#c+1] = e:name() end
+		return "S[" .. table.concat(c, ",") .. "]"`)
+	// display:true — mud.scan of the room must drop the concealed occupant.
+	got, ok := rt.invokeForString(ch, &luaInvocation{actor: viewer, display: true},
+		map[string]lua.LValue{"self": rt.newHandle(viewer)})
+	if !ok {
+		t.Fatal("chunk failed to run (display)")
+	}
+	if strings.Contains(got, "Sneak") {
+		t.Fatalf("#250: mud.scan in a DISPLAY render leaked a concealed occupant: %q", got)
+	}
+	// display:false — a mechanics scan stays raw (a script scanning a room must reach a hidden entity).
+	raw, ok := rt.invokeForString(ch, &luaInvocation{actor: viewer},
+		map[string]lua.LValue{"self": rt.newHandle(viewer)})
+	if !ok {
+		t.Fatal("chunk failed to run (mechanics)")
+	}
+	if !strings.Contains(raw, "Sneak") {
+		t.Fatalf("mud.scan in a MECHANICS invocation must stay raw: %q", raw)
+	}
+}
+
+// TestRoomDisplayTemplateThroughRenderPathFiltersContents pins the PRODUCTION wiring (#250): display:true is
+// set by renderDisplaySheet ITSELF, not just by hand in the harness. A leaky `room` template reaching for
+// self:room():contents(), rendered through the REAL renderDisplaySheet("room", viewer) path, must NOT disclose
+// a concealed occupant. Reverting the display:true at the render site (luadisplay.go) — which the harness tests
+// above cannot catch — fails this.
+func TestRoomDisplayTemplateThroughRenderPathFiltersContents(t *testing.T) {
+	z, _, room := harmZone(t)
+	viewer := harmPlayer(z, room, "Viewer")
+	sneak := harmPlayer(z, room, "Sneak")
+	setFlag(sneak, flagHidden, true)
+
+	z.defBundle().displayDefs["room"] = `
+		local c = {}
+		for _, e in ipairs(self:room():contents()) do c[#c+1] = e:name() end
+		return "ROOM[" .. table.concat(c, ",") .. "]"`
+
+	got, ok := z.renderDisplaySheet("room", viewer)
+	if !ok {
+		t.Fatal("the room template should have rendered")
+	}
+	if strings.Contains(got, "Sneak") {
+		t.Fatalf("#250 wiring: renderDisplaySheet must set display:true — a leaky room template disclosed a "+
+			"concealed occupant through the real render path: %q", got)
+	}
+	if !strings.Contains(got, "Viewer") {
+		t.Fatalf("the viewer must still appear in their own room's display contents: %q", got)
 	}
 }
 

@@ -218,6 +218,14 @@ type luaInvocation struct {
 	// quarantined, not its whole prototype. Empty => the chokepoint derives the per-(kind,ref)
 	// shared key from the chunk origin (the right scope for a shared ability/affect/formula/policy).
 	breakerKey string
+
+	// display marks a DISPLAY-surface render (renderDisplaySheet/renderDisplayList): a content template
+	// assembling a sheet FOR a viewer, not a mechanics cascade. It flips the PERCEPTION-vs-MECHANICS behavior
+	// of a handle traversal that legitimately differs between the two — today only hContents: raw for mechanics
+	// (an AoE / room-scoped affect MUST reach a hidden entity), but canSee-filtered when a display reads the
+	// contents of a container that is NOT the viewer (a room, a chest), so a sheet can't reveal what the viewer
+	// can't perceive (#250 — the "reach for contents() instead of occupants()" leak trap). `actor` is the viewer.
+	display bool
 }
 
 // newLuaRuntime builds the per-zone VM and installs the restricted-globals sandbox. The
