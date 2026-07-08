@@ -77,7 +77,7 @@ func runSetTierCLI(args []string) int {
 	// pack (falling back to the built-in ladder on a load error, exactly like the serving path).
 	forced := *force == "yes"
 	if !forced {
-		if msg := validateTier(loadLadder(ctx, pool), *tier); msg != "" {
+		if msg := validateTier(loadLadder(ctx, pool, cfg.ContentPacks), *tier); msg != "" {
 			fmt.Fprintln(os.Stderr, "set-tier: "+msg)
 			return 1
 		}
@@ -119,10 +119,19 @@ func validateTier(ladder *content.TrustLadder, tier string) string {
 		tier, strings.Join(names, ", "))
 }
 
-// loadLadder resolves the content trust ladder the same way the serving path does — the demo pack, falling
-// back to the built-in default ladder on any load error, so validation matches the running service.
-func loadLadder(ctx context.Context, pool *store.Pool) *content.TrustLadder {
-	lc, err := content.Load(ctx, pool, []string{content.DemoPack})
+// loadLadder resolves the content trust ladder the SAME way the serving path does (#246/#255): the
+// registry-resolved enabled pack set (shared content.ResolveEnabledPacks), LoadWithCore'd like the world —
+// NOT a hardcoded demo pack, which would validate a real-pack tier as "unknown" (forcing --force) or wrongly
+// accept a demo-only tier. On any read/load error it falls back to the built-in default ladder: the CLI is
+// break-glass, so it must stay usable when content is unreadable (that is exactly when recovery is needed),
+// and --force yes overrides validation entirely if the fallback ladder is wrong.
+func loadLadder(ctx context.Context, pool *store.Pool, packsOverride []string) *content.TrustLadder {
+	var registryPacks []string
+	if info, verr := pool.CurrentContentVersion(ctx); verr == nil {
+		registryPacks = info.Packs
+	}
+	enabled := content.ResolveEnabledPacks(packsOverride, registryPacks)
+	lc, err := content.LoadWithCore(ctx, pool, enabled)
 	if err != nil || lc == nil {
 		return content.NewTrustLadder(nil) // built-in default (player/builder/admin)
 	}

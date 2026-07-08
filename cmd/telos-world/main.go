@@ -40,23 +40,6 @@ import (
 	"github.com/double-nibble/telosmud/internal/world"
 )
 
-// resolveEnabledPacks picks the content packs a world shard loads from Postgres (#212 slice 4,
-// manifest-driven). Precedence: (1) an explicit operator override (cfg.ContentPacks / TELOS_CONTENT_
-// PACKS) always wins — for pinning to a subset or dev; (2) else the packs the currently imported
-// version REGISTERED (registryPacks, from content_pack_registry) — so the world auto-serves exactly
-// what telos-pull/​the director last imported, with no operator list to keep in sync; (3) else the
-// demo pack (a fresh DB that was never pulled — dev/bootstrap). The embedded core bootstrap pack is
-// layered under these unconditionally (content.LoadWithCore), so it is never listed here.
-func resolveEnabledPacks(cfg config.Config, registryPacks []string) []string {
-	if len(cfg.ContentPacks) > 0 {
-		return cfg.ContentPacks
-	}
-	if len(registryPacks) > 0 {
-		return registryPacks
-	}
-	return []string{content.DemoPack}
-}
-
 func main() {
 	cfg, err := config.Load(config.PathFromEnv())
 	if err != nil {
@@ -86,6 +69,13 @@ func main() {
 		zones = []string{"midgaard"}
 	}
 	shard, chooseTarget := buildShard(worldCtx, stopWorld, cfg, zones)
+	// Fail loud on an unauthenticated multi-shard deployment (#251): a shard that can receive cross-shard
+	// handoffs MUST have a handoff verify key, or a forged Prepare could inject carried state. Refuse to boot
+	// rather than run silently unauthenticated.
+	if err := shard.CheckHandoffAuth(); err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
+	}
 	go shard.Run(worldCtx) // each zone actor loop owns its world state from here on
 
 	lis, err := net.Listen("tcp", cfg.WorldListen)
@@ -438,7 +428,7 @@ func loadContent(ctx context.Context, cfg config.Config) (*content.LoadedContent
 	} else {
 		slog.Debug("content version registry unavailable; using configured/default packs", "err", verr)
 	}
-	enabledPacks := resolveEnabledPacks(cfg, registryPacks)
+	enabledPacks := content.ResolveEnabledPacks(cfg.ContentPacks, registryPacks)
 
 	// LoadWithCore layers the minimal embedded core pack UNDER the real packs read from Postgres, so
 	// the bootstrap zone is ALWAYS present; real content overrides it by ref (#212).
