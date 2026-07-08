@@ -486,6 +486,18 @@ type reloadLuaMsg struct {
 	ref  string // the (kind, ref) whose Lua was edited
 }
 
+// republishCommsMsg tells a zone to RE-PUBLISH every hosted player's comms config after a channel_def hot
+// reload changed a channel's access/hear_access (#75). The gate's per-player HEAR-filter is PUSHED (the world
+// publishes the effective hear-set), so a channel retightened mid-session leaves an already-subscribed player
+// with a stale, too-permissive subscription until their next toggle/handoff/relog — the security gap this
+// closes. Posted to EACH hosted zone (a channel is shard-global) so the per-player republish runs ON THE ZONE
+// GOROUTINE (sessions are zone-owned). Level-triggered + idempotent: publishCommsConfig recomputes the
+// current effective hear-set, so a re-post (bounded-retry on a dropped fan-out) always emits correct state
+// and a duplicate is harmless. ref is the reloaded channel, for logging only.
+type republishCommsMsg struct {
+	ref string
+}
+
 // reconcileZoneMsg tells a zone to converge its live room SHAPE to the reloaded content's DESIRED state
 // (#191): the KindZone invalidation carries that state (rooms + start room + a monotonic version) on the
 // wire, and the reloader hands it here so the diff-and-converge (spawn ADDs, resync UPDATEs, tear down
@@ -529,35 +541,36 @@ type pullResultMsg struct {
 	summary string // the pass/fail line to show them
 }
 
-func (joinMsg) zoneMsg()          {}
-func (attachMsg) zoneMsg()        {}
-func (inputMsg) zoneMsg()         {}
-func (detachMsg) zoneMsg()        {}
-func (reapMsg) zoneMsg()          {}
-func (leaveMsg) zoneMsg()         {}
-func (transferInMsg) zoneMsg()    {}
-func (redirectMsg) zoneMsg()      {}
-func (handedOffMsg) zoneMsg()     {}
-func (handoffFailMsg) zoneMsg()   {}
-func (prepareMsg) zoneMsg()       {}
-func (abortPendingMsg) zoneMsg()  {}
-func (pendingExpireMsg) zoneMsg() {}
-func (freezeExpireMsg) zoneMsg()  {}
-func (saveConflictMsg) zoneMsg()  {}
-func (saveOkMsg) zoneMsg()        {}
-func (saveReconcileMsg) zoneMsg() {}
-func (drainFlushMsg) zoneMsg()    {}
-func (createdMsg) zoneMsg()       {}
-func (createFailedMsg) zoneMsg()  {}
-func (adoptPidMsg) zoneMsg()      {}
-func (presenceMsg) zoneMsg()      {}
-func (loadObjectsMsg) zoneMsg()   {}
-func (reloadLuaMsg) zoneMsg()     {}
-func (reconcileZoneMsg) zoneMsg() {}
-func (reloadDoneMsg) zoneMsg()    {}
-func (pullResultMsg) zoneMsg()    {}
-func (whoFallbackMsg) zoneMsg()   {}
-func (whoRenderMsg) zoneMsg()     {}
+func (joinMsg) zoneMsg()           {}
+func (attachMsg) zoneMsg()         {}
+func (inputMsg) zoneMsg()          {}
+func (detachMsg) zoneMsg()         {}
+func (reapMsg) zoneMsg()           {}
+func (leaveMsg) zoneMsg()          {}
+func (transferInMsg) zoneMsg()     {}
+func (redirectMsg) zoneMsg()       {}
+func (handedOffMsg) zoneMsg()      {}
+func (handoffFailMsg) zoneMsg()    {}
+func (prepareMsg) zoneMsg()        {}
+func (abortPendingMsg) zoneMsg()   {}
+func (pendingExpireMsg) zoneMsg()  {}
+func (freezeExpireMsg) zoneMsg()   {}
+func (saveConflictMsg) zoneMsg()   {}
+func (saveOkMsg) zoneMsg()         {}
+func (saveReconcileMsg) zoneMsg()  {}
+func (drainFlushMsg) zoneMsg()     {}
+func (createdMsg) zoneMsg()        {}
+func (createFailedMsg) zoneMsg()   {}
+func (adoptPidMsg) zoneMsg()       {}
+func (presenceMsg) zoneMsg()       {}
+func (loadObjectsMsg) zoneMsg()    {}
+func (reloadLuaMsg) zoneMsg()      {}
+func (reconcileZoneMsg) zoneMsg()  {}
+func (republishCommsMsg) zoneMsg() {}
+func (reloadDoneMsg) zoneMsg()     {}
+func (pullResultMsg) zoneMsg()     {}
+func (whoFallbackMsg) zoneMsg()    {}
+func (whoRenderMsg) zoneMsg()      {}
 
 func newZone(id string) *Zone {
 	z := &Zone{
@@ -751,6 +764,13 @@ func (z *Zone) handle(m msg) {
 		if v.zoneRef == z.id {
 			z.reconcileZone(v)
 		}
+	case republishCommsMsg:
+		// A channel_def hot reload changed a channel's access/hear_access — re-publish EVERY hosted player's
+		// comms config so a retightened channel drops (or a loosened one adds) their subscription now, not at
+		// their next toggle/handoff/relog (#75). Unconditional over the current player set: the hear-set can
+		// move in BOTH directions (a gate added → drop; a gate removed → add), so the anyChannelGatesHearing
+		// short-circuit that guards the per-entity access-change path would MISS the loosened case here.
+		z.republishAllComms(v.ref)
 	case reloadDoneMsg:
 		// Deliver a `reload` fan-out result to the builder if they are still in this zone (single-writer
 		// over z.players); a builder who left mid-reload gets nothing rather than a bad send.

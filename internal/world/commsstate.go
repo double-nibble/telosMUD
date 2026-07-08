@@ -205,6 +205,31 @@ func (z *Zone) republishCommsOnAccessChange(e *Entity) {
 	z.publishCommsConfig(s)
 }
 
+// republishAllComms re-publishes EVERY hosted player's comms config after a channel_def hot reload changed a
+// channel's access/hear_access (#75, handling republishCommsMsg on the zone goroutine). A channel reload can
+// move a hear-set in either direction — retightening drops a now-ineligible subscriber, loosening adds a
+// newly-eligible one — so unlike republishCommsOnAccessChange this does NOT short-circuit on
+// anyChannelGatesHearing (which would miss the loosened case) and republishes unconditionally over the live
+// player set. Rare (an operator content reload) and idempotent; a no-op when comms are unwired. Single-writer:
+// zone goroutine. ref is the reloaded channel, for logging.
+func (z *Zone) republishAllComms(ref string) {
+	if z.commsBus() == nil || len(z.players) == 0 {
+		return
+	}
+	n := 0
+	for _, s := range z.players {
+		if s.frozen {
+			// A mid-handoff source session: its destination re-publishes the config on arrival (and runs its
+			// own republishAllComms for the same coordinated reload), so republishing the frozen copy here is
+			// redundant — skip it, matching the house convention for the other z.players iterators.
+			continue
+		}
+		z.publishCommsConfig(s)
+		n++
+	}
+	z.log.Debug("comms configs republished after channel reload", "channel", ref, "players", n)
+}
+
 // ignoreList returns the player's ignore list as a sorted slice for the config payload. Zone goroutine.
 func (z *Zone) ignoreList(s *session) []string {
 	if s == nil || s.comms == nil || len(s.comms.ignore) == 0 {
