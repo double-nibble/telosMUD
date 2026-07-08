@@ -35,6 +35,11 @@ jobs:
       # The default suite is hermetic: the gated Postgres integration tier (tests/integration
       # + internal/store) t.Skip without TELOS_TEST_DSN, so this run never needs a database.
       - run: go test ./... -race
+      # #96: the TELOS_DEV_AUTOAUTH bypass is compiled out of the default build (asserted above by the
+      # release-tagged tests); this second pass compiles + exercises the bypass surface behind
+      # `-tags telos_devauth` — the tag the smoke/e2e gate image is built with — so both build variants stay
+      # green. (The smoke/e2e jobs below build that variant via docker-compose's BUILD_TAGS.)
+      - run: go test -tags telos_devauth ./internal/gate/... ./internal/config/... -race
 
   # Linting (the project TEST STANDARD: golangci-lint run, locally before commit and in CI).
   # BLOCKING: the codebase is clean against .golangci.yml (gosec+revive enabled). The first

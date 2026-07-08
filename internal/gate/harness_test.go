@@ -101,6 +101,11 @@ func (h *harness) addShardWithComms(zoneID, addr string, dir world.Locator, peer
 // served listener + lifecycle management.
 func (h *harness) serveShard(addr string, sh *world.Shard) {
 	h.t.Helper()
+	// These gate journey/integration rigs run KEYLESS world shards. Since #260 a keyless shard refuses inbound
+	// cross-shard handoffs by default, so mark every served shard as an explicit insecure rig — the harness
+	// equivalent of TELOS_ALLOW_INSECURE — so the real gate→world handoff path still exercises across bufconn.
+	// A handoff-KEYED shard (WithHandoffKeys) ignores the flag and still enforces signatures.
+	sh.WithInsecureHandoff(true)
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer()
 	sh.Register(gs)

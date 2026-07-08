@@ -240,6 +240,9 @@ services:
       dockerfile: deploy/Dockerfile
       args:
         SERVICE: telos-gate
+        # DEV/SMOKE ONLY: compile in the TELOS_DEV_AUTOAUTH bypass (#96) so the headless bare-name login below
+        # works. A production image builds with no BUILD_TAGS and the bypass is physically absent.
+        BUILD_TAGS: telos_devauth
     environment:
       <<: *otel-env
       TELOS_SERVICE: telos-gate

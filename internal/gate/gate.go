@@ -141,13 +141,10 @@ func (s *Server) WithTransports(allowPlaintext bool, tlsListen, tlsCert, tlsKey 
 	return s
 }
 
-// WithDevAutoAuth enables the Phase-15.6 dev/test bypass: an account-backed gate accepts the bare name login
-// instead of the browser OAuth flow, so headless smoke/e2e (and local dev) work without a browser. INSECURE —
-// gate it behind TELOS_DEV_AUTOAUTH and never enable in production. Returns the Server for chaining.
-func (s *Server) WithDevAutoAuth(on bool) *Server {
-	s.devAutoAuth = on
-	return s
-}
+// WithDevAutoAuth is split across build tags (#96): devauth_dev.go carries the real setter in a
+// `-tags telos_devauth` build, and devauth_release.go compiles a hard-refuse no-op into the default (release)
+// build so the OAuth bypass is physically absent from a production binary. devAuthActive() (same tagged pair)
+// gates every read of the bypass and is a compile-time constant false in release.
 
 // WithDevAutoAuthAllowRemoteBind acknowledges that a dev-autoauth gate may bind a non-loopback address (for
 // containerized dev/CI, where Docker requires a 0.0.0.0 bind and controls exposure via the port publish).
@@ -216,11 +213,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// about to bind a non-loopback address. This makes the bypass safe for local dev / headless smoke+e2e
 	// (loopback only) while making the dangerous misconfiguration impossible rather than merely discouraged.
 	//
-	// SCOPE: this is a RUNTIME fence against a loopback→wildcard bind slip, NOT complete mitigation — the
-	// bypass code (account.go login()) is still compiled into the binary. The complete fix is to exclude it
-	// from release builds behind a build tag (a tracked follow-up); until then, this guard only guarantees
-	// the bypass can't be opened by an accidental non-loopback bind, not that the code is absent.
-	if s.devAutoAuth {
+	// SCOPE: this is the RUNTIME fence against a loopback→wildcard bind slip in a dev-tagged build. The
+	// COMPLETE mitigation (#96) is the build-tag split: in a default (release) build the bypass code is
+	// physically absent and devAuthActive() is a constant false, so this whole block is dead — a release
+	// binary cannot enable the bypass by any env/config means, and this guard only ever runs when the
+	// bypass was actually compiled in (`-tags telos_devauth`).
+	if s.devAuthActive() {
 		if !s.devAuthAllowRemoteBind {
 			for _, addr := range s.enabledListenAddrs() {
 				if !isLoopbackListen(addr) {

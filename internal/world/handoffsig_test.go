@@ -153,29 +153,34 @@ func TestPrepareEnforcesSignatureWhenKeyed(t *testing.T) {
 		t.Fatalf("keyed shard: want PermissionDenied for an unsigned Prepare, got %v", err)
 	}
 
-	keyless := &handoffServer{shard: NewDemoShard()}
+	// A keyless shard skips signature enforcement — but since #260 it only ACCEPTS the handoff when explicitly
+	// insecure, so mark it as such to reach the fall-through (auth skipped ⇒ unknown zone ⇒ NotFound). The
+	// keyless-REFUSE default is asserted in handoff_keyless_test.go.
+	keyless := &handoffServer{shard: NewDemoShard().WithInsecureHandoff(true)}
 	_, err = keyless.Prepare(context.Background(), req)
 	if status.Code(err) != codes.NotFound {
-		t.Fatalf("keyless shard: want NotFound (auth skipped, unknown zone), got %v", err)
+		t.Fatalf("insecure keyless shard: want NotFound (auth skipped, unknown zone), got %v", err)
 	}
 }
 
-// TestPrepareStripsTierWhenKeyless pins the #106 blast-radius guard: a KEYLESS shard (which does not verify
-// the signature) must STRIP the carried tier before any state work, so an unsigned/forged Prepare cannot
-// inject elevation — reverting the keyless posture to exactly pre-#106 (a handoff drops elevation). A KEYED
-// shard with a VALID signature preserves the tier (the signature bound it). The strip runs before the zone
-// lookup, so it is observable on the request even though both calls end at NotFound (unknown demo zone).
+// TestPrepareStripsTierWhenKeyless pins the #106 blast-radius guard on the INSECURE keyless path: an insecure
+// keyless shard (which does not verify the signature but is explicitly allowed to accept handoffs) must STRIP
+// the carried tier before any state work, so an unsigned/forged Prepare cannot inject elevation — the pre-#106
+// posture (a handoff drops elevation). A KEYED shard with a VALID signature preserves the tier (the signature
+// bound it). The strip runs before the zone lookup, so it is observable on the request even though both calls
+// end at NotFound (unknown demo zone). (A keyless shard that is NOT insecure refuses outright — #260, asserted
+// in handoff_keyless_test.go — so the strip only matters once acceptance is opted into.)
 func TestPrepareStripsTierWhenKeyless(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(nil)
 
-	// Keyless: an unsigned Prepare carrying tier="admin" must have the tier stripped.
-	keyless := &handoffServer{shard: NewDemoShard()}
+	// Insecure keyless: an unsigned Prepare carrying tier="admin" must have the tier stripped.
+	keyless := &handoffServer{shard: NewDemoShard().WithInsecureHandoff(true)}
 	unsigned := newSignedPrepare() // Tier=="admin", no SnapshotSig
 	if _, err := keyless.Prepare(context.Background(), unsigned); status.Code(err) != codes.NotFound {
-		t.Fatalf("keyless shard: want NotFound, got %v", err)
+		t.Fatalf("insecure keyless shard: want NotFound, got %v", err)
 	}
 	if unsigned.Snapshot.GetTier() != "" {
-		t.Fatalf("a keyless shard must STRIP the carried tier (unverified elevation), got %q", unsigned.Snapshot.GetTier())
+		t.Fatalf("an insecure keyless shard must STRIP the carried tier (unverified elevation), got %q", unsigned.Snapshot.GetTier())
 	}
 
 	// Keyed + validly signed: the tier survives (the signature authenticated it).

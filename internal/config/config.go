@@ -220,14 +220,12 @@ func (c *Config) applyEnv() {
 	if v, ok := os.LookupEnv("TELOS_GATE_ALLOW_PLAINTEXT"); ok {
 		c.GateAllowPlaintext = v == "1" || strings.EqualFold(v, "true")
 	}
-	if v, ok := os.LookupEnv("TELOS_DEV_AUTOAUTH"); ok {
-		c.DevAutoAuth = v == "1" || strings.EqualFold(v, "true")
-	}
+	// The TELOS_DEV_AUTOAUTH* env reads are split across build tags (#96): devauth_dev.go applies them in a
+	// `-tags telos_devauth` build; devauth_release.go leaves DevAutoAuth false (and warns if the operator set
+	// the env) in the default release build, so the OAuth bypass cannot be turned on in production config.
+	applyDevAuthEnv(c)
 	if v, ok := os.LookupEnv("TELOS_ALLOW_INSECURE"); ok {
 		c.AllowInsecure = v == "1" || strings.EqualFold(v, "true")
-	}
-	if v, ok := os.LookupEnv("TELOS_DEV_AUTOAUTH_ALLOW_REMOTE_BIND"); ok {
-		c.DevAutoAuthAllowRemoteBind = v == "1" || strings.EqualFold(v, "true")
 	}
 	if v, ok := os.LookupEnv("TELOS_GATE_WRITE_TIMEOUT"); ok {
 		if d, err := time.ParseDuration(v); err == nil {

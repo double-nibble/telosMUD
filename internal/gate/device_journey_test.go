@@ -58,20 +58,3 @@ func TestDeviceLoginJourney(t *testing.T) {
 
 	term.close(t)
 }
-
-// TestDevAutoAuthBypassesOAuth (Phase 15.6): with TELOS_DEV_AUTOAUTH on, an account-backed gate accepts the
-// bare name login instead of the browser OAuth flow — the headless smoke/e2e path.
-func TestDevAutoAuthBypassesOAuth(t *testing.T) {
-	const addr = "addr-a"
-	h := newHarness(t)
-	h.addShard("midgaard", addr, nil, nil)
-	h.serveGate(directory.Static{Addr: addr})
-	h.srv.WithAccountClient(&chargenFakeAccount{}) // account-configured...
-	h.srv.WithDevAutoAuth(true)                    // ...but the dev bypass uses the name login
-
-	term := h.dial(t)
-	term.expect(t, "By what name shall you be known?") // NOT the OAuth sign-in link
-	term.send(t, "Tester")
-	term.expect(t, "The Temple Square") // spawns straight in, no browser
-	term.close(t)
-}

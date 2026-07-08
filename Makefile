@@ -47,10 +47,15 @@ verify: ## Run the hermetic CI matrix locally (gofmt + buf + vet + build + race 
 	@command -v buf >/dev/null 2>&1 && { echo ">> buf lint + format (the CI proto job)"; buf lint && buf format --exit-code; } || echo ">> buf not installed — skipping proto checks (CI still runs them)"
 	@echo ">> go vet" && $(GO) vet ./...
 	@echo ">> go build" && $(GO) build ./...
+	@echo ">> go build (release gate: NO dev-autoauth bypass — #96)" && $(GO) build -o /dev/null ./cmd/telos-gate
 	@echo ">> go test -race" && $(GO) test ./... -race
+	@echo ">> go test -tags telos_devauth (the compiled-in dev-autoauth bypass surface — #96)" && $(GO) test -tags telos_devauth -race ./internal/gate/... ./internal/config/...
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not installed — see https://golangci-lint.run/welcome/install"; exit 1; }
 	@echo ">> golangci-lint" && golangci-lint run
 	@echo ">> verify OK (hermetic CI surface green)"
+
+test-devauth: ## Run the tests behind the telos_devauth build tag (the compiled-in dev-autoauth bypass; #96)
+	$(GO) test -tags telos_devauth -race ./internal/gate/... ./internal/config/...
 
 verify-full: verify ## verify + the Docker smoke/e2e surface CI runs (catches Dockerfile/compose breaks `go test` misses)
 	@echo ">> docker smoke (the build + whole-stack surface)" && $(MAKE) smoke-twice
