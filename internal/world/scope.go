@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/content"
@@ -56,6 +57,38 @@ type scopeDeltaMsg struct {
 }
 
 func (scopeDeltaMsg) zoneMsg() {}
+
+// scopeSeedMsg carries a FULL scope-state snapshot read from the store, posted to a zone BEFORE the shard's
+// scoped-bus subscription activates (#44 snapshot-on-join). It seeds the zone's read-replica so a zone that
+// was DOWN when a transient state delta broadcast missed it starts with the authoritative current state,
+// rather than empty until the next broadcast of each key. Applied on the zone goroutine (the golden rule).
+type scopeSeedMsg struct {
+	kind  string // "world" or "region"
+	state map[string]json.RawMessage
+}
+
+func (scopeSeedMsg) zoneMsg() {}
+
+// applyScopeSeed replaces this zone's replica for the seed's scope with the authoritative store snapshot.
+// Runs on the zone goroutine, BEFORE any live delta (the seed is posted before the subscription activates),
+// so it is the base state subsequent deltas build on. A region seed for a region-less zone is ignored.
+func (z *Zone) applyScopeSeed(m scopeSeedMsg) {
+	ns := make(map[string]json.RawMessage, len(m.state))
+	for k, v := range m.state {
+		if len(v) > 0 && string(v) != "null" {
+			ns[k] = v
+		}
+	}
+	switch m.kind {
+	case "world":
+		z.scopes.world = ns
+	case "region":
+		if z.scopes.regionID == "" {
+			return
+		}
+		z.scopes.region = ns
+	}
+}
 
 // scopeEventMsg is a director's REMOTE-EFFECT broadcast (a custom event, not a state set), posted to the
 // zone inbox so it fires the zone's on_world/on_region Lua handlers on the zone goroutine. kind is
@@ -119,6 +152,18 @@ type scopeReplication struct {
 	subs       []commbus.Subscription
 	signals    chan scopeSignalJob // outbound signal-up queue, drained by signalLoop off the zone goroutine
 	log        *slog.Logger
+	// snapshot is the authoritative state source read on join to SEED each zone's replica (#44). nil disables
+	// seeding (the single-shard tests / a shard with no store) — the pre-#44 behavior (start empty).
+	snapshot ScopeSnapshotSource
+}
+
+// ScopeSnapshotSource reads the full current world/region scope state, so a joining zone can seed its
+// read-replica rather than start empty and miss a delta broadcast while it was down (#44). Satisfied by
+// *store.Pool; nil disables snapshot-on-join. It lives here as an interface so the world package stays free
+// of the store dependency, mirroring MailReaper / ContentPuller in the director.
+type ScopeSnapshotSource interface {
+	SnapshotWorldState(ctx context.Context) (map[string][]byte, error)
+	SnapshotRegionState(ctx context.Context, regionID string) (map[string][]byte, error)
 }
 
 // scopeSignalJob is one queued signal-UP (a zone commanding its region/world director). The event name +
@@ -167,9 +212,99 @@ func (s *Shard) WithScopeBus(bus *scopebus.Bus, regions []content.RegionDTO) *Sh
 	return s
 }
 
+// WithScopeSnapshot wires the store the shard reads to SEED each zone's scope replica on join (#44). Without
+// it (a shard with no store / the tests) a zone starts with an empty replica and only catches up via live
+// broadcasts — the pre-#44 gap. Must be called after WithScopeBus (a no-op otherwise) and before Run.
+func (s *Shard) WithScopeSnapshot(src ScopeSnapshotSource) *Shard {
+	if s.scopes != nil {
+		s.scopes.snapshot = src
+	}
+	return s
+}
+
+// scopeSnapshotTimeout bounds the boot-time snapshot read so a slow/unreachable store degrades to "start
+// empty (catch up on the next broadcast)" rather than hanging shard boot.
+const scopeSnapshotTimeout = 5 * time.Second
+
+// seedFromSnapshot reads the authoritative world/region state and posts a scopeSeedMsg to each affected
+// hosted zone, BEFORE start() subscribes to the live bus (#44). Because the seed is posted to the zone inbox
+// ahead of any subscription delivery, it is applied first and later deltas build on it. A snapshot read
+// error degrades to "no seed" (the zone catches up on the next broadcast). Runs on the shard-start goroutine.
+//
+// ORDERING: Run calls this AFTER the zone actor loops are launched but BEFORE start()'s subscribe. The
+// post here is the BLOCKING z.post (a seed must never be dropped), so it is only safe once a drainer exists
+// — seeding before the actors launch could wedge boot if an inbox filled (e.g. mass inbound handoff Prepare
+// during a failover) past its buffer before any zone loop drained it. Seeds still precede every live delta
+// because the subscriptions that produce deltas do not exist until start() runs, after this returns.
+//
+// RESIDUAL: a state delta broadcast in the narrow window between this snapshot read and the subscription
+// becoming active is missed (the transient tier has no backlog) — permanently, until that key is broadcast
+// again. This closes the DOMINANT gap (a delta missed across the whole time a zone was down) and shrinks the
+// residual to that boot-time window; a version-stamped snapshot+delta merge would close it fully (follow-up).
+func (sr *scopeReplication) seedFromSnapshot() {
+	if sr == nil || sr.snapshot == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), scopeSnapshotTimeout)
+	defer cancel()
+
+	// World scope → every hosted zone.
+	if raw, err := sr.snapshot.SnapshotWorldState(ctx); err != nil {
+		sr.log.Warn("world state snapshot failed; zones start without seeded world state", "err", err)
+	} else {
+		seed := toRawMap(raw)
+		for _, z := range sr.shard.zonesList() {
+			z.post(scopeSeedMsg{kind: "world", state: seed})
+		}
+	}
+
+	// Region scopes → the member zones of each hosted region.
+	sr.mu.RLock()
+	regions := make([]string, 0, len(sr.regions))
+	for r := range sr.regions {
+		regions = append(regions, r)
+	}
+	zoneRegion := make(map[string]string, len(sr.zoneRegion))
+	for z, r := range sr.zoneRegion {
+		zoneRegion[z] = r
+	}
+	sr.mu.RUnlock()
+
+	for _, regionID := range regions {
+		raw, err := sr.snapshot.SnapshotRegionState(ctx, regionID)
+		if err != nil {
+			sr.log.Warn("region state snapshot failed; zones start without seeded region state", "region", regionID, "err", err)
+			continue
+		}
+		seed := toRawMap(raw)
+		for zoneID, rID := range zoneRegion {
+			if rID != regionID {
+				continue
+			}
+			if z := sr.shard.zoneByID(zoneID); z != nil {
+				z.post(scopeSeedMsg{kind: "region", state: seed})
+			}
+		}
+	}
+}
+
+// toRawMap converts a store snapshot ([]byte values) to the replica's json.RawMessage form.
+func toRawMap(in map[string][]byte) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(in))
+	for k, v := range in {
+		out[k] = json.RawMessage(v)
+	}
+	return out
+}
+
 // startScopeReplication subscribes to the world scope and each hosted region, routing a state-set
 // broadcast to the affected zones. Called once from Run (after the zones are adopted). A subscribe error
 // is logged and skipped — scope replication degrades to "no updates" rather than failing the shard boot.
+//
+// CONCURRENCY: since the #44 seed-before-subscribe reorder, start() runs AFTER the shard is Run-ning, so a
+// runtime HostZone→registerZone can mutate sr.regions / sr.subs concurrently. So read the boot region set
+// under the lock and guard every sr.subs append with it, matching registerZone's discipline. (A boot region
+// is populated at construction and never overlaps a genuinely-new runtime region, so no double-subscribe.)
 func (sr *scopeReplication) start() {
 	if sr == nil {
 		return
@@ -180,17 +315,29 @@ func (sr *scopeReplication) start() {
 	}); err != nil {
 		sr.log.Warn("world scope subscribe failed; world state will not replicate", "err", err)
 	} else {
+		sr.mu.Lock()
 		sr.subs = append(sr.subs, sub)
+		sr.mu.Unlock()
 	}
-	// Each region this shard hosts a member of: a region delta routes only to that region's member zones.
+	// Snapshot the boot region set under the lock, then subscribe outside it (registerZone may be adding a
+	// runtime region concurrently).
+	sr.mu.RLock()
+	regions := make([]string, 0, len(sr.regions))
 	for regionID := range sr.regions {
-		rid := regionID
+		regions = append(regions, regionID)
+	}
+	sr.mu.RUnlock()
+	// Each region this shard hosts a member of: a region delta routes only to that region's member zones.
+	for _, rid := range regions {
+		rid := rid
 		if sub, err := sr.bus.Subscribe(scopebus.Region(rid), func(event string, payload json.RawMessage, _ string) {
 			sr.onScopeEvent("region", rid, event, payload)
 		}); err != nil {
 			sr.log.Warn("region scope subscribe failed; region state will not replicate", "region", rid, "err", err)
 		} else {
+			sr.mu.Lock()
 			sr.subs = append(sr.subs, sub)
+			sr.mu.Unlock()
 		}
 	}
 }
@@ -201,6 +348,13 @@ func (sr *scopeReplication) start() {
 // fan out to every hosted zone via zonesList). MUST be called before the zone's actor starts, so the
 // regionID stamp isn't a data race with a region:get on the zone goroutine. A zone in no region, or a nil
 // replication (no scoped bus), is a no-op.
+//
+// GAP (#44 residual, tracked as a follow-up): this wires the zone for FUTURE deltas but does NOT seed its
+// replica from the store the way boot zones are seeded via seedFromSnapshot — a drain-adopted zone starts
+// empty and only catches up on the next broadcast of each key. A naive seedFromSnapshot call here is unsafe:
+// the zone is exposed to live world deltas (via zonesList) the moment it is adopted, so a full-replace seed
+// posted after would clobber a newer delta. Closing it needs the seed posted before the zone is exposed to
+// the subscription, or the version-stamped snapshot+delta merge the seedFromSnapshot doc flags.
 func (sr *scopeReplication) registerZone(z *Zone) {
 	if sr == nil {
 		return

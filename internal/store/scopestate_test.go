@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -97,4 +98,47 @@ func TestRegionStateRoundTripAndCAS(t *testing.T) {
 	_, ok, err = p.SaveRegionState(ctx, region, key, []byte(`"liberated"`), 0)
 	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+// TestSnapshotScopeState pins the #44 snapshot reads against real Postgres: SnapshotWorldState /
+// SnapshotRegionState return EVERY key->value for their scope, so a joining zone can seed its read-replica.
+func TestSnapshotScopeState(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+	suffix := time.Now().Format("150405.000000")
+	region := "snapregion-" + suffix
+	wk1 := "snapw1-" + suffix
+	wk2 := "snapw2-" + suffix
+	rk := "snapr1-" + suffix
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM world_state WHERE key = ANY($1)`, []string{wk1, wk2})
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM region_state WHERE region_id = $1`, region)
+	})
+
+	if _, _, err := p.SaveWorldState(ctx, wk1, []byte(`{"a":1}`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.SaveWorldState(ctx, wk2, []byte(`true`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.SaveRegionState(ctx, region, rk, []byte(`"tense"`), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	world, err := p.SnapshotWorldState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The value column is JSONB, so Postgres re-serializes ({"a":1} -> {"a": 1}); compare as JSON.
+	require.Contains(t, world, wk1)
+	require.Contains(t, world, wk2)
+	assert.JSONEq(t, `{"a":1}`, string(world[wk1]))
+	assert.JSONEq(t, `true`, string(world[wk2]))
+
+	reg, err := p.SnapshotRegionState(ctx, region)
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Len(t, reg, 1)
+	assert.JSONEq(t, `"tense"`, string(reg[rk]))
 }
