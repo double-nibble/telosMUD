@@ -255,8 +255,16 @@ func (z *Zone) publishCommsConfig(s *session) {
 	if bus == nil || s == nil || s.entity == nil {
 		return
 	}
+	hear := z.effectiveHearSet(s)
+	// #90: mirror the SAME hear-set into the cross-shard presence roster, so the roster is also the per-
+	// channel membership source (Comm.Channel.Players). This is the single funnel every hear-set change routes
+	// through (login/handoff/toggle/access-change/reload), so it keeps the roster's Channels current with zero
+	// extra event plumbing.
+	if z.shard != nil {
+		z.shard.presence.setResidentChannels(s.character, hear)
+	}
 	payload := commbus.ConfigPayload{
-		HearChannels: z.effectiveHearSet(s),
+		HearChannels: hear,
 		Ignore:       z.ignoreList(s),
 	}
 	body, err := commbus.MarshalConfig(payload)

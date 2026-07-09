@@ -104,6 +104,15 @@ func (p *presenceTracker) join(playerID, name string, afk, concealed bool) {
 	}
 	e := roster.Entry{PlayerID: playerID, Name: name, ShardID: p.shardID, AFK: afk, Concealed: concealed}
 	p.mu.Lock()
+	// join is also the re-write path for an AFK/conceal change (commscmds.go / republishPresenceOnConcealChange),
+	// which do NOT recompute the hear-set — so CARRY FORWARD any Channels setResidentChannels already stamped
+	// (#90), keeping setResidentChannels the sole writer of Channels and join the sole writer of name/afk/
+	// concealed. Without this, an `afk` toggle (or any command while AFK) would silently wipe the player from
+	// every channel roster until the next publishCommsConfig, and it would NOT self-heal (the heartbeat reads
+	// this wiped map). On a fresh login prev is absent → nil → the following publishCommsConfig stamps it.
+	if prev, ok := p.residents[playerID]; ok {
+		e.Channels = prev.Channels
+	}
 	p.residents[playerID] = e
 	p.mu.Unlock()
 	p.enqueue(eagerOp{id: playerID, entry: e})
@@ -125,6 +134,28 @@ func (p *presenceTracker) leave(playerID string) {
 		return // not ours (or already gone): nothing to remove
 	}
 	p.enqueue(eagerOp{id: playerID, remove: true})
+}
+
+// setResidentChannels updates a resident's effective hear-set on their roster entry (#90), so the cross-
+// shard presence roster ALSO carries the per-channel membership ("who hears X" = List() inverted). Called
+// from publishCommsConfig — the SINGLE funnel every hear-set change routes through (login, handoff arrival,
+// `channel on|off`, an access change, a channel-def hot reload) — so this one wiring point covers them all.
+// A no-op for a non-resident (not ours yet) or a disabled tracker. It eagerly re-writes so a toggle reflects
+// in the roster before the next heartbeat; a dropped eager op self-heals on the next heartbeat. Zone-safe.
+func (p *presenceTracker) setResidentChannels(playerID string, refs []string) {
+	if !p.enabled() {
+		return
+	}
+	p.mu.Lock()
+	e, ok := p.residents[playerID]
+	if !ok {
+		p.mu.Unlock()
+		return // not our resident (yet); join seeds the entry and the following publishCommsConfig re-stamps
+	}
+	e.Channels = append([]string(nil), refs...)
+	p.residents[playerID] = e
+	p.mu.Unlock()
+	p.enqueue(eagerOp{id: playerID, entry: e})
 }
 
 // enqueue hands an eager op to the background loop WITHOUT blocking the zone goroutine; a full queue drops
