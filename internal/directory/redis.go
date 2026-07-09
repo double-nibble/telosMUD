@@ -69,6 +69,7 @@ func (r *Redis) playerKey(playerID string) string  { return r.ns + ":dir:player:
 func (r *Redis) leaseKey(leaseID string) string    { return r.ns + ":dir:lease:" + leaseID }
 func (r *Redis) drainResvKey(target string) string { return r.ns + ":dir:drainresv:" + target }
 func (r *Redis) drainingKey(shardID string) string { return r.ns + ":dir:draining:" + shardID }
+func (r *Redis) occKey(zoneID string) string       { return r.ns + ":dir:occ:" + zoneID }
 
 // ClaimLease takes or RENEWS a generic exclusive lease (Phase 10.1c leader election): it succeeds when
 // the lease is free, EXPIRED, or already this owner's, then (re)sets the owner + a fresh TTL. It reuses
@@ -396,6 +397,51 @@ func (r *Redis) ListDraining(ctx context.Context) (map[string]bool, error) {
 			if id := k[len(prefix):]; id != "" {
 				out[id] = true
 			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	return out, nil
+}
+
+// --- Zone occupancy signal (#42) --------------------------------------------------------------------
+//
+// The placement coordinator balances the fleet by per-zone WEIGHT (PlanWeighted), but weight needs a live
+// signal: how many players are actually in each zone. The owning shard publishes its hosted zones' player
+// counts here on the same heartbeat cadence as its lease renewal; the coordinator reads the whole map to
+// weight the plan. Each key carries a TTL so a crashed shard's occupancy ages out (its zones then read as
+// unweighted → weight 1, the zone-count default) rather than lingering as phantom load.
+
+// SetZoneOccupancy publishes the current player count for a zone this shard owns, with a TTL so a crashed
+// owner's signal ages out. Called on the zone-lease renewal cadence (off the zone goroutine; pop is atomic).
+func (r *Redis) SetZoneOccupancy(ctx context.Context, zoneID string, players int, ttl time.Duration) error {
+	return r.rdb.Set(ctx, r.occKey(zoneID), players, ttl).Err()
+}
+
+// ZoneOccupancies returns every live zone -> player count, the weight signal the placement coordinator
+// feeds to PlanWeighted. A zone whose owner crashed (its key lapsed) is simply absent → the planner defaults
+// it to weight 1. Order is unspecified.
+func (r *Redis) ZoneOccupancies(ctx context.Context) (map[string]int, error) {
+	prefix := r.occKey("")
+	out := map[string]int{}
+	var cursor uint64
+	for {
+		keys, next, err := r.rdb.Scan(ctx, cursor, prefix+"*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range keys {
+			zoneID := k[len(prefix):]
+			if zoneID == "" {
+				continue
+			}
+			n, err := r.rdb.Get(ctx, k).Int()
+			if err != nil {
+				continue // lapsed between the SCAN and the GET, or a non-int value — skip it
+			}
+			out[zoneID] = n
 		}
 		if next == 0 {
 			break

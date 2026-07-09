@@ -160,6 +160,11 @@ type Shard struct {
 	// disables it — the process-local `draining` flag still guards fresh logins.
 	drainMarker DrainMarker
 
+	// occPublisher heartbeats each hosted zone's live player count to the directory on the lease-renewal
+	// cadence (#42), the load signal the placement coordinator weights the plan by. nil disables it (the
+	// coordinator then falls back to zone-count balancing).
+	occPublisher ZoneOccupancyPublisher
+
 	// localZones marks zones this shard hosts LOCALLY and UNLEASED (#212 embedded core bootstrap zone).
 	// A local zone is (a) never lease-renewed — every shard hosts its OWN copy, so there is no single
 	// owner to fence on, and (b) never handed off on a graceful drain — a draining peer's local zone is

@@ -193,7 +193,15 @@ func runPlacementCoordinator(ctx context.Context, dir *directory.Redis, d *direc
 				slog.Warn("placement: fleet observe failed", "err", err)
 				continue
 			}
-			moves := placement.Plan(live, assignment, pool)
+			// #42: balance by real per-zone player WEIGHT (the occupancy signal each shard heartbeats), so a
+			// busy town counts more than an empty wilderness. A read failure — or a zone with no live signal —
+			// degrades to weight 1 (the zone-count plan), never a crash.
+			zoneWeight, werr := dir.ZoneOccupancies(ctx)
+			if werr != nil {
+				slog.Warn("placement: zone occupancy read failed; balancing by zone count this tick", "err", werr)
+				zoneWeight = nil
+			}
+			moves := placement.PlanWeighted(live, assignment, pool, zoneWeight)
 			if len(moves) == 0 {
 				continue // balanced + fully claimed: nothing to do
 			}
