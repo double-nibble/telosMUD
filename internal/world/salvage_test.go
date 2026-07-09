@@ -323,6 +323,77 @@ func TestSalvageOverSkillBonus(t *testing.T) {
 	}
 }
 
+// TestSalvageOverSkillDoesNotCompoundPity (#181): the over-skill bonus re-rolls a table's CHANCE rolls
+// `passes` times, and resolveRoll advances the looter's persistent pity counter on a chance miss. A single
+// over-skilled salvage of a table whose chance roll carries a PITY spec must advance pity EXACTLY ONCE — the
+// base pass — not once per bonus pass (which compounded it up to 1+maxSalvageBonus before the fix).
+func TestSalvageOverSkillDoesNotCompoundPity(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	setAttrBase(actor, "leatherworking", 30) // deep over-skill => the max bonus passes run (same as the bonus test)
+
+	// A salvage table whose chance roll ALWAYS misses (chance 0) and carries a pity spec, so every MUTATING
+	// resolve of it advances the looter's "sunsword" counter by one.
+	e.z.defs.loot.register("pity_salvage", &lootTableDef{ref: "pity_salvage", rolls: []lootRoll{
+		{
+			kind: "chance", chance: 0.0, pity: &lootPity{key: "sunsword", step: 0.05, cap: 0.5},
+			pool: []lootEntry{{item: "midgaard:obj:torch"}},
+		},
+	}})
+	// A RARE (=> salvageBonusStep>0, so over-skill grants bonus passes) item overriding its table to it.
+	addTestItem(e.z, actor, "a pitied trinket", []string{"trinket"},
+		&ItemMeta{tags: []string{"salvageable"}, tier: "rare", salvageTable: "pity_salvage"})
+
+	c := &effectCtx{
+		z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral,
+		arg: "trinket", rng: rand.New(rand.NewSource(1)),
+	}
+	op := &effectOp{kind: "salvage_item", tag: "salvageable", skill: "leatherworking"}
+	if err := opSalvageItem(c, op); err != nil {
+		t.Fatalf("over-skill salvage: %v", err)
+	}
+	if got := lootPityMisses(actor, "sunsword"); got != 1 {
+		t.Fatalf("pity after one over-skilled salvage = %d, want 1 (bonus passes must not compound the counter)", got)
+	}
+}
+
+// TestSalvageBonusPassUsesBuffedPityWithoutMutating (#181): a bonus pass must still roll at the looter's
+// pity-ADJUSTED chance (the buffed odds), it just mustn't advance/reset the counter. Construction: base
+// chance 0 with a step-1.0/cap-1.0 pity. The BASE pass misses (adjusted chance 0 + 0*1.0 = 0) and advances
+// pity to 1; each BONUS pass then rolls at 0 + 1*1.0 = 1.0 — a guaranteed hit that DELIVERS — while leaving
+// the counter at 1 (a bonus-pass hit does not reset it). So we see maxSalvageBonus deliveries and pity == 1.
+func TestSalvageBonusPassUsesBuffedPityWithoutMutating(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	setAttrBase(actor, "leatherworking", 30) // deep over-skill => maxSalvageBonus bonus passes
+
+	e.z.defs.loot.register("buffed_salvage", &lootTableDef{ref: "buffed_salvage", rolls: []lootRoll{
+		{
+			kind: "chance", chance: 0.0, pity: &lootPity{key: "sunsword", step: 1.0, cap: 1.0},
+			pool: []lootEntry{{item: "midgaard:obj:torch"}},
+		},
+	}})
+	addTestItem(e.z, actor, "a buffed trinket", []string{"trinket"},
+		&ItemMeta{tags: []string{"salvageable"}, tier: "rare", salvageTable: "buffed_salvage"})
+
+	c := &effectCtx{
+		z: e.z, actor: actor, source: actor, target: actor, mag: 1, disp: dispNeutral,
+		arg: "trinket", rng: rand.New(rand.NewSource(1)),
+	}
+	op := &effectOp{kind: "salvage_item", tag: "salvageable", skill: "leatherworking"}
+	if err := opSalvageItem(c, op); err != nil {
+		t.Fatalf("buffed-pity salvage: %v", err)
+	}
+	// Base pass missed (0 delivered); each bonus pass hit at the pity-buffed chance.
+	if got := heldQuantity(actor, "midgaard:obj:torch"); got != maxSalvageBonus {
+		t.Fatalf("bonus-pass deliveries = %d, want %d (bonus passes roll at the pity-buffed chance)", got, maxSalvageBonus)
+	}
+	// The counter reflects only the base miss — the bonus-pass hits neither advanced nor reset it.
+	if got := lootPityMisses(actor, "sunsword"); got != 1 {
+		t.Fatalf("pity = %d, want 1 (bonus passes must not mutate the counter, even on a hit)", got)
+	}
+}
+
 // TestSalvageRefuseDoesNotAdvanceSkill: a skill-gated REFUSE suppresses the ability's OnSkillUse, so a player
 // can't train the salvaging skill by spamming a disenchant they're too unskilled to complete (#38 review #1).
 // A SUCCESSFUL salvage leaves the hook enabled.

@@ -168,6 +168,32 @@ func TestPityAccumulatesAndResets(t *testing.T) {
 	}
 }
 
+// TestResolveRollMutatePityGate pins the #181 seam directly: a "chance" miss advances the looter's pity
+// counter only when mutatePity is true (normal loot + the base salvage pass). A no-mutate resolve (a salvage
+// over-skill BONUS pass) still evaluates the same roll but leaves the counter untouched.
+func TestResolveRollMutatePityGate(t *testing.T) {
+	z := lootZone(t)
+	player := z.newPlayerEntity(&session{character: "Hero"}, "Hero")
+	roll := &lootRoll{
+		kind: "chance", chance: 0.0, pity: &lootPity{key: "sunsword", step: 0.05, cap: 0.5},
+		pool: []lootEntry{{item: "midgaard:obj:torch"}},
+	}
+	rng := rand.New(rand.NewSource(1))
+
+	// A mutating miss advances the counter.
+	z.resolveRoll(player, roll, rng, true)
+	if got := lootPityMisses(player, "sunsword"); got != 1 {
+		t.Fatalf("mutating miss: pity = %d, want 1", got)
+	}
+	// Three no-mutate misses (the over-skill bonus passes) leave it at 1.
+	for i := 0; i < 3; i++ {
+		z.resolveRoll(player, roll, rng, false)
+	}
+	if got := lootPityMisses(player, "sunsword"); got != 1 {
+		t.Fatalf("after no-mutate misses: pity = %d, want 1 (bonus passes must not advance it)", got)
+	}
+}
+
 // TestPitySurvivesReload proves a looter's accumulated pity counter round-trips through dumpCharacter/
 // loadCharacter — "I'm due a drop" progress is not lost on a relogin.
 func TestPitySurvivesReload(t *testing.T) {
