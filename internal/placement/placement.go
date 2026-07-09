@@ -91,10 +91,34 @@ type Move struct {
 	To   string
 }
 
-// RebalanceThreshold is the load-imbalance (in zone count) the coordinator tolerates before moving a zone
-// — the hysteresis that stops the fleet thrashing on every tick (PLACEMENT.md §7). With a gap of 1 between
-// the busiest and idlest server being acceptable, only a gap of >1 triggers a move.
+// RebalanceThreshold is the FLOOR imbalance tolerated before a rebalance move — the hysteresis that stops
+// the fleet thrashing over a 1-unit gap (PLACEMENT.md §7). The EFFECTIVE threshold is WEIGHT-PROPORTIONAL
+// (rebalanceThreshold): the larger the per-shard load, the larger the gap tolerated. This is the #42
+// prerequisite for driving real drains — once the coordinator balances by player WEIGHT (PlanWeighted), a
+// fixed 1-player threshold would migrate a zone to shave a single player off the busiest shard (thrash). The
+// floor keeps the pure zone-COUNT plan on small fleets unchanged (there mean load is tiny, so the floor
+// dominates and only a gap of >1 triggers a move, exactly as before).
 const RebalanceThreshold = 1
+
+// rebalanceFraction is the share of the MEAN per-shard load tolerated as imbalance before a rebalance: a gap
+// smaller than ~this fraction of the average shard's load is not worth a migration. 0.15 tolerates a ~15%
+// spread — so a 1000-player-per-shard fleet tolerates a ~150-player gap, not a 1-player one.
+const rebalanceFraction = 0.15
+
+// rebalanceThreshold is the effective imbalance tolerated for a load distribution: the larger of the
+// absolute floor (RebalanceThreshold) and rebalanceFraction of the mean per-shard load. total is the summed
+// weight across all live shards (invariant under Phase-2 moves, which only shift weight between shards), so
+// it is computed once per plan. Pure + deterministic.
+func rebalanceThreshold(total, shards int) int {
+	if shards <= 0 {
+		return RebalanceThreshold
+	}
+	prop := int(rebalanceFraction * (float64(total) / float64(shards)))
+	if prop > RebalanceThreshold {
+		return prop
+	}
+	return RebalanceThreshold
+}
 
 // Plan computes the rebalancing moves toward an even spread (PLACEMENT.md §4, the coordinator's decision
 // engine). Inputs: the live shard ids, the current zone→owner assignment (owner "" or a dead shard = the
@@ -113,11 +137,10 @@ func Plan(liveShards []string, assignment map[string]string, pool []string) []Mo
 // PlanWeighted is Plan balancing by per-zone WEIGHT (e.g. live player count / tick cost) instead of raw
 // zone count — so a busy newbie town counts more than an empty wilderness (PLACEMENT.md §7 load-aware
 // balance). zoneWeight[zone] is the zone's weight; a zone absent from the map (or weight <= 0) defaults to
-// 1, so a nil map reproduces the zone-COUNT Plan exactly. Still PURE + deterministic (the directory CAS is
-// the safety arbiter, not the plan). REMAINING follow-ups (PLACEMENT.md §7): the occupancy SIGNAL pipeline
-// (world -> director) that supplies real weights, wiring the plan to DRIVE the drain executor, a
-// weight-proportional RebalanceThreshold (a 1-player threshold would thrash), locality-aware colocation,
-// and rebalance cooldowns.
+// 1, so a nil map reproduces the zone-COUNT Plan exactly (a nil map also keeps the FIXED rebalance floor —
+// the weight-proportional threshold applies only to a real weight map). Still PURE + deterministic (the
+// directory CAS is the safety arbiter, not the plan). REMAINING follow-ups (PLACEMENT.md §7): wiring the
+// plan to DRIVE the drain executor, locality-aware colocation, and rebalance cooldowns.
 func PlanWeighted(liveShards []string, assignment map[string]string, pool []string, zoneWeight map[string]int) []Move {
 	if len(liveShards) == 0 {
 		return nil
@@ -163,12 +186,24 @@ func PlanWeighted(liveShards []string, assignment map[string]string, pool []stri
 
 	// Phase 2: rebalance by draining one zone at a time from the busiest to the idlest until the spread is
 	// within the threshold. Each move strictly reduces the gap (a moved zone's weight leaves hi and joins
-	// lo), so it terminates in a bounded number of moves.
+	// lo), so it terminates in a bounded number of moves. The threshold is WEIGHT-PROPORTIONAL only when
+	// balancing by real weights (#42) — a fixed 1-player threshold would migrate a zone to shave a single
+	// player off the busiest shard (thrash). The pure zone-COUNT plan (a nil weight map) keeps the fixed
+	// floor, so its "within 1 zone" contract is unchanged at every scale. All zones are assigned by now, so
+	// the total load is final and invariant under the moves below (they only shift weight between shards).
+	threshold := RebalanceThreshold
+	if zoneWeight != nil {
+		total := 0
+		for _, s := range liveShards {
+			total += load[s]
+		}
+		threshold = rebalanceThreshold(total, len(liveShards))
+	}
 	for {
 		hi := mostLoaded(liveShards, load)
 		lo := leastLoaded(liveShards, load)
 		gap := load[hi] - load[lo]
-		if gap <= RebalanceThreshold {
+		if gap <= threshold {
 			break
 		}
 		// Move a zone on hi whose weight STRICTLY reduces the gap (weight < gap). With uniform weights this
