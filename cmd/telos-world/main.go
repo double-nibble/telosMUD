@@ -430,7 +430,8 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithScopeSnapshot(scopeSnap(livePool)). // #44: seed each zone's scope replica from the store on join
 		WithZoneLeasing(dir, cfg.ShardID, directory.DefaultZoneLease, directory.DefaultZoneLease/3, stop).
 		WithPresence(roster, cfg.ShardID).
-		WithDrainMarker(dir). // #41: advertise "draining" so peers don't target us mid-rollout
+		WithDrainMarker(dir).        // #41: advertise "draining" so peers don't target us mid-rollout
+		WithOccupancyPublisher(dir). // #42: heartbeat each hosted zone's player count for weighted placement
 		WithMail(mailStore).
 		WithTells(tellJS), chooseDrainTarget
 }

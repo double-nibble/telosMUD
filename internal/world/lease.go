@@ -57,6 +57,20 @@ func (s *Shard) WithLocalZones(ids ...string) *Shard {
 // construction, so no lock is needed (localZones is set before Run and never mutated after).
 func (s *Shard) isLocalZone(zoneID string) bool { return s.localZones[zoneID] }
 
+// ZoneOccupancyPublisher publishes a hosted zone's live player count to the directory (#42) — the load
+// signal the placement coordinator weights the rebalance plan by. *directory.Redis satisfies it; nil
+// disables publishing (the coordinator falls back to zone-count balancing).
+type ZoneOccupancyPublisher interface {
+	SetZoneOccupancy(ctx context.Context, zoneID string, players int, ttl time.Duration) error
+}
+
+// WithOccupancyPublisher wires the directory port the shard heartbeats each hosted zone's player count to,
+// on the same cadence + TTL as the zone-lease renewal (#42). Optional.
+func (s *Shard) WithOccupancyPublisher(p ZoneOccupancyPublisher) *Shard {
+	s.occPublisher = p
+	return s
+}
+
 // leaseParams returns the effective ttl + renew cadence (applying defaults for zero values).
 func (s *Shard) leaseParams() (ttl, renew time.Duration) {
 	ttl = s.leaseTTL
@@ -151,8 +165,31 @@ func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
 				return
 			default:
 				confirmed = true
+				// Publish this zone's live occupancy (#42 weight signal) now that we've confirmed we own it,
+				// same cadence + TTL as the lease. pop is atomic, so this is safe off the zone goroutine.
+				// Best-effort: a publish error just leaves the coordinator weighting this zone as 1 until the
+				// next tick. Only owned, confirmed zones advertise load — never a zone we're merely adopting.
+				s.publishOccupancy(ctx, zoneID, ttl)
 			}
 		}
+	}
+}
+
+// publishOccupancy heartbeats zoneID's live player count to the directory (#42), if an occupancy publisher
+// is wired. Called from the lease-renewal tick for a confirmed-owned zone. A no-op without a publisher or a
+// resolvable zone.
+func (s *Shard) publishOccupancy(ctx context.Context, zoneID string, ttl time.Duration) {
+	if s.occPublisher == nil {
+		return
+	}
+	z := s.zoneByID(zoneID)
+	if z == nil {
+		return
+	}
+	octx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := s.occPublisher.SetZoneOccupancy(octx, zoneID, int(z.pop.Load()), ttl); err != nil {
+		slog.Debug("zone occupancy publish failed", "zone", zoneID, "err", err)
 	}
 }
 
