@@ -278,12 +278,13 @@ func (z *Zone) runCombatRound(pulse uint64) bool {
 			anyFighting = true
 		}
 	}
-	// Live vitals (#40): after the whole round resolves, push a change-detected vitals update to every
-	// player combatant who opted in (`vitals on`), so a round's HP drain reaches their prompt + GMCP
-	// gauge live rather than waiting for their next command. Change-detected + once-per-round: no spam.
+	// Live vitals (#40, #84): after the whole round resolves, push a change-detected HUD update to every
+	// player combatant who opted in (`vitals on`) — vitals + status + stats deltas and the text prompt — so a
+	// round's HP drain (and any mid-combat status/stat change) reaches their prompt + GMCP panels live rather
+	// than waiting for their next command. Change-detected + once-per-round: no spam.
 	for _, e := range combatants {
 		if s, ok := sessionOf(e); ok {
-			z.flushLiveVitals(s)
+			z.flushHUD(s, true)
 		}
 	}
 	return anyFighting

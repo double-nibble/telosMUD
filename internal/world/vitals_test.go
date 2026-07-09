@@ -38,6 +38,127 @@ func TestVitalsToggleAndPrompt(t *testing.T) {
 	}
 }
 
+// collectHUD drains a session's out buffer and reports which HUD GMCP packages were emitted + whether a
+// vitals-bearing text prompt was sent.
+func collectHUD(s *session) (pkgs map[string]bool, promptWithPools bool) {
+	pkgs = map[string]bool{}
+	for {
+		select {
+		case f := <-s.out:
+			if g := f.GetGmcp(); g != nil {
+				pkgs[g.GetPkg()] = true
+			}
+			if p := f.GetPrompt(); p != nil && strings.Contains(p.GetMarkup(), "hp:") {
+				promptWithPools = true
+			}
+		default:
+			return pkgs, promptWithPools
+		}
+	}
+}
+
+// TestFlushHUDNonCombatGaugesOnly pins #84 part 1: the non-combat cadence (withPrompt=false) pushes the
+// live GMCP gauges when a vital moved but does NOT reprint the text prompt (that would spam a plain client).
+func TestFlushHUDNonCombatGaugesOnly(t *testing.T) {
+	z, s := abilityTestZone(t)
+	s.vitalsLive = true
+	setResourceCurrent(s.entity, "hp", 80)
+	z.flushHUD(s, false) // prime the last-sent buffers
+	collectHUD(s)        // drain the priming frames
+
+	setResourceCurrent(s.entity, "hp", 90) // passive regen out of combat
+	if !z.flushHUD(s, false) {
+		t.Fatal("flushHUD should report it sent a HUD delta after HP moved")
+	}
+	pkgs, prompt := collectHUD(s)
+	if !pkgs["Char.Vitals"] {
+		t.Error("non-combat tick did not push the Char.Vitals gauge after HP moved")
+	}
+	if prompt {
+		t.Error("non-combat tick reprinted the text prompt; it must push gauges only (no prompt spam)")
+	}
+}
+
+// TestFlushHUDCombatSendsPrompt: the combat cadence (withPrompt=true) also reprints the vitals text prompt.
+func TestFlushHUDCombatSendsPrompt(t *testing.T) {
+	z, s := abilityTestZone(t)
+	s.vitalsLive = true
+	setResourceCurrent(s.entity, "hp", 80)
+	z.flushHUD(s, true)
+	collectHUD(s)
+
+	setResourceCurrent(s.entity, "hp", 70)
+	z.flushHUD(s, true)
+	_, prompt := collectHUD(s)
+	if !prompt {
+		t.Error("combat tick did not reprint the vitals-bearing text prompt after HP moved")
+	}
+}
+
+// TestFlushHUDStatusDeltaNoVitalChange pins #84 part 2: a status change with ZERO vital movement pushes the
+// Char.Status delta (not only on the next command), and does NOT push Char.Vitals or reprint the prompt.
+func TestFlushHUDStatusDeltaNoVitalChange(t *testing.T) {
+	z, s := abilityTestZone(t)
+	s.vitalsLive = true
+	setResourceCurrent(s.entity, "hp", 80)
+	z.flushHUD(s, true) // prime vitals + status
+	collectHUD(s)
+
+	// Change ONLY status (acquire a fighting target) — HP unchanged.
+	foe := z.newEntity(ProtoRef("test:foe"))
+	Add(foe, &Living{})
+	foe.short = "a training dummy"
+	s.entity.living.fighting = foe
+
+	z.flushHUD(s, true)
+	pkgs, prompt := collectHUD(s)
+	if !pkgs["Char.Status"] {
+		t.Error("a mid-combat status change with no vital movement did not push Char.Status")
+	}
+	if pkgs["Char.Vitals"] {
+		t.Error("Char.Vitals pushed despite no vital movement")
+	}
+	if prompt {
+		t.Error("the text prompt was reprinted despite no vital movement (it carries only the vitals gauge)")
+	}
+}
+
+// TestEnsureHUDPulseArmedOnVitalsOn: `vitals on` arms the non-combat HUD cadence; it is idempotent.
+func TestEnsureHUDPulseArmedOnVitalsOn(t *testing.T) {
+	z, s := abilityTestZone(t)
+	if z.hudPulse != nil {
+		t.Fatal("HUD pulse should not be armed before any `vitals on`")
+	}
+	z.dispatch(s, "vitals on")
+	if z.hudPulse == nil {
+		t.Fatal("`vitals on` did not arm the non-combat HUD pulse")
+	}
+	first := z.hudPulse
+	z.dispatch(s, "vitals on")
+	if z.hudPulse != first {
+		t.Fatal("ensureHUDPulse re-armed a second pulse; it must be idempotent")
+	}
+}
+
+// TestFlushHUDSkipsMidHandoff pins the review fix: a frozen (mid-handoff) `vitals on` session is NOT
+// pushed HUD frames — its frames belong to the handoff machinery, not the HUD tick.
+func TestFlushHUDSkipsMidHandoff(t *testing.T) {
+	z, s := abilityTestZone(t)
+	s.vitalsLive = true
+	setResourceCurrent(s.entity, "hp", 80)
+	z.flushHUD(s, false)
+	collectHUD(s)
+
+	setResourceCurrent(s.entity, "hp", 90)
+	s.frozen = true // mid cross-shard handoff
+	if z.flushHUD(s, false) {
+		t.Fatal("flushHUD pushed to a frozen (mid-handoff) session; it must skip it")
+	}
+	if pkgs, _ := collectHUD(s); len(pkgs) != 0 {
+		t.Fatalf("frozen session got HUD frames: %v", pkgs)
+	}
+}
+
 // TestLiveVitalsFlushOnCombatRound proves a `vitals on` player gets a change-detected Char.Vitals + a
 // vitals prompt after a combat round that drained their HP — and a `vitals off` player does NOT.
 func TestLiveVitalsFlushOnCombatRound(t *testing.T) {

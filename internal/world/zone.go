@@ -160,6 +160,11 @@ type Zone struct {
 	// Zone-owned; only the zone goroutine touches it.
 	combatPulse *pulseHandle
 
+	// hudPulse holds the cancel handle for this zone's throttled NON-combat live-HUD cadence (#84,
+	// vitals.go). nil until the first `vitals on` arms it (ensureHUDPulse); it stays armed for the zone's
+	// life. Zone-owned; only the zone goroutine touches it.
+	hudPulse *pulseHandle
+
 	// combatRand is the zone-owned SEEDED rng the combat resolver draws from (to-hit / avoidance / damage
 	// and in-combat ability rolls). Seeded at newZone from seedFromZoneID(id) so a fight is reproducible
 	// from the zone seed (#58) — production no longer draws combat from the process-global math/rand.
@@ -1055,6 +1060,9 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// destination room is THIS zone's, the entity is now ours (single-writer), so this is safe here.
 	applyRoomAffectsTo(s.entity)
 	z.aggroOnEntry(s.entity, r) // arrival-hook parity (distsys SC2): an aggressive mob engages a transferred-in player too
+	if s.vitalsLive {
+		z.ensureHUDPulse() // #84: `vitals on` rides the transfer — arm THIS zone's non-combat HUD cadence
+	}
 	z.sendPrompt(s)
 	z.log.Debug("intra-shard transfer in", "player", s.character, "room", r.proto,
 		"applied", s.appliedSeq, "population", len(z.players))
@@ -1238,6 +1246,9 @@ func (z *Zone) attach(m attachMsg) {
 		s.attachGen++
 		s.send(attachedFrame(z.id))
 		z.log.Debug("player re-attached", "player", character, "applied_seq", s.appliedSeq, "gen", s.attachGen)
+		if s.vitalsLive {
+			z.ensureHUDPulse() // #84: a reconnecting `vitals on` session keeps the pref — re-arm the HUD cadence
+		}
 		z.lookRoom(s)
 		z.sendPrompt(s)
 
