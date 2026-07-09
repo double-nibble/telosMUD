@@ -739,6 +739,8 @@ func (z *Zone) handle(m msg) {
 		z.saveAll(saveFlush)
 	case drainZoneMsg:
 		z.drainZone() // Phase 16.4b: hand every live player off to the zone's new (post-flip) owner
+	case reclaimStragglersMsg:
+		z.reclaimStragglers(v.resp) // #43: clean-disconnect + classify players still resident at the deadline
 	case createdMsg:
 		z.characterCreated(v.id, v.pid)
 	case createFailedMsg:

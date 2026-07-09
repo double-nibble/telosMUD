@@ -175,7 +175,8 @@ func main() {
 				if derr != nil {
 					slog.Warn("graceful drain incomplete; stopping anyway", "err", derr)
 				} else {
-					slog.Info("drain complete", "redirected", res.Redirected, "reclaimed", res.Reclaimed)
+					slog.Info("drain complete", "redirected", res.Redirected, "reclaimed", res.Reclaimed,
+						"reclaimed_infra", res.ReclaimedInfra, "reclaimed_client", res.ReclaimedClient)
 				}
 			} else {
 				shard.Drain() // single-shard: no peer to hand off to; best-effort durable flush
