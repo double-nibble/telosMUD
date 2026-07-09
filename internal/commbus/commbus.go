@@ -68,6 +68,13 @@ const (
 	// player's own derived config is not impersonation). A gate subscribes ONLY its own concrete
 	// config.<self> subject — never a config.* wildcard — so no config can leak across players.
 	ConfigPrefix = SubjectRoot + "config." // telos.comms.config.<playerId>
+	// RosterPrefix is the per-CHANNEL roster root (#90): telos.comms.roster.<channelRef>. The director's
+	// channel-roster aggregator publishes each channel's current listener set (its Comm.Channel.Players
+	// membership, aggregated cross-shard from the presence roster) to this subject; a player's GATE
+	// subscribes ONLY the concrete roster.<ref> subjects for channels it hears (the same HEAR-filter it
+	// applies to chan.<ref>), so a non-hearer never receives a roster. Engine mechanism (director-authored,
+	// like presence/config), so NOT under the chan/tell publish ACL.
+	RosterPrefix = SubjectRoot + "roster." // telos.comms.roster.<channelRef>
 )
 
 // ChanSubject / TellSubject build the per-ref / per-target subject from a VALIDATED token. The
@@ -82,6 +89,10 @@ func TellSubject(playerID string) string { return TellPrefix + playerID }
 // ConfigSubject builds the per-player comms-config subject (Phase 8.6). Same validated-token contract
 // as TellSubject: the caller passes a resolved player id, never free-form client text.
 func ConfigSubject(playerID string) string { return ConfigPrefix + playerID }
+
+// RosterSubject builds the per-channel roster subject (#90). Same validated-token contract as ChanSubject:
+// the caller passes a known channel ref, never free-form client text.
+func RosterSubject(channelRef string) string { return RosterPrefix + channelRef }
 
 // isACLGuarded reports whether subj is a player-authored subject the publish ACL protects (chan/tell).
 // These are the subjects a GATE may subscribe to but must NEVER publish to (P8-A2). Presence and any

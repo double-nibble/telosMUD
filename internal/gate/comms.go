@@ -78,11 +78,12 @@ type commsClient struct {
 	bus    commbus.Bus
 	gmcp   *gmcpState // for the GMCP Comm.Channel.Text mirror (Phase 9.5); never nil
 
-	mu       sync.Mutex
-	stable   []commbus.Subscription          // tell + config subscriptions (lifetime = connection)
-	chanSubs map[string]commbus.Subscription // channel ref -> its concrete subscription (HEAR-filter)
-	ignore   map[string]struct{}             // receiver ignore list (author ids) — the funnel input
-	closed   bool
+	mu         sync.Mutex
+	stable     []commbus.Subscription          // tell + config subscriptions (lifetime = connection)
+	chanSubs   map[string]commbus.Subscription // channel ref -> its concrete text subscription (HEAR-filter)
+	rosterSubs map[string]commbus.Subscription // channel ref -> its per-channel roster subscription (#90)
+	ignore     map[string]struct{}             // receiver ignore list (author ids) — the funnel input
+	closed     bool
 }
 
 // openComms establishes the connection's comms subscriptions. The STABLE subscriptions (lifetime = the
@@ -103,13 +104,14 @@ type commsClient struct {
 // subscriptions, so comms simply delivers nothing and the connection is byte-identical to pre-Phase-8).
 func openComms(log *slog.Logger, bus commbus.Bus, tc *telnet.Conn, gmcp *gmcpState, player string) *commsClient {
 	c := &commsClient{
-		log:      log,
-		tc:       tc,
-		player:   player,
-		bus:      bus,
-		gmcp:     gmcp,
-		chanSubs: map[string]commbus.Subscription{},
-		ignore:   map[string]struct{}{},
+		log:        log,
+		tc:         tc,
+		player:     player,
+		bus:        bus,
+		gmcp:       gmcp,
+		chanSubs:   map[string]commbus.Subscription{},
+		rosterSubs: map[string]commbus.Subscription{},
+		ignore:     map[string]struct{}{},
 	}
 	c.subscribeStable(commbus.TellSubject(player), c.deliverTell)
 	c.subscribeStable(commbus.ConfigSubject(player), c.applyConfig)
@@ -161,7 +163,8 @@ func (c *commsClient) applyConfig(msg commbus.Message) {
 			c.ignore[id] = struct{}{}
 		}
 	}
-	// Drop channel subscriptions no longer wanted.
+	// Drop channel subscriptions no longer wanted — the text sub AND its per-channel ROSTER sub (#90) in
+	// lockstep, so a channel the player stops hearing loses both.
 	var toDrop []commbus.Subscription
 	for ref, sub := range c.chanSubs {
 		if _, keep := want[ref]; !keep {
@@ -169,7 +172,13 @@ func (c *commsClient) applyConfig(msg commbus.Message) {
 			delete(c.chanSubs, ref)
 		}
 	}
-	// Determine channel subscriptions to add (wanted but not yet subscribed).
+	for ref, sub := range c.rosterSubs {
+		if _, keep := want[ref]; !keep {
+			toDrop = append(toDrop, sub)
+			delete(c.rosterSubs, ref)
+		}
+	}
+	// Determine channels to add (wanted but not yet subscribed).
 	var toAdd []string
 	for ref := range want {
 		if _, have := c.chanSubs[ref]; !have {
@@ -183,26 +192,44 @@ func (c *commsClient) applyConfig(msg commbus.Message) {
 	for _, sub := range toDrop {
 		_ = sub.Unsubscribe()
 	}
-	// Subscribe added channels; record each under the lock.
+	// Subscribe added channels — the text subject AND its per-channel roster subject (#90) — recorded in
+	// lockstep under the lock.
 	for _, ref := range toAdd {
-		sub, err := c.bus.Subscribe(commbus.ChanSubject(ref), c.deliverChannel)
+		csub, err := c.bus.Subscribe(commbus.ChanSubject(ref), c.deliverChannel)
 		if err != nil {
 			c.log.Debug("comms channel subscribe failed", "player", c.player, "channel", ref, "err", err)
 			continue
 		}
+		// The per-channel ROSTER sub is a COSMETIC add-on (the GMCP Comm.Channel.Players panel). If it fails
+		// to subscribe, keep the text sub anyway — the player must still HEAR the channel; only the panel
+		// degrades. rsub may be nil, and every teardown below tolerates that.
+		rsub, rerr := c.bus.Subscribe(commbus.RosterSubject(ref), c.deliverRoster)
+		if rerr != nil {
+			c.log.Debug("comms roster subscribe failed", "player", c.player, "channel", ref, "err", rerr)
+			rsub = nil
+		}
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
-			_ = sub.Unsubscribe()
+			_ = csub.Unsubscribe()
+			if rsub != nil {
+				_ = rsub.Unsubscribe()
+			}
 			return
 		}
 		// A concurrent applyConfig could have already added this ref; honor the first.
 		if _, have := c.chanSubs[ref]; have {
 			c.mu.Unlock()
-			_ = sub.Unsubscribe()
+			_ = csub.Unsubscribe()
+			if rsub != nil {
+				_ = rsub.Unsubscribe()
+			}
 			continue
 		}
-		c.chanSubs[ref] = sub
+		c.chanSubs[ref] = csub
+		if rsub != nil {
+			c.rosterSubs[ref] = rsub
+		}
 		c.mu.Unlock()
 	}
 	c.log.Debug("comms config applied", "player", c.player, "hear", len(want), "ignore", len(payload.Ignore))
@@ -296,6 +323,33 @@ func (c *commsClient) deliverChannel(msg commbus.Message) {
 	}
 }
 
+// deliverRoster forwards a per-channel roster (#90) — the director aggregator's authoritative listener set
+// for a channel this player hears — as GMCP Comm.Channel.Players {channel, players}. Content-free like
+// Comm.Channel.List: the gate re-emits the world/director-authored set, only NEUTRALIZING each display name
+// (this GMCP path bypasses telnet.Write's sanitizeOutput, so it must strip color markup + the Trojan-Source
+// bidi overrides itself — #22/#98 — or a crafted name would be display-spoofable). A client that hasn't
+// advertised the package gets nothing (the outbound gate GMCP gate drops it anyway). No ignore/hear gate is
+// needed here: the gate only SUBSCRIBED this roster subject because the player hears the channel.
+func (c *commsClient) deliverRoster(msg commbus.Message) {
+	if !c.gmcp.supported("Comm.Channel.Players") {
+		return
+	}
+	var in struct {
+		Channel string   `json:"channel"`
+		Players []string `json:"players"`
+	}
+	if err := json.Unmarshal([]byte(msg.Body), &in); err != nil {
+		c.log.Debug("comms roster unmarshal failed", "player", c.player, "err", err)
+		return
+	}
+	players := make([]string, 0, len(in.Players))
+	for _, name := range in.Players {
+		players = append(players, textsan.NeutralizeBidi(colormarkup.Strip(name)))
+	}
+	payload, _ := json.Marshal(map[string]any{"channel": in.Channel, "players": players})
+	_ = c.tc.WriteGMCP("Comm.Channel.Players", payload)
+}
+
 // close tears down every subscription this connection holds (the stable tell/config subs + every dynamic
 // channel sub). Called ONCE, via a single defer in handle, on the same return that drops the session — so
 // the subscribe/unsubscribe pair is bound to the connection lifecycle and cannot leak. Idempotent.
@@ -307,12 +361,16 @@ func (c *commsClient) close() {
 	}
 	c.closed = true
 	stable := c.stable
-	chans := make([]commbus.Subscription, 0, len(c.chanSubs))
+	chans := make([]commbus.Subscription, 0, len(c.chanSubs)+len(c.rosterSubs))
 	for _, sub := range c.chanSubs {
+		chans = append(chans, sub)
+	}
+	for _, sub := range c.rosterSubs { // #90: tear down the per-channel roster subs too
 		chans = append(chans, sub)
 	}
 	c.stable = nil
 	c.chanSubs = map[string]commbus.Subscription{}
+	c.rosterSubs = map[string]commbus.Subscription{}
 	c.mu.Unlock()
 
 	for _, sub := range stable {

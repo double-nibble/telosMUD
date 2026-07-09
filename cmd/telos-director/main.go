@@ -31,6 +31,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/directory"
 	"github.com/double-nibble/telosmud/internal/obs"
 	"github.com/double-nibble/telosmud/internal/placement"
+	"github.com/double-nibble/telosmud/internal/presence"
 	"github.com/double-nibble/telosmud/internal/scopebus"
 	"github.com/double-nibble/telosmud/internal/store"
 )
@@ -67,12 +68,14 @@ func main() {
 	// Leader election needs Redis (the lease). Without it a single director is always the leader — fine
 	// for a single-process dev run, unsafe for a multi-instance deployment (no failover arbitration).
 	var claimer director.LeaseClaimer
-	var dir *directory.Redis // the fleet view the placement coordinator watches (nil without Redis)
+	var dir *directory.Redis                   // the fleet view the placement coordinator watches (nil without Redis)
+	var rosterSrc director.ChannelRosterSource // the cross-shard presence roster the #90 aggregator reads (nil without Redis)
 	instanceID := directorInstanceID(cfg)
 	if cfg.Redis.Addr != "" {
 		rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 		defer func() { _ = rdb.Close() }()
 		dir = directory.NewRedis(rdb, "telos")
+		rosterSrc = presence.NewRedis(rdb, "telos") // #90: same Redis + namespace as the who roster
 		claimer = dir
 		slog.Info("leader election enabled", "instance", instanceID)
 	} else {
@@ -131,7 +134,10 @@ func main() {
 		// #45: the world director periodically reaps dead-letter mail — orphaned mail (to a name that never
 		// logs in) older than 30 days, and any mail older than 180 days (the backstop TTL). Leader-gated, so
 		// only one director in the fleet runs it. Reap once a day.
-		WithMailReaper(pool, 24*time.Hour, 30*24*time.Hour, 180*24*time.Hour)
+		WithMailReaper(pool, 24*time.Hour, 30*24*time.Hour, 180*24*time.Hour).
+		// #90: the LEADER world director aggregates the cross-shard presence roster into per-channel listener
+		// sets and publishes changed channels' rosters (GMCP Comm.Channel.Players). Disabled without Redis.
+		WithChannelRosterAggregator(rosterSrc, scopeComms, channelRosterInterval)
 	if claimer != nil {
 		world.WithElection(claimer, instanceID)
 	}
@@ -181,6 +187,10 @@ func main() {
 // placementCoordinatorTick is how often the leader recomputes the placement plan. A moderate cadence: the
 // directory leases (15s) already give liveness; balance is a slow-changing optimization, not a hot path.
 const placementCoordinatorTick = 10 * time.Second
+
+// channelRosterInterval is how often the leader re-aggregates + republishes changed channels' rosters (#90).
+// A roster panel tolerates a few seconds; this matches the who-cache/heartbeat cadence order.
+const channelRosterInterval = 3 * time.Second
 
 // runPlacementCoordinator is the leader-only observe→plan→report loop. It honors leadership (a standby
 // director does nothing) and surfaces the desired moves; the drain executor is the documented next step.

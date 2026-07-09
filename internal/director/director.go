@@ -103,6 +103,21 @@ type Director struct {
 	reapHardTTL     time.Duration
 	lastReapAt      time.Time
 	reapInFlight    atomic.Bool
+
+	// Channel-roster aggregator (#90): the LEADER periodically inverts the cross-shard presence roster to
+	// each channel's listener set and publishes CHANGED channels' rosters to their per-channel roster subject
+	// (Comm.Channel.Players). nil source/bus disables it. rosterInterval is the poll cooldown; lastRosterAt
+	// (actor-goroutine only) tracks the last poll; rosterInFlight single-flights the off-actor List+publish;
+	// lastRosters (worker-goroutine only, single-flighted) is the per-channel snapshot the poll diffs against;
+	// rosterPolls (worker-only) counts aggregations to drive the periodic FULL resync (a roster is convergent
+	// state, so a transient publish dropped for some subscriber must eventually be re-sent even absent a change).
+	rosterSrc      ChannelRosterSource
+	rosterBus      commbus.Bus
+	rosterInterval time.Duration
+	lastRosterAt   time.Time
+	rosterInFlight atomic.Bool
+	lastRosters    map[string][]string
+	rosterPolls    uint64
 }
 
 // MailReaper deletes undeliverable/orphaned mail past the given retention cutoffs (satisfied by *store.Pool).
@@ -291,7 +306,8 @@ func (d *Director) onTick(ctx context.Context) {
 	if len(d.schedules) > 0 {
 		d.runSchedules(ctx)
 	}
-	d.maybeReapMail(ctx) // #45: periodic dead-letter mail reap (no-op unless a reaper is wired)
+	d.maybeReapMail(ctx)                // #45: periodic dead-letter mail reap (no-op unless a reaper is wired)
+	d.maybeAggregateChannelRosters(ctx) // #90: periodic per-channel roster publish (no-op unless wired)
 }
 
 func (d *Director) handle(ctx context.Context, m msg) {
