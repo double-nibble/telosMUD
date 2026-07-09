@@ -207,7 +207,27 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 	// #192 GATE: dry-run validate against the boot builders. Definitively-broken content blocks the publish
 	// fleet-wide (shared-source convergence), so a bad edit never propagates. This runs for BOTH a real
 	// reload and a `--check` dry run.
-	if problems := validatePacks(loaded); len(problems) > 0 {
+	// #205 full merged-graph validation: resolve refs against the WHOLE live content graph (so a cross-pack
+	// attribute cycle or a cross-zone dangling exit/reset resolves), but attribute rejections to the reloaded
+	// (scoped) packs — an unrelated broken pack must not block this reload. `full` is loaded fresh from ALL
+	// enabled packs in ENABLED/BOOT ORDER (r.enabled — NOT the sorted scope list), so last-writer provenance
+	// matches what content.Load makes live; the embedded CORE pack is layered UNDER it (as boot's LoadWithCore
+	// does) so a reloaded exit/reset into a core room/proto resolves. Core is context-only (never in scope). A
+	// context re-read failure is a best-effort INFRA failure — NOT a fall-through to the now-strict cross-zone
+	// checks against a PARTIAL graph, which would falsely reject a legitimate cross-zone reference.
+	full, ferr := src.LoadPacks(ctx, r.enabled)
+	if ferr != nil {
+		r.log.Warn("reload: full-graph context re-read failed; nothing propagated", "packs", packs, "err", ferr)
+		return reloadOutcome{failed: true}
+	}
+	if corePacks, cerr := (content.EmbeddedSource{}).LoadPacks(ctx, []string{content.CorePack}); cerr == nil {
+		full = append(corePacks, full...) // core UNDERNEATH the enabled set: an enabled pack overriding a core ref still wins
+	}
+	scoped := make(map[string]bool, len(packs))
+	for _, p := range packs {
+		scoped[p] = true
+	}
+	if problems := validatePacks(full, scoped); len(problems) > 0 {
 		r.log.Warn("reload: content failed validation; nothing propagated", "packs", packs, "problems", problems)
 		return reloadOutcome{rejected: problems}
 	}

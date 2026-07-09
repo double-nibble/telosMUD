@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"sort"
 )
 
 // attributes.go is the modifier-stack derivation (docs/ABILITIES.md §1, docs/PHASE5-PLAN.md §1.1).
@@ -198,13 +199,25 @@ func addModSource(e *Entity, src modSource) {
 // error logged loudly (the malformed def still loads, but attr() will defensively return 0 for it).
 // Uses a 3-colour DFS over the static ref graph (each def's formula refs).
 func lintAttributeCycles(defs map[string]*attributeDef) []error {
+	var errs []error
+	for _, cycle := range attributeCycles(defs) {
+		errs = append(errs, fmt.Errorf("attribute cycle: %v", cycle))
+	}
+	return errs
+}
+
+// attributeCycles returns each attribute-derivation cycle as its ordered NODE LIST (the DFS stack up to and
+// including the back-edge target). It is the structured form lintAttributeCycles renders to strings: the
+// full-graph reload validator (#205) needs the node set to attribute a cycle to the reloaded packs (reject a
+// cycle only when an in-scope attribute participates), while boot just logs the message. Same DFS, one source.
+func attributeCycles(defs map[string]*attributeDef) [][]string {
 	const (
 		white = 0
 		gray  = 1
 		black = 2
 	)
 	color := make(map[string]int, len(defs))
-	var errs []error
+	var cycles [][]string
 	var visit func(ref string, stack []string)
 	visit = func(ref string, stack []string) {
 		color[ref] = gray
@@ -213,13 +226,19 @@ func lintAttributeCycles(defs map[string]*attributeDef) []error {
 		if def != nil && def.base != nil {
 			refs := map[string]bool{}
 			def.base.refs(refs)
+			// Deterministic edge order (map iteration is random) so the reported cycle set is stable.
+			nexts := make([]string, 0, len(refs))
 			for next := range refs {
+				nexts = append(nexts, next)
+			}
+			sort.Strings(nexts)
+			for _, next := range nexts {
 				if defs[next] == nil {
 					continue // references a non-derived/absent attr: not a cycle edge
 				}
 				switch color[next] {
 				case gray:
-					errs = append(errs, fmt.Errorf("attribute cycle: %v -> %s", append(append([]string{}, stack...), next), next))
+					cycles = append(cycles, append(append([]string{}, stack...), next))
 				case white:
 					visit(next, stack)
 				}
@@ -227,10 +246,15 @@ func lintAttributeCycles(defs map[string]*attributeDef) []error {
 		}
 		color[ref] = black
 	}
+	roots := make([]string, 0, len(defs))
 	for ref := range defs {
+		roots = append(roots, ref)
+	}
+	sort.Strings(roots)
+	for _, ref := range roots {
 		if color[ref] == white {
 			visit(ref, nil)
 		}
 	}
-	return errs
+	return cycles
 }
