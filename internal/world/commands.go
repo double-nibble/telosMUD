@@ -557,6 +557,10 @@ func (z *Zone) move(s *session, dir string) bool {
 	// Lua `enter`/`greet` triggers (7.4c): the room reacts to the arrival, and each scripted mob
 	// in the room greets the entrant. After aggro so a hostile greeting reads naturally. nil-safe.
 	z.fireRoomEntry(s.entity, to)
+	// Lua `witness_leave` trigger (#202): each scripted mob left behind in `from` learns the mover departed
+	// and WHICH WAY (ev.dir), so a chaser can follow (self:move(ev.dir)). Fired last, after the move fully
+	// completes, so a follower relocates toward the mover's destination. Distinct from the room's `leave`.
+	z.fireWitnessLeave(s.entity, from, dir)
 	return false
 }
 
