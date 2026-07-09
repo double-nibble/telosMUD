@@ -157,6 +157,13 @@ func runDeathPhase(t *testing.T, c *helpers.TelnetClient, killCmd string) {
 		"the guaranteed personal-loot torch was not delivered on kill (Phase-12 loot-resolver regression); transcript:\n%s",
 		c.Transcript())
 
+	// #148: goblin_loot ALSO drops a GUARANTEED bind-on-pickup hex-charm, delivered by the SAME resolver —
+	// which calls bindOnPickup on delivery, so the killer holds it BOUND. Guaranteed (not the 25% sword), so
+	// the bound-loot transfer-refusal assertion below is deterministic / flake-free.
+	require.Truef(t, c.Expect("You receive a goblin hex-charm.", 10*time.Second),
+		"the guaranteed bind-on-pickup hex-charm was not delivered on kill (#148 loot fixture regression); transcript:\n%s",
+		c.Transcript())
+
 	// look -> the corpse renders. This asserts BOTH that the death sequence built the
 	// corpse AND that lookRoom renders it (the same render gap that hid the live goblin).
 	from := c.Len()
@@ -179,5 +186,25 @@ func runDeathPhase(t *testing.T, c *helpers.TelnetClient, killCmd string) {
 	c.Send("get knife from corpse")
 	require.Truef(t, c.Expect("You get a rusty knife from the corpse of a small goblin", 10*time.Second),
 		"could not recover the rusty knife from the corpse (death-sequence loot transfer regression); transcript:\n%s",
+		c.Transcript())
+
+	// --- #148: bound-loot transfer refusal ---
+	// The bind-on-pickup hex-charm received on the kill is BOUND to the player. `drop`ping it is refused by
+	// the uniform transfer gate (binding.go transferBlocked emits "$p is bound to you and cannot be parted
+	// with."). This is the first e2e proof the bind gate fires over telnet on a real, deterministically-bound
+	// loot item (was blocked on a guaranteed BoP drop). We assert the stable refusal clause (not the $p short)
+	// so a flavor rename can't break it.
+	from = c.Len()
+	c.Send("drop charm")
+	require.Truef(t, c.ExpectFrom(from, "is bound to you and cannot be parted with.", 10*time.Second),
+		"dropping the bound hex-charm was not refused (bind transfer-gate regression, binding.go transferBlocked); transcript:\n%s",
+		c.Transcript())
+
+	// Contrast: an UNBOUND item (the torch, still held) drops normally — proving the refusal above is the
+	// binding gate specifically, not a blanket-broken drop.
+	from = c.Len()
+	c.Send("drop torch")
+	require.Truef(t, c.ExpectFrom(from, "You drop a wooden torch.", 10*time.Second),
+		"dropping the unbound torch failed (drop regression, or the bind gate is over-broad); transcript:\n%s",
 		c.Transcript())
 }

@@ -4,6 +4,13 @@ loot_tables:
       - kind: guaranteed
         pool:
           - {item: midgaard:obj:torch, tier: common}
+      # #148: a GUARANTEED bind-on-pickup drop. The resolver calls bindOnPickup on delivery (loot.go), so the
+      # looter always ends up holding a BOUND item — a deterministic fixture for the drop-refusal journey,
+      # unlike the 25% sword below. bindOnPickup fires on personal-loot delivery, NOT on a manual `get`, which
+      # is why the bound item must ride the loot table rather than being carried on the corpse.
+      - kind: guaranteed
+        pool:
+          - {item: midgaard:obj:hexcharm, tier: uncommon}
       - kind: chance
         chance: 0.25
         pool:
