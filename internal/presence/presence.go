@@ -54,7 +54,11 @@ type Entry struct {
 	ShardID   string
 	AFK       bool
 	Concealed bool
-	LastSeen  time.Time
+	// Channels is the player's effective hear-set (the sorted {enabled ∩ hearable} channel refs), carried so
+	// the cross-shard roster is ALSO the per-channel membership source (#90): "who hears channel X" is List()
+	// inverted by Channels. Written by the owning shard on the heartbeat, same as the rest of the entry.
+	Channels []string
+	LastSeen time.Time
 }
 
 // Roster is the cross-shard presence store. A shard SET/REMOVEs its own residents (write authority keyed

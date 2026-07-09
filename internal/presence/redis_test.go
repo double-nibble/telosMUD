@@ -3,6 +3,7 @@ package presence
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,6 +95,36 @@ func TestEntryFieldsRoundTrip(t *testing.T) {
 			}
 			if byID["Plain"].Concealed || byID["Plain"].AFK {
 				t.Fatalf("default flags spuriously set in round-trip: %+v", byID["Plain"])
+			}
+		})
+	}
+}
+
+// TestChannelsRoundTrip pins #90: a player's hear-set survives the roster write->read, so the cross-shard
+// roster is the per-channel membership source ("who hears X" = List() inverted).
+func TestChannelsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range eachRoster(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.r.Set(ctx, "shard-a", []Entry{
+				{PlayerID: "Ana", Name: "Ana", Channels: []string{"gossip", "trade"}},
+				{PlayerID: "Bo", Name: "Bo"}, // no channels
+			}, DefaultTTL); err != nil {
+				t.Fatal(err)
+			}
+			got, err := tc.r.List(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			byID := map[string]Entry{}
+			for _, e := range got {
+				byID[e.PlayerID] = e
+			}
+			if strings.Join(byID["Ana"].Channels, ",") != "gossip,trade" {
+				t.Fatalf("Ana channels dropped/reordered in round-trip: %v", byID["Ana"].Channels)
+			}
+			if len(byID["Bo"].Channels) != 0 {
+				t.Fatalf("Bo has spurious channels: %v", byID["Bo"].Channels)
 			}
 		})
 	}
