@@ -63,10 +63,12 @@ func NewRedis(rdb *redis.Client, ns string) *Redis {
 	return &Redis{rdb: rdb, ns: ns}
 }
 
-func (r *Redis) zoneKey(zoneID string) string     { return r.ns + ":dir:zone:" + zoneID }
-func (r *Redis) shardKey(shardID string) string   { return r.ns + ":dir:shard:" + shardID }
-func (r *Redis) playerKey(playerID string) string { return r.ns + ":dir:player:" + playerID }
-func (r *Redis) leaseKey(leaseID string) string   { return r.ns + ":dir:lease:" + leaseID }
+func (r *Redis) zoneKey(zoneID string) string      { return r.ns + ":dir:zone:" + zoneID }
+func (r *Redis) shardKey(shardID string) string    { return r.ns + ":dir:shard:" + shardID }
+func (r *Redis) playerKey(playerID string) string  { return r.ns + ":dir:player:" + playerID }
+func (r *Redis) leaseKey(leaseID string) string    { return r.ns + ":dir:lease:" + leaseID }
+func (r *Redis) drainResvKey(target string) string { return r.ns + ":dir:drainresv:" + target }
+func (r *Redis) drainingKey(shardID string) string { return r.ns + ":dir:draining:" + shardID }
 
 // ClaimLease takes or RENEWS a generic exclusive lease (Phase 10.1c leader election): it succeeds when
 // the lease is free, EXPIRED, or already this owner's, then (re)sets the owner + a fresh TTL. It reuses
@@ -311,6 +313,96 @@ func (r *Redis) ListShards(ctx context.Context) ([]string, error) {
 		cursor = next
 	}
 	return ids, nil
+}
+
+// --- Drain-target reservation + draining marker (#41) -----------------------------------------------
+//
+// A graceful drain hands its zones' players to a peer. When several shards drain at once (a fleet
+// rolling redeploy) they must not all pick the SAME least-loaded peer and blow past its ~one-core
+// occupancy — but the load signal (a peer's player count) lags by a heartbeat, so a target that just
+// AGREED to absorb 50 players still reads its old, low count. The reservation bridges that blind window:
+// a drainer atomically records how many players it is about to send a target; the count is folded into
+// the admission decision until the target's next heartbeat reflects the real higher load. Per-TARGET and
+// COUNTING (not fleet-global / single-flight) so N drains fan concurrently onto N distinct peers, and one
+// fat shard's zones spread across several targets as each fills. Reservations self-expire (TTL) so a
+// crashed drainer's hold clears without a deadlock; the ceiling is SOFT (the caller proceeds over it
+// rather than stall a drain — a dropped socket is worse than transient overload the rebalancer corrects).
+
+// reserveDrainTarget admits a reservation of ARGV incoming players onto a target iff the SUM of in-flight
+// reservations plus incoming fits the caller-computed headroom (ceiling minus the target's current load).
+// Counting via a per-drainer hash field so a drainer's holds accumulate across its zones and are cleared
+// as a unit on release. Returns 1 if admitted, 0 if the target is (reservation-)full.
+// KEYS[1]=drainResvKey(target)  ARGV: drainer, incoming, headroom, ttl_ms
+var reserveDrainTarget = redis.NewScript(`
+local vals = redis.call('HGETALL', KEYS[1])
+local total = 0
+for i = 2, #vals, 2 do total = total + tonumber(vals[i]) end
+if total + tonumber(ARGV[2]) > tonumber(ARGV[3]) then
+  return 0
+end
+redis.call('HINCRBY', KEYS[1], ARGV[1], tonumber(ARGV[2]))
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+return 1
+`)
+
+// ReserveDrainTarget atomically reserves headroom on target for drainer to send `incoming` players, iff
+// the in-flight reservation sum plus incoming fits `headroom` (the caller passes ceiling minus the
+// target's current load; a non-positive headroom always refuses). Returns false when the target is
+// reservation-full — the caller re-selects another peer or, if all are full, proceeds over the soft
+// ceiling. The reservation self-expires after ttl (the backstop for a crashed drainer).
+func (r *Redis) ReserveDrainTarget(ctx context.Context, target, drainer string, headroom, incoming int, ttl time.Duration) (bool, error) {
+	res, err := reserveDrainTarget.Run(ctx, r.rdb, []string{r.drainResvKey(target)},
+		drainer, incoming, headroom, ttl.Milliseconds()).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
+}
+
+// ReleaseDrainTarget clears a drainer's reservation on target once its handoff completes, freeing the
+// headroom immediately rather than waiting out the TTL. Best-effort (the TTL is the correctness backstop).
+//
+// IMPORTANT: this HDELs the drainer's WHOLE accumulated field. Because ReserveDrainTarget accumulates all of
+// a drainer's zones (HINCRBY the same field), release is a WHOLE-DRAIN operation — call it ONCE per target
+// at drain completion, over the set of distinct targets used, NEVER inside the per-zone loop (a per-zone
+// release would wipe sibling zones' reservations and under-count headroom for concurrent drainers).
+func (r *Redis) ReleaseDrainTarget(ctx context.Context, target, drainer string) error {
+	return r.rdb.HDel(ctx, r.drainResvKey(target), drainer).Err()
+}
+
+// SetDraining marks shardID as draining (a marker key with a TTL backstop), so the drain-target selector
+// EXCLUDES it as a candidate — otherwise a full fleet rollout could ping-pong (A drains onto B while B
+// drains onto A). Cleared on drain completion; the TTL reclaims it if the drainer crashes mid-drain.
+func (r *Redis) SetDraining(ctx context.Context, shardID string, ttl time.Duration) error {
+	return r.rdb.Set(ctx, r.drainingKey(shardID), "1", ttl).Err()
+}
+
+// ClearDraining removes shardID's draining marker (drain completed or aborted).
+func (r *Redis) ClearDraining(ctx context.Context, shardID string) error {
+	return r.rdb.Del(ctx, r.drainingKey(shardID)).Err()
+}
+
+// ListDraining returns the set of shard ids currently marked draining, for the selector to exclude.
+func (r *Redis) ListDraining(ctx context.Context) (map[string]bool, error) {
+	prefix := r.drainingKey("")
+	out := map[string]bool{}
+	var cursor uint64
+	for {
+		keys, next, err := r.rdb.Scan(ctx, cursor, prefix+"*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range keys {
+			if id := k[len(prefix):]; id != "" {
+				out[id] = true
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	return out, nil
 }
 
 // Placement is which shard a player currently lives on and the epoch that put them
