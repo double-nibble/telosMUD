@@ -70,6 +70,8 @@ func (r *Redis) leaseKey(leaseID string) string    { return r.ns + ":dir:lease:"
 func (r *Redis) drainResvKey(target string) string { return r.ns + ":dir:drainresv:" + target }
 func (r *Redis) drainingKey(shardID string) string { return r.ns + ":dir:draining:" + shardID }
 func (r *Redis) occKey(zoneID string) string       { return r.ns + ":dir:occ:" + zoneID }
+func (r *Redis) rebalanceKey(zoneID string) string { return r.ns + ":dir:rebalance:" + zoneID }
+func (r *Redis) cooldownKey(zoneID string) string  { return r.ns + ":dir:cooldown:" + zoneID }
 
 // ClaimLease takes or RENEWS a generic exclusive lease (Phase 10.1c leader election): it succeeds when
 // the lease is free, EXPIRED, or already this owner's, then (re)sets the owner + a fresh TTL. It reuses
@@ -449,6 +451,85 @@ func (r *Redis) ZoneOccupancies(ctx context.Context) (map[string]int, error) {
 		cursor = next
 	}
 	return out, nil
+}
+
+// --- Rebalance directive + cooldown (#42 slice 3) ---------------------------------------------------
+//
+// The placement coordinator (leader) balances the fleet by draining a single zone from a busy shard to an
+// idler peer. It has NO shard->director RPC, so it publishes the move as a DIRECTIVE keyed by zone; the
+// zone's CURRENT owner — the only shard that renews that zone's lease — reads it on its per-zone renewal
+// tick and executes the drain. The directive is a HINT that TRIGGERS the already-fenced HandoverZone flip;
+// it is NEVER authority for ownership (the lease CAS is), so no lost/dup/reordered directive can double-own.
+// The cooldown (keyed by ZONE so it survives the ownership change) stops a boundary zone ping-ponging.
+
+// IssueRebalance records/refreshes a directive to move zoneID to toShard (stable shard id — the owner
+// resolves its endpoint at execution). ATOMIC (a single SET with expiry) so a crash can never leave a
+// directive with no TTL. Idempotent by zone: a repeat with the same toShard just refreshes the TTL; a
+// different toShard is last-write-wins. The TTL is drain-deadline-scoped, so a crashed owner's directive
+// self-expires. Written by the coordinator leader.
+func (r *Redis) IssueRebalance(ctx context.Context, zoneID, toShard string, ttl time.Duration) error {
+	return r.rdb.Set(ctx, r.rebalanceKey(zoneID), toShard, ttl).Err()
+}
+
+// ReadRebalance returns the target shard of a pending rebalance directive for zoneID, or found=false if
+// none. Read by the owning shard (to act) and by the coordinator (to skip re-issuing an in-flight move).
+func (r *Redis) ReadRebalance(ctx context.Context, zoneID string) (toShard string, found bool, err error) {
+	to, err := r.rdb.Get(ctx, r.rebalanceKey(zoneID)).Result()
+	if err == redis.Nil {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return to, to != "", nil
+}
+
+// refreshRebalance re-arms the directive TTL only if it still points at toShard — so an in-flight drain's
+// heartbeat can't keep alive a directive the coordinator has since re-pointed at a different target.
+// KEYS[1]=rebalanceKey  ARGV[1]=toShard  ARGV[2]=ttl_ms
+var refreshRebalance = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
+  return 1
+end
+return 0
+`)
+
+// RefreshRebalance re-arms a directive's TTL while the drain to toShard is in-flight (owner heartbeat),
+// fenced so it no-ops if the directive was re-pointed or cleared.
+func (r *Redis) RefreshRebalance(ctx context.Context, zoneID, toShard string, ttl time.Duration) error {
+	return refreshRebalance.Run(ctx, r.rdb, []string{r.rebalanceKey(zoneID)}, toShard, ttl.Milliseconds()).Err()
+}
+
+// clearRebalance deletes the directive only if it still points at toShard (a fenced clear, so a completing
+// drain can't wipe a directive the coordinator has since re-pointed at a new target). KEYS[1]=rebalanceKey
+// ARGV[1]=toShard
+var clearRebalance = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+end
+return 1
+`)
+
+// ClearRebalance removes zoneID's directive once its drain to toShard completes (fenced by toShard).
+func (r *Redis) ClearRebalance(ctx context.Context, zoneID, toShard string) error {
+	return clearRebalance.Run(ctx, r.rdb, []string{r.rebalanceKey(zoneID)}, toShard).Err()
+}
+
+// SetCooldown marks zoneID as recently rebalanced, so the coordinator won't move it again until the TTL
+// elapses (anti-ping-pong). Keyed by zone so it survives the ownership change; set by the coordinator at
+// issue time. NOT read by the failover claim path (a crashed shard's zone is always reassignable).
+func (r *Redis) SetCooldown(ctx context.Context, zoneID string, ttl time.Duration) error {
+	return r.rdb.Set(ctx, r.cooldownKey(zoneID), "1", ttl).Err()
+}
+
+// OnCooldown reports whether zoneID is within its post-rebalance cooldown window.
+func (r *Redis) OnCooldown(ctx context.Context, zoneID string) (bool, error) {
+	n, err := r.rdb.Exists(ctx, r.cooldownKey(zoneID)).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // Placement is which shard a player currently lives on and the epoch that put them
