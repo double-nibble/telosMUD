@@ -85,3 +85,51 @@ func (p *Pool) SaveRegionState(ctx context.Context, regionID, key string, value 
 	}
 	return nonNegU64(v), true, nil
 }
+
+// SnapshotWorldState returns EVERY world-scope key -> value, for a subscriber (a zone read-replica) to seed
+// its cache on join (#44): a zone that was down when a transient state delta broadcast missed it starts with
+// the authoritative current state instead of empty. Values are the raw stored bytes (the version CAS is the
+// director's concern; a read-only replica only needs the value). Off the zone goroutine (a shard boot read).
+func (p *Pool) SnapshotWorldState(ctx context.Context) (map[string][]byte, error) {
+	rows, err := p.pool.Query(ctx, `SELECT key, value FROM world_state`)
+	if err != nil {
+		return nil, fmt.Errorf("store: snapshot world_state: %w", err)
+	}
+	defer rows.Close()
+	out := map[string][]byte{}
+	for rows.Next() {
+		var key string
+		var value []byte
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, fmt.Errorf("store: scan world_state snapshot: %w", err)
+		}
+		out[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: snapshot world_state: %w", err)
+	}
+	return out, nil
+}
+
+// SnapshotRegionState returns EVERY key -> value for one region, the region-scoped analog of
+// SnapshotWorldState (#44).
+func (p *Pool) SnapshotRegionState(ctx context.Context, regionID string) (map[string][]byte, error) {
+	rows, err := p.pool.Query(ctx, `SELECT key, value FROM region_state WHERE region_id = $1`, regionID)
+	if err != nil {
+		return nil, fmt.Errorf("store: snapshot region_state %s: %w", regionID, err)
+	}
+	defer rows.Close()
+	out := map[string][]byte{}
+	for rows.Next() {
+		var key string
+		var value []byte
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, fmt.Errorf("store: scan region_state snapshot %s: %w", regionID, err)
+		}
+		out[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: snapshot region_state %s: %w", regionID, err)
+	}
+	return out, nil
+}

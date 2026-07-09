@@ -55,6 +55,16 @@ const (
 	keepaliveMinTime = 10 * time.Second
 )
 
+// scopeSnap adapts the live Postgres pool to the world's scope-snapshot source (#44), returning a TRUE nil
+// interface when the pool is nil (Postgres unavailable) — so the shard degrades to "start empty, catch up on
+// broadcast" rather than tripping the nil-pointer-in-interface trap on a nil *store.Pool.
+func scopeSnap(p *store.Pool) world.ScopeSnapshotSource {
+	if p == nil {
+		return nil
+	}
+	return p
+}
+
 // handoffAuthGate is the FAIL-CLOSED boot decision for the keyless-handoff guard (#251), factored out of main
 // so it is unit-testable. shardErr is Shard.CheckHandoffAuth()'s result (non-nil = this shard can receive
 // handoffs but has no verify key). It returns that error as fatal when insecure mode was NOT explicitly opted
@@ -328,6 +338,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithHandoffKeys(handoffSignKey, handoffVerifyKey).
 			WithInsecureHandoff(cfg.AllowInsecure). // #260: a keyless shard refuses handoffs unless opted in
 			WithScopeBus(scopeBus, lc.Regions).
+			WithScopeSnapshot(scopeSnap(livePool)). // #44: seed each zone's scope replica from the store on join
 			WithMail(mailStore).
 			WithTells(tellJS), nil
 	}
@@ -423,6 +434,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithInsecureHandoff(cfg.AllowInsecure).           // #260: a keyless shard refuses handoffs unless opted in
 		WithSessionLock(sessionlock.NewRedis(rdb), 0, 0). // Phase 14.4: cross-shard single-session lock (Redis)
 		WithScopeBus(scopeBus, lc.Regions).
+		WithScopeSnapshot(scopeSnap(livePool)). // #44: seed each zone's scope replica from the store on join
 		WithZoneLeasing(dir, cfg.ShardID, directory.DefaultZoneLease, directory.DefaultZoneLease/3, stop).
 		WithPresence(roster, cfg.ShardID).
 		WithMail(mailStore).

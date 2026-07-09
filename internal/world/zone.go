@@ -802,6 +802,8 @@ func (z *Zone) handle(m msg) {
 		z.probeLastTell(v)
 	case scopeDeltaMsg:
 		z.applyScopeDelta(v) // a director's region/world broadcast updates this zone's read-replica
+	case scopeSeedMsg:
+		z.applyScopeSeed(v) // #44: the store snapshot seeds the replica on join (posted before live deltas)
 	case scopeEventMsg:
 		z.fireScopeEvent(v) // a director's remote-effect broadcast fires on_world/on_region handlers
 	}

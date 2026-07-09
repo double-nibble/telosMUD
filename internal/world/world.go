@@ -676,15 +676,6 @@ func (s *Shard) Run(ctx context.Context) {
 	if s.reloader != nil {
 		defer s.reloader.stop()
 	}
-	// Scope replication (10.3b): subscribe to the world + hosted-region scopes so a director's broadcast
-	// updates the zone replicas. Like hot reload it runs on the bus's subscription goroutines; tear the
-	// subscriptions down at stop. Started AFTER the zones exist (they do — adopted at construction) so a
-	// delivered delta always has a live zone inbox to post to.
-	if s.scopes != nil {
-		s.scopes.start()
-		defer s.scopes.stop()
-		go s.scopes.signalLoop(ctx) // off-zone-goroutine signal-up publisher (durable; 10.3c)
-	}
 	var wg sync.WaitGroup
 	// Capture the run ctx + wg so HostZone (16.4a) can launch a runtime-added zone onto this same
 	// lifetime and have the Wait below cover it. Snapshot the boot zones under the same lock so a
@@ -704,6 +695,17 @@ func (s *Shard) Run(ctx context.Context) {
 			z.Run(ctx)
 		}(z)
 		s.startZoneRenewal(ctx, z.id) // shard-owned lease renewal (16.4b; no-op when leasing is off)
+	}
+	// Scope replication (10.3b + #44): started AFTER the zone actor loops launch above, so seedFromSnapshot's
+	// BLOCKING seed posts always have a live drainer (seeding before launch could wedge boot if an inbox filled
+	// — e.g. mass inbound handoff Prepare during a failover — before its loop drained it). Seed FIRST, then
+	// subscribe: the seed is enqueued ahead of any live delta (the subscriptions don't exist until start()), so
+	// replicas are seeded before deltas build on them. Runs on the bus's subscription goroutines; stop at exit.
+	if s.scopes != nil {
+		s.scopes.seedFromSnapshot()
+		s.scopes.start()
+		defer s.scopes.stop()
+		go s.scopes.signalLoop(ctx) // off-zone-goroutine signal-up publisher (durable; 10.3c)
 	}
 	// Block on the shard's lifetime, THEN wait for every zone (incl. runtime-added ones) to finish.
 	// A standby that won no zones has an empty wg; without the ctx wait it would exit Run immediately
