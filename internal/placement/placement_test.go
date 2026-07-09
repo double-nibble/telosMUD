@@ -162,6 +162,32 @@ func TestPlanStableWhenBalanced(t *testing.T) {
 	assert.Empty(t, moves, "an already-even spread (2/2) is left alone — hysteresis, no thrash")
 }
 
+// TestRebalanceThresholdProportional pins the #42 weight-proportional threshold: the absolute floor on a
+// small (or zero-shard) fleet, ~15% of the mean per-shard load at scale.
+func TestRebalanceThresholdProportional(t *testing.T) {
+	assert.Equal(t, RebalanceThreshold, rebalanceThreshold(4, 2), "small total => the floor dominates")
+	assert.Equal(t, 150, rebalanceThreshold(2000, 2), "mean 1000 => 15% == 150")
+	assert.Equal(t, RebalanceThreshold, rebalanceThreshold(100, 0), "zero shards => floor, no divide-by-zero")
+}
+
+// TestPlanWeightedThresholdPreventsThrash pins the anti-thrash prerequisite for driving real drains: a small
+// RELATIVE imbalance on a heavily-loaded fleet is left alone (a fixed 1-player threshold would migrate a
+// zone to shave 60 players off a ~1000-load shard). The floor still bites at small scale.
+func TestPlanWeightedThresholdPreventsThrash(t *testing.T) {
+	pool := []string{"z1", "z2", "z3"}
+	// a = 1000 (z1 500 + z2 500), b = 940 (z3): a ~60-player gap, ~6% of the mean 970 — within the ~15%
+	// proportional threshold (145), so no move. With the old fixed threshold of 1, this would drain a zone.
+	assignment := map[string]string{"z1": "shard-a", "z2": "shard-a", "z3": "shard-b"}
+	weights := map[string]int{"z1": 500, "z2": 500, "z3": 940}
+	moves := PlanWeighted([]string{"shard-a", "shard-b"}, assignment, pool, weights)
+	assert.Empty(t, moves, "a small relative gap on a heavy fleet is within tolerance: no thrash")
+
+	// Small scale (floor regime): a 3-vs-0 zone-count gap still rebalances — the floor of 1 bites.
+	smallAssign := map[string]string{"z1": "shard-a", "z2": "shard-a", "z3": "shard-a"}
+	smallMoves := PlanWeighted([]string{"shard-a", "shard-b"}, smallAssign, pool, map[string]int{"z1": 1, "z2": 1, "z3": 1})
+	assert.NotEmpty(t, smallMoves, "small fleet still rebalances a 3-vs-0 gap (floor regime)")
+}
+
 func TestPlanReclaimsDeadShardsZones(t *testing.T) {
 	pool := []string{"z1", "z2", "z3"}
 	// shard-c owned z3 but is NOT in the live set (it crashed): z3 is unclaimed and must be reassigned.
