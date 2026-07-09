@@ -192,8 +192,13 @@ func itemEntry(e *Entity, wr *Wearer) gmcpItem {
 	if wr != nil && wr.slotOf(e) != WearLocNone {
 		attrib += "W"
 	}
-	return gmcpItem{ID: fmt.Sprintf("i%v", e.RuntimeID()), Name: gmcpText(e.Name()), Attrib: attrib}
+	return gmcpItem{ID: itemGMCPID(e), Name: gmcpText(e.Name()), Attrib: attrib}
 }
+
+// itemGMCPID is the stable per-instance GMCP id for a non-grouping item — "i<runtimeID>". A container is
+// never coalesced (its hidden contents differ), so a container the client names in a Char.Items list always
+// carries this id; #92's Char.Items.Contents request resolves back to the entity by it.
+func itemGMCPID(e *Entity) string { return fmt.Sprintf("i%v", e.RuntimeID()) }
 
 // coalesceGMCPItems groups a slice of items into Char.Items entries the SAME way the plain-telnet listing
 // coalesces (coalesceItemLines): identical DISCRETE items merge into one entry carrying a Count (#26).

@@ -136,13 +136,36 @@ func parseSupports(jsonBytes []byte) []string {
 	return out
 }
 
+// gmcpForward is a whitelisted inbound GMCP request the gate relays to the world (#92): a package name plus
+// its raw JSON payload. The gate handles Core.* locally and forwards ONLY the request packages it knows
+// (forwardableGMCP), so a client can never push arbitrary GMCP into the world.
+type gmcpForward struct {
+	pkg  string
+	json []byte
+}
+
+// forwardableGMCP is the whitelist of inbound GMCP packages the gate relays to the world. Everything else is
+// handled locally (Core.*) or dropped — the world only ever sees requests it has a handler for.
+var forwardableGMCP = map[string]bool{
+	"Char.Items.Contents": true, // #92: open a container's contents panel
+}
+
 // gmcpHandler builds the inbound GMCP sink installed on the telnet codec. It runs on the line-pump
-// goroutine as each IAC SB 201 message is parsed. It handles the Core.* housekeeping locally and drops
-// everything else (nothing is forwarded to the world in 9.1). tc is captured for the Core.Ping reply.
-func gmcpHandler(g *gmcpState, tc *telnet.Conn, log *slog.Logger) func(pkg string, json []byte) {
+// goroutine as each IAC SB 201 message is parsed. It handles the Core.* housekeeping locally, RELAYS a
+// whitelisted request to the world via req (#92), and drops everything else. tc is captured for the
+// Core.Ping reply. A full req channel drops the request (the client re-asks) — never blocks the line pump.
+func gmcpHandler(g *gmcpState, tc *telnet.Conn, req chan<- gmcpForward, log *slog.Logger) func(pkg string, json []byte) {
 	return func(pkg string, payload []byte) {
 		if !validGMCPPackage(pkg) {
 			log.Debug("gmcp inbound dropped: invalid package name", "len", len(pkg))
+			return
+		}
+		if forwardableGMCP[pkg] {
+			select {
+			case req <- gmcpForward{pkg: pkg, json: payload}:
+			default:
+				log.Debug("gmcp request dropped: forward channel full", "pkg", pkg)
+			}
 			return
 		}
 		switch pkg {
