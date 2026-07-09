@@ -337,6 +337,29 @@ func (z *Zone) fireSpawn(e *Entity) {
 	rt.fireTrigger(e, "spawn", rt.rootCtx(e), rt.evTable(nil, ""))
 }
 
+// fireWitnessLeave fires the `witness_leave` trigger on each scripted MOB co-located with `leaver` when the
+// leaver departs `room` in direction `dir` (ev.actor = leaver, ev.dir = direction). Unlike `leave` — which
+// fires on the ROOM and carries no direction — this reaches the OTHER occupants and tells them WHICH WAY the
+// leaver went, the hook a chaser needs to follow (self:move(ev.dir)). The leaver, items, and the room are
+// skipped. Fired from the movement path AFTER the leaver has moved, so a handler's own self:move relocates
+// the mob toward the departed leaver. The contents are SNAPSHOT before iterating, so a handler that moves an
+// occupant out of `room` (the chaser following) can't corrupt the walk. Clean ROOT cascade. nil-safe.
+func (z *Zone) fireWitnessLeave(leaver, room *Entity, dir string) {
+	if z == nil || z.lua == nil || leaver == nil || room == nil {
+		return
+	}
+	rt := z.lua
+	occs := append([]*Entity(nil), room.contents...) // snapshot: a chaser's self:move mutates room.contents
+	for _, occ := range occs {
+		if occ == leaver || occ == nil || occ.living == nil || !Has[*Scripted](occ) {
+			continue
+		}
+		ev := rt.evTable(leaver, "")
+		ev.RawSetString("dir", lua.LString(dir))
+		rt.fireTrigger(occ, "witness_leave", rt.rootCtx(occ), ev)
+	}
+}
+
 // fireRoomLeave fires the `leave` trigger on the room when `leaver` departs (ev.actor = leaver).
 // Fired BEFORE the entity detaches so the room can still see it. nil-safe.
 func (z *Zone) fireRoomLeave(leaver, room *Entity) {

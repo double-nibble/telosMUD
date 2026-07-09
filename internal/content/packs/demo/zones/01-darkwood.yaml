@@ -111,6 +111,22 @@ zones:
             end
             mud.after(20, step)
           end)
+      # stalker: a CHASING mob (#202 scenario 2). Non-combat; on("witness_leave") it learns a player left its
+      # room AND which way (ev.dir) and follows — the direction-bearing departure event a mob needs to track a
+      # fleer (the room's `leave` trigger carries no direction). Lurks in the deep sanctum; if it follows a
+      # player out, roam:true counts it zone-wide so the repop doesn't leak a replacement (like the wisp).
+      - ref: darkwood:mob:stalker
+        keywords: [stalker, shadow, lurker]
+        short: a shadowy stalker
+        long: A shadowy shape watches from the dark, poised to follow.
+        living:
+          attributes:
+            level: 1
+            constitution: 1
+        lua: |
+          on("witness_leave", function(ev)
+            self:move(ev.dir)
+          end)
       # An AGGRESSIVE goblin (Phase 6.3b): `aggressive: 1` is a CONTENT number the engine reads to make
       # the mob initiate combat on a player entering its room (death.go aggroOnEntry) — no engine flag.
       - ref: darkwood:mob:goblin-chief
@@ -298,6 +314,9 @@ zones:
       # #202: a wanderer that drifts the darkwood chain. roam:true => the repop counts it ZONE-WIDE, so when it
       # has wandered off grove the top-up sees the one live wisp elsewhere and does NOT leak a replacement.
       - {op: spawn_mob, proto: darkwood:mob:wisp, room: darkwood:room:grove, count: 1, roam: true}
+      # #202: a stalker that lurks in the deep sanctum and FOLLOWS a fleeing player (on witness_leave). roam
+      # so following a player out doesn't leak a replacement.
+      - {op: spawn_mob, proto: darkwood:mob:stalker, room: darkwood:room:sanctum, count: 1, roam: true}
       # Arm the goblin with its rusty knife: the item spawns INTO the goblin's inventory (reset `into` a
       # mob, reset.go), so its corpse holds it. Script order matters — the goblin must spawn first.
       - {op: spawn_item, proto: darkwood:obj:rusty-knife, into: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}

@@ -130,6 +130,10 @@ func cmdFlee(c *Context) error {
 	if c.s != nil {
 		c.z.lookRoom(c.s)
 	}
+	// Lua `witness_leave` (#202): a scripted mob left behind learns the fleer bolted and WHICH WAY (ev.dir),
+	// so a chaser can pursue a FLEEING player — the issue's actual scenario. Wired into the flee path as well
+	// as the walk path, since a player escaping combat can only leave via flee, not move.
+	c.z.fireWitnessLeave(c.Actor, from, dir)
 	return nil
 }
 
