@@ -215,6 +215,66 @@ func TestMobGreetingReloadsLiveStatePersists(t *testing.T) {
 	}
 }
 
+// TestTopLevelStateSeedReloadGuard (#67) pins the reload semantics that the demo greeter (and the builder
+// guide) depend on: a hot reload RE-RUNS the whole registration body against the PRESERVED self.state. So a
+// GUARDED top-level seed (`state.x = state.x or {}`) is a no-op on reload and the data survives, while a bare
+// `state.x = {}` re-executes and WIPES it. Both halves are asserted so a future engine change that alters
+// re-run semantics is caught either way.
+func TestTopLevelStateSeedReloadGuard(t *testing.T) {
+	heroIn := func(room *Entity) *Entity {
+		for _, e := range room.contents {
+			if e.short == "Hero" {
+				return e
+			}
+		}
+		return nil
+	}
+	greetedHas := func(z *Zone, guard *Entity, name string) bool {
+		es := z.lua.entityScripts[guard.rid]
+		if es == nil {
+			t.Fatal("script did not register")
+		}
+		tbl, ok := es.state.RawGetString("greeted").(*lua.LTable)
+		return ok && tbl.RawGetString(name) == lua.LTrue
+	}
+	reloadWith := func(z *Zone, src string) {
+		z.protos.reload("rl:mob:guard", newPrototype("rl:mob:guard", nil, "the guard", "A guard stands here.",
+			componentSet{
+				reflect.TypeFor[*Living]():   &Living{},
+				reflect.TypeFor[*Scripted](): &Scripted{source: src},
+			}))
+		z.reloadLua("mob", "rl:mob:guard")
+	}
+
+	// GUARDED — the idiom the demo greeter uses: the seed survives a reload.
+	guarded := `
+		state.greeted = state.greeted or {}
+		on("greet", function(ev) state.greeted[ev.actor:name()] = true end)`
+	z, room, guard := reloadScriptedZone(t, guarded)
+	z.fireRoomEntry(heroIn(room), room)
+	if !greetedHas(z, guard, "Hero") {
+		t.Fatal("guarded: Hero should be recorded after the first greet")
+	}
+	reloadWith(z, guarded) // edit-and-reload keeping the guarded seed
+	if !greetedHas(z, guard, "Hero") {
+		t.Fatal("guarded: `state.greeted = state.greeted or {}` must PRESERVE the greeted set across a reload")
+	}
+
+	// UNGUARDED — the anti-pattern #67 warns about: the bare seed re-runs and wipes the set.
+	unguarded := `
+		state.greeted = {}
+		on("greet", function(ev) state.greeted[ev.actor:name()] = true end)`
+	z2, room2, guard2 := reloadScriptedZone(t, unguarded)
+	z2.fireRoomEntry(heroIn(room2), room2)
+	if !greetedHas(z2, guard2, "Hero") {
+		t.Fatal("unguarded: Hero should be recorded after the first greet")
+	}
+	reloadWith(z2, unguarded)
+	if greetedHas(z2, guard2, "Hero") {
+		t.Fatal("unguarded: `state.greeted = {}` re-runs on reload and WIPES the set (this is the bug the guard fixes)")
+	}
+}
+
 // --- the old-gen mud.after drop (P7-D7) ----------------------------------------------------
 
 // TestOldGenTimerDropsOnReload asserts a pending mud.after timer scheduled BEFORE a reload is

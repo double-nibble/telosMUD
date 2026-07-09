@@ -9,7 +9,7 @@ zones:
         short: the guild quartermaster
         long: A broad-shouldered dwarf in a leather apron looks you over appraisingly.
         lua: |
-          state.greeted = {}
+          state.greeted = state.greeted or {}   -- idempotent: a hot reload re-runs this body, so a bare `= {}` would wipe who's been greeted (#67)
           on("greet", function(ev)
             local id = ev.actor:id()
             if not state.greeted[id] then
