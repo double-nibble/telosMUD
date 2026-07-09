@@ -19,11 +19,13 @@ const scope = "github.com/double-nibble/telosmud"
 var meter = otel.Meter(scope)
 
 var (
-	tickLag       metric.Float64Histogram
-	occupancy     metric.Int64Gauge
-	framesDropped metric.Int64Counter
-	gateConns     metric.Int64UpDownCounter
-	busLag        metric.Float64Histogram
+	tickLag         metric.Float64Histogram
+	occupancy       metric.Int64Gauge
+	framesDropped   metric.Int64Counter
+	gateConns       metric.Int64UpDownCounter
+	busLag          metric.Float64Histogram
+	drainRedirected metric.Int64Counter
+	drainReclaimed  metric.Int64Counter
 )
 
 func init() {
@@ -41,6 +43,12 @@ func init() {
 	busLag, _ = meter.Float64Histogram("telos.bus.deliver_lag_ms",
 		metric.WithDescription("Scoped-event-bus publish->deliver latency"),
 		metric.WithUnit("ms"))
+	drainRedirected, _ = meter.Int64Counter("telos.shard.drain_redirected_total",
+		metric.WithDescription("Players redirected to a peer shard during a graceful drain (socket kept open, zero drop)"))
+	drainReclaimed, _ = meter.Int64Counter("telos.shard.drain_reclaimed_total",
+		metric.WithDescription("Players still resident at the drain deadline, dropped to reconnect from durable state; "+
+			"labeled fault=infra (a connected in-world player the drain could not hand off in time) vs "+
+			"fault=client (link-dead, or never finished connecting)"))
 }
 
 func zoneAttr(zone string) metric.RecordOption {
@@ -86,5 +94,20 @@ func add(ctx context.Context, c metric.Int64UpDownCounter, n int64) {
 func RecordBusLag(ctx context.Context, ms float64) {
 	if busLag != nil {
 		busLag.Record(ctx, ms)
+	}
+}
+
+// DrainRedirected counts players redirected to a peer during a graceful drain (zero-drop; socket kept open).
+func DrainRedirected(ctx context.Context, n int) {
+	if drainRedirected != nil && n > 0 {
+		drainRedirected.Add(ctx, int64(n))
+	}
+}
+
+// DrainReclaimed counts drain-deadline stragglers dropped to reconnect from durable state, labeled by fault
+// ("infra" | "client"). Kept to those two low-cardinality label values, like the other shard-wide counters.
+func DrainReclaimed(ctx context.Context, n int, fault string) {
+	if drainReclaimed != nil && n > 0 {
+		drainReclaimed.Add(ctx, int64(n), metric.WithAttributes(attribute.String("fault", fault)))
 	}
 }

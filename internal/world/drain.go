@@ -3,6 +3,8 @@ package world
 import (
 	"context"
 	"time"
+
+	"github.com/double-nibble/telosmud/internal/metrics"
 )
 
 // initiateHandoff freezes the player and kicks off the async cross-shard handoff to (destZone, destRoom).
@@ -75,9 +77,84 @@ func (z *Zone) drainPlayer(id string) {
 
 // DrainResult reports what a BeginDrain did: Redirected players kept their socket (zero drop); Reclaimed
 // players were still resident at the deadline and will be dropped + resume from durable state on reconnect.
+// ReclaimedInfra + ReclaimedClient split the Reclaimed total by fault (see reclaimTally) for observability.
 type DrainResult struct {
-	Redirected int
-	Reclaimed  int
+	Redirected      int
+	Reclaimed       int
+	ReclaimedInfra  int
+	ReclaimedClient int
+}
+
+// drainReclaimNotice is the player-visible line a straggler still resident at the drain deadline sees before
+// its socket closes: a clean "reconnect" message rather than a silent link death. drainReclaimReason is the
+// terse Disconnect reason the gate renders. The wording deliberately does NOT promise "resume where you left
+// off": the straggler's flush is best-effort (enqueued to the async saver, which the post-drain shutdown may
+// not fully drain — see the saver-drain-barrier follow-up), so a reconnect resumes from the last DURABLE
+// state, which may trail the live state by a cadence tick.
+const (
+	drainReclaimNotice = "The server is restarting. You have been disconnected — reconnect to continue."
+	drainReclaimReason = "server restarting; reconnect"
+)
+
+// reclaimTally splits deadline stragglers by FAULT: infra (a connected, in-world player the drain could not
+// hand off in time — target selection / handoff RPC / sheer volume) vs client (un-redirectable for a
+// client-side reason: link-dead, or never finished connecting so it was never placed in a room).
+type reclaimTally struct {
+	infra  int
+	client int
+}
+
+// reclaimStragglersMsg asks a zone, ON ITS GOROUTINE, to clean-disconnect every player still resident at the
+// drain deadline and report the fault split. resp is buffered(1) by the caller so the zone never blocks.
+type reclaimStragglersMsg struct {
+	resp chan reclaimTally
+}
+
+func (reclaimStragglersMsg) zoneMsg() {}
+
+// reclaimStragglers runs on the zone goroutine (players map is race-free here): for every player still
+// resident at the drain deadline it sends a clean "server restarting; reconnect" notice + Disconnect (so the
+// client gets a graceful close, not a dead socket), classifies the straggler infra- vs client-fault, and
+// reports the tally. A pending arrival (destination side of an inbound handoff, no bound stream) is left to
+// the bind/reap machinery. A frozen session (mid-handoff) is COUNTED (infra — the handoff didn't finish in
+// time) but not sent a Disconnect: its socket fate belongs to the handoff/freeze machinery, and injecting a
+// frame could race a late redirect. The durable flush already happened (Shard.Drain, posted before this).
+func (z *Zone) reclaimStragglers(resp chan reclaimTally) {
+	var t reclaimTally
+	for _, s := range z.players {
+		if s.pending {
+			continue // an inbound handoff arriving here, not one of our residents to reclaim
+		}
+		if s.frozen && s.handedOff {
+			continue // handoff CAS committed — the destination shard owns this player, so it was in effect
+			// REDIRECTED (the source copy just awaits the freeze reaper). Excluding it from the tally counts
+			// it as Redirected (initial - reclaimed), not as an infra fault, and it keeps its socket for the
+			// pending Redirect frame.
+		}
+		if isClientFaultStraggler(s) {
+			t.client++
+		} else {
+			t.infra++
+		}
+		if !s.detached && !s.frozen {
+			s.send(textFrame(drainReclaimNotice))
+			s.send(drainDisconnectFrame())
+		}
+	}
+	resp <- t
+}
+
+// isClientFaultStraggler reports whether a deadline straggler was un-redirectable for a CLIENT-side reason.
+// A frozen session is checked FIRST: a mid-handoff player has its entity detached (location nil), so without
+// this guard it would be miscounted as "never placed" — but it is an INFRA fault (the handoff RPC/target was
+// too slow). Then: link-dead (detached), or never finished connecting (no entity / no room placement) is a
+// client fault. Everything else — a healthy, in-world, connected player the drain simply could not move in
+// the deadline — is an infra fault.
+func isClientFaultStraggler(s *session) bool {
+	if s.frozen {
+		return false
+	}
+	return s.detached || s.entity == nil || s.entity.location == nil
 }
 
 // TargetChooser selects the peer shard a draining zone's ownership + players go to. It returns the target's
@@ -157,15 +234,50 @@ wait:
 		}
 	}
 
-	// 3. Flush every zone durably (stragglers included) and tally the result.
+	// 3. Flush every zone durably (stragglers included), then have each zone clean-disconnect + classify the
+	// stragglers still resident at the deadline (#43). The reclaim runs ON the zone goroutine (safe socket +
+	// player-map access); post it AFTER Drain so the durable flush handler is ordered ahead of the disconnect
+	// on each zone's FIFO inbox. The zone loops are still live here — worldCtx is cancelled only after
+	// BeginDrain returns. The flush is only ENQUEUED to the async saver, not confirmed durable (a saver-drain
+	// barrier is a tracked follow-up); the reclaim notice's wording is honest about that.
+	//
+	// Both the post and the collect select on ctx so a zone whose loop has stopped consuming (a lease fence
+	// cancelling worldCtx mid-drain, or a wedged handler) can never block shutdown past the drain deadline —
+	// on either timeout the zone's residents are counted best-effort as infra-fault via the atomic pop.
 	s.Drain()
-	for _, z := range zones {
-		res.Reclaimed += int(z.pop.Load())
+	resps := make([]chan reclaimTally, len(zones))
+	for i, z := range zones {
+		ch := make(chan reclaimTally, 1)
+		select {
+		case z.inbox <- reclaimStragglersMsg{resp: ch}:
+			resps[i] = ch
+		case <-ctx.Done():
+			resps[i] = nil // couldn't post; accounted in the collect loop below
+		}
 	}
+	for i, z := range zones {
+		if resps[i] == nil {
+			res.ReclaimedInfra += int(z.pop.Load()) // never posted (ctx expired); best-effort count
+			continue
+		}
+		select {
+		case t := <-resps[i]:
+			res.ReclaimedInfra += t.infra
+			res.ReclaimedClient += t.client
+		case <-ctx.Done():
+			// Posted but the zone didn't answer before the drain ctx expired; count its residents (pop, which
+			// includes any pending arrival — a minor over-count acceptable in this degraded path) as infra.
+			res.ReclaimedInfra += int(z.pop.Load())
+		}
+	}
+	res.Reclaimed = res.ReclaimedInfra + res.ReclaimedClient
 	res.Redirected = int(initial) - res.Reclaimed
 	if res.Redirected < 0 {
 		res.Redirected = 0 // players who quit during the drain aren't "redirected"; keep it non-negative
 	}
+	metrics.DrainRedirected(ctx, res.Redirected)
+	metrics.DrainReclaimed(ctx, res.ReclaimedInfra, "infra")
+	metrics.DrainReclaimed(ctx, res.ReclaimedClient, "client")
 	return res, nil
 }
 

@@ -51,6 +51,17 @@ func disconnectFrame(reason string) *playv1.ServerFrame {
 	}}}
 }
 
+// drainDisconnectFrame is the clean close a straggler still resident at the drain deadline gets (#43): a
+// "server restarting; reconnect" reason, flagged reconnectable so a future gate can auto-redial (today the
+// gate renders the reason and closes; the flag is forward-looking). Its state was already durably flushed,
+// so the player resumes on reconnect.
+func drainDisconnectFrame() *playv1.ServerFrame {
+	return &playv1.ServerFrame{Payload: &playv1.ServerFrame_Disconnect{Disconnect: &playv1.Disconnect{
+		Reason:        drainReclaimReason,
+		Reconnectable: true,
+	}}}
+}
+
 // displacedNotice is the player-visible line a connection gets when a SECOND login for the
 // same character takes over the session (single-session contract): the old connection is
 // cleanly kicked rather than left mute. Mirrors the "Farewell." farewell style of quit.
