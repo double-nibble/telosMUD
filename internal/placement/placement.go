@@ -17,6 +17,7 @@ package placement
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 )
@@ -229,5 +230,165 @@ func pickMovableZone(shard string, owner map[string]string, pool []string, weigh
 func sortedShards(shards []string) []string {
 	out := append([]string(nil), shards...)
 	sort.Strings(out)
+	return out
+}
+
+// --- Drain-target selection (#41) -------------------------------------------------------------------
+//
+// When a shard drains it hands each zone's players to a live PEER. The selection is DIRECTOR-OWNED policy
+// (this package is the director's decision engine) executed DECENTRALIZED on the draining shard, serialized
+// against simultaneous drains through the directory's counting reservation — NOT a synchronous RPC to the
+// director, because a drain is liveness-critical and must keep working when the director is itself mid-
+// rollout (PLACEMENT.md §3: liveness never depends on the coordinator). SelectDrainTarget is the pure core;
+// ChooseDrainTarget composes it with the reservation + endpoint resolution over injected seams.
+
+// ShardLoad is a live candidate shard and its current player occupancy — the load signal drain-target
+// selection minimizes. It is a struct (not a bare map[string]int) so #42 can add per-zone weight / locality
+// tags behind the same SelectDrainTarget signature without churning callers.
+type ShardLoad struct {
+	ShardID string
+	Players int
+}
+
+// SelectDrainTarget picks the least-loaded candidate to absorb `incoming` players, excluding `self`, ties
+// broken by shard id for determinism. It is PURE (no I/O). overCeiling reports that even the least-loaded
+// pick would exceed `ceiling` once it absorbs `incoming` — the caller still gets that pick (progress beats
+// a SOFT ceiling: a dropped socket is worse than transient overload the rebalancer corrects), it is just
+// signalled to proceed without a reservation gate. target is "" only when there is no candidate but self.
+func SelectDrainTarget(cands []ShardLoad, self string, incoming, ceiling int) (target string, overCeiling bool) {
+	best, bestN := "", int(^uint(0)>>1)
+	for _, c := range sortedByID(cands) {
+		if c.ShardID == self {
+			continue
+		}
+		if c.Players < bestN {
+			best, bestN = c.ShardID, c.Players
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return best, bestN+incoming > ceiling
+}
+
+// DrainFleet supplies the live drain-target candidates + endpoint resolution. Excludes lapsed registrations
+// AND currently-draining shards (so a fleet rollout can't ping-pong A<->B). An adapter over the directory +
+// presence roster satisfies it; tests inject an in-memory fake.
+type DrainFleet interface {
+	DrainCandidates(ctx context.Context) ([]ShardLoad, error)
+	EndpointForShard(ctx context.Context, shardID string) (string, error)
+}
+
+// DrainReserver is the directory's counting reservation seam (serializes simultaneous drains onto one
+// target). *directory.Redis satisfies it.
+type DrainReserver interface {
+	ReserveDrainTarget(ctx context.Context, target, drainer string, headroom, incoming int, ttl time.Duration) (bool, error)
+}
+
+// ChooseDrainTarget selects + reserves a live peer for `self` to hand `incoming` players (one draining zone)
+// to. It reads the candidates, picks least-loaded via SelectDrainTarget, and atomically reserves that
+// target's headroom (ceiling minus its current load); if a concurrent drainer already filled it, it drops
+// that target and re-selects. It NEVER stalls a drain: if every candidate is reservation-full — or the
+// least-loaded is already over the soft ceiling — it proceeds on the overall least-loaded anyway (progress
+// beats the ceiling; the reservation is still recorded best-effort so a following drainer sees the load).
+// Reservations self-expire (ttl); the fast-path release on completion is the caller's / a #42 concern.
+// Returns the target id + dial endpoint, or an error only when NO live non-draining peer exists at all.
+func ChooseDrainTarget(ctx context.Context, fleet DrainFleet, resv DrainReserver, self string, incoming, ceiling int, ttl time.Duration) (shardID, addr string, err error) {
+	cands, err := fleet.DrainCandidates(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	// Phase 1 — place UNDER the soft ceiling, least-loaded first. Each pass reserves the pick's headroom and
+	// takes it if admitted (or if the pick is already over the raw ceiling — then no under-ceiling placement
+	// exists, so proceed anyway). A reservation-refused (a concurrent drainer filled it) or lapsed-endpoint
+	// target is dropped and re-selected. `remaining` shrinks each iteration, so the loop terminates.
+	remaining := withoutSelf(cands, self)
+	for len(remaining) > 0 {
+		target, over := SelectDrainTarget(remaining, self, incoming, ceiling)
+		if target == "" {
+			break
+		}
+		ok, rerr := resv.ReserveDrainTarget(ctx, target, self, ceiling-loadOf(remaining, target), incoming, ttl)
+		if rerr != nil {
+			return "", "", rerr
+		}
+		if ok || over {
+			if id, a, e := resolveOrDrop(ctx, fleet, target); e == nil {
+				return id, a, nil
+			}
+		}
+		remaining = dropShard(remaining, target)
+	}
+
+	// Phase 2 — every candidate was reservation-full (none was over the raw ceiling to force a Phase-1
+	// return). A drain must NEVER stall on a soft ceiling — a dropped socket is worse than transient overload
+	// the rebalancer corrects — so force-proceed on the least-loaded RESOLVABLE candidate, ignoring
+	// reservations (recorded best-effort). Re-selects on a lapsed endpoint; errors only if NONE resolves.
+	force := withoutSelf(cands, self)
+	for len(force) > 0 {
+		target, _ := SelectDrainTarget(force, self, incoming, ceiling)
+		if target == "" {
+			break
+		}
+		_, _ = resv.ReserveDrainTarget(ctx, target, self, ceiling-loadOf(force, target), incoming, ttl)
+		if id, a, e := resolveOrDrop(ctx, fleet, target); e == nil {
+			return id, a, nil
+		}
+		force = dropShard(force, target)
+	}
+	return "", "", errNoDrainPeer
+}
+
+// withoutSelf returns a fresh slice of the candidates excluding self (the draining shard is never its own
+// target). Fresh so the caller can compact it in place without touching the shared candidate list.
+func withoutSelf(cands []ShardLoad, self string) []ShardLoad {
+	out := make([]ShardLoad, 0, len(cands))
+	for _, c := range cands {
+		if c.ShardID != self {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+var errNoDrainPeer = fmt.Errorf("placement: no live peer shard to drain onto")
+
+// resolveOrDrop resolves target's endpoint, distinguishing "resolved" from "lapsed" so the caller can drop
+// a target whose registration expired between the candidate list and the resolve and re-select another.
+func resolveOrDrop(ctx context.Context, fleet DrainFleet, target string) (string, string, error) {
+	addr, err := fleet.EndpointForShard(ctx, target)
+	if err != nil || addr == "" {
+		if err == nil {
+			err = errNoDrainPeer
+		}
+		return "", "", err
+	}
+	return target, addr, nil
+}
+
+func loadOf(cands []ShardLoad, id string) int {
+	for _, c := range cands {
+		if c.ShardID == id {
+			return c.Players
+		}
+	}
+	return 0
+}
+
+// dropShard removes id from in, compacting in place (in is the caller's own `remaining` scratch slice, never
+// the shared candidate list — so this must not be called on a slice the caller still needs whole).
+func dropShard(in []ShardLoad, id string) []ShardLoad {
+	out := in[:0]
+	for _, c := range in {
+		if c.ShardID != id {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func sortedByID(cands []ShardLoad) []ShardLoad {
+	out := append([]ShardLoad(nil), cands...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ShardID < out[j].ShardID })
 	return out
 }

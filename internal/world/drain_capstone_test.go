@@ -84,7 +84,7 @@ func TestGracefulDrainZeroDrop(t *testing.T) {
 	}
 	done := make(chan drainOut, 1)
 	go func() {
-		res, err := shardA.BeginDrain(ctx, func(string) (string, string, error) {
+		res, err := shardA.BeginDrain(ctx, func(string, int) (string, string, error) {
 			return "shard-b", "addr-b", nil
 		}, 10*time.Second)
 		done <- drainOut{res, err}

@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/double-nibble/telosmud/internal/metrics"
@@ -158,9 +159,26 @@ func isClientFaultStraggler(s *session) bool {
 }
 
 // TargetChooser selects the peer shard a draining zone's ownership + players go to. It returns the target's
-// directory shard id and dial endpoint. Injected so a hermetic test supplies a fixed peer and production
-// supplies a live-fleet / director-driven selector (avoiding a draining or overloaded target).
-type TargetChooser func(zoneID string) (shardID, addr string, err error)
+// directory shard id and dial endpoint. incoming is how many live players this zone is about to send, so a
+// load-aware selector can reserve that much headroom on the target and serialize against simultaneous
+// drains (#41). Injected so a hermetic test supplies a fixed peer and production supplies the live-fleet,
+// reservation-serialized selector (avoiding a draining or overloaded target).
+type TargetChooser func(zoneID string, incoming int) (shardID, addr string, err error)
+
+// DrainMarker publishes this shard's draining state so the drain-target selector excludes a shard that is
+// itself draining (#41) — preventing a full-fleet-rollout ping-pong (A drains onto B while B drains onto A).
+// *directory.Redis satisfies it; nil disables the marker (single-shard / dev).
+type DrainMarker interface {
+	SetDraining(ctx context.Context, shardID string, ttl time.Duration) error
+	ClearDraining(ctx context.Context, shardID string) error
+}
+
+// WithDrainMarker wires the directory port BeginDrain uses to publish this shard's draining state (#41).
+// Optional: without it the drain still works, it just doesn't advertise itself as ineligible to peers.
+func (s *Shard) WithDrainMarker(m DrainMarker) *Shard {
+	s.drainMarker = m
+	return s
+}
 
 // BeginDrain gracefully drains this shard for a rolling redeploy (Phase 16.4b): it stops accepting new
 // fresh logins, hands each hosted zone's ownership to a chosen peer (the atomic fenced lease flip), fans the
@@ -172,9 +190,22 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 	s.mu.Lock()
 	s.draining = true // reject new fresh logins from here on (a handoff bind is still accepted)
 	s.mu.Unlock()
+	// Advertise to the fleet that we are draining (#41), so a peer draining at the same moment does not pick
+	// US as its target. The marker's TTL (2x the deadline) is the crash backstop; it is cleared on return
+	// below. Best-effort — a marker write failure must not block the drain (we still reject fresh logins).
+	if s.drainMarker != nil {
+		if merr := s.drainMarker.SetDraining(ctx, s.shardID, 2*deadline); merr != nil {
+			slog.Warn("drain: could not publish draining marker; peers may still target this shard", "err", merr)
+		}
+	}
 	// If the drain ABORTS (a target choice / handover failed before completing), clear the flag so the shard
-	// resumes accepting logins for whatever zones it still owns rather than getting stuck rejecting them.
+	// resumes accepting logins for whatever zones it still owns rather than getting stuck rejecting them. The
+	// directory marker is cleared on EITHER outcome (on success the process exits, but clear it anyway so a
+	// resumed/aborted shard isn't left ineligible; the TTL is only the crash backstop).
 	defer func() {
+		if s.drainMarker != nil {
+			_ = s.drainMarker.ClearDraining(context.Background(), s.shardID)
+		}
 		if err != nil {
 			s.mu.Lock()
 			s.draining = false
@@ -200,14 +231,24 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 		initial += z.pop.Load()
 	}
 
-	// 1. Hand each zone's ownership to a peer, then tell the zone to fan its players off to it.
+	// 1. Hand each zone's ownership to a peer, then tell the zone to fan its players off to it. Pass the
+	// zone's live population so a load-aware chooser reserves that much headroom on the target (#41).
+	// A per-zone choose/handover FAILURE is NOT fatal to the drain: it must never abort before the durable
+	// flush in step 3 (a directory outage during SIGTERM would otherwise drop every resident player's last
+	// delta). Instead, skip redirecting that zone — its players stay resident and are flushed + reclaimed
+	// (reconnect from durable state) below. That converts "no peer / handover failed" from data loss into a
+	// clean reconnect, which is the whole point of the drain ladder.
 	for _, z := range zones {
-		targetID, targetAddr, err := choose(z.id)
-		if err != nil {
-			return res, err
+		targetID, targetAddr, cerr := choose(z.id, int(z.pop.Load()))
+		if cerr != nil {
+			slog.Warn("drain: no target for zone; its players will be reclaimed from durable state",
+				"zone", z.id, "err", cerr)
+			continue
 		}
-		if err := s.handoverZoneTo(ctx, z.id, targetID, targetAddr); err != nil {
-			return res, err
+		if herr := s.handoverZoneTo(ctx, z.id, targetID, targetAddr); herr != nil {
+			slog.Warn("drain: zone handover failed; its players will be reclaimed from durable state",
+				"zone", z.id, "err", herr)
+			continue
 		}
 		z.post(drainZoneMsg{})
 	}

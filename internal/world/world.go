@@ -155,6 +155,11 @@ type Shard struct {
 	// is going away) while still accepting a handoff BIND, so an in-flight cross-shard move completes. mu.
 	draining bool
 
+	// drainMarker publishes this shard's draining state to the directory during BeginDrain (#41), so a peer
+	// draining at the same moment (a fleet rollout) does not pick US as its target. nil (no directory / dev)
+	// disables it — the process-local `draining` flag still guards fresh logins.
+	drainMarker DrainMarker
+
 	// localZones marks zones this shard hosts LOCALLY and UNLEASED (#212 embedded core bootstrap zone).
 	// A local zone is (a) never lease-renewed — every shard hosts its OWN copy, so there is no single
 	// owner to fence on, and (b) never handed off on a graceful drain — a draining peer's local zone is

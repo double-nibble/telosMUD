@@ -11,7 +11,6 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
-	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -401,28 +400,21 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// is never repointed to the lobby.
 	hostZones, hostHome, _ := resolveHosting(lc, won, preferredHome)
 
-	// chooseDrainTarget selects a live PEER shard to hand this shard's zones + players to on a graceful drain
-	// (Phase 16.4c). Decentralized self-select: the first live shard in the directory that isn't us. Good for
-	// a single rolling redeploy (the replacement/standby is the peer); director-owned load-aware selection +
-	// serialization of simultaneous drains is the documented follow-up.
-	chooseDrainTarget := func(string) (string, string, error) {
+	// chooseDrainTarget selects a live PEER shard to hand a draining zone's ownership + players to (#41),
+	// LOAD-AWARE and SERIALIZED against simultaneous drains: it reads the live fleet + per-shard player load
+	// (presence roster) minus any peer that is itself draining, picks the least-loaded via the pure
+	// placement.SelectDrainTarget, and atomically RESERVES that target's headroom in the directory so two
+	// shards draining at once don't both pile onto one peer past its soft occupancy ceiling. The selection
+	// POLICY is director-owned (it lives in the placement package, the director's decision engine) but runs
+	// DECENTRALIZED on the draining shard over Redis — a drain must keep working when the director is itself
+	// mid-rollout (PLACEMENT.md §3: liveness never depends on the coordinator). Never stalls: if every peer
+	// is reservation-full it proceeds over the soft ceiling (the rebalancer corrects transient overload; a
+	// dropped socket would be worse). #42 makes the load signal + ceiling weight/locality-aware.
+	fleet := drainFleet{dir: dir, roster: roster}
+	chooseDrainTarget := func(_ string, incoming int) (string, string, error) {
 		lctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		shards, err := dir.ListShards(lctx)
-		if err != nil {
-			return "", "", err
-		}
-		for _, id := range shards {
-			if id == cfg.ShardID {
-				continue
-			}
-			addr, err := dir.EndpointForShard(lctx, id)
-			if err != nil {
-				continue // registration lapsed between the list and the resolve
-			}
-			return id, addr, nil
-		}
-		return "", "", fmt.Errorf("no live peer shard to drain onto")
+		return placement.ChooseDrainTarget(lctx, fleet, dir, cfg.ShardID, incoming, drainTargetCeiling, drainReservationTTL)
 	}
 
 	return world.NewShardFromContent(lc, hostZones, hostHome, cfg.ShardAddr, dir, world.GRPCDialer()).
@@ -438,8 +430,61 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithScopeSnapshot(scopeSnap(livePool)). // #44: seed each zone's scope replica from the store on join
 		WithZoneLeasing(dir, cfg.ShardID, directory.DefaultZoneLease, directory.DefaultZoneLease/3, stop).
 		WithPresence(roster, cfg.ShardID).
+		WithDrainMarker(dir). // #41: advertise "draining" so peers don't target us mid-rollout
 		WithMail(mailStore).
 		WithTells(tellJS), chooseDrainTarget
+}
+
+// drainTargetCeiling is the SOFT per-shard occupancy target the drain-target selector admits reservations
+// under (#41): roughly the ~1-2k-players-per-box bar. It is soft — a drain proceeds over it rather than
+// stall (a dropped connection is worse than transient overload the rebalancer corrects). #42 makes this a
+// load/locality-aware, per-shard weight instead of one fleet-wide constant.
+const drainTargetCeiling = 1500
+
+// drainReservationTTL bounds a drain-target reservation: ~2-3x the shard heartbeat, long enough to cover the
+// blind window until the target's next registration reflects its real higher load, short enough that a
+// crashed drainer's hold self-clears fast. The reservation is only an admission hint, not a durable lock.
+const drainReservationTTL = 15 * time.Second
+
+// drainFleet adapts the directory + presence roster to placement.DrainFleet (#41): the live drain-target
+// candidates (live shards minus any that are themselves draining, each tagged with its current player load
+// from the roster) and endpoint resolution. Load is a best-effort signal — a roster read error degrades to
+// load-blind selection (all candidates read as 0), still functional. #42 enriches this with per-zone weight
+// + locality tags from a richer occupancy pipeline.
+type drainFleet struct {
+	dir    *directory.Redis
+	roster *presence.Redis
+}
+
+func (f drainFleet) DrainCandidates(ctx context.Context) ([]placement.ShardLoad, error) {
+	shards, err := f.dir.ListShards(ctx)
+	if err != nil {
+		return nil, err // can't select a target without the live fleet
+	}
+	draining, _ := f.dir.ListDraining(ctx) // best-effort; nil on error excludes no one
+	load := map[string]int{}
+	if entries, lerr := f.roster.List(ctx); lerr == nil {
+		for _, e := range entries {
+			load[e.ShardID]++
+		}
+	} else {
+		// The roster read failed: selection degrades to load-blind (all candidates read as 0 load), still
+		// functional but the primary overload guard is off — surface it so a drain-time roster outage is
+		// observable rather than silently spreading players onto an already-full target.
+		slog.Warn("drain: roster load read failed; selecting a drain target load-blind", "err", lerr)
+	}
+	out := make([]placement.ShardLoad, 0, len(shards))
+	for _, id := range shards {
+		if draining[id] {
+			continue // a peer that is itself draining is not a valid target
+		}
+		out = append(out, placement.ShardLoad{ShardID: id, Players: load[id]})
+	}
+	return out, nil
+}
+
+func (f drainFleet) EndpointForShard(ctx context.Context, shardID string) (string, error) {
+	return f.dir.EndpointForShard(ctx, shardID)
 }
 
 // openLivePool opens the long-lived Postgres pool the shard keeps for its lifetime: it backs both
