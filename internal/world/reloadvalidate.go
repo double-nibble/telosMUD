@@ -46,10 +46,60 @@ import (
 // three cases: a clean propagation, a validation REJECTION (nothing published — the content is broken), and
 // a best-effort INFRA failure (a re-read/publish blip; the applier's per-ref fail-safe is the backstop).
 type reloadOutcome struct {
-	published int      // invalidations put on the wire (0 when rejected or check-only)
-	rejected  []string // validation problems; NON-EMPTY => nothing was published (a hard content gate)
-	failed    bool     // an infrastructure failure (re-read/publish error) — logged, best-effort
-	checkOnly bool     // true => a `reload --check` dry run that validated OK and deliberately published nothing
+	published  int      // invalidations put on the wire (0 when rejected or check-only)
+	rejected   []string // validation problems; NON-EMPTY => nothing was published (a hard content gate)
+	failed     bool     // an infrastructure failure (re-read/publish error) — logged, best-effort
+	checkOnly  bool     // true => a `reload --check` dry run that validated OK and deliberately published nothing
+	sharedDefs []string // #56: shared-def kinds present in the reloaded packs that are NOT hot-applied (rolling-reboot reminder)
+}
+
+// sharedDefKinds returns the sorted, de-duplicated labels of the pack-GLOBAL "shared def" kinds present in
+// the reloaded packs that have NO hot-reload loop — the contentbus only emits room/item/mob/zone/channel
+// invalidations (contentbus/publish.go), so editing one of these takes effect only after a ROLLING REBOOT of
+// the world shards. This is the settled design (#56/#53: a live z.defs swap is optional, not required). The
+// reload readout uses this to REMIND the operator, so a shared-def edit is never silently un-applied.
+//
+// SOURCE OF TRUTH: this list must mirror the pack-global registrations in defineGlobals (build.go) MINUS the
+// ones with a hot-reload loop (channels, via KindChannel) and MINUS the ones the world shard doesn't hold
+// (regions / spawn schedules / chargens are consumed by directors / telos-account — a WORLD reboot wouldn't
+// apply to them). When a new pack-global def kind is added to defineGlobals, add it here too.
+func sharedDefKinds(loaded []content.Pack) []string {
+	seen := map[string]bool{}
+	for i := range loaded {
+		pk := &loaded[i]
+		mark := func(label string, present bool) {
+			if present {
+				seen[label] = true
+			}
+		}
+		mark("attributes", len(pk.Attributes) > 0)
+		mark("resources", len(pk.Resources) > 0)
+		mark("damage types", len(pk.DamageTypes) > 0)
+		mark("affects", len(pk.Affects) > 0)
+		mark("abilities", len(pk.Abilities) > 0)
+		mark("combat profiles", len(pk.CombatProfiles) > 0 || pk.DefaultCombat != "")
+		mark("progression tracks", len(pk.Tracks) > 0)
+		mark("bundles", len(pk.Bundles) > 0)
+		mark("rarity tiers", len(pk.RarityTiers) > 0)
+		mark("affixes", len(pk.Affixes) > 0)
+		mark("loot tables", len(pk.LootTables) > 0)
+		mark("recipes", len(pk.Recipes) > 0)
+		mark("wear slots", len(pk.WearSlots) > 0)
+		mark("trust tiers", len(pk.TrustTiers) > 0)
+		mark("custom commands", len(pk.Commands) > 0)
+		mark("display templates", len(pk.DisplayDefs) > 0)
+		mark("ruleset formulas", len(pk.Formulas) > 0)
+		mark("pvp policy", pk.PvpLua != "")
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // validatePacks returns one human-readable problem per definitively-broken thing in the re-read packs, or

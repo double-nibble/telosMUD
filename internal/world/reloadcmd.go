@@ -86,25 +86,43 @@ func cmdReload(c *Context) error {
 	go func() {
 		out := r.republish(context.Background(), packs, checkOnly)
 		auditReload(sh, pid, packs, out) // #192 S3: record who/what/when to the world director (fire-and-forget)
-		var summary string
-		switch {
-		case len(out.rejected) > 0:
-			// #192: the content did not validate — nothing went to the fleet. Name the problems so the
-			// builder can fix the pack before re-running.
-			summary = fmt.Sprintf("reload: %s REJECTED — content failed validation, nothing propagated:\r\n  - %s",
-				label, strings.Join(out.rejected, "\r\n  - "))
-		case out.checkOnly:
-			summary = fmt.Sprintf("reload --check: %s validated OK — no problems found (nothing propagated).", label)
-		case out.failed && out.published == 0:
-			summary = fmt.Sprintf("reload: %s — propagation FAILED, 0 definitions published; see the server log.", label)
-		case out.failed:
-			summary = fmt.Sprintf("reload: %s partially propagated — %d definitions published; see the server log for errors.", label, out.published)
-		default:
-			summary = fmt.Sprintf("reload: %s propagated — %d definitions pushed to all shards.", label, out.published)
-		}
-		z.postOrDrop(reloadDoneMsg{player: pid, summary: summary})
+		z.postOrDrop(reloadDoneMsg{player: pid, summary: reloadSummary(label, out)})
 	}()
 	return nil
+}
+
+// reloadSummary renders the builder-facing readout for a republish outcome. Pure (no I/O), so the readout
+// wording — including the #56 shared-def rolling-reboot reminder — is unit-testable without driving the whole
+// command. Cases: a validation REJECTION (nothing propagated), a --check dry run, an infra failure (full or
+// partial), and a clean propagation. On any successful/partial reload whose content also defines shared defs
+// (abilities/formulas/pvp policy/…), a reminder is appended — those have no hot-reload loop, so a CHANGE to
+// one needs a rolling reboot; without the reminder a live-edited shared def silently keeps its boot value.
+func reloadSummary(label string, out reloadOutcome) string {
+	var summary string
+	switch {
+	case len(out.rejected) > 0:
+		// #192: the content did not validate — nothing went to the fleet. Name the problems so the
+		// builder can fix the pack before re-running.
+		summary = fmt.Sprintf("reload: %s REJECTED — content failed validation, nothing propagated:\r\n  - %s",
+			label, strings.Join(out.rejected, "\r\n  - "))
+	case out.checkOnly:
+		summary = fmt.Sprintf("reload --check: %s validated OK — no problems found (nothing propagated).", label)
+	case out.failed && out.published == 0:
+		summary = fmt.Sprintf("reload: %s — propagation FAILED, 0 definitions published; see the server log.", label)
+	case out.failed:
+		summary = fmt.Sprintf("reload: %s partially propagated — %d definitions published; see the server log for errors.", label, out.published)
+	default:
+		summary = fmt.Sprintf("reload: %s propagated — %d definitions pushed to all shards.", label, out.published)
+	}
+	// #56: rooms/items/mobs/channels hot-swap live, but the pack-global SHARED DEFS do not. Remind the
+	// operator when the reloaded content defines any (also on a --check, so a pre-flight flags it too). Not
+	// appended on a hard rejection (nothing was applied at all) or an infra failure (the result is unreliable).
+	if len(out.sharedDefs) > 0 && len(out.rejected) == 0 && !out.failed {
+		summary += fmt.Sprintf("\r\n  Note: this content also defines shared defs (%s). These are NOT hot-applied — "+
+			"if you changed one, a rolling reboot of the world shards is required for it to take effect.",
+			strings.Join(out.sharedDefs, ", "))
+	}
+	return summary
 }
 
 // parseReloadArgs splits the `reload` command tail into the pack-scope arg and the check-only (dry-run)
@@ -202,12 +220,16 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 		r.log.Warn("reload: channel access-condition lint (present-but-empty/partial condition; likely a typo)",
 			"pack", v.Pack, "channel", v.Channel, "field", v.Field, "detail", v.Detail)
 	}
+	// #56: the pack-global shared defs (abilities/formulas/pvp policy/…) have no hot-reload loop; they take
+	// effect only after a rolling reboot. Surface which are present so the readout reminds the operator (a
+	// shared-def edit is otherwise silently un-applied). Computed for both a dry run and a real reload.
+	shared := sharedDefKinds(loaded)
 	if checkOnly {
 		// Pre-flight: the content validated, but a dry run deliberately publishes nothing.
 		r.log.Info("reload --check: content validated (dry run, nothing published)", "packs", packs)
-		return reloadOutcome{checkOnly: true}
+		return reloadOutcome{checkOnly: true, sharedDefs: shared}
 	}
-	out := reloadOutcome{}
+	out := reloadOutcome{sharedDefs: shared}
 	// A shard-local `reload` is a staff hot-edit of already-imported rows: it stamps its invalidations with
 	// a version minted from the single PG content-version authority (#232) — an atomic bump, monotonic
 	// fleet-wide with no wall clock — so it interoperates with the director-coordinated pull's PG-minted
