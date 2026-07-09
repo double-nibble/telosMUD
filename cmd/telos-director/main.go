@@ -193,6 +193,22 @@ func runPlacementCoordinator(ctx context.Context, dir *directory.Redis, d *direc
 				slog.Warn("placement: fleet observe failed", "err", err)
 				continue
 			}
+			// #42 slice 3b: fold any pending rebalance directive into the assignment so the plan sees an
+			// in-flight move as ALREADY applied — it won't re-issue that move, and won't over-target the
+			// destination during the migration window. The stateless plan otherwise re-derives the same move
+			// every tick until the occupancy signal shifts. Only fold when the target is still LIVE: a
+			// directive to a since-dead shard must NOT overwrite the real observed owner (that would understate
+			// the live owner's load for the tick) — the plan then treats the zone as still owned + the expired
+			// directive / claim-from-pool reconciles it.
+			liveSet := make(map[string]bool, len(live))
+			for _, s := range live {
+				liveSet[s] = true
+			}
+			for _, zone := range pool {
+				if to, found, rerr := dir.ReadRebalance(ctx, zone); rerr == nil && found && liveSet[to] {
+					assignment[zone] = to
+				}
+			}
 			// #42: balance by real per-zone player WEIGHT (the occupancy signal each shard heartbeats), so a
 			// busy town counts more than an empty wilderness. A read failure — or a zone with no live signal —
 			// degrades to weight 1 (the zone-count plan), never a crash.
@@ -205,15 +221,62 @@ func runPlacementCoordinator(ctx context.Context, dir *directory.Redis, d *direc
 			if len(moves) == 0 {
 				continue // balanced + fully claimed: nothing to do
 			}
+			// #42 slice 3b: DRIVE the plan. An unclaimed-zone assignment (From=="") is left to decentralized
+			// claim-from-pool (the world self-claims it); a rebalance drain (From!="") is issued as a directive
+			// the owning shard executes, gated so it doesn't thrash.
+			draining, _ := dir.ListDraining(ctx) // best-effort; exclude a target that is itself draining
+			issued := 0
 			for _, m := range moves {
 				if m.From == "" {
-					slog.Info("placement: zone needs (re)assignment", "zone", m.Zone, "to", m.To)
-				} else {
-					slog.Info("placement: rebalance drain recommended", "zone", m.Zone, "from", m.From, "to", m.To)
+					slog.Info("placement: zone needs (re)assignment (world self-claims)", "zone", m.Zone, "to", m.To)
+					continue
 				}
+				if issueRebalance(ctx, dir, m, draining) {
+					issued++
+				}
+			}
+			if issued > 0 {
+				slog.Info("placement: rebalance directives issued", "count", issued)
 			}
 		}
 	}
+}
+
+const (
+	// rebalanceDirectiveTTL bounds a published rebalance directive (matches the world executor's TTL): long
+	// enough to outlive the drain, short enough that a stuck/abandoned directive self-expires so the plan
+	// re-derives it.
+	rebalanceDirectiveTTL = 90 * time.Second
+	// rebalanceCooldown suppresses re-moving a zone right after it was rebalanced (weights shift — including
+	// from the move itself — so a boundary zone could ping-pong tick to tick). Several minutes, >> the tick +
+	// the drain deadline. Keyed by ZONE in the directory, so it survives the ownership change; the failover
+	// claim path never reads it, so a crashed shard's zone is always reassignable.
+	rebalanceCooldown = 5 * time.Minute
+)
+
+// issueRebalance gates and publishes ONE rebalance-drain directive; it returns whether the directive was
+// issued. It skips a zone on cooldown (recently moved), one already being rebalanced (an in-flight
+// directive), and a target shard that is itself draining (a fleet rollout — don't hand it more load). The
+// fenced lease CAS in the executor is the ultimate no-double-own backstop; these gates only prevent thrash.
+func issueRebalance(ctx context.Context, dir *directory.Redis, m placement.Move, draining map[string]bool) bool {
+	if on, err := dir.OnCooldown(ctx, m.Zone); err != nil || on {
+		return false
+	}
+	if _, inFlight, err := dir.ReadRebalance(ctx, m.Zone); err != nil || inFlight {
+		return false
+	}
+	if draining[m.To] {
+		return false
+	}
+	if err := dir.IssueRebalance(ctx, m.Zone, m.To, rebalanceDirectiveTTL); err != nil {
+		slog.Warn("placement: issue rebalance failed", "zone", m.Zone, "to", m.To, "err", err)
+		return false
+	}
+	if err := dir.SetCooldown(ctx, m.Zone, rebalanceCooldown); err != nil {
+		slog.Warn("placement: set cooldown failed", "zone", m.Zone, "err", err)
+	}
+	slog.Info("placement: rebalance issued", "zone", m.Zone, "from", m.From, "to", m.To)
+	return true
 }
 
 // fleetView adapts *directory.Redis to placement.Fleet: ListShards is direct; ShardForZone maps the
