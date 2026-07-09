@@ -101,12 +101,20 @@ func main() {
 	// persisting each schedule's next-spawn time in scope state (restart-safe). An empty/unreachable load
 	// yields no schedules — the director simply has no scheduled bosses.
 	var schedules []director.Schedule
+	// zoneRegion maps each pool zone to its region (#42 locality): the placement coordinator prefers to
+	// colocate a region's zones on one shard. Empty when content has no regions (locality then no-ops).
+	zoneRegion := map[string]string{}
 	if lc, err := content.Load(ctx, pool, []string{content.DemoPack}); err == nil {
 		for _, sc := range lc.SpawnSchedules {
 			schedules = append(schedules, director.BuildSchedule(sc))
 		}
 		if len(schedules) > 0 {
 			slog.Info("loaded spawn schedules", "count", len(schedules))
+		}
+		for _, r := range lc.Regions {
+			for _, z := range r.Zones {
+				zoneRegion[z] = r.Ref
+			}
 		}
 	} else {
 		slog.Warn("could not load spawn schedules (none scheduled)", "err", err)
@@ -157,7 +165,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runPlacementCoordinator(ctx, dir, world, cfg.Zones)
+			runPlacementCoordinator(ctx, dir, world, cfg.Zones, zoneRegion)
 		}()
 	}
 
@@ -176,7 +184,7 @@ const placementCoordinatorTick = 10 * time.Second
 
 // runPlacementCoordinator is the leader-only observe→plan→report loop. It honors leadership (a standby
 // director does nothing) and surfaces the desired moves; the drain executor is the documented next step.
-func runPlacementCoordinator(ctx context.Context, dir *directory.Redis, d *director.Director, pool []string) {
+func runPlacementCoordinator(ctx context.Context, dir *directory.Redis, d *director.Director, pool []string, zoneRegion map[string]string) {
 	ticker := time.NewTicker(placementCoordinatorTick)
 	defer ticker.Stop()
 	fleet := fleetView{dir: dir}
@@ -217,7 +225,7 @@ func runPlacementCoordinator(ctx context.Context, dir *directory.Redis, d *direc
 				slog.Warn("placement: zone occupancy read failed; balancing by zone count this tick", "err", werr)
 				zoneWeight = nil
 			}
-			moves := placement.PlanWeighted(live, assignment, pool, zoneWeight)
+			moves := placement.PlanColocated(live, assignment, pool, zoneWeight, zoneRegion)
 			if len(moves) == 0 {
 				continue // balanced + fully claimed: nothing to do
 			}

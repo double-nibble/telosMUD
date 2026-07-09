@@ -162,6 +162,39 @@ func TestPlanStableWhenBalanced(t *testing.T) {
 	assert.Empty(t, moves, "an already-even spread (2/2) is left alone — hysteresis, no thrash")
 }
 
+// TestPlanColocatedRebalanceColocates pins #42 locality: when a Phase-2 rebalance drains a zone off the
+// busy shard, it picks the movable zone whose region-mates already sit on the destination — over the
+// pool-order default — so the move reunites the region. The destination is unchanged (strict least-loaded).
+func TestPlanColocatedRebalanceColocates(t *testing.T) {
+	// shard-a is busy with 3 zones; shard-b idle, hosting z4 (region "north"). Pool order puts the "south"
+	// zones FIRST, so the plain heaviest/pool-order choice would drain z2 (south) a->b; locality instead
+	// drains z1 (north), reuniting it with its north-mate z4 on b.
+	pool := []string{"z2", "z3", "z1", "z4"}
+	assignment := map[string]string{"z2": "shard-a", "z3": "shard-a", "z1": "shard-a", "z4": "shard-b"}
+	region := map[string]string{"z1": "north", "z2": "south", "z3": "south", "z4": "north"}
+	moves := PlanColocated([]string{"shard-a", "shard-b"}, assignment, pool, nil, region)
+	require.Len(t, moves, 1)
+	assert.Equal(t, "shard-a", moves[0].From)
+	assert.Equal(t, "shard-b", moves[0].To, "destination stays the strict least-loaded")
+	assert.Equal(t, "z1", moves[0].Zone, "locality drains the north zone to rejoin its north-mate on shard-b")
+
+	// Without a region map the SAME shape drains the pool-order-first movable zone (z2) — proving locality is
+	// what changed the choice, and PlanWeighted is unaffected.
+	plain := PlanColocated([]string{"shard-a", "shard-b"}, assignment, pool, nil, nil)
+	require.Len(t, plain, 1)
+	assert.Equal(t, "z2", plain[0].Zone, "no region map => heaviest/pool-order choice (z2)")
+}
+
+// TestPlanColocatedNilRegionIsWeighted: a nil region map reproduces PlanWeighted exactly.
+func TestPlanColocatedNilRegionIsWeighted(t *testing.T) {
+	pool := []string{"z1", "z2", "z3", "z4"}
+	assignment := map[string]string{"z1": "shard-a", "z2": "shard-a", "z3": "shard-a", "z4": "shard-a"}
+	shards := []string{"shard-a", "shard-b"}
+	assert.Equal(t,
+		PlanWeighted(shards, assignment, pool, nil),
+		PlanColocated(shards, assignment, pool, nil, nil))
+}
+
 // TestRebalanceThresholdProportional pins the #42 weight-proportional threshold: the absolute floor on a
 // small (or zero-shard) fleet, ~15% of the mean per-shard load at scale.
 func TestRebalanceThresholdProportional(t *testing.T) {
