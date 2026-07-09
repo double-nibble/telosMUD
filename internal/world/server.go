@@ -253,12 +253,24 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			line := textsan.CleanLine(in.GetText())
 			s.log.Debug("input received", "character", character, "seq", in.GetSeq(), "text", line)
 			currentZone.Load().post(inputMsg{id: character, seq: in.GetSeq(), line: line})
+		case *playv1.ClientFrame_Gmcp:
+			// Inbound GMCP request (#92): a rich client ASKS the world for data (Char.Items.Contents).
+			// Treated as hostile input from a separate trust domain: bound the payload here at the world
+			// ingress (the gate already whitelisted the package), then route it to the owning zone, which
+			// resolves any named entity only within the requester's own reach.
+			g := pl.Gmcp
+			if raw := g.GetJson(); len(raw) <= maxInboundGMCPBytes {
+				s.log.Debug("gmcp request received", "character", character, "pkg", g.GetPkg())
+				currentZone.Load().post(gmcpRequestMsg{id: character, pkg: g.GetPkg(), json: raw})
+			} else {
+				s.log.Debug("gmcp request dropped: oversized payload", "character", character, "bytes", len(raw))
+			}
 		case *playv1.ClientFrame_Detach:
 			s.log.Debug("detach received (clean)", "character", character)
 			cleanQuit = true
 			goto done
 		default:
-			// Phase 1 ignores gmcp/resize/pong/attach-after-first.
+			// Phase 1 ignores resize/pong/attach-after-first.
 		}
 	}
 done:

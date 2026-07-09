@@ -722,6 +722,8 @@ func (z *Zone) handle(m msg) {
 		z.freezeExpire(v.id, v.gen)
 	case inputMsg:
 		z.handleInput(v)
+	case gmcpRequestMsg:
+		z.handleGMCPRequest(v) // #92: an inbound GMCP request (Char.Items.Contents) from a rich client
 	case detachMsg:
 		z.log.Debug("inbox: detach", "player", v.id)
 		z.detach(v.id, v.out)

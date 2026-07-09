@@ -233,6 +233,12 @@ type session struct {
 	// prototype) cannot be sent immediately; it is stashed here and flushed once attach binds
 	// the stream. Empty when there is nothing to tell the arriving player.
 	pendingNotice string
+
+	// gmcpReqTokens / gmcpReqRefill are a per-session TOKEN BUCKET rate-limiting inbound GMCP requests (#92):
+	// a client request forces O(container) work on the shared zone goroutine, so a flood is throttled here
+	// before the parse/scan/marshal (security review M1). Zone-owned (touched only on the zone goroutine).
+	gmcpReqTokens float64
+	gmcpReqRefill time.Time
 }
 
 // newPlayerEntity builds the in-world half of a player and links it to its session

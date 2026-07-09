@@ -352,7 +352,11 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 	// The handler runs on the line-pump's ReadLine goroutine as each IAC SB 201 message is parsed.
 	gmcp := newGMCPState()
 	_ = tc.OfferGMCP()
-	tc.SetGMCPHandler(gmcpHandler(gmcp, tc, log))
+	// gmcpReq carries a WHITELISTED inbound GMCP request (e.g. Char.Items.Contents, #92) from the line-pump
+	// (where gmcpHandler runs) to the bridge forwarder, which relays it to the world as a ClientFrame GmcpIn.
+	// Fire-and-forget (no input seq / replay): a request lost on a redirect is simply re-asked by the client.
+	gmcpReq := make(chan gmcpForward, 8)
+	tc.SetGMCPHandler(gmcpHandler(gmcp, tc, gmcpReq, log))
 
 	// --- login: the browser OAuth device flow (when an account service is wired) or the bare-name dev stub. ---
 	_ = tc.Write("\r\nWelcome to TelosMUD.\r\n")
@@ -537,6 +541,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 		assertion: assertion,
 		lines:     lines,
 		gmcp:      gmcp,
+		gmcpReq:   gmcpReq,
 	}
 	var token string
 	for {
@@ -564,7 +569,8 @@ type connState struct {
 	account   string // Phase 14.3: the authenticated account id (carried in Attach); "" on the legacy path
 	assertion string // Phase 14.3: the signed session assertion (carried in every Attach); "" when auth off
 	lines     <-chan string
-	gmcp      *gmcpState // per-connection GMCP negotiation state (Phase 9.1); never nil
+	gmcp      *gmcpState         // per-connection GMCP negotiation state (Phase 9.1); never nil
+	gmcpReq   <-chan gmcpForward // inbound whitelisted GMCP requests to relay to the world (#92); never nil
 }
 
 // redirectTarget is what a finished bridge reports when the world asked the gate to
@@ -803,6 +809,18 @@ func (b *bridge) sendInputLocked(seq uint64, text string) error {
 	}}})
 }
 
+// sendGmcpIn relays one whitelisted inbound GMCP request to the world (#92). It takes sendMu to serialize
+// with input/replay sends (gRPC Send is not concurrent-safe). Unlike input it carries NO seq and is NOT
+// buffered for replay — a request in flight when the stream ends is simply dropped, and the client re-asks.
+func (b *bridge) sendGmcpIn(f gmcpForward) error {
+	b.sendMu.Lock()
+	defer b.sendMu.Unlock()
+	return b.stream.Send(&playv1.ClientFrame{Payload: &playv1.ClientFrame_Gmcp{Gmcp: &playv1.GmcpIn{
+		Pkg:  f.pkg,
+		Json: f.json,
+	}}})
+}
+
 // runForwarder drains the connection-scoped line channel onto this stream. Each line
 // gets the next session seq and is buffered for replay; then, unless the session is
 // frozen (a re-dial in flight, lines wait behind the replay) it is forwarded live.
@@ -818,6 +836,13 @@ func (b *bridge) runForwarder() {
 			// Stop forwarding to it; any buffered input is replayed on the next shard.
 			b.log.Debug("forwarder stopping (stream ended)")
 			return
+		case f := <-b.conn.gmcpReq:
+			// A whitelisted inbound GMCP request (#92): relay it live (no seq, no replay). A send error
+			// means the stream is ending — the writer's redirect/teardown path handles it; we just drop
+			// this request (the client re-asks after the re-dial).
+			if err := b.sendGmcpIn(f); err != nil {
+				b.log.Debug("gmcp request forward failed", "pkg", f.pkg, "err", err)
+			}
 		case line, ok := <-b.conn.lines:
 			if !ok {
 				// Socket EOF: half-close the send side so the world sees end-of-input.
