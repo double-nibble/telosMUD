@@ -24,6 +24,18 @@ zones:
         bind: bind_on_pickup
         tier: rare
         tags: [magical, salvageable]
+      # hex-charm: a GUARANTEED bind-on-pickup drop (goblin_loot) — a deterministic BoP item so the
+      # bound-loot transfer-refusal journey (#148) can assert the drop refusal without racing the rare
+      # sword's 25% roll. Dark magic binds it to whoever the loot resolver delivers it to; you cannot
+      # drop, give, or put it. No slot/weapon — pure flavor loot, not gear.
+      - ref: midgaard:obj:hexcharm
+        keywords: [charm, hex, fetish]
+        short: a goblin hex-charm
+        long: A crude bone charm, sticky with dark ichor, lies here.
+        physical: {weight: 1, material: bone}
+        bind: bind_on_pickup
+        tier: uncommon
+        tags: [magical]
       # A stackable crafting material (Phase 13.2): leather scraps merge up to 20 per stack. Disenchant/
       # salvage (13.4) produce these; recipes (13.5) consume them.
       - ref: midgaard:obj:leather

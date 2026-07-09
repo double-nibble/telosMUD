@@ -14,6 +14,7 @@ func lootZone(t *testing.T) *Zone {
 	t.Helper()
 	z := newDemoZone("midgaard", newProtoCache())
 	z.defs.rarity.register("common", &rarityTierDef{ref: "common", order: 0, weight: 100})
+	z.defs.rarity.register("uncommon", &rarityTierDef{ref: "uncommon", order: 1, weight: 25})
 	z.defs.rarity.register("rare", &rarityTierDef{ref: "rare", order: 2, weight: 5})
 	return z
 }
@@ -35,6 +36,29 @@ func countItems(e *Entity, ref string) int {
 		}
 	}
 	return n
+}
+
+// TestGoblinLootDeliversBoundHexcharm (#148) pins the demo FIXTURE the bound-loot transfer-refusal e2e
+// depends on: killing a goblin (goblin_loot) always delivers the guaranteed bind-on-pickup hex-charm, and
+// the resolver binds it on delivery. A fast integration net so a regression in the demo table is caught here,
+// not only in the slow live e2e.
+func TestGoblinLootDeliversBoundHexcharm(t *testing.T) {
+	z := lootZone(t)
+	player := z.newPlayerEntity(&session{character: "Hero"}, "Hero")
+	z.resolveLoot(lootVictim(z, player, "goblin_loot"), rand.New(rand.NewSource(1)))
+
+	if got := countItems(player, "midgaard:obj:hexcharm"); got != 1 {
+		t.Fatalf("goblin_loot delivered %d hex-charms, want 1 (guaranteed BoP fixture for #148)", got)
+	}
+	var charm *Entity
+	for _, it := range player.contents {
+		if string(it.proto) == "midgaard:obj:hexcharm" {
+			charm = it
+		}
+	}
+	if !isBound(charm) {
+		t.Fatal("the delivered hex-charm is not bound (bindOnPickup did not fire on personal-loot delivery)")
+	}
 }
 
 func TestLootResolverDeliversGuaranteedDrop(t *testing.T) {

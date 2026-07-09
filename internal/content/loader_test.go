@@ -41,12 +41,12 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if mid.StartRoom != "midgaard:room:temple" {
 		t.Fatalf("midgaard start_room = %q", mid.StartRoom)
 	}
-	// midgaard expanded to 4 rooms (temple/market/guildhall/smithy) and 13 item prototypes
+	// midgaard expanded to 4 rooms (temple/market/guildhall/smithy) and 14 item prototypes
 	// (the original torch/helmet/sword/chest + the smithy gear: warhammer/frostbrand/vest/
-	// gloves/boots/shield + the #35 leather belt in the content-defined "waist" slot). The crypt
-	// zone proves multi-zone-per-shard.
-	if len(mid.Rooms) != 4 || len(mid.Items) != 13 {
-		t.Fatalf("midgaard rooms=%d items=%d, want 4/13", len(mid.Rooms), len(mid.Items))
+	// gloves/boots/shield + the #35 leather belt in the content-defined "waist" slot + the #148
+	// guaranteed bind-on-pickup hex-charm loot fixture). The crypt zone proves multi-zone-per-shard.
+	if len(mid.Rooms) != 4 || len(mid.Items) != 14 {
+		t.Fatalf("midgaard rooms=%d items=%d, want 4/14", len(mid.Rooms), len(mid.Items))
 	}
 	if crypt := lc.Zone("crypt"); crypt == nil {
 		t.Fatal("crypt zone missing (multi-zone-per-shard expansion)")
@@ -161,8 +161,9 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 		t.Fatalf("chargen step 2 = %+v, want point_buy 27pts over 3 attrs", pb)
 	}
 
-	// Loot (Phase 12.1): the demo ships 3 rarity tiers + a goblin_loot table (a guaranteed + a chance
-	// roll). Pack globals, loaded onto lc.RarityTiers / lc.LootTables.
+	// Loot (Phase 12.1): the demo ships 3 rarity tiers + a goblin_loot table (a guaranteed torch, a #148
+	// guaranteed bind-on-pickup hex-charm, and a 25% chance sword). Pack globals, loaded onto
+	// lc.RarityTiers / lc.LootTables.
 	if len(lc.RarityTiers) != 4 {
 		t.Fatalf("rarity_tiers = %d, want 4 (common/uncommon/rare/epic)", len(lc.RarityTiers))
 	}
@@ -170,8 +171,8 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 		t.Fatalf("loot_tables = %d, want 2 (goblin_loot + disenchant_arms)", len(lc.LootTables))
 	}
 	gl := lc.LootTables[0]
-	if gl.Ref != "goblin_loot" || len(gl.Rolls) != 2 {
-		t.Fatalf("goblin_loot = %+v, want ref goblin_loot with 2 rolls", gl)
+	if gl.Ref != "goblin_loot" || len(gl.Rolls) != 3 {
+		t.Fatalf("goblin_loot = %+v, want ref goblin_loot with 3 rolls", gl)
 	}
 
 	// Spawn schedules (Phase 12.4): the demo ships one weekly boss schedule.
