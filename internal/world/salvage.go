@@ -204,13 +204,13 @@ func opSalvageItem(c *effectCtx, op *effectOp) error {
 		for i := range table.rolls {
 			// A bonus pass re-rolls ONLY probabilistic ("chance") rolls; guaranteed/weighted rolls (which
 			// always yield — loot.go) are minted once on the base pass, so a bound sink is never multiplied.
-			// NOTE (tracked follow-up): a chance roll that also carries a PITY spec mutates the looter's pity
-			// counter per pass, so an over-skilled salvage compounds pity N-fold. Latent today (no salvage
-			// table uses pity); if one does, gate pity out of the bonus passes.
 			if p > 0 && table.rolls[i].kind != "chance" {
 				continue
 			}
-			for _, entry := range c.z.resolveRoll(c.actor, &table.rolls[i], rng) {
+			// #181: only the BASE pass advances the looter's pity counter. A bonus pass (p>0) re-rolls the
+			// same chance with the pity-adjusted odds but does NOT mutate pity, so one over-skilled salvage of
+			// a pitied table can't compound the counter up to 1+maxSalvageBonus times.
+			for _, entry := range c.z.resolveRoll(c.actor, &table.rolls[i], rng, p == 0) {
 				c.z.deliverComponent(c.actor, entry, rng)
 			}
 		}

@@ -178,7 +178,7 @@ func (z *Zone) resolveLoot(victim *Entity, rng *rand.Rand) {
 	looters := z.eligibleLooters(victim)
 	for _, looter := range looters {
 		for i := range table.rolls {
-			for _, entry := range z.resolveRoll(looter, &table.rolls[i], rng) {
+			for _, entry := range z.resolveRoll(looter, &table.rolls[i], rng, true) {
 				z.deliverLoot(looter, entry, table.ref, rng)
 			}
 		}
@@ -262,7 +262,11 @@ func (z *Zone) eligibleLooters(victim *Entity) []*Entity {
 // resolveRoll resolves one roll to a list of selected item prototype refs (0..N items) for `looter`.
 // guaranteed and the weighted kinds always pick from the pool; chance gates on its (pity-adjusted)
 // probability first. quality_floor filters the pool to entries at or above the floor tier's order.
-func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand) []lootEntry {
+// mutatePity controls whether a "chance" roll ADVANCES the looter's persistent bad-luck counter. Normal
+// loot passes true; a salvage over-skill BONUS pass passes false so re-rolling the same table N times can't
+// compound pity N-fold (#181) — the bonus pass still enjoys the pity-adjusted chance, it just doesn't
+// consume/advance the counter.
+func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand, mutatePity bool) []lootEntry {
 	pool := z.filterPoolByFloor(roll.pool, roll.qualityFloor)
 	if len(pool) == 0 {
 		return nil
@@ -275,8 +279,9 @@ func (z *Zone) resolveRoll(looter *Entity, roll *lootRoll, rng *rand.Rand) []loo
 	case "chance":
 		hit := rng.Float64() < pityAdjustedChance(roll, looter)
 		// Bad-luck protection (Phase 12.2): a miss raises this looter's counter (and so their next
-		// chance); a hit resets it. Per-looter, per pity key, persisted.
-		if roll.pity != nil {
+		// chance); a hit resets it. Per-looter, per pity key, persisted. Skipped on a no-mutate (salvage
+		// bonus) pass so the counter isn't advanced multiple times for one salvage (#181).
+		if mutatePity && roll.pity != nil {
 			if hit {
 				setLootPityMisses(looter, roll.pity.key, 0)
 			} else {
