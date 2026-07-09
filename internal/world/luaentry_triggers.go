@@ -312,6 +312,31 @@ func (z *Zone) fireRoomEntry(entrant, room *Entity) {
 	}
 }
 
+// fireSpawn PRIMES a freshly reset-spawned + placed scripted entity and fires its `spawn` trigger. Priming
+// (ensureEntityScript, run inside fireTrigger) executes the registration body — arming any TOP-LEVEL
+// mud.after loop, e.g. a wanderer's self-rescheduling tick — WITHOUT waiting for a player-driven trigger,
+// which entity-script laziness otherwise requires (a mob would only start wandering after a player first
+// reached its spawn room; #202). The optional `on("spawn", fn)` handler is the explicit content lifecycle
+// hook (ev is empty). Called AFTER placement so self:room() resolves, on the zone goroutine as a clean ROOT
+// cascade (the reset tick is not itself a fired event). No-ops for a non-scripted entity.
+//
+// ORDERING: spawn fires the instant this entity is placed, which is BEFORE any LATER reset op arms it (e.g. a
+// separate `spawn_item ... into: <mob>` op that gives it loot). A spawn handler therefore must not assume its
+// reset-placed inventory is present yet.
+//
+// SCOPE: fired from the RESET spawn path only (a clean root — the reset tick is not itself a cascade). A
+// mud.spawn runs INSIDE a live handler cascade and already has a script that can arm the mob directly; firing
+// a fresh root "spawn" from there would ESCAPE that cascade's depth/width budget (a depth-0 cascade nested in
+// a live one), so it is deliberately excluded. A mud.spawn'd wanderer must arm its loop at the call site or in
+// its top-level body, not in on("spawn").
+func (z *Zone) fireSpawn(e *Entity) {
+	if z == nil || z.lua == nil || e == nil || scriptSource(e) == "" {
+		return
+	}
+	rt := z.lua
+	rt.fireTrigger(e, "spawn", rt.rootCtx(e), rt.evTable(nil, ""))
+}
+
 // fireRoomLeave fires the `leave` trigger on the room when `leaver` departs (ev.actor = leaver).
 // Fired BEFORE the entity detaches so the room can still see it. nil-safe.
 func (z *Zone) fireRoomLeave(leaver, room *Entity) {

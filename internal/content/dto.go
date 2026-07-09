@@ -983,4 +983,9 @@ type ResetDTO struct {
 	Max        int    `json:"max,omitempty" yaml:"max,omitempty"`
 	Into       string `json:"into,omitempty" yaml:"into,omitempty"`
 	Persistent bool   `json:"persistent,omitempty" yaml:"persistent,omitempty"`
+	// Roam marks a spawn whose population is counted ZONE-WIDE rather than in the spawn room (#202). A
+	// WANDERING mob leaves its spawn room, so a room-scoped top-up would see the room empty and spawn a
+	// replacement every repop — an unbounded leak. With roam set, the repop counts the proto across the whole
+	// zone, so one roamer anywhere satisfies the reset. Only meaningful for a mobile (mob) spawn.
+	Roam bool `json:"roam,omitempty" yaml:"roam,omitempty"`
 }
