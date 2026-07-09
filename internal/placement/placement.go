@@ -139,9 +139,20 @@ func Plan(liveShards []string, assignment map[string]string, pool []string) []Mo
 // balance). zoneWeight[zone] is the zone's weight; a zone absent from the map (or weight <= 0) defaults to
 // 1, so a nil map reproduces the zone-COUNT Plan exactly (a nil map also keeps the FIXED rebalance floor —
 // the weight-proportional threshold applies only to a real weight map). Still PURE + deterministic (the
-// directory CAS is the safety arbiter, not the plan). REMAINING follow-ups (PLACEMENT.md §7): wiring the
-// plan to DRIVE the drain executor, locality-aware colocation, and rebalance cooldowns.
+// directory CAS is the safety arbiter, not the plan). Use PlanColocated to also prefer region-colocation.
 func PlanWeighted(liveShards []string, assignment map[string]string, pool []string, zoneWeight map[string]int) []Move {
+	return PlanColocated(liveShards, assignment, pool, zoneWeight, nil)
+}
+
+// PlanColocated is PlanWeighted that also prefers LOCALITY (#42): when a Phase-2 rebalance drains a zone off
+// the busiest shard, it prefers to move a zone whose REGION-MATES (zoneRegion[zone]=region) already sit on
+// the destination, so the load-driven move also colocates the region — keeping its cross-zone / region-state
+// traffic in-process. Locality biases only WHICH zone is moved; the DESTINATION stays the strict least-
+// loaded, so Phase-2's termination proof is untouched, and it never trades load for locality. (It is applied
+// in Phase 2, the coordinator-DRIVEN path, not Phase-1 assignment — a From=="" assignment is claimed
+// decentrally by the world, which the coordinator does not steer, so a Phase-1 preference would be inert.)
+// A nil zoneRegion (or all-region-less zones) reproduces PlanWeighted exactly. Still PURE + deterministic.
+func PlanColocated(liveShards []string, assignment map[string]string, pool []string, zoneWeight map[string]int, zoneRegion map[string]string) []Move {
 	if len(liveShards) == 0 {
 		return nil
 	}
@@ -160,12 +171,20 @@ func PlanWeighted(liveShards []string, assignment map[string]string, pool []stri
 	for _, s := range liveShards {
 		load[s] = 0
 	}
+	// rc[shard][region] = how many pool zones the shard owns in that region — the locality signal.
+	rc := map[string]map[string]int{}
+	for _, s := range liveShards {
+		rc[s] = map[string]int{}
+	}
 	owner := map[string]string{} // zone -> its live owner ("" if unclaimed/dead)
 	for _, zone := range pool {
 		o := assignment[zone]
 		if o != "" && live[o] {
 			owner[zone] = o
 			load[o] += weight(zone)
+			if r := zoneRegion[zone]; r != "" {
+				rc[o][r]++
+			}
 		} else {
 			owner[zone] = ""
 		}
@@ -174,6 +193,10 @@ func PlanWeighted(liveShards []string, assignment map[string]string, pool []stri
 	var moves []Move
 
 	// Phase 1: assign unclaimed zones to the least-loaded shard (deterministic order for reproducibility).
+	// Locality is deliberately NOT applied here: a From=="" assignment is claimed DECENTRALLY by the world
+	// (ClaimFromPool), which the coordinator does not drive, so a locality preference on Phase-1 placement
+	// would be computed-but-inert. Locality lives in Phase 2, the coordinator-DRIVEN path. (rc is still
+	// maintained so Phase 2 sees the true region layout.)
 	for _, zone := range pool {
 		if owner[zone] != "" {
 			continue
@@ -182,6 +205,9 @@ func PlanWeighted(liveShards []string, assignment map[string]string, pool []stri
 		moves = append(moves, Move{Zone: zone, From: "", To: to})
 		owner[zone] = to
 		load[to] += weight(zone)
+		if r := zoneRegion[zone]; r != "" {
+			rc[to][r]++
+		}
 	}
 
 	// Phase 2: rebalance by draining one zone at a time from the busiest to the idlest until the spread is
@@ -206,21 +232,53 @@ func PlanWeighted(liveShards []string, assignment map[string]string, pool []stri
 		if gap <= threshold {
 			break
 		}
-		// Move a zone on hi whose weight STRICTLY reduces the gap (weight < gap). With uniform weights this
-		// is every zone (gap >= 2 > 1); with weights it excludes an INDIVISIBLE heavy zone whose move would
-		// merely flip the imbalance to lo — the guard that keeps Phase 2 terminating instead of ping-ponging
-		// one big zone forever. If no zone qualifies, the current spread is the best a single-zone move can do.
-		zone := pickMovableZone(hi, owner, pool, weight, gap)
+		// Pick a movable zone (weight < gap) on hi to drain to the strict least-loaded lo. LOCALITY (#42):
+		// among the movable zones, prefer one whose region-mates ALREADY sit on lo, so the rebalance move
+		// improves colocation as well as load. The DESTINATION is unchanged (strict least-loaded), so Phase-2
+		// termination is untouched — each move still strictly shrinks the gap. With no region map this reduces
+		// to the heaviest-movable choice (fewest moves), so PlanWeighted is unchanged.
+		zone := pickColocatingZone(hi, lo, owner, zoneRegion, pool, weight, gap, rc)
 		if zone == "" {
 			break
 		}
-		moves = append(moves, Move{Zone: zone, From: hi, To: lo})
 		w := weight(zone)
+		if r := zoneRegion[zone]; r != "" {
+			rc[hi][r]-- // the zone leaves hi's region tally and joins lo's
+			rc[lo][r]++
+		}
+		moves = append(moves, Move{Zone: zone, From: hi, To: lo})
 		owner[zone] = lo
 		load[hi] -= w
 		load[lo] += w
 	}
 	return moves
+}
+
+// pickColocatingZone chooses which movable zone on `hi` (weight strictly < gap, so the move reduces the
+// spread and Phase 2 terminates) to drain to `lo`. It prefers a zone whose region-mates ALREADY sit on `lo`
+// (rc[lo][region]) — so the load-driven move ALSO improves colocation (#42) — and among equally-colocating
+// candidates the HEAVIEST (fastest gap reduction), ties by pool order for determinism. With no region info
+// (rc[lo][region]==0 for every candidate, e.g. a nil zoneRegion) it reduces to the heaviest-movable choice,
+// so PlanWeighted is unchanged. "" when no zone on hi has weight < gap (an indivisible-heavy stall).
+func pickColocatingZone(hi, lo string, owner, zoneRegion map[string]string, pool []string, weight func(string) int, gap int, rc map[string]map[string]int) string {
+	best, bestMates, bestW := "", -1, -1
+	for _, zone := range pool {
+		if owner[zone] != hi {
+			continue
+		}
+		w := weight(zone)
+		if w >= gap {
+			continue // moving it would over-correct (flip the imbalance to lo) — the termination guard
+		}
+		mates := 0
+		if r := zoneRegion[zone]; r != "" {
+			mates = rc[lo][r]
+		}
+		if mates > bestMates || (mates == bestMates && w > bestW) {
+			best, bestMates, bestW = zone, mates, w
+		}
+	}
+	return best
 }
 
 // leastLoaded returns the live shard with the fewest zones (ties broken by id for determinism).
@@ -240,23 +298,6 @@ func mostLoaded(shards []string, load map[string]int) string {
 	for _, s := range sortedShards(shards) {
 		if load[s] > bestN {
 			best, bestN = s, load[s]
-		}
-	}
-	return best
-}
-
-// pickMovableZone returns a pool zone owned by shard whose weight strictly reduces the imbalance gap
-// (weight < gap) — so moving it always shrinks the spread and Phase 2 terminates. It prefers the HEAVIEST
-// such zone (the biggest gap-reducing move), ties broken by pool order for determinism. "" when no zone
-// owned by shard has weight < gap (an indivisible-heavy-zone stall).
-func pickMovableZone(shard string, owner map[string]string, pool []string, weight func(string) int, gap int) string {
-	best, bestW := "", 0
-	for _, zone := range pool {
-		if owner[zone] != shard {
-			continue
-		}
-		if w := weight(zone); w < gap && w > bestW {
-			best, bestW = zone, w
 		}
 	}
 	return best
