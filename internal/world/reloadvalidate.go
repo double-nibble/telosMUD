@@ -34,8 +34,11 @@ import (
 // 2b) checks zone reset references (unknown op / undefined target room / undefined prototype) — a pack-HEALTH
 // check (resets don't hot-swap; they run at boot/repop), catching a broken edit before broadcast.
 // validateProtoRefs (#197 slice 2c) rejects a prototype ref collision — two rooms/items/mobs sharing a ref
-// silently collapse to one in the shared cache. Remaining #197 work: a full-graph dry-run for cross-pack
-// cycles a scoped reload misses. The framework — collect problems -> gate the publish -> report — is what each slots into.
+// silently collapse to one in the shared cache. FULL-GRAPH validation (#205): every check now resolves refs
+// against the WHOLE enabled pack set (so a cross-pack attribute cycle and a cross-zone dangling exit/reset —
+// previously invisible to a scoped `reload <onepack>` — are caught), while REJECTING only findings a reloaded
+// (in-scope) pack contributes to the merged graph (provenance-by-last-writer, see reloadScope). The framework
+// — collect problems -> gate the publish -> report — is what each slots into.
 //
 // Validation is PURE over the parsed DTOs (it reuses parseAttributeBase + lintAttributeCycles and builds a
 // THROWAWAY attributeDef map — never the shard's live registries), so it is safe on the off-zone-goroutine
@@ -102,63 +105,132 @@ func sharedDefKinds(loaded []content.Pack) []string {
 	return out
 }
 
-// validatePacks returns one human-readable problem per definitively-broken thing in the re-read packs, or
-// nil when they validate. A non-empty result MUST block the publish. Attributes merge across packs
-// last-write-wins by ref (mirroring content.Load), so a cycle spanning packs is caught WHEN both packs are
-// in scope. NOTE: a scoped `reload <onepack>` only re-reads that pack, so a cycle spanning it and a
-// NOT-reloaded pack is invisible here (lintAttributeCycles treats an out-of-scope ref as a non-edge — safe,
-// never a false positive, but asymmetric with boot which lints the full merged graph). Acceptable since
-// attributes don't hot-swap on this path anyway; full-graph validation is part of #197.
-func validatePacks(loaded []content.Pack) []string {
+// reloadScope carries the FULL enabled content graph as validation CONTEXT plus the PROVENANCE that attributes
+// a finding back to a reloaded pack (#205). validatePacks resolves refs against `full` — so a CROSS-PACK
+// attribute cycle or a CROSS-ZONE dangling exit/reset now resolves (previously invisible to a scoped reload,
+// which only saw the in-scope packs) — but REJECTS only a finding whose rooted unit's LAST-WRITER pack is in
+// `scoped`. That gives both invariants at once: no false positives (an unrelated broken pack B never blocks a
+// valid `reload A`), and full coverage (a defect A actually contributes to the merged graph is caught).
+//
+// Provenance is last-writer-wins, matching what content.Load makes live: attributes + channels merge by ref
+// (a later enabled pack's def overrides an earlier one, so the earlier is INERT and its defects are not A's
+// problem), and zones merge whole by ref (a room/exit/reset's owner is its owning zone's last-writer).
+type reloadScope struct {
+	full      []content.Pack
+	scoped    map[string]bool   // pack names being reloaded (a finding is rejectable only if rooted in one of these)
+	attrOwner map[string]string // attribute ref -> last-writer pack
+	zoneOwner map[string]string // zone ref -> last-writer pack (a room/exit/reset inherits its zone's owner)
+	chanOwner map[string]string // channel ref -> last-writer pack
+}
+
+func newReloadScope(full []content.Pack, scoped map[string]bool) *reloadScope {
+	s := &reloadScope{
+		full: full, scoped: scoped,
+		attrOwner: map[string]string{}, zoneOwner: map[string]string{}, chanOwner: map[string]string{},
+	}
+	for i := range full {
+		pk := &full[i]
+		for _, a := range pk.Attributes {
+			s.attrOwner[a.Ref] = pk.Pack
+		}
+		for _, z := range pk.Zones {
+			s.zoneOwner[z.Ref] = pk.Pack
+		}
+		for _, ch := range pk.Channels {
+			if strings.TrimSpace(ch.Ref) != "" {
+				s.chanOwner[ch.Ref] = pk.Pack
+			}
+		}
+	}
+	return s
+}
+
+func (s *reloadScope) inScope(pack string) bool { return s.scoped[pack] }
+
+// zoneInScope reports whether a zone's LIVE definition (its last-writer) is among the reloaded packs — the
+// provenance gate for a room/exit/reset finding, which is rooted in its owning zone.
+func (s *reloadScope) zoneInScope(zoneRef string) bool { return s.inScope(s.zoneOwner[zoneRef]) }
+
+// liveZones returns the merged zone set content.Load builds: whole-zone last-write-wins by ref, first-seen
+// order preserved. Judging over the LIVE zones (not every pack's copy) is what makes the cross-zone checks
+// resolve against the real world graph and attribute a finding to the zone's actual owner.
+func (s *reloadScope) liveZones() []content.ZoneDTO {
+	byRef := map[string]content.ZoneDTO{}
+	var order []string
+	for i := range s.full {
+		for _, z := range s.full[i].Zones {
+			if _, seen := byRef[z.Ref]; !seen {
+				order = append(order, z.Ref)
+			}
+			byRef[z.Ref] = z
+		}
+	}
+	out := make([]content.ZoneDTO, 0, len(order))
+	for _, ref := range order {
+		out = append(out, byRef[ref])
+	}
+	return out
+}
+
+// validatePacks returns one human-readable problem per definitively-broken thing that a reloaded (in-scope)
+// pack CONTRIBUTES to the FULL merged graph, or nil when the reloaded content is sound. A non-empty result
+// MUST block the publish. `full` is the whole enabled pack set (resolution context, in enabled/boot order for
+// last-writer provenance); `scoped` is the set of pack names being reloaded. On a bare `reload` (full == all,
+// scoped == all) every finding is rejectable, so behaviour is identical to the pre-#205 scoped-only pass.
+func validatePacks(full []content.Pack, scoped map[string]bool) []string {
+	s := newReloadScope(full, scoped)
 	var problems []string
-	// Build the merged attribute-def graph exactly as boot does (build.go defineGlobals): parse each base
-	// formula with the SAME parser, last-write-wins by ref. A parse failure is a problem; a successfully
-	// parsed set is then cycle-checked with the SAME lint boot runs.
+	// --- attributes: build the FULL merged def graph (last-write-wins by ref) exactly as boot does, then
+	// reject a parse error / cycle only when an IN-SCOPE attribute is the live cause. Building over the full
+	// graph fixes the cross-pack blind spot (a cycle spanning a reloaded pack + a not-reloaded pack); the
+	// provenance gate keeps an unrelated pack's cycle from blocking this reload.
 	attrDefs := map[string]*attributeDef{}
-	for i := range loaded {
-		for _, a := range loaded[i].Attributes {
+	for i := range full {
+		pk := &full[i]
+		for _, a := range pk.Attributes {
+			if s.attrOwner[a.Ref] != pk.Pack {
+				continue // a later pack overrides this attr — the earlier copy is inert (never the live def)
+			}
 			base, err := parseAttributeBase(a)
 			if err != nil {
-				problems = append(problems, fmt.Sprintf("attribute %q: bad base formula: %v", a.Ref, err))
+				if s.inScope(pk.Pack) {
+					problems = append(problems, fmt.Sprintf("attribute %q: bad base formula: %v", a.Ref, err))
+				}
 				continue
 			}
 			attrDefs[a.Ref] = &attributeDef{ref: a.Ref, base: base}
 		}
 	}
-	for _, err := range lintAttributeCycles(attrDefs) {
-		problems = append(problems, err.Error())
+	for _, cycle := range attributeCycles(attrDefs) {
+		if anyAttrInScope(s, cycle) {
+			problems = append(problems, fmt.Sprintf("attribute cycle: %v", cycle))
+		}
 	}
-	// Payload validation for the propagated kinds. Channels and rooms DO hot-swap on this path, so they are
-	// checked against the same build path boot uses (#197 slices 1 + 2).
-	problems = append(problems, validateChannels(loaded)...)
-	problems = append(problems, validateRoomExits(loaded)...)
-	// Reset-reference sanity (#197 slice 2b) — a pack-HEALTH check (resets do NOT hot-swap; they run at
-	// boot/repop), catching a bad edit before it is broadcast rather than at the next reset.
-	problems = append(problems, validateResets(loaded)...)
-	// Prototype ref sanity (#197 slice 2c): a collision silently collapses content in the shared cache.
-	problems = append(problems, validateProtoRefs(loaded)...)
+	// Payload + pack-health checks, each resolving against the full graph and rejecting only in-scope findings.
+	problems = append(problems, validateChannels(s)...)
+	problems = append(problems, validateRoomExits(s)...)
+	problems = append(problems, validateResets(s)...)
+	problems = append(problems, validateProtoRefs(s)...)
 	// Reserved core: namespace (#212): a real pack shipping a core-namespace world-ref would, on
 	// broadcast, drive a KindZone reconcile against the embedded bootstrap lobby (which reshapes/tears
-	// down rooms) on every shard. The boot lint only WARNS; here — the broadcast gate — it is a hard
-	// REJECT so such a ref can never enter a fleet reload. (Defense-in-depth with the reconcile guard
-	// in reload.go, which fail-safes if one slips through.)
-	for _, v := range content.LintReservedCoreRefs(loaded) {
-		problems = append(problems, fmt.Sprintf("pack %q ships %s %q under the reserved core: namespace (would clobber the embedded bootstrap pack)", v.Pack, v.Kind, v.Ref))
+	// down rooms) on every shard. Hard REJECT — but only when the OFFENDING pack is in scope (a not-reloaded
+	// pack's pre-existing violation must not block this reload).
+	for _, v := range content.LintReservedCoreRefs(full) {
+		if s.inScope(v.Pack) {
+			problems = append(problems, fmt.Sprintf("pack %q ships %s %q under the reserved core: namespace (would clobber the embedded bootstrap pack)", v.Pack, v.Kind, v.Ref))
+		}
 	}
-	// Ref charset (#66, extended #234): an identity token (ref/verb/surface/tier-name) or an exit-direction
-	// key with a character outside ITS safe charset can break a GMCP key, a comms subject, or the targeting
-	// tokenizer (all of which assume tokens are metacharacter-free). Directions get a colon-excluding charset.
-	// The boot lint only WARNS; here — the broadcast gate — it is a hard REJECT so a bad token never reloads.
-	for _, v := range content.LintRefCharset(loaded) {
-		problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside its safe charset %s (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value, v.Charset))
+	// Ref charset (#66, extended #234): an identity token with a character outside its safe charset can break
+	// a GMCP key, a comms subject, or the tokenizer. Hard REJECT for an in-scope pack only.
+	for _, v := range content.LintRefCharset(full) {
+		if s.inScope(v.Pack) {
+			problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside its safe charset %s (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value, v.Charset))
+		}
 	}
-	// Trust ladder (#111): a baseline tier granting a capability elevates EVERY un-elevated account on the next
-	// login, fleet-wide; a duplicate/nameless rung leaves the promote ceiling's rank ordering ambiguous. The
-	// boot lint only warns (the engine must boot on imperfect content); here — the broadcast gate — the
-	// Reject-severity findings are a hard REJECT so such a ladder can never enter a fleet reload. Warn-severity
-	// findings (un-grantable flags, a non-nested ladder) are authoring noise and do not block a reload.
-	for _, v := range content.LintTrustLadder(loaded) {
-		if v.Severity != content.TrustLadderReject {
+	// Trust ladder (#111): a baseline tier granting a capability elevates every un-elevated account on next
+	// login. Reject-severity findings are a hard REJECT for an in-scope pack; warn-severity is authoring noise.
+	for _, v := range content.LintTrustLadder(full) {
+		if v.Severity != content.TrustLadderReject || !s.inScope(v.Pack) {
 			continue
 		}
 		where := "pack " + strconv.Quote(v.Pack)
@@ -168,6 +240,18 @@ func validatePacks(loaded []content.Pack) []string {
 		problems = append(problems, fmt.Sprintf("%s trust ladder: %s", where, v.Detail))
 	}
 	return problems
+}
+
+// anyAttrInScope reports whether any attribute on a cycle is owned (last-writer) by an in-scope pack — the
+// provenance gate for a cross-pack cycle. Every node on a cycle owns the outgoing edge that closes it, so
+// node-provenance is edge-provenance; a cycle A->B->A is attributed to A when A owns a participating attr.
+func anyAttrInScope(s *reloadScope, cycle []string) bool {
+	for _, ref := range cycle {
+		if s.inScope(s.attrOwner[ref]) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateProtoRefs reports a problem per prototype (room/item/mob) that would be SILENTLY DROPPED from the
@@ -183,42 +267,36 @@ func validatePacks(loaded []content.Pack) []string {
 // like collisions; deduping zones by ref first collapses the override to the single zone the cache actually
 // builds, exactly as boot does. After dedup, each zone ref appears once (rooms/items/mobs already unioned
 // within a pack by packtree), so a surviving duplicate ref is a genuine cross-zone / cross-kind collision.
-func validateProtoRefs(loaded []content.Pack) []string {
-	// Cross-pack zone dedup: last-write-wins by zone ref, order preserved — the set defineContent builds.
-	zonesByRef := map[string]content.ZoneDTO{}
-	var order []string
-	for i := range loaded {
-		for _, z := range loaded[i].Zones {
-			if _, seen := zonesByRef[z.Ref]; !seen {
-				order = append(order, z.Ref)
-			}
-			zonesByRef[z.Ref] = z
-		}
-	}
+func validateProtoRefs(s *reloadScope) []string {
 	var problems []string
-	// owner records the first zone that claimed a ref, so a collision names both sides.
+	// owner records the first zone that claimed a ref, so a collision names both sides. A finding is rejected
+	// only when a reloaded (in-scope) zone is one of the two sides — a collision entirely between two
+	// not-reloaded zones is a pre-existing defect this reload didn't cause (#205 provenance gate).
 	owner := map[string]string{}
 	check := func(zoneRef, kind, ref string) {
 		if strings.TrimSpace(ref) == "" {
-			problems = append(problems, fmt.Sprintf("zone %q: %s prototype with empty ref", zoneRef, kind))
+			if s.zoneInScope(zoneRef) {
+				problems = append(problems, fmt.Sprintf("zone %q: %s prototype with empty ref", zoneRef, kind))
+			}
 			return
 		}
 		if prev, ok := owner[ref]; ok {
-			problems = append(problems, fmt.Sprintf("prototype ref %q is defined more than once (zones %q and %q) — the later one silently overwrites the earlier in the shared cache", ref, prev, zoneRef))
+			if s.zoneInScope(zoneRef) || s.zoneInScope(prev) {
+				problems = append(problems, fmt.Sprintf("prototype ref %q is defined more than once (zones %q and %q) — the later one silently overwrites the earlier in the shared cache", ref, prev, zoneRef))
+			}
 			return
 		}
 		owner[ref] = zoneRef
 	}
-	for _, zref := range order {
-		z := zonesByRef[zref]
+	for _, z := range s.liveZones() {
 		for _, r := range z.Rooms {
-			check(zref, "room", r.Ref)
+			check(z.Ref, "room", r.Ref)
 		}
 		for _, p := range z.Items {
-			check(zref, "item", p.Ref)
+			check(z.Ref, "item", p.Ref)
 		}
 		for _, p := range z.Mobs {
-			check(zref, "mob", p.Ref)
+			check(z.Ref, "mob", p.Ref)
 		}
 	}
 	return problems
@@ -232,72 +310,73 @@ func validateProtoRefs(loaded []content.Pack) []string {
 // same spirit as the attribute checks. It is faithful to applyReset's resolution rules and holds the no-
 // false-positive invariant:
 //
+// Every finding below is gated by provenance — only a reset in a reloaded (in-scope) zone is rejected:
 //   - OP: applyReset understands only {spawn_item, spawn_mob, ""}; any other op is a dead reset (it warns
-//     "op not understood" and spawns nothing). Flagged in any scope — the op vocabulary is engine-fixed.
+//     "op not understood" and spawns nothing). Provably dead — the op vocabulary is engine-fixed.
 //   - ROOM: applyReset resolves the target via z.rooms[ref] — the reset's OWN zone's rooms ONLY (a reset
 //     never places into another zone). So a Room absent from the owning zone's authored room set is provably
-//     dangling in ANY scope (the owning zone is always loaded whole here), regardless of ref prefix — a
-//     cross-zone-looking Room can never resolve at runtime. An empty Room is dead.
+//     dangling (the owning zone is always loaded whole here), regardless of ref prefix — a cross-zone-looking
+//     Room can never resolve at runtime. An empty Room is dead.
 //   - PROTO: applyReset resolves via z.spawn, which reads the SHARED per-shard proto cache. That cache holds
 //     every loaded zone's ROOM, item AND mob prototypes (defineContent registers all three — build.go), so a
 //     reset naming a room ref as its proto is degenerate but still spawns SOMETHING; the resolvable set here
-//     therefore includes rooms too, to avoid a false positive. An intra-zone prototype (its ref prefix == the
-//     reset's zone) absent from the loaded set is provably undefined; a CROSS-zone prototype may live in a
-//     pack outside a scoped reload's scope, so it is deferred (never falsely rejected). An empty Proto is dead.
+//     therefore includes rooms too, to avoid a false positive. #205: the proto set is now built over the FULL
+//     merged graph (every enabled zone), so a CROSS-zone prototype that lives in a not-reloaded zone resolves;
+//     a proto absent from the WHOLE world is provably undefined. Findings are gated by provenance — a reset in
+//     a not-reloaded zone (its owning zone's last-writer is out of scope) never blocks this reload. Empty Proto
+//     is dead.
 //
 // The `into` container target is a RUNTIME instance lookup (intoTargetInRoom finds a live container/mob in
 // the room, dependent on earlier resets' spawn order), so it cannot be judged statically and is deliberately
 // not checked — no false positive.
-func validateResets(loaded []content.Pack) []string {
-	// The shared proto cache z.spawn reads: every loaded zone's ROOM, item AND mob prototype refs
-	// (defineContent registers all three into one cache — build.go). Rooms are included so a reset naming a
-	// room ref as its proto — degenerate, but z.spawn resolves it and applyReset does spawn it — is not a
-	// false positive.
+func validateResets(s *reloadScope) []string {
+	zones := s.liveZones()
+	// The shared proto cache z.spawn reads: EVERY live zone's ROOM, item AND mob prototype refs (defineContent
+	// registers all three into one cache — build.go). Built over the FULL merged graph (#205), so a CROSS-ZONE
+	// reset prototype that lives in a not-reloaded zone now resolves — the intra-zone-only hedge is dropped.
+	// Rooms are included so a reset naming a room ref as its proto (degenerate but resolvable) is no false hit.
 	protoRefs := map[string]bool{}
-	for i := range loaded {
-		for _, z := range loaded[i].Zones {
-			for _, r := range z.Rooms {
-				protoRefs[r.Ref] = true
-			}
-			for _, p := range z.Items {
-				protoRefs[p.Ref] = true
-			}
-			for _, p := range z.Mobs {
-				protoRefs[p.Ref] = true
-			}
+	for _, z := range zones {
+		for _, r := range z.Rooms {
+			protoRefs[r.Ref] = true
+		}
+		for _, p := range z.Items {
+			protoRefs[p.Ref] = true
+		}
+		for _, p := range z.Mobs {
+			protoRefs[p.Ref] = true
 		}
 	}
 	var problems []string
-	for i := range loaded {
-		for _, z := range loaded[i].Zones {
-			// The reset's target room resolves against THIS zone's rooms only (z.rooms).
-			zoneRooms := make(map[string]bool, len(z.Rooms))
-			for _, r := range z.Rooms {
-				zoneRooms[r.Ref] = true
+	for _, z := range zones {
+		if !s.zoneInScope(z.Ref) {
+			continue // a reset in a not-reloaded zone is not this reload's problem (#205 provenance gate)
+		}
+		// The reset's target room resolves against THIS zone's rooms only (z.rooms).
+		zoneRooms := make(map[string]bool, len(z.Rooms))
+		for _, r := range z.Rooms {
+			zoneRooms[r.Ref] = true
+		}
+		for ri := range z.Resets {
+			r := &z.Resets[ri]
+			switch r.Op {
+			case "spawn_item", "spawn_mob", "":
+				// understood — check its references below.
+			default:
+				problems = append(problems, fmt.Sprintf("zone %q reset: unknown op %q (understood: spawn_item, spawn_mob)", z.Ref, r.Op))
+				continue // a dead reset; its refs are moot
 			}
-			for ri := range z.Resets {
-				r := &z.Resets[ri]
-				switch r.Op {
-				case "spawn_item", "spawn_mob", "":
-					// understood — check its references below.
-				default:
-					problems = append(problems, fmt.Sprintf("zone %q reset: unknown op %q (understood: spawn_item, spawn_mob)", z.Ref, r.Op))
-					continue // a dead reset; its refs are moot
-				}
-				if strings.TrimSpace(r.Room) == "" {
-					problems = append(problems, fmt.Sprintf("zone %q reset (proto %q): empty target room", z.Ref, r.Proto))
-				} else if !zoneRooms[r.Room] {
-					problems = append(problems, fmt.Sprintf("zone %q reset: target room %q is not a room of this zone", z.Ref, r.Room))
-				}
-				if strings.TrimSpace(r.Proto) == "" {
-					problems = append(problems, fmt.Sprintf("zone %q reset (room %q): empty prototype", z.Ref, r.Room))
-				} else if !protoRefs[r.Proto] {
-					// Undefined only DEFINITIVELY when the proto belongs to a loaded zone: an intra-zone ref
-					// (prefix == this zone) is provably undefined; a cross-zone ref may be out of scope.
-					if pz, _ := parseRef(ProtoRef(r.Proto)); pz == z.Ref {
-						problems = append(problems, fmt.Sprintf("zone %q reset: prototype %q is not defined", z.Ref, r.Proto))
-					}
-				}
+			if strings.TrimSpace(r.Room) == "" {
+				problems = append(problems, fmt.Sprintf("zone %q reset (proto %q): empty target room", z.Ref, r.Proto))
+			} else if !zoneRooms[r.Room] {
+				problems = append(problems, fmt.Sprintf("zone %q reset: target room %q is not a room of this zone", z.Ref, r.Room))
+			}
+			if strings.TrimSpace(r.Proto) == "" {
+				problems = append(problems, fmt.Sprintf("zone %q reset (room %q): empty prototype", z.Ref, r.Room))
+			} else if !protoRefs[r.Proto] {
+				// Resolves nowhere in the FULL merged proto set — provably undefined (no cross-zone-out-of-scope
+				// escape hatch now that the whole graph is the context).
+				problems = append(problems, fmt.Sprintf("zone %q reset: prototype %q is not defined", z.Ref, r.Proto))
 			}
 		}
 	}
@@ -311,58 +390,45 @@ func validateResets(loaded []content.Pack) []string {
 // before it propagates. Boot merely tolerates a dangling exit (the move just fails), but this gate is
 // deliberately stricter — a dangling exit is an authoring error, not an intended degradation.
 //
-// The check holds the NO-FALSE-POSITIVE invariant on a scoped `reload <onepack>`, where the loaded set is a
-// SUBSET of the world's content, by judging only INTRA-ZONE targets. The validator sees the RAW []content.Pack
-// LoadPacks returns (not the content.Load-merged graph), and each pack's zone is already WHOLE: the tree
-// loader unions a zone across its files within the pack (packtree mergeZone) before it leaves the source, so
-// a pack that defines a zone carries that zone's COMPLETE authored room list. Another pack can only REPLACE a
-// zone wholesale (cross-pack merge is whole-zone last-write-wins, loader.go), never add rooms to it — so an
-// intra-zone target absent from its zone is provably dangling regardless of what else the live world holds
-// (worst case across packs is a false NEGATIVE, never a false positive). A CROSS-zone target may resolve to a
-// room in a pack outside this reload's scope, so it is deliberately left to the full merged-graph check (#197
-// slice 3, which loads every pack) rather than risk a false rejection here. An empty/whitespace target is
-// always a dead exit, judged in any scope.
-//
-// This intra-zone judgment assumes a room's ref prefix equals its owning zone — the same convention cross-
-// zone exit routing (parseRef) already load-bears on, and which lintRoomZonePrefixes (build.go) warns about
-// when violated. In a world that trips that lint (a divergent-prefix room authored into another zone in an
-// out-of-scope pack), a target could be flagged though a live room exists; such a world is already mis-
-// authored (its cross-zone exits misroute and a hot-reload ADD skips it), so it is out of scope here.
-func validateRoomExits(loaded []content.Pack) []string {
-	// Every room ref present in the loaded set — the resolution target set.
+// #205 FULL-GRAPH + PROVENANCE: the resolution target set is every room in the WHOLE merged graph (all enabled
+// zones, whole-zone last-write-wins), so a CROSS-ZONE exit now resolves against the real world — the old
+// intra-zone-only hedge (which deferred cross-zone targets to avoid a false rejection on a scoped subset) is
+// gone, closing the gap where a cross-zone exit into an out-of-scope zone was never checked. To keep the
+// no-false-positive invariant on a scoped `reload`, a finding is REJECTED only when its owning zone's live
+// definition is a reloaded (in-scope) pack; an exit in a not-reloaded zone is that zone's owner's concern, not
+// this reload's. So: a target present anywhere in the world resolves; a target absent from the WHOLE world,
+// owned by an in-scope zone, is provably dangling and rejected. An empty/whitespace target is always dead.
+func validateRoomExits(s *reloadScope) []string {
+	zones := s.liveZones()
+	// Every room ref in the FULL merged graph — the resolution target set (#205). Building it over the whole
+	// enabled set (not just the in-scope packs) is what lets a CROSS-ZONE exit resolve, so the intra-zone-only
+	// hedge is dropped: a target absent from the WHOLE world is provably dangling.
 	roomRefs := map[string]bool{}
-	for i := range loaded {
-		for _, z := range loaded[i].Zones {
-			for _, r := range z.Rooms {
-				roomRefs[r.Ref] = true
-			}
+	for _, z := range zones {
+		for _, r := range z.Rooms {
+			roomRefs[r.Ref] = true
 		}
 	}
 	var problems []string
-	for i := range loaded {
-		for _, z := range loaded[i].Zones {
-			for _, r := range z.Rooms {
-				// Deterministic readout: map iteration order is random, so sort the directions.
-				dirs := make([]string, 0, len(r.Exits))
-				for dir := range r.Exits {
-					dirs = append(dirs, dir)
+	for _, z := range zones {
+		if !s.zoneInScope(z.Ref) {
+			continue // an exit in a not-reloaded zone is not this reload's problem (#205 provenance gate)
+		}
+		for _, r := range z.Rooms {
+			// Deterministic readout: map iteration order is random, so sort the directions.
+			dirs := make([]string, 0, len(r.Exits))
+			for dir := range r.Exits {
+				dirs = append(dirs, dir)
+			}
+			sort.Strings(dirs)
+			for _, dir := range dirs {
+				target := r.Exits[dir]
+				if strings.TrimSpace(target) == "" {
+					problems = append(problems, fmt.Sprintf("room %q: exit %q has an empty target", r.Ref, dir))
+					continue
 				}
-				sort.Strings(dirs)
-				for _, dir := range dirs {
-					target := r.Exits[dir]
-					if strings.TrimSpace(target) == "" {
-						problems = append(problems, fmt.Sprintf("room %q: exit %q has an empty target", r.Ref, dir))
-						continue
-					}
-					if roomRefs[target] {
-						continue // resolves (raw match, exactly as the runtime routes)
-					}
-					// An INTRA-zone target (same zone prefix as the owning zone) that is absent is provably
-					// dangling: the loaded zone holds that zone's complete room list. A cross-zone target is
-					// left to the full-graph check — its zone may be out of this reload's scope.
-					if tz, _ := parseRef(ProtoRef(target)); tz == z.Ref {
-						problems = append(problems, fmt.Sprintf("room %q: exit %q points to unknown room %q", r.Ref, dir, target))
-					}
+				if !roomRefs[target] {
+					problems = append(problems, fmt.Sprintf("room %q: exit %q points to unknown room %q", r.Ref, dir, target))
 				}
 			}
 		}
@@ -393,20 +459,25 @@ func validateRoomExits(loaded []content.Pack) []string {
 // A merely-degraded channel (an unknown $token that surfaces literally, an over-restrictive access
 // predicate) is NOT rejected: only definitively-dead content blocks the publish, preserving the
 // no-false-positive invariant.
-func validateChannels(loaded []content.Pack) []string {
+func validateChannels(s *reloadScope) []string {
 	var problems []string
 	// Merge across packs EXACTLY as content.Load / mergeByKey do: last-write-wins keyed on the RAW ref
 	// (loader.go, packtree.go — and buildChannelDef/reloadChannel/ChanSubject all key raw too), order
 	// preserved. Keying raw is what keeps this faithful: it can't collapse two whitespace-variant refs that
 	// stay distinct live channels and thereby miss (or falsely flag) a dead one. A whitespace-only ref
-	// (trims to empty) is separately caught as "missing ref" below.
+	// (trims to empty) is separately caught as "missing ref" below. A finding is rejected only when its
+	// channel's LAST-WRITER pack is in scope (#205 provenance gate).
 	merged := map[string]content.ChannelDTO{}
 	var order []string
-	for i := range loaded {
-		for _, ch := range loaded[i].Channels {
+	for i := range s.full {
+		pk := &s.full[i]
+		for _, ch := range pk.Channels {
 			if strings.TrimSpace(ch.Ref) == "" {
-				// Empty or whitespace-only: no usable merge key, and an unaddressable subject. Flag each.
-				problems = append(problems, fmt.Sprintf("channel %q: missing ref", ch.Name))
+				// Empty or whitespace-only: no usable merge key, and an unaddressable subject. Flag each — but
+				// only for an in-scope pack (a ref-less channel has no merge key, so provenance is its pack).
+				if s.inScope(pk.Pack) {
+					problems = append(problems, fmt.Sprintf("channel %q: missing ref", ch.Name))
+				}
 				continue
 			}
 			ref := ch.Ref
@@ -419,6 +490,9 @@ func validateChannels(loaded []content.Pack) []string {
 	// A sentinel that content can't contain (NUL bytes) — its survival through the format proves $t renders.
 	const probe = "\x00telos-msg-probe\x00"
 	for _, ref := range order {
+		if !s.inScope(s.chanOwner[ref]) {
+			continue // a channel whose live def is a not-reloaded pack's is not this reload's problem
+		}
 		ch := merged[ref]
 		if reason := channelRefSubjectProblem(ref); reason != "" {
 			problems = append(problems, fmt.Sprintf("channel %q: ref builds an invalid comms subject (%s)", ref, reason))

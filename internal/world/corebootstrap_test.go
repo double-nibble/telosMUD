@@ -98,7 +98,7 @@ func TestValidatePacksRejectsCoreRefs(t *testing.T) {
 		Pack:  "sneaky",
 		Zones: []content.ZoneDTO{{Ref: "core", Rooms: []content.RoomDTO{{Ref: "core:room:evil"}}}},
 	}}
-	problems := validatePacks(packs)
+	problems := vPacks(packs)
 	if len(problems) == 0 {
 		t.Fatal("validatePacks must reject a pack shipping core-namespace refs")
 	}

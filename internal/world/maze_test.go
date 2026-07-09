@@ -129,7 +129,7 @@ func TestEternalForestLoopsUntilEscape(t *testing.T) {
 // TestMazeExitsPassDanglingLint: the maze's self-looping and non-reciprocal exits all point to REAL rooms, so
 // the #197 dangling-exit validator must NOT flag them (a maze is legitimate authoring, not broken content).
 func TestMazeExitsPassDanglingLint(t *testing.T) {
-	if problems := validateRoomExits(mazePack()); len(problems) != 0 {
+	if problems := vRoomExits(mazePack()); len(problems) != 0 {
 		t.Fatalf("maze exits (self-loop / non-reciprocal, all to real rooms) were flagged as dangling: %v", problems)
 	}
 	// Positive control: a TRULY dangling exit (to a room that does not exist) IS still caught — the lint
@@ -137,7 +137,7 @@ func TestMazeExitsPassDanglingLint(t *testing.T) {
 	broken := []content.Pack{{Pack: "maze", Zones: []content.ZoneDTO{
 		{Ref: "mz", Rooms: []content.RoomDTO{{Ref: "mz:room:1", Exits: map[string]string{"north": "mz:room:nowhere"}}}},
 	}}}
-	if problems := validateRoomExits(broken); len(problems) == 0 {
+	if problems := vRoomExits(broken); len(problems) == 0 {
 		t.Fatal("a genuinely dangling exit (to a nonexistent room) should still be flagged")
 	}
 }

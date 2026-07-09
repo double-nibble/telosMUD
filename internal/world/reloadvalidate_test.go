@@ -15,7 +15,7 @@ func TestValidateChannelsDemoClean(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("load demo pack: found=%v err=%v", found, err)
 	}
-	if p := validatePacks([]content.Pack{pack}); len(p) != 0 {
+	if p := vPacks([]content.Pack{pack}); len(p) != 0 {
 		t.Fatalf("demo pack flagged by the pre-publish gate: %v", p)
 	}
 }
@@ -37,7 +37,7 @@ func TestValidateRoomExits(t *testing.T) {
 		}},
 		{Ref: "wood", Rooms: []content.RoomDTO{room("wood:room:1", nil)}},
 	}}}
-	if p := validateRoomExits(good); len(p) != 0 {
+	if p := vRoomExits(good); len(p) != 0 {
 		t.Fatalf("sound room graph flagged: %v", p)
 	}
 
@@ -45,7 +45,7 @@ func TestValidateRoomExits(t *testing.T) {
 	empty := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
 		{Ref: "mid", Rooms: []content.RoomDTO{room("mid:room:1", map[string]string{"down": "  "})}},
 	}}}
-	if p := validateRoomExits(empty); len(p) != 1 {
+	if p := vRoomExits(empty); len(p) != 1 {
 		t.Fatalf("empty exit target: want 1 problem, got %v", p)
 	}
 
@@ -53,22 +53,23 @@ func TestValidateRoomExits(t *testing.T) {
 	dangling := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
 		{Ref: "mid", Rooms: []content.RoomDTO{room("mid:room:1", map[string]string{"north": "mid:room:99"})}},
 	}}}
-	if p := validateRoomExits(dangling); len(p) != 1 {
+	if p := vRoomExits(dangling); len(p) != 1 {
 		t.Fatalf("dangling intra-zone exit: want 1 problem, got %v", p)
 	}
 
-	// NO FALSE POSITIVE: a cross-zone target is NOT judged here — its zone may be a pack outside a scoped
-	// reload's scope, so even a target absent from a co-loaded zone is left to the full-graph check.
-	crossZone := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
+	// #205: a cross-zone exit is now judged against the FULL merged graph. A target that EXISTS in another
+	// zone resolves (the `good` case above has mid->wood:room:1), but a cross-zone target absent from the WHOLE
+	// world is now CAUGHT (previously deferred/invisible to a scoped reload — the exact gap #205 closes).
+	crossZoneDangling := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
 		{Ref: "mid", Rooms: []content.RoomDTO{room("mid:room:1", map[string]string{"west": "wood:room:99"})}},
 		{Ref: "wood", Rooms: []content.RoomDTO{room("wood:room:1", nil)}},
 	}}}
-	if p := validateRoomExits(crossZone); len(p) != 0 {
-		t.Fatalf("cross-zone exit wrongly judged: %v", p)
+	if p := vRoomExits(crossZoneDangling); len(p) != 1 {
+		t.Fatalf("cross-zone exit to a nonexistent room should now be flagged (#205): %v", p)
 	}
 
 	// The gate rides validatePacks, so a dangling intra-zone exit blocks a publish.
-	if p := validatePacks(dangling); len(p) != 1 {
+	if p := vPacks(dangling); len(p) != 1 {
 		t.Fatalf("validatePacks did not surface the dangling exit: %v", p)
 	}
 }
@@ -96,37 +97,39 @@ func TestValidateResets(t *testing.T) {
 		content.ResetDTO{Op: "spawn_item", Proto: "mid:obj:torch", Room: "mid:room:1", Max: 2},
 		content.ResetDTO{Op: "", Proto: "mid:obj:torch", Room: "mid:room:1"}, // "" == spawn, valid
 	)
-	if p := validateResets(good); len(p) != 0 {
+	if p := vResets(good); len(p) != 0 {
 		t.Fatalf("sound resets flagged: %v", p)
 	}
 
 	// Unknown op => a dead reset (applyReset warns "op not understood").
-	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_dragon", Proto: "mid:mob:guard", Room: "mid:room:1"})); len(p) != 1 {
+	if p := vResets(packWith(content.ResetDTO{Op: "spawn_dragon", Proto: "mid:mob:guard", Room: "mid:room:1"})); len(p) != 1 {
 		t.Fatalf("unknown op: want 1 problem, got %v", p)
 	}
 
 	// Target room absent from THIS zone => runtime z.rooms lookup fails.
-	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:guard", Room: "mid:room:99"})); len(p) != 1 {
+	if p := vResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:guard", Room: "mid:room:99"})); len(p) != 1 {
 		t.Fatalf("unknown room: want 1 problem, got %v", p)
 	}
 	// Empty room.
-	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:guard", Room: "  "})); len(p) != 1 {
+	if p := vResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:guard", Room: "  "})); len(p) != 1 {
 		t.Fatalf("empty room: want 1 problem, got %v", p)
 	}
 
 	// Undefined intra-zone prototype => runtime z.spawn returns nil.
-	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:1"})); len(p) != 1 {
+	if p := vResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:1"})); len(p) != 1 {
 		t.Fatalf("undefined proto: want 1 problem, got %v", p)
 	}
 	// Empty prototype.
-	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_item", Proto: "", Room: "mid:room:1"})); len(p) != 1 {
+	if p := vResets(packWith(content.ResetDTO{Op: "spawn_item", Proto: "", Room: "mid:room:1"})); len(p) != 1 {
 		t.Fatalf("empty proto: want 1 problem, got %v", p)
 	}
 
-	// NO FALSE POSITIVE: a cross-ZONE prototype ref is deferred (its zone may be out of a scoped reload's
-	// scope) even though it isn't in the loaded set.
-	if p := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "other:mob:x", Room: "mid:room:1"})); len(p) != 0 {
-		t.Fatalf("cross-zone proto wrongly flagged: %v", p)
+	// #205: a cross-zone reset prototype is now judged against the FULL merged proto graph. One present in
+	// another loaded zone resolves (twoZone / crossPack below), but a ref absent from the WHOLE world is now
+	// CAUGHT (previously deferred by the ref-prefix heuristic — a gap #205 closes). The out-of-scope deferral is
+	// now provenance-driven (see the dedicated #205 scoped tests), not a blanket cross-zone-prefix skip.
+	if p := vResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "other:mob:x", Room: "mid:room:1"})); len(p) != 1 {
+		t.Fatalf("cross-zone proto that exists nowhere should now be flagged (#205): %v", p)
 	}
 
 	// A cross-zone proto that IS present in the loaded set (a second zone) resolves — not flagged.
@@ -138,7 +141,7 @@ func TestValidateResets(t *testing.T) {
 		},
 		{Ref: "wood", Mobs: []content.ProtoDTO{{Ref: "wood:mob:elf"}}},
 	}}}
-	if p := validateResets(twoZone); len(p) != 0 {
+	if p := vResets(twoZone); len(p) != 0 {
 		t.Fatalf("resolvable cross-zone proto flagged: %v", p)
 	}
 
@@ -146,7 +149,7 @@ func TestValidateResets(t *testing.T) {
 	// a garbage/cross-zone `into` blocks, proving the field is skipped regardless of form.
 	for _, into := range []string{"mid:obj:nonexistent", "utter garbage", "other:obj:x"} {
 		reset := packWith(content.ResetDTO{Op: "spawn_item", Proto: "mid:obj:torch", Room: "mid:room:1", Into: into})
-		if p := validateResets(reset); len(p) != 0 {
+		if p := vResets(reset); len(p) != 0 {
 			t.Fatalf("into=%q should not be judged: %v", into, p)
 		}
 	}
@@ -154,14 +157,14 @@ func TestValidateResets(t *testing.T) {
 	// Count/Max/Persistent are DELIBERATELY not judged (they affect the spawn ceiling / durable path, not
 	// whether a ref resolves): a persistent reset with zero count/max but valid refs validates clean.
 	persistent := packWith(content.ResetDTO{Op: "spawn_item", Proto: "mid:obj:torch", Room: "mid:room:1", Persistent: true, Count: 0, Max: 0})
-	if p := validateResets(persistent); len(p) != 0 {
+	if p := vResets(persistent); len(p) != 0 {
 		t.Fatalf("persistent/zero-count reset with valid refs flagged: %v", p)
 	}
 
 	// A reset naming a ROOM ref as its prototype is degenerate but z.spawn RESOLVES it (rooms share the
 	// proto cache), so it must NOT be flagged (regression guard for the rooms-in-protoRefs fix).
 	roomAsProto := packWith(content.ResetDTO{Op: "spawn_item", Proto: "mid:room:1", Room: "mid:room:1"})
-	if p := validateResets(roomAsProto); len(p) != 0 {
+	if p := vResets(roomAsProto); len(p) != 0 {
 		t.Fatalf("room-ref-as-proto wrongly flagged (rooms are in the proto cache): %v", p)
 	}
 
@@ -175,19 +178,19 @@ func TestValidateResets(t *testing.T) {
 		}}},
 		{Pack: "b", Zones: []content.ZoneDTO{{Ref: "wood", Mobs: []content.ProtoDTO{{Ref: "wood:mob:elf"}}}}},
 	}
-	if p := validateResets(crossPack); len(p) != 0 {
+	if p := vResets(crossPack); len(p) != 0 {
 		t.Fatalf("cross-pack proto resolution flagged: %v", p)
 	}
 
 	// Multiple defects in one reset are each surfaced — assert on CONTENT (which two), not a bare count.
-	multi := validateResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:99"}))
+	multi := vResets(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:99"}))
 	joined := strings.Join(multi, " | ")
 	if !strings.Contains(joined, "target room") || !strings.Contains(joined, "not defined") {
 		t.Fatalf("multi-defect reset should surface both the room AND the proto problem, got: %v", multi)
 	}
 
 	// The gate rides validatePacks, so a broken reset blocks a publish.
-	if p := validatePacks(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:1"})); len(p) != 1 {
+	if p := vPacks(packWith(content.ResetDTO{Op: "spawn_mob", Proto: "mid:mob:ghost", Room: "mid:room:1"})); len(p) != 1 {
 		t.Fatalf("validatePacks did not surface the reset defect: %v", p)
 	}
 }
@@ -207,7 +210,7 @@ func TestValidateProtoRefs(t *testing.T) {
 		},
 		{Ref: "wood", Rooms: []content.RoomDTO{{Ref: "wood:room:1"}}},
 	}}}
-	if p := validateProtoRefs(good); len(p) != 0 {
+	if p := vProtoRefs(good); len(p) != 0 {
 		t.Fatalf("distinct refs flagged: %v", p)
 	}
 
@@ -215,7 +218,7 @@ func TestValidateProtoRefs(t *testing.T) {
 	emptyRef := []content.Pack{{Pack: "p", Zones: []content.ZoneDTO{
 		{Ref: "mid", Mobs: []content.ProtoDTO{{Ref: ""}}},
 	}}}
-	if p := validateProtoRefs(emptyRef); len(p) != 1 {
+	if p := vProtoRefs(emptyRef); len(p) != 1 {
 		t.Fatalf("empty ref: want 1 problem, got %v", p)
 	}
 
@@ -227,7 +230,7 @@ func TestValidateProtoRefs(t *testing.T) {
 			Items: []content.ProtoDTO{{Ref: "mid:x"}},
 		},
 	}}}
-	if p := validateProtoRefs(crossKind); len(p) != 1 {
+	if p := vProtoRefs(crossKind); len(p) != 1 {
 		t.Fatalf("cross-kind collision: want 1 problem, got %v", p)
 	}
 
@@ -236,7 +239,7 @@ func TestValidateProtoRefs(t *testing.T) {
 		{Ref: "mid", Rooms: []content.RoomDTO{{Ref: "shared:room:1"}}},
 		{Ref: "wood", Mobs: []content.ProtoDTO{{Ref: "shared:room:1"}}},
 	}}}
-	if p := validateProtoRefs(crossZone); len(p) != 1 {
+	if p := vProtoRefs(crossZone); len(p) != 1 {
 		t.Fatalf("cross-zone collision: want 1 problem, got %v", p)
 	}
 
@@ -246,12 +249,12 @@ func TestValidateProtoRefs(t *testing.T) {
 		{Pack: "base", Zones: []content.ZoneDTO{{Ref: "mid", Rooms: []content.RoomDTO{{Ref: "mid:room:1"}, {Ref: "mid:room:2"}}}}},
 		{Pack: "expansion", Zones: []content.ZoneDTO{{Ref: "mid", Rooms: []content.RoomDTO{{Ref: "mid:room:1"}, {Ref: "mid:room:3"}}}}},
 	}
-	if p := validateProtoRefs(override); len(p) != 0 {
+	if p := vProtoRefs(override); len(p) != 0 {
 		t.Fatalf("cross-pack whole-zone override wrongly flagged as collision: %v", p)
 	}
 
 	// The gate rides validatePacks, so a collision blocks a publish.
-	if p := validatePacks(crossZone); len(p) != 1 {
+	if p := vPacks(crossZone); len(p) != 1 {
 		t.Fatalf("validatePacks did not surface the proto collision: %v", p)
 	}
 }
@@ -268,7 +271,7 @@ func TestValidatePacks(t *testing.T) {
 		{Ref: "con", DefaultBase: lit(10)},
 		{Ref: "hp", DefaultBase: expr([]any{"*", []any{"attr", "con"}, 10.0})},
 	}}}
-	if p := validatePacks(valid); len(p) != 0 {
+	if p := vPacks(valid); len(p) != 0 {
 		t.Fatalf("valid pack flagged: %v", p)
 	}
 
@@ -276,7 +279,7 @@ func TestValidatePacks(t *testing.T) {
 	bad := []content.Pack{{Pack: "p", Attributes: []content.AttributeDTO{
 		{Ref: "broken", DefaultBase: expr("not-a-node")},
 	}}}
-	if p := validatePacks(bad); len(p) != 1 {
+	if p := vPacks(bad); len(p) != 1 {
 		t.Fatalf("bad base formula: want 1 problem, got %v", p)
 	}
 
@@ -285,7 +288,7 @@ func TestValidatePacks(t *testing.T) {
 		{Ref: "a", DefaultBase: expr([]any{"attr", "b"})},
 		{Ref: "b", DefaultBase: expr([]any{"attr", "a"})},
 	}}}
-	if p := validatePacks(cyc); len(p) == 0 {
+	if p := vPacks(cyc); len(p) == 0 {
 		t.Fatal("attribute cycle not detected")
 	}
 
@@ -294,7 +297,7 @@ func TestValidatePacks(t *testing.T) {
 		{Pack: "a", Attributes: []content.AttributeDTO{{Ref: "a", DefaultBase: expr([]any{"attr", "b"})}}},
 		{Pack: "b", Attributes: []content.AttributeDTO{{Ref: "b", DefaultBase: expr([]any{"attr", "a"})}}},
 	}
-	if p := validatePacks(split); len(p) == 0 {
+	if p := vPacks(split); len(p) == 0 {
 		t.Fatal("cross-pack attribute cycle not detected")
 	}
 }
@@ -310,7 +313,7 @@ func TestValidateChannels(t *testing.T) {
 		{Ref: "gossip", Name: "gossip", Words: []string{"gossip", "gos"}, Format: "[$channel] $name: $t"},
 		{Ref: "newbie", Name: "newbie", Words: []string{"newbie"}}, // empty format defaults to one with $t
 	}}}
-	if p := validateChannels(ok); len(p) != 0 {
+	if p := vChannels(ok); len(p) != 0 {
 		t.Fatalf("sound channels flagged: %v", p)
 	}
 
@@ -318,7 +321,7 @@ func TestValidateChannels(t *testing.T) {
 	noRef := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
 		{Name: "orphan", Words: []string{"orphan"}},
 	}}}
-	if p := validateChannels(noRef); len(p) != 1 {
+	if p := vChannels(noRef); len(p) != 1 {
 		t.Fatalf("missing ref: want 1 problem, got %v", p)
 	}
 
@@ -326,7 +329,7 @@ func TestValidateChannels(t *testing.T) {
 	noVerb := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
 		{Ref: "quiet", Name: "quiet", Words: []string{"", "  "}},
 	}}}
-	if p := validateChannels(noVerb); len(p) != 1 {
+	if p := vChannels(noVerb); len(p) != 1 {
 		t.Fatalf("no usable verb: want 1 problem, got %v", p)
 	}
 
@@ -334,7 +337,7 @@ func TestValidateChannels(t *testing.T) {
 	dropMsg := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
 		{Ref: "void", Name: "void", Words: []string{"void"}, Format: "[$channel] $name says something"},
 	}}}
-	if p := validateChannels(dropMsg); len(p) != 1 {
+	if p := vChannels(dropMsg); len(p) != 1 {
 		t.Fatalf("message-dropping format: want 1 problem, got %v", p)
 	}
 
@@ -344,12 +347,12 @@ func TestValidateChannels(t *testing.T) {
 		{Pack: "a", Channels: []content.ChannelDTO{{Ref: "gossip", Name: "gossip", Words: []string{""}}}},
 		{Pack: "b", Channels: []content.ChannelDTO{{Ref: "gossip", Name: "gossip", Words: []string{"gossip"}}}},
 	}
-	if p := validateChannels(repaired); len(p) != 0 {
+	if p := vChannels(repaired); len(p) != 0 {
 		t.Fatalf("cross-pack repaired channel flagged: %v", p)
 	}
 
 	// The channel gate rides validatePacks, so a broken channel blocks a publish just like a bad attribute.
-	if p := validatePacks(dropMsg); len(p) != 1 {
+	if p := vPacks(dropMsg); len(p) != 1 {
 		t.Fatalf("validatePacks did not surface the channel defect: %v", p)
 	}
 }
@@ -365,7 +368,7 @@ func TestValidateChannelsSubjectSafety(t *testing.T) {
 		pk := []content.Pack{{Pack: "p", Channels: []content.ChannelDTO{
 			{Ref: ref, Name: "c", Words: []string{"c"}}, // otherwise sound: verb + default format
 		}}}
-		if p := validateChannels(pk); len(p) == 0 {
+		if p := vChannels(pk); len(p) == 0 {
 			t.Fatalf("subject-unsafe ref %q not rejected", ref)
 		}
 	}
@@ -375,7 +378,7 @@ func TestValidateChannelsSubjectSafety(t *testing.T) {
 		{Ref: "gossip", Name: "gossip", Words: []string{"gossip"}},
 		{Ref: "guild.officer", Name: "officer", Words: []string{"officer"}},
 	}}}
-	if p := validateChannels(safe); len(p) != 0 {
+	if p := vChannels(safe); len(p) != 0 {
 		t.Fatalf("safe refs flagged: %v", p)
 	}
 
@@ -386,7 +389,7 @@ func TestValidateChannelsSubjectSafety(t *testing.T) {
 		{Pack: "a", Channels: []content.ChannelDTO{{Ref: "gossip", Name: "gossip", Words: []string{""}}}},
 		{Pack: "b", Channels: []content.ChannelDTO{{Ref: " gossip", Name: "gossip", Words: []string{"gossip"}}}},
 	}
-	if p := validateChannels(rawKey); len(p) < 2 {
+	if p := vChannels(rawKey); len(p) < 2 {
 		t.Fatalf("raw-ref keying should flag the dead channel AND the subject-unsafe sibling, got: %v", p)
 	}
 }
@@ -401,7 +404,7 @@ func TestValidatePacksTrustLadderReject(t *testing.T) {
 		{Name: "citizen", Rank: 0, Flags: []string{content.FlagAdmin}},
 		{Name: "overlord", Rank: 40, Flags: []string{content.FlagAdmin}},
 	}}}
-	probs := validatePacks(baselineGrant)
+	probs := vPacks(baselineGrant)
 	if len(probs) == 0 {
 		t.Fatal("a baseline tier granting a capability must block the reload")
 	}
@@ -411,7 +414,7 @@ func TestValidatePacksTrustLadderReject(t *testing.T) {
 	}
 
 	// A duplicate rank also rejects.
-	if p := validatePacks([]content.Pack{{Pack: "dup", TrustTiers: []content.TrustTierDTO{
+	if p := vPacks([]content.Pack{{Pack: "dup", TrustTiers: []content.TrustTierDTO{
 		{Name: "player", Rank: 0},
 		{Name: "a", Rank: 30, Flags: []string{content.FlagAdmin}},
 		{Name: "b", Rank: 30, Flags: []string{content.FlagAdmin}},
@@ -424,14 +427,14 @@ func TestValidatePacksTrustLadderReject(t *testing.T) {
 		{Name: "player", Rank: 0},
 		{Name: "wizard", Rank: 40, Flags: []string{content.FlagAdmin, "hollylight"}}, // typo, dropped at apply
 	}}}
-	for _, p := range validatePacks(warnOnly) {
+	for _, p := range vPacks(warnOnly) {
 		if strings.Contains(p, "hollylight") {
 			t.Fatalf("a warn-severity ladder finding must not block a reload, got: %s", p)
 		}
 	}
 
 	// The demo pack's ladder (or none) must validate clean — no false positive on real content.
-	if p := validatePacks([]content.Pack{{Pack: "demo", TrustTiers: content.DefaultTrustTiers()}}); len(p) != 0 {
+	if p := vPacks([]content.Pack{{Pack: "demo", TrustTiers: content.DefaultTrustTiers()}}); len(p) != 0 {
 		t.Fatalf("the default ladder must not be rejected, got: %v", p)
 	}
 }
