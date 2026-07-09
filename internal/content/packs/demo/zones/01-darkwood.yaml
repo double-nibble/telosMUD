@@ -85,6 +85,32 @@ zones:
             parry: 0              # no parry skill -> roll-under-0 auto-fails ([G-C], gear-gated by 0)
             block: 0              # no shield -> block auto-fails
             soak_slash: 0         # a STARTER mob: no soak (the longsword/knife bite full damage)
+      # wisp: a WANDERING mob (#202 scenario 1). Non-combat; on spawn it arms a self-rescheduling mud.after
+      # loop that drifts to a random SAME-ZONE exit every ~5s, so a player might bump into it in any darkwood
+      # room rather than only where it spawned. The on("spawn") lifecycle hook (reset.go fireSpawn) is what
+      # arms the loop AT SPAWN — without it the mob would sit inert until a player first reached its spawn
+      # room (entity scripts build lazily). It stays in-zone by choosing only exits whose `to` is a live
+      # handle; a cross-zone exit's `to` is a bare ref string (self:room():exits(), luahandle.go hExits).
+      - ref: darkwood:mob:wisp
+        keywords: [wisp, will-o-wisp, light]
+        short: a drifting wisp
+        long: A pale wisp of light drifts aimlessly through the trees.
+        living:
+          attributes:
+            level: 1
+            constitution: 1
+        lua: |
+          on("spawn", function()
+            local function step()
+              local opts = {}
+              for _, e in ipairs(self:room():exits()) do
+                if type(e.to) ~= "string" then opts[#opts + 1] = e.dir end
+              end
+              if #opts > 0 then self:move(opts[math.random(1, #opts)]) end
+              mud.after(20, step)
+            end
+            mud.after(20, step)
+          end)
       # An AGGRESSIVE goblin (Phase 6.3b): `aggressive: 1` is a CONTENT number the engine reads to make
       # the mob initiate combat on a player entering its room (death.go aggroOnEntry) — no engine flag.
       - ref: darkwood:mob:goblin-chief
@@ -269,6 +295,9 @@ zones:
             aggressive: 1
     resets:
       - {op: spawn_mob, proto: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}
+      # #202: a wanderer that drifts the darkwood chain. roam:true => the repop counts it ZONE-WIDE, so when it
+      # has wandered off grove the top-up sees the one live wisp elsewhere and does NOT leak a replacement.
+      - {op: spawn_mob, proto: darkwood:mob:wisp, room: darkwood:room:grove, count: 1, roam: true}
       # Arm the goblin with its rusty knife: the item spawns INTO the goblin's inventory (reset `into` a
       # mob, reset.go), so its corpse holds it. Script order matters — the goblin must spawn first.
       - {op: spawn_item, proto: darkwood:obj:rusty-knife, into: darkwood:mob:goblin, room: darkwood:room:hollow, count: 1}

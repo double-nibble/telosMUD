@@ -115,8 +115,13 @@ func (z *Zone) applyReset(r *content.ResetDTO) {
 		}
 	}
 
-	// Top-up: count the live instances this op owns in the target, spawn only the difference.
+	// Top-up: count the live instances this op owns, spawn only the difference. A ROAM spawn (#202) counts
+	// ZONE-WIDE — a wandering mob leaves its spawn room, so a room-scoped count would see the room empty and
+	// leak a replacement every repop; counting the whole zone means one roamer anywhere satisfies the reset.
 	live := countProto(target, ProtoRef(r.Proto))
+	if r.Roam {
+		live = countProtoInZone(z, ProtoRef(r.Proto))
+	}
 	need := ceiling - live
 	if need <= 0 {
 		z.log.Debug("repop no-op (at or above max)", "op", r.Op, "proto", r.Proto,
@@ -131,6 +136,7 @@ func (z *Zone) applyReset(r *content.ResetDTO) {
 			break
 		}
 		Move(e, target)
+		z.fireSpawn(e) // #202: prime a scripted entity + fire on("spawn") now it is placed (arms a wanderer's loop)
 		spawned++
 	}
 	z.log.Debug("repop", "zone", z.id, "op", r.Op, "proto", r.Proto, "room", r.Room,
@@ -147,6 +153,18 @@ func countProto(target *Entity, proto ProtoRef) int {
 		if e.proto == proto {
 			n++
 		}
+	}
+	return n
+}
+
+// countProtoInZone counts live instances of proto across EVERY room in the zone (a roam reset's zone-wide
+// population, #202). A roamer sits in whatever room it has wandered to, so only a whole-zone scan sees it; a
+// room-scoped count would miss it and leak a replacement each repop. Counts room-floor instances (a roaming
+// mob stands on a room floor, never inside a container/another mob). O(zone population) on the zone goroutine.
+func countProtoInZone(z *Zone, proto ProtoRef) int {
+	n := 0
+	for _, room := range z.rooms {
+		n += countProto(room, proto)
 	}
 	return n
 }
