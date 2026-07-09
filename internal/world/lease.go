@@ -170,6 +170,10 @@ func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
 				// Best-effort: a publish error just leaves the coordinator weighting this zone as 1 until the
 				// next tick. Only owned, confirmed zones advertise load — never a zone we're merely adopting.
 				s.publishOccupancy(ctx, zoneID, ttl)
+				// Act on any coordinator rebalance directive for this zone (#42 slice 3): only the owner (us,
+				// here) renews this lease, so only we read + execute it. maybeRebalance launches the drain on
+				// its OWN goroutine so this renewal loop keeps renewing the lease until the flip stops it.
+				s.maybeRebalance(ctx, zoneID)
 			}
 		}
 	}
@@ -230,6 +234,11 @@ func (s *Shard) zoneHandedOff(zoneID string) bool {
 func (s *Shard) handoverZoneTo(ctx context.Context, zoneID, targetShardID, targetAddr string) error {
 	if s.leaser == nil {
 		return fmt.Errorf("handover %q: zone leasing not configured", zoneID)
+	}
+	if targetShardID == s.shardID {
+		// Refuse a self-handover: a HandoverZone(from==to) CAS would succeed and re-set the lease TTL while
+		// markZoneHandedOff stops us renewing it → the live zone's lease silently expires (#42 review guard).
+		return fmt.Errorf("handover %q: refusing self-handover to %s", zoneID, targetShardID)
 	}
 	client, err := s.peers(targetAddr)
 	if err != nil {

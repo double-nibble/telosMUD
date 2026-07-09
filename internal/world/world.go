@@ -165,6 +165,18 @@ type Shard struct {
 	// coordinator then falls back to zone-count balancing).
 	occPublisher ZoneOccupancyPublisher
 
+	// rebalancePort reads/refreshes/clears the coordinator's per-zone rebalance directive (#42 slice 3); the
+	// owning shard polls it on the lease-renewal tick and executes a single-zone drain. nil disables it (no
+	// coordinator-driven rebalancing — the shard still serves + is drained on SIGTERM as before).
+	rebalancePort RebalancePort
+	// rebalancing is the set of zones this shard is CURRENTLY rebalancing (a drain in flight), guarded by mu.
+	// It is the primary in-flight-drain dedupe: a directive re-read on the next renewal tick refreshes the
+	// directive rather than launching a second drain of the same zone.
+	rebalancing map[string]bool
+	// rebalanceBackoff[zone] is the earliest time a failed rebalance of that zone may be retried, guarded by
+	// mu — so a persistently-unreachable target isn't re-dialed every renewal tick.
+	rebalanceBackoff map[string]time.Time
+
 	// localZones marks zones this shard hosts LOCALLY and UNLEASED (#212 embedded core bootstrap zone).
 	// A local zone is (a) never lease-renewed — every shard hosts its OWN copy, so there is no single
 	// owner to fence on, and (b) never handed off on a graceful drain — a draining peer's local zone is
@@ -314,16 +326,18 @@ func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr
 // swaps in a configured one before any zone is adopted.
 func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 	return &Shard{
-		zones:      map[string]*Zone{},
-		home:       home,
-		addr:       addr,
-		dir:        dir,
-		peers:      peers,
-		tokenIndex: map[string]*Zone{},
-		handedOff:  map[string]bool{},
-		leaseStop:  map[string]context.CancelFunc{},
-		handoffSem: make(chan struct{}, maxConcurrentHandoffs),
-		saver:      newSaver(nil, nil), // disabled until WithPersistence configures it
+		zones:            map[string]*Zone{},
+		home:             home,
+		addr:             addr,
+		dir:              dir,
+		peers:            peers,
+		tokenIndex:       map[string]*Zone{},
+		handedOff:        map[string]bool{},
+		leaseStop:        map[string]context.CancelFunc{},
+		rebalancing:      map[string]bool{},
+		rebalanceBackoff: map[string]time.Time{},
+		handoffSem:       make(chan struct{}, maxConcurrentHandoffs),
+		saver:            newSaver(nil, nil), // disabled until WithPersistence configures it
 		// Empty global-definition bundle (defs.go); the constructor registers content into it
 		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
 		defs: newDefRegistries(),

@@ -53,6 +53,7 @@ func (drainZoneMsg) zoneMsg() {}
 // snapshot of players is race-free; each beginHandoff then runs async. A player already mid-handoff (frozen),
 // pending, or link-dead is skipped — the freeze/reap machinery already owns them.
 func (z *Zone) drainZone() {
+	z.draining = true // gates the eager reap of handed-off orphans on redirect (BeginDrain + #42 rebalance)
 	ids := make([]string, 0, len(z.players))
 	for id := range z.players {
 		ids = append(ids, id)

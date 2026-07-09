@@ -432,6 +432,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithPresence(roster, cfg.ShardID).
 		WithDrainMarker(dir).        // #41: advertise "draining" so peers don't target us mid-rollout
 		WithOccupancyPublisher(dir). // #42: heartbeat each hosted zone's player count for weighted placement
+		WithRebalance(dir).          // #42: execute the coordinator's per-zone rebalance directives
 		WithMail(mailStore).
 		WithTells(tellJS), chooseDrainTarget
 }

@@ -69,6 +69,13 @@ type Zone struct {
 	// occupancy points), read anywhere. Phase 16.4b.
 	pop atomic.Int64
 
+	// draining marks this zone as being bulk-drained (a graceful shard drain OR a #42 single-zone rebalance
+	// — both funnel through drainZone). It gates the EAGER reap of a handed-off orphan on redirect (so the
+	// zone empties promptly instead of waiting out freezeTTL), scoped to the ZONE rather than the shard-wide
+	// draining flag — a rebalance drains one zone without putting the whole shard into login-refusal. Zone-
+	// goroutine owned (set in drainZone, read in redirect).
+	draining bool
+
 	// protos is the per-SHARD prototype cache (prototype.go), shared READ-ONLY across all
 	// the shard's zone goroutines. The zone reads it via spawn; it is never mutated after
 	// shard construction, so the cross-goroutine sharing needs no lock. A bare test zone
@@ -1681,10 +1688,12 @@ func (z *Zone) redirect(v redirectMsg) {
 	s.epoch = v.epoch
 	s.send(redirectFrame(v.targetAddr, v.token))
 	z.log.Debug("redirect sent", "player", v.id, "target", v.targetAddr, "epoch", v.epoch)
-	// Phase 16.4b: during a graceful drain the player is committed to the peer (handedOff is set — the
-	// commit-marker handedOffMsg is enqueued ahead of this redirectMsg), so reap the frozen source orphan
-	// NOW rather than waiting out freezeTTL. The zone then empties promptly and BeginDrain's wait completes.
-	if s.handedOff && z.shard != nil && z.shard.isDraining() {
+	// Phase 16.4b: during a bulk drain the player is committed to the peer (handedOff is set — the commit-
+	// marker handedOffMsg is enqueued ahead of this redirectMsg), so reap the frozen source orphan NOW rather
+	// than waiting out freezeTTL. The zone then empties promptly and the drain's wait-until-empty completes.
+	// Gated on the per-ZONE draining flag (set by drainZone) so it fires for BOTH a shard-wide BeginDrain and
+	// a #42 single-zone rebalance (which never sets the shard-wide draining flag).
+	if s.handedOff && z.draining {
 		z.reapHandedOffOrphan(v.id, s)
 	}
 }
