@@ -135,7 +135,7 @@ func TestApplyConfigEmitsChannelList(t *testing.T) {
 	g.setSupports([]string{"Comm"})
 	cc := &commsClient{
 		log: discardLog(), tc: tc, gmcp: g, bus: commbus.OpenGate("", nil),
-		chanSubs: map[string]commbus.Subscription{}, ignore: map[string]struct{}{},
+		chanSubs: map[string]commbus.Subscription{}, rosterSubs: map[string]commbus.Subscription{}, ignore: map[string]struct{}{},
 	}
 	cc.applyConfig(cfg)
 	got := out.String()
@@ -152,7 +152,7 @@ func TestApplyConfigEmitsChannelList(t *testing.T) {
 	tc2.ReadLine()
 	cc2 := &commsClient{
 		log: discardLog(), tc: tc2, gmcp: newGMCPState(), bus: commbus.OpenGate("", nil),
-		chanSubs: map[string]commbus.Subscription{}, ignore: map[string]struct{}{},
+		chanSubs: map[string]commbus.Subscription{}, rosterSubs: map[string]commbus.Subscription{}, ignore: map[string]struct{}{},
 	}
 	cc2.applyConfig(cfg)
 	if strings.Contains(out2.String(), "Comm.Channel.List") {
