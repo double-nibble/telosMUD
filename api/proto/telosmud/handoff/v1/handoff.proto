@@ -54,6 +54,22 @@ message AbortResponse {}
 
 message AdoptZoneRequest {
   string zone_id = 1; // the draining peer's zone this shard should build + run + start renewing
+  // #262: AdoptZone drives HostZone + lease renewal, so an unauthenticated request is a forced-host /
+  // lease-takeover / resource-exhaustion vector against any world port an attacker can reach. These
+  // fields authenticate it with the SAME shared handoff keypair Prepare uses.
+  //
+  // A signature over zone_id ALONE would be replayable forever, so the digest also binds:
+  //   - to_shard_id, so a signature captured for one shard cannot be replayed against another;
+  //   - issued_at_unix_ms, which the verifier bounds by a clock-skew window, so a captured request
+  //     expires. (A replay INSIDE the window is harmless: HostZone is idempotent.)
+  // from_shard_id names the requesting peer, binding the (from,to) pair and giving the audit a subject.
+  string from_shard_id = 2;
+  string to_shard_id = 3;
+  int64 issued_at_unix_ms = 4;
+  // zone_sig is an Ed25519 signature over a canonical digest of the fields above (internal/world/
+  // handoffsig.go), verified when the destination has a handoff verify key. Empty when signing is
+  // unconfigured (dev/test), where the #260 keyless refusal governs instead.
+  bytes zone_sig = 5;
 }
 
 message AdoptZoneResponse {

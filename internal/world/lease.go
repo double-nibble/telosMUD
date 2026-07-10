@@ -244,7 +244,18 @@ func (s *Shard) handoverZoneTo(ctx context.Context, zoneID, targetShardID, targe
 	if err != nil {
 		return fmt.Errorf("handover %q: dial target %s: %w", zoneID, targetAddr, err)
 	}
-	if _, err := client.AdoptZone(ctx, &handoffv1.AdoptZoneRequest{ZoneId: zoneID}); err != nil {
+	// #262: sign the adopt request with the shared handoff key. The digest binds the DESTINATION shard and an
+	// issue time, so this request is worthless at any other shard and expires — it is not a standing
+	// capability to force a host. An unkeyed source signs nothing, and a keyed destination then rejects it:
+	// a mixed-version drain fails closed (the source keeps the zone) rather than adopting unauthenticated.
+	adopt := &handoffv1.AdoptZoneRequest{
+		ZoneId:         zoneID,
+		FromShardId:    s.shardID,
+		ToShardId:      targetShardID,
+		IssuedAtUnixMs: time.Now().UnixMilli(),
+	}
+	adopt.ZoneSig = signAdoptZone(s.handoffSignKey, adopt)
+	if _, err := client.AdoptZone(ctx, adopt); err != nil {
 		return fmt.Errorf("handover %q: target %s adopt failed: %w", zoneID, targetShardID, err)
 	}
 
