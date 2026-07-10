@@ -192,7 +192,7 @@ func TestCrossShardHandoffPersistsAndReconnects(t *testing.T) {
 }
 
 // placementDir routes a login by the directory's per-character placement first (the shard the player
-// actually lives on, persisted across logout), falling back to the home zone — the test twin of
+// actually lives in — #320), falling back to the recorded shard, then the home zone. The test twin of
 // cmd/telos-gate's loginDirectory after the reconnect-routing fix.
 type placementDir struct {
 	redis    *directory.Redis
@@ -200,21 +200,8 @@ type placementDir struct {
 }
 
 func (d placementDir) ShardForCharacter(characterID string) (string, bool) {
-	ctx := context.Background()
-	if place, err := d.redis.PlayerPlacement(ctx, characterID); err == nil && place.ShardID != "" {
-		if endpoint, eerr := d.redis.EndpointForShard(ctx, place.ShardID); eerr == nil && endpoint != "" {
-			return endpoint, true
-		}
-	}
-	shardID, err := d.redis.ShardForZone(ctx, d.homeZone)
-	if err != nil || shardID == "" {
-		return "", false
-	}
-	endpoint, err := d.redis.EndpointForShard(ctx, shardID)
-	if err != nil || endpoint == "" {
-		return "", false
-	}
-	return endpoint, true
+	// Calls the SHIPPING resolver, not a copy of it: a twin would silently drift from cmd/telos-gate.
+	return ResolveLoginShard(context.Background(), d.redis, characterID, d.homeZone, "")
 }
 
 func errUnknownShard(addr string) error {

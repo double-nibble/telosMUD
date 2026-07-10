@@ -912,6 +912,10 @@ func (z *Zone) join(s *session, room ProtoRef) {
 	// Publish to the cross-shard `who` roster: this shard now hosts the player (8.4). Off the zone
 	// goroutine — presenceJoin only records + enqueues; the background loop does the Redis write.
 	z.presenceJoin(s)
+	// Record the player's placement (shard + ZONE + epoch) in the directory (#320). This is what a later
+	// reconnect routes by, and what makes the tell/mail existence oracle recognize a player who has never
+	// been handed off. Enqueued, never inline: this is blocking Redis I/O and we are on the zone goroutine.
+	z.registerPlacement(s)
 	// Start the player's durable-tell consumer (Phase 8.5): it drains any OFFLINE backlog (paced,
 	// "while you were away…") and then delivers live tells. Idempotent; one per resident on this shard.
 	z.startTellConsumer(s)
@@ -1066,6 +1070,10 @@ func (z *Zone) transferIn(m transferInMsg) {
 	if s.currentZone != nil {
 		s.currentZone.Store(z)
 	}
+	// The player changed ZONE without changing shard or epoch, so the directory's placement.zone is now
+	// stale. Re-register it (#320) — otherwise a reconnect after this walk routes by the OLD zone, which a
+	// later rebalance can move to a different shard entirely.
+	z.registerPlacement(s)
 	Move(s.entity, r)
 	z.actConceal("$n arrives.", s.entity, ToRoom) // #100: silent to those who can't see the arriver
 	z.lookRoom(s)
@@ -1172,6 +1180,9 @@ func (z *Zone) attach(m attachMsg) {
 		// roster. The roster's owner-guard lets this destination SET win over the source's stale entry,
 		// and the source shard's own presenceLeave (handed-off orphan reap) drops its copy (8.4).
 		z.presenceJoin(s)
+		// The handoff CAS already wrote (destShard, destZone, newEpoch). Re-assert it from the destination
+		// so the record is correct even if the CAS raced a concurrent login's registration (#320).
+		z.registerPlacement(s)
 		// This shard now hosts the player (cross-shard arrival): start their durable-tell consumer so
 		// tells to them drain here (8.5). Idempotent.
 		z.startTellConsumer(s)

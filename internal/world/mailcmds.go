@@ -327,11 +327,19 @@ func (z *Zone) mailSendCmd(s *session, rest string) {
 		}
 		writeFrameTo(out, textFrame("Mail sent to "+target+"."))
 
-		// NEW-MAIL NOTIFY: when the recipient is ONLINE, ping their gate over the comms-bus tell subject
-		// (the SAME sink the gate already renders, 8.2). The world is the source; the gate stays a sink.
-		// OFFLINE => no notify (they see it on login / via `mail`). Never-fatal: a nil/disabled bus is a
-		// clean no-op. The notify carries NO body — just a presence ping — so it can't leak the mail text
-		// to a path that skips the recipient's own inbox scoping.
+		// NEW-MAIL NOTIFY: ping the recipient's gate over the comms-bus tell subject (the SAME sink the gate
+		// already renders, 8.2). The world is the source; the gate stays a sink. Never-fatal: a nil/disabled
+		// bus is a clean no-op. The notify carries NO body — just a ping — so it can't leak the mail text to
+		// a path that skips the recipient's own inbox scoping.
+		//
+		// `online` IS A MISNOMER: it means "has a placement", i.e. HAS EVER LOGGED IN — not "is currently
+		// connected". The placement persists across logout, so this was already true of anyone who had been
+		// handed off across shards; #320 widened it to every player, because the world now writes a placement
+		// on login rather than only on a handoff. An offline recipient therefore now also gets a ping, which
+		// the durable tell subject delivers on their next login. Harmless (they were going to see the mail
+		// anyway) and redundant — but it is not what the name says. The right oracle for "currently
+		// connected" is the presence roster; this path deliberately never consults presence for ROUTING
+		// (P8-A4), but a notification gate is not routing. Tracked in #325.
 		if online && bus != nil {
 			_ = bus.Publish(ctx, commbus.TellSubject(target), commbus.Message{
 				AuthorID:   from,

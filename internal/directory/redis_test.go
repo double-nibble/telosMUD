@@ -236,13 +236,13 @@ func TestPlayerPlacementEpochMonotonic(t *testing.T) {
 	}
 
 	// First placement applies.
-	ok, err := d.SetPlayerShard(ctx, "Bilbo", "world-a:9090", 1)
+	ok, err := d.SetPlayerShard(ctx, "Bilbo", "world-a:9090", "midgaard", 1)
 	if err != nil || !ok {
 		t.Fatalf("first placement: ok=%v err=%v", ok, err)
 	}
 
 	// An equal or older epoch must be rejected (stale/duplicate handoff).
-	ok, err = d.SetPlayerShard(ctx, "Bilbo", "world-b:9090", 1)
+	ok, err = d.SetPlayerShard(ctx, "Bilbo", "world-b:9090", "darkwood", 1)
 	if err != nil || ok {
 		t.Fatalf("equal epoch should be rejected: ok=%v err=%v", ok, err)
 	}
@@ -251,7 +251,7 @@ func TestPlayerPlacementEpochMonotonic(t *testing.T) {
 	}
 
 	// A strictly newer epoch wins.
-	ok, err = d.SetPlayerShard(ctx, "Bilbo", "world-b:9090", 2)
+	ok, err = d.SetPlayerShard(ctx, "Bilbo", "world-b:9090", "darkwood", 2)
 	if err != nil || !ok {
 		t.Fatalf("newer epoch: ok=%v err=%v", ok, err)
 	}

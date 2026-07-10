@@ -91,13 +91,15 @@ func TestCrossShardHandoff(t *testing.T) {
 	send(t, sB, inputSeq(3, "say arrived"))
 	recvSay(t, sB, "arrived")
 
-	// The directory records Walker on shard B at the bumped epoch.
+	// The directory records Walker on shard B, IN DARKWOOD, at the bumped epoch. The zone is what a later
+	// reconnect routes by (#320), so a handoff that records the shard but not the destination zone would
+	// leave this player unroutable after darkwood is next rebalanced.
 	place, err := dir.PlayerPlacement(ctx, "Walker")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if place.ShardID != "shard-b" || place.Epoch != 2 {
-		t.Fatalf("placement = %+v, want {ShardID:shard-b Epoch:2}", place)
+	if place.ShardID != "shard-b" || place.ZoneID != "darkwood" || place.Epoch != 2 {
+		t.Fatalf("placement = %+v, want {ShardID:shard-b ZoneID:darkwood Epoch:2}", place)
 	}
 }
 
@@ -175,8 +177,9 @@ func TestCrossShardHandoffRoundTrip(t *testing.T) {
 	recvAttached(t, sA2)
 	recvUntilOutput(t, sA2, "Market Square") // back home in midgaard
 
-	if place, _ := dir.PlayerPlacement(ctx, "Strider"); place.ShardID != "shard-a" || place.Epoch != 3 {
-		t.Fatalf("placement = %+v, want {ShardID:shard-a Epoch:3}", place)
+	// Back on shard A, in midgaard: the zone must track the round trip too (#320), not just the shard.
+	if place, _ := dir.PlayerPlacement(ctx, "Strider"); place.ShardID != "shard-a" || place.ZoneID != "midgaard" || place.Epoch != 3 {
+		t.Fatalf("placement = %+v, want {ShardID:shard-a ZoneID:midgaard Epoch:3}", place)
 	}
 }
 
