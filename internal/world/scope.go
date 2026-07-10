@@ -342,6 +342,72 @@ func (sr *scopeReplication) start() {
 	}
 }
 
+// adoptSeedTimeout bounds the snapshot read on the ADOPTION path. It is deliberately tighter than the boot
+// budget: AdoptZone sits on the drain critical path, the draining source blocks on it, and BeginDrain hands
+// zones over serially — so every second here is a second of drain the deadline does not get back. A slow
+// snapshot store is also correlated with the failover that triggered the drain. Degrading to "no seed"
+// quickly beats stalling the drain into reclaim-from-durable, which drops players to a reconnect.
+const adoptSeedTimeout = 2 * time.Second
+
+// seedZone seeds ONE runtime-hosted zone's scope replica from the authoritative store (#280), closing the
+// #44 residual for drain adoption — which is precisely the failover moment scope replication exists to
+// survive. Without it a drain-adopted zone starts with an EMPTY replica and learns each world/region key
+// only when it is next broadcast, so a sticky world flag ("war active") reads false there, possibly forever.
+//
+// IT MUST BE CALLED BEFORE THE ZONE IS EXPOSED TO ANY LIVE DELTA — before Shard.adoptLocked puts it in
+// s.zones (world deltas fan out over zonesList), and therefore before registerZone adds it to zoneRegion
+// (region deltas route through that map). applyScopeSeed is a full-map REPLACE, so a seed landing after a
+// delta would clobber newer state. Posting first makes the inbox do the ordering: the seed is consumed
+// first and every later delta builds on it. This is why the fix is not a seedFromSnapshot call inside
+// registerZone.
+//
+// ctx is the ADOPTING RPC's context, so a source shard that gives up on the handoff also cancels this read
+// rather than leaving it to run out its own clock.
+//
+// The WORLD snapshot is read LAST, immediately before returning, because the caller exposes the zone as its
+// next act. Anything read earlier is stale for however long the rest of this function takes — and the world
+// scope is the one every zone subscribes to. The region read therefore goes first and absorbs that staleness,
+// exactly as it does at boot, where seedFromSnapshot reads every region before subscribing.
+//
+// The blocking posts are safe: the zone's actor has not started, so nothing drains its inbox, but nothing
+// has FILLED it either — buildZone posts no messages to the zone's own inbox — so the 256-slot buffer is
+// empty and two posts cannot block. (seedFromSnapshot's doc warns that a blocking post needs a live drainer;
+// here the guarantee comes from the other side, an empty buffer. If buildZone ever starts posting, revisit.)
+//
+// A snapshot read error degrades to "no seed" (catch up on the next broadcast), exactly as at boot. A nil
+// replication or nil snapshot source (single-shard tests, a shard with no store) is a clean no-op.
+func (sr *scopeReplication) seedZone(ctx context.Context, z *Zone) {
+	if sr == nil || sr.snapshot == nil || z == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, adoptSeedTimeout)
+	defer cancel()
+
+	// Region first: its staleness window is the one we can afford to widen.
+	regionID := sr.regionForZone(z.id)
+	var regionSeed map[string]json.RawMessage
+	if regionID != "" {
+		if raw, err := sr.snapshot.SnapshotRegionState(ctx, regionID); err != nil {
+			sr.log.Warn("region state snapshot failed; adopted zone starts without seeded region state",
+				"zone", z.id, "region", regionID, "err", err)
+		} else {
+			regionSeed = toRawMap(raw)
+		}
+	}
+
+	// World last: the caller exposes the zone immediately after we return, so this read is as fresh as we
+	// can make it, and the window in which a world delta can slip past the seed is as small as we can make it.
+	if raw, err := sr.snapshot.SnapshotWorldState(ctx); err != nil {
+		sr.log.Warn("world state snapshot failed; adopted zone starts without seeded world state",
+			"zone", z.id, "err", err)
+	} else {
+		z.post(scopeSeedMsg{kind: "world", state: toRawMap(raw)})
+	}
+	if regionSeed != nil {
+		z.post(scopeSeedMsg{kind: "region", state: regionSeed})
+	}
+}
+
 // registerZone brings a RUNTIME-hosted zone (HostZone / a drain adoption, 16.4a) into scope replication: it
 // stamps the zone's region-id replica, adds it to the region delivery map, and SUBSCRIBES to its region if
 // this shard wasn't already a member — so region deltas reach a zone hosted after boot (world deltas already
@@ -349,12 +415,9 @@ func (sr *scopeReplication) start() {
 // regionID stamp isn't a data race with a region:get on the zone goroutine. A zone in no region, or a nil
 // replication (no scoped bus), is a no-op.
 //
-// GAP (#44 residual, tracked as a follow-up): this wires the zone for FUTURE deltas but does NOT seed its
-// replica from the store the way boot zones are seeded via seedFromSnapshot — a drain-adopted zone starts
-// empty and only catches up on the next broadcast of each key. A naive seedFromSnapshot call here is unsafe:
-// the zone is exposed to live world deltas (via zonesList) the moment it is adopted, so a full-replace seed
-// posted after would clobber a newer delta. Closing it needs the seed posted before the zone is exposed to
-// the subscription, or the version-stamped snapshot+delta merge the seedFromSnapshot doc flags.
+// The zone's replica was already SEEDED by seedZone, which HostZone calls before adoptLocked exposes the
+// zone to any delta (#280). Do NOT seed here: by this point the zone is in s.zones, so a world delta may
+// already be sitting in its inbox, and applyScopeSeed's full-map replace would clobber it with older state.
 func (sr *scopeReplication) registerZone(z *Zone) {
 	if sr == nil {
 		return

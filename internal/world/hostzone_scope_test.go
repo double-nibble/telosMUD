@@ -31,7 +31,7 @@ func TestHostZoneRegistersScopeReplica(t *testing.T) {
 
 	var z *Zone
 	waitCond(t, "shard running so HostZone succeeds", func() bool {
-		hz, err := sh.HostZone("midgaard")
+		hz, err := sh.HostZone(context.Background(), "midgaard")
 		if err == nil {
 			z = hz
 			return true

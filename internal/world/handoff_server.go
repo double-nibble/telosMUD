@@ -139,7 +139,7 @@ func (h *handoffServer) Abort(_ context.Context, req *handoffv1.AbortRequest) (*
 // takes over the instant the source's HandoverZone flip lands. It is BUILD-ONLY — it does NOT claim the
 // lease itself; the caller (the draining source) owns the atomic flip so ShardForZone never observes an
 // ownerless gap. Errors (FailedPrecondition) if this shard can't host the zone (not running / no content).
-func (h *handoffServer) AdoptZone(_ context.Context, req *handoffv1.AdoptZoneRequest) (*handoffv1.AdoptZoneResponse, error) {
+func (h *handoffServer) AdoptZone(ctx context.Context, req *handoffv1.AdoptZoneRequest) (*handoffv1.AdoptZoneResponse, error) {
 	// Authenticate BEFORE any state work, exactly as Prepare does. #262: a KEYED shard used to adopt on a
 	// wholly unauthenticated request, so anyone with network reach to a world port could force it to host a
 	// zone (lease takeover / resource exhaustion). The signature binds this destination and an issue time, so
@@ -167,7 +167,10 @@ func (h *handoffServer) AdoptZone(_ context.Context, req *handoffv1.AdoptZoneReq
 		// operator explicitly opted into insecure handoffs (TELOS_ALLOW_INSECURE).
 		return nil, err
 	}
-	z, err := h.shard.HostZone(req.GetZoneId())
+	// Thread the CALLER's context into HostZone (#280): building the zone now includes a blocking scope-snapshot
+	// read, and the draining source is blocking on this RPC. If it gives up, we must too, rather than running
+	// the read out on our own clock while the source has already moved on.
+	z, err := h.shard.HostZone(ctx, req.GetZoneId())
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "adopt zone %q: %v", req.GetZoneId(), err)
 	}

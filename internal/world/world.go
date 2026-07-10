@@ -582,7 +582,7 @@ func (s *Shard) zonesList() []*Zone {
 // lease + placement flip that makes peers RESOLVE this shard as the zone's owner is the caller's job
 // (the drain coordinator, 16.4b) — HostZone just makes the zone live locally so a Handoff.Prepare into
 // it succeeds. Errors if the shard isn't running yet (no run ctx) or has no retained content.
-func (s *Shard) HostZone(id string) (*Zone, error) {
+func (s *Shard) HostZone(ctx context.Context, id string) (*Zone, error) {
 	// First pass: cheap guards + the idempotent hit, without holding mu across the (slower) zone build.
 	//
 	// SECURITY-LOAD-BEARING (#262): AdoptZone's anti-replay rests on this early return. A signed AdoptZone is
@@ -617,6 +617,17 @@ func (s *Shard) HostZone(id string) (*Zone, error) {
 	z.protos = s.protos
 	z.buildZone(s.content)
 
+	// Seed the zone's scope replica from the authoritative store BEFORE adoptLocked below publishes it into
+	// s.zones (#280). Once it is in s.zones a world-scope delta can be posted to its inbox via zonesList, and
+	// applyScopeSeed is a full-map REPLACE — so a seed arriving after a delta would clobber newer state with
+	// the snapshot. Seeding here means the inbox itself enforces the order: seed first, deltas after.
+	//
+	// Without this, a drain-adopted zone starts with an EMPTY replica and only learns each world/region key
+	// when it is next broadcast — reintroducing the #44 symptom (a sticky "war active" flag reading false)
+	// at exactly the failover this subsystem exists to survive. A failed snapshot read degrades to "no seed",
+	// the same as at boot. If we lose the adoption race below, this zone is discarded unrun and the seed with it.
+	s.scopes.seedZone(ctx, z)
+
 	// Register + launch atomically under mu, re-checking the guards a concurrent build/shutdown may have
 	// tripped. Doing runWG.Add here under mu (gated on !closed) is what makes it impossible for the Add to
 	// race Run's wg.Wait: Run sets closed=true under mu before Wait, so every surviving Add happens-before it.
@@ -634,6 +645,10 @@ func (s *Shard) HostZone(id string) (*Zone, error) {
 	s.runWG.Add(1)
 	s.mu.Unlock()
 
+	// registerZone stamps z.scopes.regionID. It MUST stay above the `go z.Run` below: the region seed already
+	// sitting in the inbox is DROPPED by applyScopeSeed if the stamp has not landed by the time the loop
+	// consumes it, and that failure is silent (an empty region replica, no error).
+	//
 	// Bring the zone into scope replication (stamp its region + subscribe) BEFORE its actor starts, so a
 	// region/world scope delta reaches a runtime-hosted zone and the regionID stamp isn't a race with a
 	// region:get on the zone goroutine (16.4a defer). No-op when there's no scoped bus / the zone has no region.

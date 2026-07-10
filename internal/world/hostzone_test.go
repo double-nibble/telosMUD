@@ -31,7 +31,7 @@ func TestHostZoneAddsAZoneAtRuntime(t *testing.T) {
 	// returns an error until then, and idempotent after — so retrying is safe).
 	var z *Zone
 	waitCond(t, "shard running so HostZone succeeds", func() bool {
-		hz, err := sh.HostZone("darkwood")
+		hz, err := sh.HostZone(context.Background(), "darkwood")
 		if err == nil {
 			z = hz
 			return true
@@ -46,7 +46,7 @@ func TestHostZoneAddsAZoneAtRuntime(t *testing.T) {
 		t.Fatal("runtime-hosted zone has no rooms — content was not built from the retained pack")
 	}
 	// Idempotent: a second HostZone returns the SAME live zone, not a rebuilt duplicate.
-	if z2, err := sh.HostZone("darkwood"); err != nil || z2 != z {
+	if z2, err := sh.HostZone(context.Background(), "darkwood"); err != nil || z2 != z {
 		t.Fatalf("HostZone not idempotent: z2=%p err=%v", z2, err)
 	}
 }
@@ -60,7 +60,7 @@ func TestHostZoneErrsWithoutRunOrContent(t *testing.T) {
 	}
 	// Built from content but NOT running: no run ctx yet.
 	sh := NewShardFromContent(lc, []string{"midgaard"}, "midgaard", "", nil, nil)
-	if _, err := sh.HostZone("darkwood"); err == nil {
+	if _, err := sh.HostZone(context.Background(), "darkwood"); err == nil {
 		t.Fatal("HostZone should error before Run (no run ctx)")
 	}
 
@@ -70,11 +70,11 @@ func TestHostZoneErrsWithoutRunOrContent(t *testing.T) {
 	defer cancel()
 	go demo.Run(ctx)
 	waitCond(t, "demo shard running", func() bool {
-		_, err := demo.HostZone("darkwood")
+		_, err := demo.HostZone(context.Background(), "darkwood")
 		// It IS running once we get the content error (not the not-running error); before that, keep waiting.
 		return err != nil && err.Error() != `HostZone "darkwood": shard not running`
 	})
-	if _, err := demo.HostZone("darkwood"); err == nil {
+	if _, err := demo.HostZone(context.Background(), "darkwood"); err == nil {
 		t.Fatal("HostZone should error on a shard with no retained content")
 	}
 }
@@ -92,12 +92,12 @@ func TestHostZoneRefusesAfterShutdown(t *testing.T) {
 	done := make(chan struct{})
 	go func() { sh.Run(ctx); close(done) }()
 
-	waitCond(t, "shard running", func() bool { _, err := sh.HostZone("darkwood"); return err == nil })
+	waitCond(t, "shard running", func() bool { _, err := sh.HostZone(context.Background(), "darkwood"); return err == nil })
 
 	cancel()
 	<-done // Run has set closed=true and completed wg.Wait
 
-	if _, err := sh.HostZone("crypt"); err == nil {
+	if _, err := sh.HostZone(context.Background(), "crypt"); err == nil {
 		t.Fatal("HostZone should refuse after the shard began shutting down")
 	}
 }
@@ -134,7 +134,7 @@ func TestHostZoneConcurrentWithRouting(t *testing.T) {
 	}
 
 	waitCond(t, "HostZone darkwood while routing reads race it", func() bool {
-		_, err := sh.HostZone("darkwood")
+		_, err := sh.HostZone(context.Background(), "darkwood")
 		return err == nil
 	})
 	close(stop)
