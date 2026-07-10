@@ -540,6 +540,20 @@ func (sr *scopeReplication) postToScopeZones(kind, regionID string, m msg) {
 	}
 }
 
+// unregisterZone drops a torn-down zone (#288 UnhostZone) from the region delivery map. The shard's region
+// SUBSCRIPTION stays: other hosted zones may share the region, and a zone this shard re-adopts later would
+// have to re-subscribe anyway. A stale zoneRegion entry would be harmless today — postToScopeZones resolves
+// each target through zoneByID, which returns nil for an unhosted zone — but leaving it would make the map
+// grow without bound across rebalances, which is the very leak UnhostZone exists to close. nil-safe.
+func (sr *scopeReplication) unregisterZone(zoneID string) {
+	if sr == nil {
+		return
+	}
+	sr.mu.Lock()
+	delete(sr.zoneRegion, zoneID)
+	sr.mu.Unlock()
+}
+
 // stop unsubscribes every scope subscription (called at Run teardown). Idempotent.
 func (sr *scopeReplication) stop() {
 	if sr == nil {

@@ -138,11 +138,12 @@ func (s *Shard) succeedRebalance(zoneID string) {
 // the cross-shard handoff (sockets stay open — zero drop), waits until the zone empties or the deadline,
 // then flushes + reclaims any straggler (reconnect from durable state). Runs OFF the zone goroutine.
 //
-// LIMITATION (tracked follow-up): after the players + ownership move, this source shard keeps an EMPTY,
-// unowned, un-renewed zone OBJECT (its actor goroutine still pulses). It is inert — no double-own (the lease
-// isn't renewed), no players route to it (the directory points at the target) — but it is a resource leak
-// until shard restart. A clean teardown needs a runtime zone-REMOVE primitive (the inverse of HostZone),
-// which does not exist yet; see the follow-up. Correctness (zero-drop, single-writer) does not depend on it.
+// Finally it UNHOSTS the now-empty zone (#288): stops its actor and drops it from s.zones, so a shard that
+// lives through many rebalances does not accumulate a zombie zone goroutine per migration. The teardown runs
+// AFTER the ownership flip and after the zone has emptied, which is exactly what UnhostZone's preconditions
+// require. It is best-effort: a refusal or a wedged actor is logged and the rebalance still reports success,
+// because the players and the lease have already moved — the residue is a leak, not a correctness break, and
+// failing the rebalance here would make the coordinator retry a move that has already happened.
 func (s *Shard) RebalanceZone(ctx context.Context, zoneID, toShard, toAddr string, deadline time.Duration) (res DrainResult, err error) {
 	z := s.zoneByID(zoneID)
 	if z == nil {
@@ -162,7 +163,11 @@ func (s *Shard) RebalanceZone(ctx context.Context, zoneID, toShard, toAddr strin
 	defer tick.Stop()
 wait:
 	for {
-		if z.pop.Load() == 0 {
+		// Wait for QUIESCENCE, not merely for the player count to hit zero: a brand-new character who quit
+		// inside their create round-trip has left z.players while a final logout snapshot is still parked,
+		// waiting on a createdMsg that only this zone's actor can replay. Tearing the zone down in that window
+		// loses the write (Zone.quiescent).
+		if z.quiescent() {
 			break wait
 		}
 		select {
@@ -194,6 +199,19 @@ wait:
 	res.Redirected = initial - res.Reclaimed
 	if res.Redirected < 0 {
 		res.Redirected = 0
+	}
+
+	// 4. Tear the empty zone down (#288). Use a FRESH context: ctx may already be past its deadline (the wait
+	// above breaks on it), and the zone still has to be unhosted — leaving it is the leak this closes. The
+	// budget only has to cover a directory read and the actor's last message.
+	unhostCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unhostActorGrace)
+	defer cancel()
+	if uerr := s.UnhostZone(unhostCtx, zoneID); uerr != nil {
+		// Expected for this shard's HOME zone and for local bootstrap zones, which UnhostZone refuses on
+		// purpose (see its preconditions) — a rebalance of those moves the players and the lease but leaves
+		// the object. Anything else here is a wedged actor or an unreadable directory, and it leaks.
+		slog.Warn("rebalance: the migrated zone was not unhosted; its actor goroutine lives until restart",
+			"zone", zoneID, "to", toShard, "err", uerr)
 	}
 	return res, nil
 }
