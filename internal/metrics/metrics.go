@@ -22,6 +22,7 @@ var (
 	tickLag          metric.Float64Histogram
 	occupancy        metric.Int64Gauge
 	framesDropped    metric.Int64Counter
+	streamStalled    metric.Int64Counter
 	gateConns        metric.Int64UpDownCounter
 	busLag           metric.Float64Histogram
 	busCatchupEvents metric.Int64Counter
@@ -42,6 +43,12 @@ func init() {
 		metric.WithDescription("Live players in a zone"))
 	framesDropped, _ = meter.Int64Counter("telos.gate.frames_dropped_total",
 		metric.WithDescription("Server frames dropped because a player's outbound buffer was full (slow client)"))
+	streamStalled, _ = meter.Int64Counter("telos.world.stream_stalled_total",
+		metric.WithDescription("Play streams torn down by the world because an outbound frame was blocked in Send "+
+			"past the stall bound (#274) — the gate was answering keepalives but had stopped reading the stream. "+
+			"Labeled by the peer `gate` address, because one wedged gate stalls every player it serves (they share "+
+			"an HTTP/2 connection window), so the burst needs somewhere to attribute itself. Non-zero means a gate "+
+			"is wedged at the application layer; keepalive structurally cannot see that case."))
 	gateConns, _ = meter.Int64UpDownCounter("telos.gate.connections",
 		metric.WithDescription("Live gate connections"))
 	busLag, _ = meter.Float64Histogram("telos.bus.deliver_lag_ms",
@@ -95,6 +102,15 @@ func SetOccupancy(ctx context.Context, zone string, n int64) {
 func FrameDropped(ctx context.Context) {
 	if framesDropped != nil {
 		framesDropped.Add(ctx, 1)
+	}
+}
+
+// StreamStalled counts a Play stream the world reclaimed because its peer stopped reading (#274). Non-zero
+// means a gate is wedged at the application layer — a case gRPC keepalive structurally cannot see, because
+// the peer's HTTP/2 stack keeps acking PINGs independently of application flow control.
+func StreamStalled(ctx context.Context, gate string) {
+	if streamStalled != nil {
+		streamStalled.Add(ctx, 1, metric.WithAttributes(attribute.String("gate", gate)))
 	}
 }
 
