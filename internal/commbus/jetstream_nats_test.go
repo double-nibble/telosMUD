@@ -57,7 +57,7 @@ func TestJetStreamRealOfflineThenOnline(t *testing.T) {
 	}))
 
 	got := make(chan Message, 4)
-	cons, err := js.Consume(subj, target, func(m Message, _ bool) bool { got <- m; return true })
+	cons, err := js.Consume(subj, target, func(m Message, _ bool) AckDecision { got <- m; return AckDelivered })
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cons.Stop() })
 
@@ -77,15 +77,20 @@ func TestJetStreamRealOfflineThenOnline(t *testing.T) {
 }
 
 // TestJetStreamRealBoundedRedelivery confirms the PRODUCTION redelivery/park config against a REAL broker
-// (#62): a durable tell whose handler always NAKs is redelivered EXACTLY DefaultMaxDeliver times then PARKED,
-// never storming; and a GOOD message published alongside it is delivered PROMPTLY rather than blocked behind
-// the poison. On an explicit NAK real NATS redelivers IMMEDIATELY (no BackOff is configured), so the poison
-// exhausts its attempts fast; the good message still lands promptly because the consumer has MaxAckPending in
-// flight and delivers it concurrently. That concurrent interleaving is the property the MemJetStream stand-in
-// does NOT have (it retries synchronously in-order — see TestMemJetStreamRedeliveryIsSynchronousInOrder),
-// which is exactly why this confirmation runs gated against real NATS. Shrinks MaxDeliver so the bounded run
-// is quick. (AckWait is left at prod: it governs a HUNG handler, not an explicit NAK, so it is irrelevant
-// here — a deliberately-immediate redelivery a live never-lost concern (#266) rests on.)
+// (#62, #266). It pins three things the stand-in cannot prove:
+//
+//  1. The ConsumerConfig is ACCEPTED. NATS rejects a consumer whose MaxDeliver is not STRICTLY GREATER than
+//     len(BackOff) (err_code 10116) — which is why consumerBackoff() truncates the schedule to fit. This test
+//     shrinks MaxDeliver to 3, so it fails outright if that truncation regresses.
+//  2. A permanently-transient tell is retried EXACTLY DefaultMaxDeliver times, then PARKED — bounded, never
+//     storming. (Park is permanent loss; the consumer logs it at ERROR.)
+//  3. HEAD-OF-LINE ORDER under MaxAckPending=1: the good message published behind the stuck one is delivered
+//     only AFTER the stuck one resolves. That blocking is REQUIRED, not incidental — with a delayed NAK, a
+//     successor delivered concurrently could ack and advance the world's per-sender delivered-cursor past the
+//     pending seq, so the delayed redelivery would be suppressed as a duplicate and the tell silently LOST.
+//
+// Point 3 is why the MemJetStream's synchronous in-order retry is no longer a divergence: both transports now
+// resolve one message completely before the next. Shrinks MaxDeliver so the bounded run is quick.
 func TestJetStreamRealBoundedRedelivery(t *testing.T) {
 	url := natsURL(t)
 	js, err := NewJetStream(url)
@@ -113,29 +118,32 @@ func TestJetStreamRealBoundedRedelivery(t *testing.T) {
 
 	var poisonAttempts atomic.Int64
 	good := make(chan Message, 4)
-	cons, err := js.Consume(subj, target, func(m Message, _ bool) bool {
+	cons, err := js.Consume(subj, target, func(m Message, _ bool) AckDecision {
 		if m.Body == "poison" {
 			poisonAttempts.Add(1)
-			return false // always NAK
+			return RetryTransient // always transient-fail -> parks after DefaultMaxDeliver
 		}
 		good <- m
-		return true
+		return AckDelivered
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cons.Stop() })
 
-	// The good message is delivered PROMPTLY — the consumer delivers it concurrently with the poison's
-	// (immediate) redeliveries rather than blocking behind them, unlike the mem stand-in.
+	// HEAD-OF-LINE: the successor must NOT arrive while the stuck message is still pending (MaxAckPending=1).
+	// It lands only once the stuck one has exhausted its budget and parked. Allow the full retry window plus
+	// slack: with MaxDeliver=3 the schedule spends NakBackoff[0]+NakBackoff[1] before parking.
+	deadline := totalNakWindow() + 5*time.Second
 	select {
 	case m := <-good:
 		assert.Equal(t, "good", m.Body)
-	case <-time.After(5 * time.Second):
-		t.Fatal("the good message was blocked behind the poison's redeliveries (real NATS should interleave)")
+		assert.Equal(t, int64(DefaultMaxDeliver), poisonAttempts.Load(),
+			"the stuck tell must have fully resolved (parked) BEFORE its successor was delivered — MaxAckPending=1")
+	case <-time.After(deadline):
+		t.Fatal("the successor was never delivered after the stuck message parked")
 	}
 
-	// The poison NAKs redeliver immediately (no BackOff), so a short settle is enough for it to exhaust
-	// MaxDeliver and PARK; confirm it was attempted exactly DefaultMaxDeliver times and never storms further.
-	time.Sleep(2 * time.Second)
+	// It never storms further after parking.
+	time.Sleep(500 * time.Millisecond)
 	assert.Equal(t, int64(DefaultMaxDeliver), poisonAttempts.Load(),
-		"real NATS must redeliver a NAKing tell exactly MaxDeliver times, then park")
+		"real NATS must redeliver a transient-NAKing tell exactly MaxDeliver times, then park")
 }

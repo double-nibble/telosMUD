@@ -18,9 +18,9 @@ import (
 
 func drainConsumer(t *testing.T, js JetStream, subj, consumerID string, sink chan<- Message) Consumer {
 	t.Helper()
-	cons, err := js.Consume(subj, consumerID, func(m Message, _ bool) bool {
+	cons, err := js.Consume(subj, consumerID, func(m Message, _ bool) AckDecision {
 		sink <- m
-		return true // ack
+		return AckDelivered // ack
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cons.Stop() })
@@ -106,13 +106,13 @@ func TestJetStreamBoundedRedelivery(t *testing.T) {
 
 	var poisonAttempts atomic.Int64
 	good := make(chan Message, 4)
-	cons, err := js.Consume(subj, "alice", func(m Message, _ bool) bool {
+	cons, err := js.Consume(subj, "alice", func(m Message, _ bool) AckDecision {
 		if m.Body == "poison" {
 			poisonAttempts.Add(1)
-			return false // always NAK
+			return RetryTransient // always transient-fail -> parks after DefaultMaxDeliver
 		}
 		good <- m
-		return true
+		return AckDelivered
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cons.Stop() })
@@ -130,29 +130,47 @@ func TestJetStreamBoundedRedelivery(t *testing.T) {
 }
 
 // TestDurableRedeliveryProdConfig pins the PRODUCTION durable-tell redelivery config against regression
-// (#62): the real NATS consumer (jetstream_nats.go Consume) is built with MaxDeliver=DefaultMaxDeliver and
-// AckWait=jsAckWait, so lowering MaxDeliver PARKS (loses) a tell after fewer attempts. NOTE on AckWait: it is
-// the broker's wait for a RESPONSE before redelivering a message whose handler neither Ack'd nor Nak'd within
-// the window (a hung/crashed consumer, a lost ack) — it is NOT the interval between explicit NAK
-// redeliveries. An explicit m.Nak() (jetstream_nats.go) redelivers IMMEDIATELY, because no ConsumerConfig
-// BackOff is set. That immediate redelivery is a live never-lost concern (a transient NAK burns MaxDeliver in
-// milliseconds and parks) tracked in #266; this test only guards the two config values from silent drift.
-// These tests mutate the DefaultMaxDeliver/jsAckWait package globals, so they must stay NON-parallel (no
-// t.Parallel) or this assertion could observe another test's shrunk values.
+// (#62, #266). AckWait is the broker's wait for a RESPONSE before redelivering a message whose handler
+// neither Ack'd nor Nak'd (a hung/crashed consumer, a lost ack) — it is NOT the interval between explicit
+// NAK redeliveries. An explicit NAK is paced by NakBackoff via m.NakWithDelay (#266); a bare Nak() would
+// redeliver IMMEDIATELY and burn the whole budget inside a transient window, parking (losing) the tell.
+// The window the schedule covers is the never-lost guarantee's actual bound, so it is asserted here.
+// These tests mutate the DefaultMaxDeliver/jsAckWait package globals, so they must stay NON-parallel.
 func TestDurableRedeliveryProdConfig(t *testing.T) {
-	assert.Equal(t, 5, DefaultMaxDeliver, "prod durable-tell MaxDeliver must be 5 (bounded redelivery before park)")
+	assert.Equal(t, 10, DefaultMaxDeliver, "prod durable-tell MaxDeliver must be 10 (bounded redelivery before park)")
 	assert.Equal(t, 30*time.Second, jsAckWait, "prod durable-tell AckWait must be 30s (no-response redelivery timeout)")
+	assert.Equal(t, []time.Duration{200 * time.Millisecond, time.Second, 3 * time.Second, 10 * time.Second, 30 * time.Second},
+		NakBackoff, "prod NAK backoff schedule (ramp, then hold at the last entry)")
+	// NATS constraint (err_code 10116): MaxDeliver must be STRICTLY GREATER than len(BackOff).
+	assert.Greater(t, DefaultMaxDeliver, len(NakBackoff), "MaxDeliver must be > len(BackOff)")
+	assert.Equal(t, NakBackoff, consumerBackoff(), "at prod MaxDeliver the whole schedule fits")
+	// The covered transient window: past this a message PARKS, which is permanent loss. It must comfortably
+	// outlive a cross-shard handoff (sub-second), a bus blip (seconds) and a reconnect (tens of seconds).
+	assert.Equal(t, 164200*time.Millisecond, totalNakWindow(), "covered transient window before park")
+	assert.Greater(t, totalNakWindow(), 2*time.Minute, "the never-lost window must outlive a realistic transient")
 }
 
-// TestMemJetStreamRedeliveryIsSynchronousInOrder pins the MemJetStream ↔ real-NATS DIVERGENCE the durable
-// tests rest on (#62). MemJetStream.deliverBounded retries a NAK SYNCHRONOUSLY and IN STREAM ORDER on the
-// single consumer goroutine: all attempts for one message run back-to-back, so a poison message is fully
-// redelivered-then-parked BEFORE the next message is ever delivered. Real NATS also redelivers a NAK
-// immediately (no backoff), but its consumer has MaxAckPending in flight, so a later message is delivered
-// CONCURRENTLY — a good message lands promptly instead of waiting behind the poison's retries. The test
-// asserts the deterministic Mem order — [poison ×maxDeliver, then good] — which is exactly the in-order
-// blocking that does NOT hold on a real broker; any interleaving assertion must use the gated real-NATS test,
-// never this stand-in.
+// TestNakBackoffRampsThenHolds pins the schedule function itself: attempt N earns the Nth entry, and past
+// the schedule's end the LAST entry repeats (the flat tail) rather than wrapping or going to zero.
+func TestNakBackoffRampsThenHolds(t *testing.T) {
+	for i, want := range NakBackoff {
+		assert.Equal(t, want, nakBackoff(i+1), "attempt %d earns schedule entry %d", i+1, i)
+	}
+	last := NakBackoff[len(NakBackoff)-1]
+	assert.Equal(t, last, nakBackoff(len(NakBackoff)+1), "past the end, the last entry repeats")
+	assert.Equal(t, last, nakBackoff(100), "…and keeps repeating, never wrapping to a short delay")
+	assert.Equal(t, NakBackoff[0], nakBackoff(0), "a defensive 0/negative attempt clamps to the first entry")
+}
+
+// TestMemJetStreamRedeliveryIsSynchronousInOrder pins the head-of-line invariant BOTH transports now share
+// (#62 wrote this as a divergence; #266 removed it). MemJetStream.deliverBounded resolves one message
+// completely — every RetryTransient attempt, then park — before run() delivers the next. The real consumer
+// now does the same via MaxAckPending=1, which is REQUIRED once a NAK is delayed: were a successor delivered
+// while a delay-NAK'd message is still pending, it could ack and advance the world's per-sender
+// delivered-cursor past the pending seq, so the redelivery would be suppressed as a duplicate and the
+// message silently LOST. So the deterministic order asserted here — [stuck ×maxDeliver, then good] — is now
+// the real broker's order too, not a stand-in artifact. Blocking behind a stuck message is correct: only a
+// transient can block (poison is DropPoison'd out of band), and it clears on its own.
 func TestMemJetStreamRedeliveryIsSynchronousInOrder(t *testing.T) {
 	js := NewMemJetStream()
 	t.Cleanup(func() { _ = js.Close() })
@@ -166,15 +184,15 @@ func TestMemJetStreamRedeliveryIsSynchronousInOrder(t *testing.T) {
 	var mu sync.Mutex
 	var order []string
 	done := make(chan struct{})
-	cons, err := js.Consume(subj, "alice", func(m Message, _ bool) bool {
+	cons, err := js.Consume(subj, "alice", func(m Message, _ bool) AckDecision {
 		mu.Lock()
 		order = append(order, m.Body)
 		mu.Unlock()
 		if m.Body == "poison" {
-			return false // always NAK — parks after DefaultMaxDeliver synchronous attempts
+			return RetryTransient // always transient-fail -> parks after DefaultMaxDeliver attempts
 		}
 		close(done)
-		return true
+		return AckDelivered
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cons.Stop() })
@@ -208,13 +226,13 @@ func TestJetStreamConsumerRestartIdempotent(t *testing.T) {
 	require.NoError(t, js.PublishDurable(ctx, subj, Message{AuthorID: "bob", Seq: 1, IdempotencyKey: "bob:1", Body: "one"}))
 
 	sink := make(chan Message, 8)
-	cons1, err := js.Consume(subj, "alice", func(m Message, _ bool) bool { sink <- m; return true })
+	cons1, err := js.Consume(subj, "alice", func(m Message, _ bool) AckDecision { sink <- m; return AckDelivered })
 	require.NoError(t, err)
 	assert.Equal(t, "one", recv(t, sink).Body)
 	require.NoError(t, cons1.Stop())
 
 	// A NEW consumer with the same id (a restart) drains nothing new — the cursor advanced past "one".
-	cons2, err := js.Consume(subj, "alice", func(m Message, _ bool) bool { sink <- m; return true })
+	cons2, err := js.Consume(subj, "alice", func(m Message, _ bool) AckDecision { sink <- m; return AckDelivered })
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cons2.Stop() })
 	assertNoMsg(t, sink)
@@ -230,7 +248,7 @@ func TestJetStreamConcurrentPublish(t *testing.T) {
 
 	const n = uint64(100)
 	var got atomic.Int64
-	_, err := js.Consume(subj, "alice", func(Message, bool) bool { got.Add(1); return true })
+	_, err := js.Consume(subj, "alice", func(Message, bool) AckDecision { got.Add(1); return AckDelivered })
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -291,9 +309,9 @@ func TestJetStreamBacklogFlag(t *testing.T) {
 		backlog bool
 	}
 	sink := make(chan flagged, 8)
-	cons, err := js.Consume(subj, "alice", func(m Message, backlog bool) bool {
+	cons, err := js.Consume(subj, "alice", func(m Message, backlog bool) AckDecision {
 		sink <- flagged{m.Body, backlog}
-		return true
+		return AckDelivered
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cons.Stop() })

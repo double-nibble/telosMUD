@@ -271,10 +271,11 @@ func (b *Bus) SubscribeDurable(scope Scope, consumerID string, handler DurableHa
 	if err != nil {
 		return nil, err
 	}
-	return b.durable.Consume(subj, consumerID, func(m commbus.Message, backlog bool) bool {
+	return b.durable.Consume(subj, consumerID, func(m commbus.Message, backlog bool) commbus.AckDecision {
 		var sm scopeMsg
 		if err := json.Unmarshal([]byte(m.Body), &sm); err != nil || sm.Event == "" {
-			return true // a malformed durable message is acked away, not redelivered forever
+			// Undeliverable forever: drop it now rather than spend the transient retry budget (#266).
+			return commbus.DropPoison
 		}
 		_, seq, seqOK := commbus.ParseIdempotencyKey(m.IdempotencyKey)
 		ack := handler(DurableEvent{
@@ -293,6 +294,13 @@ func (b *Bus) SubscribeDurable(scope Scope, consumerID string, handler DurableHa
 		if ack && !backlog {
 			recordBusDeliverLag(sm.PubMillis)
 		}
-		return ack
+		if ack {
+			return commbus.AckDelivered
+		}
+		// A handler NAK is a TRANSIENT apply failure (the scope actor is busy / mid-failover): redeliver on
+		// the backoff schedule rather than immediately (#266). Note the same overtaking hazard the tell
+		// cursor has applies to this bus's per-source `applied` high-water — a successor acking past a
+		// delay-NAK'd event would suppress it on redelivery — which is why the consumer runs MaxAckPending=1.
+		return commbus.RetryTransient
 	})
 }

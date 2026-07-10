@@ -26,6 +26,8 @@ var (
 	busLag          metric.Float64Histogram
 	drainRedirected metric.Int64Counter
 	drainReclaimed  metric.Int64Counter
+	durableParked   metric.Int64Counter
+	durablePoisoned metric.Int64Counter
 )
 
 func init() {
@@ -49,6 +51,13 @@ func init() {
 		metric.WithDescription("Players still resident at the drain deadline, dropped to reconnect from durable state; "+
 			"labeled fault=infra (a connected in-world player the drain could not hand off in time) vs "+
 			"fault=client (link-dead, or never finished connecting)"))
+	durableParked, _ = meter.Int64Counter("telos.commbus.durable_parked_total",
+		metric.WithDescription("Durable messages PARKED after exhausting the redelivery budget — permanent LOSS "+
+			"(the never-lost invariant only covers transients shorter than the backoff window). Labeled by stream. "+
+			"Any non-zero value is an incident: an outage outlived the whole retry schedule."))
+	durablePoisoned, _ = meter.Int64Counter("telos.commbus.durable_poisoned_total",
+		metric.WithDescription("Durable messages DROPPED as undeliverable (malformed / permanently unroutable). "+
+			"Labeled by stream. Distinct from parked: poison spends no retry budget and is never a transient."))
 }
 
 func zoneAttr(zone string) metric.RecordOption {
@@ -109,5 +118,24 @@ func DrainRedirected(ctx context.Context, n int) {
 func DrainReclaimed(ctx context.Context, n int, fault string) {
 	if drainReclaimed != nil && n > 0 {
 		drainReclaimed.Add(ctx, int64(n), metric.WithAttributes(attribute.String("fault", fault)))
+	}
+}
+
+// DurableParked counts a durable message that exhausted its redelivery budget and was parked — PERMANENT
+// LOSS (#266). It is the alertable signal that the never-lost guarantee's covered window was exceeded, so it
+// must never be folded together with the (routine, harmless) poison drop. `stream` is low-cardinality
+// (COMMS_TELL | WORLD_EVENTS) — never a per-player subject.
+func DurableParked(ctx context.Context, stream string) {
+	if durableParked != nil {
+		durableParked.Add(ctx, 1, metric.WithAttributes(attribute.String("stream", stream)))
+	}
+}
+
+// DurablePoisoned counts a durable message dropped as undeliverable (malformed / permanently unroutable).
+// Routine and bounded — it spends no retry budget — but still worth a counter so a spike in malformed
+// content is visible rather than only appearing as a log line.
+func DurablePoisoned(ctx context.Context, stream string) {
+	if durablePoisoned != nil {
+		durablePoisoned.Add(ctx, 1, metric.WithAttributes(attribute.String("stream", stream)))
 	}
 }

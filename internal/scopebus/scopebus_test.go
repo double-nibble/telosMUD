@@ -386,3 +386,53 @@ func TestScopeBusDurableConsumerDedupsRedelivery(t *testing.T) {
 	assert.Equal(t, keys[0], keys[1], "a redelivery must carry the SAME idempotency key (so the consumer can dedup it)")
 	assert.Equal(t, 1, applied, "the idempotent consumer must apply the key EXACTLY ONCE despite the redelivery")
 }
+
+// TestScopeBusDurableMalformedBodyIsPoison pins the #266 DropPoison arm on its real producer. A durable
+// scoped event whose BODY is not a parseable scopeMsg can never be applied, no matter how long we wait — so
+// it must be dropped after ONE handler-less pass, spending none of the transient retry budget and never
+// parking. (Contrast TestScopeBusDurableMalformedKeyDegrades: a malformed KEY has a valid body, so it IS
+// delivered — with SeqOK=false — and acked.) A later well-formed event must still be delivered, proving the
+// poison did not wedge or throttle the stream.
+func TestScopeBusDurableMalformedBodyIsPoison(t *testing.T) {
+	b, js := durableBus(t, "run1")
+	ctx := context.Background()
+
+	subj, err := World().Subject()
+	require.NoError(t, err)
+
+	got := make(chan DurableEvent, 4)
+	cons, err := b.SubscribeDurable(World(), "world-dir", func(ev DurableEvent) bool {
+		got <- ev
+		return true
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	// Not a scopeMsg at all.
+	require.NoError(t, js.PublishDurable(ctx, subj, commbus.Message{
+		AuthorID: "run1", IdempotencyKey: "run1:1", Body: "{not json at all",
+	}))
+	// A well-formed scopeMsg with an EMPTY event name is equally unapplyable.
+	empty, err := json.Marshal(scopeMsg{Event: ""})
+	require.NoError(t, err)
+	require.NoError(t, js.PublishDurable(ctx, subj, commbus.Message{
+		AuthorID: "run1", IdempotencyKey: "run1:2", Body: string(empty),
+	}))
+	// …then a good one, which must still arrive.
+	good, err := json.Marshal(scopeMsg{Event: "boss.slain"})
+	require.NoError(t, err)
+	require.NoError(t, js.PublishDurable(ctx, subj, commbus.Message{
+		AuthorID: "run1", IdempotencyKey: "run1:3", Body: string(good),
+	}))
+
+	select {
+	case ev := <-got:
+		assert.Equal(t, "boss.slain", ev.Event, "the handler must only ever see the well-formed event")
+	case <-time.After(2 * time.Second):
+		t.Fatal("a poison event wedged the durable stream")
+	}
+
+	assert.Len(t, js.Poisoned("world-dir"), 2, "both unapplyable events are dropped as poison, and recorded")
+	assert.Empty(t, js.NakDelays("world-dir"), "poison must spend no transient retry budget")
+	assert.Empty(t, js.Parked("world-dir"), "poison is dropped, never parked")
+}

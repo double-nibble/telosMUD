@@ -8,6 +8,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/double-nibble/telosmud/internal/metrics"
 )
 
 // jetstream_nats.go is the PRODUCTION durable-tell transport: a thin wrapper over a NATS JetStream
@@ -61,13 +63,36 @@ var (
 	jsAckWait     = 30 * time.Second
 )
 
+// maxAttemptClamp bounds the broker's uint64 NumDelivered before it is narrowed to an int (#266). The real
+// counter never approaches this — the consumer parks at DefaultMaxDeliver — so the clamp exists purely to
+// make the narrowing provably overflow-free.
+const maxAttemptClamp uint64 = 1 << 20
+
 // NATSJetStream is the JetStream-backed durable transport. It owns the JetStream context (over a NATS
 // connection it does NOT own — the connection is shared with the transient bus in production, so Close
 // here only stops the consumers, it does not close the connection).
 type NATSJetStream struct {
 	js     jetstream.JetStream
 	stream jetstream.Stream
+	name   string // the stream name (COMMS_TELL | WORLD_EVENTS): the low-cardinality metric label
 	log    *slog.Logger
+}
+
+// durableConsumerConfig builds the per-consumer JetStream config. Extracted from Consume so the production
+// values — above all MaxAckPending=1, which is load-bearing rather than tuning (#266) — are pinned by a
+// HERMETIC test rather than only by the broker-gated tier.
+func durableConsumerConfig(subj, consumerID string) jetstream.ConsumerConfig {
+	return jetstream.ConsumerConfig{
+		Durable:       consumerID,
+		Name:          consumerID,
+		FilterSubject: subj,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		MaxDeliver:    DefaultMaxDeliver,
+		AckWait:       jsAckWait,
+		BackOff:       consumerBackoff(),
+		MaxAckPending: 1,
+	}
 }
 
 // NewJetStream dials/uses url (its own connection for now — a later wiring may share the transient
@@ -122,7 +147,12 @@ func newJetStreamFromConn(nc *nats.Conn, streamName, subjectFilter string) (*NAT
 	if err != nil {
 		return nil, fmt.Errorf("commbus: ensure stream %s: %w", streamName, err)
 	}
-	return &NATSJetStream{js: js, stream: stream, log: slog.With("component", "commbus", "transport", "jetstream")}, nil
+	return &NATSJetStream{
+		js:     js,
+		stream: stream,
+		name:   streamName,
+		log:    slog.With("component", "commbus", "transport", "jetstream", "stream", streamName),
+	}, nil
 }
 
 // PublishDurable publishes msg on subj with the Nats-Msg-Id header set to msg.IdempotencyKey, so the
@@ -149,21 +179,22 @@ func (b *NATSJetStream) PublishDurable(ctx context.Context, subj string, msg Mes
 
 // Consume runs a per-player durable consumer filtered to subj (the player's dtell.<id> subject).
 // consumerID is the durable name (stable per player so a restart resumes from the last ack). handler
-// returns ack=true (Ack) or ack=false (Nak — redelivered IMMEDIATELY up to MaxDeliver, then parked; no
-// BackOff is set, and AckWait covers only a hung/lost-ack handler, not an explicit NAK — see the never-lost
-// caveat on jetstream.go's Consume). The consumer delivers the backlog (DeliverAll) then live, in stream order.
-func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, bool) bool) (Consumer, error) {
+// returns an AckDecision: AckDelivered acks; DropPoison acks + logs (an undeliverable message never
+// spends the retry budget); RetryTransient NAKs it WITH the NakBackoff delay (#266 — a bare Nak()
+// redelivers immediately, which burned the whole budget inside a transient window and parked the tell).
+//
+// MaxAckPending=1 is load-bearing, not tuning: a delayed NAK must not let a successor be delivered and
+// advance the world's per-sender delivered-cursor past the pending message, which would suppress it as a
+// duplicate on redelivery and lose it (see jetstream.go's ordering note). BackOff paces the OTHER
+// redelivery path (an AckWait expiry from a hung/lost-ack handler) on the same schedule; NATS applies it
+// there but NOT to an explicit NAK, which is why NakWithDelay is required below. len(BackOff) <=
+// MaxDeliver is a NATS constraint; past the schedule's end the last entry repeats.
+//
+// The consumer delivers the backlog (DeliverAll) then live, in stream order.
+func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, bool) AckDecision) (Consumer, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
-	cons, err := b.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:       consumerID,
-		Name:          consumerID,
-		FilterSubject: subj,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		MaxDeliver:    DefaultMaxDeliver,
-		AckWait:       jsAckWait,
-	})
+	cons, err := b.stream.CreateOrUpdateConsumer(ctx, durableConsumerConfig(subj, consumerID))
 	if err != nil {
 		return nil, fmt.Errorf("commbus: ensure consumer %s: %w", consumerID, err)
 	}
@@ -178,20 +209,45 @@ func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, b
 	cc, err := cons.Consume(func(m jetstream.Msg) {
 		msg, err := unmarshalMessage(m.Data())
 		if err != nil {
-			b.log.Debug("dropping malformed durable tell", "subject", m.Subject(), "err", err)
-			_ = m.Ack() // a malformed message is poison; ack it so it doesn't redeliver forever
+			b.log.Warn("dropping malformed durable message (poison)", "subject", m.Subject(), "err", err)
+			metrics.DurablePoisoned(context.Background(), b.name)
+			_ = m.Ack() // poison: ack it so it doesn't redeliver forever, and it spends no retry budget
 			return
 		}
 		msg.Subject = m.Subject()
 		backlog := false
+		attempt := 1
 		if meta, merr := m.Metadata(); merr == nil {
 			backlog = meta.Sequence.Stream <= backlogEdge
+			// Clamp before narrowing. NumDelivered is a small positive counter (the broker parks at
+			// MaxDeliver), and the schedule holds at its last entry past the end, so a larger count carries
+			// no information — the clamp only makes the narrowing provably safe.
+			nd := meta.NumDelivered
+			if nd > maxAttemptClamp {
+				nd = maxAttemptClamp
+			}
+			attempt = int(nd) //nolint:gosec // clamped to maxAttemptClamp (< MaxInt32) on the line above
 		}
-		if handler(msg, backlog) {
+		switch handler(msg, backlog) {
+		case AckDelivered:
 			_ = m.Ack()
-			return
+		case DropPoison:
+			b.log.Warn("dropping undeliverable durable message (poison)",
+				"subject", m.Subject(), "author", msg.AuthorID, "seq", msg.Seq)
+			metrics.DurablePoisoned(context.Background(), b.name)
+			_ = m.Ack()
+		default: // RetryTransient
+			// The final attempt failing means the broker will PARK this message — permanent loss, since
+			// the durable consumer is never deleted and so never replays it. That is an incident, not a
+			// routine drop: surface it loudly rather than losing the tell in silence.
+			if attempt >= DefaultMaxDeliver {
+				b.log.Error("durable message PARKED after exhausting the redelivery budget — it is LOST",
+					"subject", m.Subject(), "author", msg.AuthorID, "seq", msg.Seq,
+					"attempts", attempt, "window", totalNakWindow())
+				metrics.DurableParked(context.Background(), b.name)
+			}
+			_ = m.NakWithDelay(nakBackoff(attempt))
 		}
-		_ = m.Nak()
 	})
 	if err != nil {
 		return nil, fmt.Errorf("commbus: consume %s: %w", consumerID, err)

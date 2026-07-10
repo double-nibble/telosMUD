@@ -232,9 +232,9 @@ func (c *commSource) startConsumer(playerID string, route func() *Zone) {
 	// the start — the at-least-once delivery + the cursor suppression give steady-state exactly-once,
 	// never-lost rendering). The handler posts to the
 	// player's current zone and blocks for the ack so the JetStream ack reflects the actual render.
-	cons, err := c.js.Consume(subj, playerID, func(msg commbus.Message, backlog bool) bool {
-		ack := routeTellDeliver(route, playerID, msg, backlog)
-		if ack && pace > 0 {
+	cons, err := c.js.Consume(subj, playerID, func(msg commbus.Message, backlog bool) commbus.AckDecision {
+		decision := routeTellDeliver(route, playerID, msg, backlog)
+		if decision == commbus.AckDelivered && pace > 0 {
 			// PACE the drain (P8-A5, backlog pacing): cap the rate at which tells reach a freshly-joined
 			// gate so a long OFFLINE backlog drains as a steady "while you were away…" stream, not a
 			// single flood. The cap is small (loginDrainPace) so a live tell to an online player is
@@ -242,7 +242,7 @@ func (c *commSource) startConsumer(playerID string, route func() *Zone) {
 			// on its own backoff). Runs on the consumer goroutine — never a zone goroutine.
 			time.Sleep(pace)
 		}
-		return ack
+		return decision
 	})
 	if err != nil {
 		// Never fatal: tells degrade to undelivered (they remain durable in the stream for a later
@@ -306,26 +306,33 @@ func (z *Zone) dir() Locator {
 }
 
 // routeTellDeliver posts one drained durable tell to the resident's CURRENT zone (resolved via the
-// route func, which Loads the session's currentZone atomic pointer) and blocks for the ack result
-// (handled/suppressed => ack; not-our-resident or emit-failed => nak). It runs on a bus consumer
-// goroutine (NOT a zone goroutine), so it reaches the zone only via the inbox — single-writer
-// preserved. route returns nil for a session with no currentZone (a bare test); we fall back to NAK so
-// the message stays durable. The authoritative resident re-check is on the zone goroutine
-// (deliverDrainedTell NAKs if the player is not actually in z.players right now).
-func routeTellDeliver(route func() *Zone, playerID string, msg commbus.Message, backlog bool) bool {
+// route func, which Loads the session's currentZone atomic pointer) and blocks for the ack result. It
+// runs on a bus consumer goroutine (NOT a zone goroutine), so it reaches the zone only via the inbox —
+// single-writer preserved. The authoritative resident re-check is on the zone goroutine
+// (deliverDrainedTell reports failure if the player is not actually in z.players right now).
+//
+// Every failure the world can produce here is TRANSIENT (#266) — an unknown current zone (mid cross-shard
+// handoff, or a bare test session), a not-our-resident re-check, an emit blip on a momentarily closed bus,
+// or a zone too busy/shutting-down to reply within tellAckTimeout. All of them clear on their own, so each
+// maps to RetryTransient and redelivers on the backoff schedule rather than being retried instantly and
+// parked. There is NO world-side poison today: a malformed message never reaches here (the commbus
+// unmarshal drops it), so DropPoison is deliberately unused on this path.
+func routeTellDeliver(route func() *Zone, playerID string, msg commbus.Message, backlog bool) commbus.AckDecision {
 	z := route()
 	if z == nil {
-		return false // unknown current zone: NAK -> redeliver (bounded); the message stays durable
+		return commbus.RetryTransient // unknown current zone: redeliver on the schedule; the message stays durable
 	}
 	ack := make(chan bool, 1)
 	z.post(tellDeliverMsg{target: playerID, msg: msg, backlog: backlog, ack: ack})
 	select {
 	case ok := <-ack:
-		return ok
+		if ok {
+			return commbus.AckDelivered
+		}
+		return commbus.RetryTransient // not our resident right now, or the gate emit blipped
 	case <-time.After(tellAckTimeout):
-		// The zone did not reply in time (shutting down / overloaded): NAK so the durable message
-		// redelivers rather than being lost. Bounded by maxDeliver.
-		return false
+		// The zone did not reply in time (shutting down / overloaded): redeliver rather than lose it.
+		return commbus.RetryTransient
 	}
 }
 
