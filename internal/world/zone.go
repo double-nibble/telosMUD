@@ -1639,6 +1639,19 @@ func (z *Zone) freezeExpire(id string, gen uint64) {
 	}
 	s.send(textFrame("The way is barred. (handoff timed out)"))
 	z.sendPrompt(s)
+	z.linkDeathAfterThaw(id, s)
+}
+
+// linkDeathAfterThaw drops a thawed session straight into link-death when its stream died while it was frozen
+// (#274). detach() declined to remove it — the handoff owned its fate — and the watchdog had already closed
+// the stream, so nothing else will ever notice the loss. Without this the session thaws live, un-detached and
+// unreaped, and becomes a permanent in-world ghost.
+func (z *Zone) linkDeathAfterThaw(id string, s *session) {
+	if s == nil || !s.streamGone {
+		return
+	}
+	z.log.Info("thawed player's stream had already died; entering link-death", "player", id)
+	z.enterLinkDeath(id, s)
 }
 
 // detach handles a player's stream dropping. out identifies which stream, so a stale
@@ -1666,7 +1679,13 @@ func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
 	if s.frozen {
 		// Mid-handoff: the gate is re-dialing the destination shard. Do NOT remove the
 		// player — the handoff owns its fate (commit -> discard, abort -> thaw).
-		z.log.Debug("detach ignored: player frozen (handoff in progress)", "player", id)
+		//
+		// But REMEMBER that the stream is gone (#274). This is the only link-loss signal the world will ever
+		// get for it: the watchdog already closed the stream, so no future Recv error posts another detach.
+		// Without this, an aborted handoff thaws into a live session with a dead stream and no reap timer —
+		// a permanent ghost. freezeExpire/handoffFailed consult it.
+		s.streamGone = true
+		z.log.Debug("detach ignored: player frozen (handoff in progress); stream loss recorded", "player", id)
 		return
 	}
 	if s.quitting {
@@ -1686,6 +1705,15 @@ func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
 		z.clearPlacement(s)
 		z.leave(id)
 		return
+	}
+	z.enterLinkDeath(id, s)
+}
+
+// enterLinkDeath marks a session link-dead, flushes it durably, and schedules its reap. Split out of detach
+// so the handoff THAW paths can reach it when the stream died while the player was frozen (#274).
+func (z *Zone) enterLinkDeath(id string, s *session) {
+	if s.detached {
+		return // already link-dead; do not schedule a second reap
 	}
 	s.detached = true
 	gen := s.attachGen
@@ -1817,6 +1845,7 @@ func (z *Zone) handoffFailed(v handoffFailMsg) {
 	z.log.Debug("handoff failed, thawing player", "player", v.id, "reason", v.reason)
 	s.send(textFrame("The way is barred. (" + v.reason + ")"))
 	z.sendPrompt(s)
+	z.linkDeathAfterThaw(v.id, s)
 }
 
 // --- Durability ladder: cadence + reconcile (docs/PHASE4-PLAN.md §4) -------------------

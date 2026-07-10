@@ -148,6 +148,20 @@ type session struct {
 	detached  bool
 	attachGen uint64
 
+	// streamGone records that this session's Play stream is already CLOSED, even though the session was not
+	// removed because it was mid-handoff (#274).
+	//
+	// It exists because the writer-stall watchdog closes a wedged stream itself. detach() then declines to
+	// remove a FROZEN session — correctly, the handoff owns its fate — but that swallows the world's ONLY
+	// link-loss signal: the stream is gone, so no future Recv error will ever post another detach. If the
+	// handoff then ABORTS, the thaw paths would restore a live, un-frozen, un-detached session with no reap
+	// timer and no stream: a permanent in-world ghost, visible in `who` and the room, receiving nothing,
+	// unable to act, never reclaimed. The thaw paths consult this and enter link-death instead.
+	//
+	// Before #274 this could not happen: the world never closed the stream first, so a wedged gate's eventual
+	// close drove a normal (non-frozen) detach.
+	streamGone bool
+
 	// quitting marks a clean, player-initiated disconnect ("quit"), so the stream
 	// dropping removes the player immediately rather than entering the link-death grace.
 	quitting bool
@@ -313,3 +327,25 @@ func (s *session) send(f *playv1.ServerFrame) {
 		s.windowSends, s.windowDrops = 0, 0
 	}
 }
+
+// streamSendStallTimeout bounds how long ONE outbound frame may sit blocked in gRPC's stream.Send before the
+// world tears the Play stream down itself (#274).
+//
+// A blocked Send means the peer's HTTP/2 flow-control window is exhausted and it is not reading. gRPC server
+// keepalive already reclaims a gate whose TRANSPORT is dead, but a gate whose transport acks our PINGs while
+// its application has stopped draining the stream is invisible to it — the HTTP/2 stack answers PINGs
+// independently of application flow control. Without this bound, that stream's writer, reader, session,
+// entity ownership, and session-lock renewer leak until the gate's own write-deadline fires, which is
+// precisely the dependency on gate correctness that keepalive was added to remove.
+//
+// Sized to sit just past the keepalive budget (30s ping + 10s ack), so transport death is still reclaimed by
+// keepalive — the cheaper, more precise signal — and this only fires for the application-level stall it is
+// for. A player whose stream is torn down here enters link-death and reconnects, exactly as if the gate had
+// closed the socket.
+var streamSendStallTimeout = 45 * time.Second
+
+// streamStallCheckInterval is how often the watchdog samples the in-flight Send. Coarse on purpose: this is a
+// last-resort reclaim, not a latency measurement, and it costs one timer per live stream.
+//
+// Both are vars, not consts, so a test can shrink them; nothing else writes them.
+var streamStallCheckInterval = 5 * time.Second

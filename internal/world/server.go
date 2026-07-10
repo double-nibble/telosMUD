@@ -9,10 +9,12 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/assertion"
+	"github.com/double-nibble/telosmud/internal/metrics"
 	"github.com/double-nibble/telosmud/internal/sessionlock"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
@@ -203,6 +205,25 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// out is this stream's outbound channel; the zone binds it to the character's
 	// player. The writer goroutine below is the ONLY caller of stream.Send.
 	out := make(chan *playv1.ServerFrame, sessionOutBuffer)
+
+	// #274: a WRITER-STALL watchdog. gRPC keepalive (cmd/telos-world) reclaims TRANSPORT death — a gate that
+	// crashed, partitioned, or wedged its HTTP/2 stack stops acking PINGs and the connection closes. It
+	// structurally cannot see the other failure: a gate whose transport happily acks our PINGs (the HTTP/2
+	// stack answers them independently of application flow control) while its APPLICATION has stopped reading
+	// the Play stream. The stream's flow-control window then exhausts, the stream.Send below blocks with no
+	// deadline, `out` fills, and session.send starts dropping. The zone stays healthy — that drop is why it
+	// never blocks — but this stream's writer goroutine, its reader goroutine, the session, the entity's zone
+	// ownership, and the session-lock renewer all leak until the GATE's own write-deadline closes its side.
+	// Which is exactly the dependency on gate correctness that #46's keepalive set out to remove.
+	//
+	// sendStarted is nil when no Send is in flight, else the instant the current one began. The watchdog
+	// samples it; a Send blocked past streamSendStallTimeout means the peer is not reading, and we tear the
+	// stream down ourselves.
+	//
+	// A *time.Time, not a UnixNano int64: round-tripping through UnixNano strips Go's monotonic reading, so
+	// the bound would ride the wall clock and an NTP step could trip or mask it.
+	var sendStarted atomic.Pointer[time.Time]
+	stalled := make(chan struct{})
 	go func() {
 		for {
 			select {
@@ -210,13 +231,31 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 				s.log.Debug("stream writer stop (ctx done)", "character", character)
 				return
 			case f := <-out:
-				if err := stream.Send(f); err != nil {
+				now := time.Now()
+				sendStarted.Store(&now)
+				err := stream.Send(f)
+				sendStarted.Store(nil)
+				if err != nil {
 					s.log.Debug("stream writer stop (send error)", "character", character, "err", err)
 					return
 				}
 			}
 		}
 	}()
+	// The peer address labels the metric and the log. A wedged gate stalls EVERY player it serves — the
+	// HTTP/2 connection-level window is shared across their streams — so an unlabeled counter would show a
+	// burst of increments with nothing to attribute them to. `gate` is the actionable dimension (which gate
+	// to restart) and has fleet-bounded cardinality; character and zone would not.
+	gateAddr := "unknown"
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		gateAddr = p.Addr.String()
+	}
+	go watchSendStall(ctx, &sendStarted, stalled, streamSendStallTimeout, streamStallCheckInterval, func(blocked time.Duration) {
+		s.log.Warn("play stream reclaimed: a frame has been blocked in Send past the stall bound; "+
+			"the gate is answering keepalives but is not reading this stream",
+			"character", character, "gate", gateAddr, "blocked", blocked)
+		metrics.StreamStalled(context.Background(), gateAddr)
+	})
 
 	// Hand the stream to the chosen zone: it creates a new player, re-binds an existing
 	// one (a re-dial within the link-death window), or activates a pending player when
@@ -261,12 +300,54 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// Reader loop: translate client frames into zone inbox messages, posting each to
 	// the player's CURRENT zone (which can change as they walk between this shard's
 	// zones). detach/leave likewise go to the current zone.
+	// Recv runs on its own goroutine so this loop can also select on the writer-stall signal (#274). A bare
+	// `stream.Recv()` here is uninterruptible: when the writer is wedged, nothing would ever return the
+	// handler, and only the handler returning closes the stream and unblocks that Send. The goroutine exits
+	// when Recv errors, or when the stream context is cancelled — which happens the moment we return.
+	type recvResult struct {
+		f   *playv1.ClientFrame
+		err error
+	}
+	frames := make(chan recvResult, 1)
+	go func() {
+		for {
+			f, err := stream.Recv()
+			select {
+			case frames <- recvResult{f: f, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	cleanQuit := false
+	reclaimed := false // the watchdog tore this stream down; the peer gets a distinct status, not a clean EOF
 	for {
-		f, err := stream.Recv()
-		if err != nil {
-			s.log.Debug("stream recv ended", "character", character, "err", err)
-			break // EOF or transport error
+		var f *playv1.ClientFrame
+		select {
+		case <-ctx.Done():
+			// The stream ended (client cancelled, transport died, server stopping). This case is REQUIRED, not
+			// belt-and-braces: the Recv goroutine races us on the same ctx, and when it wins it returns without
+			// ever delivering its error to `frames`. Without this case the handler would block here forever and
+			// never post the detach below — the player would stay resident with a dead stream.
+			s.log.Debug("stream ctx done", "character", character, "err", ctx.Err())
+			goto done
+		case <-stalled:
+			// The peer is not reading. Returning closes the stream, which unblocks the writer's Send and ends
+			// the Recv goroutine. The player enters link-death below and reconnects, exactly as they would if
+			// the gate had closed the socket itself.
+			s.log.Info("stream torn down by the writer-stall watchdog", "character", character, "gate", gateAddr)
+			reclaimed = true
+			goto done
+		case r := <-frames:
+			if r.err != nil {
+				s.log.Debug("stream recv ended", "character", character, "err", r.err)
+				goto done // EOF or transport error
+			}
+			f = r.f
 		}
 		switch pl := f.Payload.(type) {
 		case *playv1.ClientFrame_Input:
@@ -310,6 +391,11 @@ done:
 		currentZone.Load().post(detachMsg{id: character, out: out})
 	}
 	s.log.Debug("stream closing", "character", character, "clean", cleanQuit)
+	if reclaimed {
+		// A distinct status, not a clean EOF: the gate can tell "the world reclaimed me because I stopped
+		// reading" from "the world shut down cleanly", and log accordingly instead of guessing (#274).
+		return status.Error(codes.Aborted, "play stream reclaimed: the peer stopped reading")
+	}
 	return nil
 }
 
@@ -337,6 +423,43 @@ func (s *playServer) runSessionLockRenewer(ctx context.Context, character, token
 			if !owned {
 				s.log.Debug("session lock lost to a newer login; kicking this connection", "character", character)
 				displacedKick(out, 0)
+				return
+			}
+		}
+	}
+}
+
+// watchSendStall closes `stalled` when a single stream.Send has been in flight longer than
+// streamSendStallTimeout, having first called onStall (#274).
+//
+// started carries the UnixNano at which the current Send began, or 0 when none is in flight — written by the
+// writer goroutine, sampled here. A Send blocked that long means the peer's HTTP/2 flow-control window is
+// exhausted and it is not reading. That is the failure gRPC keepalive structurally cannot see: the peer's
+// transport keeps acking PINGs independently of application flow control, so the world would otherwise wait
+// for the GATE's write-deadline to reclaim the stream — the dependency on gate correctness that keepalive was
+// added to remove.
+//
+// timeout and interval are parameters rather than reads of the package vars so the watchdog is testable
+// without mutating shared state under a running goroutine.
+//
+// It returns on ctx.Done (the stream ended for any other reason), and closes `stalled` at most once.
+func watchSendStall(ctx context.Context, started *atomic.Pointer[time.Time], stalled chan struct{}, timeout, interval time.Duration, onStall func(time.Duration)) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			begun := started.Load()
+			if begun == nil {
+				continue // no Send in flight; the peer is keeping up
+			}
+			if blocked := time.Since(*begun); blocked >= timeout {
+				if onStall != nil {
+					onStall(blocked)
+				}
+				close(stalled)
 				return
 			}
 		}

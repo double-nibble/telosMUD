@@ -20,6 +20,7 @@ func TestInstrumentsRecord(t *testing.T) {
 	RecordTickLag(ctx, "midgaard", 12.5)
 	SetOccupancy(ctx, "midgaard", 7)
 	FrameDropped(ctx)
+	StreamStalled(ctx, "10.0.0.7:5001")
 	ConnOpened(ctx)
 	ConnOpened(ctx)
 	ConnClosed(ctx)
@@ -42,6 +43,7 @@ func TestInstrumentsRecord(t *testing.T) {
 		"telos.zone.tick_lag_ms",
 		"telos.zone.occupancy",
 		"telos.gate.frames_dropped_total",
+		"telos.world.stream_stalled_total",
 		"telos.gate.connections",
 		"telos.bus.deliver_lag_ms",
 		"telos.bus.catchup_events_total",

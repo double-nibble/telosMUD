@@ -42,9 +42,11 @@ import (
 
 // gRPC server keepalive (#46): the world PINGs an idle gate connection every keepaliveTime and closes it if
 // there is no ack within keepaliveTimeout, reclaiming a dead/wedged gate's streams without depending on the
-// gate's own telnet write-deadline. This covers TRANSPORT death (crash/partition/wedged HTTP/2) — it does NOT
-// cover a gate that ACKs pings but stops draining the stream (that residual leak is bounded by part-1 drops +
-// the gate write-deadline; an app-level stream.Send bound is the follow-up, #274). keepaliveMinTime is the
+// gate's own telnet write-deadline. This covers TRANSPORT death (crash/partition/wedged HTTP/2) — it cannot
+// cover a gate that ACKs pings but stops draining the stream, because the peer's HTTP/2 stack answers PINGs
+// independently of application flow control. THAT case is now reclaimed by the world's own writer-stall
+// watchdog (#274, internal/world/server.go), which tears the stream down when one frame sits blocked in
+// stream.Send past its bound. keepaliveMinTime is the
 // enforcement floor: it GOAWAYs a CLIENT that PINGs faster than this. No client (gate pool / handoff dialer)
 // sets client keepalive today, so it never triggers — but this 10s floor is a CONSTRAINT any future gate/peer
 // client keepalive must respect (or the world will GOAWAY it).
