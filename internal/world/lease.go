@@ -94,6 +94,14 @@ func (s *Shard) leaseParams() (ttl, renew time.Duration) {
 // stored in leaseStop, so a graceful handoff can stop THIS zone's renewal without touching the others or
 // the shard. A no-op when leasing is off. Called from Run (boot zones) and HostZone/adopt (runtime zones).
 func (s *Shard) startZoneRenewal(parent context.Context, zoneID string) {
+	s.startZoneRenewalAdopting(parent, zoneID, false)
+}
+
+// startZoneRenewalAdopting is startZoneRenewal with the adopting flag. adopted=true marks a zone this shard
+// built at RUNTIME for a cross-shard handoff whose HandoverZone flip has not landed yet — so if the flip
+// never comes, the renewer UN-ADOPTS the zone rather than merely stopping (#327). A boot zone is never
+// adopting: it already holds its claim, and a boot zone that loses its lease must fence, not un-adopt itself.
+func (s *Shard) startZoneRenewalAdopting(parent context.Context, zoneID string, adopted bool) {
 	if s.leaser == nil {
 		return
 	}
@@ -113,7 +121,7 @@ func (s *Shard) startZoneRenewal(parent context.Context, zoneID string) {
 	s.leaseStop[zoneID] = cancel
 	s.mu.Unlock()
 	//nolint:gosec // G118: ctx is a child of the shard's lifetime ctx (cancelled on shutdown/handoff) — exactly what this lease goroutine should follow.
-	go s.renewZoneLease(ctx, zoneID)
+	go s.renewZoneLease(ctx, zoneID, adopted)
 }
 
 // renewZoneLease keeps this shard's claim on zoneID alive until its ctx is cancelled (shutdown or a
@@ -121,12 +129,12 @@ func (s *Shard) startZoneRenewal(parent context.Context, zoneID string) {
 // the shard via onFence, mirroring the pre-16.4 cmd/telos-world behavior. A zone we deliberately handed off
 // (handedOff) never fences: its renewal returns silently and does NOT release (the new owner holds it).
 // adoptConfirmDeadline bounds how long a freshly-adopted zone's renewal may sit in the pre-confirm
-// "adopting" state before giving up (#288). Sized at the handoff's own pendingTTL: a legitimate adoption's
-// HandoverZone flip follows its AdoptZone by a round trip, so this never bites it. A var so a test can shrink
-// it; nothing else writes it.
+// "adopting" state before giving up (#288) and UN-ADOPTING the zone (#327). Sized at the handoff's own
+// pendingTTL: a legitimate adoption's HandoverZone flip follows its AdoptZone by a round trip, so this never
+// bites it. A var so a test can shrink it; nothing else writes it.
 var adoptConfirmDeadline = pendingTTL
 
-func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
+func (s *Shard) renewZoneLease(ctx context.Context, zoneID string, adopted bool) {
 	ttl, every := s.leaseParams()
 	t := time.NewTicker(every)
 	defer t.Stop()
@@ -186,7 +194,17 @@ func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
 						// The flip never came. Stop renewing rather than idle here forever waiting to snatch
 						// the lease the moment its rightful owner blinks.
 						slog.Warn("adoption never confirmed; abandoning this zone's lease renewal",
-							"zone", zoneID, "shard", s.shardID, "waited", waited)
+							"zone", zoneID, "shard", s.shardID, "waited", waited, "adopted", adopted)
+						// For a RUNTIME adoption, also tear the zone back down (#327): we built it for a handover
+						// that never landed, nothing in the directory points here, and nothing else will ever
+						// clean it up. This is safe precisely because we are unconfirmed — we never held the
+						// lease, so there is nothing to reclaim. A boot zone (adopted=false) is NOT un-adopted:
+						// it holds a real claim, and if it genuinely lost its lease that is a fence condition,
+						// not a zone to delete. unadoptZone retires this very renewal registration first, which
+						// is safe here: we are returning.
+						if adopted {
+							s.unadoptZone(zoneID, "adoption never confirmed within the deadline")
+						}
 						return
 					}
 					// Still adopting: the draining source owns the lease until its HandoverZone flip lands.
@@ -267,6 +285,20 @@ func (s *Shard) clearZoneHandedOff(zoneID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.handedOff, zoneID)
+}
+
+// retireZoneRenewal drops a zone's renewal registration and releases its context, WITHOUT the caller having to
+// be a different goroutine than the renewer. Called by renewZoneLease itself when it abandons an unconfirmed
+// adoption: from that instant the shard is no longer renewing the zone, which is what lets UnhostZone accept
+// it (a zone we are still renewing is one we are about to reclaim, not one we may drop).
+func (s *Shard) retireZoneRenewal(zoneID string) {
+	s.mu.Lock()
+	cancel := s.leaseStop[zoneID]
+	delete(s.leaseStop, zoneID)
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // handoverZoneTo migrates zoneID's ownership from this (draining) shard to the target peer, so a subsequent
