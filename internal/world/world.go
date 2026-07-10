@@ -633,6 +633,10 @@ func (s *Shard) HostZone(ctx context.Context, id string) (*Zone, error) {
 			// an HONEST adoption whose flip never lands because the source died mid-drain (#327).
 			s.clearZoneHandedOff(id)
 			s.startZoneRenewal(runCtx, id)
+			// Defensive (#269): a re-adopted zone's actor never stopped (a retained zone keeps serving), so a
+			// coalescing flag armed before the handoff was already drained and disarmed — a no-op today. Reset
+			// it anyway so the flag can never latch if zone-teardown ordering ever changes.
+			z.commsRepublishArmed.Store(false)
 			slog.Info("re-adopted a previously handed-off zone; lease renewal restarted", "zone", id)
 		}
 		return z, nil // already hosting it — idempotent

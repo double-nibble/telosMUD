@@ -81,6 +81,14 @@ type Zone struct {
 	// pop == 0 is NOT "this zone is empty" — see quiescent().
 	stashed atomic.Int64
 
+	// commsRepublishArmed coalesces a burst of channel_def reloads into ONE republish per zone (#269).
+	// republishAllComms recomputes EVERY player's FULL hear-set and is ref-INDEPENDENT, so K channel edits
+	// produce K identical republishes where one suffices. The off-goroutine reloader CAS-arms this before
+	// posting a republishCommsMsg and skips the post when it is already armed; the zone-goroutine handler
+	// disarms it before republishing, so an edit arriving mid-republish re-arms and converges. Off-goroutine
+	// reader/writer (the content-bus subscriber) + zone-goroutine writer, hence atomic.
+	commsRepublishArmed atomic.Bool
+
 	// draining marks this zone as being bulk-drained (a graceful shard drain OR a #42 single-zone rebalance
 	// — both funnel through drainZone). It gates the EAGER reap of a handed-off orphan on redirect (so the
 	// zone empties promptly instead of waiting out freezeTTL), scoped to the ZONE rather than the shard-wide
@@ -832,6 +840,19 @@ func (z *Zone) handle(m msg) {
 		// their next toggle/handoff/relog (#75). Unconditional over the current player set: the hear-set can
 		// move in BOTH directions (a gate added → drop; a gate removed → add), so the anyChannelGatesHearing
 		// short-circuit that guards the per-entity access-change path would MISS the loosened case here.
+		//
+		// Disarm the coalescing flag (#269) BEFORE recomputing: a channel edit that arrives during the
+		// republish re-arms and posts a fresh message, so the final state always reflects the latest edit.
+		// Disarming after would let an edit whose registry swap lands between our read and our disarm be
+		// swallowed (it would find the flag still armed, skip its post, and never be republished) — a stale,
+		// too-permissive hear-set, the #75 security miss.
+		//
+		// This correctness rests on the channel registry being an SEQUENTIALLY-CONSISTENT atomic publish
+		// (defs.go's defRegistry: copy-then-atomic-swap). The disarm Store and the registry Load share Go's
+		// single total order over atomics, so a coalesced edit's swap (which precedes its failed CAS, which
+		// precedes this disarm) always precedes republishAllComms's registry read. If the registry is ever
+		// refactored to a mutex-guarded structure without an atomic swap, re-verify this fence.
+		z.commsRepublishArmed.Store(false)
 		z.republishAllComms(v.ref)
 	case reloadDoneMsg:
 		// Deliver a `reload` fan-out result to the builder if they are still in this zone (single-writer

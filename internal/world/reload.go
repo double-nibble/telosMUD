@@ -368,11 +368,28 @@ func (r *reloader) reloadChannel(inv contentbus.Invalidation) {
 // hear-set PERMANENTLY stale (it is pushed, not pulled) and RE-OPENS the security gap, so a drop is handed to
 // bounded-retry (retryRepublishComms), the same posture the zone-shape reconcile uses (#191). Idempotent +
 // level-triggered, so the retry (or a re-run) always converges to the current state.
+//
+// COALESCED (#269): republishAllComms recomputes every player's FULL hear-set and is ref-INDEPENDENT, so a
+// pack edit touching K channel_defs emits K serial KindChannel invalidations → K identical republishes per
+// zone, where one suffices. commsRepublishArmed collapses them: a zone with a republish already queued (or in
+// retry) is skipped, so K invalidations cost ONE republish per zone.
+//
+// Convergence is safe because the SINGLE surviving message is processed LATER, on the zone goroutine, and
+// reads the CURRENT channel registry — which by then holds every coalesced edit's swap. The flag CAS orders
+// it: for a later edit to be skipped, its reg.reload must precede its CAS(fail), which precedes the zone's
+// disarm, which precedes the zone's registry read. So the republish reflects all coalesced edits, not just the
+// first. The zone handler disarms the flag before recomputing, so an edit landing mid-republish re-arms and
+// gets its own pass.
+// This also collapses the retry fan-out from K:Z down to 1:Z, which is what keeps a KindChannel drop-storm
+// from starving the shared reconcile-retry budget (the caveat retryRepublishComms records).
 func (r *reloader) republishCommsToZones(ref string) {
 	if r == nil || r.shard == nil {
 		return
 	}
 	for _, z := range r.shard.zonesList() { // mu-guarded: safe against a runtime HostZone (16.4a)
+		if !z.commsRepublishArmed.CompareAndSwap(false, true) {
+			continue // a republish is already queued for this zone; ref-independent, so it covers this edit too
+		}
 		if !z.postOrDrop(republishCommsMsg{ref: ref}) {
 			r.retryRepublishComms(z, ref)
 		}
@@ -464,15 +481,22 @@ func (r *reloader) retryReconcile(z *Zone, msg reconcileZoneMsg) {
 // toggle/handoff/relog) — a strict Pareto improvement, never worse than before. Two caveats the distsys
 // review recorded: (a) the operator "re-run the reload" remedy is weaker than reconcile's — re-applying an
 // IDENTICAL edit may emit no KindChannel invalidation, so it can be a no-op; a genuinely stuck hear-set clears
-// only on the player's next toggle/handoff/relog. (b) Unlike reconcile (which retries at most ONE zone per
-// invalidation), a channel reload fans to EVERY hosted zone, so a KindChannel drop-storm consumes the SHARED
-// maxReconcileRetryGoroutines budget 1:Z and can starve concurrent reconcile retries (and vice versa) — the
-// coalescing follow-up #269 bounds this. Past the cap the drop is abandoned with a loud warn. Self-terminates on
-// success, exhaustion, or reloader stop (retryDone).
+// only on the player's next toggle/handoff/relog. (b) A channel reload fans to every hosted zone, but the
+// coalescing flag (#269) collapses a K-channel edit to ONE republish (and so at most ONE retry) per zone, so
+// a KindChannel burst now consumes the shared maxReconcileRetryGoroutines budget 1:Z rather than K:Z — the
+// starvation window is bounded to the zone count. Past the cap the drop is abandoned with a loud warn.
+// Self-terminates on success, exhaustion, or reloader stop (retryDone).
 func (r *reloader) retryRepublishComms(z *Zone, ref string) {
+	// The coalescing flag (#269) stays ARMED across the retry: it means "a republish is queued OR being
+	// retried for this zone", so a concurrent channel edit correctly coalesces onto this in-flight one rather
+	// than racing a second delivery. Whoever stops carrying the republish must disarm it — the zone handler on
+	// a successful delivery, or this goroutine if it abandons the drop — or the flag would latch and suppress
+	// every future republish to this zone.
 	if r.retryInFlight.Add(1) > maxReconcileRetryGoroutines {
 		r.retryInFlight.Add(-1)
-		r.log.Warn("hot-reload comms republish dropped (retry budget exhausted); a channel's hear-set stays stale until re-run",
+		z.commsRepublishArmed.Store(false)
+		r.log.Warn("hot-reload comms republish dropped (retry budget exhausted); this zone's comms hear-sets "+
+			"stay stale until re-run (a coalesced republish covers every channel edited in the burst, not just this one)",
 			"zone", z.id, "channel", ref)
 		return
 	}
@@ -481,15 +505,20 @@ func (r *reloader) retryRepublishComms(z *Zone, ref string) {
 		for attempt := 1; attempt <= reconcileRetryAttempts; attempt++ {
 			select {
 			case <-r.retryDone:
-				return // reloader stopped — abandon the retry
+				z.commsRepublishArmed.Store(false) // reloader stopped mid-retry — release the flag
+				return
 			case <-time.After(reconcileRetryBackoff * time.Duration(attempt)):
 			}
 			if z.postOrDrop(republishCommsMsg{ref: ref}) {
+				// Delivered: the zone handler disarms the flag when it processes the message. Do NOT disarm
+				// here, or a coalesced edge could re-arm and double-post before the handler runs.
 				r.log.Debug("comms republish retry delivered", "zone", z.id, "channel", ref, "attempt", attempt)
 				return
 			}
 		}
-		r.log.Warn("hot-reload comms republish retries exhausted; a channel's hear-set stays stale until re-run",
+		z.commsRepublishArmed.Store(false) // exhausted: no message will land, so release the flag for a future reload
+		r.log.Warn("hot-reload comms republish retries exhausted; this zone's comms hear-sets stay stale until "+
+			"re-run (the coalesced republish covers every channel edited in the burst)",
 			"zone", z.id, "channel", ref, "attempts", reconcileRetryAttempts)
 	}()
 }
