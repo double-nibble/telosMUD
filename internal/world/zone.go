@@ -51,7 +51,13 @@ type Zone struct {
 	startRoom ProtoRef             // ProtoRef of the room a fresh login spawns in
 	rids      ridAllocator         // per-zone RuntimeID source for entities (identity.go)
 	inbox     chan msg             // message queue; the only ingress to zone state
-	log       *slog.Logger         // scoped logger: component=zone, zone=<id>
+	// dead is closed by UnhostZone once this zone's actor has returned for good (#288). `post` selects on it,
+	// so a sender that arrives after the teardown returns immediately instead of filling — and eventually
+	// blocking on — an inbox nobody will ever drain again. That matters because some senders are NOT
+	// ctx-bounded: the saver's saveOk/saveConflict acks ride the ONE shared drainer goroutine, so a single
+	// torn-down zone with a full inbox would wedge persistence for every zone on the shard.
+	dead chan struct{}
+	log  *slog.Logger // scoped logger: component=zone, zone=<id>
 
 	// lastReconciledPackVer is the version of the newest zone-SHAPE reconcile this zone has applied
 	// (#191). A reconcileZoneMsg whose version is ≤ this is DROPPED — a racing reload's stale reconcile
@@ -68,6 +74,12 @@ type Zone struct {
 	// can observe occupancy without posting a query. Written ONLY on the zone goroutine (at the join/leave
 	// occupancy points), read anywhere. Phase 16.4b.
 	pop atomic.Int64
+
+	// stashed mirrors len(pendingFinalFlush) as an atomic, for the same reason pop mirrors len(players): an
+	// OFF-goroutine reader has to know whether this zone still holds player state. A parked create-window
+	// logout snapshot is DURABLE state that is not yet written and belongs to nobody in z.players, so
+	// pop == 0 is NOT "this zone is empty" — see quiescent().
+	stashed atomic.Int64
 
 	// draining marks this zone as being bulk-drained (a graceful shard drain OR a #42 single-zone rebalance
 	// — both funnel through drainZone). It gates the EAGER reap of a handed-off orphan on redirect (so the
@@ -208,7 +220,8 @@ type Zone struct {
 	// e.location is current) keyed by character name; characterCreated stamps the freshly-minted PID
 	// onto it and enqueues the saveFinal once the row exists, so logout stays a true flush point
 	// (docs/PERSISTENCE.md §6) even across the create window. Keyed by character name (the create key).
-	// Zone-owned; only the zone goroutine writes it.
+	// Zone-owned; only the zone goroutine writes it, and only through stashFinalFlush/dropFinalFlush so the
+	// `stashed` atomic mirror stays exact.
 	pendingFinalFlush map[string]CharSnapshot
 
 	// gen is the zone's generation counter — the forward-looking guard a Lua handle captures
@@ -602,6 +615,7 @@ func (whoRenderMsg) zoneMsg()      {}
 func newZone(id string) *Zone {
 	z := &Zone{
 		id:                id,
+		dead:              make(chan struct{}),
 		whoCooldown:       defaultWhoCooldown,
 		rooms:             map[ProtoRef]*Entity{},
 		players:           map[string]*session{},
@@ -650,7 +664,16 @@ func newZone(id string) *Zone {
 
 // post enqueues a message for the zone goroutine. Safe to call from any goroutine —
 // this is the *only* sanctioned way to reach zone state from outside the loop.
-func (z *Zone) post(m msg) { z.inbox <- m }
+// post enqueues m on the zone's inbox, blocking until there is room — the backpressure every caller relies
+// on. It abandons the send if the zone has been torn down (#288): after UnhostZone, nothing drains the inbox,
+// so a blocking send would wait forever. A dropped message there is by construction inert (a torn-down zone
+// is quiescent: no players, no owed durable writes).
+func (z *Zone) post(m msg) {
+	select {
+	case z.inbox <- m:
+	case <-z.dead:
+	}
+}
 
 // postOrDrop is a NON-BLOCKING inbox post: it enqueues m if the inbox has room, else DROPS it and returns
 // false. Only for RECOVERABLE notices — e.g. a hot-reload invalidation, where the shared prototype cache is
@@ -1005,7 +1028,7 @@ func (z *Zone) leave(id string) {
 			// point across the create window. If the create ultimately FAILS (stays ephemeral), the
 			// stash is evicted by characterCreateFailed (never replayed) — no worse than the prior
 			// behavior, but the common case (a fast create that just hadn't returned yet) is saved.
-			z.pendingFinalFlush[id] = dumpCharacter(s)
+			z.stashFinalFlush(id, dumpCharacter(s))
 			z.log.Info("character logged out before its durable id was assigned; deferring final flush to create completion", "player", id)
 		} else {
 			// saveFinal (not saveFlush): the session is removed below in this same handler, so a CAS
@@ -2024,8 +2047,7 @@ func (z *Zone) characterCreated(id string, pid PersistID) {
 		// CreateCharacter INSERT started the row at version 0 and the snapshot was dumped at version 0,
 		// so its CAS lands cleanly; saveFinal's saver reconcile (finalizeFlush) covers any late cadence
 		// race (there is none here — the session is gone). No stash => genuinely nothing to persist.
-		if snap, ok := z.pendingFinalFlush[id]; ok {
-			delete(z.pendingFinalFlush, id)
+		if snap, ok := z.dropFinalFlush(id); ok {
 			snap.PID = pid
 			z.log.Info("replaying deferred logout flush after create completion", "player", id, "pid", pid, "room", snap.RoomRef)
 			z.saver.enqueue(saveRequest{snap: snap, zone: z, id: id, reason: saveFinal})
@@ -2037,7 +2059,7 @@ func (z *Zone) characterCreated(id string, pid PersistID) {
 	// The player is still present: a stale stash (they quit then re-attached within the grace, or a
 	// duplicate createdMsg) must not later clobber the live record — drop it; the live cadence/logout
 	// flush is authoritative.
-	delete(z.pendingFinalFlush, id)
+	z.dropFinalFlush(id)
 	if s.entity.pid != nil {
 		return // already has one (a prior create/load won the race)
 	}
@@ -2064,11 +2086,44 @@ func (z *Zone) characterCreated(id string, pid PersistID) {
 // will still replay: a permanent create failure is mutually exclusive with a (slow-but-successful)
 // createdMsg — the goroutine posts exactly one of the two, so a slow success is never falsely evicted.
 func (z *Zone) characterCreateFailed(id string) {
-	if _, ok := z.pendingFinalFlush[id]; !ok {
+	if _, ok := z.dropFinalFlush(id); !ok {
 		return // the common case: a fast create that returned an error but never stashed a logout
 	}
-	delete(z.pendingFinalFlush, id)
 	z.log.Info("evicted create-window logout stash after permanent create failure (data was never persistable)", "player", id)
+}
+
+// stashFinalFlush parks a create-window logout snapshot, keeping the `stashed` mirror exact. Zone goroutine.
+func (z *Zone) stashFinalFlush(id string, snap CharSnapshot) {
+	if _, existed := z.pendingFinalFlush[id]; !existed {
+		z.stashed.Add(1)
+	}
+	z.pendingFinalFlush[id] = snap
+}
+
+// dropFinalFlush removes a parked snapshot and reports whether one was there, keeping the `stashed` mirror
+// exact. Safe to call for an id that never stashed (the common fast-create path). Zone goroutine.
+func (z *Zone) dropFinalFlush(id string) (CharSnapshot, bool) {
+	snap, ok := z.pendingFinalFlush[id]
+	if !ok {
+		return CharSnapshot{}, false
+	}
+	delete(z.pendingFinalFlush, id)
+	z.stashed.Add(-1)
+	return snap, true
+}
+
+// quiescent reports that this zone holds no player state at all — no residents, and no create-window logout
+// snapshot still waiting for its CreateCharacter to return a durable id.
+//
+// It exists because `pop == 0` is a trap. A brand-new character who quits before their async create returns
+// has leave() park their final snapshot in pendingFinalFlush and then leave z.players, so pop drops to zero
+// while a durable write is still owed. The createdMsg that replays it is delivered to THIS zone's inbox; stop
+// the actor first and that write is silently lost, along with everything the player did inside the create
+// window. Both counters must be zero before a zone can be torn down or considered drained.
+//
+// Readable from any goroutine (both are atomics).
+func (z *Zone) quiescent() bool {
+	return z.pop.Load() == 0 && z.stashed.Load() == 0
 }
 
 // resolveHandoffPid recovers a handed-off player's durable PersistID BY NAME when the handoff

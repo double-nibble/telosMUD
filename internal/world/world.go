@@ -155,6 +155,13 @@ type Shard struct {
 	handedOff  map[string]bool
 	leaseStop  map[string]context.CancelFunc
 
+	// Per-zone ACTOR lifetime (#288). Every zone's Run goroutine gets its own ctx derived from runCtx, so a
+	// single zone can be stopped without stopping the shard — the inverse of HostZone's runtime zone-add.
+	// actorDone closes when that goroutine returns, which is what UnhostZone waits on before declaring the
+	// zone gone (the Lua VM is torn down on the zone goroutine, in Run's defer). Both guarded by mu.
+	actorStop map[string]context.CancelFunc
+	actorDone map[string]chan struct{}
+
 	// draining flips true on BeginDrain (16.4b): the Play attach path then REFUSES a fresh login (this shard
 	// is going away) while still accepting a handoff BIND, so an in-flight cross-shard move completes. mu.
 	draining bool
@@ -341,6 +348,8 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		tokenIndex:       map[string]*Zone{},
 		handedOff:        map[string]bool{},
 		leaseStop:        map[string]context.CancelFunc{},
+		actorStop:        map[string]context.CancelFunc{},
+		actorDone:        map[string]chan struct{}{},
 		rebalancing:      map[string]bool{},
 		rebalanceBackoff: map[string]time.Time{},
 		handoffSem:       make(chan struct{}, maxConcurrentHandoffs),
@@ -673,6 +682,10 @@ func (s *Shard) HostZone(ctx context.Context, id string) (*Zone, error) {
 	s.adoptLocked(id, z) // registers in s.zones + wires handoff/saver/defs
 	runCtx := s.runCtx
 	s.runWG.Add(1)
+	// Arm the actor's cancel + done in the SAME lock hold that published the zone, so no UnhostZone can ever
+	// observe a zone in s.zones with no way to stop it (see armZoneActorLocked). registerZone below does a
+	// blocking bus subscribe, which is exactly the window that would otherwise be wide open.
+	zctx, zcancel, zdone := s.armZoneActorLocked(runCtx, id)
 	s.mu.Unlock()
 
 	// registerZone stamps z.scopes.regionID. It MUST stay above the `go z.Run` below: the region seed already
@@ -686,7 +699,9 @@ func (s *Shard) HostZone(ctx context.Context, id string) (*Zone, error) {
 
 	go func() {
 		defer s.runWG.Done()
-		z.Run(runCtx)
+		defer s.disarmZoneActor(id, zdone)
+		defer zcancel()
+		z.Run(zctx)
 	}()
 	s.startZoneRenewal(runCtx, id) // renew the adopted zone's lease (16.4b; no-op when leasing is off)
 	slog.Info("hosting zone at runtime", "zone", id, "shard", s.addr)
@@ -759,21 +774,33 @@ func (s *Shard) Run(ctx context.Context) {
 	// Capture the run ctx + wg so HostZone (16.4a) can launch a runtime-added zone onto this same
 	// lifetime and have the Wait below cover it. Snapshot the boot zones under the same lock so a
 	// HostZone racing startup is either in the snapshot or adds itself after runWG is visible.
+	type bootZone struct {
+		z      *Zone
+		ctx    context.Context
+		cancel context.CancelFunc
+		done   chan struct{}
+	}
 	s.mu.Lock()
 	s.runCtx = ctx
 	s.runWG = &wg
-	boot := make([]*Zone, 0, len(s.zones))
+	boot := make([]bootZone, 0, len(s.zones))
 	for _, z := range s.zones {
-		boot = append(boot, z)
+		// Arm each boot zone's actor under the SAME lock hold that publishes runCtx: the zones are already in
+		// s.zones (they were built at construction), so an UnhostZone racing startup must never find one with
+		// no cancel. Same invariant HostZone maintains.
+		zctx, zcancel, zdone := s.armZoneActorLocked(ctx, z.id)
+		boot = append(boot, bootZone{z: z, ctx: zctx, cancel: zcancel, done: zdone})
 	}
 	s.mu.Unlock()
-	for _, z := range boot {
+	for _, b := range boot {
 		wg.Add(1)
-		go func(z *Zone) {
+		go func(b bootZone) {
 			defer wg.Done()
-			z.Run(ctx)
-		}(z)
-		s.startZoneRenewal(ctx, z.id) // shard-owned lease renewal (16.4b; no-op when leasing is off)
+			defer s.disarmZoneActor(b.z.id, b.done)
+			defer b.cancel()
+			b.z.Run(b.ctx)
+		}(b)
+		s.startZoneRenewal(ctx, b.z.id) // shard-owned lease renewal (16.4b; no-op when leasing is off)
 	}
 	// Scope replication (10.3b + #44): started AFTER the zone actor loops launch above, so seedFromSnapshot's
 	// BLOCKING seed posts always have a live drainer (seeding before launch could wedge boot if an inbox filled
