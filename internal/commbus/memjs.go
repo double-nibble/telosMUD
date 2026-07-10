@@ -3,6 +3,7 @@ package commbus
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // memjs.go is the JetStream STAND-IN for the durable path (slice 8.5: offline tells). The real
@@ -42,6 +43,64 @@ type MemJetStream struct {
 	wakers map[string]chan struct{}
 	// closed marks the stand-in closed (Close): PublishDurable/Consume then refuse like a closed broker.
 	closed bool
+	// #266 redelivery observations. The stand-in RECORDS the redelivery schedule it would have waited
+	// (it never sleeps it — see deliverBounded) plus the terminal outcomes, so a hermetic test can assert
+	// the real consumer's semantics: which delays a RetryTransient earns, that a DropPoison earns none,
+	// and that an exhausted message is PARKED (permanent loss) rather than silently vanishing.
+	nakDelays map[string][]time.Duration // consumerID -> the backoff delay recorded per RetryTransient
+	parked    map[string][]Message       // consumerID -> messages that exhausted DefaultMaxDeliver
+	poisoned  map[string][]Message       // consumerID -> messages the handler dropped as DropPoison
+}
+
+// noteNak records the backoff delay a RetryTransient redelivery would have waited. Consumer goroutine.
+func (js *MemJetStream) noteNak(consumerID string, d time.Duration) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	if js.nakDelays == nil {
+		js.nakDelays = map[string][]time.Duration{}
+	}
+	js.nakDelays[consumerID] = append(js.nakDelays[consumerID], d)
+}
+
+// notePark records a message that exhausted its redelivery budget — permanent loss in the real consumer.
+func (js *MemJetStream) notePark(consumerID string, msg Message) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	if js.parked == nil {
+		js.parked = map[string][]Message{}
+	}
+	js.parked[consumerID] = append(js.parked[consumerID], msg)
+}
+
+// notePoison records a message the handler declared undeliverable (dropped after one call, no budget).
+func (js *MemJetStream) notePoison(consumerID string, msg Message) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	if js.poisoned == nil {
+		js.poisoned = map[string][]Message{}
+	}
+	js.poisoned[consumerID] = append(js.poisoned[consumerID], msg)
+}
+
+// NakDelays returns the backoff schedule recorded for consumerID's RetryTransient redeliveries (a copy).
+func (js *MemJetStream) NakDelays(consumerID string) []time.Duration {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	return append([]time.Duration(nil), js.nakDelays[consumerID]...)
+}
+
+// Parked returns the messages that exhausted consumerID's redelivery budget (a copy).
+func (js *MemJetStream) Parked(consumerID string) []Message {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	return append([]Message(nil), js.parked[consumerID]...)
+}
+
+// Poisoned returns the messages consumerID's handler dropped as DropPoison (a copy).
+func (js *MemJetStream) Poisoned(consumerID string) []Message {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	return append([]Message(nil), js.poisoned[consumerID]...)
 }
 
 // NewMemJetStream returns an empty durable-log stand-in.

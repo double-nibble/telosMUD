@@ -180,10 +180,14 @@ func TestDurableTellNotLostOnEmitFailure(t *testing.T) {
 // TestDurableTellRedeliversWithinMaxDeliver is the END-TO-END never-lost pin the distsys review asked
 // for: it drives a real `tell` through the full durable path — PublishDurable → the target's live
 // Consume consumer → routeTellDeliver → deliverDrainedTell — with the FIRST emit attempt failing, and
-// asserts the bounded-redelivery loop (DefaultMaxDeliver=5) RETRIES and delivers the tell EXACTLY ONCE.
-// Unlike TestDurableTellNotLostOnEmitFailure (which re-presents the message directly), this exercises
-// the actual Consume/deliverBounded redelivery machinery — a NAK-then-recover within the window must
-// self-heal, never lose and never duplicate the tell.
+// asserts the bounded-redelivery loop RETRIES and delivers the tell EXACTLY ONCE. Unlike
+// TestDurableTellNotLostOnEmitFailure (which re-presents the message directly), this exercises the actual
+// Consume/deliverBounded redelivery machinery — a NAK-then-recover within the window must self-heal, never
+// lose and never duplicate the tell.
+//
+// #266: it also pins that the world classifies an emit blip as TRANSIENT, so the retry rides the NakBackoff
+// SCHEDULE. Before the fix a bare Nak() redelivered immediately, so an emit blip outlasting a few
+// microseconds burned the whole budget and PARKED (lost) the tell.
 func TestDurableTellRedeliversWithinMaxDeliver(t *testing.T) {
 	core := commbus.NewMemBus()
 	t.Cleanup(func() { _ = core.Close() })
@@ -199,7 +203,7 @@ func TestDurableTellRedeliversWithinMaxDeliver(t *testing.T) {
 	bob := joinTellPlayer(t, z, "Bob")
 
 	// Fail exactly the FIRST tell emit; the bounded-redelivery loop must retry (attempt 2) and succeed —
-	// 1 < DefaultMaxDeliver (5), so the message redelivers rather than parks.
+	// 1 < DefaultMaxDeliver, so the message redelivers rather than parks.
 	flaky.failTellN.Store(1)
 
 	z.post(inputMsg{id: "Alice", line: "tell Bob arrive once"})
@@ -211,6 +215,14 @@ func TestDurableTellRedeliversWithinMaxDeliver(t *testing.T) {
 	waitTellCursor(t, z, bob, "Alice", 1) // cursor advanced once, after the successful retry
 	if n := flaky.failTellN.Load(); n != 0 {
 		t.Fatalf("the injected tell-emit failure was never consumed (%d left) — the redelivery path was not exercised", n)
+	}
+	// #266: the single emit blip earned exactly ONE scheduled backoff delay (the schedule's first entry) —
+	// proving the world mapped it to RetryTransient and the retry was PACED, not immediate. And it never parked.
+	if delays := js.NakDelays("Bob"); len(delays) != 1 || delays[0] != commbus.NakBackoff[0] {
+		t.Fatalf("emit-blip retry did not ride the backoff schedule: got %v, want [%v]", delays, commbus.NakBackoff[0])
+	}
+	if parked := js.Parked("Bob"); len(parked) != 0 {
+		t.Fatalf("a tell whose transient cleared must never park, got %d parked", len(parked))
 	}
 }
 
