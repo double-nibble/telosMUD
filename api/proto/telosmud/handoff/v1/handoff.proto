@@ -53,9 +53,6 @@ message AbortRequest {
 message AbortResponse {}
 
 message AdoptZoneRequest {
-  reserved 4;
-  reserved "issued_at_unix_ms";
-
   string zone_id = 1; // the draining peer's zone this shard should build + run + start renewing
   // #262: AdoptZone drives HostZone + lease renewal, so an unauthenticated request is a forced-host /
   // lease-takeover / resource-exhaustion vector against any world port an attacker can reach. These
@@ -74,15 +71,23 @@ message AdoptZoneRequest {
   // current generation, so the instant the flip lands, this request is dead: a captured AdoptZone can
   // never be replayed to force a rebuild.
   //
-  // It replaces issued_at_unix_ms (field 4, reserved). That bounded a replay by a 60s clock-skew window,
-  // which is weaker (a replay inside the window was merely harmless-by-accident, resting on HostZone's
-  // idempotence and on s.zones never being pruned) and dragged a clock dependence into the drain control
-  // plane, where a peer with >60s of drift became silently undrainable-to.
+  // It supersedes issued_at_unix_ms (field 4, deprecated below).
   uint64 lease_gen = 6;
   // zone_sig is an Ed25519 signature over a canonical digest of the fields above (internal/world/
   // handoffsig.go), verified when the destination has a handoff verify key. Empty when signing is
   // unconfigured (dev/test), where the #260 keyless refusal governs instead.
   bytes zone_sig = 5;
+
+  // DEPRECATED (#315), never read and never set. #262 bounded a replay by a 60s clock-skew window around
+  // this issue time. That was weaker than it looked: a replay inside the window was harmless only by
+  // accident, resting on HostZone's idempotence and on s.zones never being pruned; and it dragged a clock
+  // dependence into the drain control plane, where a peer with >60s of drift became silently
+  // undrainable-to. lease_gen replaces it with a fence a replay cannot get around.
+  //
+  // The field stays on the wire (rather than reserved) so an old peer's request still decodes during a
+  // rolling upgrade. It is outside the signing digest, so setting it authorizes nothing. Do not reuse
+  // field 4 for anything else.
+  int64 issued_at_unix_ms = 4 [deprecated = true];
 }
 
 message AdoptZoneResponse {
