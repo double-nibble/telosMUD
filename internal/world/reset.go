@@ -297,6 +297,20 @@ func (z *Zone) spawnPersistent(parent *Entity, o PersistentObject) {
 		return
 	}
 	Move(e, parent)
+	// #304: prime the scripted entity and fire on("spawn") the instant it is placed, exactly as the ephemeral
+	// repop path does (applyReset). Without this a durable scripted MOB — one loaded from object_instances
+	// rather than re-spawned each repop — would never be primed and never receive on("spawn"), so a
+	// wander/behavior loop that arms itself there would stay inert. A no-op for a non-scripted object
+	// (fireSpawn returns early when the entity has no script), which is the common case, so existing content
+	// is unaffected.
+	//
+	// Fired BEFORE the contents recursion, to keep the two paths' contract identical: on the ephemeral path a
+	// mob's inventory is armed by a SEPARATE LATER reset op, so on("spawn") fires with an empty inventory (see
+	// the ORDERING note on fireSpawn). Doing the same here means (a) a content author has ONE rule across both
+	// paths — "spawn fires when placed, don't assume inventory yet" — and (b) every scripted child spawns
+	// under a parent whose own spawn has already fired, so a child's handler never observes a half-constructed
+	// parent via self:room().
+	z.fireSpawn(e)
 	for _, child := range o.Contents {
 		z.spawnPersistent(e, child)
 	}
