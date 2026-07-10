@@ -928,9 +928,20 @@ func (z *Zone) join(s *session, room ProtoRef) {
 // room when ref is empty or names no room this zone hosts. This is the single place the
 // old "if z.rooms[room] == nil { room = z.startRoom }" guard lives now that rooms are
 // entities keyed by ProtoRef.
+//
+// An EMPTY ref is the intended path (a brand-new character, a respawn), so it falls back silently. A
+// NON-EMPTY ref that names no room here is an anomaly, and now says so. Since #320 routes a login to the
+// zone its durable zone_ref names, this fallback is the last line of defense rather than the routine one:
+// reaching it means the saved room genuinely vanished — a pack edit that dropped or renamed it, or a bad
+// exit-graph destination. Silently teleporting the player to the start room is precisely how the #320 data
+// loss stayed invisible for so long.
 func (z *Zone) resolveRoom(ref ProtoRef) *Entity {
 	if r := z.rooms[ref]; r != nil {
 		return r
+	}
+	if ref != "" {
+		z.log.Warn("room ref not hosted in this zone; falling back to the start room",
+			"zone", z.id, "room_ref", ref, "start_room", z.startRoom)
 	}
 	return z.rooms[z.startRoom]
 }
