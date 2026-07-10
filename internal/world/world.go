@@ -163,6 +163,9 @@ type Shard struct {
 	// draining at the same moment (a fleet rollout) does not pick US as its target. nil (no directory / dev)
 	// disables it — the process-local `draining` flag still guards fresh logins.
 	drainMarker DrainMarker
+	// drainReleaser hands back this shard's drain-target reservations at drain completion (#284); nil
+	// leaves them to expire on their own per-field TTL.
+	drainReleaser DrainTargetReleaser
 
 	// occPublisher heartbeats each hosted zone's live player count to the directory on the lease-renewal
 	// cadence (#42), the load signal the placement coordinator weights the plan by. nil disables it (the

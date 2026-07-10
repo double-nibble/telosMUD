@@ -77,10 +77,18 @@ func (f fakeDrainFleet) EndpointForShard(_ context.Context, id string) (string, 
 type fakeReserver struct {
 	reserved map[string]int
 	fullAt   map[string]int // target -> headroom cap; a reserve fails if reserved+incoming would exceed it
+	released []string       // targets whose reservation was handed back (an abandoned selection, #284)
 }
 
 func newFakeReserver() *fakeReserver {
 	return &fakeReserver{reserved: map[string]int{}, fullAt: map[string]int{}}
+}
+
+// ReleaseDrainTarget drops a reservation the selector abandoned (#284).
+func (r *fakeReserver) ReleaseDrainTarget(_ context.Context, target, _ string) error {
+	r.released = append(r.released, target)
+	delete(r.reserved, target)
+	return nil
 }
 
 func (r *fakeReserver) ReserveDrainTarget(_ context.Context, target, _ string, headroom, incoming int, _ time.Duration) (bool, error) {
@@ -167,12 +175,47 @@ func TestChooseDrainTargetDropsLapsedEndpoint(t *testing.T) {
 		cands:  []ShardLoad{{ShardID: "shard-b", Players: 40}, {ShardID: "shard-c", Players: 5}},
 		lapsed: map[string]bool{"shard-c": true}, // shard-c reserved fine but its registration lapsed
 	}
-	id, addr, err := ChooseDrainTarget(context.Background(), fleet, newFakeReserver(), "self", 10, 1000, time.Second)
+	resv := newFakeReserver()
+	id, addr, err := ChooseDrainTarget(context.Background(), fleet, resv, "self", 10, 1000, time.Second)
 	if err != nil {
 		t.Fatalf("ChooseDrainTarget: %v", err)
 	}
 	if id != "shard-b" || addr != "addr-shard-b" {
 		t.Errorf("got (%q,%q), want (shard-b, addr-shard-b) after dropping lapsed shard-c", id, addr)
+	}
+
+	// #284: the reserve on shard-c was ADMITTED before its endpoint failed to resolve. We are never sending
+	// it players, so its hold must be released here — the caller only ever learns about the RETURNED target,
+	// so if the selector does not clean up after itself the hold leaks until its TTL. That is the exact stale
+	// hold this issue exists to remove, triggered by the endpoint race most likely during a fleet rollout.
+	if len(resv.released) != 1 || resv.released[0] != "shard-c" {
+		t.Fatalf("released = %v; want [shard-c] — a reservation on an abandoned target must be handed back", resv.released)
+	}
+	if resv.reserved["shard-c"] != 0 {
+		t.Fatalf("shard-c still holds %d reserved players after being abandoned", resv.reserved["shard-c"])
+	}
+}
+
+// TestChooseDrainTargetDoesNotReleaseARefusedReserve: a reserve that was REFUSED wrote nothing, so there is
+// nothing to hand back. Releasing anyway would be a harmless HDEL, but it would also wipe a hold this drainer
+// legitimately placed on that target for a DIFFERENT zone earlier in the same drain.
+func TestChooseDrainTargetDoesNotReleaseARefusedReserve(t *testing.T) {
+	fleet := fakeDrainFleet{
+		cands: []ShardLoad{{ShardID: "shard-b", Players: 5}, {ShardID: "shard-c", Players: 40}},
+	}
+	resv := newFakeReserver()
+	resv.fullAt["shard-b"] = 0 // every reserve on shard-b is refused
+
+	id, _, err := ChooseDrainTarget(context.Background(), fleet, resv, "self", 10, 1000, time.Second)
+	if err != nil {
+		t.Fatalf("ChooseDrainTarget: %v", err)
+	}
+	if id != "shard-c" {
+		t.Fatalf("got %q, want shard-c after shard-b refused", id)
+	}
+	if len(resv.released) != 0 {
+		t.Fatalf("released = %v; a REFUSED reserve wrote nothing and must not be released — doing so would "+
+			"wipe a hold this drainer placed on that target for a different zone (#284)", resv.released)
 	}
 }
 

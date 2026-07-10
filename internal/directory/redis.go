@@ -331,28 +331,79 @@ func (r *Redis) ListShards(ctx context.Context) ([]string, error) {
 // crashed drainer's hold clears without a deadlock; the ceiling is SOFT (the caller proceeds over it
 // rather than stall a drain — a dropped socket is worse than transient overload the rebalancer corrects).
 
-// reserveDrainTarget admits a reservation of ARGV incoming players onto a target iff the SUM of in-flight
-// reservations plus incoming fits the caller-computed headroom (ceiling minus the target's current load).
-// Counting via a per-drainer hash field so a drainer's holds accumulate across its zones and are cleared
-// as a unit on release. Returns 1 if admitted, 0 if the target is (reservation-)full.
+// reserveDrainTarget admits a reservation of ARGV incoming players onto a target iff the SUM of the LIVE
+// in-flight reservations plus incoming fits the caller-computed headroom (ceiling minus the target's current
+// load). Counting via a per-drainer hash field so a drainer's holds accumulate across its zones and are
+// cleared as a unit on release. Returns 1 if admitted, 0 if the target is (reservation-)full.
+//
+// EACH FIELD CARRIES ITS OWN EXPIRY, as "<count>:<expires_at_ms>" (#284). The previous shape stored a bare
+// count and refreshed the WHOLE key's PEXPIRE on every reserve — so under the fleet rollout this guard exists
+// for, a crashed drainer's stale hold survived indefinitely as long as OTHER drainers kept reserving onto the
+// same hot target. The reserved sum stayed inflated, the target refused real reservations, and more drainers
+// spilled to the soft-ceiling fallback. The guard was weakest exactly under the concurrency it is for. Now a
+// stale field is excluded from the sum and pruned on sight. A field's own expiry is REFRESHED on each of its
+// drainer's reserves — that drainer is demonstrably alive.
+//
+// TIME COMES FROM THE SERVER, not the caller. Every drainer's expiry is then measured against ONE clock, so
+// inter-drainer skew cannot corrupt the cross-drainer sum. Passing each drainer's own `now` would have made a
+// SLOW clock the dangerous case: a correct-clock peer would prune a live drainer's hold early, under-count the
+// target, and let a peer pile on — an unsafe direction, unbounded on a host with no NTP. (A fast clock merely
+// over-counts, which is conservative.) redis.call('TIME') before a write is allowed under effects replication,
+// the default since Redis 5, and miniredis dispatches it in EVAL (verified) with SetTime as the test seam.
+//
+// The KEY's expiry is set to the MAX live field expiry plus a grace, so the key always outlives every field it
+// holds. A blanket PEXPIRE would let a short-ttl reserve stomp the key's expiry below a longer-lived field's,
+// evicting a live hold early.
+//
 // KEYS[1]=drainResvKey(target)  ARGV: drainer, incoming, headroom, ttl_ms
 var reserveDrainTarget = redis.NewScript(`
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local ttl = tonumber(ARGV[4])
 local vals = redis.call('HGETALL', KEYS[1])
 local total = 0
-for i = 2, #vals, 2 do total = total + tonumber(vals[i]) end
+local mine = 0
+local maxexp = 0
+for i = 1, #vals, 2 do
+  local field = vals[i]
+  local v = vals[i+1]
+  local sep = string.find(v, ':', 1, true)
+  local cnt, exp
+  if sep then
+    cnt = tonumber(string.sub(v, 1, sep - 1))
+    exp = tonumber(string.sub(v, sep + 1))
+  else
+    cnt = tonumber(v)  -- a legacy bare-count field written before this shape; treat as expiring now
+    exp = 0
+  end
+  if (not cnt) or (not exp) or exp <= now then
+    redis.call('HDEL', KEYS[1], field)
+  else
+    if field == ARGV[1] then
+      mine = cnt
+    else
+      if exp > maxexp then maxexp = exp end
+    end
+    total = total + cnt
+  end
+end
 if total + tonumber(ARGV[2]) > tonumber(ARGV[3]) then
+  if maxexp > 0 then redis.call('PEXPIREAT', KEYS[1], maxexp + 1000) end
   return 0
 end
-redis.call('HINCRBY', KEYS[1], ARGV[1], tonumber(ARGV[2]))
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+local myexp = now + ttl
+redis.call('HSET', KEYS[1], ARGV[1], (mine + tonumber(ARGV[2])) .. ':' .. myexp)
+if myexp > maxexp then maxexp = myexp end
+redis.call('PEXPIREAT', KEYS[1], maxexp + 1000)
 return 1
 `)
 
 // ReserveDrainTarget atomically reserves headroom on target for drainer to send `incoming` players, iff
-// the in-flight reservation sum plus incoming fits `headroom` (the caller passes ceiling minus the
+// the LIVE in-flight reservation sum plus incoming fits `headroom` (the caller passes ceiling minus the
 // target's current load; a non-positive headroom always refuses). Returns false when the target is
 // reservation-full — the caller re-selects another peer or, if all are full, proceeds over the soft
-// ceiling. The reservation self-expires after ttl (the backstop for a crashed drainer).
+// ceiling. Each reservation carries a per-field expiry of ttl, measured against the REDIS server's clock,
+// so a crashed drainer's hold stops counting after its own ttl regardless of what other drainers do.
 func (r *Redis) ReserveDrainTarget(ctx context.Context, target, drainer string, headroom, incoming int, ttl time.Duration) (bool, error) {
 	res, err := reserveDrainTarget.Run(ctx, r.rdb, []string{r.drainResvKey(target)},
 		drainer, incoming, headroom, ttl.Milliseconds()).Int()
@@ -362,15 +413,62 @@ func (r *Redis) ReserveDrainTarget(ctx context.Context, target, drainer string, 
 	return res == 1, nil
 }
 
-// ReleaseDrainTarget clears a drainer's reservation on target once its handoff completes, freeing the
-// headroom immediately rather than waiting out the TTL. Best-effort (the TTL is the correctness backstop).
+// ReleaseDrainTarget clears a drainer's reservation on target OUTRIGHT.
 //
-// IMPORTANT: this HDELs the drainer's WHOLE accumulated field. Because ReserveDrainTarget accumulates all of
-// a drainer's zones (HINCRBY the same field), release is a WHOLE-DRAIN operation — call it ONCE per target
-// at drain completion, over the set of distinct targets used, NEVER inside the per-zone loop (a per-zone
-// release would wipe sibling zones' reservations and under-count headroom for concurrent drainers).
+// Use it only when the target will receive NO players from this drainer — the reservation was made and then
+// abandoned (a lapsed endpoint mid-selection, a handover that failed). Its hold is pure waste and should go
+// immediately.
+//
+// Do NOT use it when the handover SUCCEEDED. The reservation exists to bridge the window between the players
+// landing on the target and the target's presence heartbeat reflecting their weight; deleting the hold the
+// moment the drain completes reopens exactly that window, and a concurrent drainer would read the target's
+// stale (low) load with no reservation to correct it, and over-commit. Use ExpireDrainTargetSoon instead.
+//
+// This deletes the drainer's WHOLE accumulated field. ReserveDrainTarget accumulates all of a drainer's zones
+// into one field, so release is a WHOLE-DRAIN operation — once per target at drain completion, over the set
+// of distinct targets touched, NEVER inside the per-zone loop (a per-zone delete would wipe the sibling
+// zones' reservations and under-count headroom for concurrent drainers).
 func (r *Redis) ReleaseDrainTarget(ctx context.Context, target, drainer string) error {
 	return r.rdb.HDel(ctx, r.drainResvKey(target), drainer).Err()
+}
+
+// expireDrainTargetSoon rewrites a drainer's field to expire at now+ttl_ms, keeping its count. Fenced: it
+// touches nothing if the field is absent. Never EXTENDS an expiry — a shorter one already in place wins.
+// KEYS[1]=drainResvKey(target)  ARGV: drainer, ttl_ms, now_ms
+var expireDrainTargetSoon = redis.NewScript(`
+local v = redis.call('HGET', KEYS[1], ARGV[1])
+if not v then return 0 end
+local sep = string.find(v, ':', 1, true)
+if not sep then return 0 end
+local cnt = tonumber(string.sub(v, 1, sep - 1))
+local exp = tonumber(string.sub(v, sep + 1))
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local want = now + tonumber(ARGV[2])
+if (not cnt) or (not exp) or want >= exp then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], cnt .. ':' .. want)
+return 1
+`)
+
+// ExpireDrainTargetSoon shortens a drainer's reservation on target to expire in `in`, instead of running out
+// its full TTL (#284).
+//
+// This is the right move once a drain's handoffs have COMPLETED. The reservation's whole job is to bridge the
+// blind window between the migrated players landing on the target and the target's next presence heartbeat
+// reflecting their weight. Deleting the hold at drain completion would reopen that window — a concurrent
+// drainer reads the target's stale, low load, finds no reservation, and over-commits. But leaving it for the
+// full TTL double-counts the players for the remainder, once presence HAS caught up, which needlessly denies
+// a peer real headroom. Shortening it to roughly one heartbeat threads both.
+//
+// Never extends: a field already expiring sooner is left alone. A missing field is a no-op. Reports whether
+// it rewrote anything.
+func (r *Redis) ExpireDrainTargetSoon(ctx context.Context, target, drainer string, in time.Duration) (bool, error) {
+	res, err := expireDrainTargetSoon.Run(ctx, r.rdb, []string{r.drainResvKey(target)},
+		drainer, in.Milliseconds()).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
 }
 
 // SetDraining marks shardID as draining (a marker key with a TTL backstop), so the drain-target selector

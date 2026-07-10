@@ -181,6 +181,47 @@ func (s *Shard) WithDrainMarker(m DrainMarker) *Shard {
 	return s
 }
 
+// DrainTargetReleaser retires this shard's drain-target reservations when its drain finishes (#284).
+// *directory.Redis satisfies it; nil leaves every reservation to run out its own TTL.
+type DrainTargetReleaser interface {
+	// ReleaseDrainTarget drops the hold outright. Only for a target that will receive NO players.
+	ReleaseDrainTarget(ctx context.Context, target, drainer string) error
+	// ExpireDrainTargetSoon shortens the hold to expire in `in`. For a target whose handover SUCCEEDED.
+	ExpireDrainTargetSoon(ctx context.Context, target, drainer string, in time.Duration) (bool, error)
+}
+
+// presenceReflectWindow is how long a reservation is kept alive after a SUCCESSFUL handover: one presence
+// heartbeat plus margin, which is how long the target takes to report the migrated players' weight.
+//
+// This is the crux of #284. The reservation's job is to bridge the window between the players landing on the
+// target and its next heartbeat reflecting them. DELETING the hold the moment the drain completes would
+// reopen exactly that window — a concurrent drainer would read the target's stale, low load, find no
+// reservation, and OVER-COMMIT. But leaving it for the full reservation TTL double-counts those players for
+// the remainder, once presence HAS caught up, needlessly denying a peer real headroom. Shortening it to about
+// one heartbeat threads both. (orchestration review.)
+//
+// It must sit strictly between presence.DefaultHeartbeat (10s — below that, we drop the hold before the
+// target can report) and the reservation TTL that cmd/telos-world configures (15s — above that, shortening
+// is meaningless). A drain-release test pins the lower bound.
+//
+// NOTE that ExpireDrainTargetSoon never EXTENDS an expiry. A drain that took more than a few seconds has
+// already burned most of its 15s hold, so the retire is a no-op and the TTL simply runs out — which is the
+// safe outcome. The shortening only bites when a drain completes fast (an empty or tiny zone), which is
+// precisely when the full TTL would otherwise sit on a target that received almost nothing.
+const presenceReflectWindow = 12 * time.Second
+
+// WithDrainTargetReleaser wires the port BeginDrain uses to retire the headroom it reserved on its targets,
+// rather than letting each reservation sit until its full TTL lapses (#284).
+//
+// Without it, for the remainder of the reservation TTL after a drainer's players have landed AND registered
+// in the target's presence, BOTH the reservation and the now-real migrated load count against that target.
+// The over-count is conservative — it never overloads a target — but it blocks concurrent drainers from real
+// headroom, which is precisely the fleet-rollout case the reservation exists to coordinate.
+func (s *Shard) WithDrainTargetReleaser(r DrainTargetReleaser) *Shard {
+	s.drainReleaser = r
+	return s
+}
+
 // BeginDrain gracefully drains this shard for a rolling redeploy (Phase 16.4b): it stops accepting new
 // fresh logins, hands each hosted zone's ownership to a chosen peer (the atomic fenced lease flip), fans the
 // live players off to that peer over the cross-shard handoff (sockets stay open — zero dropped connections),
@@ -239,6 +280,17 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 	// delta). Instead, skip redirecting that zone — its players stay resident and are flushed + reclaimed
 	// (reconnect from durable state) below. That converts "no peer / handover failed" from data loss into a
 	// clean reconnect, which is the whole point of the drain ladder.
+	// The DISTINCT targets this drain reserved headroom on, and whether any zone actually handed off to each.
+	// Retired once per target at completion (#284) — never per zone: ReserveDrainTarget accumulates a
+	// drainer's zones into ONE hash field, so a per-zone retire would wipe the sibling zones' reservations
+	// for that drainer/target pair and under-count the headroom a concurrent drainer sees.
+	//
+	// The two cases retire DIFFERENTLY. A target that received players keeps its hold for about one presence
+	// heartbeat (it is still bridging the blind window). A target that received none — its handover failed —
+	// is holding headroom for players that will never arrive, so its hold goes at once.
+	sentPlayers := map[string]bool{}
+	defer func() { s.retireDrainTargets(sentPlayers) }()
+
 	for _, z := range zones {
 		targetID, targetAddr, cerr := choose(z.id, int(z.pop.Load()))
 		if cerr != nil {
@@ -246,11 +298,17 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 				"zone", z.id, "err", cerr)
 			continue
 		}
+		// Record the target even if the handover below fails: `choose` already reserved headroom on it, and
+		// an unretired reservation for an abandoned zone is exactly the stale hold #284 is about.
+		if _, seen := sentPlayers[targetID]; !seen {
+			sentPlayers[targetID] = false
+		}
 		if herr := s.handoverZoneTo(ctx, z.id, targetID, targetAddr); herr != nil {
 			slog.Warn("drain: zone handover failed; its players will be reclaimed from durable state",
 				"zone", z.id, "err", herr)
 			continue
 		}
+		sentPlayers[targetID] = true
 		z.post(drainZoneMsg{})
 	}
 
@@ -332,3 +390,41 @@ func (s *Shard) isDraining() bool {
 	defer s.mu.Unlock()
 	return s.draining
 }
+
+// retireDrainTargets retires the headroom this drain reserved, once per distinct target (#284). Called from
+// BeginDrain's defer, so it runs on every exit path — success, abort, or a mid-drain error.
+//
+// A target that RECEIVED players has its hold shortened to about one presence heartbeat: it is still bridging
+// the window before that target's heartbeat reports the migrated weight, and deleting it now would let a
+// concurrent drainer read a stale low load and over-commit. A target that received NONE (its handover failed)
+// is holding headroom for players that will never arrive, so its hold is dropped outright.
+//
+// Best-effort: the per-field TTL is the correctness backstop, and a drain that is exiting must not fail
+// because Redis blinked. Each call gets its own short deadline, and a FRESH context: BeginDrain's ctx is
+// typically already past its deadline by the time this defer runs (the drain deadline is what got us here),
+// which would cancel the retire before it left the process.
+func (s *Shard) retireDrainTargets(sentPlayers map[string]bool) {
+	if s.drainReleaser == nil || s.shardID == "" || len(sentPlayers) == 0 {
+		return
+	}
+	for target, sent := range sentPlayers {
+		ctx, cancel := context.WithTimeout(context.Background(), drainReleaseTimeout)
+		var err error
+		if sent {
+			_, err = s.drainReleaser.ExpireDrainTargetSoon(ctx, target, s.shardID, presenceReflectWindow)
+		} else {
+			err = s.drainReleaser.ReleaseDrainTarget(ctx, target, s.shardID)
+		}
+		if err != nil {
+			slog.Warn("drain: could not retire the reservation on a target; it will expire on its own TTL",
+				"target", target, "drainer", s.shardID, "sent_players", sent, "err", err)
+		} else {
+			slog.Debug("drain: retired target reservation", "target", target, "drainer", s.shardID, "sent_players", sent)
+		}
+		cancel()
+	}
+}
+
+// drainReleaseTimeout bounds one reservation retire. Short: the shard is exiting, and the TTL already covers
+// us if this never lands.
+const drainReleaseTimeout = 2 * time.Second
