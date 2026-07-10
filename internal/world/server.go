@@ -111,19 +111,6 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		loginTier = claims.Tier
 	}
 
-	// Decide which hosted zone this connection starts in: a handoff re-dial binds to
-	// whichever zone holds the matching pending player; everything else (fresh login,
-	// link-dead reconnect) routes to the shard's home zone. currentZone is this
-	// connection's routing pointer — the zone Stores itself into it on attach, and the
-	// reader loop Loads it for every input so a later intra-shard move follows the player.
-	zone := s.shard.zoneByID(s.shard.home)
-	if token != "" {
-		if z := s.shard.zoneForToken(token); z != nil {
-			zone = z
-		}
-		// If no zone holds the token, fall through with home zone; the zone's attach
-		// rejects the unknown token rather than spawning a fresh character.
-	}
 	// Phase 16.4b: a draining shard refuses a FRESH login (it is handing its zones + players to a peer and is
 	// about to exit) so a new arrival doesn't land here and become a drain straggler; the gate re-resolves
 	// via the directory (whose zone leases have flipped to the peer) and dials there. A handoff BIND
@@ -132,8 +119,6 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		s.log.Info("refusing fresh login: shard draining", "character", character)
 		return status.Error(codes.Unavailable, "shard draining; reconnect")
 	}
-	var currentZone atomic.Pointer[Zone]
-	currentZone.Store(zone)
 
 	// Resume the player's ownership epoch from the directory BEFORE handing the stream to
 	// the zone. Only for a fresh/link-dead login (token == ""), never a handoff re-dial
@@ -171,6 +156,48 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		loaded, loadedOK = s.shard.loadCharacterSnapshot(lctx, character)
 		lcancel()
 	}
+
+	// Decide which hosted zone this connection starts in. This runs AFTER the snapshot load because the
+	// durable record is what names the zone (#320). currentZone is this connection's routing pointer — the
+	// zone Stores itself into it on attach, and the reader loop Loads it for every input so a later
+	// intra-shard move follows the player.
+	//
+	//   - handoff re-dial (token != "")  -> whichever zone holds the matching pending player.
+	//   - rehydrating login              -> the zone named by the durable zone_ref.
+	//   - brand-new character, or a zone_ref this shard does not host -> the shard's home zone.
+	//
+	// Before #320 EVERY non-handoff login attached to `home`, and loginRoom's resolveRoom silently fell
+	// back to that zone's start room when the saved room_ref named a room some other zone hosts. A shard
+	// hosts many zones (the demo pack ships three), so a player who walked from midgaard into darkwood and
+	// logged out there came back standing in midgaard's temple, with their durable location gone. No
+	// rebalance and no cross-shard hop required — an ordinary intra-shard walk was enough.
+	zone := s.shard.zoneByID(s.shard.home)
+	switch {
+	case token != "":
+		if z := s.shard.zoneForToken(token); z != nil {
+			zone = z
+		}
+		// If no zone holds the token, fall through with the home zone; the zone's attach
+		// rejects the unknown token rather than spawning a fresh character.
+	case loadedOK && loaded.ZoneRef != "":
+		if z := s.shard.zoneByID(loaded.ZoneRef); z != nil {
+			zone = z
+		} else {
+			// This shard does not host the player's durable zone, so we cannot honor it. Falling back to
+			// home preserves the pre-#320 behavior (they land in the home start room) rather than refusing
+			// the login outright — the gate cannot yet re-resolve, because the directory placement records
+			// a SHARD, not a zone. Fixing that is the second half of #320; until then this WARN is the
+			// operator's signal that a rebalance stranded someone's durable location.
+			s.log.Warn("durable zone not hosted on this shard; falling back to the home zone (the player's saved location is lost)",
+				"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
+		}
+	}
+	if zone == nil {
+		s.log.Error("no zone to attach to", "character", character, "home", s.shard.home)
+		return status.Error(codes.Unavailable, "no hosted zone; reconnect")
+	}
+	var currentZone atomic.Pointer[Zone]
+	currentZone.Store(zone)
 
 	ctx := stream.Context()
 	// out is this stream's outbound channel; the zone binds it to the character's
