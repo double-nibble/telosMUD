@@ -587,6 +587,7 @@ type formulaBody struct {
 type packMetaBody struct {
 	DefaultCombat string `json:"default_combat,omitempty"`
 	PvpLua        string `json:"pvp_lua,omitempty"`
+	WorldScript   string `json:"world_script,omitempty"` // #47: the world-director Lua signal-handler body
 }
 
 // loadGlobalDefs reads the pack-global attribute/resource/damage-type rows for the enabled packs
@@ -1335,6 +1336,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 			}
 			pack(pk).DefaultCombat = b.DefaultCombat
 			pack(pk).PvpLua = b.PvpLua
+			pack(pk).WorldScript = b.WorldScript
 		}
 	}
 	return mRows.Err()

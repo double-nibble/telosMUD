@@ -9,6 +9,8 @@ import (
 	"time"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/double-nibble/telosmud/internal/luasandbox"
 )
 
 // luart.go — the per-zone Lua runtime: VM lifecycle + the restricted-globals sandbox
@@ -24,46 +26,21 @@ import (
 // Zone.Run's goroutine (the single-writer invariant). gopher-lua is not goroutine-safe
 // and we never need it to be — no goroutine touches it, no lock guards it.
 
+// The zone sandbox's caps + budgets are ALIASES of the shared luasandbox constants (#47), so the zone and
+// the director sandboxes cannot diverge: luasandbox is the single source of truth, and a parity test
+// (TestSandboxParityWithLuasandbox) cross-checks the two live sandboxes' allowlist + amplifier-cap behavior.
+// The threat-model rationale for each (T3/T4/T13) lives in docs/PHASE7-PLAN.md §2 and in luasandbox's doc.
 const (
-	// luaCallStackSize caps the Lua call-stack depth (T4 — recursion blowout). gopher-lua
-	// v1.1.1 has NO SetMaxStackSize; the cap is the BUILD-TIME Options.CallStackSize. Deep
-	// or infinite Lua recursion errors out as a catchable Lua error caught by pcall, never
-	// overflowing the host goroutine stack (which would crash the process). 200 is well
-	// below what would threaten the Go stack while leaving ample headroom for legitimate
-	// nested calls.
-	luaCallStackSize = 200
+	luaCallStackSize   = luasandbox.CallStackSize   // T4 — recursion blowout (build-time Options.CallStackSize)
+	luaRegistrySize    = luasandbox.RegistrySize    // T4 — value-stack floor
+	luaRegistryMaxSize = luasandbox.RegistryMaxSize // T4 — value-stack ceiling
+	luaInstrBudget     = luasandbox.InstrBudget     // T3 — per-call instruction cap (fork count abort)
+	luaStrByteCap      = luasandbox.StrByteCap      // T13 — amplifier OUTPUT byte cap
+	luaPatternInputCap = luasandbox.PatternInputCap // T13 — pattern INPUT byte cap
 
-	// luaRegistrySize / luaRegistryMaxSize bound the value stack (T4, paired with the call
-	// stack). The registry starts at luaRegistrySize and may grow to luaRegistryMaxSize;
-	// growth never shrinks back. These cap a single call's value-stack appetite.
-	luaRegistrySize    = 1024
-	luaRegistryMaxSize = 1024 * 64
-
-	// luaInstrBudget is the default per-call VM-instruction cap (T3, P7-D6 layer 1) enforced
-	// by the vendored fork's count abort. 100k instructions per entry-point call (the plan
-	// default). The full budget chokepoint that re-arms this per call lands in slice 7.5; in
-	// 7.1 we set it once at build so the abort is testable and a runaway loop cannot stall
-	// the zone.
-	luaInstrBudget = 100_000
-
-	// luaCallDeadline is the default per-call wall-clock deadline (T3, P7-D6 layer 2),
-	// armed via SetContext. Catches a low-instruction stall the count cannot (a GC pause).
-	// The per-call re-arm chokepoint is slice 7.5; here it bounds the standalone runner.
-	luaCallDeadline = 5 * time.Millisecond
-
-	// luaStrByteCap bounds the OUTPUT size of the amplifier string builtins (T13 — the
-	// single-op alloc bomb: string.rep("A", 2e9) allocates GB in ONE instruction, which
-	// neither the instruction count (one op) nor the deadline (no between-op check inside a
-	// Go builtin) can stop). The capped wrappers reject a result that would exceed this many
-	// bytes BEFORE allocating it. 1 MiB is generous for any legitimate script string while
-	// making a bomb a clean error.
-	luaStrByteCap = 1 << 20
-
-	// luaPatternInputCap bounds the INPUT length of the pattern builtins (string.find/
-	// match/gsub — T13 pathological backtracking). Lua patterns can backtrack super-linearly;
-	// capping input length bounds the worst case. 64 KiB is far past any legitimate script
-	// subject.
-	luaPatternInputCap = 1 << 16
+	// luaCallDeadline is the per-call wall-clock deadline (T3), armed via SetContext — catches a
+	// low-instruction stall the count cannot (a GC pause). Derived from the shared millisecond constant.
+	luaCallDeadline = luasandbox.CallDeadline * time.Millisecond
 )
 
 // luaRuntime is a zone's Lua VM plus the engine-owned state the sandbox depends on. It is
@@ -333,11 +310,9 @@ func (rt *luaRuntime) installSandbox() {
 	// (deletion would be defeatable by _G/_ENV aliasing).
 	env := L.NewTable()
 
-	// Kept base functions (registered individually — never OpenBase, PHASE7-PLAN.md §2.1).
-	for _, name := range []string{
-		"assert", "error", "pcall", "xpcall", "select",
-		"type", "tostring", "tonumber", "pairs", "ipairs", "unpack",
-	} {
+	// Kept base functions (registered individually — never OpenBase, PHASE7-PLAN.md §2.1). The name set is
+	// the SHARED allowlist (#47, luasandbox.BaseAllowlist) so the zone and director sandboxes cannot diverge.
+	for _, name := range luasandbox.BaseAllowlist {
 		if fn := raw.RawGetString(name); fn != lua.LNil {
 			env.RawSetString(name, fn)
 		}

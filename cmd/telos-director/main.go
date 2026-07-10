@@ -107,6 +107,9 @@ func main() {
 	// zoneRegion maps each pool zone to its region (#42 locality): the placement coordinator prefers to
 	// colocate a region's zones on one shard. Empty when content has no regions (locality then no-ops).
 	zoneRegion := map[string]string{}
+	// worldScript is the content-defined world-director Lua signal handler (#47), read from pack_meta. Empty
+	// => the director drains+acks signals with no orchestration reaction.
+	var worldScript string
 	if lc, err := content.Load(ctx, pool, []string{content.DemoPack}); err == nil {
 		for _, sc := range lc.SpawnSchedules {
 			schedules = append(schedules, director.BuildSchedule(sc))
@@ -119,8 +122,9 @@ func main() {
 				zoneRegion[z] = r.Ref
 			}
 		}
+		worldScript = lc.WorldScript
 	} else {
-		slog.Warn("could not load spawn schedules (none scheduled)", "err", err)
+		slog.Warn("could not load director content (no schedules / world script)", "err", err)
 	}
 
 	// Build + run the WORLD director. Region directors (one per region_defs) join here once region
@@ -130,6 +134,10 @@ func main() {
 	// in here when director-script content lands). WithSchedules wires the Phase-12.4 boss scheduler.
 	world := director.New("", pool, slog.Default()).
 		WithScopeBus(scopeBus, instanceID).
+		// #47: the content-defined world-director script reacts to signal-up events. Wired BEFORE
+		// WithSchedules so the scheduler's reserved-event (boss.died) handling composes OUTERMOST and the
+		// Lua handler (its `prev`) only sees non-reserved events. Empty/failed script => no orchestration.
+		WithWorldScript(worldScript).
 		WithSchedules(schedules).
 		// #45: the world director periodically reaps dead-letter mail — orphaned mail (to a name that never
 		// logs in) older than 30 days, and any mail older than 180 days (the backstop TTL). Leader-gated, so

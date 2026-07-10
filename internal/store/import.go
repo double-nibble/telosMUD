@@ -852,10 +852,11 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert formula %s: %w", name, err)
 		}
 	}
-	// Pack-level scalars (Phase 6.3a: default_combat; #20/Phase 7.4f: pvp_lua) in the pack_meta row. Only
-	// written when a scalar is set, so a pack that names none leaves no row (the loader then leaves them empty).
-	if pk.DefaultCombat != "" || pk.PvpLua != "" {
-		body, err := json.Marshal(packMetaBody{DefaultCombat: pk.DefaultCombat, PvpLua: pk.PvpLua})
+	// Pack-level scalars (Phase 6.3a: default_combat; #20/Phase 7.4f: pvp_lua; #47: world_script) in the
+	// pack_meta row. Only written when a scalar is set, so a pack that names none leaves no row (the loader
+	// then leaves them empty).
+	if pk.DefaultCombat != "" || pk.PvpLua != "" || pk.WorldScript != "" {
+		body, err := json.Marshal(packMetaBody{DefaultCombat: pk.DefaultCombat, PvpLua: pk.PvpLua, WorldScript: pk.WorldScript})
 		if err != nil {
 			return fmt.Errorf("store: marshal pack_meta %s: %w", pk.Pack, err)
 		}

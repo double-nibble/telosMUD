@@ -1,11 +1,11 @@
 package world
 
 import (
-	"context"
 	"fmt"
-	"strings"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/double-nibble/telosmud/internal/luasandbox"
 )
 
 // luaentry_chokepoint.go — THE SOLE Lua-invocation chokepoint (slice 7.5, §4 invariant) + the
@@ -33,18 +33,16 @@ const (
 	luaDeadline                     // the wall-clock deadline (transient — weighted lightly)
 )
 
-// classifyLuaError maps a pcall error to an abort kind. The fork raises "instruction budget
-// exceeded" for the count abort and the context error (DeadlineExceeded) for the wall-clock
-// abort; everything else is a logic error.
+// classifyLuaError maps a pcall error to an abort kind for the breaker's weighting. The fork-error-string
+// matching is the SHARED luasandbox.ClassifyError (#47) so the zone and director agree on the classification;
+// this adapts its result onto the zone's luaAbortKind enum.
 func classifyLuaError(err error) luaAbortKind {
-	if err == nil {
+	switch luasandbox.ClassifyError(err) {
+	case luasandbox.AbortOK:
 		return luaOK
-	}
-	msg := err.Error()
-	switch {
-	case strings.Contains(msg, "instruction budget exceeded"):
+	case luasandbox.AbortBudget:
 		return luaBudget
-	case strings.Contains(msg, context.DeadlineExceeded.Error()):
+	case luasandbox.AbortDeadline:
 		return luaDeadline
 	default:
 		return luaLogicErr
