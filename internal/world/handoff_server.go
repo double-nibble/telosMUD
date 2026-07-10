@@ -2,7 +2,6 @@ package world
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"time"
 
@@ -142,24 +141,49 @@ func (h *handoffServer) Abort(_ context.Context, req *handoffv1.AbortRequest) (*
 func (h *handoffServer) AdoptZone(ctx context.Context, req *handoffv1.AdoptZoneRequest) (*handoffv1.AdoptZoneResponse, error) {
 	// Authenticate BEFORE any state work, exactly as Prepare does. #262: a KEYED shard used to adopt on a
 	// wholly unauthenticated request, so anyone with network reach to a world port could force it to host a
-	// zone (lease takeover / resource exhaustion). The signature binds this destination and an issue time, so
-	// a captured request is neither transferable to another shard nor usable after the skew window.
+	// zone (lease takeover / resource exhaustion). #315 then made the authorization SINGLE-USE.
 	if h.shard.handoffVerifyKey != nil {
-		if err := verifyAdoptZone(h.shard.handoffVerifyKey, req, h.shard.shardID, adoptZoneNow()); err != nil {
-			// The wire response stays uniform — an attacker learns nothing about WHY. The local log does
-			// distinguish, because a valid-but-stale signature means the peers' clocks disagree (an
-			// environmental, silent, self-healing fault that makes this shard undrainable-to), whereas a bad
-			// signature means a misconfigured key or a forgery. An operator staring at a stalled drain needs
-			// to tell those apart.
-			if errors.Is(err, ErrAdoptZoneSkew) {
-				slog.Warn("adopt zone refused: issue time outside the clock-skew window — check NTP on the peers",
-					"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId(),
-					"issued_at_ms", req.GetIssuedAtUnixMs(), "now_ms", adoptZoneNow().UnixMilli(),
-					"max_skew", adoptZoneMaxSkew)
-			} else {
-				slog.Warn("adopt zone refused: signature authentication failed",
-					"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId())
-			}
+		// LOCAL checks first: signature + destination binding. The handoff port is unauthenticated, so a
+		// forged request must cost this shard a signature verify and nothing more — never a round trip to the
+		// cluster's shared directory Redis, which every shard, the placement coordinator and leader election
+		// all depend on. This ordering is the whole defense against unauthenticated read amplification.
+		if err := verifyAdoptZoneSig(h.shard.handoffVerifyKey, req, h.shard.shardID); err != nil {
+			slog.Warn("adopt zone refused: signature authentication failed",
+				"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId())
+			return nil, status.Error(codes.PermissionDenied, "adopt zone authentication failed")
+		}
+
+		// Authentic, and addressed to us. Now the fence (#315): read the zone's CURRENT lease generation from
+		// the directory. The source signed the generation it saw while holding the lease, and its HandoverZone
+		// flip increments it, so this request is honored only until the handover it authorizes lands.
+		//
+		// A keyed shard with no leaser cannot perform this check — and a keyed shard is by definition part of
+		// a multi-shard cluster, which leases its zones. Refuse rather than fall back to an unfenced verify.
+		if h.shard.leaser == nil {
+			slog.Error("adopt zone refused: this shard has a handoff verify key but no zone leaser, so the "+
+				"lease-generation fence cannot be checked", "zone", req.GetZoneId())
+			return nil, status.Error(codes.PermissionDenied, "adopt zone authentication failed")
+		}
+		_, curGen, gerr := h.shard.leaser.ZoneLease(ctx, req.GetZoneId())
+		if gerr != nil {
+			// Fail closed. Unavailable is the honest code (transient, not an auth verdict), though nothing
+			// consumes the distinction automatically: a graceful drain does not retry a failed handover, it
+			// degrades that zone to reclaim-from-durable (drain.go); a rebalance directive is what gets
+			// re-issued on backoff. Either way, adopting on an unverifiable generation would reinstate exactly
+			// the replay window #315 removes.
+			slog.Warn("adopt zone refused: could not read the zone's lease generation",
+				"zone", req.GetZoneId(), "err", gerr)
+			return nil, status.Error(codes.Unavailable, "adopt zone: directory unavailable")
+		}
+		if err := verifyAdoptZoneGen(req, curGen); err != nil {
+			// The wire response stays uniform — an attacker learns nothing about WHY. The local log is
+			// specific, because an authentic-but-STALE request is a replay of a handover that already
+			// completed (or a racing one that lost the flip), and an operator staring at a stalled drain
+			// needs to tell that apart from a misconfigured key.
+			slog.Warn("adopt zone refused: stale lease generation — the handover this request authorized has "+
+				"already completed, or another shard won the flip",
+				"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId(),
+				"request_gen", req.GetLeaseGen(), "current_gen", curGen)
 			return nil, status.Error(codes.PermissionDenied, "adopt zone authentication failed")
 		}
 	} else if err := h.shard.keylessHandoffRefused(); err != nil {

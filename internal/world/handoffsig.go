@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"time"
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 )
@@ -119,45 +118,40 @@ func verifySnapshot(pub ed25519.PublicKey, req *handoffv1.PrepareRequest) error 
 //
 // It is authenticated with the SAME shared handoff keypair, but the threat model differs from Prepare's in
 // one way that matters: Prepare's digest binds an EPOCH the destination monotonically rejects, so a captured
-// Prepare cannot be replayed. AdoptZone has no such monotonic field. A signature over zone_id alone would
-// therefore be a permanent, transferable capability to force any shard to host that zone. So the digest
-// binds the DESTINATION (to_shard_id — a signature for shard A is worthless at shard B) and an ISSUE TIME
-// the verifier bounds (adoptZoneMaxSkew), giving the capability an expiry.
+// Prepare cannot be replayed. A signature over zone_id alone would therefore be a permanent, transferable
+// capability to force any shard to host that zone.
 //
-// A replay inside that window re-adopts the same zone at the same shard, which HostZone treats as idempotent
-// (see the security-load-bearing note on HostZone's early return). That is the common case and is a true
-// no-op. It is NOT unconditional: if the destination has since handed the zone ONWARD (a cascading rebalance)
-// it no longer holds it, and a replay would rebuild the zone actor. Such a zombie can never win the lease —
-// its renewal self-terminates on the handedOff fence, and ShardForZone never routes to it — so single-writer
-// holds and it is a bounded resource leak, not a correctness break. Binding the zone's monotonic directory
-// lease generation instead of a wall clock would collapse the window entirely and remove the clock dependence
-// this check introduces into the drain path; that is the recommended hardening, tracked as a follow-up.
+// So the digest binds two things beyond the zone:
+//
+//   - to_shard_id — a signature minted for shard A is worthless at shard B.
+//   - lease_gen (#315) — the zone lease's MONOTONIC GENERATION, read from the directory by the source while
+//     it still holds the lease. The verifier checks it against the directory's current generation. Every
+//     ownership change bumps it, and the HandoverZone flip that ends this very drain is an ownership change,
+//     so the request stops being honored the instant the handover it authorizes completes. A captured
+//     AdoptZone is not a time-bounded capability; it is a SINGLE-USE fence token for one specific handover.
+//
+// This replaces #262's issued_at_unix_ms + clock-skew window, which was weaker on three counts. A replay
+// inside the window was safe only by accident — it rested on HostZone's early return being a pure no-op and
+// on s.zones never being pruned, emergent properties rather than enforced ones. It was NOT unconditionally
+// safe: if the destination had since handed the zone ONWARD, a replay rebuilt the zone actor as a zombie.
+// And it dragged a clock dependence into the drain control plane, where a peer with more than 60s of drift
+// became silently undrainable-to. The generation removes all three: there is no window to be inside, no
+// clock to trust, and a post-flip replay is rejected outright rather than tolerated.
 //
 // from_shard_id is bound by the digest as an AUDIT SUBJECT, not an authorization input: the verifier does not
 // check that the named source actually owns the zone. Under the mutually-trusting shared-key peer model any
-// key-holder is already authorized; a source-ownership check would narrow the residual key-holder surface.
+// key-holder is already authorized; a source-ownership check would narrow the residual key-holder surface
+// (tracked as #316).
 
 // ErrAdoptZoneSig is returned when an AdoptZone request fails authentication: a missing/malformed signature,
 // a digest over tampered fields, or a signature minted for a different destination shard.
 var ErrAdoptZoneSig = errors.New("handoff: adopt-zone authentication failed")
 
-// ErrAdoptZoneSkew is returned when the signature is VALID and bound to this shard, but its issue time falls
-// outside the accepted clock-skew window. It is separated from ErrAdoptZoneSig only so the server can log
-// which it was: an authentic-but-stale request means the two peers' clocks disagree (or a genuine replay of
-// an old capture), not that the cluster key is wrong. Both map to the same opaque PermissionDenied on the wire.
-var ErrAdoptZoneSkew = errors.New("handoff: adopt-zone issue time outside the accepted clock-skew window")
-
-// adoptZoneMaxSkew bounds how far an AdoptZone's issued_at may sit from the verifier's clock, in either
-// direction. It is the replay window: a captured request is useless after it, and useless at any shard but
-// the one it names. Generous enough to absorb ordinary NTP drift between cluster peers, short enough that a
-// captured request is not a standing capability. A package var so a test can shrink it.
-var adoptZoneMaxSkew = 60 * time.Second
-
-// adoptZoneNow is the verifier's clock seam. The server reads it rather than calling time.Now directly so an
-// integration test can pin the skew REJECTION at the RPC boundary — clock is the one novel dependency this
-// change introduces into the drain path, and a unit test with an injected `now` does not prove the server
-// actually consults it.
-var adoptZoneNow = time.Now
+// ErrAdoptZoneStale is returned when the signature is VALID and bound to this shard, but the lease generation
+// it carries is not the zone's current one. It is separated from ErrAdoptZoneSig only so the server can log
+// which it was: an authentic-but-stale request is a REPLAY of a handover that has already completed (or a
+// racing one that lost), not a wrong cluster key. Both map to the same opaque PermissionDenied on the wire.
+var ErrAdoptZoneStale = errors.New("handoff: adopt-zone lease generation is stale (the handover it authorized is over)")
 
 // adoptZoneSigningInput builds the canonical digest an AdoptZone signature covers, length-prefixing every
 // field exactly as snapshotSigningInput does, under its OWN domain separator — so an AdoptZone signature can
@@ -171,9 +165,9 @@ func adoptZoneSigningInput(req *handoffv1.AdoptZoneRequest) []byte {
 		h.Write(b)
 	}
 	writeStr := func(s string) { write([]byte(s)) }
-	writeI64 := func(v int64) {
+	writeU64 := func(v uint64) {
 		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], uint64(v)) //nolint:gosec // two's-complement round-trip; the verifier reads it back the same way
+		binary.BigEndian.PutUint64(b[:], v)
 		write(b[:])
 	}
 
@@ -181,7 +175,7 @@ func adoptZoneSigningInput(req *handoffv1.AdoptZoneRequest) []byte {
 	writeStr(req.GetZoneId())
 	writeStr(req.GetFromShardId())
 	writeStr(req.GetToShardId())
-	writeI64(req.GetIssuedAtUnixMs())
+	writeU64(req.GetLeaseGen())
 	return h.Sum(nil)
 }
 
@@ -195,17 +189,15 @@ func signAdoptZone(priv ed25519.PrivateKey, req *handoffv1.AdoptZoneRequest) []b
 	return ed25519.Sign(priv, adoptZoneSigningInput(req))
 }
 
-// verifyAdoptZone authenticates an inbound AdoptZone against pub. Called only when the destination has a
-// verify key, so a missing or malformed signature is a hard reject — there is no "accept unsigned when a key
-// is present" fallback. selfShardID is this shard's id: a request naming a DIFFERENT destination is refused
-// even with a valid signature, which is what stops a captured request from being replayed across the fleet.
-// now is injected so the skew check is testable.
+// verifyAdoptZoneSig is the LOCAL half of authenticating an inbound AdoptZone on a keyed shard: a well-formed
+// Ed25519 signature over the canonical digest (zone, from, to, lease_gen), and a request that names THIS shard
+// as its destination.
 //
-// It distinguishes ErrAdoptZoneSkew from ErrAdoptZoneSig so the SERVER can log the difference. Clock skew is
-// the one rejection cause here that is environmental, silent and self-healing — an operator debugging a
-// stalled drain must be able to tell "chrony died on this node" from "you configured the wrong key". The RPC
-// response stays deliberately uniform; only the local log distinguishes them.
-func verifyAdoptZone(pub ed25519.PublicKey, req *handoffv1.AdoptZoneRequest, selfShardID string, now time.Time) error {
+// It is deliberately separate from the generation fence, and it runs FIRST. The fence needs a directory read,
+// and the handoff port takes unauthenticated connections — so if the read came first, anyone with network
+// reach could make every shard hammer the cluster's shared Redis with a stream of garbage AdoptZone requests.
+// Nothing remote happens until a request proves it was signed by a cluster key and is addressed here.
+func verifyAdoptZoneSig(pub ed25519.PublicKey, req *handoffv1.AdoptZoneRequest, selfShardID string) error {
 	if len(pub) != ed25519.PublicKeySize {
 		return ErrAdoptZoneSig
 	}
@@ -221,17 +213,36 @@ func verifyAdoptZone(pub ed25519.PublicKey, req *handoffv1.AdoptZoneRequest, sel
 	if req.GetToShardId() == "" || req.GetToShardId() != selfShardID {
 		return ErrAdoptZoneSig
 	}
-	// Bound the replay window in BOTH directions: a stale capture expires, and a far-future issue time is
-	// refused rather than granted a long life.
-	//
-	// Compare RAW MILLISECONDS, never time.Duration. `now.Sub(time.UnixMilli(v))` SATURATES at ±maxDuration
-	// for an absurd v, and negating minDuration overflows back to minDuration (still negative) — so the
-	// natural `if d < 0 { d = -d }; if d > max` form silently ACCEPTS a far-future timestamp, exactly
-	// inverting this check's purpose. `now` is a real clock (~1.7e12 ms) and the window is small, so the
-	// bounds below cannot overflow, and issuedMs is compared as the signed integer the digest actually bound.
-	nowMs, skewMs := now.UnixMilli(), adoptZoneMaxSkew.Milliseconds()
-	if issuedMs := req.GetIssuedAtUnixMs(); issuedMs < nowMs-skewMs || issuedMs > nowMs+skewMs {
-		return ErrAdoptZoneSkew
+	return nil
+}
+
+// verifyAdoptZoneGen is the FENCE (#315), checked once the signature is known good. The source signs the
+// generation it observes while it still holds the lease; its HandoverZone flip then increments it. So a
+// captured request is honored only until the handover it authorizes lands, and never afterwards — a replay is
+// rejected outright rather than tolerated as "idempotent".
+//
+// curGen is read from the directory by the caller, never derived from the request. A generation of 0 means the
+// zone has never been claimed, so there is no handover to authorize; refuse rather than let an unclaimed zone
+// be adopted on a signature bound to nothing.
+//
+// WHY EQUALITY IS ENOUGH, and why this does not also have to check that from_shard_id owns the zone: the
+// directory bumps `gen` on EVERY ownership change (a new-owner claim, the handover flip) and on NOTHING else
+// (a renewal by the current owner does not move it; a refused claim or flip does not move it). So
+// `req.LeaseGen == curGen` transitively proves the owner has not changed since the source read it while
+// holding the lease. The bump rule in directory/redis.go and this comparison are load-bearing for each other:
+// weaken either — bump on a renewal, or accept a near-miss generation — and this stops proving anything.
+func verifyAdoptZoneGen(req *handoffv1.AdoptZoneRequest, curGen uint64) error {
+	if curGen == 0 || req.GetLeaseGen() != curGen {
+		return ErrAdoptZoneStale
 	}
 	return nil
+}
+
+// verifyAdoptZone runs both halves in the order the server runs them. The wire response is a uniform
+// PermissionDenied; the split error types exist only so the server can log which check failed.
+func verifyAdoptZone(pub ed25519.PublicKey, req *handoffv1.AdoptZoneRequest, selfShardID string, curGen uint64) error {
+	if err := verifyAdoptZoneSig(pub, req, selfShardID); err != nil {
+		return err
+	}
+	return verifyAdoptZoneGen(req, curGen)
 }

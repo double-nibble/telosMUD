@@ -53,6 +53,9 @@ message AbortRequest {
 message AbortResponse {}
 
 message AdoptZoneRequest {
+  reserved 4;
+  reserved "issued_at_unix_ms";
+
   string zone_id = 1; // the draining peer's zone this shard should build + run + start renewing
   // #262: AdoptZone drives HostZone + lease renewal, so an unauthenticated request is a forced-host /
   // lease-takeover / resource-exhaustion vector against any world port an attacker can reach. These
@@ -60,12 +63,22 @@ message AdoptZoneRequest {
   //
   // A signature over zone_id ALONE would be replayable forever, so the digest also binds:
   //   - to_shard_id, so a signature captured for one shard cannot be replayed against another;
-  //   - issued_at_unix_ms, which the verifier bounds by a clock-skew window, so a captured request
-  //     expires. (A replay INSIDE the window is harmless: HostZone is idempotent.)
+  //   - lease_gen, the zone lease's monotonic generation, which makes a replay UNREPRESENTABLE rather
+  //     than merely time-bounded (#315).
   // from_shard_id names the requesting peer, binding the (from,to) pair and giving the audit a subject.
   string from_shard_id = 2;
   string to_shard_id = 3;
-  int64 issued_at_unix_ms = 4;
+  // lease_gen is the zone lease's generation as the SOURCE observed it while still holding the lease
+  // (#315). The directory increments it on every ownership CHANGE — a claim by a new owner, and the
+  // HandoverZone flip that ends this very drain. The destination verifies it against the directory's
+  // current generation, so the instant the flip lands, this request is dead: a captured AdoptZone can
+  // never be replayed to force a rebuild.
+  //
+  // It replaces issued_at_unix_ms (field 4, reserved). That bounded a replay by a 60s clock-skew window,
+  // which is weaker (a replay inside the window was merely harmless-by-accident, resting on HostZone's
+  // idempotence and on s.zones never being pruned) and dragged a clock dependence into the drain control
+  // plane, where a peer with >60s of drift became silently undrainable-to.
+  uint64 lease_gen = 6;
   // zone_sig is an Ed25519 signature over a canonical digest of the fields above (internal/world/
   // handoffsig.go), verified when the destination has a handoff verify key. Empty when signing is
   // unconfigured (dev/test), where the #260 keyless refusal governs instead.

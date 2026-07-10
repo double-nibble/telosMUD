@@ -53,6 +53,14 @@ func (nopLeaser) ClaimZone(context.Context, string, string, time.Duration) (bool
 	return true, nil
 }
 func (nopLeaser) ReleaseZone(context.Context, string, string) error { return nil }
+
+// ZoneLease reports this shard as the live owner at a fixed generation. These tests drive the re-adoption
+// path through HostZone directly, never through handoverZoneTo, so the generation never has to move here; the
+// moving-generation case is covered end-to-end by TestKeyedZoneHandoverEndToEnd's A->B->A leg.
+func (nopLeaser) ZoneLease(context.Context, string) (string, uint64, error) {
+	return "shard-a", 1, nil
+}
+
 func (nopLeaser) HandoverZone(context.Context, string, string, string, time.Duration) (bool, error) {
 	return true, nil
 }
@@ -152,7 +160,15 @@ func (r refusingLeaser) ClaimZone(context.Context, string, string, time.Duration
 	}
 	return false, nil // another owner holds a LIVE lease
 }
-func (refusingLeaser) ReleaseZone(context.Context, string, string) error { return nil }
+
+func (refusingLeaser) ReleaseZone(context.Context, string, string) error {
+	return nil
+}
+
+func (refusingLeaser) ZoneLease(context.Context, string) (string, uint64, error) {
+	return "shard-other", 1, nil // someone else holds a live lease
+}
+
 func (refusingLeaser) HandoverZone(context.Context, string, string, string, time.Duration) (bool, error) {
 	return true, nil
 }
@@ -162,8 +178,8 @@ func (refusingLeaser) HandoverZone(context.Context, string, string, string, time
 // The pre-confirm "adopting" state used to idle forever, polling ClaimZone for the shard's whole lifetime.
 // ClaimZone is fenced only against a LIVE lease, so such a renewer WINS the zone the moment its rightful
 // owner's lease lapses — a crash, a partition, a GC pause past the 15s TTL — and starts writing to a zone it
-// was never given. An AdoptZone whose HandoverZone flip never lands (the source died mid-drain) or which was
-// REPLAYED inside its clock-skew window plants exactly that.
+// was never given. An AdoptZone whose HandoverZone flip never lands — the source died mid-drain — plants
+// exactly that, and no signature check can tell it apart from a healthy adoption at the moment it arrives.
 //
 // A legitimate adoption confirms within a round trip of its flip, so the deadline never bites it.
 func TestUnconfirmedAdoptionAbandonsTheZone(t *testing.T) {

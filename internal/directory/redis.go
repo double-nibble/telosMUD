@@ -3,6 +3,7 @@ package directory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -73,12 +74,37 @@ func (r *Redis) occKey(zoneID string) string       { return r.ns + ":dir:occ:" +
 func (r *Redis) rebalanceKey(zoneID string) string { return r.ns + ":dir:rebalance:" + zoneID }
 func (r *Redis) cooldownKey(zoneID string) string  { return r.ns + ":dir:cooldown:" + zoneID }
 
+// claimLease is the generic time-fenced CAS: take the lease when it is free, EXPIRED, or already ours, then
+// (re)set owner + a fresh TTL. Same shape and same redis.call('TIME') clock as claimZone, minus the zone's
+// generation counter — a leader-election lease has no fence token to carry, and it wants the key TTL for GC.
+// KEYS[1]=lease key  ARGV[1]=owner  ARGV[2]=ttl_ms
+var claimLease = redis.NewScript(`
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local owner = redis.call('HGET', KEYS[1], 'owner')
+local exp = redis.call('HGET', KEYS[1], 'expires')
+if owner and owner ~= ARGV[1] and exp and tonumber(exp) > now then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'owner', ARGV[1], 'expires', now + tonumber(ARGV[2]))
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]) + 5000)
+return 1
+`)
+
+// releaseLease drops a lease this owner still holds, so a standby can take it immediately.
+var releaseLease = redis.NewScript(`
+if redis.call('HGET', KEYS[1], 'owner') == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+end
+return 1
+`)
+
 // ClaimLease takes or RENEWS a generic exclusive lease (Phase 10.1c leader election): it succeeds when
-// the lease is free, EXPIRED, or already this owner's, then (re)sets the owner + a fresh TTL. It reuses
-// the same time-fenced CAS script as ClaimZone, so exactly one owner can hold a given leaseID at a time
-// — the director leader-election primitive (leaseID = the scope, owner = the director instance id).
+// the lease is free, EXPIRED, or already this owner's, then (re)sets the owner + a fresh TTL — so exactly one
+// owner can hold a given leaseID at a time (the director leader-election primitive: leaseID = the scope,
+// owner = the director instance id).
 func (r *Redis) ClaimLease(ctx context.Context, leaseID, owner string, ttl time.Duration) (bool, error) {
-	res, err := claimZone.Run(ctx, r.rdb, []string{r.leaseKey(leaseID)}, owner, ttl.Milliseconds()).Int()
+	res, err := claimLease.Run(ctx, r.rdb, []string{r.leaseKey(leaseID)}, owner, ttl.Milliseconds()).Int()
 	if err != nil {
 		return false, err
 	}
@@ -88,15 +114,41 @@ func (r *Redis) ClaimLease(ctx context.Context, leaseID, owner string, ttl time.
 // ReleaseLease frees a lease this owner holds (a graceful director resign), so a standby can take over
 // immediately rather than waiting out the TTL. A no-op if owned by someone else (the CAS arbitrates).
 func (r *Redis) ReleaseLease(ctx context.Context, leaseID, owner string) error {
-	return releaseZone.Run(ctx, r.rdb, []string{r.leaseKey(leaseID)}, owner).Err()
+	return releaseLease.Run(ctx, r.rdb, []string{r.leaseKey(leaseID)}, owner).Err()
 }
 
 // claimZone takes/renews an exclusive lease on a zone. It succeeds when the zone is
 // unowned, its lease has expired, or the caller is already the owner (a renewal);
 // it fails (returns 0) only when a DIFFERENT shard holds a still-live lease. This is
 // what stops two shards from both claiming one zone (the cardinal single-writer
-// guarantee, one level up from players). A Redis key TTL backstops the lease so a
-// fully-dead zone's binding eventually disappears even without a reader.
+// guarantee, one level up from players).
+//
+// It also maintains `gen`, the zone's monotonic lease GENERATION (#315). It bumps on every ownership CHANGE
+// — a fresh claim, a takeover after the lease lapsed — but NOT on a renewal by the current owner, because an
+// AdoptZone signed at generation N must survive until its own handover flips it.
+//
+// `gen` must NEVER re-tread a value it has already issued, because an Ed25519 signature does not expire: a
+// captured AdoptZone bound to generation N goes live again the moment the counter returns to N. Two defenses,
+// because one is not enough:
+//
+//   - the key is PERSISTed, not TTL'd, so it does not lapse out from under a quiet zone; and
+//   - on FIRST creation `gen` is SEEDED from the Redis clock (ms since epoch) rather than starting at 0.
+//
+// The seed is what survives the events PERSIST cannot: FLUSHDB, an allkeys-* eviction, a failover to a replica
+// that lost writes, a restore from an older snapshot, a changed key namespace. After any of those the counter
+// restarts from the CURRENT millisecond, which is far above every value it has ever issued, so no historical
+// request can ever match again. (The residual assumption is that the directory's clock does not jump backwards
+// by more than the zone's ownership-change count — orders of magnitude weaker than trusting two shards' clocks
+// to agree, which is what #262 required.)
+//
+// Reading TIME in a write script requires EFFECTS replication (Redis 5+, mandatory in 7+), which the drain
+// reservations already depend on. The seed makes the anti-replay property depend on it too. `gen` stays an
+// exact integer for ~250 years: HINCRBY is a signed int64, and ms-since-epoch (~1.7e12) plus any plausible
+// number of ownership changes stays far inside both that range and Lua's exact-integer range.
+//
+// Liveness still comes from `expires` alone (zoneOwner ignores an owner whose lease has lapsed), so a persisted
+// key holds no authority once its lease is stale — it is one small hash per zone id, and zone ids are a bounded
+// content set.
 //
 // All time comparisons use redis.call('TIME') — the single Redis clock — rather than
 // each caller's wall clock, so a shard with a skewed clock can't mis-judge a lease
@@ -109,8 +161,14 @@ local exp = redis.call('HGET', KEYS[1], 'expires')
 if owner and owner ~= ARGV[1] and exp and tonumber(exp) > now then
   return 0
 end
+if owner ~= ARGV[1] then
+  if redis.call('HEXISTS', KEYS[1], 'gen') == 0 then
+    redis.call('HSET', KEYS[1], 'gen', now)
+  end
+  redis.call('HINCRBY', KEYS[1], 'gen', 1)
+end
 redis.call('HSET', KEYS[1], 'owner', ARGV[1], 'expires', now + tonumber(ARGV[2]))
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]) * 3)
+redis.call('PERSIST', KEYS[1])
 return 1
 `)
 
@@ -146,9 +204,13 @@ func (r *Redis) ReleaseZone(ctx context.Context, zoneID, shardID string) error {
 	return releaseZone.Run(ctx, r.rdb, []string{r.zoneKey(zoneID)}, shardID).Err()
 }
 
+// releaseZone drops the OWNERSHIP fields but never the key: `gen` must survive, or a captured AdoptZone
+// bound to generation N could be replayed once the counter restarted from zero (#315). A released zone reads
+// as unowned anyway — zoneOwner returns ” without a live `expires` — so nothing routes to it. The key is one
+// small hash per zone id, and zone ids are a bounded content set.
 var releaseZone = redis.NewScript(`
 if redis.call('HGET', KEYS[1], 'owner') == ARGV[1] then
-  redis.call('DEL', KEYS[1])
+  redis.call('HDEL', KEYS[1], 'owner', 'expires')
 end
 return 1
 `)
@@ -170,17 +232,25 @@ func (r *Redis) HandoverZone(ctx context.Context, zoneID, fromShard, toShard str
 }
 
 // handoverZone flips owner from ARGV[1] to ARGV[2] only if ARGV[1] is the current LIVE owner, setting a
-// fresh ARGV[3]-ms lease. Atomic, so ShardForZone never observes an ownerless gap during the flip. Same
-// redis.call('TIME') clock as claimZone. KEYS[1]=zone key  ARGV[1]=from  ARGV[2]=to  ARGV[3]=ttl_ms
+// fresh ARGV[3]-ms lease, and bumps the zone's lease generation (#315) — the bump is what consumes the
+// AdoptZone this flip completes. Atomic, so ShardForZone never observes an ownerless gap during the flip.
+// Same redis.call('TIME') clock as claimZone.
+//
+// A self-handover (from == to) is refused HERE, not just in the Go caller: it is not an ownership change, so
+// bumping the generation for it would invalidate every in-flight AdoptZone for the zone while flipping
+// nothing. (It would also re-set the TTL of a lease its owner has stopped renewing — the #42 review guard.)
+// KEYS[1]=zone key  ARGV[1]=from  ARGV[2]=to  ARGV[3]=ttl_ms
 var handoverZone = redis.NewScript(`
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local owner = redis.call('HGET', KEYS[1], 'owner')
 local exp = redis.call('HGET', KEYS[1], 'expires')
+if ARGV[1] == ARGV[2] then return 0 end
 if owner ~= ARGV[1] then return 0 end
 if not exp or tonumber(exp) <= now then return 0 end
+redis.call('HINCRBY', KEYS[1], 'gen', 1)
 redis.call('HSET', KEYS[1], 'owner', ARGV[2], 'expires', now + tonumber(ARGV[3]))
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]) * 3)
+redis.call('PERSIST', KEYS[1])
 return 1
 `)
 
@@ -195,6 +265,47 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 if not exp or tonumber(exp) <= now then return '' end
 return owner
 `)
+
+// zoneLease reads {owner, gen} for a zone, honoring the lease expiry: a lapsed owner reads as ”. gen is
+// returned regardless, because it must be readable for an unowned zone too.
+var zoneLease = redis.NewScript(`
+local owner = redis.call('HGET', KEYS[1], 'owner')
+local exp = redis.call('HGET', KEYS[1], 'expires')
+local gen = redis.call('HGET', KEYS[1], 'gen')
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+if (not owner) or (not exp) or tonumber(exp) <= now then owner = '' end
+return { owner, gen or '0' }
+`)
+
+// ZoneLease returns a zone's live owner ("" when unowned or lapsed) and its lease GENERATION (#315).
+//
+// The generation is monotonic per zone and increments on every ownership CHANGE: a claim by a shard that did
+// not already own it (including a takeover after the lease lapsed) and the HandoverZone flip. A renewal by
+// the current owner does NOT bump it — otherwise an AdoptZone signed at generation N would go stale before
+// its destination could verify it. It is seeded from the Redis clock on first claim (see claimZone), so the
+// absolute value is meaningless; only "did it change" is.
+//
+// It is the fence token AdoptZone binds: the source signs the generation it observes while still holding the
+// lease, and the destination checks it against this. The moment the flip lands the generation moves, so the
+// request is dead — a replay is unrepresentable rather than merely time-bounded.
+//
+// A zone that has never been claimed reads ("", 0).
+func (r *Redis) ZoneLease(ctx context.Context, zoneID string) (owner string, gen uint64, err error) {
+	vals, err := zoneLease.Run(ctx, r.rdb, []string{r.zoneKey(zoneID)}).Slice()
+	if err != nil {
+		return "", 0, err
+	}
+	if len(vals) != 2 {
+		return "", 0, fmt.Errorf("zone lease %q: malformed reply", zoneID)
+	}
+	owner, _ = vals[0].(string)
+	genStr, _ := vals[1].(string)
+	if genStr != "" {
+		gen, _ = strconv.ParseUint(genStr, 10, 64)
+	}
+	return owner, gen, nil
+}
 
 // ShardForZone returns the id of the shard hosting zoneID, or ErrNotFound. It honors
 // the lease against the Redis clock: an expired (un-renewed) claim reads as not-found,
