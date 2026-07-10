@@ -347,6 +347,10 @@ func (d *mailDir) PlayerShard(_ context.Context, playerID string) (string, bool,
 
 func (d *mailDir) ShardForZone(context.Context, string) (string, error)     { return "", nil }
 func (d *mailDir) EndpointForShard(context.Context, string) (string, error) { return "", nil }
+func (d *mailDir) ClearPlayerShard(context.Context, string, string, string, uint64) (bool, error) {
+	return true, nil
+}
+
 func (d *mailDir) RegisterPlacement(context.Context, string, string, string, uint64) (bool, error) {
 	return true, nil
 }
