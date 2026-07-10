@@ -138,10 +138,21 @@ func verifySnapshot(pub ed25519.PublicKey, req *handoffv1.PrepareRequest) error 
 // became silently undrainable-to. The generation removes all three: there is no window to be inside, no
 // clock to trust, and a post-flip replay is rejected outright rather than tolerated.
 //
-// from_shard_id is bound by the digest as an AUDIT SUBJECT, not an authorization input: the verifier does not
-// check that the named source actually owns the zone. Under the mutually-trusting shared-key peer model any
-// key-holder is already authorized; a source-ownership check would narrow the residual key-holder surface
-// (tracked as #316).
+// from_shard_id is bound by the digest AND checked against the directory (#316): the named source must be the
+// zone's live owner. Be precise about what that is and is not worth.
+//
+// It is NOT an adversarial barrier. Every shard holds the same cluster key, and `owner` and `gen` live in the
+// same directory hash, returned by the same read. Any attacker who can satisfy the generation fence — by
+// reading the directory, or by capturing an AdoptZone off the plaintext handoff wire — has thereby learned the
+// true owner and can simply name it. A leaked key or a compromised shard defeats both checks together.
+//
+// What it IS: destination-side enforcement of a precondition the source already asserts (handoverZoneTo bails
+// unless it is the live owner), so a shard that is merely WRONG — desynced, lagging, mid-partition, buggy —
+// is refused at the door instead of building a zone nobody handed it. Without it such a request builds rooms,
+// resets, mob spawns and an actor goroutine, and only then fails at the flip; renewal is owner-fenced so the
+// zone can never take ownership and ShardForZone never routes to it, but nothing un-adopts it either (#327),
+// so it lingers as an orphan. The check moves that failure before any state work, and it is free — the fence
+// already reads the owner in the same round trip.
 
 // ErrAdoptZoneSig is returned when an AdoptZone request fails authentication: a missing/malformed signature,
 // a digest over tampered fields, or a signature minted for a different destination shard.
@@ -152,6 +163,11 @@ var ErrAdoptZoneSig = errors.New("handoff: adopt-zone authentication failed")
 // which it was: an authentic-but-stale request is a REPLAY of a handover that has already completed (or a
 // racing one that lost), not a wrong cluster key. Both map to the same opaque PermissionDenied on the wire.
 var ErrAdoptZoneStale = errors.New("handoff: adopt-zone lease generation is stale (the handover it authorized is over)")
+
+// ErrAdoptZoneNotOwner is returned when the signature is VALID and the generation matches, but from_shard_id
+// is not the zone's live owner in the directory (#316) — so the named source has no zone to give away. Also
+// opaque PermissionDenied on the wire; the split exists for the log.
+var ErrAdoptZoneNotOwner = errors.New("handoff: adopt-zone source does not own the zone")
 
 // adoptZoneSigningInput builds the canonical digest an AdoptZone signature covers, length-prefixing every
 // field exactly as snapshotSigningInput does, under its OWN domain separator — so an AdoptZone signature can
@@ -216,33 +232,48 @@ func verifyAdoptZoneSig(pub ed25519.PublicKey, req *handoffv1.AdoptZoneRequest, 
 	return nil
 }
 
-// verifyAdoptZoneGen is the FENCE (#315), checked once the signature is known good. The source signs the
-// generation it observes while it still holds the lease; its HandoverZone flip then increments it. So a
-// captured request is honored only until the handover it authorizes lands, and never afterwards — a replay is
-// rejected outright rather than tolerated as "idempotent".
+// verifyAdoptZoneLease is the DIRECTORY half, checked once the signature is known good. It takes the zone's
+// live (owner, generation) as the caller read them, never anything derived from the request.
 //
-// curGen is read from the directory by the caller, never derived from the request. A generation of 0 means the
-// zone has never been claimed, so there is no handover to authorize; refuse rather than let an unclaimed zone
-// be adopted on a signature bound to nothing.
+// The GENERATION is the fence (#315). The source signs the generation it observes while it still holds the
+// lease; its HandoverZone flip then increments it. So a captured request is honored only until the handover it
+// authorizes lands, and never afterwards — a replay is rejected outright rather than tolerated as
+// "idempotent". A generation of 0 means the zone has never been claimed, so there is no handover to authorize;
+// refuse rather than let an unclaimed zone be adopted on a signature bound to nothing.
 //
-// WHY EQUALITY IS ENOUGH, and why this does not also have to check that from_shard_id owns the zone: the
-// directory bumps `gen` on EVERY ownership change (a new-owner claim, the handover flip) and on NOTHING else
-// (a renewal by the current owner does not move it; a refused claim or flip does not move it). So
-// `req.LeaseGen == curGen` transitively proves the owner has not changed since the source read it while
-// holding the lease. The bump rule in directory/redis.go and this comparison are load-bearing for each other:
-// weaken either — bump on a renewal, or accept a near-miss generation — and this stops proving anything.
-func verifyAdoptZoneGen(req *handoffv1.AdoptZoneRequest, curGen uint64) error {
+// Equality is what makes the fence work, and it is load-bearing with the directory's bump rule: `gen` moves on
+// EVERY ownership change (a new-owner claim, the handover flip) and on NOTHING else (a renewal by the current
+// owner does not move it; a refused claim or flip does not move it). So `req.LeaseGen == curGen` transitively
+// proves the owner has not changed since the source read it. Weaken either side — bump on a renewal, or accept
+// a near-miss generation — and this stops proving anything.
+//
+// The OWNER check (#316) closes what that transitive argument cannot: it assumes the source truthfully named
+// itself. A request that misnames its source satisfies the generation and would otherwise make this shard
+// build a zone nobody handed it — an orphan with no un-adopt path. It buys correctness and an early
+// fail-closed, not secrecy: an attacker who can read `gen` reads `owner` from the same hash, so this does not
+// harden the fence against a leaked cluster key. See the file header.
+func verifyAdoptZoneLease(req *handoffv1.AdoptZoneRequest, curOwner string, curGen uint64) error {
 	if curGen == 0 || req.GetLeaseGen() != curGen {
 		return ErrAdoptZoneStale
+	}
+	// An empty curOwner means the lease has LAPSED — nobody owns the zone, so nobody can hand it over.
+	// Aborting here is intended, not an oversight: the source's own HandoverZone flip is fenced on a LIVE
+	// lease and would be refused a moment later anyway, so all we lose is the wasted zone build. The zone
+	// stays with the source and the drain degrades to reclaim-from-durable. Reaching this at all means the
+	// source missed three consecutive renewals — it is already unhealthy.
+	//
+	// An empty from_shard_id can never match a real owner, so an unattributed request is refused here too.
+	if req.GetFromShardId() == "" || req.GetFromShardId() != curOwner {
+		return ErrAdoptZoneNotOwner
 	}
 	return nil
 }
 
 // verifyAdoptZone runs both halves in the order the server runs them. The wire response is a uniform
 // PermissionDenied; the split error types exist only so the server can log which check failed.
-func verifyAdoptZone(pub ed25519.PublicKey, req *handoffv1.AdoptZoneRequest, selfShardID string, curGen uint64) error {
+func verifyAdoptZone(pub ed25519.PublicKey, req *handoffv1.AdoptZoneRequest, selfShardID, curOwner string, curGen uint64) error {
 	if err := verifyAdoptZoneSig(pub, req, selfShardID); err != nil {
 		return err
 	}
-	return verifyAdoptZoneGen(req, curGen)
+	return verifyAdoptZoneLease(req, curOwner, curGen)
 }

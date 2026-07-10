@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -164,7 +165,7 @@ func (h *handoffServer) AdoptZone(ctx context.Context, req *handoffv1.AdoptZoneR
 				"lease-generation fence cannot be checked", "zone", req.GetZoneId())
 			return nil, status.Error(codes.PermissionDenied, "adopt zone authentication failed")
 		}
-		_, curGen, gerr := h.shard.leaser.ZoneLease(ctx, req.GetZoneId())
+		curOwner, curGen, gerr := h.shard.leaser.ZoneLease(ctx, req.GetZoneId())
 		if gerr != nil {
 			// Fail closed. Unavailable is the honest code (transient, not an auth verdict), though nothing
 			// consumes the distinction automatically: a graceful drain does not retry a failed handover, it
@@ -175,15 +176,22 @@ func (h *handoffServer) AdoptZone(ctx context.Context, req *handoffv1.AdoptZoneR
 				"zone", req.GetZoneId(), "err", gerr)
 			return nil, status.Error(codes.Unavailable, "adopt zone: directory unavailable")
 		}
-		if err := verifyAdoptZoneGen(req, curGen); err != nil {
+		if err := verifyAdoptZoneLease(req, curOwner, curGen); err != nil {
 			// The wire response stays uniform — an attacker learns nothing about WHY. The local log is
-			// specific, because an authentic-but-STALE request is a replay of a handover that already
-			// completed (or a racing one that lost the flip), and an operator staring at a stalled drain
-			// needs to tell that apart from a misconfigured key.
-			slog.Warn("adopt zone refused: stale lease generation — the handover this request authorized has "+
-				"already completed, or another shard won the flip",
-				"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId(),
-				"request_gen", req.GetLeaseGen(), "current_gen", curGen)
+			// specific, because an operator staring at a stalled drain needs to tell these apart: a STALE
+			// request is a replay of a handover that already completed (or a racing one that lost the flip);
+			// a NOT-OWNER request means the named source does not hold the zone, which for a correctly-signed
+			// request means a key-holder forged the source (#316); and a bad signature means a wrong key.
+			if errors.Is(err, ErrAdoptZoneNotOwner) {
+				slog.Warn("adopt zone refused: the named source does not own this zone",
+					"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId(),
+					"current_owner", curOwner)
+			} else {
+				slog.Warn("adopt zone refused: stale lease generation — the handover this request authorized "+
+					"has already completed, or another shard won the flip",
+					"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId(),
+					"request_gen", req.GetLeaseGen(), "current_gen", curGen)
+			}
 			return nil, status.Error(codes.PermissionDenied, "adopt zone authentication failed")
 		}
 	} else if err := h.shard.keylessHandoffRefused(); err != nil {

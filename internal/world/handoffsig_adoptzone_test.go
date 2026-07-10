@@ -79,7 +79,7 @@ func (s stubLeaser) ZoneLease(context.Context, string) (string, uint64, error) {
 func TestVerifyAdoptZoneAcceptsRequestAtTheCurrentGeneration(t *testing.T) {
 	pub, priv := adoptKeys(t)
 	req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
-	if err := verifyAdoptZone(pub, req, "shard-b", 7); err != nil {
+	if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); err != nil {
 		t.Fatalf("a correctly-signed request at the live generation must verify, got %v", err)
 	}
 }
@@ -92,13 +92,13 @@ func TestVerifyAdoptZoneRejectsForgeryAndTampering(t *testing.T) {
 
 	t.Run("unsigned", func(t *testing.T) {
 		req := &handoffv1.AdoptZoneRequest{ZoneId: "midgaard", ToShardId: "shard-b", LeaseGen: 7}
-		if err := verifyAdoptZone(pub, req, "shard-b", 7); err == nil {
+		if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); err == nil {
 			t.Fatal("a keyed shard must refuse an unsigned AdoptZone — that is the whole #262 hole")
 		}
 	})
 	t.Run("wrong key", func(t *testing.T) {
 		req := signedAdopt(otherPriv, "midgaard", "shard-a", "shard-b", 7)
-		if err := verifyAdoptZone(pub, req, "shard-b", 7); err == nil {
+		if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); err == nil {
 			t.Fatal("a signature from outside the cluster keypair must be refused")
 		}
 	})
@@ -113,7 +113,7 @@ func TestVerifyAdoptZoneRejectsForgeryAndTampering(t *testing.T) {
 		t.Run("tampered "+tc.name, func(t *testing.T) {
 			req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
 			tc.mutate(req)
-			if err := verifyAdoptZone(pub, req, "shard-b", 7); err == nil {
+			if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); err == nil {
 				t.Fatalf("mutating %s after signing must invalidate the request", tc.name)
 			}
 		})
@@ -126,7 +126,7 @@ func TestVerifyAdoptZoneRejectsForgeryAndTampering(t *testing.T) {
 	t.Run("tampered lease_gen (re-stamped past the flip)", func(t *testing.T) {
 		req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
 		req.LeaseGen = 8
-		if err := verifyAdoptZone(pub, req, "shard-b", 8); !errors.Is(err, ErrAdoptZoneSig) {
+		if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 8); !errors.Is(err, ErrAdoptZoneSig) {
 			t.Fatalf("re-stamping lease_gen must break the signature, got %v", err)
 		}
 	})
@@ -136,7 +136,7 @@ func TestVerifyAdoptZoneRejectsForgeryAndTampering(t *testing.T) {
 	t.Run("tampered to_shard_id (redirected at another shard)", func(t *testing.T) {
 		req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
 		req.ToShardId = "shard-c"
-		if err := verifyAdoptZone(pub, req, "shard-c", 7); err == nil {
+		if err := verifyAdoptZone(pub, req, "shard-c", "shard-a", 7); err == nil {
 			t.Fatal("rewriting to_shard_id must break the signature — otherwise the capability is redirectable")
 		}
 	})
@@ -149,17 +149,17 @@ func TestVerifyAdoptZoneBindsDestinationShard(t *testing.T) {
 	pub, priv := adoptKeys(t)
 	req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
 
-	if err := verifyAdoptZone(pub, req, "shard-b", 7); err != nil {
+	if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); err != nil {
 		t.Fatalf("the named destination must accept it, got %v", err)
 	}
-	if err := verifyAdoptZone(pub, req, "shard-c", 7); err == nil {
+	if err := verifyAdoptZone(pub, req, "shard-c", "shard-a", 7); err == nil {
 		t.Fatal("a request naming shard-b must NOT be replayable at shard-c")
 	}
 
 	// An unbound request (no destination) is refused even with a valid signature over it.
 	unbound := &handoffv1.AdoptZoneRequest{ZoneId: "midgaard", FromShardId: "shard-a", LeaseGen: 7}
 	unbound.ZoneSig = signAdoptZone(priv, unbound)
-	if err := verifyAdoptZone(pub, unbound, "shard-b", 7); err == nil {
+	if err := verifyAdoptZone(pub, unbound, "shard-b", "shard-a", 7); err == nil {
 		t.Fatal("a request that names no destination must be refused (it would be replayable anywhere)")
 	}
 }
@@ -174,22 +174,22 @@ func TestVerifyAdoptZoneIsDeadOnceTheHandoverLands(t *testing.T) {
 	pub, priv := adoptKeys(t)
 	req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
 
-	if err := verifyAdoptZone(pub, req, "shard-b", 7); err != nil {
+	if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); err != nil {
 		t.Fatalf("before the flip the source may retry at the same generation, got %v", err)
 	}
-	if err := verifyAdoptZone(pub, req, "shard-b", 8); !errors.Is(err, ErrAdoptZoneStale) {
+	if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 8); !errors.Is(err, ErrAdoptZoneStale) {
 		t.Fatal("after the flip bumps the generation, the captured request must be refused as stale")
 	}
 	// And it never comes back. Under the old issue-time scheme a captured request was live for a full 60s
 	// window regardless of what had happened to the zone; here every later generation is dead ground.
 	for _, cur := range []uint64{9, 10, 1 << 20} {
-		if err := verifyAdoptZone(pub, req, "shard-b", cur); !errors.Is(err, ErrAdoptZoneStale) {
+		if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", cur); !errors.Is(err, ErrAdoptZoneStale) {
 			t.Fatalf("a consumed request must stay dead at generation %d, got %v", cur, err)
 		}
 	}
 	// A generation BEHIND the request is refused too. The source cannot pre-sign a future handover, and a
 	// directory that somehow reads backwards (a restored-from-backup Redis) must not resurrect the capability.
-	if err := verifyAdoptZone(pub, req, "shard-b", 6); !errors.Is(err, ErrAdoptZoneStale) {
+	if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 6); !errors.Is(err, ErrAdoptZoneStale) {
 		t.Fatalf("a request ahead of the live generation must be refused, got %v", err)
 	}
 }
@@ -201,7 +201,7 @@ func TestVerifyAdoptZoneIsDeadOnceTheHandoverLands(t *testing.T) {
 func TestVerifyAdoptZoneRefusesAnUnleasedZone(t *testing.T) {
 	pub, priv := adoptKeys(t)
 	req := signedAdopt(priv, "nowhere", "shard-a", "shard-b", 0)
-	if err := verifyAdoptZone(pub, req, "shard-b", 0); !errors.Is(err, ErrAdoptZoneStale) {
+	if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 0); !errors.Is(err, ErrAdoptZoneStale) {
 		t.Fatalf("an unleased zone (gen 0) must be refused, got %v", err)
 	}
 }
@@ -217,8 +217,76 @@ func TestVerifyAdoptZoneRefusesAnUnleasedZone(t *testing.T) {
 func TestVerifyAdoptZoneRefusesAKeyedSourceThatSendsNoGeneration(t *testing.T) {
 	pub, priv := adoptKeys(t)
 	req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 0)
-	if err := verifyAdoptZone(pub, req, "shard-b", 5); !errors.Is(err, ErrAdoptZoneStale) {
+	if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 5); !errors.Is(err, ErrAdoptZoneStale) {
 		t.Fatalf("a request carrying no lease generation must not adopt a claimed zone, got %v", err)
+	}
+}
+
+// TestVerifyAdoptZoneRefusesASourceThatDoesNotOwnTheZone is #316: the check the generation fence cannot make.
+//
+// The fence's transitive argument — "gen unchanged since the source read it, therefore the owner is unchanged"
+// — silently assumes the source truthfully NAMED itself. A shard that misnames its source (desynced, lagging,
+// mid-partition, buggy) satisfies the generation and would otherwise make this shard build the zone: rooms,
+// resets, mob spawns, an actor goroutine. Renewal is owner-fenced so it could never take ownership, and
+// ShardForZone would never route to it — but nothing un-adopts it either (#327), so it lingers as an orphan.
+//
+// Be honest about the security value: this is NOT a barrier against a leaked cluster key. `owner` and `gen`
+// come from the same directory hash in the same read, so anyone who can satisfy the fence has already learned
+// the owner and can name it. What #316 buys is enforcing, at the destination, the precondition the source
+// already asserts — and failing closed BEFORE any state work rather than after the flip is refused.
+func TestVerifyAdoptZoneRefusesASourceThatDoesNotOwnTheZone(t *testing.T) {
+	pub, priv := adoptKeys(t)
+
+	t.Run("misnamed source", func(t *testing.T) {
+		// Correctly signed, and at the live generation. Only from_shard_id names a shard that does not own
+		// the zone.
+		req := signedAdopt(priv, "midgaard", "shard-evil", "shard-b", 7)
+		if err := verifyAdoptZoneLease(req, "shard-a", 7); !errors.Is(err, ErrAdoptZoneNotOwner) {
+			t.Fatalf("a source that does not own the zone has nothing to hand over, got %v", err)
+		}
+		if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); !errors.Is(err, ErrAdoptZoneNotOwner) {
+			t.Fatalf("the composed verifier must refuse it too, got %v", err)
+		}
+	})
+
+	t.Run("unattributed source", func(t *testing.T) {
+		// from_shard_id is inside the digest, so an empty one is a legitimately signable request. It can never
+		// match a real owner, and it must not be treated as a wildcard.
+		req := signedAdopt(priv, "midgaard", "", "shard-b", 7)
+		if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); !errors.Is(err, ErrAdoptZoneNotOwner) {
+			t.Fatalf("a request naming no source must be refused, got %v", err)
+		}
+	})
+
+	t.Run("lapsed lease", func(t *testing.T) {
+		// The zone has a generation but no live owner: the source crashed, or was partitioned long enough for
+		// its lease to expire. Nobody can hand over a zone nobody owns — the flip would be refused anyway, and
+		// building the zone here would leave an orphan.
+		req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
+		if err := verifyAdoptZone(pub, req, "shard-b", "", 7); !errors.Is(err, ErrAdoptZoneNotOwner) {
+			t.Fatalf("a lapsed lease has no owner to hand the zone over, got %v", err)
+		}
+	})
+
+	t.Run("the live owner is accepted", func(t *testing.T) {
+		req := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
+		if err := verifyAdoptZone(pub, req, "shard-b", "shard-a", 7); err != nil {
+			t.Fatalf("the zone's live owner must still be able to hand it over, got %v", err)
+		}
+	})
+}
+
+// TestVerifyAdoptZoneChecksTheGenerationBeforeTheOwner pins the refusal ORDER, which is what makes the two
+// log lines mean what they say. A stale request from a source that has since lost the zone (the ordinary
+// post-flip replay) must report STALENESS — the operator should not go hunting for a forged source when what
+// actually happened is that the handover completed.
+func TestVerifyAdoptZoneChecksTheGenerationBeforeTheOwner(t *testing.T) {
+	_, priv := adoptKeys(t)
+	// A's request, captured; the flip has since moved the zone to B and bumped the generation. Both checks
+	// would refuse it. The generation is the more specific truth.
+	replayed := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
+	if err := verifyAdoptZoneLease(replayed, "shard-b", 8); !errors.Is(err, ErrAdoptZoneStale) {
+		t.Fatalf("a post-flip replay must be reported as stale, not as a forged source, got %v", err)
 	}
 }
 
@@ -230,14 +298,20 @@ func TestVerifyAdoptZoneDistinguishesStaleFromForgery(t *testing.T) {
 	pub, priv := adoptKeys(t)
 
 	stale := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
-	if err := verifyAdoptZone(pub, stale, "shard-b", 8); !errors.Is(err, ErrAdoptZoneStale) || errors.Is(err, ErrAdoptZoneSig) {
+	if err := verifyAdoptZone(pub, stale, "shard-b", "shard-a", 8); !errors.Is(err, ErrAdoptZoneStale) || errors.Is(err, ErrAdoptZoneSig) {
 		t.Fatalf("an authentic but consumed request must report staleness, got %v", err)
 	}
 
 	forged := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
 	forged.ZoneSig[0] ^= 0xff
-	if err := verifyAdoptZone(pub, forged, "shard-b", 7); !errors.Is(err, ErrAdoptZoneSig) || errors.Is(err, ErrAdoptZoneStale) {
+	if err := verifyAdoptZone(pub, forged, "shard-b", "shard-a", 7); !errors.Is(err, ErrAdoptZoneSig) || errors.Is(err, ErrAdoptZoneStale) {
 		t.Fatalf("a bad signature must report forgery, not staleness, got %v", err)
+	}
+
+	notOwner := signedAdopt(priv, "midgaard", "shard-evil", "shard-b", 7)
+	if err := verifyAdoptZone(pub, notOwner, "shard-b", "shard-a", 7); !errors.Is(err, ErrAdoptZoneNotOwner) ||
+		errors.Is(err, ErrAdoptZoneSig) || errors.Is(err, ErrAdoptZoneStale) {
+		t.Fatalf("a misnamed source must report its own reason, not staleness or forgery, got %v", err)
 	}
 }
 
@@ -254,7 +328,7 @@ func TestAdoptZoneSignatureIsDomainSeparated(t *testing.T) {
 		ZoneId: "midgaard", FromShardId: "shard-a", ToShardId: "shard-b",
 		LeaseGen: 7, ZoneSig: prep.GetSnapshotSig(),
 	}
-	if err := verifyAdoptZone(pub, borrowed, "shard-b", 7); err == nil {
+	if err := verifyAdoptZone(pub, borrowed, "shard-b", "shard-a", 7); err == nil {
 		t.Fatal("a Prepare signature must not authenticate an AdoptZone (domain separation)")
 	}
 
@@ -332,6 +406,41 @@ func TestKeyedAdoptZoneRejectsStaleGenerationOverRPC(t *testing.T) {
 	fresh := signedAdopt(priv, zone, "shard-a", "shard-b", 8)
 	if _, err := keyed.AdoptZone(context.Background(), fresh); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("a request at the live generation must clear auth and reach HostZone, got %v", err)
+	}
+}
+
+// TestKeyedAdoptZoneRefusesAMisnamedSourceOverRPC is #316 at the RPC boundary. A verifier unit test alone
+// would pass on a server that read the generation but threw the owner away — which is exactly what the server
+// did before this change.
+//
+// The request is correctly signed and carries the live generation; only from_shard_id names a shard that does
+// not own the zone. Name a zone this shard does NOT already host, so "did any state work happen?" is
+// observable: a pre-hosted zone would hit HostZone's idempotent early return and prove nothing.
+func TestKeyedAdoptZoneRefusesAMisnamedSourceOverRPC(t *testing.T) {
+	pub, priv := adoptKeys(t)
+	const zone = "darkwood"
+
+	shard := NewDemoShard().WithHandoffKeys(priv, pub).
+		WithZoneLeasing(stubLeaser{owner: "shard-a", gen: 7}, "shard-b", 0, 0, nil)
+	if shard.ZoneByID(zone) != nil {
+		t.Fatalf("precondition: %s must not already be hosted", zone)
+	}
+	keyed := &handoffServer{shard: shard}
+
+	misnamed := signedAdopt(priv, zone, "shard-evil", "shard-b", 7)
+	if _, err := keyed.AdoptZone(context.Background(), misnamed); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a request from a source that does not own the zone must be refused, got %v", err)
+	}
+	if shard.ZoneByID(zone) != nil {
+		t.Fatal("the zone was BUILT for a source that never owned it — an orphan with no un-adopt path (#316)")
+	}
+
+	// The control: the same request from the zone's real owner clears auth and reaches HostZone, which refuses
+	// for its own reason (this bare shard isn't running). Landing on FailedPrecondition rather than
+	// PermissionDenied is what proves the earlier refusal was the owner check.
+	honest := signedAdopt(priv, zone, "shard-a", "shard-b", 7)
+	if _, err := keyed.AdoptZone(context.Background(), honest); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("the zone's live owner must clear auth and reach HostZone, got %v", err)
 	}
 }
 
@@ -458,11 +567,11 @@ func TestKeyedZoneHandoverEndToEnd(t *testing.T) {
 	// PermissionDenied is deliberately uniform on the wire, so pin the REASON directly: the refusal must come
 	// from the generation fence, not from some incidental signature problem. (The pre-flip accept above already
 	// proves the signature is good; this proves what changed.)
-	_, postFlipGen, err := dir.ZoneLease(ctx, "midgaard")
+	postFlipOwner, postFlipGen, err := dir.ZoneLease(ctx, "midgaard")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyAdoptZoneGen(captured, postFlipGen); !errors.Is(err, ErrAdoptZoneStale) {
+	if err := verifyAdoptZoneLease(captured, postFlipOwner, postFlipGen); !errors.Is(err, ErrAdoptZoneStale) {
 		t.Fatalf("the replay must be refused BY THE FENCE (request_gen=%d, current_gen=%d), got %v",
 			captured.GetLeaseGen(), postFlipGen, err)
 	}
@@ -500,12 +609,26 @@ func TestKeyedZoneHandoverEndToEnd(t *testing.T) {
 		t.Fatalf("the first leg's captured AdoptZone must stay dead across a rebalance-back, got %v", err)
 	}
 
-	// FAIL-CLOSED: an UNKEYED source attaches no signature, so the keyed destination refuses. Hand darkwood
-	// from an unkeyed A' to the keyed B.
+	// #316 END-TO-END: a correctly signed request at darkwood's real current generation, naming a source that
+	// does not own it, asks B to adopt a zone B does not host. B must refuse before building anything.
 	mustReg(t, dir.RegisterZone(ctx, "darkwood", "shard-a"))
 	if _, err := dir.ClaimZone(ctx, "darkwood", "shard-a", time.Second); err != nil {
 		t.Fatal(err)
 	}
+	darkOwner, darkGen, err := dir.ZoneLease(ctx, "darkwood")
+	if err != nil || darkOwner != "shard-a" {
+		t.Fatalf("precondition: darkwood must be owned by shard-a, got %q (err %v)", darkOwner, err)
+	}
+	misnamed := signedAdopt(priv, "darkwood", "shard-evil", "shard-b", darkGen)
+	if _, err := bSrv.AdoptZone(ctx, misnamed); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a request naming a source that does not own darkwood must be refused, got %v", err)
+	}
+	if shardB.ZoneByID("darkwood") != nil {
+		t.Fatal("B built darkwood for a source that never owned it — an orphan zone with no un-adopt path (#316)")
+	}
+
+	// FAIL-CLOSED: an UNKEYED source attaches no signature, so the keyed destination refuses. Hand darkwood
+	// from an unkeyed A' to the keyed B.
 	unkeyedA := NewShardFromContent(lc, []string{"darkwood"}, "darkwood", "addr-a", dir, peers).
 		WithZoneLeasing(dir, "shard-a", time.Second, 80*time.Millisecond, noFence)
 	err = unkeyedA.handoverZoneTo(ctx, "darkwood", "shard-b", "addr-b")
@@ -601,6 +724,7 @@ func TestForgedAdoptZoneNeverReachesTheDirectory(t *testing.T) {
 		req  *handoffv1.AdoptZoneRequest
 	}{
 		{"unsigned", &handoffv1.AdoptZoneRequest{ZoneId: "midgaard", ToShardId: "shard-b", LeaseGen: 7}},
+		{"no source named", signedAdopt(otherPriv, "midgaard", "", "shard-b", 7)},
 		{"wrong key", signedAdopt(otherPriv, "midgaard", "shard-a", "shard-b", 7)},
 		{"garbage signature", func() *handoffv1.AdoptZoneRequest {
 			r := signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)
@@ -624,11 +748,26 @@ func TestForgedAdoptZoneNeverReachesTheDirectory(t *testing.T) {
 		})
 	}
 
-	// The control: an AUTHENTIC request does consult the directory. Without this, the assertion above would
+	// A forged request must also never learn that the directory is DOWN. The `Unavailable` code exists so a
+	// legitimate source can tell a transient directory fault from an auth verdict; if an unauthenticated caller
+	// could elicit it, the handoff port would double as a Redis health oracle for anyone with network reach.
+	// The signature check running first is what prevents that — this pins it against a refactor.
+	down := &countingLeaser{stubLeaser: stubLeaser{err: errors.New("redis: connection refused")}}
+	shard := NewDemoShard().WithHandoffKeys(priv, pub).WithZoneLeasing(down, "shard-b", 0, 0, nil)
+	unsigned := &handoffv1.AdoptZoneRequest{ZoneId: "midgaard", ToShardId: "shard-b", LeaseGen: 7}
+	if _, err := (&handoffServer{shard: shard}).AdoptZone(context.Background(), unsigned); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("an unsigned request must get the uniform auth verdict even when the directory is down, got %v",
+			status.Code(err))
+	}
+	if down.count() != 0 {
+		t.Fatal("an unsigned request probed the directory")
+	}
+
+	// The control: an AUTHENTIC request does consult the directory. Without this, the assertions above would
 	// pass on a server that never reads the generation at all.
 	leaser := &countingLeaser{stubLeaser: stubLeaser{owner: "shard-a", gen: 7}}
-	shard := NewDemoShard().WithHandoffKeys(priv, pub).WithZoneLeasing(leaser, "shard-b", 0, 0, nil)
-	if _, err := (&handoffServer{shard: shard}).AdoptZone(context.Background(), signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)); err != nil {
+	ok := NewDemoShard().WithHandoffKeys(priv, pub).WithZoneLeasing(leaser, "shard-b", 0, 0, nil)
+	if _, err := (&handoffServer{shard: ok}).AdoptZone(context.Background(), signedAdopt(priv, "midgaard", "shard-a", "shard-b", 7)); err != nil {
 		t.Fatalf("an authentic request must be accepted, got %v", err)
 	}
 	if leaser.count() != 1 {
