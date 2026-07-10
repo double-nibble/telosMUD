@@ -584,6 +584,15 @@ func (s *Shard) zonesList() []*Zone {
 // it succeeds. Errors if the shard isn't running yet (no run ctx) or has no retained content.
 func (s *Shard) HostZone(id string) (*Zone, error) {
 	// First pass: cheap guards + the idempotent hit, without holding mu across the (slower) zone build.
+	//
+	// SECURITY-LOAD-BEARING (#262): AdoptZone's anti-replay rests on this early return. A signed AdoptZone is
+	// replayable inside its clock-skew window, and that is only harmless because re-adopting a zone this shard
+	// already built returns HERE — before startZoneRenewal — so a replay cannot restart renewal or rebuild the
+	// zone. Two properties hold it up: s.zones is never pruned (a handed-off zone stays in the map, so the hit
+	// is sticky), and this return precedes renewal. If you ever prune s.zones on handoff (a reasonable
+	// memory-leak fix) or move renewal above this line, a replayed AdoptZone would rebuild the zone and start a
+	// second renewer — re-open #262 unless the signature is first rebound to the zone's monotonic lease
+	// generation instead of a wall clock (tracked in the #262 follow-ups).
 	s.mu.Lock()
 	if z := s.zones[id]; z != nil {
 		s.mu.Unlock()

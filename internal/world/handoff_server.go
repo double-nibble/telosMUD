@@ -2,6 +2,8 @@ package world
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"time"
 
 	"google.golang.org/grpc"
@@ -138,12 +140,31 @@ func (h *handoffServer) Abort(_ context.Context, req *handoffv1.AbortRequest) (*
 // lease itself; the caller (the draining source) owns the atomic flip so ShardForZone never observes an
 // ownerless gap. Errors (FailedPrecondition) if this shard can't host the zone (not running / no content).
 func (h *handoffServer) AdoptZone(_ context.Context, req *handoffv1.AdoptZoneRequest) (*handoffv1.AdoptZoneResponse, error) {
-	// #260: same keyless refusal as Prepare — a keyless shard must not host a zone on an unauthenticated,
-	// attacker-forgeable request (a resource-exhaustion / disruption vector) unless explicitly insecure.
-	// keylessHandoffRefused is a no-op on a keyed shard (it proceeds). NOTE: AdoptZone carries no per-request
-	// signature, so a KEYED shard still adopts on an unauthenticated request — a separate, pre-existing gap
-	// (the drain control plane leans on transport trust); authenticating keyed AdoptZone is tracked in #262.
-	if err := h.shard.keylessHandoffRefused(); err != nil {
+	// Authenticate BEFORE any state work, exactly as Prepare does. #262: a KEYED shard used to adopt on a
+	// wholly unauthenticated request, so anyone with network reach to a world port could force it to host a
+	// zone (lease takeover / resource exhaustion). The signature binds this destination and an issue time, so
+	// a captured request is neither transferable to another shard nor usable after the skew window.
+	if h.shard.handoffVerifyKey != nil {
+		if err := verifyAdoptZone(h.shard.handoffVerifyKey, req, h.shard.shardID, adoptZoneNow()); err != nil {
+			// The wire response stays uniform — an attacker learns nothing about WHY. The local log does
+			// distinguish, because a valid-but-stale signature means the peers' clocks disagree (an
+			// environmental, silent, self-healing fault that makes this shard undrainable-to), whereas a bad
+			// signature means a misconfigured key or a forgery. An operator staring at a stalled drain needs
+			// to tell those apart.
+			if errors.Is(err, ErrAdoptZoneSkew) {
+				slog.Warn("adopt zone refused: issue time outside the clock-skew window — check NTP on the peers",
+					"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId(),
+					"issued_at_ms", req.GetIssuedAtUnixMs(), "now_ms", adoptZoneNow().UnixMilli(),
+					"max_skew", adoptZoneMaxSkew)
+			} else {
+				slog.Warn("adopt zone refused: signature authentication failed",
+					"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId())
+			}
+			return nil, status.Error(codes.PermissionDenied, "adopt zone authentication failed")
+		}
+	} else if err := h.shard.keylessHandoffRefused(); err != nil {
+		// #260: a KEYLESS shard cannot authenticate the request at all, so it refuses outright unless the
+		// operator explicitly opted into insecure handoffs (TELOS_ALLOW_INSECURE).
 		return nil, err
 	}
 	z, err := h.shard.HostZone(req.GetZoneId())
