@@ -17,3 +17,24 @@
 
 pack: demo
 default_combat: melee
+
+# The WORLD-DIRECTOR script (#47, Phase 10.4): sandboxed Lua run in telos-director. It defines on_signal,
+# invoked per signal-up event a zone emits. This demo reacts to a "boss_slain" signal by recording the fallen
+# boss in world state (director.set — a DERIVED, idempotent write; NOT a blind increment, so the durable
+# at-least-once redelivery of an event cannot double-count) and broadcasting a world announcement DOWN to the
+# member zones (which apply it locally via their on_world handlers — the golden rule: the director never
+# reaches into a zone). IMPORTANT: on_signal is delivered EVERY non-boss.died signal — including engine
+# events like content.reload.audit / content.pull.result (only boss.died is intercepted by the scheduler).
+# So ALWAYS guard on your own event names (as below); never write a catch-all/default branch that would react
+# to engine-internal events. director.broadcast likewise refuses engine-reserved event names (scope.state.set,
+# content.*), so a script cannot forge a state-set that bypasses the director's single-writer path.
+world_script: |
+  function on_signal(event, payload)
+    if event == "boss_slain" then
+      local boss = "an unknown foe"
+      if type(payload) == "table" and payload.boss then boss = tostring(payload.boss) end
+      director.set("last_boss_slain", boss)
+      director.broadcast("world_announce", { text = "The " .. boss .. " has fallen before the realm's heroes!" })
+      director.log("recorded boss_slain: " .. boss)
+    end
+  end

@@ -118,6 +118,9 @@ func mergePacks(parts []Pack) Pack {
 		if p.PvpLua != "" {
 			out.PvpLua = p.PvpLua
 		}
+		if p.WorldScript != "" {
+			out.WorldScript = p.WorldScript // #47: last non-empty file/pack wins
+		}
 		for name, body := range p.Formulas {
 			if out.Formulas == nil {
 				out.Formulas = map[string]string{}

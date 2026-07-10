@@ -127,6 +127,8 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 	counter++
 	pk.PvpLua = sentinelString(counter)
 	counter++
+	pk.WorldScript = sentinelString(counter)
+	counter++
 	formulaName := sentinelString(counter)
 	counter++
 	pk.Formulas = map[string]string{formulaName: sentinelString(counter)}
@@ -184,6 +186,10 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 		require.Equal(t, pk.PvpLua, lc.PvpLua,
 			"reflect round-trip: PvpLua was dropped on the store import/load path (pack_meta body)")
 	})
+	t.Run("world_script", func(t *testing.T) {
+		require.Equal(t, pk.WorldScript, lc.WorldScript,
+			"reflect round-trip: WorldScript was dropped on the store import/load path (pack_meta body)")
+	})
 	t.Run("formulas", func(t *testing.T) {
 		require.Equal(t, pk.Formulas, lc.Formulas,
 			"reflect round-trip: a Formulas entry was dropped on the store import/load path (formula_defs)")
@@ -237,7 +243,7 @@ func TestStoreReflectNetCoversEveryDefSlice(t *testing.T) {
 // TestStoreDTOReflectRoundTrip round-trips directly — the sibling of reflectNetCovered for the []struct def
 // kinds. These ride pack_meta (DefaultCombat, PvpLua) or a keyed def table (Formulas → formula_defs).
 var reflectNetScalarCovered = map[string]bool{
-	"DefaultCombat": true, "PvpLua": true, "Formulas": true,
+	"DefaultCombat": true, "PvpLua": true, "Formulas": true, "WorldScript": true,
 }
 
 // reflectNetScalarExcluded lists content.Pack scalar/map fields deliberately NOT round-tripped, with reasons.

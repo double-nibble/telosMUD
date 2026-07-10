@@ -107,6 +107,10 @@ type LoadedContent struct {
 	// by name).
 	PvpLua   string
 	Formulas map[string]string
+	// WorldScript is the pack-global world-director Lua script (#47); the LAST non-empty pack value wins
+	// (there is one world orchestrator). Empty => the director reacts to no signals. The telos-director
+	// service reads it (not the world/zone) to build its sandboxed Lua signal handler.
+	WorldScript string
 }
 
 // Zone returns the loaded zone with the given ref, or nil.
@@ -204,6 +208,9 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 		}
 		if p.PvpLua != "" {
 			lc.PvpLua = p.PvpLua // last non-empty pack wins (7.4f)
+		}
+		if p.WorldScript != "" {
+			lc.WorldScript = p.WorldScript // last non-empty pack wins (#47: one world orchestrator)
 		}
 		for name, body := range p.Formulas { // 7.4f: last-write-wins by name
 			if lc.Formulas == nil {

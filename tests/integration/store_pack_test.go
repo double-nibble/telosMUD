@@ -206,6 +206,11 @@ func TestStorePackRoundTrip(t *testing.T) {
 	// store import/load path is the same top-level-field-drop class this test closes, so pin it directly.
 	assert.Equal(t, fromYAML.DefaultCombat, fromDB.DefaultCombat, "round-trip: pack default_combat scalar")
 
+	// Pack-level scalar (#47): WorldScript rides pack_meta.world_script — the demo ships one, so a drop on
+	// the store import/load path shows here. Non-empty in the demo, so this also asserts the field is populated.
+	assert.Equal(t, fromYAML.WorldScript, fromDB.WorldScript, "round-trip: pack world_script scalar")
+	assert.NotEmpty(t, fromYAML.WorldScript, "the demo pack should ship a world_script (#47)")
+
 	// Deep-compare every pack-GLOBAL def kind, the same way the zone DeepEqual above covers zone
 	// content. THIS is the systemic catch: a global def is NOT zone content, so the zones-only
 	// round-trip never saw a top-level field silently dropped on the store import/load path — the

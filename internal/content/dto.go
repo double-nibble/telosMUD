@@ -123,6 +123,24 @@ type Pack struct {
 	// engine's built-in pvp_allowed policy. A missing/erroring policy FAILS CLOSED (denies harm).
 	PvpLua string `json:"pvp_lua" yaml:"pvp_lua"`
 
+	// WorldScript is the OPTIONAL content-defined WORLD-DIRECTOR script (#47, Phase 10.4): a sandboxed Lua
+	// body run in the telos-director that defines `on_signal(event, payload)` — the orchestration logic
+	// reacting to the signal-up events its zones emit (a zone signals "boss_slain" up; the world script
+	// writes world state + broadcasts the consequence down). A pack-GLOBAL scalar like PvpLua (world is a
+	// singleton scope with no def); the LAST non-empty pack value wins — there is ONE world orchestrator, so
+	// multiple packs wanting to react must merge into one script. Empty => the director drains+acks signals
+	// with no reaction. Region-director scripts (a Script field on RegionDTO) are a documented follow-up.
+	//
+	// IDEMPOTENCY CONTRACT: signal-up is durable/at-least-once and a crash between handler-run and ack
+	// replays an event once, so `on_signal` MUST be idempotent — write values DERIVED from the payload,
+	// never a blind read-modify-write (get N, set N+1 double-counts on replay). NOTE the replay also re-fires
+	// any director.broadcast the handler made, so a down-broadcast can be a PLAYER-VISIBLE duplicate — keep
+	// announcements tolerant of a repeat. GUARD on your own event names: on_signal receives every non-boss.died
+	// signal, including engine events (content.reload.audit / content.pull.result), so a catch-all branch would
+	// react to engine internals. In-VM Lua globals persist across calls but are EPHEMERAL (per-instance, lost on
+	// failover, not leader-fenced) — authoritative state goes through director.set, never a Lua global.
+	WorldScript string `json:"world_script" yaml:"world_script"`
+
 	// Formulas are the OPTIONAL Lua ruleset-formula overrides (Phase 7.4f): a map of formula name
 	// (to_hit/soak/regen/xp_for) to a Lua body that returns a number, an alternative to the prefix-AST
 	// data formula. A ref uses the data formula OR the Lua one, never both.
