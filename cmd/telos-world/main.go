@@ -178,9 +178,31 @@ func main() {
 						"reclaimed_infra", res.ReclaimedInfra, "reclaimed_client", res.ReclaimedClient)
 				}
 			} else {
-				shard.Drain() // single-shard: no peer to hand off to; best-effort durable flush
+				// Single-shard: no peer to hand off to; durably flush every resident instead. Drain waits for
+				// each zone to dump onto the saver queue.
+				dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				if dropped := shard.Drain(dctx); dropped > 0 {
+					slog.Warn("some flushes never reached the saver queue", "dropped", dropped)
+				}
+				cancel()
 			}
+			// SAVER BARRIER (#282): the flushes above are only ENQUEUED. The saver's drainer returns on ctx
+			// cancel without emptying its buffer, and stopWorld below cancels it — so the reclaimed cohort,
+			// enqueued last, is exactly the cohort whose writes would be thrown away. Wait for the queue to
+			// drain before pulling the rug. Bounded, so a wedged store delays shutdown but cannot hang it.
+			fctx, fcancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if ferr := shard.FlushSaver(fctx); ferr != nil {
+				// Note this is not necessarily data loss: handle() writes the Redis checkpoint BEFORE it
+				// attempts the Postgres CAS, so a barrier that timed out on a wedged Postgres has usually
+				// still mirrored drain-time state to the checkpoint tier, which the next login reads.
+				slog.Warn("saver did not drain before shutdown; queued Postgres writes were abandoned", "err", ferr)
+			} else {
+				slog.Info("saver drained; every save that reached the queue is durable")
+			}
+			fcancel()
 		case <-worldCtx.Done():
+			// A lease fence cancelled the world context: the saver drainer is already gone, so there is no
+			// barrier to take. Nothing was drained and nothing can be flushed.
 			slog.Warn("lease fence: stopping without drain")
 		}
 		stopWorld()       // stop the zone + saver goroutines (state already flushed / handed off)

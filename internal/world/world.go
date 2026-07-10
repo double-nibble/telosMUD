@@ -766,13 +766,60 @@ func (s *Shard) Run(ctx context.Context) {
 // the saver writes the snapshots off-goroutine. Phase 4 BUILDS this hook; the placement controller
 // that TRIGGERS a drain (graceful handoff of every player before shutdown) is Phase 10. A no-op on
 // a disabled (ephemeral) saver.
-func (s *Shard) Drain() {
+func (s *Shard) Drain(ctx context.Context) (dropped int) {
 	if s.saver == nil || !s.saver.enabled() {
-		return
+		return 0
 	}
-	for _, z := range s.zonesList() {
-		z.post(drainFlushMsg{})
+	zones := s.zonesList()
+	dones := make([]chan int, 0, len(zones))
+	for _, z := range zones {
+		done := make(chan int, 1)
+		select {
+		case z.inbox <- drainFlushMsg{ctx: ctx, done: done}:
+			dones = append(dones, done)
+		case <-ctx.Done():
+			return dropped // a zone whose loop has stopped consuming must not block shutdown
+		}
 	}
+	// WAIT for each zone to have DUMPED its players onto the saver queue (#282). Posting alone proves
+	// nothing: a saver barrier taken immediately afterwards could drain an empty queue and report success
+	// while the zones' saves were still sitting unposted in their inboxes.
+	for _, done := range dones {
+		select {
+		case n := <-done:
+			dropped += n
+		case <-ctx.Done():
+			return dropped
+		}
+	}
+	return dropped
+}
+
+// FlushSaver blocks until every save enqueued so far has been written durably, or ctx expires, or the
+// saver's drainer is already gone (#282).
+//
+// Call it between the drain and the shutdown that cancels the world context. The saver's drainer returns on
+// ctx cancel WITHOUT draining its buffer, so without this barrier the reclaimed stragglers — enqueued last,
+// microseconds before the cancel — lose their flush and come back up to a cadence-tick-stale state.
+//
+// It watches the shard's run context as well as the caller's: a lease fence can cancel worldCtx mid-drain,
+// killing the drainer, and without that watch the barrier's blocking send would stall for the caller's whole
+// timeout on a shutdown path that has nothing left to flush.
+//
+// A non-zero `dropped` from Drain means some saves never reached the queue at all; this barrier says nothing
+// about those. The caller must report them.
+func (s *Shard) FlushSaver(ctx context.Context) error {
+	if s.saver == nil {
+		return nil
+	}
+	s.mu.Lock()
+	runCtx := s.runCtx
+	s.mu.Unlock()
+	var dead <-chan struct{}
+	if runCtx != nil {
+		dead = runCtx.Done()
+	}
+	return s.saver.flush(ctx, dead)
 }
 
 // Register installs the gRPC Play and Handoff services on the given server. The Play

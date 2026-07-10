@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 )
@@ -68,6 +69,12 @@ type saveRequest struct {
 	zone   *Zone
 	id     string
 	reason saveReason
+	// barrier makes this request a SENTINEL rather than a save (#282). The drainer closes it on dequeue
+	// and never passes the request to handle. Because one goroutine drains a FIFO queue, dequeuing the
+	// sentinel proves every request enqueued before it has already completed its I/O. A dedicated field,
+	// not a magic saveReason: reason is switched on in several places and a value outside its iota range
+	// would be one forgotten `default` away from writing a zero-valued character row.
+	barrier chan struct{}
 }
 
 // saver owns the character store + checkpointer and a buffered request channel drained by a
@@ -135,8 +142,76 @@ func (sv *saver) run(ctx context.Context) {
 			sv.log.Debug("saver loop stop")
 			return
 		case req := <-sv.reqs:
+			if req.barrier != nil {
+				// FIFO + single drainer: everything queued before this sentinel is already written.
+				close(req.barrier)
+				continue
+			}
 			sv.handle(ctx, req)
 		}
+	}
+}
+
+// enqueueCtx is the BLOCKING, ctx-bounded enqueue used by the drain path. Unlike enqueue, it does not drop
+// on a full queue — a dropped drain flush is exactly the data loss #282 exists to prevent, and dropping it
+// silently while a barrier reports success would be worse than not having a barrier at all. It reports
+// whether the request made it in.
+//
+// The ctx bound is what keeps this safe. A zone goroutine blocking here while the drainer blocks posting a
+// saveConflictMsg into that same zone's full inbox would deadlock; the drain deadline breaks the cycle.
+func (sv *saver) enqueueCtx(ctx context.Context, req saveRequest) bool {
+	if !sv.enabled() {
+		return true // nothing to write; not a loss
+	}
+	select {
+	case sv.reqs <- req:
+		return true
+	case <-ctx.Done():
+		sv.log.Warn("drain save dropped: saver queue full and the drain deadline expired",
+			"player", req.id, "reason", req.reason)
+		return false
+	}
+}
+
+// flush blocks until every request already in the queue has been written, or ctx expires, or the drainer is
+// gone (dead closed).
+//
+// It exists because the drainer returns on ctx cancel WITHOUT draining its buffer. On a graceful drain the
+// reclaimed stragglers' flush is enqueued LAST, microseconds before shutdown cancels that context — so the
+// one cohort whose only durability path is this flush was exactly the cohort most likely to have it thrown
+// away. Redirected players are unaffected (their state crosses in the handoff snapshot, not via the saver).
+//
+// The sentinel is enqueued with a BLOCKING send, not saver.enqueue's drop-on-full: a dropped barrier would
+// make the caller wait out its whole timeout for a signal that can never come. `dead` covers the other side
+// of that — if the drainer has already exited (a lease fence cancelled the world context mid-drain), the
+// send would otherwise block for the caller's whole timeout on a shutdown path with nothing to flush.
+//
+// RESIDUAL, deliberately not closed (distsys review): a saveFlush whose Postgres CAS MISSES bounces a
+// saveConflictMsg back to its zone, which re-dumps and enqueues a NEW request — landing after this sentinel
+// and therefore outside the barrier. The only contender at drain time is this shard's own save cadence,
+// dumping the same session at the same moment, so whichever CAS wins persists equivalent state before the
+// barrier and the loser's re-dump is redundant. Looping the barrier until the queue is quiescent would
+// LIVELOCK against that still-ticking cadence, so it stays single-shot.
+func (sv *saver) flush(ctx context.Context, dead <-chan struct{}) error {
+	if !sv.enabled() {
+		return nil // no durable tier: nothing was ever queued
+	}
+	barrier := make(chan struct{})
+	select {
+	case sv.reqs <- saveRequest{barrier: barrier}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-dead:
+		return errors.New("saver drainer already stopped")
+	}
+	select {
+	case <-barrier:
+		sv.log.Debug("saver queue drained")
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-dead:
+		return errors.New("saver drainer stopped before the barrier completed")
 	}
 }
 
@@ -180,6 +255,13 @@ const finalFlushIOTimeout = 750 * time.Millisecond
 // The saver NEVER mutates entity state here; on success it posts the bumped state_version back via
 // saveOkMsg so a still-present session (the non-final case) stays monotonic for its next save.
 func (sv *saver) handle(ctx context.Context, req saveRequest) {
+	if req.barrier != nil {
+		// Unreachable: run intercepts the sentinel. Defensive, because a barrier that reached here would
+		// checkpoint a zero-valued CharSnapshot under an empty name.
+		sv.log.Error("saver barrier sentinel reached handle; dropping")
+		close(req.barrier)
+		return
+	}
 	ioCtx, cancel := context.WithTimeout(ctx, saveIOTimeout)
 	defer cancel()
 
