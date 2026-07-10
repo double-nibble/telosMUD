@@ -17,31 +17,60 @@ type fakeLeaser struct {
 	releases  map[string]int
 	handovers []string
 	denied    map[string]bool
+	owner     map[string]string
+	gen       map[string]uint64
 }
 
 func newFakeLeaser() *fakeLeaser {
-	return &fakeLeaser{claims: map[string]int{}, releases: map[string]int{}, denied: map[string]bool{}}
+	return &fakeLeaser{
+		claims: map[string]int{}, releases: map[string]int{}, denied: map[string]bool{},
+		owner: map[string]string{}, gen: map[string]uint64{},
+	}
 }
 
-func (f *fakeLeaser) ClaimZone(_ context.Context, zoneID, _ string, _ time.Duration) (bool, error) {
+func (f *fakeLeaser) ClaimZone(_ context.Context, zoneID, shardID string, _ time.Duration) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claims[zoneID]++
-	return !f.denied[zoneID], nil
+	if f.denied[zoneID] {
+		return false, nil
+	}
+	if f.owner[zoneID] != shardID {
+		f.owner[zoneID] = shardID
+		f.gen[zoneID]++
+	}
+	return true, nil
 }
 
 func (f *fakeLeaser) ReleaseZone(_ context.Context, zoneID, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.releases[zoneID]++
+	delete(f.owner, zoneID) // the generation survives a release — it is monotonic per zone, not per owner
 	return nil
 }
 
+// HandoverZone mirrors the real owner-fenced Lua, refusals included: a flip from a shard that is not the live
+// owner, and a self-handover, both fail and bump nothing. A double that always reports "flipped" would hide
+// exactly the bug the fence exists to catch.
 func (f *fakeLeaser) HandoverZone(_ context.Context, zoneID, from, to string, _ time.Duration) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if from == to || f.owner[zoneID] != from {
+		return false, nil
+	}
 	f.handovers = append(f.handovers, from+"->"+to+":"+zoneID)
+	f.gen[zoneID]++
+	f.owner[zoneID] = to
 	return true, nil
+}
+
+// ZoneLease models the directory's #315 fence: the generation moves on an ownership CHANGE, never on a
+// renewal. A fake that returned a constant would let a stale-generation bug pass every test that uses it.
+func (f *fakeLeaser) ZoneLease(_ context.Context, zoneID string) (string, uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.owner[zoneID], f.gen[zoneID], nil
 }
 
 func (f *fakeLeaser) deny(zoneID string)      { f.mu.Lock(); f.denied[zoneID] = true; f.mu.Unlock() }

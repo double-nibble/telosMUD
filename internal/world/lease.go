@@ -19,6 +19,12 @@ type ZoneLeaser interface {
 	ClaimZone(ctx context.Context, zoneID, shardID string, ttl time.Duration) (bool, error)
 	ReleaseZone(ctx context.Context, zoneID, shardID string) error
 	HandoverZone(ctx context.Context, zoneID, fromShard, toShard string, ttl time.Duration) (bool, error)
+	// ZoneLease reads a zone's live owner ("" when unowned) and its lease GENERATION (#315) — the fence
+	// token AdoptZone binds. The generation increments on every ownership CHANGE, never on a renewal, so
+	// the source can sign the value it observes while holding the lease and the destination can check it
+	// against the directory. The moment the HandoverZone flip lands the generation moves, and the request
+	// is dead.
+	ZoneLease(ctx context.Context, zoneID string) (owner string, gen uint64, err error)
 }
 
 // WithZoneLeasing moves zone-lease RENEWAL into the shard (from cmd/telos-world's per-zone renewZoneLease
@@ -135,11 +141,16 @@ func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
 	// the shard's whole lifetime. That matters because ClaimZone is fenced only against a LIVE lease
 	// (directory/redis.go): the instant the real owner's lease lapses — a crash, a partition, a GC pause past
 	// the 15s TTL — an unconfirmed renewer WINS it, and starts writing to a zone it was never given. An
-	// AdoptZone whose HandoverZone flip never lands (the source died mid-drain, #327) or which was REPLAYED
-	// inside its clock-skew window (#262) plants exactly such a renewer. A legitimate adoption confirms within
-	// a round trip of its flip, so a deadline of pendingTTL costs it nothing and denies the rest a permanent
-	// foothold. #315 (binding the signature to the zone's lease generation) is what makes a replay
-	// unrepresentable; this bound is what makes the residual survivable until then.
+	// AdoptZone whose HandoverZone flip never lands (the source died mid-drain, #327) plants exactly such a
+	// renewer. A legitimate adoption confirms within a round trip of its flip, so a deadline of pendingTTL
+	// costs it nothing and denies the rest a permanent foothold. (A REPLAYED AdoptZone used to plant one too;
+	// #315 bound the signature to the zone's lease generation, so that route is now closed at the door. This
+	// bound still covers the honest-but-abandoned adoption, which no signature scheme can detect.)
+	//
+	// Note the deadline only bites the pathological case. When the SOURCE DIES mid-drain, its lease lapses
+	// after the (much shorter) zone TTL and this renewer simply wins the zone on an ordinary ClaimZone — one
+	// owner, faster recovery. What pendingTTL bounds is the source that stays alive and renewing while its
+	// flip never lands.
 	confirmed := false
 	adoptingSince := time.Now()
 	for {
@@ -279,19 +290,36 @@ func (s *Shard) handoverZoneTo(ctx context.Context, zoneID, targetShardID, targe
 		// markZoneHandedOff stops us renewing it → the live zone's lease silently expires (#42 review guard).
 		return fmt.Errorf("handover %q: refusing self-handover to %s", zoneID, targetShardID)
 	}
+	// Read the lease GENERATION we are handing over at (#315). We still hold the lease here — the flip is
+	// several statements below — so this value is stable, and it is what the destination checks against the
+	// directory. A read failure aborts the handover: the zone stays with us, which is the drain's normal
+	// degraded outcome.
+	owner, leaseGen, gerr := s.leaser.ZoneLease(ctx, zoneID)
+	if gerr != nil {
+		return fmt.Errorf("handover %q: read lease generation: %w", zoneID, gerr)
+	}
+	if owner != s.shardID {
+		// Not the live owner: there is nothing to hand over and the flip below would be refused anyway. Bail
+		// before making the peer build a zone for a handover that cannot land.
+		return fmt.Errorf("handover %q: not the live owner (owner=%q)", zoneID, owner)
+	}
+
 	client, err := s.peers(targetAddr)
 	if err != nil {
 		return fmt.Errorf("handover %q: dial target %s: %w", zoneID, targetAddr, err)
 	}
-	// #262: sign the adopt request with the shared handoff key. The digest binds the DESTINATION shard and an
-	// issue time, so this request is worthless at any other shard and expires — it is not a standing
-	// capability to force a host. An unkeyed source signs nothing, and a keyed destination then rejects it:
-	// a mixed-version drain fails closed (the source keeps the zone) rather than adopting unauthenticated.
+
+	// #262/#315: sign the adopt request with the shared handoff key. The digest binds the DESTINATION shard
+	// and the zone's lease GENERATION, so this request is worthless at any other shard and stops being
+	// honored the instant our HandoverZone flip below increments that generation. It is not a standing
+	// capability to force a host, and it does not depend on either peer's clock. An unkeyed source signs
+	// nothing, and a keyed destination then rejects it: a mixed-version drain fails closed (the source keeps
+	// the zone) rather than adopting unauthenticated.
 	adopt := &handoffv1.AdoptZoneRequest{
-		ZoneId:         zoneID,
-		FromShardId:    s.shardID,
-		ToShardId:      targetShardID,
-		IssuedAtUnixMs: time.Now().UnixMilli(),
+		ZoneId:      zoneID,
+		FromShardId: s.shardID,
+		ToShardId:   targetShardID,
+		LeaseGen:    leaseGen,
 	}
 	adopt.ZoneSig = signAdoptZone(s.handoffSignKey, adopt)
 	if _, err := client.AdoptZone(ctx, adopt); err != nil {

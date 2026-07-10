@@ -60,16 +60,34 @@ message AdoptZoneRequest {
   //
   // A signature over zone_id ALONE would be replayable forever, so the digest also binds:
   //   - to_shard_id, so a signature captured for one shard cannot be replayed against another;
-  //   - issued_at_unix_ms, which the verifier bounds by a clock-skew window, so a captured request
-  //     expires. (A replay INSIDE the window is harmless: HostZone is idempotent.)
+  //   - lease_gen, the zone lease's monotonic generation, which makes a replay UNREPRESENTABLE rather
+  //     than merely time-bounded (#315).
   // from_shard_id names the requesting peer, binding the (from,to) pair and giving the audit a subject.
   string from_shard_id = 2;
   string to_shard_id = 3;
-  int64 issued_at_unix_ms = 4;
+  // lease_gen is the zone lease's generation as the SOURCE observed it while still holding the lease
+  // (#315). The directory increments it on every ownership CHANGE — a claim by a new owner, and the
+  // HandoverZone flip that ends this very drain. The destination verifies it against the directory's
+  // current generation, so the instant the flip lands, this request is dead: a captured AdoptZone can
+  // never be replayed to force a rebuild.
+  //
+  // It supersedes issued_at_unix_ms (field 4, deprecated below).
+  uint64 lease_gen = 6;
   // zone_sig is an Ed25519 signature over a canonical digest of the fields above (internal/world/
   // handoffsig.go), verified when the destination has a handoff verify key. Empty when signing is
   // unconfigured (dev/test), where the #260 keyless refusal governs instead.
   bytes zone_sig = 5;
+
+  // DEPRECATED (#315), never read and never set. #262 bounded a replay by a 60s clock-skew window around
+  // this issue time. That was weaker than it looked: a replay inside the window was harmless only by
+  // accident, resting on HostZone's idempotence and on s.zones never being pruned; and it dragged a clock
+  // dependence into the drain control plane, where a peer with >60s of drift became silently
+  // undrainable-to. lease_gen replaces it with a fence a replay cannot get around.
+  //
+  // The field stays on the wire (rather than reserved) so an old peer's request still decodes during a
+  // rolling upgrade. It is outside the signing digest, so setting it authorizes nothing. Do not reuse
+  // field 4 for anything else.
+  int64 issued_at_unix_ms = 4 [deprecated = true];
 }
 
 message AdoptZoneResponse {
