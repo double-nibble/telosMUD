@@ -545,6 +545,16 @@ type chargenBody struct {
 	Steps []content.ChargenStepDTO `json:"steps,omitempty"`
 }
 
+// helpBody is the JSONB-tail shape for a help_defs row (#64): everything but the ref/pack PK — the topic's
+// title, category, keyword aliases, body text, and see-also list.
+type helpBody struct {
+	Title    string   `json:"title,omitempty"`
+	Category string   `json:"category,omitempty"`
+	Keywords []string `json:"keywords,omitempty"`
+	Body     string   `json:"body,omitempty"`
+	SeeAlso  []string `json:"see_also,omitempty"`
+}
+
 // displayDefBody is the JSONB-tail shape for a display_defs row: the Lua render body, everything but the
 // (pack, surface) PK.
 type displayDefBody struct {
@@ -1150,6 +1160,36 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	cgRows.Close()
+
+	// Help topics (#64): ref+pack first-class, the title/category/keywords/body/see_also in the JSONB body.
+	hdRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM help_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query help_defs: %w", err)
+	}
+	for hdRows.Next() {
+		var hd content.HelpDTO
+		var pk string
+		var body []byte
+		if err := hdRows.Scan(&hd.Ref, &pk, &body); err != nil {
+			hdRows.Close()
+			return fmt.Errorf("store: scan help_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b helpBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				hdRows.Close()
+				return fmt.Errorf("store: help_def %s body: %w", hd.Ref, err)
+			}
+			hd.Title, hd.Category, hd.Keywords = b.Title, b.Category, b.Keywords
+			hd.Body, hd.SeeAlso = b.Body, b.SeeAlso
+		}
+		pack(pk).HelpDefs = append(pack(pk).HelpDefs, hd)
+	}
+	if err := hdRows.Err(); err != nil {
+		return err
+	}
+	hdRows.Close()
 
 	// Display templates: (pack, surface) first-class, the Lua render body in the JSONB body. Ordered by
 	// (pack, surface) for deterministic load; the loader's per-pack accumulation applies last-write-wins.

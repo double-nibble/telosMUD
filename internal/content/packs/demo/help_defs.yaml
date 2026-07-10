@@ -1,0 +1,47 @@
+# Builder-defined help topics (#64). A browsable `help` / `help <topic>` reads these; the engine names no
+# topic and auto-includes the registered command set on top, so the command index shows even with no rows.
+# A topic is reachable by its ref leaf (implicit keyword) and by any declared keyword; `body` may carry the
+# engine {{TOKEN}} color markup (rendered at the edge, stripped for `color off` players).
+help_defs:
+  - ref: help:getting_started
+    title: Getting Started
+    category: Getting Started
+    keywords: [start, newbie, begin]
+    body: |-
+      Welcome, adventurer.  Move between rooms with the compass directions
+      ({{FG_CYAN}}north{{RESET}}, {{FG_CYAN}}south{{RESET}}, {{FG_CYAN}}east{{RESET}}, {{FG_CYAN}}west{{RESET}}, {{FG_CYAN}}up{{RESET}}, {{FG_CYAN}}down{{RESET}} — or just n/s/e/w/u/d).
+      Use {{FG_CYAN}}look{{RESET}} to survey a room and {{FG_CYAN}}score{{RESET}} to see your character sheet.
+      Type {{FG_CYAN}}help <topic>{{RESET}} for more on a subject, or just {{FG_CYAN}}help{{RESET}} for the index.
+    see_also: [movement, combat, communication]
+
+  - ref: help:movement
+    title: Moving Around
+    category: Getting Started
+    keywords: [move, directions, travel]
+    body: |-
+      Travel by typing a direction: north, south, east, west, up, or down.
+      Each may be abbreviated to its first letter (n, s, e, w, u, d).
+      The exits available from your current room are listed when you look.
+    see_also: [getting_started]
+
+  - ref: help:combat
+    title: Combat
+    category: Combat
+    keywords: [fighting, kill, attack]
+    body: |-
+      Start a fight with {{FG_CYAN}}kill <target>{{RESET}}.  Combat resolves in rounds until one
+      side falls or flees.  Break off a losing fight with {{FG_CYAN}}flee{{RESET}} — it moves you
+      a random open exit, but a fast foe may still land a parting blow.
+      Watch your health on your {{FG_CYAN}}score{{RESET}} sheet.
+    see_also: [getting_started]
+
+  - ref: help:communication
+    title: Talking to Others
+    category: Communication
+    keywords: [comms, talk, chat, say, tell]
+    body: |-
+      Speak to everyone in your room with {{FG_CYAN}}say <message>{{RESET}} (or just a leading ').
+      Send a private message across the world with {{FG_CYAN}}tell <player> <message>{{RESET}},
+      and answer the last person who told you with {{FG_CYAN}}reply <message>{{RESET}}.
+      See who else is online with {{FG_CYAN}}who{{RESET}}.
+    see_also: [getting_started]

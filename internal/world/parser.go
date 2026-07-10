@@ -94,6 +94,21 @@ func newCommandTable(cmds []*Command) *commandTable {
 	return t
 }
 
+// register appends one command at the LOWEST precedence (highest priority index) after the base table is
+// built. It exists so a command whose handler transitively reads baseTable (help, #64: it auto-includes the
+// command set) can be registered from an init() WITHOUT forming a package-initialization cycle — registering
+// it inside registerCommands, which baseTable's var initializer calls, would make baseTable depend on itself.
+// init() runs after every package var is initialized, so the table is fully built here. Not for runtime use
+// (baseTable is read-only once dispatch begins); an init()-time append is single-goroutine and safe.
+func (t *commandTable) register(c *Command) {
+	c.priority = len(t.ordered)
+	t.ordered = append(t.ordered, c)
+	t.byExact[c.Name] = c
+	for _, a := range c.Aliases {
+		t.byExact[a] = c
+	}
+}
+
 // resolve maps a typed verb to a command using the documented precedence (MUDLIB §6):
 //
 //  1. an exact match (canonical name or alias) always wins;

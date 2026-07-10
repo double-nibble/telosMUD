@@ -59,6 +59,10 @@ type LoadedContent struct {
 	// DisplayDefs are the pack-global display templates (Lua render body per surface), accumulated across
 	// packs (last-write-wins by surface). The world side registers them into the per-shard display table.
 	DisplayDefs []DisplayDefDTO
+	// HelpDefs are the pack-global help topics (#64), same last-write-wins override rule keyed by ref. The
+	// world side registers them into the per-shard help registry; the `help` command reads them and layers
+	// the auto-included command set on top. An empty list => no topics (the command index still renders).
+	HelpDefs []HelpDTO
 	// Channels are the pack-global comms channel definitions (Phase 8.3), same last-write-wins
 	// override rule keyed by ref. The world side registers them into the per-shard channel registry
 	// and binds each channel's verb(s) into the per-shard channel-command table. An empty list => no
@@ -190,6 +194,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	lootIdx := make(map[string]int)
 	schedIdx := make(map[string]int)
 	recipeIdx := make(map[string]int)
+	helpIdx := make(map[string]int)
 	wearSlotIdx := make(map[string]int)
 	chargenIdx := make(map[string]int)
 	trustIdx := make(map[string]int)
@@ -336,6 +341,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				recipeIdx[rc.Ref] = len(lc.Recipes)
 				lc.Recipes = append(lc.Recipes, rc)
+			}
+		}
+		for _, hd := range p.HelpDefs {
+			if idx, ok := helpIdx[hd.Ref]; ok {
+				lc.HelpDefs[idx] = hd
+			} else {
+				helpIdx[hd.Ref] = len(lc.HelpDefs)
+				lc.HelpDefs = append(lc.HelpDefs, hd)
 			}
 		}
 		for _, ws := range p.WearSlots {

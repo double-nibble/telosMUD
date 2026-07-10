@@ -73,6 +73,9 @@ func registerCommands() []*Command {
 	// Screen utilities (#31): `clear` — engine-owned raw-ANSI output, universal. Low-priority so `cl` still
 	// abbreviates to `close`.
 	base = append(base, screenCommands()...)
+	// NOTE: `help` (#64) is NOT registered here. Its handler (cmdHelp) transitively reads baseTable to
+	// auto-include the command set, so registering it inside this function — which baseTable's initializer
+	// calls — would form a package-init cycle. It is appended post-construction via an init() in help.go.
 	// Staff verbs (#29 stat, #30 view toggles): registered LAST (lowest priority) and each carries a
 	// positive MinRank, so a staff verb is both invisible below that rank (dispatch gate) and never wins an
 	// abbreviation against a mortal verb.

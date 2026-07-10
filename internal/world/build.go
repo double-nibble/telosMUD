@@ -210,6 +210,11 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, rc := range lc.Recipes {
 		d.recipe.register(rc.Ref, buildRecipeDef(rc))
 	}
+	// Help topics (#64): builder-defined help into the per-shard registry. The `help` command reads it and
+	// layers the auto-included built-in command set on top, so an empty list still yields a command index.
+	for _, hd := range lc.HelpDefs {
+		d.help.register(hd.Ref, buildHelpDef(hd))
+	}
 	d.defaultCombat = lc.DefaultCombat
 	// Trust ladder (#27/#29, Round 9 Slice 0): build the content-defined tier→rank+flags ladder. An empty
 	// list leaves d.trust nil so z.trustLadder() falls back to the engine default (round-8 mapping).
