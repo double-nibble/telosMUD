@@ -423,8 +423,23 @@ type saveReconcileMsg struct {
 
 // drainFlushMsg requests an immediate durable flush of every persisted player in this zone — the
 // shard-drain flush point (Shard.Drain, a rolling-redeploy hook). The dump runs on the zone
-// goroutine; the write is the saver's job. Phase 4 builds it; Phase 10 wires the trigger.
-type drainFlushMsg struct{}
+// goroutine; the write is the saver's job.
+//
+// done, when non-nil, is CLOSED once the dump has been enqueued to the saver. It makes Drain a real
+// barrier: without it the caller only knows the message was posted, not that the zone processed it, and a
+// saver-drain barrier posted immediately afterwards could be handled BEFORE the zone's saves ever reached
+// the queue (#282).
+type drainFlushMsg struct {
+	// ctx bounds the BLOCKING enqueue of each dumped player onto the saver queue. Passing a context in a
+	// message is unusual; it is deliberate. The drain's per-player saves must not be dropped on a full
+	// queue (that is the loss #282 exists to prevent), so the zone blocks to get them in — and the drain
+	// deadline is what stops that block from deadlocking against a drainer that is itself blocked posting
+	// a save-conflict into this zone's full inbox.
+	ctx context.Context
+	// done receives the number of saves that could NOT be enqueued before ctx expired, then is closed.
+	// A non-zero count means the barrier's success is a lie for those players, and the caller says so.
+	done chan int
+}
 
 // createdMsg carries a freshly-minted PersistID back to the zone after a brand-new character's
 // row was INSERTed off the zone goroutine (createCharacter). The zone adopts the UUID onto the
@@ -750,7 +765,15 @@ func (z *Zone) handle(m msg) {
 	case saveReconcileMsg:
 		z.saveReconcile(v.id, v.newVersion)
 	case drainFlushMsg:
-		z.saveAll(saveFlush)
+		if v.done == nil {
+			z.saveAll(saveFlush) // the rebalance path: fire-and-forget, the saver is not being cancelled
+			break
+		}
+		// The shutdown path: block (bounded) to get every dump onto the saver queue, and report any that
+		// still could not be enqueued, so the caller's "all durable" claim stays honest.
+		dropped := z.saveAllBlocking(v.ctx, saveFlush)
+		v.done <- dropped
+		close(v.done)
 	case drainZoneMsg:
 		z.drainZone() // Phase 16.4b: hand every live player off to the zone's new (post-flip) owner
 	case reclaimStragglersMsg:
@@ -1841,6 +1864,30 @@ func (z *Zone) saveAll(reason saveReason) {
 		}
 		z.enqueueSave(id, s, reason)
 	}
+}
+
+// saveAllBlocking is saveAll for the DRAIN path: it dumps every persisted resident and BLOCKS (bounded by
+// ctx) to get each one onto the saver queue, rather than dropping on a full queue. It returns how many it
+// still could not enqueue before ctx expired.
+//
+// The ordinary saveAll drops on a full queue, which is right for the ~60s cadence (the next tick re-enqueues)
+// and catastrophic at drain (there is no next tick — the process is exiting, and this flush is the straggler
+// cohort's only durability path). saveQueueDepth is a shard-wide 256, and a failed-handover drain or a
+// single-shard shutdown can make a zone dump far more residents than that at once.
+func (z *Zone) saveAllBlocking(ctx context.Context, reason saveReason) int {
+	dropped := 0
+	for id, s := range z.players {
+		if s.pending || s.frozen || s.entity == nil || s.entity.pid == nil {
+			continue
+		}
+		if z.saver == nil || !z.saver.enabled() {
+			continue
+		}
+		if !z.saver.enqueueCtx(ctx, saveRequest{snap: dumpCharacter(s), zone: z, id: id, reason: reason}) {
+			dropped++
+		}
+	}
+	return dropped
 }
 
 // enqueueSave dumps one session (on the zone goroutine) and hands the snapshot to the async saver.

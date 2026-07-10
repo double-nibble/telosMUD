@@ -286,7 +286,10 @@ wait:
 	// Both the post and the collect select on ctx so a zone whose loop has stopped consuming (a lease fence
 	// cancelling worldCtx mid-drain, or a wedged handler) can never block shutdown past the drain deadline —
 	// on either timeout the zone's residents are counted best-effort as infra-fault via the atomic pop.
-	s.Drain()
+	if dropped := s.Drain(ctx); dropped > 0 {
+		slog.Warn("drain: some straggler flushes never reached the saver queue; those players will load stale state",
+			"dropped", dropped)
+	}
 	resps := make([]chan reclaimTally, len(zones))
 	for i, z := range zones {
 		ch := make(chan reclaimTally, 1)
