@@ -54,6 +54,7 @@ type reloadOutcome struct {
 	failed     bool     // an infrastructure failure (re-read/publish error) — logged, best-effort
 	checkOnly  bool     // true => a `reload --check` dry run that validated OK and deliberately published nothing
 	sharedDefs []string // #56: shared-def kinds present in the reloaded packs that are NOT hot-applied (rolling-reboot reminder)
+	advisories []string // #309: ADVISORY (non-blocking) heads-ups — a NOT-reloaded pack references a room/proto THIS reload removes
 }
 
 // sharedDefKinds returns the sorted, de-duplicated labels of the pack-GLOBAL "shared def" kinds present in
@@ -544,4 +545,105 @@ func channelRefSubjectProblem(ref string) string {
 		}
 	}
 	return ""
+}
+
+// advisoryReloadRemovals surfaces (NON-BLOCKING, #309) the inverse of the #205 provenance gate: a room or
+// prototype that THIS reload removes, still referenced by a NOT-reloaded pack. Example: reloading pack A drops
+// room az:room:5, but pack B (not reloaded) has an exit bz:room:9 -> az:room:5. #205 correctly does NOT
+// hard-block A for B's dependency — B's dangling exit is rooted out of scope — but silently letting the
+// operator remove something another pack still points at is a footgun. This is the heads-up: not a rejection,
+// a line in the reload readout.
+//
+// PRECISION needs a pre-vs-post diff, not a snapshot: a dangling out-of-scope reference is only THIS reload's
+// doing if its target USED TO resolve. A target that was never live is a pre-existing defect in the depending
+// pack, not ours, and must not be warned (that is the no-false-positive invariant #205 also holds). `wasLive`
+// is the "before" snapshot — the shard's live proto cache at VALIDATE TIME, which still holds the pre-reload
+// prototypes: this reload's removal lands only when the publish drives the zone-shape reconcile
+// (KindZone -> reconcileZone -> removeRoom -> protoCache.reload(ref,nil)), which runs AFTER the advisory is
+// computed. So target-absent-from-the-re-read-graph AND wasLive == "this reload removes a currently-live
+// room/proto", and since only in-scope packs are re-read/changed, the removal is attributable to this reload.
+//
+// It scans only OUT-OF-SCOPE zones: an in-scope pack's own dangling reference to something it removed is
+// already hard-rejected by validateRoomExits/validateResets, so it never reaches here.
+//
+// One honest caveat: the DEPENDER side (the out-of-scope zone's exits/resets) is read from the re-read `full`
+// graph, which is the current SOURCE, not necessarily the depender's LIVE state — the same basis #205 uses. If
+// an out-of-scope pack's source was edited since boot without reloading it, the reference set can diverge. So
+// the wording is "still references", not a promise about the running world.
+func advisoryReloadRemovals(s *reloadScope, wasLive func(ref string) bool) []string {
+	if wasLive == nil {
+		return nil
+	}
+	zones := s.liveZones()
+	// The post-reload resolution sets: every room ref (exit targets) and every spawnable proto ref (reset
+	// targets: rooms are spawnable too — a degenerate reset naming a room — so rooms are in both sets).
+	roomRefs := map[string]bool{}
+	protoRefs := map[string]bool{}
+	for _, z := range zones {
+		for _, r := range z.Rooms {
+			roomRefs[r.Ref] = true
+			protoRefs[r.Ref] = true
+		}
+		for _, p := range z.Items {
+			protoRefs[p.Ref] = true
+		}
+		for _, p := range z.Mobs {
+			protoRefs[p.Ref] = true
+		}
+	}
+	var advisories []string
+	for _, z := range zones {
+		if s.zoneInScope(z.Ref) {
+			continue // an in-scope pack's own dangler is already hard-rejected; #309 is about the OUT-OF-SCOPE depender
+		}
+		for _, r := range z.Rooms {
+			dirs := make([]string, 0, len(r.Exits))
+			for dir := range r.Exits {
+				dirs = append(dirs, dir)
+			}
+			sort.Strings(dirs)
+			for _, dir := range dirs {
+				target := strings.TrimSpace(r.Exits[dir])
+				if target == "" || roomRefs[target] || !wasLive(target) {
+					continue
+				}
+				advisories = append(advisories, fmt.Sprintf(
+					"room %q exit %q still references %q, which this reload removes (the referencing room is not "+
+						"reloaded, so it is not blocked — but the exit now leads nowhere)", r.Ref, dir, target))
+			}
+		}
+		// A not-reloaded zone whose START ROOM this reload removes: logins/recalls into that zone dead-end.
+		// Same room-ref mechanism as an exit, and arguably more severe.
+		if start := strings.TrimSpace(z.StartRoom); start != "" && !roomRefs[start] && wasLive(start) {
+			advisories = append(advisories, fmt.Sprintf(
+				"zone %q start room %q is removed by this reload (the zone is not reloaded, so it is not "+
+					"blocked — but entering the zone will fail)", z.Ref, start))
+		}
+		for ri := range z.Resets {
+			proto := strings.TrimSpace(z.Resets[ri].Proto)
+			if proto == "" || protoRefs[proto] || !wasLive(proto) {
+				continue
+			}
+			advisories = append(advisories, fmt.Sprintf(
+				"zone %q has a reset that spawns %q, which this reload removes (the zone is not reloaded, so it "+
+					"is not blocked — but the reset will spawn nothing)", z.Ref, proto))
+		}
+	}
+	sort.Strings(advisories)
+	return dedupeSorted(advisories)
+}
+
+// dedupeSorted collapses adjacent duplicates in a sorted slice (two resets in one zone spawning the same
+// removed proto produce identical advisory lines).
+func dedupeSorted(in []string) []string {
+	if len(in) < 2 {
+		return in
+	}
+	out := in[:1]
+	for _, v := range in[1:] {
+		if v != out[len(out)-1] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
