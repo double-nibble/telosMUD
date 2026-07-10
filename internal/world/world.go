@@ -703,7 +703,10 @@ func (s *Shard) HostZone(ctx context.Context, id string) (*Zone, error) {
 		defer zcancel()
 		z.Run(zctx)
 	}()
-	s.startZoneRenewal(runCtx, id) // renew the adopted zone's lease (16.4b; no-op when leasing is off)
+	// This is a RUNTIME adoption: it renews as an ADOPTING zone (adopted=true), so if the source's
+	// HandoverZone flip never lands, its renewer un-adopts it after adoptConfirmDeadline (#327) instead of
+	// leaving a permanent zombie. Boot zones never reach here, so they never un-adopt.
+	s.startZoneRenewalAdopting(runCtx, id, true) // renew the adopted zone's lease (16.4b; no-op when leasing is off)
 	slog.Info("hosting zone at runtime", "zone", id, "shard", s.addr)
 	return z, nil
 }

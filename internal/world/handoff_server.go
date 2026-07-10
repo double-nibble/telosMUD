@@ -202,6 +202,15 @@ func (h *handoffServer) AdoptZone(ctx context.Context, req *handoffv1.AdoptZoneR
 	// Thread the CALLER's context into HostZone (#280): building the zone now includes a blocking scope-snapshot
 	// read, and the draining source is blocking on this RPC. If it gives up, we must too, rather than running
 	// the read out on our own clock while the source has already moved on.
+	//
+	// THE DEADLINE INVERSION (#327) is handled NOT here but by the renewer. HostZone starts this zone's lease
+	// renewal in the ADOPTING state, so if the source's deadline elapses mid-RPC (it returns before its
+	// HandoverZone flip and keeps the lease), the zone we just built is left hosted-but-unowned — and its
+	// renewer un-adopts it after adoptConfirmDeadline. Compensating HERE, synchronously, on ctx.Err() would be
+	// racy: a concurrent sibling AdoptZone could have legitimately flipped ownership to us while this call's
+	// context died, and we would tear down a zone we now own. The renewer is immune to that: a landed flip
+	// makes its ClaimZone succeed, which sets confirmed and stops it ever un-adopting. One compensation point,
+	// gated on the fact that actually matters (did the flip land?), not on this RPC's context.
 	z, err := h.shard.HostZone(ctx, req.GetZoneId())
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "adopt zone %q: %v", req.GetZoneId(), err)

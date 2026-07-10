@@ -209,3 +209,36 @@ func (s *Shard) renewingLocked(zoneID string) bool {
 	_, renewing := s.leaseStop[zoneID]
 	return renewing && !s.handedOff[zoneID]
 }
+
+// unadoptTimeout bounds a compensating un-adopt (#327). It runs on a context of its own — the caller's is,
+// by definition, already cancelled — and only has to outlast a directory read plus the zone actor's last
+// message. Var for tests.
+var unadoptTimeout = 15 * time.Second
+
+// unadoptZone tears down a zone this shard adopted for a handover that never landed (#327). Its sole caller is
+// the adopting renewer (renewZoneLease), which invokes it when the adoption fails to confirm within
+// adoptConfirmDeadline — because the source's drain deadline elapsed mid-RPC (it returned before its
+// HandoverZone flip and kept the lease), or the source died mid-drain, or it lost a race. Either way this
+// shard is left hosting a zone that no directory entry points to, whose actor runs resets and subscribes to
+// scope forever. Single-writer is never violated (the lease stayed with the source), which is why this is a
+// leak rather than a correctness bug — and why it can be best-effort.
+//
+// It retires the zone's renewal FIRST. That is safe precisely because the caller IS that renewal, returning: a
+// landed flip would have set confirmed and skipped this path, so an unadopted zone is by definition one whose
+// adoption never confirmed — this shard never held its lease, there is nothing to reclaim, and retiring the
+// registration is what lets it past UnhostZone's "still renewing => about to reclaim => refuse" guard.
+//
+// It takes its own context: the caller's renewal ctx is being cancelled by the retire above. It logs rather
+// than returns, because there is nothing the renewer can do about a failure here — a refusal means the zone
+// acquired players or owes a durable write, in which case keeping it is the correct outcome.
+func (s *Shard) unadoptZone(id, why string) {
+	s.retireZoneRenewal(id)
+	ctx, cancel := context.WithTimeout(context.Background(), unadoptTimeout)
+	defer cancel()
+	if err := s.UnhostZone(ctx, id); err != nil {
+		slog.Warn("could not un-adopt an abandoned zone; its actor goroutine lives until restart",
+			"zone", id, "reason", why, "err", err)
+		return
+	}
+	slog.Info("un-adopted an abandoned zone", "zone", id, "reason", why)
+}

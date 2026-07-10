@@ -195,7 +195,7 @@ func TestUnconfirmedAdoptionAbandonsTheZone(t *testing.T) {
 	defer cancel()
 
 	done := make(chan struct{})
-	go func() { sh.renewZoneLease(ctx, "darkwood"); close(done) }()
+	go func() { sh.renewZoneLease(ctx, "darkwood", true); close(done) }()
 
 	// It must poll at least once (it is genuinely adopting) ...
 	select {
@@ -234,7 +234,7 @@ func TestConfirmedRenewerIsNotSubjectToTheDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { sh.renewZoneLease(ctx, "midgaard"); close(done) }()
+	go func() { sh.renewZoneLease(ctx, "midgaard", false); close(done) }()
 
 	// nopLeaser always grants the claim, so the renewer confirms on tick one and must keep running well past
 	// the (tiny) adopting deadline.
