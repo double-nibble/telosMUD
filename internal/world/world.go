@@ -593,17 +593,52 @@ func (s *Shard) zonesList() []*Zone {
 func (s *Shard) HostZone(ctx context.Context, id string) (*Zone, error) {
 	// First pass: cheap guards + the idempotent hit, without holding mu across the (slower) zone build.
 	//
-	// SECURITY-LOAD-BEARING (#262): AdoptZone's anti-replay rests on this early return. A signed AdoptZone is
-	// replayable inside its clock-skew window, and that is only harmless because re-adopting a zone this shard
-	// already built returns HERE — before startZoneRenewal — so a replay cannot restart renewal or rebuild the
-	// zone. Two properties hold it up: s.zones is never pruned (a handed-off zone stays in the map, so the hit
-	// is sticky), and this return precedes renewal. If you ever prune s.zones on handoff (a reasonable
-	// memory-leak fix) or move renewal above this line, a replayed AdoptZone would rebuild the zone and start a
-	// second renewer — re-open #262 unless the signature is first rebound to the zone's monotonic lease
-	// generation instead of a wall clock (tracked in the #262 follow-ups).
+	// SECURITY-RELEVANT (#262). A signed AdoptZone is replayable inside its clock-skew window, and this early
+	// return is what keeps that mostly harmless: re-adopting a zone this shard already built never REBUILDS
+	// it. `s.zones` is never pruned, so a handed-off zone stays in the map and the hit is sticky. If you ever
+	// prune s.zones on handoff (the reasonable memory-leak fix, #288), a replayed AdoptZone WOULD rebuild the
+	// zone — do not do it until the signature is rebound to the zone's monotonic lease generation (#315),
+	// which makes a replay unrepresentable.
+	//
+	// The early return is no longer a pure no-op: a zone that was handed AWAY and is now being handed BACK has
+	// its renewal restarted below (#288). A replay reaches that too, but ClaimZone is owner-fenced, so a
+	// replay's renewer can never take a live lease — it idles in the pre-confirm "adopting" state (the zombie
+	// renewer of #327). Weigh that against what it fixes: without it, every rebalance-BACK leaves this shard
+	// hosting and serving a zone whose lease it never renews, so the lease lapses and any shard may claim it.
+	// A second writer for a zone we are still writing to. Single-writer is the invariant everything rests on.
 	s.mu.Lock()
 	if z := s.zones[id]; z != nil {
+		handedOff := s.handedOff[id]
+		runCtx := s.runCtx
 		s.mu.Unlock()
+		if handedOff && runCtx != nil {
+			// RE-ADOPTION of a zone this shard previously gave away (#288). The object is still in s.zones —
+			// nothing prunes it — so the early return above is what a replayed AdoptZone hits. But a zone the
+			// coordinator has handed BACK is not handed off any more, and until this ran, its renewal loop
+			// returned on its first tick (zoneHandedOff) and its lease quietly lapsed while this shard kept
+			// hosting and serving it. ShardForZone then resolves nobody and any shard may ClaimZone it: a
+			// second host for a zone we are still writing to.
+			//
+			// SECURITY (#262, and read this carefully). A replayed AdoptZone inside its clock-skew window
+			// reaches here too, so this is no longer a pure no-op: a replay now plants a lease renewer.
+			//
+			// ClaimZone is fenced only against a LIVE lease. So the replay's renewer does not take over
+			// immediately — it sits in the pre-confirm "adopting" state — but it WOULD win the lease the
+			// instant the true owner's lease lapsed (a crash, a partition, a GC pause past the 15s TTL), and
+			// clearing handedOff above disarms the two fences that would otherwise stop it. That is why
+			// renewZoneLease now BOUNDS the adopting state (adoptConfirmDeadline): an adoption whose flip
+			// never lands abandons the zone instead of waiting for its owner to blink. Do not remove that
+			// bound while this call exists.
+			//
+			// The clean close is binding AdoptZone to the zone's monotonic lease generation (#315), which makes
+			// a replay unrepresentable. Until then the trade is deliberate: without this, EVERY rebalance-back
+			// leaves the shard hosting and serving a zone whose lease it never renews, the lease lapses in 15s,
+			// and any shard may claim a zone we are still writing to. A guaranteed split-brain on a routine
+			// operation outranks a bounded replay residual that needs a wire capture and an owner failure.
+			s.clearZoneHandedOff(id)
+			s.startZoneRenewal(runCtx, id)
+			slog.Info("re-adopted a previously handed-off zone; lease renewal restarted", "zone", id)
+		}
 		return z, nil // already hosting it — idempotent
 	}
 	if s.runCtx == nil || s.runWG == nil {
