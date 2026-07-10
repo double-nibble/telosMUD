@@ -12,6 +12,14 @@ import (
 
 func newTestRedis(t *testing.T) *Redis {
 	t.Helper()
+	d, _ := newTestRedisWithClock(t)
+	return d
+}
+
+// newTestRedisWithClock also returns the miniredis handle, whose SetTime is the seam for anything that reads
+// the SERVER clock inside a Lua script (the drain-target reservation expiries, #284).
+func newTestRedisWithClock(t *testing.T) (*Redis, *miniredis.Miniredis) {
+	t.Helper()
 	mr, err := miniredis.Run()
 	if err != nil {
 		t.Fatal(err)
@@ -19,7 +27,7 @@ func newTestRedis(t *testing.T) *Redis {
 	t.Cleanup(mr.Close)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return NewRedis(rdb, "test")
+	return NewRedis(rdb, "test"), mr
 }
 
 func TestZoneRegistration(t *testing.T) {

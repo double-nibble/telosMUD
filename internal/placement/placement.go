@@ -18,6 +18,7 @@ package placement
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 )
@@ -359,6 +360,11 @@ type DrainFleet interface {
 // target). *directory.Redis satisfies it.
 type DrainReserver interface {
 	ReserveDrainTarget(ctx context.Context, target, drainer string, headroom, incoming int, ttl time.Duration) (bool, error)
+	// ReleaseDrainTarget drops a reservation this selector made on a target it then ABANDONED (its endpoint
+	// lapsed between the candidate read and the resolve). Without it the hold leaks until its TTL — the very
+	// stale hold #284 exists to remove, and triggered by the endpoint race that is most likely during the
+	// fleet rollout the guard is for.
+	ReleaseDrainTarget(ctx context.Context, target, drainer string) error
 }
 
 // ChooseDrainTarget selects + reserves a live peer for `self` to hand `incoming` players (one draining zone)
@@ -393,6 +399,12 @@ func ChooseDrainTarget(ctx context.Context, fleet DrainFleet, resv DrainReserver
 				return id, a, nil
 			}
 		}
+		// We are abandoning this target. If our reserve was ADMITTED, we are holding headroom on a shard we
+		// will never send players to — release it now rather than leak it until the TTL (#284). A refused
+		// reserve wrote nothing, so there is nothing to release.
+		if ok {
+			releaseAbandoned(ctx, resv, target, self)
+		}
 		remaining = dropShard(remaining, target)
 	}
 
@@ -406,13 +418,25 @@ func ChooseDrainTarget(ctx context.Context, fleet DrainFleet, resv DrainReserver
 		if target == "" {
 			break
 		}
-		_, _ = resv.ReserveDrainTarget(ctx, target, self, ceiling-loadOf(force, target), incoming, ttl)
+		reserved, _ := resv.ReserveDrainTarget(ctx, target, self, ceiling-loadOf(force, target), incoming, ttl)
 		if id, a, e := resolveOrDrop(ctx, fleet, target); e == nil {
 			return id, a, nil
+		}
+		if reserved {
+			releaseAbandoned(ctx, resv, target, self)
 		}
 		force = dropShard(force, target)
 	}
 	return "", "", errNoDrainPeer
+}
+
+// releaseAbandoned drops a reservation the selector made on a target it then discarded. Best-effort: the
+// per-field TTL is the correctness backstop, and a selection must never fail because a release did.
+func releaseAbandoned(ctx context.Context, resv DrainReserver, target, self string) {
+	if err := resv.ReleaseDrainTarget(ctx, target, self); err != nil {
+		slog.Warn("drain selector: could not release a reservation on an abandoned target; it will expire on its TTL",
+			"target", target, "drainer", self, "err", err)
+	}
 }
 
 // withoutSelf returns a fresh slice of the candidates excluding self (the draining shard is never its own
