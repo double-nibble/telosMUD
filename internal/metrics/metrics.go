@@ -19,15 +19,17 @@ const scope = "github.com/double-nibble/telosmud"
 var meter = otel.Meter(scope)
 
 var (
-	tickLag         metric.Float64Histogram
-	occupancy       metric.Int64Gauge
-	framesDropped   metric.Int64Counter
-	gateConns       metric.Int64UpDownCounter
-	busLag          metric.Float64Histogram
-	drainRedirected metric.Int64Counter
-	drainReclaimed  metric.Int64Counter
-	durableParked   metric.Int64Counter
-	durablePoisoned metric.Int64Counter
+	tickLag          metric.Float64Histogram
+	occupancy        metric.Int64Gauge
+	framesDropped    metric.Int64Counter
+	gateConns        metric.Int64UpDownCounter
+	busLag           metric.Float64Histogram
+	busCatchupEvents metric.Int64Counter
+	busCatchupAge    metric.Float64Histogram
+	drainRedirected  metric.Int64Counter
+	drainReclaimed   metric.Int64Counter
+	durableParked    metric.Int64Counter
+	durablePoisoned  metric.Int64Counter
 )
 
 func init() {
@@ -44,6 +46,15 @@ func init() {
 		metric.WithDescription("Live gate connections"))
 	busLag, _ = meter.Float64Histogram("telos.bus.deliver_lag_ms",
 		metric.WithDescription("Scoped-event-bus publish->deliver latency"),
+		metric.WithUnit("ms"))
+	busCatchupEvents, _ = meter.Int64Counter("telos.bus.catchup_events_total",
+		metric.WithDescription("Durable scoped-event BACKLOG events drained by a resuming consumer (#276). Labeled by "+
+			"subject. Distinct from live deliveries: this counts how much a consumer had missed while it was down, "+
+			"which is a recovery/MTTR signal, not a delivery-latency one."))
+	busCatchupAge, _ = meter.Float64Histogram("telos.bus.catchup_age_ms",
+		metric.WithDescription("Age (now - publish time) of each durable scoped-event BACKLOG event at delivery (#276). "+
+			"Its MAX at a consumer's resume is how far behind that consumer was. Deliberately NOT folded into "+
+			"telos.bus.deliver_lag_ms, whose live-latency distribution a multi-hour catch-up would dwarf."),
 		metric.WithUnit("ms"))
 	drainRedirected, _ = meter.Int64Counter("telos.shard.drain_redirected_total",
 		metric.WithDescription("Players redirected to a peer shard during a graceful drain (socket kept open, zero drop)"))
@@ -103,6 +114,25 @@ func add(ctx context.Context, c metric.Int64UpDownCounter, n int64) {
 func RecordBusLag(ctx context.Context, ms float64) {
 	if busLag != nil {
 		busLag.Record(ctx, ms)
+	}
+}
+
+// BusCatchup records one durable scoped-event BACKLOG delivery: the event count and its age (#276).
+//
+// It exists because deliver_lag_ms deliberately skips backlog. A consumer resuming after an outage drains
+// events published hours ago; sampling those into the live-latency histogram would dwarf its distribution and
+// make the p99 useless exactly when you are trying to read it. But the catch-up DEPTH is itself the signal you
+// want during recovery — how far behind is this consumer, and is it converging — so it gets its own pair.
+//
+// ageMillis is clamped at 0 by the caller: cross-host clock skew can make now-PubMillis negative, and a
+// negative sample would drag the histogram's SUM down and poison any avg=sum/count panel.
+func BusCatchup(ctx context.Context, subject string, ageMillis float64) {
+	attrs := metric.WithAttributes(attribute.String("subject", subject))
+	if busCatchupEvents != nil {
+		busCatchupEvents.Add(ctx, 1, attrs)
+	}
+	if busCatchupAge != nil {
+		busCatchupAge.Record(ctx, ageMillis, attrs)
 	}
 }
 

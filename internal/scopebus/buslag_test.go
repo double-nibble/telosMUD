@@ -13,8 +13,8 @@ import (
 	"github.com/double-nibble/telosmud/internal/commbus"
 )
 
-// busLagHistogram returns the telos.bus.deliver_lag_ms histogram's (count, sum), both 0 if never recorded.
-func busLagHistogram(t *testing.T, rdr *sdkmetric.ManualReader) (uint64, float64) {
+// histoStats returns a float64 histogram's (count, sum) summed across attribute sets, both 0 if never recorded.
+func histoStats(t *testing.T, rdr *sdkmetric.ManualReader, name string) (uint64, float64) {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	if err := rdr.Collect(context.Background(), &rm); err != nil {
@@ -22,15 +22,29 @@ func busLagHistogram(t *testing.T, rdr *sdkmetric.ManualReader) (uint64, float64
 	}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name != "telos.bus.deliver_lag_ms" {
+			if m.Name != name {
 				continue
 			}
-			if h, ok := m.Data.(metricdata.Histogram[float64]); ok && len(h.DataPoints) > 0 {
-				return h.DataPoints[0].Count, h.DataPoints[0].Sum
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				continue
 			}
+			var count uint64
+			var sum float64
+			for _, dp := range h.DataPoints {
+				count += dp.Count
+				sum += dp.Sum
+			}
+			return count, sum
 		}
 	}
 	return 0, 0
+}
+
+// busLagHistogram returns the telos.bus.deliver_lag_ms histogram's (count, sum).
+func busLagHistogram(t *testing.T, rdr *sdkmetric.ManualReader) (uint64, float64) {
+	t.Helper()
+	return histoStats(t, rdr, "telos.bus.deliver_lag_ms")
 }
 
 // TestScopeBusDeliverLag consolidates the #44 bus-lag assertions into ONE test: OTel's global meter binds its
@@ -85,5 +99,37 @@ func TestScopeBusDeliverLag(t *testing.T) {
 	c3, _ := busLagHistogram(t, rdr)
 	if c3 != c2 {
 		t.Fatalf("an unstamped message recorded a sample: count %d -> %d", c2, c3)
+	}
+
+	// (4) #276: a BACKLOG delivery goes to the catch-up instruments, never to deliver_lag_ms. A resuming
+	// consumer drains events published hours ago; sampling those into the live-latency histogram would dwarf
+	// its distribution exactly when you are trying to read it during a recovery.
+	catch0, _ := histoStats(t, rdr, "telos.bus.catchup_age_ms")
+	recordBusCatchup("scope.world", time.Now().UnixMilli()-3_600_000) // an hour behind
+	catch1, catchSum := histoStats(t, rdr, "telos.bus.catchup_age_ms")
+	if catch1 != catch0+1 {
+		t.Fatalf("catchup_age_ms count %d -> %d, want +1", catch0, catch1)
+	}
+	if catchSum < 3_000_000 {
+		t.Fatalf("catchup_age_ms sum = %.0f; an hour-old backlog event must record its real age", catchSum)
+	}
+	if c4, _ := busLagHistogram(t, rdr); c4 != c3 {
+		t.Fatalf("a BACKLOG event leaked into the live-latency histogram: deliver_lag count %d -> %d (#276)", c3, c4)
+	}
+
+	// (5) the same clamps as deliver_lag: an unstamped backlog event records nothing, and a skewed future
+	// stamp clamps at 0 rather than dragging the Sum down.
+	recordBusCatchup("scope.world", 0)
+	recordBusCatchup("scope.world", -5)
+	if c5, _ := histoStats(t, rdr, "telos.bus.catchup_age_ms"); c5 != catch1 {
+		t.Fatalf("an unstamped backlog event recorded a sample: %d -> %d", catch1, c5)
+	}
+	recordBusCatchup("scope.world", time.Now().UnixMilli()+10_000)
+	c6, sum6 := histoStats(t, rdr, "telos.bus.catchup_age_ms")
+	if c6 != catch1+1 {
+		t.Fatalf("a skewed backlog stamp must still record (clamped): %d -> %d", catch1, c6)
+	}
+	if sum6 < catchSum {
+		t.Fatalf("a skewed backlog stamp dragged the Sum down (%.0f -> %.0f); it must clamp at 0", catchSum, sum6)
 	}
 }

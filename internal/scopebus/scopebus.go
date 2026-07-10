@@ -135,6 +135,26 @@ func recordBusDeliverLag(pubMillis int64) {
 	metrics.RecordBusLag(context.Background(), float64(lag))
 }
 
+// recordBusCatchup records one durable BACKLOG delivery: its count and its age (#276).
+//
+// deliver_lag_ms deliberately skips backlog, because a consumer resuming after an outage drains events
+// published hours ago and those samples would dwarf the live-latency distribution. But the catch-up depth is
+// the signal you actually want during a recovery — how far behind is this consumer, and is it converging — so
+// it gets its own instruments rather than being thrown away.
+//
+// Same clamp as above: cross-host clock skew can make now-PubMillis negative, and a negative sample poisons
+// any avg=sum/count panel. A publisher that never stamped a time is simply not measured.
+func recordBusCatchup(subject string, pubMillis int64) {
+	if pubMillis <= 0 {
+		return
+	}
+	age := time.Now().UnixMilli() - pubMillis
+	if age < 0 {
+		age = 0
+	}
+	metrics.BusCatchup(context.Background(), subject, float64(age))
+}
+
 // Handler receives one scoped event: the event name, its payload, and the source id (the emitting
 // director/zone, used for ordering/idempotency on the durable tier).
 type Handler func(event string, payload json.RawMessage, source string)
@@ -288,11 +308,18 @@ func (b *Bus) SubscribeDurable(scope Scope, consumerID string, handler DurableHa
 			Backlog: backlog,
 		})
 		// #44: record publish->first-successful-deliver latency for LIVE events only, and only on the ACK.
-		// Skipping backlog excludes downtime catch-up (a separate catch-up-depth metric is #276); recording AFTER a
-		// successful ack means a NAK'd redelivery (a poison message, a transient apply failure + backoff) is
-		// not sampled once per attempt with an ever-growing lag — which would skew the histogram upward.
-		if ack && !backlog {
-			recordBusDeliverLag(sm.PubMillis)
+		// Backlog goes to its own catch-up instruments instead (#276) — folding a multi-hour downtime replay
+		// into the live-latency histogram would dwarf its distribution exactly when you need to read it.
+		// Recording AFTER a successful ack means a NAK'd redelivery (a poison message, a transient apply
+		// failure + backoff) is not sampled once per attempt with an ever-growing lag, which would skew both
+		// instruments upward.
+		if ack {
+			if backlog {
+				// #276: a resuming consumer's catch-up depth + age, kept OUT of the live-latency histogram.
+				recordBusCatchup(subj, sm.PubMillis)
+			} else {
+				recordBusDeliverLag(sm.PubMillis)
+			}
 		}
 		if ack {
 			return commbus.AckDelivered
