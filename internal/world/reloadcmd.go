@@ -31,10 +31,10 @@ const reloadRepublishTimeout = 30 * time.Second
 // multi-shard consistency for this per-ref propagation without central coordination.
 //
 // SCOPE + LIMITS (v1). Scope is PACK-granular: bare `reload` republishes every pack this shard loads;
-// `reload <pack>` just that one. The per-ref applier swaps EXISTING prototypes in place, so this
-// propagates edits to rooms/mobs/items/channels; it does NOT yet add/remove rooms (a zone-SHAPE change)
-// nor hot-swap shared defs (attributes/abilities — a rolling reboot, by design, per the settled design
-// note). Central DIRECTOR-side validate-before-broadcast and finer zone/region scope are the tracked
+// `reload <pack>` just that one. The per-ref applier swaps EXISTING prototypes in place, and a trailing
+// zone-SHAPE reconcile (#191) adds/removes rooms; so this propagates edits AND structural add/remove for
+// rooms/mobs/items/channels. It does NOT hot-swap shared defs (attributes/abilities — a rolling reboot, by
+// design, per the settled design note). Central DIRECTOR-side validate-before-broadcast and finer zone/region scope are the tracked
 // follow-ups on #53. The publish loop runs OFF the zone goroutine (each NATS publish flushes — a per-ref
 // round-trip), so the command acks immediately and the fan-out completes in the background.
 
@@ -121,6 +121,13 @@ func reloadSummary(label string, out reloadOutcome) string {
 		summary += fmt.Sprintf("\r\n  Note: this content also defines shared defs (%s). These are NOT hot-applied — "+
 			"if you changed one, a rolling reboot of the world shards is required for it to take effect.",
 			strings.Join(out.sharedDefs, ", "))
+	}
+	// #309: advisory heads-ups — a not-reloaded pack references a room/proto this reload removes. Non-blocking
+	// (the reload still propagated), but the operator should know a dependency now dead-ends. Not shown on a
+	// hard rejection (nothing was applied) — the advisories are moot there.
+	if len(out.advisories) > 0 && len(out.rejected) == 0 {
+		summary += fmt.Sprintf("\r\n  Heads-up: this reload removes content another (not-reloaded) pack still "+
+			"references — those references will dead-end:\r\n  - %s", strings.Join(out.advisories, "\r\n  - "))
 	}
 	return summary
 }
@@ -244,12 +251,24 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 	// effect only after a rolling reboot. Surface which are present so the readout reminds the operator (a
 	// shared-def edit is otherwise silently un-applied). Computed for both a dry run and a real reload.
 	shared := sharedDefKinds(loaded)
+	// #309: ADVISORY (non-blocking) — a NOT-reloaded pack references a room/proto THIS reload removes. #205
+	// correctly does not hard-block the reload for an out-of-scope pack's dependency, but the operator should
+	// still hear about it. `wasLive` is the pre-reload snapshot: r.cache holds the CURRENT live prototypes, and
+	// a removal lands only when the publish below drives the zone-shape reconcile — AFTER this line — so at
+	// validate time the cache is the "before" graph. A target absent from the re-read content but still live
+	// here is one this reload removes. Computed for both a dry run and a real reload.
+	advisories := advisoryReloadRemovals(newReloadScope(full, scoped), func(ref string) bool {
+		return r.cache != nil && r.cache.get(ProtoRef(ref)) != nil
+	})
+	for _, a := range advisories {
+		r.log.Warn("reload: advisory — a not-reloaded pack depends on content this reload removes", "detail", a)
+	}
 	if checkOnly {
 		// Pre-flight: the content validated, but a dry run deliberately publishes nothing.
 		r.log.Info("reload --check: content validated (dry run, nothing published)", "packs", packs)
-		return reloadOutcome{checkOnly: true, sharedDefs: shared}
+		return reloadOutcome{checkOnly: true, sharedDefs: shared, advisories: advisories}
 	}
-	out := reloadOutcome{sharedDefs: shared}
+	out := reloadOutcome{sharedDefs: shared, advisories: advisories}
 	// A shard-local `reload` is a staff hot-edit of already-imported rows: it stamps its invalidations with
 	// a version minted from the single PG content-version authority (#232) — an atomic bump, monotonic
 	// fleet-wide with no wall clock — so it interoperates with the director-coordinated pull's PG-minted
