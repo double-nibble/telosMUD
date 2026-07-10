@@ -46,7 +46,11 @@ func (f *fakeLocator) PlayerShard(_ context.Context, playerID string) (string, b
 
 func (f *fakeLocator) ShardForZone(context.Context, string) (string, error)     { return "", nil }
 func (f *fakeLocator) EndpointForShard(context.Context, string) (string, error) { return "", nil }
-func (f *fakeLocator) SetPlayerShard(context.Context, string, string, uint64) (bool, error) {
+func (f *fakeLocator) RegisterPlacement(context.Context, string, string, string, uint64) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeLocator) SetPlayerShard(context.Context, string, string, string, uint64) (bool, error) {
 	return true, nil
 }
 

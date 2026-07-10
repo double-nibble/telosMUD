@@ -146,12 +146,11 @@ func main() {
 	}
 }
 
-// loginDirectory adapts the Redis directory to the gate's directory.Directory seam.
-// On login it resolves the shard hosting the home zone (the demo's spawn zone); if
-// the directory is unreachable or the zone is unregistered it falls back to the
-// configured world target, so a single-shard dev stack still works without Redis.
-// The gate only consults the directory for the FIRST shard — cross-shard moves carry
-// the destination address in the Redirect frame.
+// loginDirectory adapts the Redis directory to the gate's directory.Directory seam. It is a thin
+// binding: the routing POLICY (route by the placement's zone, then a legacy shard id, then the home
+// zone, then the configured target) lives in internal/gate.ResolveLoginShard, where the gate's own
+// integration tests can call it directly. The gate consults the directory only for the FIRST shard —
+// cross-shard moves after login carry the destination address in the Redirect frame.
 type loginDirectory struct {
 	redis    *directory.Redis
 	homeZone string
@@ -159,47 +158,7 @@ type loginDirectory struct {
 }
 
 func (d loginDirectory) ShardForCharacter(characterID string) (string, bool) {
-	ctx := context.Background()
-	// FIRST consult the per-character placement: the directory is the authoritative ownership
-	// record (the handoff CAS writes it, and it PERSISTS across logout — ClearPlayer is deferred).
-	// A character who was handed off to another shard and logged out there must reconnect to THAT
-	// shard, not to the fixed home zone — otherwise a fresh login routed back to the home shard
-	// rehydrates the player at a room the home shard cannot place (the cross-shard reconnect bug).
-	// Falls through to the home-zone resolution when the player has no placement yet (brand-new, or
-	// never handed off), so a first-ever login is unchanged. Resolving the placement's shard id to
-	// an endpoint reuses the same id->endpoint hop as the home-zone path.
-	if place, perr := d.redis.PlayerPlacement(ctx, characterID); perr == nil && place.ShardID != "" {
-		if endpoint, eerr := d.redis.EndpointForShard(ctx, place.ShardID); eerr == nil && endpoint != "" {
-			slog.Debug("login directory resolved by placement",
-				"component", "gate", "character", characterID,
-				"shard_id", place.ShardID, "epoch", place.Epoch, "endpoint", endpoint)
-			return endpoint, true
-		}
-	}
-	// Fallback: route to the home zone's shard. This is correct ONLY while ClearPlayer is deferred
-	// (placement persists across logout, so a returning handed-off player resolves via the branch
-	// above and never reaches here). COUPLED INVARIANT — do not decouple: if a future slice wires
-	// ClearPlayer-on-quit, a returning player will have no placement and fall through HERE, and this
-	// fallback MUST then resolve the player's DURABLE zone_ref (load the row, route to whoever owns
-	// that zone), not the fixed home zone — otherwise it reintroduces the cross-shard reconnect bug
-	// for anyone who quit outside their home zone. (distsys review, 6.3a handoff fix.)
-	// Two hops: which shard owns the home zone, then where that shard is reachable.
-	shardID, err := d.redis.ShardForZone(ctx, d.homeZone)
-	if err == nil && shardID != "" {
-		endpoint, eerr := d.redis.EndpointForShard(ctx, shardID)
-		if eerr == nil && endpoint != "" {
-			slog.Debug("login directory resolved",
-				"component", "gate", "character", characterID,
-				"home_zone", d.homeZone, "shard_id", shardID, "endpoint", endpoint)
-			return endpoint, true
-		}
-		err = eerr
-	}
-	slog.Debug("login directory fallback",
-		"component", "gate", "character", characterID,
-		"home_zone", d.homeZone, "shard_id", shardID, "err", err, "fallback", d.fallback)
-	if d.fallback == "" {
-		return "", false
-	}
-	return d.fallback, true
+	// The policy itself lives in internal/gate (loginroute.go) so the gate's integration tests exercise
+	// the SHIPPING resolver rather than a hand-synced copy of it. It bounds its own Redis I/O.
+	return gate.ResolveLoginShard(context.Background(), d.redis, characterID, d.homeZone, d.fallback)
 }

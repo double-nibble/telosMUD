@@ -39,11 +39,11 @@ type faultLocator struct {
 	setShardHook func(playerID, shardID string, epoch uint64) (bool, error)
 }
 
-func (f *faultLocator) SetPlayerShard(ctx context.Context, playerID, shardID string, epoch uint64) (bool, error) {
+func (f *faultLocator) SetPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error) {
 	if f.setShardHook != nil {
 		return f.setShardHook(playerID, shardID, epoch)
 	}
-	return f.Locator.SetPlayerShard(ctx, playerID, shardID, epoch)
+	return f.Locator.SetPlayerShard(ctx, playerID, shardID, zoneID, epoch)
 }
 
 // TestHandoffDoublePrepareIdempotentThenRejected pins the single-writer invariant at the

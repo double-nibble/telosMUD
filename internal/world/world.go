@@ -143,8 +143,12 @@ type Shard struct {
 	// key; onFence cancels the shard's run ctx when we UNEXPECTEDLY lose a lease. handedOff records zones we
 	// DELIBERATELY handed off (their renewal stops silently, no fence); leaseStop cancels a hosted zone's
 	// renewal goroutine on handoff. handedOff + leaseStop are guarded by mu.
-	leaser     ZoneLeaser
-	shardID    string
+	leaser  ZoneLeaser
+	shardID string
+	// placement collects per-player directory placement writes from the zone goroutines for the
+	// background writer (placement.go, #320). Coalescing by player: never blocks an actor loop, and
+	// never discards a meaningful write.
+	placement  *placementWriter
 	leaseTTL   time.Duration
 	leaseRenew time.Duration
 	onFence    func()
@@ -337,6 +341,7 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		rebalancing:      map[string]bool{},
 		rebalanceBackoff: map[string]time.Time{},
 		handoffSem:       make(chan struct{}, maxConcurrentHandoffs),
+		placement:        newPlacementWriter(),
 		saver:            newSaver(nil, nil), // disabled until WithPersistence configures it
 		// Empty global-definition bundle (defs.go); the constructor registers content into it
 		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
@@ -701,9 +706,10 @@ func (s *Shard) ZoneByID(id string) *Zone { return s.zoneByID(id) }
 // single-writer; the saver drainer is the ONE place character I/O runs, never on a zone
 // goroutine. A disabled saver's run returns immediately (no goroutine cost for a storeless boot).
 func (s *Shard) Run(ctx context.Context) {
-	go s.saver.run(ctx)         // off-zone-goroutine character writer (no-op if disabled)
-	go s.presence.run(ctx)      // off-zone-goroutine cross-shard `who` heartbeat (no-op if disabled)
-	go s.comms.publishLoop(ctx) // off-zone-goroutine single-writer durable-tell publisher (8.5)
+	go s.saver.run(ctx)          // off-zone-goroutine character writer (no-op if disabled)
+	go s.runPlacementWriter(ctx) // off-zone-goroutine directory placement writer (#320; no-op without a directory)
+	go s.presence.run(ctx)       // off-zone-goroutine cross-shard `who` heartbeat (no-op if disabled)
+	go s.comms.publishLoop(ctx)  // off-zone-goroutine single-writer durable-tell publisher (8.5)
 	// Hot reload runs on the bus's own subscription goroutine (no shard goroutine of its own);
 	// just tear the subscription down when the shard stops so a restart doesn't double-subscribe.
 	if s.reloader != nil {
@@ -851,9 +857,10 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 		}
 
 		// Prepare succeeded: claim ownership in the directory (epoch CAS), recording the
-		// destination SHARD ID (not its address). On conflict, roll back the destination's
-		// pending entity.
-		if ok, err := s.dir.SetPlayerShard(ctx, character, destShardID, newEpoch); err != nil || !ok {
+		// destination SHARD ID (not its address) AND the destination ZONE (#320 — the zone is what a
+		// later reconnect routes by, because a shard id goes stale the moment that zone is rebalanced).
+		// On conflict, roll back the destination's pending entity.
+		if ok, err := s.dir.SetPlayerShard(ctx, character, destShardID, destZone, newEpoch); err != nil || !ok {
 			log.Warn("directory claim failed after prepare", "ok", ok, "err", err)
 			// The rollback Abort needs a FRESH context: ctx may already be at/past its
 			// deadline (e.g. SetPlayerShard was what timed out), which would cancel the

@@ -537,36 +537,82 @@ func (r *Redis) OnCooldown(ctx context.Context, zoneID string) (bool, error) {
 // EndpointForShard.
 type Placement struct {
 	ShardID string
-	Epoch   uint64
+	// ZoneID is the zone the player was last resident in (#320). It is the ROUTING key a reconnect
+	// should use: a shard id goes stale the moment the zone is rebalanced onto another shard, whereas
+	// the zone is stable and ShardForZone resolves its current owner. Empty on a legacy record written
+	// before this field existed — callers fall back to ShardID.
+	ZoneID string
+	Epoch  uint64
 }
 
-// casPlacement writes {shard, epoch} only when the new epoch is strictly greater
+// casPlacement writes {shard, zone, epoch} only when the new epoch is strictly greater
 // than any stored epoch. This makes player placement monotonic: a stale or
 // duplicated handoff (lower-or-equal epoch) is a no-op, so it can never roll a
 // player back to a shard they already left. Returns 1 if applied, else 0.
 var casPlacement = redis.NewScript(`
 local cur = redis.call('HGET', KEYS[1], 'epoch')
-if cur and tonumber(cur) >= tonumber(ARGV[2]) then
+if cur and tonumber(cur) >= tonumber(ARGV[3]) then
   return 0
 end
-redis.call('HSET', KEYS[1], 'shard', ARGV[1], 'epoch', ARGV[2])
+redis.call('HSET', KEYS[1], 'shard', ARGV[1], 'zone', ARGV[2], 'epoch', ARGV[3])
 return 1
 `)
 
-// SetPlayerShard atomically records that playerID now lives on shardID as of
+// registerPlacement is the LOGIN / zone-change write (#320). It differs from casPlacement in exactly
+// one way: it accepts an EQUAL epoch. A login legitimately re-registers at the epoch it just resumed
+// from this very directory (server.go reads PlayerEpoch, the zone seeds the session at that value), so
+// demanding a strictly greater epoch would make every login a silent no-op.
+//
+// It still cannot clobber a NEWER placement: an in-flight handoff writes epoch+1 through casPlacement,
+// and a login arriving at the older epoch sees `cur > mine` and refuses. The stored epoch never
+// decreases (it is kept at the max), so the monotonic fence the handoff CAS depends on survives.
+//
+// Returns 1 if applied, 0 if a newer epoch already owns the record.
+var registerPlacement = redis.NewScript(`
+local cur = redis.call('HGET', KEYS[1], 'epoch')
+local mine = tonumber(ARGV[3])
+if cur and tonumber(cur) > mine then
+  return 0
+end
+local keep = mine
+if cur and tonumber(cur) > keep then keep = tonumber(cur) end
+redis.call('HSET', KEYS[1], 'shard', ARGV[1], 'zone', ARGV[2], 'epoch', keep)
+return 1
+`)
+
+// SetPlayerShard atomically records that playerID now lives on shardID, in zoneID, as of
 // epoch, iff epoch is newer than any prior placement. It reports whether the
 // write applied (false means a newer/equal placement already won the race).
-func (r *Redis) SetPlayerShard(ctx context.Context, playerID, shardID string, epoch uint64) (bool, error) {
-	res, err := casPlacement.Run(ctx, r.rdb, []string{r.playerKey(playerID)}, shardID, epoch).Int()
+func (r *Redis) SetPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error) {
+	res, err := casPlacement.Run(ctx, r.rdb, []string{r.playerKey(playerID)}, shardID, zoneID, epoch).Int()
 	if err != nil {
 		return false, err
 	}
 	return res == 1, nil
 }
 
-// PlayerPlacement returns which shard playerID currently lives on, or ErrNotFound.
+// RegisterPlacement records that playerID is resident on shardID in zoneID at epoch (#320). It is called
+// when a player JOINS a zone — a fresh login, a link-dead resume, or an intra-shard zone transfer — none
+// of which advance the ownership epoch, so it accepts an equal epoch where SetPlayerShard (the
+// cross-shard handoff CAS) demands a strictly greater one.
+//
+// Before #320 the ONLY writer of this hash was the handoff CAS. A player who had never been handed off
+// therefore had NO placement: unroutable on reconnect, and invisible to the tell/mail existence oracle,
+// which answered "there is no player by that name" for them. This is the write that fixes both.
+//
+// Blocking Redis I/O: call it OFF the zone goroutine.
+func (r *Redis) RegisterPlacement(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error) {
+	res, err := registerPlacement.Run(ctx, r.rdb, []string{r.playerKey(playerID)}, shardID, zoneID, epoch).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
+}
+
+// PlayerPlacement returns where playerID currently lives (shard, zone, epoch), or ErrNotFound.
+// ZoneID is "" on a legacy record written before #320 added the field.
 func (r *Redis) PlayerPlacement(ctx context.Context, playerID string) (Placement, error) {
-	vals, err := r.rdb.HMGet(ctx, r.playerKey(playerID), "shard", "epoch").Result()
+	vals, err := r.rdb.HMGet(ctx, r.playerKey(playerID), "shard", "epoch", "zone").Result()
 	if err != nil {
 		return Placement{}, err
 	}
@@ -578,7 +624,8 @@ func (r *Redis) PlayerPlacement(ctx context.Context, playerID string) (Placement
 	if s, ok := vals[1].(string); ok {
 		epoch, _ = strconv.ParseUint(s, 10, 64)
 	}
-	return Placement{ShardID: shardID, Epoch: epoch}, nil
+	zoneID, _ := vals[2].(string)
+	return Placement{ShardID: shardID, ZoneID: zoneID, Epoch: epoch}, nil
 }
 
 // PlayerEpoch returns the player's last-recorded ownership epoch, or found=false (with a

@@ -16,7 +16,18 @@ import (
 type Locator interface {
 	ShardForZone(ctx context.Context, zoneID string) (string, error)      // -> shard id
 	EndpointForShard(ctx context.Context, shardID string) (string, error) // shard id -> dial endpoint
-	SetPlayerShard(ctx context.Context, playerID, shardID string, epoch uint64) (bool, error)
+	SetPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error)
+	// RegisterPlacement records that a player is resident on this shard, in this zone, at their current
+	// epoch (#320). Called when a player JOINS a zone: a fresh login, a link-dead resume, or an
+	// intra-shard transfer. None of those advance the epoch, so it accepts an EQUAL epoch where
+	// SetPlayerShard's cross-shard CAS demands a strictly greater one. It still refuses to clobber a
+	// NEWER placement, so an in-flight handoff always wins the race.
+	//
+	// Before this existed, the handoff CAS was the placement hash's only writer — so a player who had
+	// never been handed off had no placement at all: unroutable on reconnect, and refused by the tell
+	// existence oracle ("there is no player by that name"). Written OFF the zone goroutine (blocking
+	// Redis I/O), exactly like presenceJoin.
+	RegisterPlacement(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error)
 	// PlayerEpoch reads the player's last-recorded ownership epoch from the directory so a
 	// fresh login can RESUME it (instead of restarting at 1). The directory's placement
 	// persists across logout/crash/restart, so the next cross-shard move must compute
