@@ -114,6 +114,12 @@ func (s *Shard) startZoneRenewal(parent context.Context, zoneID string) {
 // deliberate handoff). On an UNEXPECTED lease loss (a different shard took over — not our doing) it fences
 // the shard via onFence, mirroring the pre-16.4 cmd/telos-world behavior. A zone we deliberately handed off
 // (handedOff) never fences: its renewal returns silently and does NOT release (the new owner holds it).
+// adoptConfirmDeadline bounds how long a freshly-adopted zone's renewal may sit in the pre-confirm
+// "adopting" state before giving up (#288). Sized at the handoff's own pendingTTL: a legitimate adoption's
+// HandoverZone flip follows its AdoptZone by a round trip, so this never bites it. A var so a test can shrink
+// it; nothing else writes it.
+var adoptConfirmDeadline = pendingTTL
+
 func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
 	ttl, every := s.leaseParams()
 	t := time.NewTicker(every)
@@ -124,7 +130,18 @@ func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
 	// sense AFTER we have confirmed ownership (a real loss); fencing on the pre-flip !ok would kill the
 	// adopting target. A boot zone is already claimed (cmd ClaimFromPool), so its first renew confirms on
 	// tick one and the grace never applies.
+	//
+	// The adopting state is BOUNDED (#288, security review). It used to idle forever, polling ClaimZone for
+	// the shard's whole lifetime. That matters because ClaimZone is fenced only against a LIVE lease
+	// (directory/redis.go): the instant the real owner's lease lapses — a crash, a partition, a GC pause past
+	// the 15s TTL — an unconfirmed renewer WINS it, and starts writing to a zone it was never given. An
+	// AdoptZone whose HandoverZone flip never lands (the source died mid-drain, #327) or which was REPLAYED
+	// inside its clock-skew window (#262) plants exactly such a renewer. A legitimate adoption confirms within
+	// a round trip of its flip, so a deadline of pendingTTL costs it nothing and denies the rest a permanent
+	// foothold. #315 (binding the signature to the zone's lease generation) is what makes a replay
+	// unrepresentable; this bound is what makes the residual survivable until then.
 	confirmed := false
+	adoptingSince := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -154,6 +171,13 @@ func (s *Shard) renewZoneLease(ctx context.Context, zoneID string) {
 					return // a handoff flipped ownership under us — expected, don't fence
 				}
 				if !confirmed {
+					if waited := time.Since(adoptingSince); waited >= adoptConfirmDeadline {
+						// The flip never came. Stop renewing rather than idle here forever waiting to snatch
+						// the lease the moment its rightful owner blinks.
+						slog.Warn("adoption never confirmed; abandoning this zone's lease renewal",
+							"zone", zoneID, "shard", s.shardID, "waited", waited)
+						return
+					}
 					// Still adopting: the draining source owns the lease until its HandoverZone flip lands.
 					slog.Debug("awaiting zone lease (adopting)", "zone", zoneID, "shard", s.shardID)
 					continue
@@ -217,6 +241,21 @@ func (s *Shard) zoneHandedOff(zoneID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.handedOff[zoneID]
+}
+
+// clearZoneHandedOff forgets that this shard once gave `zoneID` away, so a RE-ADOPTION of it renews its lease
+// again (#288).
+//
+// `handedOff` was set-only. It means "we handed this zone to a peer": the renewal loop consults it to stop
+// renewing without fencing, and to skip the release on shutdown. But a zone that comes BACK — the coordinator
+// rebalances it here again — is not handed off any more, and leaving the flag set means its renewal loop
+// returns on its first tick. The lease then lapses while this shard is still hosting and serving the zone, at
+// which point ShardForZone resolves nobody and ANY shard may ClaimZone it: a second host for a zone we are
+// still writing to. That breaks single-writer, the invariant everything else rests on.
+func (s *Shard) clearZoneHandedOff(zoneID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.handedOff, zoneID)
 }
 
 // handoverZoneTo migrates zoneID's ownership from this (draining) shard to the target peer, so a subsequent
