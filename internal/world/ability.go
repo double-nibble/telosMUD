@@ -207,6 +207,7 @@ func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, arg st
 	// Depth+width guarded (event.go); the reaction threads the SAME budget (T12 invariant 3).
 	prec := &effectCtx{z: z, actor: actor, source: actor, target: actor, mag: 1, disp: def.disposition, rng: rng}
 	castOrigin := actor.location
+	castGen := deathGen(actor)
 	z.fireEvent(prec, evBeforeCastCommit, actor, target, 1)
 	// The result-altering reaction pass (7.9): if any observer's Counterspell-style reaction cancels
 	// the cast, ABORT before committing (no costs paid, no resolve). Observe-then-recheck: the engine
@@ -216,10 +217,17 @@ func (z *Zone) commitAbility(s *session, def *abilityDef, target *Entity, arg st
 		return
 	}
 	// SC2 (distsys review): if a BeforeCastCommit handler KILLED the caster, die()->respawnPlayer already
-	// relocated + revived them — do NOT commit the cast (it would pay costs + resolve from the respawn
-	// room). Same liveness-after-sub-call discipline as the flee/move M1 fix: a changed location (respawn
-	// clears posDead) means the death path owns the caster now.
-	if actor.location != castOrigin || position(actor) == posDead {
+	// revived them — do NOT commit the cast (it would pay costs + resolve from beyond the grave).
+	//
+	// THREE signals, none redundant (#69, combat review):
+	//   - deathGen: the caster DIED. It is the only reliable one, because a caster slain while standing in
+	//     the start room respawns IN PLACE — location unchanged, posDead already cleared — so the two
+	//     checks below both read "fine" and the cast used to commit from a fresh corpse. In the demo pack
+	//     the start room is an ordinary standing room, so this was reachable.
+	//   - location: a NON-lethal forced relocation (a fear/knockback reaction that yanks the caster out).
+	//     A death is not the only reason to abort, so this check stays.
+	//   - posDead: a death whose respawn was refused/deferred (a mob caster leaves the latch set).
+	if deathGen(actor) != castGen || actor.location != castOrigin || position(actor) == posDead {
 		return
 	}
 
