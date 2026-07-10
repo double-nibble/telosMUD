@@ -105,11 +105,27 @@ func (z *Zone) onVitalDepleted(victim, killer *Entity, parent *effectCtx) {
 	if victim == nil || victim.living == nil || position(victim) == posDead {
 		return
 	}
+	gen := deathGen(victim)
 	if pool := vitalResource(victim); pool != "" {
 		if def := z.resourceDefs().get(pool); def != nil && len(def.onDepleted) > 0 {
 			dc := z.deathCtx(victim, killer, parent)
 			z.runDeathHook(dc, def.onDepleted, victim)
 		}
+	}
+	// THE RE-ENTRY GUARD (#69). The posDead check at entry only screens frames that have not started yet.
+	// An on_depleted hook that re-deals lethal damage re-enters onVitalDepleted recursively; the INNERMOST
+	// frame (the one that hits the depth cap and runs no hook) reaches die() and buries the victim. As the
+	// stack unwinds, every outer frame is still holding a victim whose vital reads 0 — a corpsed mob's
+	// resCur is never restored — and would call die() AGAIN: a second corpse, a second OnKill, and a second
+	// resolveLoot, which is an item dupe. The generation is the only durable "already died" evidence (the
+	// posDead latch is cleared by respawnPlayer on the player path), so compare it across the hook.
+	//
+	// die()'s own entry latch also refuses the re-entry, so this is belt-and-braces — but it is the belt
+	// that matters: without it a PLAYER victim (whose latch respawnPlayer releases, and whose vital the
+	// respawn restored) would fall through the cancel re-check below as though the hook had SAVED them,
+	// which is a different lie. Stopping here says the truth: they already died, this frame is done.
+	if deathGen(victim) != gen {
+		return
 	}
 	// THE CANCEL RE-CHECK: after any on_depleted hook ran, re-read the vital. A hook that revived the
 	// victim above 0 (death-ward / second wind) cancels the death declaratively — abort cleanly with no
@@ -206,6 +222,27 @@ func (z *Zone) die(victim, killer *Entity, parent *effectCtx) {
 	if victim == nil || victim.living == nil {
 		return
 	}
+	// ENTRY IDEMPOTENCY (#69). die() is re-entrant: it fires OnKill and resolves loot while the victim is
+	// still standing in the room with its threat table intact — deliberately, so an XP/quest handler sees
+	// the kill in context — and only THEN latches posDead. An OnKill handler that deals damage to the
+	// victim (a cleave, an "execute" rider) therefore re-enters the funnel through a 0-hp entity whose
+	// posDead is not yet set, and used to run the WHOLE death again: a second corpse, a second OnKill, and
+	// a second resolveLoot. That last one is an item dupe. The posDead latch cannot move up here — the
+	// disengage() below resets position to standing — so the latch is its own flag, taken before anything
+	// re-entrant runs, and released only by respawnPlayer (a mob is extracted and never returns).
+	//
+	// The death generation is bumped in the same breath, so EVERY observer downstream — OnKill, loot,
+	// fireDeath, respawnPlayer, and the runOps cross-respawn guard on return — reads the incremented value.
+	// COW: mutableLiving forks a proto-aliased mob's Living first, so a killed instance never stamps the
+	// prototype (every future repop would be born pre-dead) or its live siblings.
+	l := mutableLiving(victim)
+	if l == nil || l.dying {
+		z.log.Debug("die() re-entered for an already-dying victim; ignored (#69)", "victim", targetShort(victim))
+		return
+	}
+	l.dying = true
+	l.deaths++
+
 	z.act("$n is DEAD!", victim, nil, nil, "", "", ToRoom)
 
 	// --- OnKill (the reserved combat event, now LIT). subject=KILLER (the event is ABOUT the slayer —
@@ -341,6 +378,14 @@ func (z *Zone) respawnPlayer(victim *Entity) {
 		}
 	}
 	setPosition(victim, posStanding)
+	// Release die()'s entry latch (#69): the player is alive again, so a LATER death must run the full
+	// funnel. A mob never reaches here — it is corpsed and extracted with the latch still held.
+	if l := mutableLiving(victim); l != nil {
+		l.dying = false
+	}
+	// NOTE: a player slain while already standing in the start room respawns IN PLACE — location is
+	// unchanged. Anything trying to detect "did my target just die?" across a sub-call must therefore
+	// compare deathGen, never location (#69; see the SC2/M1 guards in ability.go and commands.go).
 	if start := z.resolveRoom(z.startRoom); start != nil && start != victim.location {
 		Move(victim, start)
 	}
@@ -349,6 +394,20 @@ func (z *Zone) respawnPlayer(victim *Entity) {
 		z.lookRoom(s)
 	}
 	z.log.Debug("player died -> respawned", "player", victim.short, "room", targetShort(victim.location))
+}
+
+// deathGen reads an entity's death generation (the Living.deaths counter). A nil entity, or one with no
+// Living (an item), reads 0 and never changes — so a caller comparing a before/after pair on a non-living
+// target always sees "did not die", which is exactly right.
+//
+// The generation is the ONLY reliable cross-call death signal for a player: die() -> respawnPlayer revives
+// them inside the same call stack, so on return their position is standing, their hp is full, and only
+// their location moved. Compare generations, not positions.
+func deathGen(e *Entity) uint64 {
+	if e == nil || e.living == nil {
+		return 0
+	}
+	return e.living.deaths
 }
 
 // --- Threat list (death.go) -------------------------------------------------------------------

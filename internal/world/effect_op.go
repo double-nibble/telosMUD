@@ -93,6 +93,38 @@ type effectCtx struct {
 	// idempotent), just not globally deduped. Affect apply/expire still republish inline (affect_runtime.go).
 	commsCoalescing bool
 	commsDirty      []*Entity
+
+	// diedInCascade is the #69 cross-respawn dead-set: every entity that DIED while this ctx's op-list
+	// tree was resolving. An op whose bound target is in here is skipped — it was aimed at someone who
+	// has since been corpsed (a mob) or respawned across the world (a player), and landing it is the
+	// "your debuff follows you to the temple" bug.
+	//
+	// It lives on the CTX, not on a runOps frame, for the same reason commsDirty does: the flow ops
+	// (if/chance/check) and the area loop all recurse on THIS ctx and freely rebind c.target — so a
+	// nested frame can kill `other` while the parent frame is watching only its own bound `target`.
+	// A per-frame set cannot see that; a cascade-scoped set can. Populated by whichever frame observes
+	// the death (runOps around each op, runOpArea around each victim) and read by every frame.
+	// nil until something actually dies, so a death-free cascade — nearly all of them — allocates nothing.
+	diedInCascade map[*Entity]bool
+}
+
+// markDied records that `e` died while this ctx's op-list tree was resolving, so every later op in the
+// cascade that binds it as a target is skipped (#69). Allocates the set on first death.
+func (c *effectCtx) markDied(e *Entity, opKind string) {
+	if e == nil {
+		return
+	}
+	if c.diedInCascade == nil {
+		c.diedInCascade = map[*Entity]bool{}
+	}
+	c.diedInCascade[e] = true
+	c.z.log.Debug("op killed its target; remaining ops on it are skipped (#69)",
+		"op", opKind, "actor", c.actor.short, "target", targetShort(e))
+}
+
+// diedThisCascade reports whether an earlier op in this ctx's op-list tree already killed e (#69).
+func (c *effectCtx) diedThisCascade(e *Entity) bool {
+	return e != nil && c.diedInCascade[e]
 }
 
 // markCommsDirty records that e's comms config needs a mid-session republish (#77). Inside a runOps cascade
@@ -264,15 +296,49 @@ func init() {
 // the ops, dispatching each to its registered handler; an unknown op is logged+skipped (content-lint
 // is the real gate). Single-writer: zone goroutine. Never blocks.
 //
-// CROSS-RESPAWN HAZARD (security S1, documented-not-fixed this slice): runOps holds c.target across
-// SIBLING ops. With 6.5 uniform death, an op-list like `[deal_damage <lethal>, apply_affect rooted]` on
-// one bound target now KILLS+respawns on op1 (the shared funnel runs death inside deal_damage) and then
-// lands op2 (the debuff) on the RESPAWNED player — the same *Entity, fresh hp, at the start room. This is
-// SAFE today: op2 still funnels guardHarmful (it re-validates the now-respawned target every op, so no
-// crash and the PvP gate still holds), and there is no respawn-invulnerability window to violate yet. It
-// is a LATENT grief vector once respawn-sickness / spawn-protection exists. The real fix — skip the
-// remaining same-op-list ops on a target that died/respawned mid-list (track the target's pre-op
-// position/identity and bail) — lands WITH respawn-sickness, not here. Not marking it now by design.
+// CROSS-RESPAWN GUARD (#69, security S1). runOps holds c.target across SIBLING ops, and since 6.5 made
+// death uniform ANY deal_damage can run the whole death funnel inline. So an op-list like
+// `[deal_damage <lethal>, apply_affect rooted]` used to kill+respawn on op1 and then land op2 on the
+// RESPAWNED player — the same *Entity, fresh hp, standing at the start room. Nothing crashed (op2 still
+// funneled guardHarmful, which re-validates its target and re-checks the PvP gate), but a debuff that
+// follows you to the temple is wrong on its face, and it becomes a real grief vector the moment
+// respawn-sickness / spawn-protection exists: an attacker's already-committed op-list would land inside
+// the protection window by construction, bypassing a guard that had not yet been written.
+//
+// The guard: snapshot each op's bound target's DEATH GENERATION (death.go) around the op. If it changed,
+// that op killed the target, and every LATER op in the CASCADE bound to that same entity is skipped. The
+// dead-set (c.diedInCascade) is identity-keyed, so ops aimed at a DIFFERENT target — an AoE's other
+// victims, a self-buff rider on the caster — still run; a kill does not silently swallow the rest of the
+// list. If an op killed the ACTOR — a thorns proc, a reflected nuke, an on_depleted hook re-dealing lethal
+// damage back at the killer — the whole list stops: nothing the actor was mid-way through doing should
+// finish resolving from beyond the grave. That is the same liveness-after-sub-call discipline the flee/
+// move (M1) and cast-commit (SC2) paths already apply.
+//
+// Position is NOT a usable signal here: die() -> respawnPlayer clears posDead inside the same call stack,
+// so on return a respawned player reads as a healthy standing entity. Only the generation survives.
+//
+// The dead-set is CASCADE-scoped (on the ctx), not frame-scoped, and that is load-bearing. The flow ops
+// (if/chance/check) and the area loop recurse on the SAME ctx and freely rebind c.target, so a nested
+// frame can kill `other` while the parent frame is watching only its own bound `target` — the parent's
+// around-the-op comparison would never see it, and a later `target: other` op would land on the respawned
+// player. A per-frame set is structurally unable to compose across that rebinding. (mudlib review
+// reproduced both the nested-branch and the area variants of this.)
+//
+// SCOPE, stated honestly. This guard enforces "no op lands on an entity this cascade already killed" for
+// the DATA op-list path only. It is NOT the general invariant "no hostile effect survives respawn":
+//   - Lua harm (luaharm.go) issues each `h:damage` / `h:apply_affect` as its own Go call outside any
+//     op-list, so a script can kill and then debuff the respawned player. (security review, F1.)
+//   - An op-list run by a fired event handler or an affect tick is a fresh ctx with a fresh dead-set.
+//
+// The durable form of that invariant belongs at the respawnPlayer chokepoint (clear hostile affects /
+// open the spawn-protection window there), where every death path inherits it and no caller can forget.
+// Tracked as #318. Nothing here is a substitute for it.
+//
+// INVARIANT the guard rests on: die() is the only thing that bumps the generation, and the only op in the
+// vocabulary that removes a LIVING target. An op that ever extracts or relocates a living entity without
+// routing through die() would silently defeat this — a later non-harmful op (set_flag, grant_*, heal)
+// would land on the detached entity, and guardHarmful's fail-closed-on-detached check only backstops
+// HARMFUL ops. A new op that can unmake a living entity must bump the generation. (security review, F5.)
 func runOps(c *effectCtx, ops []effectOp) {
 	// #77: the OUTERMOST runOps owns the coalesced comms-republish flush. A grant op marks its target dirty
 	// (markCommsDirty) instead of republishing inline; when this frame is the one that opened the cascade it
@@ -284,6 +350,10 @@ func runOps(c *effectCtx, ops []effectOp) {
 		c.commsCoalescing = true
 		defer c.flushCommsDirty()
 	}
+	// #69: the actor's generation is fixed for the whole frame (an actor that died BEFORE this frame was
+	// entered is the caller's problem — and a nested frame's caller is the parent runOps, which aborts on
+	// exactly that signal, so the check composes upward without a shared snapshot).
+	actorGen := deathGen(c.actor)
 	for i := range ops {
 		op := &ops[i]
 		h, ok := effectOpHandlers[op.kind]
@@ -295,8 +365,15 @@ func runOps(c *effectCtx, ops []effectOp) {
 		// once per target with c.target bound to each. This is the whole [G12] mechanism — the per-op
 		// handler (and the guardHarmful it funnels) is UNCHANGED, just invoked N times, gated N times. A
 		// non-area op (op.area == "") is the degenerate 1-target case below.
+		//
+		// #69: runOpArea marks each victim it kills into the cascade's dead-set itself (it binds c.target
+		// per victim, so only it can see which ones died); here we only have to honor the actor abort.
 		if op.area != "" {
 			runOpArea(c, op, h)
+			if deathGen(c.actor) != actorGen {
+				c.z.log.Debug("op-list stopped: the actor died mid-list (#69)", "op", op.kind, "actor", c.actor.short)
+				return
+			}
 			continue
 		}
 		// Per-op target selection (event handlers bind self/other): "self" -> the subject, "other" ->
@@ -311,14 +388,30 @@ func runOps(c *effectCtx, ops []effectOp) {
 				c.target = c.other
 			}
 		}
+		// #69: an earlier op ANYWHERE in this cascade killed the entity this op is aimed at. It has already
+		// been corpsed (a mob) or respawned across the world (a player); either way this op must not land.
+		if c.diedThisCascade(c.target) {
+			c.z.log.Debug("effect op skipped: its target died earlier in this cascade (#69)",
+				"op", op.kind, "actor", c.actor.short, "target", targetShort(c.target))
+			c.target = prev
+			continue
+		}
 		if c.z.log.Enabled(context.Background(), slog.LevelDebug) {
 			c.z.log.Debug("effect op", "op", op.kind, "actor", c.actor.short,
 				"target", targetShort(c.target), "disp", int(c.disp))
 		}
+		tgt, tgtGen := c.target, deathGen(c.target)
 		if err := h(c, op); err != nil {
 			c.z.log.Debug("effect op error (skipped)", "op", op.kind, "err", err)
 		}
 		c.target = prev
+		if deathGen(tgt) != tgtGen {
+			c.markDied(tgt, op.kind)
+		}
+		if deathGen(c.actor) != actorGen {
+			c.z.log.Debug("op-list stopped: the actor died mid-list (#69)", "op", op.kind, "actor", c.actor.short)
+			return
+		}
 	}
 }
 
@@ -329,17 +422,32 @@ func runOps(c *effectCtx, ops []effectOp) {
 // non-consenting player in the same room is a clean no-op — per target. A per-target `check` save rolls
 // once per target (resolveCheck reads the bound c.target). c.target is restored after the loop so a
 // sibling op in the list (area or not) sees the original target. Single-writer: zone goroutine.
+//
+// #69: the loop is the ONLY place that knows which victims this op bound, so it is the only place that
+// can record which ones it killed. It marks each into the cascade's dead-set (c.markDied) so a LATER op
+// in the enclosing list — `[fireball area:room, apply_affect rooted]`, or a `target: other` rider — is
+// skipped for anyone the blast already killed and respawned. Skipping a victim the cascade already killed
+// also stops a second area op in the same list from hitting them again at the temple.
 func runOpArea(c *effectCtx, op *effectOp, h effectOpHandler) {
 	targets := areaTargets(c, op.area)
 	prev := c.target
 	for _, t := range targets {
+		if c.diedThisCascade(t) {
+			c.z.log.Debug("area op skipped for a target that died earlier in this cascade (#69)",
+				"op", op.kind, "area", op.area, "actor", c.actor.short, "target", targetShort(t))
+			continue
+		}
 		c.target = t
 		if c.z.log.Enabled(context.Background(), slog.LevelDebug) {
 			c.z.log.Debug("effect op (area)", "op", op.kind, "area", op.area,
 				"actor", c.actor.short, "target", targetShort(t), "disp", int(c.disp))
 		}
+		gen := deathGen(t)
 		if err := h(c, op); err != nil {
 			c.z.log.Debug("effect op error (skipped)", "op", op.kind, "err", err)
+		}
+		if deathGen(t) != gen {
+			c.markDied(t, op.kind)
 		}
 	}
 	c.target = prev

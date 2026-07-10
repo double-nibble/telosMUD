@@ -523,12 +523,18 @@ func (z *Zone) move(s *session, dir string) bool {
 	// fire is the general movement checkpoint (a foe with a one-sided fighting link still provokes). A
 	// directional `flee` (combat_commands.go) is the engaged-leaver path that exercises the OA milestone.
 	moveOrigin := s.entity.location
+	moveGen := deathGen(s.entity)
 	z.fireLeaveRoom(nil, s.entity)
-	// M1 (distsys review): if a reaction killed the mover, die()->respawnPlayer already relocated them —
-	// don't continue the move (it would teleport the respawned player to the move destination). A changed
-	// location is the signal (respawn clears posDead). Unengaged movers rarely take a lethal reaction, but
-	// a one-sided fighting link can still provoke, so guard the same way as the flee path.
-	if s.entity.location != moveOrigin || position(s.entity) == posDead {
+	// M1 (distsys review): if a reaction killed the mover, die()->respawnPlayer already revived them — don't
+	// continue the move (it would teleport the respawned player to the move destination). Unengaged movers
+	// rarely take a lethal reaction, but a one-sided fighting link can still provoke.
+	//
+	// deathGen is the load-bearing check (#69, combat review): a mover slain while standing in the START
+	// ROOM respawns IN PLACE, so location is unchanged and posDead is already cleared — both weaker signals
+	// read "fine" and the move proceeded, walking a just-respawned player back out of the temple. The
+	// location check still earns its place: it also catches a NON-lethal forced relocation (a knockback
+	// reaction), which is likewise a reason to abandon the move.
+	if deathGen(s.entity) != moveGen || s.entity.location != moveOrigin || position(s.entity) == posDead {
 		return false
 	}
 	// Lua `leave` trigger (7.4c): fire on the FROM room BEFORE the move detaches the leaver, so

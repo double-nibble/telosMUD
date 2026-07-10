@@ -142,6 +142,23 @@ type Living struct {
 	// (MUDLIB §6, position.go). Stored as an int (the Position enum's underlying type) so the COW
 	// shallow-copy and the persisted shape are unchanged; position()/setPosition give it names.
 	position int
+	// deaths is this entity's DEATH GENERATION: a monotonic counter bumped exactly once per die(),
+	// alongside the posDead latch (death.go). It exists because posDead is NOT a durable "this entity
+	// died" signal for a PLAYER — respawnPlayer clears it back to standing within the same call stack,
+	// so a caller that regains control after a lethal sub-call cannot tell "still alive" from "died and
+	// was already revived" by reading position/hp. runOps snapshots this around every op to stop an
+	// op-list from landing its remaining ops on a target it just killed and respawned (#69).
+	// Transient — never persisted (a fresh process starts every entity at 0, and nothing compares a
+	// generation across a save/handoff). COW-safe: bumped through mutableLiving, so a proto-aliased mob
+	// forks its own Living rather than stamping the prototype and every sibling.
+	deaths uint64
+	// dying is die()'s ENTRY re-entrancy latch (death.go, #69). die() fires OnKill and resolves loot
+	// while the victim is still standing in-room with an intact threat table, and only latches posDead
+	// afterwards; without this flag, a handler that damages the 0-hp victim inside that window re-enters
+	// die() and duplicates the corpse, the OnKill, and the loot roll (an item dupe). Taken at die()'s
+	// first statement, released only by respawnPlayer — a dead mob is extracted and never returns.
+	// Transient, never persisted. COW-safe: written through mutableLiving.
+	dying bool
 	// fighting is the current combat target (a live entity), nil when not fighting. Set by startFight
 	// (combat.go) and cleared by stopFight; the per-zone round driver swings every posFighting entity
 	// at its `fighting` target each PULSE_VIOLENCE. Transient — never persisted (combat drops on a

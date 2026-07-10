@@ -273,6 +273,24 @@ func TestRecursiveOnDepletedTerminates(t *testing.T) {
 	if roomCorpse(room) == nil {
 		t.Fatalf("recursive on_depleted did not resolve to a death/corpse (cascade should truncate, then die)")
 	}
+	// CARDINALITY, not just existence (#69). This test registered the exact fixture that produced a
+	// re-entrant die(), and passed anyway for a long time: roomCorpse returns the FIRST container it finds,
+	// and `!= nil` is satisfied identically by one corpse or by nine. Termination was proven; exactly-once
+	// was not — and the missing half WAS an item dupe (N deaths => N resolveLoot calls). A recursion-bound
+	// test must assert idempotency on the same fixture, or a double-fire hides behind "it terminated and a
+	// corpse exists".
+	corpses := 0
+	for _, e := range room.contents {
+		if _, ok := Get[*Container](e); ok {
+			corpses++
+		}
+	}
+	if corpses != 1 {
+		t.Fatalf("re-entrant on_depleted produced %d corpses, want exactly 1 (double die() = double loot = item dupe)", corpses)
+	}
+	if got := deathGen(mob); got != 1 {
+		t.Fatalf("the mob died %d times via the recursive on_depleted hook, want exactly 1", got)
+	}
 }
 
 // TestPingPongOnDepletedTerminates is the two-entity M1 variant: A's on_depleted deals lethal damage to
