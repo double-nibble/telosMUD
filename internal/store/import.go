@@ -409,6 +409,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM wear_slot_defs WHERE pack=$1`,
 		// Chargens (Phase 14.8): same strips-and-replaces idempotency.
 		`DELETE FROM chargen_defs WHERE pack=$1`,
+		// Help topics (#64): same strips-and-replaces idempotency. No FK into the zone tree.
+		`DELETE FROM help_defs WHERE pack=$1`,
 		// Display templates: same strips-and-replaces idempotency.
 		`DELETE FROM display_defs WHERE pack=$1`,
 		// Trust tiers (#27/#29): same strips-and-replaces idempotency. No FK into the zone tree.
@@ -788,6 +790,20 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO chargen_defs (ref, pack, body) VALUES ($1,$2,$3)`, cg.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert chargen %s: %w", cg.Ref, err)
+		}
+	}
+	// Help topics (#64): ref+pack PK, the title/category/keywords/body/see_also in the JSONB body.
+	for _, hd := range pk.HelpDefs {
+		body, err := json.Marshal(helpBody{
+			Title: hd.Title, Category: hd.Category, Keywords: hd.Keywords,
+			Body: hd.Body, SeeAlso: hd.SeeAlso,
+		})
+		if err != nil {
+			return fmt.Errorf("store: marshal help_def %s body: %w", hd.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO help_defs (ref, pack, body) VALUES ($1,$2,$3)`, hd.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert help_def %s: %w", hd.Ref, err)
 		}
 	}
 	// Display templates: (pack, surface) PK, the Lua render body in the JSONB body.

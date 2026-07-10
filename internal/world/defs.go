@@ -120,6 +120,7 @@ type defRegistries struct {
 	affix   *defRegistry[*affixDef]      // #37 named affixes (referenced by loot quality pools)
 	loot    *defRegistry[*lootTableDef]  // Phase 12.1 loot tables
 	recipe  *defRegistry[*recipeDef]     // Phase 13.5 crafting recipes
+	help    *defRegistry[*helpDef]       // #64 builder-defined help topics
 
 	// trust is the pack's content-defined trust ladder (#27/#29, Round 9 Slice 0): tier→rank + granted
 	// reserved flags, built from lc.TrustTiers. nil => the engine default ladder (player/builder/admin,
@@ -180,6 +181,7 @@ func newDefRegistries() *defRegistries {
 		affix:       newDefRegistry[*affixDef](),
 		loot:        newDefRegistry[*lootTableDef](),
 		recipe:      newDefRegistry[*recipeDef](),
+		help:        newDefRegistry[*helpDef](),
 		abilityCmds: map[string]*abilityDef{},
 		customCmds:  map[string]string{},
 		formulas:    map[string]string{},
@@ -249,6 +251,11 @@ func (z *Zone) bundleDefs() *defRegistry[*bundleDef] {
 func (z *Zone) rarityTierDefs() *defRegistry[*rarityTierDef] { return z.defBundle().rarity }
 func (z *Zone) lootTableDefs() *defRegistry[*lootTableDef]   { return z.defBundle().loot }
 func (z *Zone) recipeDefs() *defRegistry[*recipeDef]         { return z.defBundle().recipe }
+
+// helpDefs is the zone-goroutine read accessor for the global help-topic registry (#64). Lock-free
+// atomic.Load; a bare zone falls back to its own empty bundle (no topics — the `help` command still
+// renders the auto-included built-in command index).
+func (z *Zone) helpDefs() *defRegistry[*helpDef] { return z.defBundle().help }
 
 // channelForVerb returns the channel a verb emits on (lower-cased), or nil. The verb→channel mapping
 // is DERIVED from the channel registry on each lookup (the table is small) rather than cached in a

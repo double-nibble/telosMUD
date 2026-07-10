@@ -148,6 +148,7 @@ func mergePacks(parts []Pack) Pack {
 		out.LootTables = mergeByKey(out.LootTables, p.LootTables, func(l LootTableDTO) string { return l.Ref })
 		out.SpawnSchedules = mergeByKey(out.SpawnSchedules, p.SpawnSchedules, func(s SpawnScheduleDTO) string { return s.Ref })
 		out.Recipes = mergeByKey(out.Recipes, p.Recipes, func(r RecipeDTO) string { return r.Ref })
+		out.HelpDefs = mergeByKey(out.HelpDefs, p.HelpDefs, func(h HelpDTO) string { return h.Ref })
 		out.WearSlots = mergeByKey(out.WearSlots, p.WearSlots, func(w WearSlotDTO) string { return w.Ref })
 		out.Chargens = mergeByKey(out.Chargens, p.Chargens, func(c ChargenDTO) string { return c.Ref })
 		out.TrustTiers = mergeByKey(out.TrustTiers, p.TrustTiers, func(t TrustTierDTO) string { return t.Name })

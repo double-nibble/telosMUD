@@ -133,6 +133,26 @@ type Pack struct {
 	// sandbox `ui` toolkit. Content-authored so a 5e vs WoW pack shows its own sheet layout, labels, and stat
 	// order without an engine change (the mechanism/flavor pillar). Same last-write-wins override-by-surface.
 	DisplayDefs []DisplayDefDTO `json:"display_defs" yaml:"display_defs"`
+
+	// HelpDefs are pack-GLOBAL help topics (#64): a browsable `help` / `help <topic>` reads them. A topic is
+	// pure CONTENT — the engine names no topic and only knows the KIND (help_defs); a pack supplies the text.
+	// The `help` command AUTO-INCLUDES the registered command set on top of these, so an empty pack still has
+	// a usable command index (the empty-boot invariant). Same last-write-wins override-by-ref rule.
+	HelpDefs []HelpDTO `json:"help_defs" yaml:"help_defs"`
+}
+
+// HelpDTO is one content-defined help topic (#64): the data a browsable `help` / `help <topic>` renders. A
+// topic is addressed by its Ref (a stable id, "help:combat") and by any of its Keywords (the words a player
+// types after `help`; the ref's own leaf token is an implicit keyword, like a recipe alias). Category groups
+// it in the index; Body is the help text (may carry engine {{TOKEN}} color markup); SeeAlso lists related
+// topic refs/keywords. Pure CONTENT — a builder authors these; the engine renders them.
+type HelpDTO struct {
+	Ref      string   `json:"ref" yaml:"ref"`
+	Title    string   `json:"title,omitempty" yaml:"title,omitempty"`
+	Category string   `json:"category,omitempty" yaml:"category,omitempty"`
+	Keywords []string `json:"keywords,omitempty" yaml:"keywords,omitempty"` // words a player types after `help`; ref leaf is implicit
+	Body     string   `json:"body,omitempty" yaml:"body,omitempty"`
+	SeeAlso  []string `json:"see_also,omitempty" yaml:"see_also,omitempty"` // related topic refs/keywords
 }
 
 // DisplayDefDTO is one content-defined display template: a surface name and the Lua render body. The body runs
