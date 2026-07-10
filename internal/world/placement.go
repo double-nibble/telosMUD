@@ -37,11 +37,17 @@ import (
 // exists to kill, so we must not drop it. Coalescing bounds memory by RESIDENT COUNT (not by event rate)
 // while never blocking an actor loop and never discarding a meaningful write.
 
-// placementOp is one pending placement write: "playerID is resident in zoneID on this shard at epoch".
+// placementOp is one pending placement write. Either "playerID is resident in zoneID on this shard at
+// epoch" (clear == false), or the clean-logout tombstone "playerID left this shard at epoch" (clear == true).
+//
+// Both ride the same coalescing map, and that is deliberate: if a player quits and immediately reconnects,
+// the pending clear is REPLACED by the fresh registration rather than being applied after it. Last write
+// wins, and the last write is the truth.
 type placementOp struct {
 	playerID string
 	zoneID   string
 	epoch    uint64
+	clear    bool
 }
 
 // placementWriteTimeout bounds one Redis round trip on the background worker, so a wedged directory cannot
@@ -107,6 +113,44 @@ func (z *Zone) registerPlacement(s *session) {
 	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch})
 }
 
+// clearPlacement enqueues the clean-logout tombstone: drop this player's `shard` field, keeping their epoch
+// (the handoff fence) and zone (the reconnect routing key). Safe to call from a zone goroutine.
+//
+// ONLY for a clean, player-initiated quit.
+//
+// NOT for link death. Note that this is NOT because reconnect routing needs the shard field — since #320
+// the gate routes by ZONE (ShardForZone names the zone's current owner), so a tombstoned link-dead player
+// would still be routed straight back to the shard holding their detached session. The reason is simpler
+// and narrower: while the session is detached it is still HELD here, entity and all, for the whole grace.
+// The record should say so. Tombstoning would claim the player is hosted nowhere while this shard is very
+// much hosting them.
+//
+// NOT mid-handoff either: `detach` returns early on `frozen`, the destination owns the record by then, and
+// the directory-side fence would reject us anyway.
+//
+// WHAT THE DIRECTORY FENCE DOES NOT COVER (distsys + test review). `clearPlayerShard` applies when the
+// record still names (this shard, this epoch). A player who quits and relogs on the SAME shard resumes the
+// SAME epoch — registerPlacement accepts an equal epoch by design — so a late-draining clear would match
+// the live record on both axes and blank a connected player's shard field. The fence cannot see it.
+//
+// What makes that safe is ORDERING, not the fence: `detach` offers the clear and only then calls `leave`,
+// so a relog's registration is always offered AFTER the clear; and one serial writer drains a per-player
+// coalescing map, so the register either replaces the pending clear or is written strictly after it. Final
+// state is the register, every time.
+//
+// That is a real invariant, and it is load-bearing. If a second writer of this record ever appears on the
+// same shard, or the placement writer becomes concurrent, a stale clear could evict a live placement with
+// no self-heal. Tracked in #329.
+func (z *Zone) clearPlacement(s *session) {
+	if z.shard == nil || z.shard.dir == nil || z.shard.shardID == "" || s == nil || s.character == "" {
+		return
+	}
+	// Carry the zone. The writer coalesces per player, so a logout offered while a zone-change registration
+	// is still pending REPLACES it — without this the tombstone would leave the record naming the zone the
+	// player walked out of, and a later reconnect would route by that stale zone.
+	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch, clear: true})
+}
+
 // runPlacementWriter drains pending placements off every zone goroutine, performing the blocking Redis
 // writes. Started by Shard.Run; exits with the shard's context.
 //
@@ -137,6 +181,27 @@ func (s *Shard) runPlacementWriter(ctx context.Context) {
 func (s *Shard) writePlacement(ctx context.Context, op placementOp) {
 	wctx, cancel := context.WithTimeout(ctx, placementWriteTimeout)
 	defer cancel()
+
+	if op.clear {
+		ok, err := s.dir.ClearPlayerShard(wctx, op.playerID, s.shardID, op.zoneID, op.epoch)
+		switch {
+		case err != nil:
+			// Fail-safe: the record keeps naming this shard. The player's next login rewrites it, and until
+			// then a reconnect routes here — which is exactly the pre-#70 behavior.
+			slog.Warn("placement tombstone failed", "component", "world",
+				"player", op.playerID, "zone", op.zoneID, "epoch", op.epoch, "err", err)
+		case !ok:
+			// The fence rejected us: the record no longer names this shard at this epoch, because the player
+			// already re-registered somewhere (a fast relog) or was handed off. Either way, not ours to clear.
+			slog.Debug("placement tombstone fenced out", "component", "world",
+				"player", op.playerID, "shard", s.shardID, "epoch", op.epoch)
+		default:
+			slog.Debug("placement tombstoned on clean logout", "component", "world",
+				"player", op.playerID, "shard", s.shardID, "epoch", op.epoch)
+		}
+		return
+	}
+
 	ok, err := s.dir.RegisterPlacement(wctx, op.playerID, s.shardID, op.zoneID, op.epoch)
 	switch {
 	case err != nil:

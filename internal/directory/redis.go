@@ -609,14 +609,69 @@ func (r *Redis) RegisterPlacement(ctx context.Context, playerID, shardID, zoneID
 	return res == 1, nil
 }
 
+// clearPlayerShard is the CLEAN-LOGOUT TOMBSTONE (#70). It removes only the `shard` field, and only when
+// that field still names the caller AT the caller's epoch — a compare-and-delete, not a blind HDEL.
+//
+// The fence matters. A clear racing a concurrent re-login (the player reconnected elsewhere and their new
+// shard already registered) reads a different shard, or a newer epoch, and no-ops. So a late-draining
+// logout write can never evict a live placement.
+//
+// `epoch` and `zone` deliberately SURVIVE:
+//   - epoch is the monotonic fence the handoff CAS compares against. Deleting the key would let a delayed
+//     or retried SetPlayerShard from an earlier handoff find `cur == nil` and APPLY, resurrecting a stale
+//     placement.
+//   - zone is the reconnect routing key (#320). A returning player must still resolve to whoever owns the
+//     zone they logged out in.
+//
+// Returns 1 if the field was cleared, 0 if the fence rejected it.
+var clearPlayerShard = redis.NewScript(`
+local shard = redis.call('HGET', KEYS[1], 'shard')
+local epoch = redis.call('HGET', KEYS[1], 'epoch')
+if shard ~= ARGV[1] then return 0 end
+if not epoch or tonumber(epoch) ~= tonumber(ARGV[3]) then return 0 end
+if ARGV[2] ~= '' then
+  redis.call('HSET', KEYS[1], 'zone', ARGV[2])
+end
+redis.call('HDEL', KEYS[1], 'shard')
+return 1
+`)
+
+// ClearPlayerShard tombstones a cleanly-logged-out player: it drops the `shard` field iff the record still
+// names shardID at epoch, keeping `epoch` (the handoff fence) and recording zoneID as the zone they logged
+// out in (the reconnect routing key, #320).
+//
+// It WRITES the zone rather than merely preserving it because the world's placement writer coalesces per
+// player: a logout enqueued while a zone-change registration is still pending would otherwise replace it,
+// and the record would name the zone the player walked out of. Passing the quitting zone here makes the
+// tombstone carry the same information the superseded registration would have. An empty zoneID leaves the
+// stored zone untouched.
+//
+// Call it ONLY on a clean, player-initiated quit — never on link death, never mid-handoff. Blocking Redis
+// I/O: off the zone goroutine.
+func (r *Redis) ClearPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error) {
+	res, err := clearPlayerShard.Run(ctx, r.rdb, []string{r.playerKey(playerID)}, shardID, zoneID, epoch).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
+}
+
 // PlayerPlacement returns where playerID currently lives (shard, zone, epoch), or ErrNotFound.
-// ZoneID is "" on a legacy record written before #320 added the field.
+//
+// EXISTENCE IS KEYED ON `epoch`, NOT `shard` (#70). A cleanly-logged-out player is tombstoned by dropping
+// the shard field, so `shard` is absent for anyone offline — but the character still EXISTS, and the
+// tell/mail existence oracle (PlayerShard) must keep saying so, or tells to offline players would be
+// refused with "there is no player by that name". `epoch` is written by every placement write and never
+// removed except by a full ClearPlayer, so its presence is the character's existence.
+//
+// A caller therefore sees ShardID == "" for an offline player. ZoneID is "" only on a legacy record written
+// before #320 added the field.
 func (r *Redis) PlayerPlacement(ctx context.Context, playerID string) (Placement, error) {
 	vals, err := r.rdb.HMGet(ctx, r.playerKey(playerID), "shard", "epoch", "zone").Result()
 	if err != nil {
 		return Placement{}, err
 	}
-	if vals[0] == nil {
+	if vals[1] == nil {
 		return Placement{}, ErrNotFound
 	}
 	shardID, _ := vals[0].(string)
@@ -644,16 +699,30 @@ func (r *Redis) PlayerEpoch(ctx context.Context, playerID string) (uint64, bool,
 	return place.Epoch, true, nil
 }
 
-// ClearPlayer removes a player's placement (on clean logout).
+// ClearPlayer DELETES a player's whole placement record — epoch, zone and shard.
+//
+// This is CHARACTER DELETION, not logout. A clean logout uses ClearPlayerShard, which tombstones only the
+// shard field. Deleting the record outright is destructive in two ways that are easy to miss:
+//   - it drops the monotonic `epoch`, so a delayed or retried SetPlayerShard from an earlier handoff finds
+//     `cur == nil` and APPLIES, resurrecting a stale placement;
+//   - it makes the character non-existent to the tell/mail existence oracle, so a tell to them is refused
+//     with "there is no player by that name".
+//
+// Both are correct for a deleted character and wrong for a logged-out one.
 func (r *Redis) ClearPlayer(ctx context.Context, playerID string) error {
 	return r.rdb.Del(ctx, r.playerKey(playerID)).Err()
 }
 
 // PlayerShard is the world-Locator-facing wrapper over PlayerPlacement (Phase 8.5 tell routing,
 // P8-D5): it resolves which shard a player currently lives on as (shardID, found, err) without the
-// caller importing Placement, mirroring PlayerEpoch's wrapper shape. found=false (nil error) when the
-// player has no placement yet (a never-seen name) — the tell path refuses such a target. This is the
-// EPOCH-AUTHORITATIVE player->shard map; tell routing reads it, NEVER the presence roster (P8-A4).
+// caller importing Placement, mirroring PlayerEpoch's wrapper shape. This is the EPOCH-AUTHORITATIVE
+// player->shard map; tell routing reads it, NEVER the presence roster (P8-A4).
+//
+// found reports EXISTENCE, not presence. found=false (nil error) means a never-seen name, and the tell path
+// refuses such a target. A character who has logged in and cleanly quit is found=true with shardID == ""
+// (#70's tombstone): they exist, they are addressable, and their tell drains from the durable subject when
+// they next log in. Callers that need "is currently hosted somewhere" must check shardID != "" as well —
+// and callers that need "is currently CONNECTED" want the presence roster, not this (#325).
 func (r *Redis) PlayerShard(ctx context.Context, playerID string) (string, bool, error) {
 	place, err := r.PlayerPlacement(ctx, playerID)
 	if errors.Is(err, ErrNotFound) {

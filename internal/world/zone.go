@@ -1648,6 +1648,19 @@ func (z *Zone) detach(id string, out chan *playv1.ServerFrame) {
 	}
 	if s.quitting {
 		z.log.Debug("clean quit, removing player", "player", id)
+		// Tombstone the directory placement (#70): drop the `shard` field so the record stops claiming this
+		// shard still hosts them, while KEEPING their epoch (the handoff fence) and zone (the reconnect
+		// routing key). Enqueued, never inline — this is blocking Redis I/O and we are on the zone goroutine.
+		//
+		// Only on a clean quit. A link-dead detach falls through below and keeps its placement, because this
+		// shard genuinely still holds the detached session (entity and all) for the whole grace. That is not
+		// a routing requirement — since #320 the gate resolves by zone, so a link-dead player would be routed
+		// back here regardless — it is just the record telling the truth.
+		//
+		// Ordering matters here: offer the clear BEFORE leave() removes the session, so a relog's
+		// registration is necessarily offered after it. See clearPlacement's doc for why the directory fence
+		// alone would not save us.
+		z.clearPlacement(s)
 		z.leave(id)
 		return
 	}

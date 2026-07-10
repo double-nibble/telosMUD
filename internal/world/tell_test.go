@@ -46,6 +46,10 @@ func (f *fakeLocator) PlayerShard(_ context.Context, playerID string) (string, b
 
 func (f *fakeLocator) ShardForZone(context.Context, string) (string, error)     { return "", nil }
 func (f *fakeLocator) EndpointForShard(context.Context, string) (string, error) { return "", nil }
+func (f *fakeLocator) ClearPlayerShard(context.Context, string, string, string, uint64) (bool, error) {
+	return true, nil
+}
+
 func (f *fakeLocator) RegisterPlacement(context.Context, string, string, string, uint64) (bool, error) {
 	return true, nil
 }
@@ -541,5 +545,40 @@ func waitPublished(t *testing.T, js *commbus.MemJetStream, subj, probeID string,
 			t.Fatalf("durable subject %s never reached %d pending (last %d)", subj, want, js.Pending(subj, probeID))
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+// TestTellToATombstonedPlayerIsAccepted is the user-visible reason #70 tombstones the placement instead of
+// deleting it, and the one behavior nothing else covered.
+//
+// The tell path uses the directory as an EXISTENCE oracle: `found == false` means "There is no player by
+// that name" and the tell is refused. A cleanly-logged-out player is tombstoned — their `shard` field is
+// gone, but the record (epoch + zone) remains — so they must still resolve, and their tell must be published
+// durably for delivery on next login. Had #70 shipped the `DEL` its title asked for, every offline character
+// would have become unaddressable.
+func TestTellToATombstonedPlayerIsAccepted(t *testing.T) {
+	core := commbus.NewMemBus()
+	t.Cleanup(func() { _ = core.Close() })
+	js := commbus.NewMemJetStream()
+	t.Cleanup(func() { _ = js.Close() })
+
+	// Bob exists but is tombstoned: found=true, shardID="". Nobody does not exist at all.
+	dir := newFakeLocator("Alice")
+	dir.players["Bob"] = "" // the tombstoned shape
+
+	z := tellShard(t, core.WorldHandle(), js, dir)
+	alice := joinTellPlayer(t, z, "Alice")
+
+	z.post(inputMsg{id: "Alice", line: "tell Bob are you there"})
+	if drainContains(t, alice, "no player by that name") {
+		t.Fatal("a tell to a cleanly-logged-out (tombstoned) player was REFUSED — the existence oracle must " +
+			"report found=true for a record whose shard field was tombstoned (#70)")
+	}
+
+	// And the contrast: a name with no record at all is still refused, so the tombstone specifically flipped
+	// the outcome rather than the check being dead.
+	z.post(inputMsg{id: "Alice", line: "tell Nobody are you there"})
+	if !drainContains(t, alice, "no player by that name") {
+		t.Fatal("a tell to a genuinely unknown player must still be refused")
 	}
 }
