@@ -45,6 +45,8 @@ func TestOverworldMapCentresOnPlayer(t *testing.T) {
 }
 
 // TestOverworldMapEdgeLabels: at the south gate the Midgaard label box appears; at the north edge, Darkwood.
+// The city label is inferred from the room's `enter` gate (there is NO redundant cardinal exit to the same
+// city, #361 refinement), and a `|` connector must join the label box to the player's cell.
 func TestOverworldMapEdgeLabels(t *testing.T) {
 	_, _, render := overworldViewer(t)
 	south, _ := render("overworld:room:c2_r0")
@@ -55,11 +57,31 @@ func TestOverworldMapEdgeLabels(t *testing.T) {
 	if !strings.Contains(north, "Darkwood") {
 		t.Fatalf("north-edge map is missing the Darkwood label:\n%s", north)
 	}
+	// The city label must be joined to the player by a connector stub: on the line adjacent to the label box
+	// (the row between the "+----------+" bar and the "| @ |" cell) there is a lone `|` — the gate indicator.
+	if !cityConnectorPresent(north) {
+		t.Fatalf("north-edge map has the Darkwood label but no connector to the player:\n%s", north)
+	}
+	if !cityConnectorPresent(south) {
+		t.Fatalf("south-gate map has the Midgaard label but no connector to the player:\n%s", south)
+	}
 	// Deep in the middle, neither city is in view.
 	mid, _ := render("overworld:room:c2_r10")
 	if strings.Contains(mid, "Midgaard") || strings.Contains(mid, "Darkwood") {
 		t.Fatalf("mid-plains map should show no city label:\n%s", mid)
 	}
+}
+
+// cityConnectorPresent reports whether the map has a line whose only non-space, non-frame content is a single
+// `|` — the connector stub the template draws between a city label box and the edge room that gates into it.
+func cityConnectorPresent(sheet string) bool {
+	for _, ln := range strings.Split(sheet, "\n") {
+		inner := strings.TrimSpace(strings.Trim(ln, "|"))
+		if inner == "|" {
+			return true
+		}
+	}
+	return false
 }
 
 // TestOverworldMapLandmarkIcons: a landmark room renders its icon (lake ~, hill ^, house H) when in view.
@@ -127,10 +149,14 @@ func TestOverworldTemplateSkipsNonPlainsRooms(t *testing.T) {
 // TestOverworldWiring: the city↔plains↔forest gateway exits are wired both ways.
 func TestOverworldWiring(t *testing.T) {
 	over := newDemoZone("overworld", newProtoCache())
-	// Entry room bridges back to Midgaard (enter/south) and up into the grid (north).
+	// Entry room bridges back to Midgaard via `enter` ONLY (no redundant `south` to the same room, #361
+	// refinement) and up into the grid (north).
 	gate := over.rooms["overworld:room:c2_r0"].room
 	if gate.exits["enter"] != "midgaard:room:market" {
 		t.Fatalf("c2_r0 enter = %q, want midgaard:room:market", gate.exits["enter"])
+	}
+	if _, dup := gate.exits["south"]; dup {
+		t.Fatalf("c2_r0 must NOT have a redundant `south` exit to Midgaard alongside `enter`: %v", gate.exits)
 	}
 	if gate.exits["north"] != "overworld:room:c2_r1" {
 		t.Fatalf("c2_r0 north = %q, want overworld:room:c2_r1", gate.exits["north"])
@@ -139,6 +165,9 @@ func TestOverworldWiring(t *testing.T) {
 	top := over.rooms["overworld:room:c2_r19"].room
 	if top.exits["enter"] != "darkwood:room:grove" {
 		t.Fatalf("c2_r19 enter = %q, want darkwood:room:grove", top.exits["enter"])
+	}
+	if _, dup := top.exits["north"]; dup {
+		t.Fatalf("c2_r19 must NOT have a redundant `north` exit to Darkwood alongside `enter`: %v", top.exits)
 	}
 	// Midgaard's market and Darkwood's grove each open onto the plains.
 	mid := newDemoZone("midgaard", newProtoCache())
