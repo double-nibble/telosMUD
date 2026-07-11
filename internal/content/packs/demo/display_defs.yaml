@@ -87,23 +87,40 @@ display_defs:
           rec["ex_" .. d] = true
           if type(e.to) == "string" then                                 -- cross-zone: a connecting-zone label
             local zn = e.to:match("^([^:]+)")
-            if zn then rec["cz_" .. d] = zn:sub(1, 1):upper() .. zn:sub(2) end
+            if zn then
+              local label = zn:sub(1, 1):upper() .. zn:sub(2)
+              if d == "north" or d == "south" or d == "east" or d == "west" then
+                rec["cz_" .. d] = label                                   -- a cardinal cross-zone exit names its own side
+              else
+                rec.gateLabel = label                                    -- a non-cardinal gate (enter/exit/out): direction inferred below
+              end
+            end
           elseif (ndx ~= dx or ndy ~= dy) and ndx >= -R and ndx <= R and ndy >= -R and ndy <= R then
             local k = key(ndx, ndy)
             if not seen[k] then seen[k] = true; q[#q + 1] = { e.to, ndx, ndy } end
           end
         end
+        -- A non-cardinal gate (`enter`/`exit`/`out`) carries no direction of its own; the connecting zone lies
+        -- BEYOND the grid edge — the one cardinal this edge room has no exit toward. Attribute the gate's label
+        -- to that open side so the map draws the city box + connector there (an `enter`-only city gate, #361).
+        if rec.gateLabel then
+          for _, d in ipairs({ "north", "south", "east", "west" }) do
+            if not rec["ex_" .. d] and not rec["cz_" .. d] then rec["cz_" .. d] = rec.gateLabel; break end
+          end
+        end
         cell[key(dx, dy)] = rec
       end
 
-      -- A cross-zone edge exit puts the connecting-zone label box one cell BEYOND that edge (if in-window).
-      local labelAt = {}
+      -- A cross-zone edge exit puts the connecting-zone label box one cell BEYOND that edge (if in-window), and
+      -- records a connector column so the gap between the edge room and its label box shows a `|` down/up to it.
+      -- connectorAt is keyed by the gap that follows a row (the "south gap" of the upper of {label, gate}).
+      local labelAt, connectorAt = {}, {}
       for dx = -R, R do
         for dy = -R, R do
           local c = cell[key(dx, dy)]
           if c then
-            if c.cz_south and dy - 1 >= -R then labelAt[dy - 1] = { name = c.cz_south, dx = dx } end
-            if c.cz_north and dy + 1 <= R then labelAt[dy + 1] = { name = c.cz_north, dx = dx } end
+            if c.cz_south and dy - 1 >= -R then labelAt[dy - 1] = { name = c.cz_south, dx = dx }; connectorAt[dy] = dx end
+            if c.cz_north and dy + 1 <= R then labelAt[dy + 1] = { name = c.cz_north, dx = dx }; connectorAt[dy + 1] = dx end
           end
         end
       end
@@ -150,6 +167,19 @@ display_defs:
         return place(bar), place("|" .. txt .. "|"), place(bar)
       end
 
+      -- overlayConnector stamps a single `|` at cell dx's centre column of a gap line, so a city label box
+      -- visibly connects to the edge room it gates from. The column mirrors gapLine's "  |  " stub centre.
+      local function overlayConnector(line, dx)
+        local col = 6 + (dx + R) * 8
+        if #line < col then line = line .. string.rep(" ", col - #line) end
+        return line:sub(1, col - 1) .. "|" .. line:sub(col + 1)
+      end
+      local function southGap(dy)                                        -- the gap below row dy, plus any city connector
+        local ln = gapLine(dy, "south")
+        if connectorAt[dy] ~= nil then ln = overlayConnector(ln, connectorAt[dy]) end
+        return ln
+      end
+
       local lines = { gapLine(R, "north") }                              -- top stubs (north exits leaving the window)
       for dy = R, -R, -1 do                                              -- north (top) down to south (bottom)
         if labelAt[dy] then
@@ -158,7 +188,7 @@ display_defs:
         else
           lines[#lines + 1] = borderLine(dy); lines[#lines + 1] = contentLine(dy); lines[#lines + 1] = borderLine(dy)
         end
-        lines[#lines + 1] = gapLine(dy, "south")                         -- gap below this row (bottom stubs at dy=-R)
+        lines[#lines + 1] = southGap(dy)                                 -- gap below this row (bottom stubs at dy=-R) + connector
       end
 
       -- 3) frame it and drop the room's description below (no exit list — that's what the map is for).

@@ -30,11 +30,12 @@ zones:
         flags: [overworld]
         long: >-
           Rolling grassland stretches out under an open sky. The walls of Midgaard stand at your back to the south.
+        # The gate INTO Midgaard is `enter` only (no redundant `south` to the same room): the map infers
+        # the city's on-map direction from the grid edge this `enter` sits on and draws its label + connector.
         exits:
           north: overworld:room:c2_r1
           east: overworld:room:c3_r0
           west: overworld:room:c1_r0
-          south: midgaard:room:market
           enter: midgaard:room:market
       - ref: overworld:room:c3_r0
         name: The Open Plains
@@ -1242,11 +1243,12 @@ zones:
         flags: [overworld]
         long: >-
           A dark treeline looms to the north and the air turns cold. Darkwood is not far now.
+        # The gate INTO Darkwood is `enter` only (no redundant `north` to the same room): the map infers
+        # the city's on-map direction from the grid edge this `enter` sits on and draws its label + connector.
         exits:
           south: overworld:room:c2_r18
           east: overworld:room:c3_r19
           west: overworld:room:c1_r19
-          north: darkwood:room:grove
           enter: darkwood:room:grove
       - ref: overworld:room:c3_r19
         name: The Open Plains
