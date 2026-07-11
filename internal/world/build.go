@@ -174,6 +174,25 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, ch := range lc.Channels {
 		d.channel.register(ch.Ref, buildChannelDef(ch))
 	}
+	// Player toggles (#358): register each content toggle_def. Its verb(s) become toggle commands
+	// (dispatch consults toggleForVerb after baseTable/abilities/custom/channels — a toggle verb never
+	// shadows a core verb). A verb word colliding with a BUILT-IN verb is dropped from the def + logged
+	// LOUDLY (never silently shadowing), mirroring the custom-command collision guard. An empty pack
+	// registers ZERO toggles => no toggle verbs (the empty-boot invariant). Toggles are CONTENT.
+	for _, tg := range lc.ToggleDefs {
+		def := buildToggleDef(tg)
+		kept := def.words[:0]
+		for _, w := range def.words {
+			if _, builtin := baseTable.byExact[w]; builtin {
+				slog.Warn("content: toggle verb rejected — it collides with a built-in command; rename it",
+					"verb", w, "toggle", tg.Ref)
+				continue
+			}
+			kept = append(kept, w)
+		}
+		def.words = kept
+		d.toggle.register(tg.Ref, def)
+	}
 	// Tracks (Phase 11.2): parse each track's per-step grant op-lists into the runtime def and register it.
 	// A malformed step op-list is logged and the track registers with whatever parsed (content-lint gate).
 	for _, tr := range lc.Tracks {

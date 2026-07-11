@@ -93,6 +93,9 @@ func (rt *luaRuntime) installHandleType() {
 		"exits":      rt.hExits,
 		"occupants":  rt.hOccupants,
 		"room_items": rt.hRoomItems,
+		// content player toggles (#358): read the subject player's toggle state (default-aware). Pure read,
+		// safe inside a display template — e.g. the overworld `room` template gates on self:toggle("overworld").
+		"toggle": rt.hToggle,
 		// 7.3a comms (message via the existing act()/send — no harm)
 		"send":  rt.hSend,
 		"act":   rt.hAct,
@@ -298,6 +301,37 @@ func (rt *luaRuntime) hAffectMagnitude(l *lua.LState) int {
 
 // hHasFlag reports whether the entity has the named flag set. Returns false for an unresolved
 // handle.
+// hToggle reads a content player-toggle (#358) on the subject: self:toggle("<ref>") → bool, the per-player
+// override or the toggle's default_on. An unresolved subject (nil / cross-zone / stale handle — resolveHandle
+// fails closed) or an unknown toggle ref reads FALSE; a RESOLVED non-player subject (a mob/item handle, which
+// has no per-player state) reads the toggle's plain default_on. Pure read (no state change), so it is safe
+// inside a display template.
+//
+// TRUST: the returned bool is PLAYER-CONTROLLED input — a player flips it freely via the self-service
+// `<word> on|off` verb. It is a display/UX preference ONLY; content must NEVER gate a privilege, reward, or
+// advantage on it (a player could just turn it on). It carries no effect itself, so it opens no harm/PvP path.
+func (rt *luaRuntime) hToggle(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	ref := l.CheckString(2)
+	if e == nil || rt.zone == nil {
+		l.Push(lua.LFalse)
+		return 1
+	}
+	def := rt.zone.toggleDefs().get(ref)
+	if def == nil {
+		l.Push(lua.LFalse)
+		return 1
+	}
+	// A player reads their override; a non-player (a mob/item passed a toggle ref) has no toggle state, so
+	// it reads the toggle's plain default_on.
+	if s, ok := sessionOf(e); ok {
+		l.Push(lua.LBool(s.comms.toggleEnabled(def)))
+		return 1
+	}
+	l.Push(lua.LBool(def.defaultOn))
+	return 1
+}
+
 func (rt *luaRuntime) hHasFlag(l *lua.LState) int {
 	e := resolveHandle(l, 1)
 	name := l.CheckString(2)

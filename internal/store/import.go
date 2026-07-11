@@ -411,6 +411,8 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 		`DELETE FROM chargen_defs WHERE pack=$1`,
 		// Help topics (#64): same strips-and-replaces idempotency. No FK into the zone tree.
 		`DELETE FROM help_defs WHERE pack=$1`,
+		// Player toggles (#358): same strips-and-replaces idempotency. No FK into the zone tree.
+		`DELETE FROM toggle_defs WHERE pack=$1`,
 		// Display templates: same strips-and-replaces idempotency.
 		`DELETE FROM display_defs WHERE pack=$1`,
 		// Trust tiers (#27/#29): same strips-and-replaces idempotency. No FK into the zone tree.
@@ -804,6 +806,19 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO help_defs (ref, pack, body) VALUES ($1,$2,$3)`, hd.Ref, pk.Pack, body); err != nil {
 			return fmt.Errorf("store: insert help_def %s: %w", hd.Ref, err)
+		}
+	}
+	// Player toggles (#358): ref+pack PK, the name/words/default_on/desc in the JSONB body.
+	for _, tg := range pk.ToggleDefs {
+		body, err := json.Marshal(toggleBody{
+			Name: tg.Name, Words: tg.Words, DefaultOn: tg.DefaultOn, Desc: tg.Desc,
+		})
+		if err != nil {
+			return fmt.Errorf("store: marshal toggle_def %s body: %w", tg.Ref, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO toggle_defs (ref, pack, body) VALUES ($1,$2,$3)`, tg.Ref, pk.Pack, body); err != nil {
+			return fmt.Errorf("store: insert toggle_def %s: %w", tg.Ref, err)
 		}
 	}
 	// Display templates: (pack, surface) PK, the Lua render body in the JSONB body.

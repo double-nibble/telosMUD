@@ -170,6 +170,11 @@ type CommsStateJSON struct {
 	// clears on the player's next input.
 	AFK    bool   `json:"afk,omitempty"`
 	AFKMsg string `json:"afk_msg,omitempty"`
+	// Toggles is the per-toggle ENABLED OVERRIDE keyed by content toggle ref (#358): a present entry forces
+	// a player toggle on (true) or off (false) regardless of its default_on; an ABSENT entry means "use the
+	// toggle's default_on". Same store-the-delta rule as Channels, so a player who never flipped a toggle
+	// picks up a changed default on the next rebuild. Carried on the handoff snapshot too (marshalCommsState).
+	Toggles map[string]bool `json:"toggles,omitempty"`
 }
 
 // commsIgnoreMaxIDs / commsChanMaxRefs cap the comms-state subtree's two open-ended collections (the

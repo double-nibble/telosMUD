@@ -1,0 +1,14 @@
+# Content-defined PLAYER TOGGLES (#358): on/off preferences a player flips with a verb and Lua content
+# reads via self:toggle("<ref>"). Pure CONTENT — the engine names no toggle; a pack decides which exist.
+# The per-player state is stored as an override (present => forced on/off; absent => default_on) on the
+# comms-state subtree, so it persists across relog and survives a cross-shard handoff.
+toggle_defs:
+  # overworld: the opt-in old-school RPG minimap for the wilderness (the plains between Midgaard and
+  # Darkwood). Default OFF — a fresh character walks the plains as ordinary rooms. When ON, the overworld
+  # `room` display template (display_defs.yaml) draws a centred 5x5 map instead, with the room's description
+  # below it. `overworld` reports the state; `overworld on|off` flips it.
+  - ref: overworld
+    name: Overworld map
+    words: [overworld]
+    default_on: false
+    desc: When on, the open plains draw a scrolling minimap. Use `overworld on|off`.

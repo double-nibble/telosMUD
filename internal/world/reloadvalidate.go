@@ -91,6 +91,7 @@ func sharedDefKinds(loaded []content.Pack) []string {
 		mark("wear slots", len(pk.WearSlots) > 0)
 		mark("trust tiers", len(pk.TrustTiers) > 0)
 		mark("custom commands", len(pk.Commands) > 0)
+		mark("player toggles", len(pk.ToggleDefs) > 0)
 		mark("display templates", len(pk.DisplayDefs) > 0)
 		mark("ruleset formulas", len(pk.Formulas) > 0)
 		mark("pvp policy", pk.PvpLua != "")

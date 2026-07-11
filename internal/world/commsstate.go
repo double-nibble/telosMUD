@@ -51,10 +51,28 @@ type commsState struct {
 	ignore map[string]struct{}
 	afk    bool
 	afkMsg string
+	// toggleOverride[ref] forces a content player-toggle (#358) on (true) / off (false) vs its default_on;
+	// an absent ref uses the toggle's default_on. Stored as the delta-from-default (like chanOverride) so a
+	// never-touched toggle picks up a changed default on the next rebuild (toggles are reboot-only shared
+	// defs — no live hot-reload loop). It rides the same CommsStateJSON
+	// subtree, so it persists across relog and survives a cross-shard handoff for free.
+	toggleOverride map[string]bool
 }
 
 func newCommsState() *commsState {
-	return &commsState{chanOverride: map[string]bool{}, ignore: map[string]struct{}{}}
+	return &commsState{chanOverride: map[string]bool{}, ignore: map[string]struct{}{}, toggleOverride: map[string]bool{}}
+}
+
+// toggleEnabled reports whether the player has this content toggle ENABLED: the override if present, else
+// the toggle's default_on. nil-receiver-safe (a session with no comms state yet reads pure defaults). Zone
+// goroutine.
+func (cs *commsState) toggleEnabled(def *toggleDef) bool {
+	if cs != nil {
+		if on, ok := cs.toggleOverride[def.ref]; ok {
+			return on
+		}
+	}
+	return def.defaultOn
 }
 
 // commsOf returns the session's comms state, lazily creating an empty (all-default) one. Zone goroutine.
@@ -76,7 +94,7 @@ func dumpCommsState(s *session) *CommsStateJSON {
 		return nil
 	}
 	cs := s.comms
-	if len(cs.chanOverride) == 0 && len(cs.ignore) == 0 && !cs.afk && cs.afkMsg == "" {
+	if len(cs.chanOverride) == 0 && len(cs.ignore) == 0 && !cs.afk && cs.afkMsg == "" && len(cs.toggleOverride) == 0 {
 		return nil
 	}
 	var chans map[string]bool
@@ -100,7 +118,17 @@ func dumpCommsState(s *session) *CommsStateJSON {
 			ignore = ignore[:commsIgnoreMaxIDs]
 		}
 	}
-	return &CommsStateJSON{Channels: chans, Ignore: ignore, AFK: cs.afk, AFKMsg: cs.afkMsg}
+	var toggles map[string]bool
+	if len(cs.toggleOverride) > 0 {
+		toggles = make(map[string]bool, len(cs.toggleOverride))
+		for ref, on := range cs.toggleOverride {
+			if len(toggles) >= commsChanMaxRefs { // same per-map bound as channel overrides
+				break
+			}
+			toggles[ref] = on
+		}
+	}
+	return &CommsStateJSON{Channels: chans, Ignore: ignore, AFK: cs.afk, AFKMsg: cs.afkMsg, Toggles: toggles}
 }
 
 // loadCommsState installs a persisted comms-state subtree onto the session (Phase 8.6). A nil/all-empty
@@ -121,6 +149,16 @@ func loadCommsState(s *session, c *CommsStateJSON) {
 	}
 	cs.afk = c.AFK
 	cs.afkMsg = c.AFKMsg
+	// Bound the load like the dump does (#358 security review): a durable save / handoff snapshot is a
+	// trusted producer (the state_json is signed), but capping the install is cheap defense-in-depth against
+	// a forged/corrupt snapshot ballooning the in-memory override map. Channels/Ignore share this producer
+	// trust; the cap here at least keeps the toggle map's cardinality bounded on the way in, not only out.
+	for ref, on := range c.Toggles {
+		if len(cs.toggleOverride) >= commsChanMaxRefs {
+			break
+		}
+		cs.toggleOverride[ref] = on
+	}
 	s.comms = cs
 }
 

@@ -68,6 +68,10 @@ type LoadedContent struct {
 	// and binds each channel's verb(s) into the per-shard channel-command table. An empty list => no
 	// channels => no channel verbs (the empty-boot invariant).
 	Channels []ChannelDTO
+	// ToggleDefs are the pack-global player toggles, same last-write-wins override rule keyed by ref.
+	// The world side registers them into the per-shard toggle registry and binds each toggle's verb(s)
+	// into the dispatch path. An empty list => no toggles => no toggle verbs (the empty-boot invariant).
+	ToggleDefs []ToggleDTO
 	// Regions are the pack-global region definitions (Phase 10.3), same last-write-wins override rule
 	// keyed by ref. A region groups member zones a director owns the supra-zone state of; an empty list
 	// => no regions (only the world scope). The director/zone wiring consumes these in 10.3b/c.
@@ -190,6 +194,7 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	abilIdx := make(map[string]int)
 	cpIdx := make(map[string]int)
 	chanIdx := make(map[string]int)
+	toggleIdx := make(map[string]int)
 	regIdx := make(map[string]int)
 	trackIdx := make(map[string]int)
 	bundleIdx := make(map[string]int)
@@ -284,6 +289,14 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 			} else {
 				chanIdx[ch.Ref] = len(lc.Channels)
 				lc.Channels = append(lc.Channels, ch)
+			}
+		}
+		for _, tg := range p.ToggleDefs {
+			if idx, ok := toggleIdx[tg.Ref]; ok {
+				lc.ToggleDefs[idx] = tg
+			} else {
+				toggleIdx[tg.Ref] = len(lc.ToggleDefs)
+				lc.ToggleDefs = append(lc.ToggleDefs, tg)
 			}
 		}
 		for _, rg := range p.Regions {
