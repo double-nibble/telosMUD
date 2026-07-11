@@ -58,6 +58,17 @@ func registerCommands() []*Command {
 	// movement/look/say so abbreviation precedence (the "n->north not nuke" rule) is unchanged. They
 	// live in container.go (Phase 3) and combat_commands.go (Phase 6.3a).
 	base = append(base, containerCommands()...)
+	// Non-cardinal movement words (#360): classic MUD "go through a named exit" verbs so a pack can author
+	// an exit keyed `enter`/`exit`/`out` (a city gate, a portal). Registered LOW-priority (after the cardinals
+	// AND after container verbs) and with NO single-letter alias, so they never win an abbreviation — in
+	// particular `o` still resolves to `open`, not `out` (the earlier-registered command wins the prefix; an
+	// exact `out`/`enter`/`exit` still matches via byExact). `move()` already dispatches any exit key; these
+	// just make the words typeable. A room with no such exit gets the normal "You can't go that way."
+	base = append(base,
+		&Command{Name: "enter", Run: mv("enter")},
+		&Command{Name: "exit", Run: mv("exit")},
+		&Command{Name: "out", Run: mv("out")},
+	)
 	base = append(base, combatCommands()...)
 	// Rest/stand (Track 5, #39): registered low-priority (after combat) so rest/sit/stand never shadow
 	// a movement/look/say abbreviation.

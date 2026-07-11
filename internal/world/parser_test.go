@@ -35,6 +35,16 @@ func TestAbbreviationResolves(t *testing.T) {
 		{"wh", "who"}, // "wh" prefixes only "who" -> who
 		{"q", "quit"}, // "q" prefixes only "quit"
 		{"qu", "quit"},
+		// Non-cardinal movement verbs (#360): exact matches resolve to themselves, but they are registered
+		// LOW-priority so they never STEAL a shorter command's abbreviation. `o` must stay `open` (the
+		// earlier-registered container verb), NOT `out`; `e` stays `east`, not `enter`/`exit`.
+		{"enter", "enter"},
+		{"exit", "exit"},
+		{"out", "out"},
+		{"o", "open"},      // #360 regression guard: `out` must NOT steal `o` from `open`
+		{"en", "enter"},    // "en" prefixes only enter (was "Huh?" before #360) -> benign new abbreviation
+		{"ex", "exit"},     // "ex" prefixes only exit
+		{"ou", "out"},      // "ou" prefixes only out
 		{"frobnicate", ""}, // unknown
 		{"", ""},           // empty
 		{"x", ""},          // matches nothing

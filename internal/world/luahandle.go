@@ -93,6 +93,9 @@ func (rt *luaRuntime) installHandleType() {
 		"exits":      rt.hExits,
 		"occupants":  rt.hOccupants,
 		"room_items": rt.hRoomItems,
+		// room grid position (#360): self:room():coord() -> {x,y,z} for the authored GMCP minimap coord, or
+		// nil for a room with none. Pure read — the overworld map template centres its 5x5 window on it.
+		"coord": rt.hCoord,
 		// content player toggles (#358): read the subject player's toggle state (default-aware). Pure read,
 		// safe inside a display template — e.g. the overworld `room` template gates on self:toggle("overworld").
 		"toggle": rt.hToggle,
@@ -533,6 +536,25 @@ func (rt *luaRuntime) viewer() *Entity {
 // The enumeration is TOTAL over the room's exit table, so a data-only / non-reciprocal maze exit is included
 // (it is a real edge of the graph). Read-only: the records are fresh tables, mutating them changes nothing.
 // A non-room / unresolved handle yields an empty table.
+// hCoord returns a room's authored grid position: self:room():coord() -> {x=,y=,z=}, or NIL when the
+// subject is not a room / has no authored coord (the same [x,y,z] the GMCP Room.Info minimap reads,
+// components.go). Pure read (no state change), safe inside a display template — the overworld `room`
+// template reads it to place + centre the 5x5 viewport and detect grid edges. A content author treats a
+// nil return as "this room is not on a grid".
+func (rt *luaRuntime) hCoord(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	if e == nil || e.room == nil || len(e.room.coord) != 3 {
+		l.Push(lua.LNil)
+		return 1
+	}
+	t := l.NewTable()
+	t.RawSetString("x", lua.LNumber(e.room.coord[0]))
+	t.RawSetString("y", lua.LNumber(e.room.coord[1]))
+	t.RawSetString("z", lua.LNumber(e.room.coord[2]))
+	l.Push(t)
+	return 1
+}
+
 func (rt *luaRuntime) hExits(l *lua.LState) int {
 	t := l.NewTable()
 	e := resolveHandle(l, 1)
