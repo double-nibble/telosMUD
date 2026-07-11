@@ -27,11 +27,12 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 	if lc.Empty() {
 		t.Fatal("demo pack loaded empty")
 	}
-	// The richer demo ships THREE zones: midgaard + darkwood (the original pair) + the crypt
-	// (the multi-zone-per-shard expansion). The empty-boot invariant is asserted separately
-	// (TestEmptyLoad): an empty pack still yields an empty world.
-	if len(lc.Zones) != 3 {
-		t.Fatalf("zones = %d, want 3 (midgaard + darkwood + crypt)", len(lc.Zones))
+	// The richer demo ships FOUR zones: midgaard + darkwood (the original pair) + the crypt
+	// (the multi-zone-per-shard expansion) + the overworld plains (#361, the wilderness between
+	// Midgaard and Darkwood). The empty-boot invariant is asserted separately (TestEmptyLoad): an
+	// empty pack still yields an empty world.
+	if len(lc.Zones) != 4 {
+		t.Fatalf("zones = %d, want 4 (midgaard + darkwood + crypt + overworld)", len(lc.Zones))
 	}
 
 	mid := lc.Zone("midgaard")

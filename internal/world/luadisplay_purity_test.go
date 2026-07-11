@@ -32,12 +32,13 @@ var renderOpClass = map[string]map[string]bool{
 	// handle metatable methods (luahandle.go / luaharm.go)
 	"handle": {
 		// read/query/traversal — SAFE (a sheet is built from these)
-		"id": false, "name": false, "short": false, "attr": false, "resource": false, "resource_max": false,
+		"id": false, "name": false, "short": false, "long": false, "attr": false, "resource": false, "resource_max": false,
 		"level": false, "has_affect": false, "affect_magnitude": false, "has_flag": false, "room": false,
 		"contents": false, "equipment": false, "equipment_slots": false, "group": false, "is_enemy": false,
 		"distance": false, "can_see": false, "exits": false, "occupants": false, "room_items": false,
-		"toggle": false, // #358 content player-toggle read (default-aware) — pure read, safe in a sheet
-		"coord":  false, // #360 room grid-coord read — pure read, safe in a sheet
+		"toggle":        false, // #358 content player-toggle read (default-aware) — pure read, safe in a sheet
+		"coord":         false, // #360 room grid-coord read — pure read, safe in a sheet
+		"has_room_flag": false, // #361 room named-flag read — pure read, safe in a sheet
 		// comms/output + harm + forced movement — FORBIDDEN
 		"send": true, "act": true, "say": true, "emote": true,
 		"damage": true, "heal": true, "modify_resource": true, "drain": true,

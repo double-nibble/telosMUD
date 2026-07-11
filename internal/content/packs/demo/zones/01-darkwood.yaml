@@ -12,6 +12,7 @@ zones:
         exits:
           south: midgaard:room:market   # back across the shard boundary
           north: darkwood:room:hollow
+          exit: overworld:room:c2_r19   # #361 back out onto the open plains (the forest's southern edge)
       - ref: darkwood:room:hollow
         name: A Dark Hollow
         long: The trees crowd close and the moonlight fails. Something rustles, unseen.

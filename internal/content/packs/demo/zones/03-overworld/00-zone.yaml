@@ -1,0 +1,11 @@
+zones:
+  - ref: overworld
+    name: The Open Plains
+    # The wilderness between Midgaard and Darkwood (#361). The player crosses it room-by-room; with the
+    # `overworld` player-toggle on, a vt100-style 5x5 minimap (display_defs.yaml `room` template) draws
+    # around them instead of the normal room listing. start_room is the south gate (the room a player from
+    # Midgaard's `exit` arrives in), though players normally enter via the market's cross-zone exit.
+    start_room: overworld:room:c2_r0
+    # Roaming mobs wander the plains, so the map's mob markers move between looks. 90s repop keeps the
+    # population steady after a wanderer drifts off (roam:true counts them zone-wide — reset.go).
+    reset_secs: 90

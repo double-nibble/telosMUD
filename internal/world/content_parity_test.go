@@ -52,13 +52,18 @@ func TestDemoPackPrototypeParity(t *testing.T) {
 		"midgaard:room:market": {
 			short: "Market Square",
 			long:  "Stalls crowd the square and merchants cry their wares over the din of haggling.",
-			exits: map[string]ProtoRef{"south": "midgaard:room:temple", "north": "darkwood:room:grove"},
+			// #361: the `exit` exit (the city's north gate into the overworld plains) is an INTENTIONAL
+			// additive change — the name/long and the original south/north exits stay byte-identical, so the
+			// parity guarantee (no SHIFTING of existing identity) holds; the new exit is reflected here.
+			exits: map[string]ProtoRef{"south": "midgaard:room:temple", "north": "darkwood:room:grove", "exit": "overworld:room:c2_r0"},
 			comps: []reflect.Type{roomT},
 		},
 		"darkwood:room:grove": {
 			short: "A Moonlit Grove",
 			long:  "Silver birches ring a still clearing; the air hums with quiet magic.",
-			exits: map[string]ProtoRef{"south": "midgaard:room:market", "north": "darkwood:room:hollow"},
+			// #361: the `exit` exit (the forest's southern edge back onto the open plains) is an INTENTIONAL
+			// additive change, mirroring the market's north gate; the original south/north stay identical.
+			exits: map[string]ProtoRef{"south": "midgaard:room:market", "north": "darkwood:room:hollow", "exit": "overworld:room:c2_r19"},
 			comps: []reflect.Type{roomT},
 		},
 		"darkwood:room:hollow": {

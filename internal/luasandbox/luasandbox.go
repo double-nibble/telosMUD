@@ -58,9 +58,12 @@ const (
 	// loop aborts with "instruction budget exceeded" rather than stalling the host goroutine.
 	InstrBudget = 100_000
 
-	// CallDeadline is the default per-call wall-clock deadline, armed via SetContext. It catches a
-	// low-instruction stall the count cannot (e.g. a GC pause, host load).
-	CallDeadline = 5 // milliseconds — see callDeadline for the time.Duration
+	// CallDeadline (the per-call wall-clock deadline, armed via SetContext — catches a low-instruction stall
+	// the instruction count cannot, e.g. a GC pause) is defined in the build-tagged deadline.go /
+	// deadline_race.go: 5ms in a normal build, scaled up under `-race` (whose instrumentation makes every VM
+	// op ~10x slower, so a legitimately budget-bounded template would otherwise trip the wall-clock guard in
+	// CI while being sub-millisecond in production). The 100k instruction budget is the real per-call bound;
+	// this deadline is the secondary stall guard, so scaling it under the race detector is safe.
 
 	// StrByteCap bounds the OUTPUT size of the amplifier string builtins (the single-op alloc bomb:
 	// string.rep("A", 2e9) allocates GB in ONE instruction). The capped wrappers reject an over-cap result
