@@ -34,3 +34,131 @@ display_defs:
       s:divider("=")
       return s:render()
 
+
+  # `room` is the look/enter render surface. This template OWNS the room display ONLY for the overworld
+  # plains AND only when the viewer has the `overworld` toggle on: it draws an old-school RPG 5x5 minimap
+  # centred on the player (the room's description below it). For EVERY other room — Midgaard, Darkwood, the
+  # crypt — and for a plains-walker with the toggle off, it returns nil, so lookRoom falls back to the
+  # built-in name/desc/exits/occupants render (a non-string return == "use the fallback", luadisplay.go).
+  #
+  # The map is a full ASCII block reprinted each look/move (lookRoom runs this on both), so it needs none of
+  # the trusted cursor/screen path. It flood-fills the rooms within a 5x5 window of the player's coord()
+  # (staying in-zone — a cross-zone exit's `to` is a bare ref string, an in-zone exit's is a live handle),
+  # marks the player (@) and landmark rooms (~ lake / H house / ^ hill), draws the exits as connectors/edge-
+  # stubs, and renders a connecting-zone LABEL box (Midgaard / Darkwood) where an edge room has a cross-zone
+  # exit. Pure reads only (coord/exits/has_room_flag/toggle/long) — display-safe. (Nearby-creature markers
+  # are deferred; see the NOTE in the flood-fill — a display may not read a foreign room's occupants, #253.)
+  - surface: room
+    render: |
+      local room = self:room()
+      if not room or not room:has_room_flag("overworld") then return nil end   -- not the plains: built-in render
+      if not self:toggle("overworld") then return nil end                 -- toggle off: normal traversal
+      local c0 = room:coord()
+      if not c0 then return nil end
+      local R = 2                                                         -- window radius (5x5)
+
+      -- 1) flood-fill the in-window rooms. PERF: a display handle resolve walks the whole zone (entityByRID),
+      -- and this runs under a 5ms wall-clock deadline, so we minimise resolves — neighbour offsets are COMPUTED
+      -- from the exit DIRECTION (no per-neighbour coord() call), one resolve per room for its flags+exits. A
+      -- flat integer key (dx,dy in [-2,2]) keeps the cell map cheap.
+      local cell = {}
+      local function key(dx, dy) return (dx + 8) * 16 + (dy + 8) end
+      local q, head = { { room, 0, 0 } }, 1
+      local seen = { [key(0, 0)] = true }
+      while head <= #q do
+        local it = q[head]; head = head + 1
+        local h, dx, dy = it[1], it[2], it[3]
+        local rec = {}
+        -- Icon: the centre is always the player; otherwise a landmark by its room flag (~ lake / H house /
+        -- ^ hill), else a plain cell. The centre skips the flag reads (it is `@` regardless).
+        if dx == 0 and dy == 0 then
+          rec.icon = "@"
+        elseif h:has_room_flag("landmark_lake") then rec.icon = "~"
+        elseif h:has_room_flag("landmark_house") then rec.icon = "H"
+        elseif h:has_room_flag("landmark_hill") then rec.icon = "^"
+        else rec.icon = "." end
+        -- NOTE: nearby-creature markers (a roaming mob as `!`) are deferred — a display template may NOT read
+        -- a FOREIGN room's occupants (#253 anti-scry). Tracked as a follow-up; the plains still spawn roamers.
+        for _, e in ipairs(h:exits()) do
+          local d = e.dir
+          local ndx, ndy = dx, dy
+          if d == "north" then ndy = dy + 1 elseif d == "south" then ndy = dy - 1
+          elseif d == "east" then ndx = dx + 1 elseif d == "west" then ndx = dx - 1 end
+          rec["ex_" .. d] = true
+          if type(e.to) == "string" then                                 -- cross-zone: a connecting-zone label
+            local zn = e.to:match("^([^:]+)")
+            if zn then rec["cz_" .. d] = zn:sub(1, 1):upper() .. zn:sub(2) end
+          elseif (ndx ~= dx or ndy ~= dy) and ndx >= -R and ndx <= R and ndy >= -R and ndy <= R then
+            local k = key(ndx, ndy)
+            if not seen[k] then seen[k] = true; q[#q + 1] = { e.to, ndx, ndy } end
+          end
+        end
+        cell[key(dx, dy)] = rec
+      end
+
+      -- A cross-zone edge exit puts the connecting-zone label box one cell BEYOND that edge (if in-window).
+      local labelAt = {}
+      for dx = -R, R do
+        for dy = -R, R do
+          local c = cell[key(dx, dy)]
+          if c then
+            if c.cz_south and dy - 1 >= -R then labelAt[dy - 1] = c.cz_south end
+            if c.cz_north and dy + 1 <= R then labelAt[dy + 1] = c.cz_north end
+          end
+        end
+      end
+
+      -- 2) build the lines directly (5 cells wide; box "| X |" = 5, gap 3; a 3-col left margin for a west stub).
+      local LW = 3 + 5 * 8                                                -- interior width = 43
+      local function contentLine(dy)
+        local lead = cell[key(-R, dy)]
+        local parts = { (lead and lead.ex_west) and "---" or "   " }
+        for dx = -R, R do
+          local c = cell[key(dx, dy)]
+          parts[#parts + 1] = c and ("| " .. c.icon .. " |") or "     "
+          parts[#parts + 1] = (c and c.ex_east) and "---" or "   "
+        end
+        return table.concat(parts)
+      end
+      local function borderLine(dy)
+        local parts = { "   " }
+        for dx = -R, R do
+          parts[#parts + 1] = cell[key(dx, dy)] and "+---+" or "     "
+          parts[#parts + 1] = "   "
+        end
+        return table.concat(parts)
+      end
+      local function gapLine(dy, dir)                                     -- vertical connectors on `dir` side of row dy
+        local parts = { "   " }
+        for dx = -R, R do
+          local c = cell[key(dx, dy)]
+          parts[#parts + 1] = (c and c["ex_" .. dir]) and "  |  " or "     "
+          parts[#parts + 1] = "   "
+        end
+        return table.concat(parts)
+      end
+      local function pad(s) return #s < LW and (s .. string.rep(" ", LW - #s)) or s end
+      local function labelLines(name)
+        local txt = " " .. name .. " "
+        local bar = "+" .. string.rep("-", #txt) .. "+"
+        local padL = string.rep(" ", math.floor((LW - #bar) / 2))
+        return padL .. bar, padL .. "|" .. txt .. "|", padL .. bar
+      end
+
+      local lines = { gapLine(R, "north") }                              -- top stubs (north exits leaving the window)
+      for dy = R, -R, -1 do                                              -- north (top) down to south (bottom)
+        if labelAt[dy] then
+          local a, b, c = labelLines(labelAt[dy])
+          lines[#lines + 1] = a; lines[#lines + 1] = b; lines[#lines + 1] = c
+        else
+          lines[#lines + 1] = borderLine(dy); lines[#lines + 1] = contentLine(dy); lines[#lines + 1] = borderLine(dy)
+        end
+        lines[#lines + 1] = gapLine(dy, "south")                         -- gap below this row (bottom stubs at dy=-R)
+      end
+
+      -- 3) frame it and drop the room's description below (no exit list — that's what the map is for).
+      local out = { "+" .. string.rep("-", LW) .. "+" }
+      for _, ln in ipairs(lines) do out[#out + 1] = "|" .. pad(ln) .. "|" end
+      out[#out + 1] = "+" .. string.rep("-", LW) .. "+"
+      out[#out + 1] = room:long()
+      return table.concat(out, "\n")

@@ -45,3 +45,18 @@ help_defs:
       and answer the last person who told you with {{FG_CYAN}}reply <message>{{RESET}}.
       See who else is online with {{FG_CYAN}}who{{RESET}}.
     see_also: [getting_started]
+
+  - ref: help:overworld
+    title: The Overworld Map
+    category: Getting Started
+    keywords: [overworld, map, plains, wilderness]
+    body: |-
+      North of Midgaard's market lies the open plains — a wide wilderness you
+      cross to reach the Darkwood. From the market, type {{FG_CYAN}}exit{{RESET}} to step out
+      the city gate onto the plains; type {{FG_CYAN}}enter{{RESET}} to go back into a city or
+      forest from its edge.
+      Turn on the old-school overworld map with {{FG_CYAN}}overworld on{{RESET}}: while it is on,
+      the plains draw a 5x5 minimap centred on you ({{FG_CYAN}}@{{RESET}}), showing nearby
+      wanderers ({{FG_CYAN}}!{{RESET}}) and landmarks, with the room's description below it.
+      Turn it back off with {{FG_CYAN}}overworld off{{RESET}} to walk the plains as ordinary rooms.
+    see_also: [movement, getting_started]

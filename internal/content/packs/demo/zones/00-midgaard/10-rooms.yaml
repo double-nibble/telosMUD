@@ -16,12 +16,14 @@ zones:
         name: Market Square
         coord: [0, 1, 0]   # north of the temple
         long: Stalls crowd the square and merchants cry their wares over the din of haggling.
-        # PARITY: south+north exits MUST match the test's expected map exactly (it asserts both).
-        # Adding `east` to the smithy here would BREAK the parity exits DeepEqual — so the smithy is
-        # reached from the GUILD HALL instead, keeping market's exit map exactly {south, north}.
+        # PARITY: the south+north exits MUST match the test's expected map (it asserts them). The `exit`
+        # exit below is an INTENTIONAL additive change (#361): it is the city's north gate into the open
+        # plains, so the parity want-map for market was updated to include it. `north` (the old forest road
+        # straight to Darkwood) stays as the shortcut; `exit` is the scenic route through the wilderness.
         exits:
           south: midgaard:room:temple
-          north: darkwood:room:grove   # cross-zone exit (intra-shard transfer when co-hosted)
+          north: darkwood:room:grove       # cross-zone exit (intra-shard transfer when co-hosted)
+          exit: overworld:room:c2_r0       # #361 the north gate → the open plains (the overworld)
       # --- richer-demo midgaard rooms (no floor placements that touch the parity-checked market/temple) ---
       - ref: midgaard:room:guildhall
         name: The Adventurers' Guild

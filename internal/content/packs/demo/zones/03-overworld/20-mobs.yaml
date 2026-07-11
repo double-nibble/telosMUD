@@ -1,0 +1,53 @@
+zones:
+  - ref: overworld
+    mob_prototypes:
+      # A roaming plains creature (#361 + the #202 wander pattern): on spawn it arms a self-rescheduling
+      # drift to a random same-zone exit, so it moves across the grid between a player's looks — the map's
+      # mob marker (`!`) moves with it. It only follows same-zone exits (a cross-zone exit's `to` is a bare
+      # ref string, not a live handle), so it never wanders out of the plains into Midgaard/Darkwood.
+      - ref: overworld:mob:hare
+        keywords: [hare, rabbit, brown]
+        short: a brown hare
+        long: A brown hare bounds through the tall grass.
+        living:
+          attributes:
+            level: 1
+            constitution: 1
+        lua: |
+          on("spawn", function()
+            local function step()
+              local opts = {}
+              for _, e in ipairs(self:room():exits()) do
+                if type(e.to) ~= "string" then opts[#opts + 1] = e.dir end
+              end
+              if #opts > 0 then self:move(opts[math.random(1, #opts)]) end
+              mud.after(15, step)
+            end
+            mud.after(15, step)
+          end)
+      # A second wanderer with a different marker feel — a slow-drifting flock of crows near the forest edge.
+      - ref: overworld:mob:crows
+        keywords: [crows, flock, birds]
+        short: a flock of crows
+        long: A ragged flock of crows wheels and mutters overhead.
+        living:
+          attributes:
+            level: 1
+            constitution: 1
+        lua: |
+          on("spawn", function()
+            local function step()
+              local opts = {}
+              for _, e in ipairs(self:room():exits()) do
+                if type(e.to) ~= "string" then opts[#opts + 1] = e.dir end
+              end
+              if #opts > 0 then self:move(opts[math.random(1, #opts)]) end
+              mud.after(25, step)
+            end
+            mud.after(25, step)
+          end)
+    resets:
+      # A hare near the south fields and a flock near the northern treeline. roam:true so a wanderer that
+      # drifts off its spawn room does not leak a replacement (the top-up counts it zone-wide).
+      - {op: spawn_mob, proto: overworld:mob:hare, room: overworld:room:c2_r3, count: 1, roam: true}
+      - {op: spawn_mob, proto: overworld:mob:crows, room: overworld:room:c3_r16, count: 1, roam: true}

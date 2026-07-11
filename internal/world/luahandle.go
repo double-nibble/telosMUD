@@ -72,6 +72,7 @@ func (rt *luaRuntime) installHandleType() {
 		"id":               rt.hID,
 		"name":             rt.hName,
 		"short":            rt.hShort,
+		"long":             rt.hLong,
 		"attr":             rt.hAttr,
 		"resource":         rt.hResource,
 		"resource_max":     rt.hResourceMax,
@@ -96,6 +97,10 @@ func (rt *luaRuntime) installHandleType() {
 		// room grid position (#360): self:room():coord() -> {x,y,z} for the authored GMCP minimap coord, or
 		// nil for a room with none. Pure read — the overworld map template centres its 5x5 window on it.
 		"coord": rt.hCoord,
+		// room named-flag (#361): self:room():has_room_flag("overworld") -> bool. Reads the ROOM's authored
+		// content flags (Room.namedFlags — e.g. `forge`, `overworld`, `landmark_lake`), which are DISTINCT
+		// from has_flag's entity (Living) flags. Pure read, display-safe.
+		"has_room_flag": rt.hHasRoomFlag,
 		// content player toggles (#358): read the subject player's toggle state (default-aware). Pure read,
 		// safe inside a display template — e.g. the overworld `room` template gates on self:toggle("overworld").
 		"toggle": rt.hToggle,
@@ -219,6 +224,19 @@ func (rt *luaRuntime) hShort(l *lua.LState) int {
 		return 1
 	}
 	l.Push(lua.LString(e.Name()))
+	return 1
+}
+
+// hLong returns the entity's LONG description (#361): a room's flavour text, a mob/item's room-presence
+// line. Empty string for an entity with none; nil for an unresolved handle. Pure read — a room display
+// template shows it below the map (the built-in room render shows it too, via r.Long()).
+func (rt *luaRuntime) hLong(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	if e == nil {
+		l.Push(lua.LNil)
+		return 1
+	}
+	l.Push(lua.LString(e.Long()))
 	return 1
 }
 
@@ -552,6 +570,21 @@ func (rt *luaRuntime) hCoord(l *lua.LState) int {
 	t.RawSetString("y", lua.LNumber(e.room.coord[1]))
 	t.RawSetString("z", lua.LNumber(e.room.coord[2]))
 	l.Push(t)
+	return 1
+}
+
+// hHasRoomFlag reads a ROOM's authored content flag: self:room():has_room_flag("<name>") -> bool. Room
+// content flags (Room.namedFlags — `forge`, `overworld`, `landmark_*`) are separate from the entity/Living
+// flags has_flag reads, so a room (which has no Living) needs this dedicated reader. FALSE for a non-room
+// subject or an unresolved handle. Pure read (no state change), safe inside a display template.
+func (rt *luaRuntime) hHasRoomFlag(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	name := l.CheckString(2)
+	if e == nil || e.room == nil || e.room.namedFlags == nil {
+		l.Push(lua.LFalse)
+		return 1
+	}
+	l.Push(lua.LBool(e.room.namedFlags[name]))
 	return 1
 }
 
