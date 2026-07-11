@@ -1101,9 +1101,18 @@ func (z *Zone) transferIn(m transferInMsg) {
 		s.send(disconnectFrame("destination has no rooms"))
 		return
 	}
-	// The entity now belongs to this zone: re-home it (rid allocator, zone owner) so a
-	// future target reference resolves here, then place it in the destination room.
-	s.entity.zone = z
+	// The entity now belongs to this zone: re-home it — AND everything it carries — into THIS zone's
+	// identity space (rid allocator + zone owner), then place it in the destination room. This is
+	// load-bearing, not cosmetic: rids are allocated from each zone's OWN 1-based ridAllocator, so the
+	// source zone's rid for the player (and its inventory/worn items) COLLIDES with a room/mob/item this
+	// zone already allocated the same number to. entityByRID re-resolves a Lua handle by walking this
+	// zone's containment and returning the FIRST rid match — under a collision that is the wrong entity,
+	// chosen nondeterministically by Go's randomized map iteration, so a `self:...` handle read (e.g. the
+	// overworld map template resolving the just-arrived player) intermittently resolves a colliding room.
+	// Reassigning a fresh local rid to the whole subtree makes every carried rid unique here again.
+	// (The cross-shard handoff path REBUILDS the entity from a snapshot via this zone's allocator, so it
+	// gets fresh local rids for free; only this intra-shard live-object fast path must re-home explicitly.)
+	z.rehomeSubtree(s.entity)
 	z.setPlayer(s.character, s)
 	// Belt-and-suspenders combat clear: transferOut already disengaged the mover (and move() refuses
 	// to walk while fighting), so this is normally a no-op. But it GUARANTEES the destination never
