@@ -37,6 +37,7 @@ var renderOpClass = map[string]map[string]bool{
 		"contents": false, "equipment": false, "equipment_slots": false, "group": false, "is_enemy": false,
 		"distance": false, "can_see": false, "exits": false, "occupants": false, "room_items": false,
 		"toggle": false, // #358 content player-toggle read (default-aware) — pure read, safe in a sheet
+		"coord":  false, // #360 room grid-coord read — pure read, safe in a sheet
 		// comms/output + harm + forced movement — FORBIDDEN
 		"send": true, "act": true, "say": true, "emote": true,
 		"damage": true, "heal": true, "modify_resource": true, "drain": true,
