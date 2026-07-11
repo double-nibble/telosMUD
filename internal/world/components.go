@@ -43,10 +43,29 @@ func (*Room) componentKind() Kind { return KindRoom }
 // N/E/S/W/U/D regardless of map iteration order (carried over from the old Room).
 var dirOrder = []string{"north", "east", "south", "west", "up", "down"}
 
+// displayDirOrder is the order the built-in "Exits:" line renders (displayExits). It is dirOrder plus the
+// non-cardinal MOVEMENT verbs exit/enter/out (#360) — a player can walk those, so a room's `exit` gate must
+// be listed just like `north`. They lead the line (a named gate reads before the compass). Any OTHER
+// authored direction (a data-only maze `portal`) is deliberately NOT here — it is not a walkable verb.
+var displayDirOrder = []string{"exit", "enter", "out", "north", "east", "south", "west", "up", "down"}
+
 // sortedExits returns this room's exit directions in canonical display order.
 func (r *Room) sortedExits() []string {
 	var out []string
 	for _, d := range dirOrder {
+		if _, ok := r.exits[d]; ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// displayExits returns the room's WALKABLE exits in "Exits:" display order — the cardinals plus the
+// exit/enter/out movement verbs (displayDirOrder). This is what the built-in look line shows, so a gate
+// like `exit` appears; a non-walkable data-only direction is omitted.
+func (r *Room) displayExits() []string {
+	var out []string
+	for _, d := range displayDirOrder {
 		if _, ok := r.exits[d]; ok {
 			out = append(out, d)
 		}
@@ -68,7 +87,7 @@ func isCanonicalDir(d string) bool {
 // directions first (so a listing reads N/E/S/W/U/D), then any other authored direction in sorted order.
 // The tail is what makes the enumeration TOTAL — a data-only, non-reciprocal maze exit (an authored
 // direction the movement registry never binds) is a real edge of the room graph and a room display template
-// must be able to see it. sortedExits stays the canonical-only accessor the built-in look line uses.
+// must be able to see it. sortedExits stays the canonical-only accessor (GMCP/targeting); displayExits is the built-in look line.
 func (r *Room) allExits() []string {
 	out := r.sortedExits()
 	var extra []string

@@ -102,14 +102,15 @@ display_defs:
         for dy = -R, R do
           local c = cell[key(dx, dy)]
           if c then
-            if c.cz_south and dy - 1 >= -R then labelAt[dy - 1] = c.cz_south end
-            if c.cz_north and dy + 1 <= R then labelAt[dy + 1] = c.cz_north end
+            if c.cz_south and dy - 1 >= -R then labelAt[dy - 1] = { name = c.cz_south, dx = dx } end
+            if c.cz_north and dy + 1 <= R then labelAt[dy + 1] = { name = c.cz_north, dx = dx } end
           end
         end
       end
 
       -- 2) build the lines directly (5 cells wide; box "| X |" = 5, gap 3; a 3-col left margin for a west stub).
-      local LW = 3 + 5 * 8                                                -- interior width = 43
+      local LW = 3 + 5 * 8 + 1                                            -- interior width = 44 (1-col right
+      -- margin so the east edge-stub reads `--- |`, not `---|` flush against the frame).
       local function contentLine(dy)
         local lead = cell[key(-R, dy)]
         local parts = { (lead and lead.ex_west) and "---" or "   " }
@@ -138,17 +139,21 @@ display_defs:
         return table.concat(parts)
       end
       local function pad(s) return #s < LW and (s .. string.rep(" ", LW - #s)) or s end
-      local function labelLines(name)
+      -- The label box sits UNDER the column of its cross-zone exit (dx), so it reads next to the gate rather
+      -- than always centred. Placed at that column's box-left and CLIPPED at the map's right edge (LW) — a
+      -- label near the east edge is intentionally cut off (there is nowhere else to put it).
+      local function labelLines(name, dx)
+        local x = 3 + (dx + R) * 8                                        -- canvas col of that cell's box-left
         local txt = " " .. name .. " "
         local bar = "+" .. string.rep("-", #txt) .. "+"
-        local padL = string.rep(" ", math.floor((LW - #bar) / 2))
-        return padL .. bar, padL .. "|" .. txt .. "|", padL .. bar
+        local function place(s) return (string.rep(" ", x) .. s):sub(1, LW) end
+        return place(bar), place("|" .. txt .. "|"), place(bar)
       end
 
       local lines = { gapLine(R, "north") }                              -- top stubs (north exits leaving the window)
       for dy = R, -R, -1 do                                              -- north (top) down to south (bottom)
         if labelAt[dy] then
-          local a, b, c = labelLines(labelAt[dy])
+          local a, b, c = labelLines(labelAt[dy].name, labelAt[dy].dx)
           lines[#lines + 1] = a; lines[#lines + 1] = b; lines[#lines + 1] = c
         else
           lines[#lines + 1] = borderLine(dy); lines[#lines + 1] = contentLine(dy); lines[#lines + 1] = borderLine(dy)
