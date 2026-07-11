@@ -53,6 +53,25 @@ func (a *ridAllocator) alloc() RuntimeID {
 // populations, so this O(entities-in-zone) walk is fine for script method calls (not a
 // combat-hot path); if a future slice needs it hot, a maintained rid->entity index can sit
 // behind this same accessor without touching callers. Single-writer: zone goroutine only.
+// rehomeSubtree re-homes e AND its entire contents subtree into THIS zone's identity space: each
+// entity gets a freshly-allocated local rid (z.rids) and its zone pointer repointed to z. It is the
+// intra-shard transfer fix (Zone.transferIn): a live *Entity object carried between co-hosted zones
+// keeps the SOURCE zone's rids, which collide with this zone's own (both allocators are 1-based and
+// independent), and entityByRID would then resolve a Lua handle to whichever colliding entity Go's
+// randomized map iteration hit first. Reassigning local rids to the whole subtree restores the
+// per-zone-unique-rid invariant entityByRID depends on. Single-writer: zone goroutine only (called
+// from transferIn before the entity is placed, so no concurrent handle resolve races the reassignment).
+func (z *Zone) rehomeSubtree(e *Entity) {
+	if e == nil {
+		return
+	}
+	e.rid = z.rids.alloc()
+	e.zone = z
+	for _, c := range e.contents {
+		z.rehomeSubtree(c)
+	}
+}
+
 func (z *Zone) entityByRID(rid RuntimeID) *Entity {
 	if z == nil || rid == 0 {
 		return nil
