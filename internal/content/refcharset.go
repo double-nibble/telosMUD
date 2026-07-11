@@ -79,6 +79,7 @@ var refKeyFields = map[string]bool{
 var refListFields = map[string]bool{
 	"ChannelDTO.Words":   true, // channel invocation verbs
 	"AbilityDTO.Words":   true, // ability command verbs
+	"ToggleDTO.Words":    true, // player-toggle verbs (#358; same exact-dispatch table as channel words)
 	"CommandDTO.Aliases": true, // alternate command spellings (exact-match dispatch)
 }
 

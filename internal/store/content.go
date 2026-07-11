@@ -561,6 +561,15 @@ type displayDefBody struct {
 	Render string `json:"render,omitempty"`
 }
 
+// toggleBody is the JSONB-tail shape for a toggle_defs row (#358): the player-toggle SHAPE (display name,
+// verb words, default state, description), everything but the ref/pack PK.
+type toggleBody struct {
+	Name      string   `json:"name,omitempty"`
+	Words     []string `json:"words,omitempty"`
+	DefaultOn bool     `json:"default_on,omitempty"`
+	Desc      string   `json:"desc,omitempty"`
+}
+
 // trustTierBody is the JSONB-tail shape for a trust_tier_defs row (#27/#29, Round 9 Slice 0): the granted
 // reserved-flag list, everything but the (pack, name) PK and the first-class rank column.
 type trustTierBody struct {
@@ -1191,6 +1200,35 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 		return err
 	}
 	hdRows.Close()
+
+	// Player toggles (#358): ref+pack first-class, the name/words/default_on/desc in the JSONB body.
+	tgRows, err := p.pool.Query(ctx,
+		`SELECT ref, pack, body FROM toggle_defs WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
+	if err != nil {
+		return fmt.Errorf("store: query toggle_defs: %w", err)
+	}
+	for tgRows.Next() {
+		var tg content.ToggleDTO
+		var pk string
+		var body []byte
+		if err := tgRows.Scan(&tg.Ref, &pk, &body); err != nil {
+			tgRows.Close()
+			return fmt.Errorf("store: scan toggle_def: %w", err)
+		}
+		if len(body) > 0 {
+			var b toggleBody
+			if err := json.Unmarshal(body, &b); err != nil {
+				tgRows.Close()
+				return fmt.Errorf("store: toggle_def %s body: %w", tg.Ref, err)
+			}
+			tg.Name, tg.Words, tg.DefaultOn, tg.Desc = b.Name, b.Words, b.DefaultOn, b.Desc
+		}
+		pack(pk).ToggleDefs = append(pack(pk).ToggleDefs, tg)
+	}
+	if err := tgRows.Err(); err != nil {
+		return err
+	}
+	tgRows.Close()
 
 	// Display templates: (pack, surface) first-class, the Lua render body in the JSONB body. Ordered by
 	// (pack, surface) for deterministic load; the loader's per-pack accumulation applies last-write-wins.

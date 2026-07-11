@@ -56,6 +56,7 @@ func TestLintRefCharsetCatchesBadTokens(t *testing.T) {
 		}},
 		Commands:    []CommandDTO{{Verb: "gos.sip", Aliases: []string{"al.ias"}}}, // bad Verb + bad ALIAS token
 		Channels:    []ChannelDTO{{Ref: "ok", Words: []string{"wor{d}"}}},         // bad WORDS verb token (#66 F1)
+		ToggleDefs:  []ToggleDTO{{Ref: "ok2", Words: []string{"tog*le"}}},         // bad toggle-verb token (#358)
 		DisplayDefs: []DisplayDefDTO{{Surface: "sc*re"}},                          // bad Surface (NATS wildcard)
 	}
 	got := LintRefCharset([]Pack{p})
@@ -74,14 +75,15 @@ func TestLintRefCharsetCatchesBadTokens(t *testing.T) {
 		{"gos.sip", "Verb"},
 		{"al.ias", "Aliases"}, // a command-alias verb token (type-qualified list field)
 		{"wor{d}", "Words"},   // a channel-verb token
+		{"tog*le", "Words"},   // a toggle-verb token (#358)
 		{"sc*re", "Surface"},
 	} {
 		if bad[want.val] != want.field {
 			t.Errorf("expected %q flagged as field %q; got field %q (all: %+v)", want.val, want.field, bad[want.val], got)
 		}
 	}
-	if len(got) != 7 {
-		t.Fatalf("expected exactly 7 findings, got %d: %+v", len(got), got)
+	if len(got) != 8 {
+		t.Fatalf("expected exactly 8 findings, got %d: %+v", len(got), got)
 	}
 }
 

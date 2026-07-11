@@ -143,6 +143,7 @@ func mergePacks(parts []Pack) Pack {
 		out.Abilities = mergeByKey(out.Abilities, p.Abilities, func(a AbilityDTO) string { return a.Ref })
 		out.CombatProfiles = mergeByKey(out.CombatProfiles, p.CombatProfiles, func(c CombatProfileDTO) string { return c.Ref })
 		out.Channels = mergeByKey(out.Channels, p.Channels, func(c ChannelDTO) string { return c.Ref })
+		out.ToggleDefs = mergeByKey(out.ToggleDefs, p.ToggleDefs, func(t ToggleDTO) string { return t.Ref })
 		out.Regions = mergeByKey(out.Regions, p.Regions, func(r RegionDTO) string { return r.Ref })
 		out.Tracks = mergeByKey(out.Tracks, p.Tracks, func(t TrackDTO) string { return t.Ref })
 		out.Bundles = mergeByKey(out.Bundles, p.Bundles, func(b BundleDTO) string { return b.Ref })

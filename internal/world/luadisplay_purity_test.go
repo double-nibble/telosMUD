@@ -36,6 +36,7 @@ var renderOpClass = map[string]map[string]bool{
 		"level": false, "has_affect": false, "affect_magnitude": false, "has_flag": false, "room": false,
 		"contents": false, "equipment": false, "equipment_slots": false, "group": false, "is_enemy": false,
 		"distance": false, "can_see": false, "exits": false, "occupants": false, "room_items": false,
+		"toggle": false, // #358 content player-toggle read (default-aware) — pure read, safe in a sheet
 		// comms/output + harm + forced movement — FORBIDDEN
 		"send": true, "act": true, "say": true, "emote": true,
 		"damage": true, "heal": true, "modify_resource": true, "drain": true,

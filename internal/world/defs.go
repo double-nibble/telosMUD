@@ -114,6 +114,7 @@ type defRegistries struct {
 	ability *defRegistry[*abilityDef]
 	combat  *defRegistry[*combatProfile]
 	channel *defRegistry[*channelDef]
+	toggle  *defRegistry[*toggleDef]     // #358 content-defined player toggles
 	track   *defRegistry[*trackDef]      // Phase 11.2 advancement tracks
 	bundle  *defRegistry[*bundleDef]     // Phase 11.4b class/race/feat bundles
 	rarity  *defRegistry[*rarityTierDef] // Phase 12.1 rarity tiers
@@ -175,6 +176,7 @@ func newDefRegistries() *defRegistries {
 		ability:     newDefRegistry[*abilityDef](),
 		combat:      newDefRegistry[*combatProfile](),
 		channel:     newDefRegistry[*channelDef](),
+		toggle:      newDefRegistry[*toggleDef](),
 		track:       newDefRegistry[*trackDef](),
 		bundle:      newDefRegistry[*bundleDef](),
 		rarity:      newDefRegistry[*rarityTierDef](),
@@ -232,6 +234,12 @@ func (z *Zone) trustLadder() *trustLadder {
 // free atomic.Load; a bare zone falls back to its own empty bundle (no channels => no channel verbs).
 func (z *Zone) channelDefs() *defRegistry[*channelDef] {
 	return z.defBundle().channel
+}
+
+// toggleDefs is the zone-goroutine read accessor for the global player-toggle registry (#358). Lock-free
+// atomic.Load; a bare zone falls back to its own empty bundle (no toggles => no toggle verbs).
+func (z *Zone) toggleDefs() *defRegistry[*toggleDef] {
+	return z.defBundle().toggle
 }
 
 // trackDefs is the zone-goroutine read accessor for the global advancement-track registry (Phase 11.2).

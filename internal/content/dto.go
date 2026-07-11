@@ -58,6 +58,13 @@ type Pack struct {
 	// override-by-ref rule as the other pack globals.
 	Channels []ChannelDTO `json:"channels" yaml:"channels"`
 
+	// ToggleDefs are pack-GLOBAL player toggles: content-defined on/off preferences (e.g. an
+	// `overworld` minimap switch) that register a player verb and are readable from Lua. Pure
+	// CONTENT — the engine knows the KIND (a toggle: a ref, verb words, a default), not which
+	// toggles exist; a pack names them. An empty pack ships none and there are NO toggle verbs
+	// (the empty-boot invariant). Same last-write-wins override-by-ref rule as the other globals.
+	ToggleDefs []ToggleDTO `json:"toggle_defs" yaml:"toggle_defs"`
+
 	// Regions are pack-GLOBAL region definitions (Phase 10.3, docs/WORLD-EVENTS.md §1): a content-
 	// defined grouping of member zones (an "area/city" a builder thinks of as one place) that a region
 	// director owns the supra-zone state of. A region is pure CONTENT — the engine knows the KIND
@@ -589,6 +596,29 @@ type CommandDTO struct {
 	Verb    string   `json:"verb" yaml:"verb"`
 	Aliases []string `json:"aliases" yaml:"aliases"`
 	Lua     string   `json:"lua" yaml:"lua"`
+}
+
+// ToggleDTO is one content-defined player toggle: an on/off preference a player flips with a verb and
+// content (Lua) can read. Pure CONTENT — the engine names no toggle (no hard-coded `overworld`), it only
+// knows the toggle SHAPE. Authoring a toggle registers its verb(s) and gives content a per-player switch.
+//
+//   - Ref is the stable toggle id and the key `self:toggle("<ref>")` reads + the per-player override key.
+//   - Name is the display name used in the report line ("Overworld map is ON.").
+//   - Words are the command verbs that report/flip the toggle (`overworld` / `overworld on|off`). An
+//     empty pack => no such verb. Registered EXACT-only beside the channel/custom-command verbs; a word
+//     colliding with a built-in verb is rejected at build (logged), never shadowing a core verb.
+//   - DefaultOn is the value a player has before ever flipping it (the override falls back to this).
+//   - Desc is an optional one-line description surfaced in the report line / help.
+//
+// The per-player state is stored as an OVERRIDE (present => forced on/off; absent => DefaultOn), the same
+// delta-from-default rule content channels use — so a player who never touched the toggle picks up a changed
+// DefaultOn on the next rebuild.
+type ToggleDTO struct {
+	Ref       string   `json:"ref" yaml:"ref"`
+	Name      string   `json:"name" yaml:"name"`
+	Words     []string `json:"words" yaml:"words"`
+	DefaultOn bool     `json:"default_on" yaml:"default_on"`
+	Desc      string   `json:"desc" yaml:"desc"`
 }
 
 // CombatProfileDTO is one named combat profile (Phase 6.3a). to_hit is the attacker's to-hit CHECK

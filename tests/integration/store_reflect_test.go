@@ -116,6 +116,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 	fillOneDef(&pk.WearSlots, &counter)
 	fillOneDef(&pk.Chargens, &counter)
 	fillOneDef(&pk.HelpDefs, &counter)
+	fillOneDef(&pk.ToggleDefs, &counter)
 	fillOneDef(&pk.DisplayDefs, &counter)
 	fillOneDef(&pk.TrustTiers, &counter)
 	fillOneDef(&pk.Commands, &counter)
@@ -160,6 +161,7 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 		{"wear_slots", pk.WearSlots, lc.WearSlots},
 		{"chargens", pk.Chargens, lc.Chargens},
 		{"help_defs", pk.HelpDefs, lc.HelpDefs},
+		{"toggle_defs", pk.ToggleDefs, lc.ToggleDefs},
 		{"display_defs", pk.DisplayDefs, lc.DisplayDefs},
 		{"trust_tiers", pk.TrustTiers, lc.TrustTiers},
 		{"commands", pk.Commands, lc.Commands},
@@ -204,6 +206,7 @@ var reflectNetCovered = map[string]bool{
 	"Tracks": true, "Bundles": true, "RarityTiers": true, "Affixes": true, "LootTables": true,
 	"SpawnSchedules": true, "Recipes": true, "WearSlots": true, "Chargens": true,
 	"HelpDefs": true, "DisplayDefs": true, "TrustTiers": true, "Commands": true,
+	"ToggleDefs": true,
 }
 
 // reflectNetExcluded lists the content.Pack def-slice fields deliberately NOT in the reflect net, each with

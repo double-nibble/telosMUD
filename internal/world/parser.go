@@ -254,6 +254,16 @@ func (z *Zone) dispatch(s *session, line string) {
 			z.sendPrompt(s)
 			return
 		}
+		// Content player-toggle verb (#358): an `overworld` verb defined by a toggle_def. Consulted by
+		// EXACT match only, AFTER abilities + custom + channel verbs (a toggle verb never shadows or
+		// abbreviates a core verb). The handler reports/flips the per-player override; it never releases
+		// ownership, so we prompt on return. An empty pack defines no toggles => this is always nil.
+		if def := z.toggleForVerb(lower); def != nil {
+			z.log.Debug("dispatch: toggle command", "player", s.character, "verb", lower, "toggle", def.ref)
+			z.cmdToggle(s, def, rest)
+			z.sendPrompt(s)
+			return
+		}
 		z.log.Debug("unknown verb", "player", s.character, "verb", lower)
 		s.send(textFrame("Huh?"))
 		z.sendPrompt(s)
