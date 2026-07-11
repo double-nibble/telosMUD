@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [telos-gate, telos-world, telos-account, telos-migrate, telos-seed]
+        service: [telos-gate, telos-world, telos-account, telos-migrate, telos-seed, telos-pull]
     steps:
       - uses: actions/checkout@v4
 
