@@ -382,13 +382,23 @@ func (z *Zone) lookRoom(s *session) {
 		return
 	}
 
+	// Diagnostic (#361): an overworld room with the `overworld` toggle ON should have rendered the map
+	// template above, not fallen through to the built-in render. If it did, surface WHY (a stale/transient
+	// state, a deadline, a nil coord) — this fires ONLY for that anomaly, so it is quiet in normal play.
+	if r.room != nil && r.room.namedFlags["overworld"] {
+		if def := z.toggleDefs().get("overworld"); def != nil && s.comms.toggleEnabled(def) {
+			z.log.Warn("overworld map fell back to built-in render (template returned no sheet)",
+				"player", s.character, "room", r.proto)
+		}
+	}
+
 	room := r.room // its Room component (direct-pointer hot path, MUDLIB §3)
 	var b strings.Builder
 	b.WriteString(r.Name())
 	b.WriteByte('\n')
 	b.WriteString(r.Long())
 	b.WriteByte('\n')
-	if ex := room.sortedExits(); len(ex) > 0 {
+	if ex := room.displayExits(); len(ex) > 0 {
 		// Engine auto-color (Track 1): exits render cyan. This emits the `{{TOKEN}}` markup the color layer
 		// (internal/telnet/color.go) renders to SGR at the edge — or strips for a `color off` player — so it
 		// is safe plain-looking text, never raw ESC. Content can layer its own colors in room longs.
