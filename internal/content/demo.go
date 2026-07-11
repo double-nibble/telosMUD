@@ -2,7 +2,6 @@ package content
 
 import (
 	"context"
-	"embed"
 	"fmt"
 	"io/fs"
 
@@ -34,13 +33,11 @@ const (
 // the last-write-wins merge. The bare "core" zone ref is reserved too (CoreZone).
 const CoreRefPrefix = "core:"
 
-// The embed covers the whole packs/ tree, so a pack may be a single packs/<name>.yaml file OR a
-// directory packs/<name>/**/*.yaml (the #53 tree layout). `all:` keeps files the default embed
-// would skip (those beginning with `.`/`_`) out of scope only where intended; here the plain form
-// is enough — we only read *.yaml/*.yml.
-//
-//go:embed packs
-var packFS embed.FS
+// packFS is the compiled-in content tree. It is build-tag-split (embed_fixture.go / embed_release.go): a
+// normal build embeds the WHOLE packs/ tree (core + the `demo` test fixture); a `nofixture` build embeds
+// ONLY packs/core (the minimal bootstrap pack), so a release GHCR image ships the bootstrap lobby but NOT
+// the demo fixture — the deployable content is pulled from the external store (telosMUD-content) into
+// Postgres, never the embed. Everything below reads packFS the same way regardless of which is compiled in.
 
 // fsSource serves content packs from any fs.FS presenting a packs/ tree — a compiled-in embed, a
 // checked-out git worktree (internal/contentstore, #212 slice 3), or a testdata dir. Each pack is

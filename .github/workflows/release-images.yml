@@ -53,8 +53,13 @@ jobs:
           context: .
           file: deploy/Dockerfile
           platforms: linux/amd64,linux/arm64
+          # nofixture STRIPS the embedded `demo` test fixture (embed_release.go) from the shipped image —
+          # release services carry only the minimal `core` bootstrap pack; the deployable world is pulled
+          # from telosMUD-content into Postgres. telos-seed (the demo-seeder tool) is the sole exception:
+          # it keeps the full embed so it can still seed the demo for a dev/compose stack.
           build-args: |
             SERVICE=${{ matrix.service }}
+            BUILD_TAGS=${{ matrix.service != 'telos-seed' && 'nofixture' || '' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
