@@ -70,11 +70,36 @@ func (z *Zone) drainPlayer(id string) {
 	if s == nil || s.frozen || s.pending || s.detached {
 		return // already migrating / not attached — the existing machinery owns it
 	}
+	if isGateWedged(s) {
+		// The gate has stopped draining the Play stream (a full outbound buffer of consecutive dropped frames,
+		// Phase 16.3): the Redirect rides the SAME s.send/out path as every other frame, so a full buffer means
+		// it too would be dropped and the gate would never re-dial. Redirecting it would report a zero-drop
+		// that never happened (#336). Leave it resident so the deadline reclaims it from durable state (a clean
+		// reconnect), counted honestly as a straggler — not a phantom Redirected. This is the same "resident
+		// player holds the drain to its deadline" shape a link-dead player already has; a wedged gate detaches
+		// shortly anyway (the gate's write-deadline reclaims the socket).
+		//
+		// SCOPE (this is the interim heuristic, not the full fix). The check is synchronous HERE, but the
+		// Redirect is sent asynchronously LATER, after the handoff RPC. A player healthy at this instant that
+		// wedges DURING the in-flight handoff still gets a dropped Redirect and is still counted Redirected —
+		// the window this shrinks dramatically but cannot close. Only a gate ack on the Redirect (deferred
+		// option 1) closes it. The rare false positive (a busy player briefly stalling 256 sends then
+		// recovering) costs one clean reconnect instead of a seamless redirect — strictly better than the drop.
+		return
+	}
 	room := s.entity.location
 	if room == nil {
 		return // not placed in a room yet (a just-attaching player); the drain deadline reclaims it
 	}
 	z.initiateHandoff(s, room, z.id, room.proto, "") // silent, same zone, current room — now owned by the peer
+}
+
+// isGateWedged reports whether a player's gate has stopped draining the Play stream — a full outbound
+// buffer's worth of consecutive dropped frames (Phase 16.3, the same threshold that logs "gate write-deadline
+// will reclaim the connection"). A wedged gate cannot receive a Redirect frame, so a drain must not treat it
+// as redirectable (#336). consecutiveDrops is zone-owned, so this is race-free on the zone goroutine.
+func isGateWedged(s *session) bool {
+	return s.consecutiveDrops >= slowClientWedgedDrops
 }
 
 // DrainResult reports what a BeginDrain did: Redirected players kept their socket (zero drop); Reclaimed
@@ -149,12 +174,21 @@ func (z *Zone) reclaimStragglers(resp chan reclaimTally) {
 // isClientFaultStraggler reports whether a deadline straggler was un-redirectable for a CLIENT-side reason.
 // A frozen session is checked FIRST: a mid-handoff player has its entity detached (location nil), so without
 // this guard it would be miscounted as "never placed" — but it is an INFRA fault (the handoff RPC/target was
-// too slow). Then: link-dead (detached), or never finished connecting (no entity / no room placement) is a
-// client fault. Everything else — a healthy, in-world, connected player the drain simply could not move in
-// the deadline — is an infra fault.
+// too slow). Then: a WEDGED gate (drainPlayer skipped it because it can't receive the Redirect), link-dead
+// (detached), or never finished connecting (no entity / no room placement) is a client fault — the drain
+// machinery was ready, the client's connection was the thing that couldn't complete the move. Everything
+// else — a healthy, in-world, connected player the drain simply could not move in the deadline — is an infra
+// fault.
+//
+// A wedged gate is deliberately CLIENT, not infra (#336 suggested "infra"): the root cause is the client's
+// stalled socket, the same category as link death, and misfiling it as infra would inflate the metric ops
+// watch to decide whether the drain/handoff machinery itself is struggling.
 func isClientFaultStraggler(s *session) bool {
 	if s.frozen {
 		return false
+	}
+	if isGateWedged(s) {
+		return true
 	}
 	return s.detached || s.entity == nil || s.entity.location == nil
 }
