@@ -224,7 +224,7 @@ type DrainTargetReleaser interface {
 	ExpireDrainTargetSoon(ctx context.Context, target, drainer string, in time.Duration) (bool, error)
 }
 
-// presenceReflectWindow is how long a reservation is kept alive after a SUCCESSFUL handover: one presence
+// PresenceReflectWindow is how long a reservation is kept alive after a SUCCESSFUL handover: one presence
 // heartbeat plus margin, which is how long the target takes to report the migrated players' weight.
 //
 // This is the crux of #284. The reservation's job is to bridge the window between the players landing on the
@@ -235,14 +235,16 @@ type DrainTargetReleaser interface {
 // one heartbeat threads both. (orchestration review.)
 //
 // It must sit strictly between presence.DefaultHeartbeat (10s — below that, we drop the hold before the
-// target can report) and the reservation TTL that cmd/telos-world configures (15s — above that, shortening
-// is meaningless). A drain-release test pins the lower bound.
+// target can report) and the reservation TTL that cmd/telos-world configures — the TTL is now tied to the
+// drain deadline (#334, drainReservationTTL == drainHandoffDeadline + PresenceReflectWindow), well above this
+// window, so shortening to it is always meaningful. A drain-release test pins the lower bound; a
+// cmd/telos-world test pins the upper bound against this exported constant.
 //
-// NOTE that ExpireDrainTargetSoon never EXTENDS an expiry. A drain that took more than a few seconds has
-// already burned most of its 15s hold, so the retire is a no-op and the TTL simply runs out — which is the
-// safe outcome. The shortening only bites when a drain completes fast (an empty or tiny zone), which is
-// precisely when the full TTL would otherwise sit on a target that received almost nothing.
-const presenceReflectWindow = 12 * time.Second
+// NOTE that ExpireDrainTargetSoon never EXTENDS an expiry — it only ever shortens a hold toward this window.
+// Now that the reservation TTL spans the whole drain deadline (was ~15s), a hold retired after a SUCCESSFUL
+// handover still has time left, so the shorten to ~one heartbeat bites reliably rather than being pre-empted
+// by a near-lapsed TTL — the retire is precise for a fast drain and a slow one alike.
+const PresenceReflectWindow = 12 * time.Second
 
 // WithDrainTargetReleaser wires the port BeginDrain uses to retire the headroom it reserved on its targets,
 // rather than letting each reservation sit until its full TTL lapses (#284).
@@ -445,7 +447,7 @@ func (s *Shard) retireDrainTargets(sentPlayers map[string]bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), drainReleaseTimeout)
 		var err error
 		if sent {
-			_, err = s.drainReleaser.ExpireDrainTargetSoon(ctx, target, s.shardID, presenceReflectWindow)
+			_, err = s.drainReleaser.ExpireDrainTargetSoon(ctx, target, s.shardID, PresenceReflectWindow)
 		} else {
 			err = s.drainReleaser.ReleaseDrainTarget(ctx, target, s.shardID)
 		}

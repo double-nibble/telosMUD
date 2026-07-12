@@ -171,7 +171,7 @@ func main() {
 			slog.Info("signal received: draining before shutdown")
 			if chooseTarget != nil {
 				dctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-				res, derr := shard.BeginDrain(dctx, chooseTarget, 30*time.Second)
+				res, derr := shard.BeginDrain(dctx, chooseTarget, drainHandoffDeadline)
 				cancel()
 				if derr != nil {
 					slog.Warn("graceful drain incomplete; stopping anyway", "err", derr)
@@ -480,10 +480,33 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 // load/locality-aware, per-shard weight instead of one fleet-wide constant.
 const drainTargetCeiling = 1500
 
-// drainReservationTTL bounds a drain-target reservation: ~2-3x the shard heartbeat, long enough to cover the
-// blind window until the target's next registration reflects its real higher load, short enough that a
-// crashed drainer's hold self-clears fast. The reservation is only an admission hint, not a durable lock.
-const drainReservationTTL = 15 * time.Second
+// drainHandoffDeadline bounds how long a graceful drain waits for its zones to empty onto peers before it
+// gives up and reclaims the stragglers from durable state. It is passed to BeginDrain; the outer shutdown
+// context (which also covers the saver barrier) is longer so the drain runs to this deadline first.
+const drainHandoffDeadline = 30 * time.Second
+
+// drainReservationTTL bounds a drain-target reservation. It MUST outlast the whole drain (#334): the
+// reservation is placed ONCE, when ChooseDrainTarget selects a peer, and is NOT refreshed during the wait
+// for the zones to empty. A TTL shorter than that let a slow-but-alive drain lose its per-field hold
+// mid-flight — a concurrent drainer would then read the target's stale (pre-migration) load with no
+// reservation correcting it and over-commit (it was 15s vs a 30s deadline).
+//
+// The lifetime a live drainer legitimately needs is slightly MORE than drainHandoffDeadline, for two reasons
+// the review panel drew out: (1) the reservation is stamped in BeginDrain's step-1 selection loop, BEFORE
+// the deadline clock starts ticking on the wait-for-empty, so an early zone's hold must cover that step-1
+// offset too; and (2) a player landing on the target right at the deadline needs the hold to survive one
+// more presence heartbeat so the target's next registration reflects its weight — which is exactly what
+// PresenceReflectWindow is. So the TTL is drainHandoffDeadline + world.PresenceReflectWindow: the deadline
+// plus that one-heartbeat bridge, which also absorbs the step-1 offset. A CRASHED drainer's hold now lingers
+// that long rather than ~15s, which is conservative (it only ever makes the target look busier, never
+// over-commits) and self-clears via the per-field TTL; the soft ceiling + rebalancer backstop it. On a
+// SUCCESSFUL handover the hold is retired early to PresenceReflectWindow (internal/world drain.go, #284), so
+// the full TTL only ever backs a drainer that died. The reservation is still only an admission hint.
+//
+// The ordering PresenceReflectWindow must respect — presence heartbeat (10s) < PresenceReflectWindow (12s) <
+// drainReservationTTL — is guaranteed structurally by this definition (the TTL is the window plus a positive
+// deadline) and asserted against the REAL exported constant in drain_ttl_test.go.
+const drainReservationTTL = drainHandoffDeadline + world.PresenceReflectWindow
 
 // drainFleet adapts the directory + presence roster to placement.DrainFleet (#41): the live drain-target
 // candidates (live shards minus any that are themselves draining, each tagged with its current player load
