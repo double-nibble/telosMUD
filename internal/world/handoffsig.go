@@ -277,3 +277,105 @@ func verifyAdoptZone(pub ed25519.PublicKey, req *handoffv1.AdoptZoneRequest, sel
 	}
 	return verifyAdoptZoneLease(req, curOwner, curGen)
 }
+
+// --- Commit / Abort authentication (#314) ------------------------------------------------------
+//
+// Handoff.Commit and Handoff.Abort mutate a pending handoff's lifecycle (Abort discards the rehydrated
+// pending player; Commit exists for the explicit-lifecycle path). Their only credential used to be the
+// handoff_token, and that token is NOT a secret: handoffToken derives it as sha256(character/epoch), and
+// both inputs are guessable — a character name is public (`who`) and the epoch is a small monotonic
+// integer. So anyone with network reach to a world port could compute a valid token for a player
+// mid-handoff and Abort it (a targeted disruption). The port being private was the only barrier — the same
+// trusted-network assumption #260/#262 removed for Prepare/AdoptZone.
+//
+// The fix mirrors Prepare/AdoptZone: an Ed25519 signature under the shared cluster handoff keypair, gated
+// on the destination having a verify key (a keyless shard is governed by the #260 refusal instead). We keep
+// the token DETERMINISTIC — the retried-Prepare convergence and the zoneForToken index both depend on it —
+// and add the signature as the thing an attacker cannot forge. The token stays public; possession of the
+// cluster key is what the signature proves.
+//
+// The digest binds the token AND the destination shard id, under an operation-specific domain separator.
+// The DESTINATION BINDING is load-bearing, not decoration (security review of #314): the handoff wire is
+// plaintext (world.go dials peers with insecure creds), so an on-path attacker can CAPTURE a legitimately
+// signed Abort. It is NOT enough that the token is a per-(character, epoch) capability, because two
+// concurrent handoffs of the SAME character in a split-brain race both read the same base epoch M, both
+// derive the identical token(character, M+1), and both Prepare — parking a pending under one token at TWO
+// different destinations D and D2. The loser's genuine, correctly-signed Abort goes to D; captured and
+// replayed to D2 (or broadcast), it would discard the WINNER's live pending. Binding to_shard_id and
+// checking it against the receiver's own shard id (exactly as verifyAdoptZoneSig does) makes the loser's
+// Abort worthless anywhere but D — the replay at D2 fails the destination check before any pending is
+// touched.
+//
+// (The SAME-destination variant of that race — both handoffs target D, Prepare idempotency parks one shared
+// pending, and the loser's genuine Abort discards the pending the winner needs — is a pre-existing
+// token-idempotency-vs-rollback interaction, NOT an authentication gap; it is tracked separately and is out
+// of scope here. Destination binding does not and need not address it.)
+//
+// The distinct domain separators keep a Commit signature from being replayable as an Abort signature (or
+// vice versa) even though both cover the same token bytes — the same hygiene AdoptZone's separator gives.
+
+// ErrHandoffTokenSig is returned when a Commit/Abort request fails authentication: a missing/malformed
+// signature, a digest over a different token/operation, or a signature minted for a different destination
+// shard.
+var ErrHandoffTokenSig = errors.New("handoff: commit/abort authentication failed")
+
+// Domain separators for the token-capability signatures. Distinct from each other and from the Prepare /
+// AdoptZone digests, so no signature minted for one operation verifies for another under the shared key.
+const (
+	handoffCommitDomain = "telosmud/handoff/v1/commit"
+	handoffAbortDomain  = "telosmud/handoff/v1/abort"
+)
+
+// handoffTokenSigningInput builds the canonical digest a Commit/Abort signature covers: the operation's
+// domain separator, the handoff token, and the destination shard id — each length-prefixed exactly as the
+// other handoff digests are (8-byte big-endian length + bytes), so no field can be reassociated by a
+// boundary shift.
+func handoffTokenSigningInput(domain, token, toShardID string) []byte {
+	h := sha256.New()
+	var lenbuf [8]byte
+	write := func(b []byte) {
+		binary.BigEndian.PutUint64(lenbuf[:], uint64(len(b)))
+		h.Write(lenbuf[:])
+		h.Write(b)
+	}
+	write([]byte(domain))
+	write([]byte(token))
+	write([]byte(toShardID))
+	return h.Sum(nil)
+}
+
+// signHandoffToken returns the signature the source attaches to an outgoing Commit/Abort, binding the token
+// to its destination shard. A nil or wrong-sized private key returns nil (signing unconfigured — dev/test),
+// degrading to an unsigned request that a key-enforcing destination then rejects, rather than panicking on
+// the caller's goroutine.
+func signHandoffToken(priv ed25519.PrivateKey, domain, token, toShardID string) []byte {
+	if len(priv) != ed25519.PrivateKeySize {
+		return nil
+	}
+	return ed25519.Sign(priv, handoffTokenSigningInput(domain, token, toShardID))
+}
+
+// verifyHandoffToken checks a Commit/Abort sig against pub AND binds the request to this shard. Called only
+// when the destination has a verify key (the server gates on pub != nil), so a missing/short/tampered
+// signature is a hard reject — there is no "accept unsigned when a key is present" fallback, mirroring
+// verifySnapshot. selfShardID is the RECEIVER's shard id: a signature whose bound to_shard_id is not this
+// shard (or is empty) is refused, so a signature minted for a different destination cannot be replayed here
+// (the split-brain cross-shard replay in the header).
+func verifyHandoffToken(pub ed25519.PublicKey, domain, token, toShardID, selfShardID string, sig []byte) error {
+	if len(pub) != ed25519.PublicKeySize {
+		return ErrHandoffTokenSig
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return ErrHandoffTokenSig
+	}
+	if !ed25519.Verify(pub, handoffTokenSigningInput(domain, token, toShardID), sig) {
+		return ErrHandoffTokenSig
+	}
+	// Bind the destination: a signature minted for another shard must not be usable here. An empty
+	// to_shard_id can never match a real shardID, so an unbound request is refused too (same rule as
+	// verifyAdoptZoneSig).
+	if toShardID == "" || toShardID != selfShardID {
+		return ErrHandoffTokenSig
+	}
+	return nil
+}
