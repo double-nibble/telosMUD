@@ -202,6 +202,18 @@ func main() {
 				slog.Info("saver drained; every save that reached the queue is durable")
 			}
 			fcancel()
+			// PLACEMENT BARRIER (#331): the placement writer is a SEPARATE background goroutine that the saver
+			// barrier says nothing about. A player who quit during the drain enqueued a clean-logout tombstone
+			// on it; if stopWorld below cancels the world context before it drains, the record keeps naming a
+			// shard that is exiting, and the tell/mail oracle reports that player as hosted on a dead shard
+			// until their next login. Drain it through the barrier first. Bounded, like the saver barrier.
+			pctx, pcancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if perr := shard.FlushPlacement(pctx); perr != nil {
+				slog.Warn("placement writer did not drain before shutdown; some records may name this shard until the players' next login", "err", perr)
+			} else {
+				slog.Info("placement writer drained; every enqueued placement record is written")
+			}
+			pcancel()
 		case <-worldCtx.Done():
 			// A lease fence cancelled the world context: the saver drainer is already gone, so there is no
 			// barrier to take. Nothing was drained and nothing can be flushed.
