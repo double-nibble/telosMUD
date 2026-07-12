@@ -27,7 +27,7 @@ func TestRegisterPlacementRecordsZone(t *testing.T) {
 		t.Fatalf("unknown player: want ErrNotFound, got %v", err)
 	}
 
-	ok, err := d.RegisterPlacement(ctx, "Frodo", "world-a", "midgaard", 1)
+	ok, err := d.RegisterPlacement(ctx, "Frodo", "world-a", "midgaard", 1, 0)
 	if err != nil || !ok {
 		t.Fatalf("first registration: ok=%v err=%v", ok, err)
 	}
@@ -47,11 +47,11 @@ func TestRegisterPlacementAcceptsAnEqualEpoch(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Sam", "world-a", "midgaard", 5); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Sam", "world-a", "midgaard", 5, 0); err != nil {
 		t.Fatal(err)
 	}
 	// Same epoch, different shard + zone: this is a relog onto a different shard after a rebalance.
-	ok, err := d.RegisterPlacement(ctx, "Sam", "world-b", "darkwood", 5)
+	ok, err := d.RegisterPlacement(ctx, "Sam", "world-b", "darkwood", 5, 0)
 	if err != nil || !ok {
 		t.Fatalf("equal epoch must be accepted by RegisterPlacement: ok=%v err=%v", ok, err)
 	}
@@ -68,7 +68,7 @@ func TestRegisterPlacementCannotClobberANewerEpoch(t *testing.T) {
 	ctx := context.Background()
 
 	// The player is on world-a at epoch 1, then hands off to world-b at epoch 2.
-	if _, err := d.RegisterPlacement(ctx, "Merry", "world-a", "midgaard", 1); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Merry", "world-a", "midgaard", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 	if ok, err := d.SetPlayerShard(ctx, "Merry", "world-b", "darkwood", 2); err != nil || !ok {
@@ -76,7 +76,7 @@ func TestRegisterPlacementCannotClobberANewerEpoch(t *testing.T) {
 	}
 
 	// A racing login registration, still carrying epoch 1, must be refused outright.
-	ok, err := d.RegisterPlacement(ctx, "Merry", "world-a", "midgaard", 1)
+	ok, err := d.RegisterPlacement(ctx, "Merry", "world-a", "midgaard", 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestRegisterPlacementNeverLowersTheEpoch(t *testing.T) {
 		t.Fatalf("seed: ok=%v err=%v", ok, err)
 	}
 	// Equal epoch -> accepted, and the stored epoch stays 7.
-	if ok, err := d.RegisterPlacement(ctx, "Pippin", "world-a", "crypt", 7); err != nil || !ok {
+	if ok, err := d.RegisterPlacement(ctx, "Pippin", "world-a", "crypt", 7, 0); err != nil || !ok {
 		t.Fatalf("equal epoch: ok=%v err=%v", ok, err)
 	}
 	p, _ := d.PlayerPlacement(ctx, "Pippin")

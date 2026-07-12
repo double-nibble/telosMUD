@@ -1362,7 +1362,7 @@ func (z *Zone) attach(m attachMsg) {
 		if epoch < 1 {
 			epoch = 1
 		}
-		s = &session{character: character, out: out, epoch: epoch, currentZone: curZone, tier: m.tier}
+		s = &session{character: character, out: out, epoch: epoch, currentZone: curZone, tier: m.tier, nonce: newSessionNonce()}
 		z.newPlayerEntity(s, character)
 		z.log.Debug("fresh login epoch seeded", "player", character, "epoch", epoch, "resume", resumeEpoch, "tier", m.tier)
 		if curZone != nil {
@@ -1529,6 +1529,7 @@ func (z *Zone) prepare(m prepareMsg) {
 		appliedSeq:   m.snap.GetAppliedSeq(),
 		stateVersion: m.snap.GetStateVersion(), // carry the CAS base across the handoff (§7)
 		epoch:        m.epoch,
+		nonce:        newSessionNonce(), // fresh per-session placement nonce (#329); not carried on the snapshot
 		pending:      true,
 		token:        m.token,
 		// Adopt the account trust tier carried on the SIGNED snapshot (#106). The reserved flags themselves are

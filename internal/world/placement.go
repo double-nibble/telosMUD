@@ -48,6 +48,7 @@ type placementOp struct {
 	playerID string
 	zoneID   string
 	epoch    uint64
+	nonce    uint64 // the session's per-session fence value (#329): stamped on register, matched on clear
 	clear    bool
 }
 
@@ -139,7 +140,7 @@ func (z *Zone) registerPlacement(s *session) {
 	if z.shard == nil || z.shard.dir == nil || z.shard.shardID == "" || s == nil || s.character == "" {
 		return
 	}
-	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch})
+	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch, nonce: s.nonce})
 }
 
 // clearPlacement enqueues the clean-logout tombstone: drop this player's `shard` field, keeping their epoch
@@ -177,7 +178,7 @@ func (z *Zone) clearPlacement(s *session) {
 	// Carry the zone. The writer coalesces per player, so a logout offered while a zone-change registration
 	// is still pending REPLACES it — without this the tombstone would leave the record naming the zone the
 	// player walked out of, and a later reconnect would route by that stale zone.
-	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch, clear: true})
+	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch, nonce: s.nonce, clear: true})
 }
 
 // runPlacementWriter drains pending placements off every zone goroutine, performing the blocking Redis
@@ -262,7 +263,7 @@ func (s *Shard) writePlacement(ctx context.Context, op placementOp) {
 	defer cancel()
 
 	if op.clear {
-		ok, err := s.dir.ClearPlayerShard(wctx, op.playerID, s.shardID, op.zoneID, op.epoch)
+		ok, err := s.dir.ClearPlayerShard(wctx, op.playerID, s.shardID, op.zoneID, op.epoch, op.nonce)
 		switch {
 		case err != nil:
 			// Fail-safe: the record keeps naming this shard. The player's next login rewrites it, and until
@@ -281,7 +282,7 @@ func (s *Shard) writePlacement(ctx context.Context, op placementOp) {
 		return
 	}
 
-	ok, err := s.dir.RegisterPlacement(wctx, op.playerID, s.shardID, op.zoneID, op.epoch)
+	ok, err := s.dir.RegisterPlacement(wctx, op.playerID, s.shardID, op.zoneID, op.epoch, op.nonce)
 	switch {
 	case err != nil:
 		slog.Warn("placement write failed", "component", "world",

@@ -292,6 +292,47 @@ func TestFreshLoginMakesAPlayerTellAddressable(t *testing.T) {
 	}
 }
 
+// TestReloginStampsADistinctPlacementNonce is the world half of #329: two successive logins of the same
+// player mint DISTINCT session nonces in the placement record. That is the wiring that makes the directory's
+// nonce fence able to reject a stale same-shard/same-epoch tombstone — proven at the directory level in
+// TestTombstoneFenceDiscriminatesASameShardSameEpochRelog; here we prove the world actually stamps a fresh
+// nonce per session (not a constant, not 0).
+func TestReloginStampsADistinctPlacementNonce(t *testing.T) {
+	client, dir := placementWorld(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	ctx1, drop1 := context.WithCancel(ctx)
+	s, err := client.Connect(ctx1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(t, s, attach("Nonce"))
+	recvAttached(t, s)
+	first := waitPlacement(t, dir, "Nonce", func(p directory.Placement) bool { return p.Nonce != 0 },
+		"a fresh login must stamp a non-zero session nonce (#329)")
+
+	// A clean quit, then a relog: the second session must stamp a DIFFERENT nonce.
+	send(t, s, inputSeq(1, "quit"))
+	recvOutputContaining(t, s, "Farewell")
+	drop1()
+	waitPlacement(t, dir, "Nonce", func(p directory.Placement) bool { return p.ShardID == "" },
+		"the quit did not tombstone")
+
+	s2, err := client.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(t, s2, attach("Nonce"))
+	recvAttached(t, s2)
+	second := waitPlacement(t, dir, "Nonce", func(p directory.Placement) bool { return p.ShardID == "shard-a" && p.Nonce != 0 },
+		"the relog must re-register with a nonce")
+
+	if second.Nonce == first.Nonce {
+		t.Fatalf("relog reused the prior session's nonce (%d) — a stale tombstone could not be discriminated (#329)", first.Nonce)
+	}
+}
+
 // TestCleanQuitTombstonesThePlacement is the #70 regression at the world level: a player who types `quit`
 // has their placement's SHARD field dropped, while the epoch and zone survive so they stay routable and
 // tell-addressable.
