@@ -848,10 +848,28 @@ func (s *Shard) loadCharacterSnapshot(ctx context.Context, name string) (CharSna
 	if sv.ckpt != nil {
 		if snap, ok, err := sv.ckpt.LoadCheckpoint(ctx, name); err != nil {
 			s.saver.log.Debug("checkpoint load failed (non-fatal)", "name", name, "err", err)
-		} else if ok && (!found || snap.StateVersion > best.StateVersion) {
-			// The checkpoint is fresher (or Postgres had no row): prefer it. Carry the Postgres
-			// PID forward if the checkpoint lacks one (a checkpoint written before the row's
-			// create returned), so the rehydrated entity keeps its durable identity.
+		} else if ok && (!found || snap.StateVersion >= best.StateVersion) {
+			// Prefer the checkpoint when it is fresher OR TIED, and when Postgres had no row (#322). The tie is
+			// the whole point of the fix — and, as it turns out, the ONLY state in which the checkpoint tier
+			// can ever contribute to crash recovery of a flushed player. state_version only advances on a
+			// durable Postgres CAS (saveOk); it never moves on a checkpoint-only pulse, AND the checkpoint is
+			// dumped at the PRE-bump version (saver.go writes Redis from the snapshot before SaveCharacter
+			// CASes the row up by one). So `checkpoint_version <= row_version` is an invariant: a checkpoint
+			// can equal the row's version (a ~10s pulse after a flush, carrying the newer position the player
+			// walked to) but can never exceed it. Under a STRICT `>` with a row present, the checkpoint's win
+			// condition was therefore UNSATISFIABLE — the tier did the writes, paid the Redis traffic, and was
+			// inert for every player who had ever been flushed, silently leaving the crash-loss window at the
+			// ~60s Postgres cadence instead of the ~10s the tier advertises (checkpoint/redis.go). The `>=` is
+			// what activates it.
+			//
+			// Preferring the checkpoint on a tie is SAFE, not merely convenient: at any equal state_version the
+			// checkpoint's content is by construction at least as recent as the row's — both tiers are dumped
+			// from the same on-goroutine state, the checkpoint is additionally rewritten on every pulse
+			// (advancing its content within the same version), and the row's content only changes on a flush,
+			// which BUMPS the version (so a genuinely newer row never ties — it wins on `>`). A genuinely stale
+			// checkpoint (Redis lapsed while Postgres advanced) sits at a strictly LOWER version and is still
+			// correctly rejected. Carry the Postgres PID forward if the checkpoint lacks one (a checkpoint
+			// written before the row's create returned) so the rehydrated entity keeps its durable identity.
 			if snap.PID == "" {
 				snap.PID = best.PID
 			}
