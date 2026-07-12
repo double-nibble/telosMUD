@@ -359,6 +359,12 @@ func TestFinalFlushYieldsToReattachedSession(t *testing.T) {
 // TestCheckpointFreshnessWins proves the login read picks the HIGHER-state_version source between
 // the Postgres row and the Redis checkpoint — the crash-window freshness check. We write a stale
 // row and a fresher checkpoint and assert the loaded snapshot is the checkpoint's.
+//
+// NOTE (#322): this exercises the comparator with checkpoint_version STRICTLY GREATER than the row's — a
+// relationship that is not actually reachable in production, because the checkpoint is dumped at the
+// pre-CAS-bump version so checkpoint_version <= row_version always holds. It is a valid unit test of the
+// operator in isolation, but the reachable crash-recovery case is the TIE — see
+// TestCheckpointWinsOnStateVersionTie, which is the one that fails on the pre-fix strict `>`.
 func TestCheckpointFreshnessWins(t *testing.T) {
 	mem := NewMemStore()
 	shard := NewDemoShard().WithPersistence(mem, mem)
@@ -396,6 +402,102 @@ func TestCheckpointFreshnessWins(t *testing.T) {
 	if snap2.StateVersion != 2 || snap2.RoomRef != "midgaard:room:temple" {
 		t.Fatalf("freshness check chose version %d room %q, want the row (2, temple)",
 			snap2.StateVersion, snap2.RoomRef)
+	}
+}
+
+// TestCheckpointWinsOnStateVersionTie is the #322 regression: state_version only advances on a durable
+// Postgres CAS, never on a checkpoint-only pulse, so the ~10s checkpoints between two ~60s flushes all carry
+// the SAME state_version as the last flush but STRICTLY NEWER content (the player kept moving). A strict `>`
+// freshness check made every one of those checkpoints lose the tie to Postgres, silently widening the crash
+// data-loss window from the ~10s the checkpoint tier advertises back to the ~60s Postgres cadence. The tie
+// must resolve to the CHECKPOINT — by construction it is never older than the row it mirrors at an equal
+// version.
+func TestCheckpointWinsOnStateVersionTie(t *testing.T) {
+	mem := NewMemStore()
+	shard := NewDemoShard().WithPersistence(mem, mem)
+	ctx := context.Background()
+
+	// The durable row: last Postgres flush left the player in the temple at version 2.
+	pid, _ := mem.CreateCharacter(ctx, "Tie", "midgaard", "midgaard:room:temple")
+	row := CharSnapshot{PID: pid, Name: "Tie", ZoneRef: "midgaard", RoomRef: "midgaard:room:temple", StateVersion: 0}
+	for row.StateVersion < 2 {
+		v, _, _ := mem.SaveCharacter(ctx, row)
+		row.StateVersion = v
+	}
+
+	// A checkpoint-only pulse fired AFTER the flush: the player walked to the market, but no Postgres flush
+	// bumped the version, so the checkpoint mirrors the SAME version 2 with the newer room. This is the exact
+	// tie the bug dropped.
+	_ = mem.Checkpoint(ctx, CharSnapshot{
+		PID: pid, Name: "Tie", ZoneRef: "midgaard", RoomRef: "midgaard:room:market", StateVersion: 2,
+	})
+
+	snap, ok := shard.loadCharacterSnapshot(ctx, "Tie")
+	if !ok {
+		t.Fatal("expected to load a snapshot")
+	}
+	if snap.StateVersion != 2 || snap.RoomRef != "midgaard:room:market" {
+		t.Fatalf("on a state_version tie the checkpoint must win: got version %d room %q, want (2, market)",
+			snap.StateVersion, snap.RoomRef)
+	}
+
+	// Guard the boundary the tie-break relies on: a GENUINELY stale checkpoint (a LOWER version, e.g. Redis
+	// lapsed while Postgres advanced) must still lose. Advance the row to version 3 (market via a flush),
+	// leaving the checkpoint at version 2 — the row is now strictly fresher and must win.
+	row = CharSnapshot{PID: pid, Name: "Tie", ZoneRef: "midgaard", RoomRef: "midgaard:room:square", StateVersion: 2}
+	v, ok2, _ := mem.SaveCharacter(ctx, row)
+	if !ok2 {
+		t.Fatalf("row flush to advance version failed")
+	}
+	if v != 3 {
+		t.Fatalf("expected row to advance to version 3, got %d", v)
+	}
+	snap2, ok := shard.loadCharacterSnapshot(ctx, "Tie")
+	if !ok {
+		t.Fatal("expected to load a snapshot (stale-checkpoint case)")
+	}
+	if snap2.StateVersion != 3 || snap2.RoomRef != "midgaard:room:square" {
+		t.Fatalf("a strictly-newer row must beat a lower-version checkpoint: got version %d room %q, want (3, square)",
+			snap2.StateVersion, snap2.RoomRef)
+	}
+}
+
+// TestCheckpointTieRecoversMigratedHandoffLocation locks in the highest-value case the #322 tie-break
+// unblocks (raised by the distsys review): a just-migrated player. The cross-shard handoff carries
+// state_version and the destination seeds session.stateVersion from it, so a player who walked
+// midgaard->darkwood is at version N on BOTH the durable row (still the SOURCE's last-flushed pre-handoff
+// location, because the destination has not flushed yet) and the destination's first checkpoint pulse (the
+// MIGRATED location, at the same seeded version N). Under the pre-fix strict `>` a crash before the
+// destination's first flush would rehydrate the player at their PRE-HANDOFF room — an actual data-loss bug.
+// The tie-break recovers the migrated location. This test models that state at the load seam so a future
+// revert to `>` is caught.
+func TestCheckpointTieRecoversMigratedHandoffLocation(t *testing.T) {
+	mem := NewMemStore()
+	shard := NewDemoShard().WithPersistence(mem, mem)
+	ctx := context.Background()
+
+	// Source's last durable flush before the handoff: the player is in midgaard at version 3.
+	pid, _ := mem.CreateCharacter(ctx, "Migrant", "midgaard", "midgaard:room:temple")
+	row := CharSnapshot{PID: pid, Name: "Migrant", ZoneRef: "midgaard", RoomRef: "midgaard:room:temple", StateVersion: 0}
+	for row.StateVersion < 3 {
+		v, _, _ := mem.SaveCharacter(ctx, row)
+		row.StateVersion = v
+	}
+
+	// The destination rehydrated the carried player (session.stateVersion seeded to the SAME 3, no flush on
+	// the destination yet) and its first ~10s checkpoint pulse mirrors the MIGRATED location at that version.
+	_ = mem.Checkpoint(ctx, CharSnapshot{
+		PID: pid, Name: "Migrant", ZoneRef: "darkwood", RoomRef: "darkwood:room:entrance", StateVersion: 3,
+	})
+
+	snap, ok := shard.loadCharacterSnapshot(ctx, "Migrant")
+	if !ok {
+		t.Fatal("expected to load a snapshot")
+	}
+	// The tie must recover the MIGRATED darkwood location, not the pre-handoff midgaard row.
+	if snap.ZoneRef != "darkwood" || snap.RoomRef != "darkwood:room:entrance" {
+		t.Fatalf("post-handoff crash recovery landed at %s/%s, want the migrated darkwood:room:entrance "+
+			"(a strict `>` would strand the player at the pre-handoff midgaard row)", snap.ZoneRef, snap.RoomRef)
 	}
 }
 
