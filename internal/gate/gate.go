@@ -67,6 +67,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/commbus"
@@ -544,15 +546,43 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 		gmcpReq:   gmcpReq,
 	}
 	var token string
+	attachRetries := 0
 	for {
-		next, ok := s.runStream(ctx, conn, addr, token)
-		if !ok {
+		next, outcome := s.runStream(ctx, conn, addr, token)
+		switch outcome {
+		case outcomeRedirect:
+			// The actual replay keys off the DESTINATION's ack_input_seq on its first (Attached)
+			// frame (runStream / doReplay); the redirect carries no resume point.
+			log.Debug("redirect received", "target", next.addr)
+			addr, token = next.addr, next.token
+			attachRetries = 0 // a successful bind clears the fresh-login refusal budget
+		case outcomeUnavailable:
+			// A fresh-login Attach was refused because the shard is draining (#324). Re-resolve through the
+			// directory — whose zone leases have flipped to the peer — and re-dial on the SAME socket. The
+			// token stays empty: this is still a fresh login, not a handoff bind. Bounded so a fully
+			// saturated fleet can't spin here forever.
+			attachRetries++
+			if attachRetries > maxAttachRetries {
+				log.Debug("attach kept returning Unavailable; giving up", "retries", attachRetries)
+				_ = tc.Write("\r\nThe world is busy right now. Please reconnect in a moment.\r\n")
+				return
+			}
+			select {
+			case <-time.After(attachRetryBackoff):
+			case <-ctx.Done():
+				return
+			}
+			newAddr, ok := s.dir.ShardForCharacter(name)
+			if !ok {
+				log.Debug("no shard available on re-resolve after Unavailable")
+				_ = tc.Write("\r\nNo world is available right now. Goodbye.\r\n")
+				return
+			}
+			log.Debug("re-resolved after Unavailable", "old", addr, "new", newAddr, "retry", attachRetries)
+			addr = newAddr
+		default: // outcomeDone
 			return // bridge ended without a redirect: socket/world closed.
 		}
-		// The actual replay keys off the DESTINATION's ack_input_seq on its first (Attached)
-		// frame (runStream / doReplay); the redirect carries no resume point.
-		log.Debug("redirect received", "target", next.addr)
-		addr, token = next.addr, next.token
 	}
 }
 
@@ -582,6 +612,25 @@ type redirectTarget struct {
 	token string
 }
 
+// streamOutcome is how a finished bridge tells the outer re-dial loop what to do next.
+type streamOutcome int
+
+const (
+	outcomeDone        streamOutcome = iota // tear the connection down (socket EOF, world Disconnect, or a non-retryable error)
+	outcomeRedirect                         // re-dial the target the world named (a cross-shard handoff bind — carries a token)
+	outcomeUnavailable                      // a fresh-login Attach was refused with codes.Unavailable (shard draining); re-resolve + re-dial (#324)
+)
+
+// attachRetry* bound the re-resolve loop a fresh-login Attach refusal drives (#324). A shard refuses a fresh
+// login while it is draining so the arrival lands on the peer the zone leases have flipped to; the gate
+// re-resolves through the directory and re-dials. The leases flip within a zone-lease TTL, so a handful of
+// short backoffs comfortably covers the window without hanging a connect. Exhausting them means the fleet is
+// genuinely saturated (every candidate draining), and the player is asked to reconnect.
+const (
+	maxAttachRetries   = 5
+	attachRetryBackoff = 250 * time.Millisecond
+)
+
 // runStream binds the session to the shard at addr and runs the bridge over a single
 // Play stream. token is empty on the first attach and carries the redirect's handoff
 // token on a re-dial.
@@ -592,23 +641,25 @@ type redirectTarget struct {
 // redirect carries no resume point at all (the source-side estimate that once rode on
 // Redirect.resume_input_seq was retired — it only ever fed a diagnostic log).
 //
-// It returns (target, true) when the stream ended in a Redirect — the caller re-dials
-// target. It returns (_, false) when the bridge ended for any other reason (socket
+// It returns outcomeRedirect (with the target) when the stream ended in a Redirect —
+// the caller re-dials target. It returns outcomeUnavailable when a FRESH-LOGIN Attach
+// was refused with codes.Unavailable (a draining shard) — the caller re-resolves and
+// re-dials on the same socket (#324). It returns outcomeDone for any other end (socket
 // EOF, world disconnect, dial/attach failure): the caller tears the connection down.
-func (s *Server) runStream(ctx context.Context, c *connState, addr, token string) (redirectTarget, bool) {
+func (s *Server) runStream(ctx context.Context, c *connState, addr, token string) (redirectTarget, streamOutcome) {
 	log := c.log.With("addr", addr)
 
 	cli, err := s.pool.client(addr)
 	if err != nil {
 		log.Debug("shard dial failed", "err", err)
 		_ = c.tc.Write("\r\nThe world is unreachable. Goodbye.\r\n")
-		return redirectTarget{}, false
+		return redirectTarget{}, outcomeDone
 	}
 	stream, err := cli.Connect(ctx)
 	if err != nil {
 		log.Debug("play stream dial failed", "err", err)
 		_ = c.tc.Write("\r\nThe world is unreachable. Goodbye.\r\n")
-		return redirectTarget{}, false
+		return redirectTarget{}, outcomeDone
 	}
 	log.Debug("play stream opened")
 
@@ -624,7 +675,7 @@ func (s *Server) runStream(ctx context.Context, c *connState, addr, token string
 	}
 	if err := stream.Send(&playv1.ClientFrame{Payload: &playv1.ClientFrame_Attach{Attach: attach}}); err != nil {
 		log.Debug("attach send failed", "err", err)
-		return redirectTarget{}, false
+		return redirectTarget{}, outcomeDone
 	}
 	log.Debug("attach sent", "token_present", token != "", "input_seq", attach.InputSeq)
 
@@ -664,8 +715,8 @@ func (s *Server) runStream(ctx context.Context, c *connState, addr, token string
 	// flagged a redirect/disconnect. Wait for the writer to finish so we read its result
 	// without a race.
 	wg.Wait()
-	target, redirected := br.result()
-	if !redirected {
+	target, outcome := br.result()
+	if outcome == outcomeDone {
 		// A real teardown (a player quit / world Disconnect, or socket EOF), NOT a re-dial.
 		// Half-close the world stream's send side so the shard's reader loop promptly sees
 		// end-of-input and runs its leave/detach (and thus the logout DURABLE FLUSH) NOW,
@@ -675,12 +726,13 @@ func (s *Server) runStream(ctx context.Context, c *connState, addr, token string
 		// already CloseSends on socket EOF; this covers the world-initiated Disconnect path,
 		// where the forwarder returns via `done` without closing the send side. Idempotent: a
 		// second CloseSend (the forwarder already closed it) is a harmless no-op error we drop.
-		// A redirect must NOT take this path — the socket stays open for the re-dial.
+		// A redirect or a re-resolve (unavailable) must NOT take this path — the socket stays open
+		// for the re-dial, and the refused stream is already dead (its Recv errored).
 		br.sendMu.Lock()
 		_ = stream.CloseSend()
 		br.sendMu.Unlock()
 	}
-	return target, redirected
+	return target, outcome
 }
 
 // bridge runs the two halves of one Play stream for a connection. It shares the
@@ -698,8 +750,9 @@ type bridge struct {
 
 	sendMu sync.Mutex // serializes stream.Send across the writer (replay) and forwarder (live)
 
-	mu       sync.Mutex
-	redirect *redirectTarget // set by the writer when a Redirect frame arrives
+	mu          sync.Mutex
+	redirect    *redirectTarget // set by the writer when a Redirect frame arrives
+	unavailable bool            // set by the writer when a fresh-login Attach was refused with codes.Unavailable (#324)
 }
 
 // runWriter pumps world frames to the terminal. On EVERY frame it prunes the
@@ -715,6 +768,23 @@ func (b *bridge) runWriter() {
 		f, err := b.stream.Recv()
 		if err != nil {
 			b.log.Debug("play stream recv ended", "err", err)
+			// A FRESH-LOGIN Attach refused with codes.Unavailable (the shard began draining between the
+			// gate's resolve and the world's attach) is RETRYABLE (#324): the world refuses the arrival so
+			// it lands on the peer the zone leases have flipped to, and expects the gate to re-resolve and
+			// re-dial. Flag it and KEEP THE SOCKET OPEN for the outer loop to re-dial on.
+			//
+			// Guards: `first` (no frame ever arrived — so this is the Attach itself being refused, not a
+			// mid-session drop) and `!b.replay` (a fresh login, no handoff token). A token-bearing re-dial
+			// has exactly ONE valid destination — retrying it would race the pending-player TTL — so it must
+			// tear down normally. Note gRPC also maps a transport failure (connection refused, server
+			// graceful-stop) to codes.Unavailable, not just the world's explicit "shard draining" status; a
+			// transport blip on a FRESH login is safe to re-resolve too (bounded, and it picks a live peer),
+			// and `!b.replay` still keeps a handoff bind out of this path.
+			if first && !b.replay && status.Code(err) == codes.Unavailable {
+				b.log.Debug("fresh-login attach refused (shard draining); will re-resolve and re-dial")
+				b.flagUnavailable()
+				return
+			}
 			// If we already flagged a redirect, the stream close is expected and the
 			// socket must stay open for the re-dial. Otherwise drop the socket so the
 			// reader loop unblocks and the connection tears down.
@@ -895,15 +965,24 @@ func (b *bridge) takenRedirect() bool {
 	return b.redirect != nil
 }
 
-// result reports the bridge outcome: (target, true) if a redirect was flagged, else
-// (_, false). Read only after both loops have finished.
-func (b *bridge) result() (redirectTarget, bool) {
+func (b *bridge) flagUnavailable() {
+	b.mu.Lock()
+	b.unavailable = true
+	b.mu.Unlock()
+}
+
+// result reports the bridge outcome. Read only after both loops have finished. A redirect wins over an
+// unavailable flag (they are mutually exclusive in practice, but redirect is the stronger signal).
+func (b *bridge) result() (redirectTarget, streamOutcome) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.redirect == nil {
-		return redirectTarget{}, false
+	if b.redirect != nil {
+		return *b.redirect, outcomeRedirect
 	}
-	return *b.redirect, true
+	if b.unavailable {
+		return redirectTarget{}, outcomeUnavailable
+	}
+	return redirectTarget{}, outcomeDone
 }
 
 // renderFrame turns one world ServerFrame into terminal bytes for this connection.
