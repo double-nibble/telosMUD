@@ -165,6 +165,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// intra-shard move follows the player.
 	//
 	//   - handoff re-dial (token != "")  -> whichever zone holds the matching pending player.
+	//   - a session STILL HELD on this shard (link-dead resume) -> its ACTUAL live zone (#321).
 	//   - rehydrating login              -> the zone named by the durable zone_ref.
 	//   - brand-new character, or a zone_ref this shard does not host -> the shard's home zone.
 	//
@@ -173,7 +174,26 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// hosts many zones (the demo pack ships three), so a player who walked from midgaard into darkwood and
 	// logged out there came back standing in midgaard's temple, with their durable location gone. No
 	// rebalance and no cross-shard hop required — an ordinary intra-shard walk was enough.
+	//
+	// The in-memory residency index (#321) takes precedence over the durable zone_ref for a fresh/link-dead
+	// login. The durable record LAGS an intra-shard walk (transferIn never flushes; detach's save drains
+	// async), so a reconnect that beats the flush would read the stale pre-walk zone, find no session there,
+	// take the fresh-login branch, and double-own the character while the detached copy still sits in the zone
+	// they walked to. Routing to where the session is actually held re-binds it (attach's re-attach branch)
+	// instead. If the session was already reaped (index miss), we fall through to the now-consistent durable
+	// zone_ref.
+	//
+	// The REPORTED #321 case — link death AFTER the walk lands — is fully closed: detach forwards the detach
+	// to the destination via z.forwarding, so the session is always held on (and indexed to) the zone it
+	// walked to. A residual micro-window remains only for a reconnect landing DURING an in-flight intra-shard
+	// transfer (between the source's delPlayer and the destination's setPlayer the session is in no zone's
+	// players map), where the index misses and we fall back to the stale durable zone. That is intrinsic to
+	// the message-passing handoff and strictly narrower than the pre-fix window; tracked as a follow-up.
 	zone := s.shard.zoneByID(s.shard.home)
+	var resident *Zone
+	if token == "" {
+		resident = s.shard.zoneForResidentCharacter(character)
+	}
 	switch {
 	case token != "":
 		if z := s.shard.zoneForToken(token); z != nil {
@@ -181,6 +201,10 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		}
 		// If no zone holds the token, fall through with the home zone; the zone's attach
 		// rejects the unknown token rather than spawning a fresh character.
+	case resident != nil:
+		// A session for this character is still held on this shard: route to its actual zone so attach
+		// re-binds it. This is authoritative over the (possibly stale) durable zone_ref (#321).
+		zone = resident
 	case loadedOK && loaded.ZoneRef != "":
 		if z := s.shard.zoneByID(loaded.ZoneRef); z != nil {
 			zone = z

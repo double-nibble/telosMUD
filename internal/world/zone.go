@@ -1870,11 +1870,17 @@ func (z *Zone) reapHandedOffOrphan(id string, s *session) {
 func (z *Zone) setPlayer(id string, s *session) {
 	z.players[id] = s
 	z.pop.Store(int64(len(z.players)))
+	if z.shard != nil {
+		z.shard.indexResident(id, z) // maintain the shard-level character->zone index (#321)
+	}
 }
 
 func (z *Zone) delPlayer(id string) {
 	delete(z.players, id)
 	z.pop.Store(int64(len(z.players)))
+	if z.shard != nil {
+		z.shard.unindexResident(id, z) // only-if-mine, so a transfer's dest setPlayer isn't erased (#321)
+	}
 }
 
 // handoffFailed thaws a player whose cross-shard move could not be initiated, so they
