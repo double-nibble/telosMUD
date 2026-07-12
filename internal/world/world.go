@@ -121,6 +121,22 @@ type Shard struct {
 	mu         sync.Mutex       // guards tokenIndex, zones, and runCtx/runWG/draining (16.4a runtime zone-add)
 	tokenIndex map[string]*Zone // handoff token -> hosting zone (populated by Prepare)
 
+	// residentZone maps a character -> the zone on THIS shard that currently HOLDS their session (including a
+	// link-dead session still held through its grace). It is the live, in-memory answer to "which zone hosts
+	// this player right now", maintained by setPlayer/delPlayer so it stays EXACTLY the union of every zone's
+	// players map (the same choke points that mirror pop) (#321).
+	//
+	// A reconnect consults it BEFORE the durable zone_ref. The durable record lags an intra-shard zone walk by
+	// an async flush (transferIn never enqueues a save; detach's save is drained off-goroutine), so a link-dead
+	// resume routed by the stale durable zone lands in a zone that no longer holds the session, takes the
+	// fresh-login branch, and DOUBLE-OWNS the character — a fresh copy while the detached copy still sits in
+	// the zone they walked to. The in-memory index closes that window with no I/O.
+	//
+	// Its own mutex: setPlayer/delPlayer run on EVERY zone's goroutine and the reconnect read on a stream
+	// goroutine, so keeping it off s.mu avoids contending with zone-hosting/drain. Guarded by residentMu.
+	residentMu   sync.Mutex
+	residentZone map[string]*Zone
+
 	// content is the full loaded content — every pack's prototypes are already in protos (defineContent
 	// fills from ALL loaded zones, not just the hosted set). Retained so HostZone (Phase 16.4a runtime
 	// zone-add) can build a zone this shard did NOT host at boot: a standby re-claiming a draining peer's
@@ -346,6 +362,7 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		dir:              dir,
 		peers:            peers,
 		tokenIndex:       map[string]*Zone{},
+		residentZone:     map[string]*Zone{},
 		handedOff:        map[string]bool{},
 		leaseStop:        map[string]context.CancelFunc{},
 		actorStop:        map[string]context.CancelFunc{},
@@ -736,6 +753,39 @@ func (s *Shard) dropToken(token string) {
 	s.mu.Lock()
 	delete(s.tokenIndex, token)
 	s.mu.Unlock()
+}
+
+// indexResident records that zone z now holds character's session (#321). Called from setPlayer, so it
+// mirrors z.players exactly. An unconditional set is correct: a character is resident in at most one zone on
+// a shard at a time, and during an intra-shard transfer the destination's setPlayer is the newest truth.
+func (s *Shard) indexResident(character string, z *Zone) {
+	s.residentMu.Lock()
+	s.residentZone[character] = z
+	s.residentMu.Unlock()
+}
+
+// unindexResident drops character's residency, but ONLY if it still points to z (#321). On the plain A->B
+// intra-shard walk the ordering is actually fixed — transferOut's delPlayer strictly precedes the posting of
+// transferInMsg, so the source unindex happens-before the destination setPlayer — and a blind delete would
+// be correct there. The only-if-mine guard is defense-in-depth: it makes the index robust to ANY future call
+// site (or a re-ordering) where a source delete could otherwise erase a destination's fresh entry, matching
+// the only-if-mine discipline the placement tombstone fence uses. Cheap, and it removes a latent footgun.
+func (s *Shard) unindexResident(character string, z *Zone) {
+	s.residentMu.Lock()
+	if s.residentZone[character] == z {
+		delete(s.residentZone, character)
+	}
+	s.residentMu.Unlock()
+}
+
+// zoneForResidentCharacter returns the zone on THIS shard currently holding character's session, or nil.
+// Consulted by the Play attach BEFORE the durable zone_ref so a link-dead resume routes to the zone that
+// actually holds the detached session, never the zone the durable record has gone stale naming (#321). Read
+// on the stream goroutine; safe against the zone-goroutine writers via residentMu.
+func (s *Shard) zoneForResidentCharacter(character string) *Zone {
+	s.residentMu.Lock()
+	defer s.residentMu.Unlock()
+	return s.residentZone[character]
 }
 
 // GRPCDialer dials peer shards over plaintext gRPC, caching one connection per

@@ -160,6 +160,18 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 			delete(s.tokenIndex, token)
 		}
 	}
+	// The residency index (#321) is kept clean by the quiescence precondition above: pop==0 => z.players is
+	// empty => no residentZone entry points here. This sweep is belt-and-suspenders so a future change that
+	// ever unhosts a non-quiescent zone can't leave the index pointing at a stopped actor — mirroring the
+	// tokenIndex sweep. residentZone has its own lock, taken briefly here under s.mu (leaf order preserved:
+	// residentMu never reaches back for s.mu).
+	s.residentMu.Lock()
+	for character, rz := range s.residentZone {
+		if rz == z {
+			delete(s.residentZone, character)
+		}
+	}
+	s.residentMu.Unlock()
 	// Clear the handed-off flag WITH the zone. It exists to tell this shard's renewal loop "stop renewing, do
 	// not fence" for a zone we gave away. Leaving it set outlives the zone object, and a later re-adoption
 	// takes HostZone's full BUILD path (the zone is gone, so the re-adoption branch that clears the flag never
