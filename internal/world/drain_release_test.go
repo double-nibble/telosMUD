@@ -293,9 +293,9 @@ func TestRetireDrainTargetsShortensTheHoldOfATargetThatGotPlayers(t *testing.T) 
 // TestPresenceReflectWindowOutlivesTheHeartbeat pins the constant's intent: the shortened hold must survive
 // long enough for the target's presence heartbeat to report the migrated players, or the retire is unsafe.
 func TestPresenceReflectWindowOutlivesTheHeartbeat(t *testing.T) {
-	if presenceReflectWindow <= presencepkg.DefaultHeartbeat {
-		t.Fatalf("presenceReflectWindow (%v) must exceed the presence heartbeat (%v): the hold's whole job "+
+	if PresenceReflectWindow <= presencepkg.DefaultHeartbeat {
+		t.Fatalf("PresenceReflectWindow (%v) must exceed the presence heartbeat (%v): the hold's whole job "+
 			"after a successful handover is to bridge until the target reports the migrated weight",
-			presenceReflectWindow, presencepkg.DefaultHeartbeat)
+			PresenceReflectWindow, presencepkg.DefaultHeartbeat)
 	}
 }
