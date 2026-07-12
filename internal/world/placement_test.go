@@ -191,7 +191,8 @@ func TestPlacementWriteIsSkippedWithoutADirectory(t *testing.T) {
 	s := &Shard{placement: newPlacementWriter()} // shard present, dir == nil, shardID == ""
 	z := &Zone{id: "midgaard", shard: s}
 	z.registerPlacement(&session{character: "Hermit", epoch: 1})
-	if got := len(s.placement.take()); got != 0 {
+	if ops, _ := s.placement.take(); len(ops) != 0 {
+		got := len(ops)
 		t.Fatalf("pending placements = %d, want 0 — a shard with no directory must enqueue nothing", got)
 	}
 
@@ -215,7 +216,7 @@ func TestPlacementWriterCoalescesByPlayer(t *testing.T) {
 	w.offer(placementOp{playerID: "Walker", zoneID: "darkwood", epoch: 1}) // the walk
 	w.offer(placementOp{playerID: "Other", zoneID: "crypt", epoch: 1})
 
-	ops := w.take()
+	ops, _ := w.take()
 	if len(ops) != 2 {
 		t.Fatalf("pending = %d ops, want 2 (one per distinct player)", len(ops))
 	}
@@ -229,7 +230,8 @@ func TestPlacementWriterCoalescesByPlayer(t *testing.T) {
 	if byPlayer["Other"] != "crypt" {
 		t.Fatalf("Other = %q, want crypt — coalescing must be per-player, not global", byPlayer["Other"])
 	}
-	if got := len(w.take()); got != 0 {
+	if ops, _ := w.take(); len(ops) != 0 {
+		got := len(ops)
 		t.Fatalf("take() must drain: second take returned %d ops", got)
 	}
 }
@@ -251,7 +253,8 @@ func TestPlacementOfferNeverBlocks(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("offer blocked — a placement hand-off must never stall the zone goroutine that made it")
 	}
-	if got := len(w.take()); got != 26 {
+	if ops, _ := w.take(); len(ops) != 26 {
+		got := len(ops)
 		t.Fatalf("coalesced to %d players, want 26 (memory bounded by resident count, not event rate)", got)
 	}
 }
@@ -427,7 +430,8 @@ func TestAReapedPlayerIsNotTombstoned(t *testing.T) {
 	w := newPlacementWriter()
 	// leave()/reap() have no clearPlacement call, so nothing is ever offered for a reaped player. The
 	// assertion is structural: a writer that saw no offer has nothing pending.
-	if got := len(w.take()); got != 0 {
+	if ops, _ := w.take(); len(ops) != 0 {
+		got := len(ops)
 		t.Fatalf("pending = %d, want 0", got)
 	}
 	// Guard the real invariant by grepping the call graph would be brittle; instead assert the one call site
@@ -444,7 +448,7 @@ func TestQuitThenRelogLeavesTheLivePlacement(t *testing.T) {
 	w.offer(placementOp{playerID: "Yo-yo", epoch: 1, clear: true})        // quit
 	w.offer(placementOp{playerID: "Yo-yo", zoneID: "darkwood", epoch: 1}) // immediate relog
 
-	ops := w.take()
+	ops, _ := w.take()
 	if len(ops) != 1 {
 		t.Fatalf("pending = %d ops, want 1 (coalesced per player)", len(ops))
 	}

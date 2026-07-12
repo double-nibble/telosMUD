@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -58,10 +59,19 @@ const placementWriteTimeout = 2 * time.Second
 // pending is keyed by player, so a burst of zone changes for one player collapses to that player's latest
 // placement. signal is a 1-slot doorbell: a full signal channel already means "there is work", so a
 // non-blocking send is sufficient and can never block a caller.
+//
+// barriers is the shutdown-barrier queue (#331). A caller (FlushPlacement) registers a channel here and the
+// drain loop closes it once it has written every op that was pending when the barrier was collected. Both
+// offer and barrier registration take mu, and the drain loop collects pending ops AND barriers under the
+// same lock, so any op offered before a barrier was registered is guaranteed written before that barrier
+// closes. Without this, a clean-logout tombstone enqueued microseconds before stopWorld cancels the world
+// context is dropped, leaving the record naming a shard that is exiting (the tell/mail oracle then reports
+// the player as hosted on a dead shard until their next login).
 type placementWriter struct {
-	mu      sync.Mutex
-	pending map[string]placementOp
-	signal  chan struct{}
+	mu       sync.Mutex
+	pending  map[string]placementOp
+	barriers []chan struct{}
+	signal   chan struct{}
 }
 
 func newPlacementWriter() *placementWriter {
@@ -83,19 +93,38 @@ func (w *placementWriter) offer(op placementOp) {
 	}
 }
 
-// take atomically removes and returns everything pending.
-func (w *placementWriter) take() []placementOp {
+// take atomically removes and returns everything pending, plus every barrier registered so far. The two are
+// taken under ONE lock so the caller can write the ops and only then close the barriers, giving the barrier
+// its guarantee: every op that was pending when the barrier was collected is written before it closes.
+func (w *placementWriter) take() ([]placementOp, []chan struct{}) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	barriers := w.barriers
+	w.barriers = nil
 	if len(w.pending) == 0 {
-		return nil
+		return nil, barriers
 	}
 	ops := make([]placementOp, 0, len(w.pending))
 	for _, op := range w.pending {
 		ops = append(ops, op)
 	}
 	w.pending = map[string]placementOp{}
-	return ops
+	return ops, barriers
+}
+
+// addBarrier registers a shutdown barrier and rings the doorbell so the drain loop wakes to collect it even
+// when nothing is pending. The drain loop closes the returned channel after writing every op collected
+// alongside it.
+func (w *placementWriter) addBarrier() chan struct{} {
+	ch := make(chan struct{})
+	w.mu.Lock()
+	w.barriers = append(w.barriers, ch)
+	w.mu.Unlock()
+	select {
+	case w.signal <- struct{}{}:
+	default:
+	}
+	return ch
 }
 
 // registerPlacement records that this player now lives in this zone on this shard. Safe to call from a zone
@@ -154,8 +183,11 @@ func (z *Zone) clearPlacement(s *session) {
 // runPlacementWriter drains pending placements off every zone goroutine, performing the blocking Redis
 // writes. Started by Shard.Run; exits with the shard's context.
 //
-// Dropping whatever is still pending at shutdown is safe: on a drain, the destination's own handoff CAS is
-// the truth, and a queued source-shard registration drained late would be epoch-fenced against it anyway.
+// Dropping whatever is still pending on a HARD stop (ctx cancelled without a barrier — a lease fence) is
+// safe for REGISTRATIONS: on a drain the destination's own handoff CAS is the truth, and a queued
+// source-shard registration drained late would be epoch-fenced against it anyway. It is NOT safe for the
+// clean-logout TOMBSTONE — a dropped clear leaves the record naming a shard that is exiting — which is why a
+// graceful shutdown calls FlushPlacement before stopWorld to drain the queue through the barrier first (#331).
 func (s *Shard) runPlacementWriter(ctx context.Context) {
 	if s.dir == nil || s.placement == nil {
 		return
@@ -165,13 +197,60 @@ func (s *Shard) runPlacementWriter(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-s.placement.signal:
-			for _, op := range s.placement.take() {
+			ops, barriers := s.placement.take()
+			for _, op := range ops {
 				if ctx.Err() != nil {
+					// Do not close the barriers: a hard-cancelled writer cannot honor the "everything before
+					// me is written" promise. FlushPlacement's ctx/dead select unblocks its caller instead.
 					return
 				}
 				s.writePlacement(ctx, op)
 			}
+			// Re-check AFTER the writes: a cancel during the LAST op's write (writePlacement returns early on a
+			// dead ctx) leaves the top-of-loop guard unreached, so without this a torn-down drain would still
+			// close the barrier and hand FlushPlacement a false success. A cancel here means at least one op may
+			// not have landed — leave the barrier for the dead-channel watch.
+			if ctx.Err() != nil {
+				return
+			}
+			for _, b := range barriers {
+				close(b) // every op collected alongside this barrier was attempted before the barrier closes
+			}
 		}
+	}
+}
+
+// FlushPlacement blocks until every placement op enqueued so far has been written, or ctx expires, or the
+// writer's run context is already cancelled (#331).
+//
+// Call it between the drain and the shutdown that cancels the world context, alongside FlushSaver. The
+// writer returns on ctx cancel WITHOUT draining its pending map, so without this barrier a clean-logout
+// tombstone enqueued last — microseconds before stopWorld — is thrown away, and the placement record keeps
+// naming a shard that is exiting. That stale row makes the tell/mail existence oracle report the player as
+// hosted on a dead shard until their next login rewrites it.
+//
+// It watches the shard's run context as well as the caller's: a lease fence can cancel worldCtx and stop the
+// writer, and without that watch the barrier's wait would stall for the caller's whole timeout on a path
+// that has nothing left to flush. A no-op without a directory (nothing is ever enqueued).
+func (s *Shard) FlushPlacement(ctx context.Context) error {
+	if s.dir == nil || s.placement == nil {
+		return nil
+	}
+	s.mu.Lock()
+	runCtx := s.runCtx
+	s.mu.Unlock()
+	var dead <-chan struct{}
+	if runCtx != nil {
+		dead = runCtx.Done()
+	}
+	barrier := s.placement.addBarrier()
+	select {
+	case <-barrier:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-dead:
+		return errors.New("placement writer stopped before the barrier completed")
 	}
 }
 
