@@ -27,14 +27,18 @@ type Locator interface {
 	// never been handed off had no placement at all: unroutable on reconnect, and refused by the tell
 	// existence oracle ("there is no player by that name"). Written OFF the zone goroutine (blocking
 	// Redis I/O), exactly like presenceJoin.
-	RegisterPlacement(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error)
+	// The `nonce` is the registering session's per-session value (#329): every register stamps it, so the
+	// record's nonce names the session that most recently became resident — the axis clearPlayerShard uses
+	// to fence a same-shard/same-epoch relog.
+	RegisterPlacement(ctx context.Context, playerID, shardID, zoneID string, epoch, nonce uint64) (bool, error)
 	// ClearPlayerShard tombstones a cleanly-logged-out player: it drops the placement's `shard` field iff
-	// the record still names this shard AT this epoch, keeping `epoch` (the handoff fence) and `zone` (the
-	// reconnect routing key). The fence makes a clear racing a fast relog a no-op (#70).
+	// the record still names this shard AT this epoch AND session nonce, keeping `epoch` (the handoff fence)
+	// and `zone` (the reconnect routing key). The fence makes a clear racing a fast relog a no-op (#70), and
+	// the nonce axis extends that to a SAME-shard relog the shard+epoch axes could not see (#329).
 	//
 	// Clean quit ONLY: never on link death (the detached session must keep resolving here for the reconnect
 	// grace) and never mid-handoff. Written OFF the zone goroutine.
-	ClearPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error)
+	ClearPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch, nonce uint64) (bool, error)
 	// PlayerEpoch reads the player's last-recorded ownership epoch from the directory so a
 	// fresh login can RESUME it (instead of restarting at 1). The directory's placement
 	// persists across logout/crash/restart, so the next cross-shard move must compute

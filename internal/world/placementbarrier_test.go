@@ -34,13 +34,13 @@ type slowClearDir struct {
 	delay time.Duration
 }
 
-func (d *slowClearDir) ClearPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error) {
+func (d *slowClearDir) ClearPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch, nonce uint64) (bool, error) {
 	select {
 	case <-time.After(d.delay):
 	case <-ctx.Done():
 		return false, ctx.Err()
 	}
-	return d.Redis.ClearPlayerShard(ctx, playerID, shardID, zoneID, epoch)
+	return d.Redis.ClearPlayerShard(ctx, playerID, shardID, zoneID, epoch, nonce)
 }
 
 // barrierShard builds a minimal shard wired to `dir` with a running placement writer, and a run context the
@@ -75,7 +75,7 @@ func TestFlushPlacementDrainsAPendingTombstone(t *testing.T) {
 	ctx := context.Background()
 
 	// A live placement to tombstone: (shard-a, midgaard, epoch 5).
-	if _, err := dir.RegisterPlacement(ctx, "Ghost", "shard-a", "midgaard", 5); err != nil {
+	if _, err := dir.RegisterPlacement(ctx, "Ghost", "shard-a", "midgaard", 5, 0); err != nil {
 		t.Fatal(err)
 	}
 	s.placement.offer(placementOp{playerID: "Ghost", zoneID: "midgaard", epoch: 5, clear: true})
@@ -150,7 +150,7 @@ func TestFlushPlacementReportsAHardCancelMidWrite(t *testing.T) {
 	dir := newBarrierDir(t, 300*time.Millisecond) // slow enough that we can cancel mid-write
 	s, cancel := barrierShard(t, dir)
 	ctx := context.Background()
-	if _, err := dir.RegisterPlacement(ctx, "Casualty", "shard-a", "keep", 3); err != nil {
+	if _, err := dir.RegisterPlacement(ctx, "Casualty", "shard-a", "keep", 3, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -287,7 +287,7 @@ func TestPlacementBarrierOrdersAfterPendingOps(t *testing.T) {
 	dir := newBarrierDir(t, 120*time.Millisecond)
 	s, _ := barrierShard(t, dir)
 	ctx := context.Background()
-	if _, err := dir.RegisterPlacement(ctx, "Straggler", "shard-a", "crypt", 9); err != nil {
+	if _, err := dir.RegisterPlacement(ctx, "Straggler", "shard-a", "crypt", 9, 0); err != nil {
 		t.Fatal(err)
 	}
 

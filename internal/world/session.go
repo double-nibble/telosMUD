@@ -3,12 +3,29 @@ package world
 import (
 	"context"
 	"log/slog"
+	"math/rand"
 	"sync/atomic"
 	"time"
 
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/metrics"
 )
+
+// newSessionNonce mints a per-session placement nonce (#329). The top-level math/rand source is auto-seeded
+// (Go 1.20+) and safe for concurrent use; a 64-bit draw makes a collision between two sessions of the same
+// player at the same epoch negligible. It is never 0 (0 is the "bare test session / no real login" sentinel),
+// so a legitimate nonce is always distinguishable from an unstamped one.
+func newSessionNonce() uint64 {
+	for {
+		//nolint:gosec // G404: the nonce is a non-security uniqueness token, not a secret — it only ever
+		// distinguishes two sessions of one player at one epoch for the tombstone fence (#329). It is never
+		// authenticated on (the handoff snapshot is separately signed), so math/rand is appropriate and avoids
+		// crypto/rand error handling on the login path.
+		if n := rand.Uint64(); n != 0 {
+			return n
+		}
+	}
+}
 
 // sessionOutBuffer is the depth of a session's outbound frame channel (server.go binds it). It absorbs a
 // burst of output while the client's writer goroutine drains it; once full, send drops (the zone never
@@ -173,6 +190,15 @@ type session struct {
 	// directory's compare-and-set can reject stale routing.
 	frozen bool
 	epoch  uint64
+
+	// nonce is a per-session value stamped into the directory placement record on every registerPlacement
+	// (#329). Two DIFFERENT sessions of the same player at the same (shard, epoch) — the same-shard relog the
+	// epoch axis cannot discriminate — differ here, so a late clean-logout tombstone carrying the prior
+	// session's nonce is fenced against the live record the relog rewrote. Generated fresh at each session
+	// creation (fresh login AND a handoff destination); it does NOT ride the handoff snapshot, because the
+	// destination re-registers with its own nonce on attach before any clear it issues could fire.
+	// Zone-goroutine-owned. 0 only for a bare test session that never went through the real login path.
+	nonce uint64
 
 	// frozenFrom is the room entity the player tried to leave when the cross-shard handoff
 	// was initiated. move() detaches the entity from its room while the handoff is in flight;

@@ -752,18 +752,33 @@ type Placement struct {
 	// before this field existed — callers fall back to ShardID.
 	ZoneID string
 	Epoch  uint64
+	// Nonce is the per-session value the last registering session stamped (#329). It is the axis that lets a
+	// clean-logout tombstone fence a same-shard/same-epoch relog. 0 on a legacy or handoff-CAS-only record
+	// that has never been through registerPlacement.
+	Nonce uint64
 }
 
 // casPlacement writes {shard, zone, epoch} only when the new epoch is strictly greater
 // than any stored epoch. This makes player placement monotonic: a stale or
 // duplicated handoff (lower-or-equal epoch) is a no-op, so it can never roll a
 // player back to a shard they already left. Returns 1 if applied, else 0.
+//
+// It DELETES the session nonce (#329). The handoff bumps the epoch onto a new shard whose destination
+// session has not yet registered, so any nonce still in the record belongs to the SOURCE session and is now
+// stale. Leaving it would make clearPlayerShard's present-only fence see a present-but-stale nonce, and a
+// destination player who quits before their register drains (the coalescing writer collapses register+clear
+// to the clear) would carry the destination nonce, mismatch the stale source nonce, and be wrongly fenced —
+// leaving a permanent stale `shard` field. Deleting it restores the genuine "no nonce yet" state the
+// present-only fence is built for: the destination's own clear then tombstones on shard+epoch, and the
+// destination's register re-stamps the real nonce. A same-shard relog (constant epoch) never runs this CAS,
+// so the #329 fence it enables is untouched.
 var casPlacement = redis.NewScript(`
 local cur = redis.call('HGET', KEYS[1], 'epoch')
 if cur and tonumber(cur) >= tonumber(ARGV[3]) then
   return 0
 end
 redis.call('HSET', KEYS[1], 'shard', ARGV[1], 'zone', ARGV[2], 'epoch', ARGV[3])
+redis.call('HDEL', KEYS[1], 'nonce')
 return 1
 `)
 
@@ -776,6 +791,12 @@ return 1
 // and a login arriving at the older epoch sees `cur > mine` and refuses. The stored epoch never
 // decreases (it is kept at the max), so the monotonic fence the handoff CAS depends on survives.
 //
+// It also stamps a per-session NONCE (ARGV[4], #329). Every register overwrites it with the registering
+// session's value, so the record's nonce always names the session that most recently became resident. That
+// is what lets clearPlayerShard fence a SAME-shard, SAME-epoch relog: a late logout carrying the prior
+// session's nonce no longer matches the record a fresh login rewrote. The nonce is written only when the
+// register applies (an epoch that loses to a newer one leaves it untouched).
+//
 // Returns 1 if applied, 0 if a newer epoch already owns the record.
 var registerPlacement = redis.NewScript(`
 local cur = redis.call('HGET', KEYS[1], 'epoch')
@@ -785,7 +806,7 @@ if cur and tonumber(cur) > mine then
 end
 local keep = mine
 if cur and tonumber(cur) > keep then keep = tonumber(cur) end
-redis.call('HSET', KEYS[1], 'shard', ARGV[1], 'zone', ARGV[2], 'epoch', keep)
+redis.call('HSET', KEYS[1], 'shard', ARGV[1], 'zone', ARGV[2], 'epoch', keep, 'nonce', ARGV[4])
 return 1
 `)
 
@@ -810,8 +831,8 @@ func (r *Redis) SetPlayerShard(ctx context.Context, playerID, shardID, zoneID st
 // which answered "there is no player by that name" for them. This is the write that fixes both.
 //
 // Blocking Redis I/O: call it OFF the zone goroutine.
-func (r *Redis) RegisterPlacement(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error) {
-	res, err := registerPlacement.Run(ctx, r.rdb, []string{r.playerKey(playerID)}, shardID, zoneID, epoch).Int()
+func (r *Redis) RegisterPlacement(ctx context.Context, playerID, shardID, zoneID string, epoch, nonce uint64) (bool, error) {
+	res, err := registerPlacement.Run(ctx, r.rdb, []string{r.playerKey(playerID)}, shardID, zoneID, epoch, nonce).Int()
 	if err != nil {
 		return false, err
 	}
@@ -819,25 +840,38 @@ func (r *Redis) RegisterPlacement(ctx context.Context, playerID, shardID, zoneID
 }
 
 // clearPlayerShard is the CLEAN-LOGOUT TOMBSTONE (#70). It removes only the `shard` field, and only when
-// that field still names the caller AT the caller's epoch — a compare-and-delete, not a blind HDEL.
+// that field still names the caller AT the caller's epoch AND session nonce — a compare-and-delete, not a
+// blind HDEL.
 //
 // The fence matters. A clear racing a concurrent re-login (the player reconnected elsewhere and their new
 // shard already registered) reads a different shard, or a newer epoch, and no-ops. So a late-draining
 // logout write can never evict a live placement.
 //
-// `epoch` and `zone` deliberately SURVIVE:
+// THE NONCE AXIS (#329) closes the one case shard+epoch could not: a SAME-shard relog resumes the SAME
+// epoch (registerPlacement accepts an equal epoch by design), so a late clear would match a live record on
+// both older axes. Each register stamps the registering session's nonce, so the relog's fresh nonce no
+// longer matches the quitting session's — the clear is fenced. The check is present-only: a record with NO
+// nonce (a handoff-CAS-only record before its destination has registered, or a legacy pre-#329 record) is
+// still clearable on shard+epoch alone. That is safe — those records have no concurrent same-shard relog to
+// protect against — and it keeps the handoff CAS (which writes no nonce) working unchanged.
+//
+// `epoch`, `zone`, and `nonce` deliberately SURVIVE the tombstone:
 //   - epoch is the monotonic fence the handoff CAS compares against. Deleting the key would let a delayed
 //     or retried SetPlayerShard from an earlier handoff find `cur == nil` and APPLY, resurrecting a stale
 //     placement.
 //   - zone is the reconnect routing key (#320). A returning player must still resolve to whoever owns the
 //     zone they logged out in.
+//   - nonce identifies the session that owned the record; keeping it is harmless (the next register
+//     overwrites it) and dropping it would only widen the present-only fence's blind spot.
 //
 // Returns 1 if the field was cleared, 0 if the fence rejected it.
 var clearPlayerShard = redis.NewScript(`
 local shard = redis.call('HGET', KEYS[1], 'shard')
 local epoch = redis.call('HGET', KEYS[1], 'epoch')
+local nonce = redis.call('HGET', KEYS[1], 'nonce')
 if shard ~= ARGV[1] then return 0 end
 if not epoch or tonumber(epoch) ~= tonumber(ARGV[3]) then return 0 end
+if nonce and nonce ~= ARGV[4] then return 0 end
 if ARGV[2] ~= '' then
   redis.call('HSET', KEYS[1], 'zone', ARGV[2])
 end
@@ -855,10 +889,14 @@ return 1
 // tombstone carry the same information the superseded registration would have. An empty zoneID leaves the
 // stored zone untouched.
 //
+// The `nonce` is the quitting session's per-session value (#329). The clear applies only if it matches the
+// record's nonce (or the record has none), so a same-shard/same-epoch relog — which rewrote the nonce — is
+// fenced out.
+//
 // Call it ONLY on a clean, player-initiated quit — never on link death, never mid-handoff. Blocking Redis
 // I/O: off the zone goroutine.
-func (r *Redis) ClearPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch uint64) (bool, error) {
-	res, err := clearPlayerShard.Run(ctx, r.rdb, []string{r.playerKey(playerID)}, shardID, zoneID, epoch).Int()
+func (r *Redis) ClearPlayerShard(ctx context.Context, playerID, shardID, zoneID string, epoch, nonce uint64) (bool, error) {
+	res, err := clearPlayerShard.Run(ctx, r.rdb, []string{r.playerKey(playerID)}, shardID, zoneID, epoch, nonce).Int()
 	if err != nil {
 		return false, err
 	}
@@ -876,7 +914,7 @@ func (r *Redis) ClearPlayerShard(ctx context.Context, playerID, shardID, zoneID 
 // A caller therefore sees ShardID == "" for an offline player. ZoneID is "" only on a legacy record written
 // before #320 added the field.
 func (r *Redis) PlayerPlacement(ctx context.Context, playerID string) (Placement, error) {
-	vals, err := r.rdb.HMGet(ctx, r.playerKey(playerID), "shard", "epoch", "zone").Result()
+	vals, err := r.rdb.HMGet(ctx, r.playerKey(playerID), "shard", "epoch", "zone", "nonce").Result()
 	if err != nil {
 		return Placement{}, err
 	}
@@ -889,7 +927,11 @@ func (r *Redis) PlayerPlacement(ctx context.Context, playerID string) (Placement
 		epoch, _ = strconv.ParseUint(s, 10, 64)
 	}
 	zoneID, _ := vals[2].(string)
-	return Placement{ShardID: shardID, ZoneID: zoneID, Epoch: epoch}, nil
+	var nonce uint64
+	if s, ok := vals[3].(string); ok {
+		nonce, _ = strconv.ParseUint(s, 10, 64)
+	}
+	return Placement{ShardID: shardID, ZoneID: zoneID, Epoch: epoch, Nonce: nonce}, nil
 }
 
 // PlayerEpoch returns the player's last-recorded ownership epoch, or found=false (with a

@@ -59,7 +59,7 @@ func TestLoginDirectoryRoutesByPlacementZone(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The record names shard-stale, but darkwood is owned by shard-b.
-	if _, err := dir.RegisterPlacement(ctx, "Wanderer", "shard-stale", "darkwood", 1); err != nil {
+	if _, err := dir.RegisterPlacement(ctx, "Wanderer", "shard-stale", "darkwood", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,7 +84,7 @@ func TestLoginDirectoryFollowsARebalancedZone(t *testing.T) {
 	if err := dir.RegisterZone(ctx, "darkwood", "shard-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dir.RegisterPlacement(ctx, "Wanderer", "shard-b", "darkwood", 1); err != nil {
+	if _, err := dir.RegisterPlacement(ctx, "Wanderer", "shard-b", "darkwood", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -166,7 +166,7 @@ func TestLoginDirectoryFallsBackWhenThePlacementZoneIsUnowned(t *testing.T) {
 		t.Fatal(err)
 	}
 	// "crypt" is recorded on the placement but leased by nobody, and shard-z is not registered either.
-	if _, err := dir.RegisterPlacement(ctx, "Lost", "shard-z", "crypt", 1); err != nil {
+	if _, err := dir.RegisterPlacement(ctx, "Lost", "shard-z", "crypt", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 

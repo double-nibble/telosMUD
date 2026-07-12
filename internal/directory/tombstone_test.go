@@ -23,10 +23,10 @@ func TestClearPlayerShardKeepsEpochAndZone(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Frodo", "world-a", "darkwood", 3); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Frodo", "world-a", "darkwood", 3, 0); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := d.ClearPlayerShard(ctx, "Frodo", "world-a", "", 3)
+	ok, err := d.ClearPlayerShard(ctx, "Frodo", "world-a", "", 3, 0)
 	if err != nil || !ok {
 		t.Fatalf("tombstone: ok=%v err=%v", ok, err)
 	}
@@ -52,10 +52,10 @@ func TestTombstonedPlayerStaysTellAddressable(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Sam", "world-a", "midgaard", 1); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Sam", "world-a", "midgaard", 1, 0); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := d.ClearPlayerShard(ctx, "Sam", "world-a", "", 1); err != nil || !ok {
+	if ok, err := d.ClearPlayerShard(ctx, "Sam", "world-a", "", 1, 0); err != nil || !ok {
 		t.Fatalf("tombstone: ok=%v err=%v", ok, err)
 	}
 
@@ -86,7 +86,7 @@ func TestTombstonePreservesTheHandoffFence(t *testing.T) {
 	if ok, err := d.SetPlayerShard(ctx, "Merry", "world-b", "darkwood", 5); err != nil || !ok {
 		t.Fatalf("seed: ok=%v err=%v", ok, err)
 	}
-	if ok, err := d.ClearPlayerShard(ctx, "Merry", "world-b", "", 5); err != nil || !ok {
+	if ok, err := d.ClearPlayerShard(ctx, "Merry", "world-b", "", 5, 0); err != nil || !ok {
 		t.Fatalf("tombstone: ok=%v err=%v", ok, err)
 	}
 
@@ -110,16 +110,16 @@ func TestTombstoneIsFencedAgainstAFastRelog(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Pippin", "world-a", "midgaard", 2); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Pippin", "world-a", "midgaard", 2, 0); err != nil {
 		t.Fatal(err)
 	}
 	// The relog lands first: the player is now live on world-b.
-	if ok, err := d.RegisterPlacement(ctx, "Pippin", "world-b", "crypt", 2); err != nil || !ok {
+	if ok, err := d.RegisterPlacement(ctx, "Pippin", "world-b", "crypt", 2, 0); err != nil || !ok {
 		t.Fatalf("relog: ok=%v err=%v", ok, err)
 	}
 
 	// world-a's queued logout tombstone drains late. It names a shard that no longer owns the record.
-	ok, err := d.ClearPlayerShard(ctx, "Pippin", "world-a", "", 2)
+	ok, err := d.ClearPlayerShard(ctx, "Pippin", "world-a", "", 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestTombstoneIsFencedAgainstAHandoff(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Gimli", "world-a", "midgaard", 1); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Gimli", "world-a", "midgaard", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 	if ok, err := d.SetPlayerShard(ctx, "Gimli", "world-b", "darkwood", 2); err != nil || !ok {
@@ -145,7 +145,7 @@ func TestTombstoneIsFencedAgainstAHandoff(t *testing.T) {
 	}
 
 	// The source shard's logout tombstone, carrying the OLD epoch, must be rejected.
-	if ok, _ := d.ClearPlayerShard(ctx, "Gimli", "world-a", "", 1); ok {
+	if ok, _ := d.ClearPlayerShard(ctx, "Gimli", "world-a", "", 1, 0); ok {
 		t.Fatal("a tombstone at a stale epoch applied — it would have orphaned a handed-off player")
 	}
 	if p, _ := d.PlayerPlacement(ctx, "Gimli"); p.ShardID != "world-b" {
@@ -156,7 +156,7 @@ func TestTombstoneIsFencedAgainstAHandoff(t *testing.T) {
 // TestTombstoneOnAnUnknownPlayerIsANoOp: no record, nothing to clear, no error.
 func TestTombstoneOnAnUnknownPlayerIsANoOp(t *testing.T) {
 	d := newTestRedis(t)
-	ok, err := d.ClearPlayerShard(context.Background(), "Ghost", "world-a", "", 1)
+	ok, err := d.ClearPlayerShard(context.Background(), "Ghost", "world-a", "", 1, 0)
 	if err != nil {
 		t.Fatalf("clearing an unknown player must not error: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestClearPlayerStillDeletesTheWholeRecord(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Boromir", "world-a", "midgaard", 1); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Boromir", "world-a", "midgaard", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.ClearPlayer(ctx, "Boromir"); err != nil {
@@ -212,50 +212,112 @@ func TestPlacementExistenceIsKeyedOnEpochNotShard(t *testing.T) {
 	}
 }
 
-// TestTombstoneFenceIsBlindToASameShardSameEpochRelog documents, deliberately, the ONE axis the fence cannot
-// see — so that nobody reads `clearPlayerShard` and assumes it protects a live placement unconditionally.
+// TestTombstoneFenceDiscriminatesASameShardSameEpochRelog is the #329 fix: the NONCE axis closes the one
+// gap shard+epoch could not see. A same-shard relog resumes the SAME epoch (registerPlacement accepts an
+// equal epoch by design; requiring `>` would make every login a no-op), so shard and epoch both match a
+// late clear. The relog's fresh session nonce is what discriminates: the record now carries the new
+// session's nonce, and the quitting session's late clear carries the OLD one, so the fence rejects it and
+// the connected player's shard field survives.
 //
-// A same-shard relog resumes the SAME epoch (registerPlacement accepts an equal epoch by design; requiring
-// `>` would make every login a no-op). So a late clear carrying that shard and that epoch matches the live
-// record on both axes, and applies.
-//
-// This is safe today only because of ORDERING outside the directory: detach offers the clear before leave()
-// removes the session, and one serial writer drains a per-player coalescing map, so a relog's registration is
-// always written after the clear. The directory cannot see any of that. Tracked in #329.
-//
-// The assertion below pins the ACTUAL behavior. If someone strengthens the fence, this test should be
-// inverted — deliberately, with #329 closed.
-func TestTombstoneFenceIsBlindToASameShardSameEpochRelog(t *testing.T) {
+// This used to be the "blind spot" test that pinned the OPPOSITE behavior (the clear applied, relying on
+// world-side single-writer ordering the directory could not see). With #329 the directory enforces it
+// unaided.
+func TestTombstoneFenceDiscriminatesASameShardSameEpochRelog(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Echo", "world-a", "midgaard", 4); err != nil {
+	// Session 1 registers with nonce 100.
+	if _, err := d.RegisterPlacement(ctx, "Echo", "world-a", "midgaard", 4, 100); err != nil {
 		t.Fatal(err)
 	}
-	// The relog: same shard, same resumed epoch.
-	if ok, err := d.RegisterPlacement(ctx, "Echo", "world-a", "midgaard", 4); err != nil || !ok {
+	// The relog: same shard, same resumed epoch, but a NEW session nonce (202). It rewrites the record's nonce.
+	if ok, err := d.RegisterPlacement(ctx, "Echo", "world-a", "midgaard", 4, 202); err != nil || !ok {
 		t.Fatalf("a same-shard relog must re-register: ok=%v err=%v", ok, err)
 	}
 
-	// The quit's late clear, carrying the same pair. The fence has nothing to discriminate on.
-	ok, err := d.ClearPlayerShard(ctx, "Echo", "world-a", "", 4)
+	// Session 1's late quit tombstone, carrying its OLD nonce (100). Same shard, same epoch — only the nonce
+	// discriminates, and it must fence this out now.
+	ok, err := d.ClearPlayerShard(ctx, "Echo", "world-a", "", 4, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("a stale same-shard/same-epoch clear evicted a live placement — the nonce fence did not hold (#329)")
+	}
+	// The live player's shard field SURVIVES: the relog is still hosted, addressable, and routable.
+	p, _ := d.PlayerPlacement(ctx, "Echo")
+	if p.ShardID != "world-a" {
+		t.Fatalf("the live relog's shard field was cleared by a stale tombstone: %+v (#329)", p)
+	}
+	if p.Epoch != 4 || p.ZoneID != "midgaard" || p.Nonce != 202 {
+		t.Fatalf("the live record was corrupted: %+v — want {world-a midgaard 4 nonce=202}", p)
+	}
+
+	// And the SAME session's clear (matching nonce 202) still works: the fence rejects only a STALE session,
+	// not the owner. This proves the nonce is a discriminator, not a blanket block.
+	if ok, err := d.ClearPlayerShard(ctx, "Echo", "world-a", "", 4, 202); err != nil || !ok {
+		t.Fatalf("the live session's own clear (matching nonce) must apply: ok=%v err=%v", ok, err)
+	}
+	if p, _ := d.PlayerPlacement(ctx, "Echo"); p.ShardID != "" {
+		t.Fatalf("the owning session's clear did not tombstone: %+v", p)
+	}
+}
+
+// TestHandoffClearsTheStaleNonceSoAnArrivalCanTombstone is the regression the distsys review caught (#329):
+// a cross-shard handoff CAS writes {shard:B, epoch:E+1} but must NOT leave the SOURCE session's stale nonce
+// in the record. If it did, an arrived player who quits before their destination register drains (the
+// coalescing placement writer collapses register+clear into just the clear) would carry the DESTINATION
+// nonce, mismatch the stale source nonce, and be wrongly fenced — leaving a permanent stale `shard` field
+// (the tell/mail oracle would keep reporting them hosted on B). Pre-#329 this interleaving tombstoned
+// correctly, so the nonce fence must not regress it.
+func TestHandoffClearsTheStaleNonceSoAnArrivalCanTombstone(t *testing.T) {
+	d := newTestRedis(t)
+	ctx := context.Background()
+
+	// Source session on world-a registered nonce 100.
+	if _, err := d.RegisterPlacement(ctx, "Mover", "world-a", "midgaard", 5, 100); err != nil {
+		t.Fatal(err)
+	}
+	// Handoff to world-b (epoch bumps). The CAS must clear the stale source nonce.
+	if ok, err := d.SetPlayerShard(ctx, "Mover", "world-b", "darkwood", 6); err != nil || !ok {
+		t.Fatalf("handoff CAS: ok=%v err=%v", ok, err)
+	}
+	if p, _ := d.PlayerPlacement(ctx, "Mover"); p.Nonce != 0 {
+		t.Fatalf("the handoff CAS left a stale nonce (%d) — an arrival's own clear would be wrongly fenced (#329)", p.Nonce)
+	}
+
+	// The destination session (nonce 200) quits before its register drained: only the clear reaches the
+	// directory, carrying 200. Against a nonce-less record it must tombstone on shard+epoch.
+	ok, err := d.ClearPlayerShard(ctx, "Mover", "world-b", "", 6, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok {
-		t.Fatal("the fence rejected a same-shard/same-epoch clear — if you strengthened it, invert this test and close #329")
+		t.Fatal("an arrived-then-quit player was wrongly fenced by a stale CAS-era nonce — permanent stale shard field (#329)")
 	}
-	// And this is what "blind" costs: a live player's shard field is gone. Harmless today (nothing routes on
-	// it, and existence is epoch-keyed), but it is not the fence that saves us.
-	p, _ := d.PlayerPlacement(ctx, "Echo")
-	if p.ShardID != "" {
-		t.Fatalf("expected the shard field to have been cleared: %+v", p)
+	if p, _ := d.PlayerPlacement(ctx, "Mover"); p.ShardID != "" {
+		t.Fatalf("the arrival's clean quit did not tombstone: %+v", p)
 	}
-	if p.Epoch != 4 || p.ZoneID != "midgaard" {
-		t.Fatalf("the clear must still be a tombstone, not a delete: %+v", p)
+}
+
+// TestTombstoneNonceFenceIsPresentOnly pins the backward-compat / handoff-CAS carve-out: a record with NO
+// nonce (a legacy pre-#329 record, or a handoff-CAS-only record whose destination has not registered yet) is
+// still clearable on shard+epoch alone. The nonce check only bites when a nonce is present. This is what
+// keeps SetPlayerShard (which writes no nonce) working and lets a rolling deploy self-heal.
+func TestTombstoneNonceFenceIsPresentOnly(t *testing.T) {
+	d := newTestRedis(t)
+	ctx := context.Background()
+
+	// A handoff-CAS write: shard+zone+epoch, no nonce field.
+	if ok, err := d.SetPlayerShard(ctx, "Legacy", "world-a", "midgaard", 3); err != nil || !ok {
+		t.Fatalf("seed: ok=%v err=%v", ok, err)
 	}
-	if _, found, _ := d.PlayerShard(ctx, "Echo"); !found {
-		t.Fatal("even a spurious tombstone must leave the player addressable")
+	// A clear carrying an arbitrary nonce must still apply — the record has no nonce to discriminate on.
+	if ok, err := d.ClearPlayerShard(ctx, "Legacy", "world-a", "", 3, 999); err != nil || !ok {
+		t.Fatalf("a nonce-less record must be clearable on shard+epoch: ok=%v err=%v", ok, err)
+	}
+	if p, _ := d.PlayerPlacement(ctx, "Legacy"); p.ShardID != "" {
+		t.Fatalf("the nonce-less record was not tombstoned: %+v", p)
 	}
 }
 
@@ -268,11 +330,11 @@ func TestTombstoneRecordsTheQuittingZone(t *testing.T) {
 	ctx := context.Background()
 
 	// The player logged in in midgaard; their walk to darkwood was never written.
-	if _, err := d.RegisterPlacement(ctx, "Rover", "world-a", "midgaard", 1); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Rover", "world-a", "midgaard", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 	// They quit in darkwood. The tombstone carries it.
-	if ok, err := d.ClearPlayerShard(ctx, "Rover", "world-a", "darkwood", 1); err != nil || !ok {
+	if ok, err := d.ClearPlayerShard(ctx, "Rover", "world-a", "darkwood", 1, 0); err != nil || !ok {
 		t.Fatalf("tombstone: ok=%v err=%v", ok, err)
 	}
 
@@ -291,10 +353,10 @@ func TestTombstoneWithNoZoneLeavesTheStoredZone(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Quiet", "world-a", "crypt", 2); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Quiet", "world-a", "crypt", 2, 0); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := d.ClearPlayerShard(ctx, "Quiet", "world-a", "", 2); err != nil || !ok {
+	if ok, err := d.ClearPlayerShard(ctx, "Quiet", "world-a", "", 2, 0); err != nil || !ok {
 		t.Fatalf("tombstone: ok=%v err=%v", ok, err)
 	}
 	if p, _ := d.PlayerPlacement(ctx, "Quiet"); p.ZoneID != "crypt" {
@@ -308,15 +370,15 @@ func TestAFencedOutTombstoneDoesNotRewriteTheZone(t *testing.T) {
 	d := newTestRedis(t)
 	ctx := context.Background()
 
-	if _, err := d.RegisterPlacement(ctx, "Racer", "world-a", "midgaard", 1); err != nil {
+	if _, err := d.RegisterPlacement(ctx, "Racer", "world-a", "midgaard", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 	// The player relogged on world-b before world-a's logout drained.
-	if ok, err := d.RegisterPlacement(ctx, "Racer", "world-b", "crypt", 1); err != nil || !ok {
+	if ok, err := d.RegisterPlacement(ctx, "Racer", "world-b", "crypt", 1, 0); err != nil || !ok {
 		t.Fatalf("relog: ok=%v err=%v", ok, err)
 	}
 	// world-a's late tombstone claims they quit in darkwood. The fence must reject it whole.
-	if ok, _ := d.ClearPlayerShard(ctx, "Racer", "world-a", "darkwood", 1); ok {
+	if ok, _ := d.ClearPlayerShard(ctx, "Racer", "world-a", "darkwood", 1, 0); ok {
 		t.Fatal("a stale tombstone applied")
 	}
 	if p, _ := d.PlayerPlacement(ctx, "Racer"); p.ShardID != "world-b" || p.ZoneID != "crypt" {
