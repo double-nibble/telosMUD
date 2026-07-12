@@ -41,6 +41,20 @@ message PrepareResponse {
 
 message CommitRequest {
   string handoff_token = 1;
+  // sig authenticates Commit with the SAME shared handoff keypair Prepare/AdoptZone use (#314). The
+  // handoff_token is derived deterministically from (character, epoch) — both public — so it is NOT a
+  // secret and cannot itself gate this RPC. sig is an Ed25519 signature over a canonical digest binding
+  // the token AND to_shard_id under a Commit-specific domain separator (internal/world/handoffsig.go),
+  // verified when the destination has a handoff verify key. Empty when signing is unconfigured (dev/test),
+  // where the #260 keyless refusal governs instead.
+  bytes sig = 2;
+  // to_shard_id is the destination shard this Commit is addressed to, bound by sig and checked against the
+  // receiver's own shard id (exactly as AdoptZone.to_shard_id, #314). It closes a same-token cross-shard
+  // replay: two concurrent same-epoch handoffs of one character (a split-brain race) derive the IDENTICAL
+  // token, so a signed Commit/Abort captured off the plaintext wire for destination D would otherwise be
+  // replayable against a DIFFERENT destination D2 holding a live pending under the same token. Binding the
+  // destination makes a signature minted for D worthless at D2.
+  string to_shard_id = 3;
 }
 
 message CommitResponse {}
@@ -48,6 +62,15 @@ message CommitResponse {}
 message AbortRequest {
   string handoff_token = 1;
   string reason = 2;
+  // sig authenticates Abort exactly as CommitRequest.sig does (#314): an Ed25519 signature over the token
+  // AND to_shard_id under an Abort-specific domain separator. Without it, anyone with network reach to a
+  // world port could compute the guessable token and discard a pending handoff mid-flight (a targeted
+  // disruption). reason is a log-only string and is intentionally NOT bound — rewriting it authorizes
+  // nothing.
+  bytes sig = 3;
+  // to_shard_id binds the destination shard this Abort is addressed to (see CommitRequest.to_shard_id) so a
+  // signed Abort for destination D cannot be replayed against a concurrent same-token pending at D2.
+  string to_shard_id = 4;
 }
 
 message AbortResponse {}

@@ -29,7 +29,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	"github.com/double-nibble/telosmud/internal/commbus"
@@ -1037,7 +1039,28 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			// deadline (e.g. SetPlayerShard was what timed out), which would cancel the
 			// Abort before it could discard the destination's pending entity.
 			abortCtx, ac := context.WithTimeout(context.Background(), 2*time.Second)
-			_, _ = client.Abort(abortCtx, &handoffv1.AbortRequest{HandoffToken: resp.GetHandoffToken(), Reason: "directory conflict"})
+			// Sign the rollback so a key-enforcing destination accepts it (#314); an unconfigured source signs
+			// nil, which only a keyless destination accepts — the same seam as the Prepare signature above.
+			// Bind the rollback to the destination SHARD it is addressed to (#314) so a signature captured off
+			// the plaintext wire cannot be replayed against a concurrent same-token pending at another shard.
+			abortReq := &handoffv1.AbortRequest{
+				HandoffToken: resp.GetHandoffToken(),
+				Reason:       "directory conflict",
+				ToShardId:    destShardID,
+			}
+			abortReq.Sig = signHandoffToken(s.handoffSignKey, handoffAbortDomain, abortReq.GetHandoffToken(), destShardID)
+			if _, aerr := client.Abort(abortCtx, abortReq); aerr != nil {
+				// Best-effort: the destination's pending self-heals via pendingTTL (60s) regardless. But log the
+				// error so the rejection is not silent — in particular a PermissionDenied here means a version/key
+				// skew (#314): a new keyed destination rejected an unsigned rollback from an old-code source
+				// mid-rolling-upgrade. That is an actionable operator signal, not the usual network/deadline miss.
+				if status.Code(aerr) == codes.PermissionDenied {
+					log.Warn("rollback Abort rejected by destination (auth) — pending will self-heal via pendingTTL; "+
+						"check handoff key/version skew during a rolling upgrade", "err", aerr)
+				} else {
+					log.Debug("rollback Abort did not reach destination; pending self-heals via pendingTTL", "err", aerr)
+				}
+			}
 			ac()
 			fail("ownership conflict")
 			return

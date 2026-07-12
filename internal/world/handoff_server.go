@@ -113,17 +113,41 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 	}, nil
 }
 
+// authTokenRPC gates Commit/Abort exactly as Prepare gates itself (#314): a KEYED destination requires a
+// valid signature over the token under the operation's domain separator and rejects otherwise; a KEYLESS
+// destination is governed by the #260 refusal (fail closed unless the operator opted into insecure
+// handoffs). It returns a gRPC status error to return verbatim, or nil to proceed. Runs BEFORE any state
+// work, so a forged Abort can never reach the pending-discard path.
+func (h *handoffServer) authTokenRPC(domain, token, toShardID string, sig []byte) error {
+	if h.shard.handoffVerifyKey != nil {
+		if err := verifyHandoffToken(h.shard.handoffVerifyKey, domain, token, toShardID, h.shard.shardID, sig); err != nil {
+			return status.Error(codes.PermissionDenied, "handoff authentication failed")
+		}
+		return nil
+	}
+	return h.shard.keylessHandoffRefused()
+}
+
 // Commit is an idempotent no-op: the destination self-commits when the gate's stream
-// binds the pending player (see Zone.attach). Kept for the explicit-lifecycle path.
-func (h *handoffServer) Commit(_ context.Context, _ *handoffv1.CommitRequest) (*handoffv1.CommitResponse, error) {
+// binds the pending player (see Zone.attach). Kept for the explicit-lifecycle path. Authenticated (#314)
+// so the surface is uniform — every mutating handoff RPC proves cluster-key possession — even though the
+// no-op body has nothing to protect today; a future Commit that gains real behavior inherits the gate.
+func (h *handoffServer) Commit(_ context.Context, req *handoffv1.CommitRequest) (*handoffv1.CommitResponse, error) {
+	if err := h.authTokenRPC(handoffCommitDomain, req.GetHandoffToken(), req.GetToShardId(), req.GetSig()); err != nil {
+		return nil, err
+	}
 	return &handoffv1.CommitResponse{}, nil
 }
 
 // Abort discards a pending player whose handoff was cancelled by the source. The token
 // index names the zone that prepared it; absent that, broadcast to every hosted zone
-// (the matching one discards, the rest no-op).
+// (the matching one discards, the rest no-op). Authenticated (#314): before this, the guessable token was
+// the only credential, so anyone with network reach could discard a pending mid-handoff.
 func (h *handoffServer) Abort(_ context.Context, req *handoffv1.AbortRequest) (*handoffv1.AbortResponse, error) {
 	token := req.GetHandoffToken()
+	if err := h.authTokenRPC(handoffAbortDomain, token, req.GetToShardId(), req.GetSig()); err != nil {
+		return nil, err
+	}
 	if z := h.shard.zoneForToken(token); z != nil {
 		z.post(abortPendingMsg{token: token})
 	} else {
