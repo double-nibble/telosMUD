@@ -37,6 +37,7 @@ type helpDef struct {
 	keywords []string // lower-cased lookup words a player types after `help`; ref leaf is implicit
 	body     string
 	seeAlso  []string
+	minRank  int // staff-only visibility gate (#351): min trust rank to see; 0 = world-readable
 }
 
 // buildHelpDef maps a content HelpDTO onto the runtime helpDef. It lower-cases the declared keywords and adds
@@ -45,7 +46,7 @@ type helpDef struct {
 func buildHelpDef(d content.HelpDTO) *helpDef {
 	def := &helpDef{
 		ref: d.Ref, title: d.Title, category: d.Category, body: d.Body,
-		seeAlso: append([]string(nil), d.SeeAlso...),
+		seeAlso: append([]string(nil), d.SeeAlso...), minRank: d.MinRank,
 	}
 	seen := map[string]bool{}
 	add := func(w string) {
@@ -82,26 +83,59 @@ func (d *helpDef) indexName() string {
 	return helpRefLeaf(d.ref)
 }
 
-// resolveHelp resolves a typed `help <topic>` argument to a single topic, or nil. Precedence (deterministic,
-// ties broken by ref so the result never depends on map iteration order):
+// helpTopicVisible reports whether actor s may see topic d — the shared staff-only gate (#351) both the index
+// and a direct `help <topic>` lookup apply, mirroring commandVisible for verbs. A topic with minRank == 0 is
+// world-readable; a gated topic is visible only at or above its rank (the actor's account tier resolved through
+// the zone's content ladder). Filtering a gated topic OUT of resolveHelp makes a below-rank lookup fall through
+// to the SAME "There is no help on ..." path as a nonexistent topic — the topic's existence never leaks.
+func (z *Zone) helpTopicVisible(d *helpDef, s *session) bool {
+	if d.minRank <= 0 {
+		return true
+	}
+	return z.trustLadder().rank(s.tier) >= d.minRank
+}
+
+// resolveHelp resolves a typed `help <topic>` argument to a single topic VISIBLE to actor s, or nil. Precedence
+// (deterministic, ties broken by ref so the result never depends on map iteration order):
 //
 //  1. an exact REF match ("help:combat");
 //  2. an exact KEYWORD match (a declared keyword or the implicit ref leaf);
 //  3. a keyword PREFIX match ("comb" -> combat).
 //
-// The scan is over the (small) topic table on the zone goroutine — no allocation beyond the match set,
-// bounded regardless of input. An empty argument returns nil (the caller renders the index instead).
-func (z *Zone) resolveHelp(arg string) *helpDef {
+// A topic the actor may not see (a staff-only topic below their rank, #351) is treated as absent at EVERY
+// precedence tier — even an exact ref match — so a mortal's lookup falls through to the same "no help" path as
+// an unknown topic (no existence leak). The scan is over the (small) topic table on the zone goroutine — no
+// allocation beyond the match set, bounded regardless of input. An empty argument returns nil (the caller
+// renders the index instead).
+func (z *Zone) resolveHelp(s *session, arg string) *helpDef {
+	return z.resolveHelpFiltered(arg, func(d *helpDef) bool { return z.helpTopicVisible(d, s) })
+}
+
+// resolveHelpUnfiltered resolves an argument RANK-BLIND (ignoring the staff-only gate), used only to detect
+// whether a token NAMES a topic at all — the see_also filter (#351) needs to tell "matches a gated topic I
+// must hide" from "matches nothing / free-form text". It must never be used to RENDER a topic (that would
+// bypass the gate); the sole caller checks helpTopicVisible on the result before acting.
+func (z *Zone) resolveHelpUnfiltered(arg string) *helpDef {
+	return z.resolveHelpFiltered(arg, func(*helpDef) bool { return true })
+}
+
+// resolveHelpFiltered is the shared resolution core: it applies the same ref/keyword/prefix precedence for
+// any `visible` predicate, so the main lookup (visibility-gated) and the see_also existence probe (rank-blind)
+// share one implementation. A def for which visible() is false is treated as ABSENT in every match bucket.
+func (z *Zone) resolveHelpFiltered(arg string, visible func(*helpDef) bool) *helpDef {
 	q := strings.ToLower(strings.TrimSpace(arg))
 	if q == "" {
 		return nil
 	}
 	table := z.helpDefs().table()
-	if d, ok := table[q]; ok { // exact ref
+	if d, ok := table[q]; ok && visible(d) { // exact ref
 		return d
 	}
 	var exact, prefix []*helpDef
 	for _, d := range table {
+		if !visible(d) {
+			continue // filtered out (gated topic below the viewer's rank): invisible in every match bucket
+		}
 		// Scan ALL of a def's keywords before bucketing so an exact match always beats a prefix match,
 		// independent of keyword order within the def (a `["combatant","combat"]` def still classifies as
 		// exact for query "combat", not prefix).
@@ -131,6 +165,34 @@ func (z *Zone) resolveHelp(arg string) *helpDef {
 	return nil
 }
 
+// visibleSeeAlso filters a topic's see_also cross-references to those the viewer may follow (#351). An entry
+// that resolves ONLY to a gated topic the viewer cannot see is DROPPED — otherwise a world-readable topic
+// would disclose a staff-only topic's existence and its exact lookup keyword through "See also: staff",
+// bypassing the same gate resolveHelp enforces. An entry naming a VISIBLE topic, or matching no topic at all
+// (free-form text / a dangling ref), is kept unchanged. Returns the input slice untouched when nothing is
+// dropped (the common case), so a topic with no gated cross-reference allocates nothing.
+func (z *Zone) visibleSeeAlso(s *session, seeAlso []string) []string {
+	// First pass: is any entry a gated topic? Avoid allocating in the common (no-gated-reference) case.
+	drop := false
+	for _, ref := range seeAlso {
+		if d := z.resolveHelpUnfiltered(ref); d != nil && !z.helpTopicVisible(d, s) {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return seeAlso
+	}
+	out := make([]string, 0, len(seeAlso))
+	for _, ref := range seeAlso {
+		if d := z.resolveHelpUnfiltered(ref); d != nil && !z.helpTopicVisible(d, s) {
+			continue // names a topic this viewer may not see: dropping it closes the existence leak
+		}
+		out = append(out, ref)
+	}
+	return out
+}
+
 // smallestByRef returns the def with the lexicographically smallest ref, so a multi-match resolves
 // deterministically (map iteration order is random in Go).
 func smallestByRef(defs []*helpDef) *helpDef {
@@ -153,8 +215,8 @@ func cmdHelp(c *Context) error {
 		c.Send(c.z.renderHelpIndex(c.s))
 		return nil
 	}
-	if def := c.z.resolveHelp(arg); def != nil {
-		c.Send(renderHelpTopic(def))
+	if def := c.z.resolveHelp(c.s, arg); def != nil {
+		c.Send(c.z.renderHelpTopic(c.s, def))
 		return nil
 	}
 	if entry, ok := c.z.commandHelpEntry(c.s, arg); ok {
@@ -174,10 +236,15 @@ func (z *Zone) renderHelpIndex(s *session) string {
 	b.WriteString(colorize("Help", "FG_CYAN"))
 	b.WriteString("\n")
 
-	// Content topics, grouped by category (uncategorized => "General").
+	// Content topics, grouped by category (uncategorized => "General"). A staff-only topic (#351) the actor
+	// cannot see is omitted here exactly as it is unresolvable via `help <topic>` — the same visibility gate
+	// commandVisible applies to verbs, so the index never lists a topic a direct lookup would deny.
 	if topics := z.helpDefs().table(); len(topics) > 0 {
 		byCat := map[string][]*helpDef{}
 		for _, d := range topics {
+			if !z.helpTopicVisible(d, s) {
+				continue
+			}
 			cat := d.category
 			if cat == "" {
 				cat = "General"
@@ -215,10 +282,12 @@ func (z *Zone) renderHelpIndex(s *session) string {
 	return b.String()
 }
 
-// renderHelpTopic renders one topic: its title (falling back to the ref), an inline category tag, the body
-// text, and a "see also" line. The body is TRUSTED content and may carry engine {{TOKEN}} color markup —
-// it is not a player-supplied string, so it flows through the same color layer as any other content text.
-func renderHelpTopic(d *helpDef) string {
+// renderHelpTopic renders one topic for viewer s: its title (falling back to the ref), an inline category tag,
+// the body text, and a "see also" line filtered to the cross-references the viewer may follow. The body is
+// TRUSTED content and may carry engine {{TOKEN}} color markup — it is not a player-supplied string, so it flows
+// through the same color layer as any other content text. The see_also filter (visibleSeeAlso) is what keeps a
+// world-readable topic from disclosing a staff-only topic's existence via its cross-references (#351).
+func (z *Zone) renderHelpTopic(s *session, d *helpDef) string {
 	var b strings.Builder
 	title := d.title
 	if title == "" {
@@ -233,11 +302,11 @@ func renderHelpTopic(d *helpDef) string {
 		b.WriteString("\n")
 		b.WriteString(d.body)
 	}
-	if len(d.seeAlso) > 0 {
+	if seeAlso := z.visibleSeeAlso(s, d.seeAlso); len(seeAlso) > 0 {
 		b.WriteString("\n\n")
 		b.WriteString(colorize("See also:", "FG_YELLOW"))
 		b.WriteString(" ")
-		b.WriteString(strings.Join(d.seeAlso, ", "))
+		b.WriteString(strings.Join(seeAlso, ", "))
 	}
 	return b.String()
 }

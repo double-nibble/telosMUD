@@ -553,6 +553,7 @@ type helpBody struct {
 	Keywords []string `json:"keywords,omitempty"`
 	Body     string   `json:"body,omitempty"`
 	SeeAlso  []string `json:"see_also,omitempty"`
+	MinRank  int      `json:"min_rank,omitempty"` // staff-only visibility gate (#351); 0 = world-readable
 }
 
 // displayDefBody is the JSONB-tail shape for a display_defs row: the Lua render body, everything but the
@@ -1192,7 +1193,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				return fmt.Errorf("store: help_def %s body: %w", hd.Ref, err)
 			}
 			hd.Title, hd.Category, hd.Keywords = b.Title, b.Category, b.Keywords
-			hd.Body, hd.SeeAlso = b.Body, b.SeeAlso
+			hd.Body, hd.SeeAlso, hd.MinRank = b.Body, b.SeeAlso, b.MinRank
 		}
 		pack(pk).HelpDefs = append(pack(pk).HelpDefs, hd)
 	}

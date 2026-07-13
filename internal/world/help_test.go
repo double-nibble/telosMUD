@@ -96,6 +96,78 @@ func TestHelpStaffVerbHiddenFromMortal(t *testing.T) {
 	}
 }
 
+// TestHelpTopicMinRankHiddenFromMortal: a content help TOPIC gated by min_rank (#351) is invisible to a mortal
+// — absent from the index AND unresolvable by ref, keyword, and prefix, each falling through to the same
+// "no help" path as an unknown topic (no existence leak) — but fully visible to a staff actor at/above the rank.
+func TestHelpTopicMinRankHiddenFromMortal(t *testing.T) {
+	e := newCmdEnv(t)
+	// A staff-only topic: distinctive title/category/body/keyword so any leak is unmistakable, and a keyword
+	// whose PREFIX ("wizhelp") also tests the prefix bucket is gated out, not just the exact match.
+	e.z.helpDefs().register("help:wizsecret", buildHelpDef(content.HelpDTO{
+		Ref: "help:wizsecret", Title: "Wiz Secret", Category: "Staff",
+		Keywords: []string{"wizsecret", "wizhelp"}, Body: "SEKRIT-STAFF-ONLY-TEXT", MinRank: rankStaff,
+	}))
+
+	// --- A mortal (tier "" => rank 0) must see nothing of it. ---
+	idx, _ := e.run("help")
+	for _, leak := range []string{"Wiz Secret", "Staff", "wizsecret"} {
+		if has(idx, leak) {
+			t.Errorf("mortal help index leaked gated topic (%q):\n%s", leak, strings.Join(idx, "\n"))
+		}
+	}
+	for _, arg := range []string{"wizsecret", "wizhelp", "wiz", "help:wizsecret"} { // exact ref, exact kw, prefix
+		out, _ := e.run("help " + arg)
+		if has(out, "SEKRIT-STAFF-ONLY-TEXT") {
+			t.Errorf("mortal help %q leaked gated topic body:\n%s", arg, strings.Join(out, "\n"))
+		}
+		if !has(out, "There is no help on") {
+			t.Errorf("mortal help %q should fall through to no-help, got:\n%s", arg, strings.Join(out, "\n"))
+		}
+	}
+
+	// --- A staff actor (builder rank 20 >= rankStaff) sees it in the index and by lookup. ---
+	e.actor.tier = tierBuilder
+	idx, _ = e.run("help")
+	if !has(idx, "Wiz Secret") {
+		t.Errorf("staff help index should list the gated topic:\n%s", strings.Join(idx, "\n"))
+	}
+	out, _ := e.run("help wizsecret")
+	if !has(out, "SEKRIT-STAFF-ONLY-TEXT") {
+		t.Errorf("staff help wizsecret should show the body:\n%s", strings.Join(out, "\n"))
+	}
+}
+
+// TestHelpSeeAlsoDoesNotLeakGatedTopic: a WORLD-READABLE topic whose see_also references a STAFF-ONLY topic
+// must not disclose that topic's existence/keyword to a mortal — the see_also entry is dropped for a mortal
+// and shown to staff (#351, the cross-reference leak vector).
+func TestHelpSeeAlsoDoesNotLeakGatedTopic(t *testing.T) {
+	e := newCmdEnv(t)
+	e.z.helpDefs().register("help:wizsecret", buildHelpDef(content.HelpDTO{
+		Ref: "help:wizsecret", Title: "Wiz Secret", Keywords: []string{"wizsecret"}, Body: "SEKRIT", MinRank: rankStaff,
+	}))
+	// A public topic that (foolishly) cross-links the gated one AND a real visible topic.
+	e.z.helpDefs().register("help:pub", buildHelpDef(content.HelpDTO{
+		Ref: "help:pub", Title: "Public", Keywords: []string{"pubtopic"}, Body: "public body",
+		SeeAlso: []string{"wizsecret", "combat"},
+	}))
+
+	// Mortal: the gated cross-reference is dropped; the visible one ("combat") stays.
+	out, _ := e.run("help pubtopic")
+	if has(out, "wizsecret") {
+		t.Errorf("mortal help pubtopic leaked a gated see_also reference:\n%s", strings.Join(out, "\n"))
+	}
+	if !has(out, "combat") {
+		t.Errorf("mortal help pubtopic dropped a VISIBLE see_also reference:\n%s", strings.Join(out, "\n"))
+	}
+
+	// Staff: both cross-references show.
+	e.actor.tier = tierBuilder
+	out, _ = e.run("help pubtopic")
+	if !has(out, "wizsecret") || !has(out, "combat") {
+		t.Errorf("staff help pubtopic should show both see_also references:\n%s", strings.Join(out, "\n"))
+	}
+}
+
 // TestCommandVisible: the shared visibility predicate hides CmdHidden and above-rank staff verbs, and passes
 // an ordinary mortal verb.
 func TestCommandVisible(t *testing.T) {
@@ -119,7 +191,7 @@ func TestResolveHelpDeterministic(t *testing.T) {
 	e.z.helpDefs().register("help:aaa", buildHelpDef(content.HelpDTO{Ref: "help:aaa", Keywords: []string{"shared"}}))
 	e.z.helpDefs().register("help:bbb", buildHelpDef(content.HelpDTO{Ref: "help:bbb", Keywords: []string{"shared"}}))
 	for i := 0; i < 20; i++ {
-		if def := e.z.resolveHelp("shared"); def == nil || def.ref != "help:aaa" {
+		if def := e.z.resolveHelp(e.actor, "shared"); def == nil || def.ref != "help:aaa" {
 			t.Fatalf("resolveHelp(shared) = %v, want help:aaa every time", def)
 		}
 	}
@@ -135,7 +207,7 @@ func TestResolveHelpExactBeatsPrefix(t *testing.T) {
 	e.z.helpDefs().register("help:zzexact", buildHelpDef(content.HelpDTO{Ref: "help:zzexact", Keywords: []string{"combatant", "combatx"}}))
 	// A def whose prefix keyword ("combatant") is listed BEFORE its exact keyword ("combatx"): querying the
 	// exact token must still classify it as exact and return it, not the pure-prefix def.
-	if def := e.z.resolveHelp("combatx"); def == nil || def.ref != "help:zzexact" {
+	if def := e.z.resolveHelp(e.actor, "combatx"); def == nil || def.ref != "help:zzexact" {
 		t.Fatalf("resolveHelp(combatx) = %v, want help:zzexact (exact must beat prefix)", def)
 	}
 }

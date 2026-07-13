@@ -171,6 +171,18 @@ type Pack struct {
 // types after `help`; the ref's own leaf token is an implicit keyword, like a recipe alias). Category groups
 // it in the index; Body is the help text (may carry engine {{TOKEN}} color markup); SeeAlso lists related
 // topic refs/keywords. Pure CONTENT — a builder authors these; the engine renders them.
+//
+// MinRank (#351) is the optional STAFF-ONLY visibility gate: a topic with MinRank > 0 is visible only to an
+// actor whose trust rank (the content ladder, #29) is at least MinRank — invisible in the index AND in a
+// direct `help <topic>` lookup for anyone below it (which falls through to the same "no help" path as an
+// unknown topic, so a gated topic's existence never leaks). 0 (the default/omitted) is a world-readable
+// topic — the historical behavior, now a conscious contract. It mirrors Command.MinRank so a pack can
+// document wiz commands in a topic without leaking the text to mortals.
+//
+// This gate is deliberately fail-OPEN (unlike the reserved capability flags, which fail closed): a dropped/
+// zeroed MinRank decodes to 0 = world-readable, so a lost field on a stale reload makes a staff topic VISIBLE,
+// never the reverse. That is acceptable because the impact ceiling is disclosure of staff DOCUMENTATION text,
+// not a capability — a gated topic protects no power, so an accidental un-gate is a text leak, not privilege.
 type HelpDTO struct {
 	Ref      string   `json:"ref" yaml:"ref"`
 	Title    string   `json:"title,omitempty" yaml:"title,omitempty"`
@@ -178,6 +190,7 @@ type HelpDTO struct {
 	Keywords []string `json:"keywords,omitempty" yaml:"keywords,omitempty"` // words a player types after `help`; ref leaf is implicit
 	Body     string   `json:"body,omitempty" yaml:"body,omitempty"`
 	SeeAlso  []string `json:"see_also,omitempty" yaml:"see_also,omitempty"` // related topic refs/keywords
+	MinRank  int      `json:"min_rank,omitempty" yaml:"min_rank,omitempty"` // staff-only gate (#351): min trust rank to see; 0 = world-readable
 }
 
 // DisplayDefDTO is one content-defined display template: a surface name and the Lua render body. The body runs
