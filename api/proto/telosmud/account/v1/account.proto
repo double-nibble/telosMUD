@@ -193,4 +193,11 @@ message IssueSessionAssertionRequest {
 }
 message IssueSessionAssertionResponse {
   string assertion = 1; // the signed token, or "" when signing is not configured
+  // manage_tiers is the resolved "may this actor change trust tiers" capability (#369): the actor's tier
+  // grants the admin/manage-tiers flag per the content ladder. The gate reads it as a cheap LOCAL visibility
+  // gate for its reserved staff verbs (promote/demote) — a non-staff actor never sees them (they fall through
+  // to the world's "Huh?"). It is DEFENSE-IN-DEPTH VISIBILITY ONLY: SetAccountTier stays the authoritative
+  // check, so a stale/spoofed bit that reads too high still hits the service's authoritative refusal, and one
+  // that reads too low just yields "Huh?" (fail-safe). It rides alongside the (opaque) assertion, not inside it.
+  bool manage_tiers = 2;
 }

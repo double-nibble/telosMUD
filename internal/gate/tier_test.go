@@ -35,10 +35,11 @@ func (f *tierFakeAccount) SetAccountTier(_ context.Context, actor, target, tier 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func TestHandleTierCommand(t *testing.T) {
+	// These cases exercise the STAFF path (canManageTiers=true); the mortal-visibility gate has its own test.
 	run := func(ac AccountClient, line string) (bool, string) {
 		var out bytes.Buffer
 		tc := telnet.NewReadWriter(&bytes.Buffer{}, &out)
-		handled := handleTierCommand(context.Background(), tc, ac, "acct-me", line, discardLogger())
+		handled := handleTierCommand(context.Background(), tc, ac, "acct-me", true, line, discardLogger())
 		return handled, out.String()
 	}
 
@@ -127,8 +128,41 @@ func TestHandleTierCommand(t *testing.T) {
 	// service's rejection): actor is passed through unchanged and the service is still called.
 	var out2 bytes.Buffer
 	faEmpty := &tierFakeAccount{ok: false, reason: "not authorized"}
-	handleTierCommand(context.Background(), telnet.NewReadWriter(&bytes.Buffer{}, &out2), faEmpty, "", "promote Bob admin", discardLogger())
+	handleTierCommand(context.Background(), telnet.NewReadWriter(&bytes.Buffer{}, &out2), faEmpty, "", true, "promote Bob admin", discardLogger())
 	if faEmpty.called != 1 || faEmpty.gotActor != "" {
 		t.Fatalf("empty actor must be forwarded verbatim (never synthesized): gotActor=%q calls=%d", faEmpty.gotActor, faEmpty.called)
+	}
+}
+
+// TestHandleTierCommandVisibilityGate (#369) proves the wiz-command posture: for a NON-staff actor
+// (canManageTiers=false), promote/demote are indistinguishable from an unknown command — NOT intercepted
+// (so they fall through to the world's "Huh?"), with NO usage hint, NO refusal message, and crucially NO
+// account-service round-trip (the existence never leaks, and a mortal can't amplify RPCs by probing).
+func TestHandleTierCommandVisibilityGate(t *testing.T) {
+	runMortal := func(line string) (bool, string, int) {
+		var out bytes.Buffer
+		fa := &tierFakeAccount{ok: true, oldTier: "player", appliedTier: "admin"} // would succeed IF called
+		tc := telnet.NewReadWriter(&bytes.Buffer{}, &out)
+		handled := handleTierCommand(context.Background(), tc, fa, "acct-mortal", false, line, discardLogger())
+		return handled, out.String(), fa.called
+	}
+
+	// A well-formed promote/demote, and a bad-arity one, all fall through silently for a mortal.
+	for _, line := range []string{"promote Bob admin", "demote Bob", "promote", "demote Bob builder extra"} {
+		handled, out, called := runMortal(line)
+		if handled {
+			t.Errorf("%q: a mortal's tier verb must NOT be intercepted (must fall through to the world)", line)
+		}
+		if out != "" {
+			t.Errorf("%q: a mortal must get NO gate output (no usage/refusal leak), got %q", line, out)
+		}
+		if called != 0 {
+			t.Errorf("%q: a mortal's attempt must NOT reach the account service (no existence leak / RPC probe), calls=%d", line, called)
+		}
+	}
+
+	// Case-insensitive: `PROMOTE` is gated the same as `promote` (the verb match lower-cases first).
+	if handled, _, _ := runMortal("PROMOTE Bob admin"); handled {
+		t.Error("`PROMOTE` (upper-case) must also be invisible to a mortal")
 	}
 }

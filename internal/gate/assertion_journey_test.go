@@ -31,11 +31,12 @@ func (f *signingFakeAccount) PollDeviceAuth(context.Context, string) (string, st
 	return "authed", "acct-1", []CharacterInfo{{ID: "c1", Name: f.char}}, nil
 }
 
-func (f *signingFakeAccount) IssueSessionAssertion(_ context.Context, account, character, session string) (string, error) {
-	return assertion.Sign(f.priv, assertion.Claims{
+func (f *signingFakeAccount) IssueSessionAssertion(_ context.Context, account, character, session string) (string, bool, error) {
+	tok, err := assertion.Sign(f.priv, assertion.Claims{
 		Account: account, Character: character, Session: session,
 		Expires: time.Now().Add(time.Minute).Unix(),
 	})
+	return tok, false, err
 }
 
 // TestSessionAssertionAcceptedByWorld: a valid signed assertion is verified by the shard and the player

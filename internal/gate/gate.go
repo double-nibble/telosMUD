@@ -377,10 +377,19 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 	// in every Attach and the world verifies it offline. Empty when auth is not configured (the stub returns
 	// "" and the world skips verification — dev / pre-14.3). Issued ONCE here so a re-dial reuses the same
 	// token (stable like the session id), within its short TTL.
+	// canManageTiers (#369) rides back with the assertion: the account service resolves whether this actor's
+	// tier grants the manage-tiers capability, and the gate uses it as a LOCAL visibility gate for its reserved
+	// staff verbs (promote/demote) so a mortal never sees them. Defaults false (the stub / dev-autoauth path,
+	// where those verbs are refused anyway) — so they stay invisible there too. Resolved ONCE per login and
+	// cached for the connection, exactly like the signed tier: a mid-session promote/demote of THIS actor takes
+	// effect on their next login. That staleness is harmless — it is visibility-only, and SetAccountTier stays
+	// authoritative, so a stale-high bit only shows the verb (the service still refuses) and a stale-low bit
+	// only hides it (the actor relogs to use it).
 	var assertion string
+	var canManageTiers bool
 	if s.accountConfigured && account != "" { // account=="" is the stub / dev-autoauth path: no assertion
 		actx, acancel := context.WithTimeout(ctx, 5*time.Second)
-		tok, err := s.account.IssueSessionAssertion(actx, account, name, sess.id)
+		tok, manageTiers, err := s.account.IssueSessionAssertion(actx, account, name, sess.id)
 		acancel()
 		if err != nil {
 			log.Warn("issue session assertion failed", "err", err)
@@ -388,6 +397,7 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 			return
 		}
 		assertion = tok
+		canManageTiers = manageTiers
 	}
 
 	// --- restore the persisted terminal color preference (#23): color is an EDGE concern, so the gate reads
@@ -518,8 +528,11 @@ func (s *Server) handle(ctx context.Context, nc net.Conn, encrypted bool) {
 				continue
 			}
 			// promote/demote (#27): change an account's trust tier via the account service (authz enforced
-			// there). Edge-local like color, since the account client lives at the gate.
-			if handleTierCommand(ctx, tc, s.account, account, line, log) {
+			// there). Edge-local like color, since the account client lives at the gate. canManageTiers (#369)
+			// is the LOCAL visibility gate: a non-staff actor's promote/demote is NOT intercepted, so it falls
+			// through to the world and returns the same "Huh?" as any unknown verb (no usage/refusal leak, no
+			// account-service round-trip). The account service stays authoritative for a staff actor's attempt.
+			if handleTierCommand(ctx, tc, s.account, account, canManageTiers, line, log) {
 				continue
 			}
 			lines <- line

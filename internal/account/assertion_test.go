@@ -70,6 +70,60 @@ func TestIssueSessionAssertionCarriesTier(t *testing.T) {
 	}
 }
 
+// TestIssueSessionAssertionManageTiersBit (#369): the resolved manage-tiers capability rides back with the
+// assertion so the gate can locally gate staff-verb (promote/demote) visibility. An admin (grants FlagAdmin
+// per the default ladder) reports true; a player reports false; an unknown account fails safe to player →
+// false. It is resolved even WITHOUT a signing key (a signing-less deployment's gate still needs the bit).
+func TestIssueSessionAssertionManageTiersBit(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := newFakeStore()
+	fs.tiers["acct-admin"] = "admin"
+	fs.tiers["acct-player"] = "player"
+
+	cases := []struct {
+		acct   string
+		signed bool
+		want   bool
+	}{
+		{"acct-admin", true, true},
+		{"acct-player", true, false},
+		{"acct-admin", false, true}, // no signing key: the bit is still resolved
+		{"acct-player", false, false},
+		{"acct-missing", true, false}, // unknown account fails safe to player → no manage-tiers
+	}
+	for _, tc := range cases {
+		svc := newTestService(fs)
+		if tc.signed {
+			svc = svc.WithSigningKey(priv)
+		}
+		resp, err := svc.IssueSessionAssertion(context.Background(), &accountv1.IssueSessionAssertionRequest{
+			AccountId: tc.acct, CharacterId: "C", SessionId: "s",
+		})
+		if err != nil {
+			t.Fatalf("%s signed=%v: %v", tc.acct, tc.signed, err)
+		}
+		if resp.GetManageTiers() != tc.want {
+			t.Errorf("%s signed=%v: ManageTiers=%v, want %v", tc.acct, tc.signed, resp.GetManageTiers(), tc.want)
+		}
+	}
+
+	// Ladder unavailable → fail-safe false even for a real admin (a promote would be refused anyway, so the
+	// verb stays hidden rather than showing to an actor the service can't authoritatively authorize).
+	svc := newTestService(fs).WithSigningKey(priv).WithTrustLadderUnavailable()
+	resp, err := svc.IssueSessionAssertion(context.Background(), &accountv1.IssueSessionAssertionRequest{
+		AccountId: "acct-admin", CharacterId: "C", SessionId: "s",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetManageTiers() {
+		t.Error("ManageTiers must be false when the trust ladder is unavailable (fail-safe)")
+	}
+}
+
 func TestIssueSessionAssertionDisabledWithoutKey(t *testing.T) {
 	svc := newTestService(newFakeStore()) // no WithSigningKey
 	resp, err := svc.IssueSessionAssertion(context.Background(), &accountv1.IssueSessionAssertionRequest{
@@ -111,5 +165,10 @@ func TestIssueSessionAssertionTierReadErrorFailsSafeToPlayer(t *testing.T) {
 	}
 	if claims.Tier != "player" {
 		t.Fatalf("tier = %q, want player (a tier-read error must fail safe, never elevate to the stored admin)", claims.Tier)
+	}
+	// The manage-tiers bit (#369) must fail safe the same way — a read error must never hand the gate a
+	// staff-visibility signal derived from the (unread) elevated tier.
+	if resp.GetManageTiers() {
+		t.Error("ManageTiers must be false on a tier-read error (fail safe, never elevate)")
 	}
 }

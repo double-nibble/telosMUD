@@ -345,16 +345,26 @@ func (s *Service) IssueSessionAssertion(ctx context.Context, req *accountv1.Issu
 	if req.GetAccountId() == "" || req.GetSessionId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "account_id and session_id required")
 	}
-	if s.signKey == nil {
-		return &accountv1.IssueSessionAssertionResponse{}, nil // assertions disabled
-	}
-	// The trust tier (#27) is signed INTO the assertion so the world trusts it offline (no per-connect RPC).
-	// FAIL SAFE: a read error / unknown account degrades to player — an error must never elevate a tier.
+	// The trust tier (#27) is read once here — it is signed INTO the assertion so the world trusts it offline
+	// (no per-connect RPC), AND it resolves the manage_tiers capability bit (#369) the gate uses for LOCAL
+	// staff-verb visibility. FAIL SAFE: a read error / unknown account degrades to player — an error must never
+	// elevate a tier (nor grant the manage-tiers bit).
 	tier := store.TierPlayer
 	if t, found, err := s.store.AccountTier(ctx, req.GetAccountId()); err != nil {
 		s.log.Error("IssueSessionAssertion: tier read (defaulting to player)", "account", req.GetAccountId(), "err", err)
 	} else if found {
 		tier = t
+	}
+	// manage_tiers (#369): does this actor's tier grant the admin/manage-tiers capability, per the authoritative
+	// content ladder? Fail-safe to false when the ladder could not load (a promote would be refused anyway, so
+	// the verb stays hidden). VISIBILITY-ONLY — SetAccountTier re-checks this authoritatively, so an over-high
+	// bit still hits the service refusal and an under-low bit only yields the gate's "Huh?".
+	manageTiers := !s.ladderUnavailable && s.trustLadder().GrantsFlag(tier, content.FlagAdmin)
+
+	if s.signKey == nil {
+		// Assertions disabled (no signing key): still report the capability bit so a signing-less deployment's
+		// gate can gate staff-verb visibility (the world runs unverified on this path, but the bit is honest).
+		return &accountv1.IssueSessionAssertionResponse{ManageTiers: manageTiers}, nil
 	}
 	tok, err := assertion.Sign(s.signKey, assertion.Claims{
 		Account:   req.GetAccountId(),
@@ -367,7 +377,7 @@ func (s *Service) IssueSessionAssertion(ctx context.Context, req *accountv1.Issu
 		s.log.Error("IssueSessionAssertion: sign", "account", req.GetAccountId(), "err", err)
 		return nil, status.Error(codes.Internal, "sign failed")
 	}
-	return &accountv1.IssueSessionAssertionResponse{Assertion: tok}, nil
+	return &accountv1.IssueSessionAssertionResponse{Assertion: tok, ManageTiers: manageTiers}, nil
 }
 
 // SetAccountTier is the promote/demote authority (#27; content-tier-aware since #29 Slice 0b). AUTHZ IS
