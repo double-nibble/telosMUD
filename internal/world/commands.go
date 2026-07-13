@@ -215,6 +215,12 @@ func cmdWho(c *Context) error {
 	// goroutine never dereferences it.
 	viewer := c.s.entity
 	seeAll := hasFlag(viewer, flagHolylight)
+	s := c.s
+	// This command is ASYNC: its output is produced by the whoRenderMsg/whoFallbackMsg inbox handler below,
+	// not here. Tell dispatch to skip the trailing prompt so it doesn't land BEFORE the async output (#371);
+	// the handler emits the prompt itself, after writing the sheet (promptAfterAsync). Set only on this
+	// async branch — the cooldown and presence-disabled early returns above are synchronous and prompt normally.
+	c.deferPrompt = true
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), presenceIOTimeout)
 		defer cancel()
@@ -222,12 +228,12 @@ func cmdWho(c *Context) error {
 		if !ok {
 			// A roster read error degrades to the zone-local list — never an error to the player. We post
 			// a message back to the zone goroutine so the fallback render stays single-writer.
-			z.post(whoFallbackMsg{out: out, viewer: viewer})
+			z.post(whoFallbackMsg{s: s, out: out, viewer: viewer})
 			return
 		}
 		// Success: hand the (remote, plain-data) roster snapshot back to the zone goroutine, which renders it
 		// — through the content `who` template if the pack defines one, else the built-in renderWho.
-		z.post(whoRenderMsg{out: out, viewer: viewer, entries: entries, seeAll: seeAll})
+		z.post(whoRenderMsg{s: s, out: out, viewer: viewer, entries: entries, seeAll: seeAll})
 	}()
 	return nil
 }

@@ -145,6 +145,12 @@ type Context struct {
 	Actor *Entity  // the actor's in-world entity (s.entity)
 	arg   string   // the verb's argument tail, trimmed ("hi" in `say hi`)
 	moved bool     // set by movement handlers when they released ownership (see dispatch)
+	// deferPrompt is set by an ASYNC command handler (one that returns immediately and posts its output
+	// back to the zone inbox later, e.g. cmdWho's cross-shard path). Like moved, it tells dispatch to skip
+	// the trailing sendPrompt — but here the command still OWNS the session, and its inbox handler emits the
+	// prompt AFTER writing the deferred output, so the prompt lands last (#371). Without this, dispatch would
+	// prompt on return, before the async output arrives, printing "> = Players online: =" (prompt, then sheet).
+	deferPrompt bool
 }
 
 // Rest returns the full argument string after the verb (trimmed). For `say hello there`
@@ -280,6 +286,13 @@ func (z *Zone) dispatch(s *session, line string) {
 		// the session. This goroutine must not read or write s/its entity again — and the
 		// prompt is the destination's job. Returning here keeps single-writer (the
 		// slice-1 dispatch early-return invariant, preserved verbatim).
+		return
+	}
+	if ctx.deferPrompt {
+		// An async command (cmdWho on the cross-shard path) returned without producing its output yet: it
+		// posted a message back to the inbox and will emit the trailing prompt itself, AFTER writing that
+		// output, so the prompt lands last (#371). The session is still ours (unlike moved), but this
+		// goroutine must not prompt now or the prompt would precede the async output.
 		return
 	}
 	z.sendPrompt(s)

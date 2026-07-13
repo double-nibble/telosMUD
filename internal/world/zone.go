@@ -329,6 +329,7 @@ type leaveMsg struct{ id string }
 // the fallback zone-local render runs on the zone goroutine (single-writer over z.players) and writes to
 // the captured out channel. A roster miss thus degrades to the local list, never an error to the player.
 type whoFallbackMsg struct {
+	s      *session // the requester's session, carried SOLELY to resolve the still-live session for the trailing prompt (#371)
 	out    chan *playv1.ServerFrame
 	viewer *Entity // the requester, for the #28 canSee visibility filter (captured at post time)
 }
@@ -343,6 +344,7 @@ type whoFallbackMsg struct {
 // entries are REMOTE data (a snapshot of other shards' rosters), not live entities, so carrying them across
 // the goroutine boundary in a message is sound — the message IS the ownership transfer.
 type whoRenderMsg struct {
+	s       *session // the requester's session, carried SOLELY to resolve the still-live session for the trailing prompt (#371)
 	out     chan *playv1.ServerFrame
 	viewer  *Entity        // the requester (the render's `self`), captured at post time
 	entries []roster.Entry // the roster snapshot the async read returned
@@ -868,6 +870,7 @@ func (z *Zone) handle(m msg) {
 		}
 	case whoFallbackMsg:
 		writeFrameTo(v.out, textFrame(z.whoLocalSheet(v.viewer)))
+		z.promptAfterAsync(v.s) // #371: the async command owns its trailing prompt, emitted AFTER its output
 	case whoRenderMsg:
 		// The async roster read landed. Render HERE, on the zone goroutine (single-writer): a content `who`
 		// template enters the zone-owned Lua VM, so it may only run on this goroutine (#24). No template (or a
@@ -877,6 +880,7 @@ func (z *Zone) handle(m msg) {
 		} else {
 			writeFrameTo(v.out, textFrame(renderWho(v.entries, v.seeAll)))
 		}
+		z.promptAfterAsync(v.s) // #371: the async command owns its trailing prompt, emitted AFTER its output
 	case tellDeliverMsg:
 		v.ack <- z.deliverDrainedTell(v) // drained durable tell: dedup-via-cursor, render+emit, ack/nak
 	case tellCursorProbeMsg:
