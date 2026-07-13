@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
+	roster "github.com/double-nibble/telosmud/internal/presence"
 )
 
 // TestMailInboxCap pins the anti-griefing/storage cap: SendMail refuses once the recipient is at
@@ -198,18 +199,29 @@ func TestMailOfflineThenReadOnLogin(t *testing.T) {
 	}
 }
 
-// TestMailNewMailNotifyToOnlineRecipient proves a "you have new mail" ping reaches an ONLINE recipient's
-// gate over the comms bus tell subject (the same sink the gate renders). The world is the source; we
-// observe the gate-side subscriber. A directory marks the recipient online so the notify fires.
+// TestMailNewMailNotifyToOnlineRecipient proves a "you have new mail" ping reaches a CURRENTLY-CONNECTED
+// recipient's gate over the comms bus tell subject (the same sink the gate renders). The world is the
+// source; we observe the gate-side subscriber. The recipient is present in the PRESENCE roster (the #325
+// oracle for "connected now"), and also has a directory placement (existence) so the send is not refused.
 func TestMailNewMailNotifyToOnlineRecipient(t *testing.T) {
 	ms := NewMemStore()
 	wbus, gate := commbus.NewWorldBus()
 	t.Cleanup(func() { _ = wbus.Close() })
-	dir := newMailDir(map[string]string{"Bob": "shard-1"}) // Bob is online on shard-1
+	dir := newMailDir(map[string]string{"Bob": "shard-1"}) // Bob exists (a placement)
+
+	// Bob is CURRENTLY CONNECTED on another shard: a live presence entry. The notify gates on presence, not
+	// placement (#325). Bob's presence lives under "shard-1", distinct from the sender shard, so the sender's
+	// own presence heartbeat never touches it.
+	mem := roster.NewMem()
+	if err := mem.Set(context.Background(), "shard-1",
+		[]roster.Entry{{PlayerID: "Bob", Name: "Bob", ShardID: "shard-1"}}, roster.DefaultTTL); err != nil {
+		t.Fatal(err)
+	}
 
 	sh := newShard([]string{"midgaard"}, "midgaard", "addr", dir, nil).
 		WithComms(wbus).
-		WithMail(ms)
+		WithMail(ms).
+		WithPresence(mem, "sender-shard")
 	z := sh.Zone()
 
 	// Bob's gate subscribes its concrete tell subject (the 8.2 sink).
@@ -230,7 +242,50 @@ func TestMailNewMailNotifyToOnlineRecipient(t *testing.T) {
 			t.Fatalf("new-mail notify body wrong: %q", m.Body)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("online recipient never received the new-mail notify")
+		t.Fatal("connected recipient never received the new-mail notify")
+	}
+}
+
+// TestMailNoNotifyToPlacedButDisconnectedRecipient is the core #325 guard: a recipient who HAS a directory
+// placement (exists / has logged in before) but is NOT currently connected (no live presence entry) must NOT
+// receive a new-mail ping. Before #325 the notify gated on the placement, which persists across logout (and
+// since #320 is written on every login), so an offline recipient was pinged; the ping is delivered on their
+// NEXT login — redundant with, and possibly stale relative to, the login mail check. The mail is still stored.
+func TestMailNoNotifyToPlacedButDisconnectedRecipient(t *testing.T) {
+	ms := NewMemStore()
+	wbus, gate := commbus.NewWorldBus()
+	t.Cleanup(func() { _ = wbus.Close() })
+	dir := newMailDir(map[string]string{"Bob": "shard-1"}) // Bob EXISTS (a placement) ...
+	mem := roster.NewMem()                                 // ... but is ABSENT from presence (disconnected).
+
+	sh := newShard([]string{"midgaard"}, "midgaard", "addr", dir, nil).
+		WithComms(wbus).
+		WithMail(ms).
+		WithPresence(mem, "sender-shard")
+	z := sh.Zone()
+
+	notifies := make(chan commbus.Message, 4)
+	sub, err := gate.Subscribe(commbus.TellSubject("Bob"), func(m commbus.Message) { notifies <- m })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	alice := newTestPlayerEntity(z, "Alice")
+	z.dispatch(alice, "mail send Bob Ping | check this")
+	waitMailLine(t, alice, "Mail sent to Bob.")
+
+	// The mail IS stored — a disconnected recipient reads it on next login.
+	inbox, err := ms.ListMail(context.Background(), "Bob")
+	if err != nil || len(inbox) != 1 {
+		t.Fatalf("Bob inbox = %v (err %v), want the mail stored for on-login read", inbox, err)
+	}
+	// But NO ping fires: presence, not placement, gates the notify.
+	select {
+	case m := <-notifies:
+		t.Fatalf("a placed-but-disconnected recipient must NOT get a new-mail ping (#325); got %q", m.Body)
+	case <-time.After(300 * time.Millisecond):
+		// expected: no notify
 	}
 }
 

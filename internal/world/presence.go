@@ -320,6 +320,30 @@ func (z *Zone) rosterList(ctx context.Context) ([]roster.Entry, bool) {
 	return z.shard.presence.cachedList(ctx)
 }
 
+// rosterConnected reports whether playerID has a LIVE presence entry — i.e. is CURRENTLY connected on some
+// shard right now — using the same cross-shard roster (and its ~1s cache) `who` reads. This is the correct
+// oracle for a "is this character connected?" decision (#325), distinct from the directory placement, which
+// only answers "has ever logged in / where do we route" (a placement persists across logout, and since #320
+// is written on every login). Returns false when presence is DISABLED or the roster read fails: the caller
+// (the new-mail notify ping) is a best-effort nicety, so when we cannot DEMONSTRATE a live connection we
+// send none — the mail is durable and the recipient sees it when they next run `mail` (there is no
+// automatic on-login mail notice). Membership is checked against the RAW
+// roster (not the visibility-filtered set): the ping goes to the recipient's OWN gate, so a concealed player
+// must still be notified of their own mail. Runs OFF the zone goroutine (the mail send I/O goroutine);
+// cachedList's whoMu makes that safe, exactly like cmdWho's read.
+func (z *Zone) rosterConnected(ctx context.Context, playerID string) bool {
+	entries, ok := z.rosterList(ctx)
+	if !ok {
+		return false
+	}
+	for i := range entries {
+		if entries[i].PlayerID == playerID {
+			return true
+		}
+	}
+	return false
+}
+
 // cachedList returns the cross-shard roster, serving a sub-whoCacheTTL cached snapshot when one exists so a
 // `who` flood collapses to ONE Redis SCAN per window. whoMu serializes the refresh: at the window edge one
 // goroutine does the List (holding the lock) and the rest block briefly, then read the just-refreshed cache
