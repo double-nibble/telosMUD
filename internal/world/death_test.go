@@ -502,6 +502,104 @@ func TestPlayerDeathRespawns(t *testing.T) {
 	}
 }
 
+// TestPlayerRespawnStripsHostileAffects proves the #318 chokepoint: a player who dies carrying a hostile
+// affect (a CC/debuff a death path left on them) respawns with it PURGED, while a beneficial buff survives.
+// Driven end-to-end through the real death funnel (a killing mob swing -> die -> respawnPlayer).
+func TestPlayerRespawnStripsHostileAffects(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	z.combatRand = rand.New(rand.NewSource(1))
+	// Register a hostile CC affect and a beneficial buff to hang on the victim before death.
+	z.defs.affect.register("hex", &affectDef{
+		ref: "hex", name: "Hexed", stacking: stackRefresh, maxStacks: 1, duration: 300,
+		prevents: []string{"cast"}, // a CC => hostile
+	})
+	z.defs.affect.register("boon", &affectDef{
+		ref: "boon", name: "Boon", stacking: stackIgnore, maxStacks: 1, duration: 300,
+	})
+
+	market := z.rooms["midgaard:room:market"]
+	s := &session{character: "Victim", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(s, "Victim")
+	s.entity.living.combatRef = "" // no avoidance ladder, so the killing swing lands
+	Move(s.entity, market)
+	z.players["Victim"] = s
+	setResourceCurrent(s.entity, "hp", 5)
+
+	// The victim enters death carrying both affects (as if a death-triggered handler / prior tick applied them).
+	applyAffect(s.entity, "hex", attachOpts{}, nil)
+	applyAffect(s.entity, "boon", attachOpts{}, nil)
+	if !hasAffect(s.entity, "hex") || !hasAffect(s.entity, "boon") {
+		t.Fatal("precondition: victim should carry both affects before death")
+	}
+
+	z.defs.combat.register("brute", killShotProfile(100))
+	mob := z.newEntity(ProtoRef("test:brute"))
+	mob.short = "a brute"
+	mob.setKeywords([]string{"brute"})
+	Add(mob, &Living{combatRef: "brute"})
+	Move(mob, market)
+	Add(mob, &Weapon{diceNum: 6, diceSize: 1, damageType: "slash"})
+	z.startFight(mob, s.entity)
+
+	z.resolveSwing(mob, s.entity, 0, rand.New(rand.NewSource(1)), newBudget())
+
+	// Respawned, the hostile CC is gone but the blessing remains.
+	if hasAffect(s.entity, "hex") {
+		t.Error("hostile CC affect survived respawn (#318 chokepoint not enforced)")
+	}
+	if !hasAffect(s.entity, "boon") {
+		t.Error("beneficial buff was wrongly stripped on respawn")
+	}
+	if position(s.entity) == posDead {
+		t.Fatal("respawned player is still posDead")
+	}
+}
+
+// TestLethalDotTickRespawnStripsInline is the re-entrancy regression (#318 security review): a DoT's OWN
+// killing tick runs die -> respawnPlayer -> stripHostileAffects INLINE, inside the tickOnce snapshot loop. The
+// guard in tickOnce must skip every snapshot entry the strip removed, so NO later hostile tick lands on the
+// just-respawned player. Observable clincher: after the lethal tick the player is at FULL hp (respawn healed
+// them and nothing re-damaged them) and every DoT is gone.
+func TestLethalDotTickRespawnStripsInline(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	z.combatRand = rand.New(rand.NewSource(1))
+	// Two self-DoTs that both tick THIS pulse (interval 1); the first is lethal. Applied in order, so the
+	// snapshot is [lethaltick, smalltick] — smalltick is the later entry that must NOT re-fire post-respawn.
+	z.defs.affect.register("lethaltick", &affectDef{
+		ref: "lethaltick", stacking: stackRefresh, maxStacks: 1, duration: 30,
+		hasTick: true, tickInterval: 1, tickOps: []effectOp{{kind: "deal_damage", dmgType: "physical", amount: 999}},
+	})
+	z.defs.affect.register("smalltick", &affectDef{
+		ref: "smalltick", stacking: stackRefresh, maxStacks: 1, duration: 30,
+		hasTick: true, tickInterval: 1, tickOps: []effectOp{{kind: "deal_damage", dmgType: "physical", amount: 4}},
+	})
+
+	// A player standing in a non-safe room so the self-harm tick is not vetoed and death can fire.
+	market := z.rooms["midgaard:room:market"]
+	s := &session{character: "Victim", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(s, "Victim")
+	Move(s.entity, market)
+	z.players["Victim"] = s
+	setResourceCurrent(s.entity, "hp", 10) // low enough that the 999 tick empties the pool
+
+	applyAffect(s.entity, "lethaltick", attachOpts{}, nil)
+	applyAffect(s.entity, "smalltick", attachOpts{}, nil)
+
+	a, _ := Get[*Affected](s.entity)
+	a.tickOnce(s.entity, 1) // the lethal tick kills + respawns + strips inline; the guard skips the stripped smalltick
+
+	if position(s.entity) == posDead {
+		t.Fatal("player left dead after a lethal DoT tick (respawn did not run)")
+	}
+	if hasAffect(s.entity, "lethaltick") || hasAffect(s.entity, "smalltick") {
+		t.Error("a DoT survived the inline respawn strip")
+	}
+	// The clincher: full hp. If the guard were missing, smalltick would re-fire post-respawn and shave 4 hp.
+	if got, full := resourceCurrent(s.entity, "hp"), resourceMax(s.entity, "hp"); got != full {
+		t.Errorf("post-respawn hp = %d, want full %d — a hostile tick landed AFTER respawn (re-entrancy guard failed)", got, full)
+	}
+}
+
 // --- Threat list + retargeting -----------------------------------------------------------------
 
 // TestThreatPicksHighestThreatTarget proves a mob fighting in a room re-targets the attacker with the

@@ -515,6 +515,96 @@ func affectIsDetrimental(def *affectDef) bool {
 	return false
 }
 
+// affectStrippedOnRespawn reports whether an affect must be PURGED when its bearer respawns (#318): death is a
+// clean slate, so a freshly-respawned player carries no harm. It is deliberately a WHITELIST inversion —
+// strip everything EXCEPT an affect PROVABLY benign (affectSurvivesRespawn) — because "hostile" is an open,
+// unenumerable set (a debuff, a CC, a DoT via deal_damage OR a modify_resource drain, a save-gated bleed
+// nested in a check band, an onEvent/reaction proc that burns the bearer), whereas "provably benign" is a
+// small, closed, structurally-checkable set. Erring toward stripping means a false positive is a lost blessing
+// while a false negative is the exact bug #318 exists to close (a hostile effect following you to the temple).
+// This is intentionally BROADER than affectIsDetrimental (the PvP apply-gate's def-only harm test, which is
+// itself a strict subset of the runtime gate's harm notion) — left unchanged so PvP semantics don't move.
+func affectStrippedOnRespawn(def *affectDef) bool {
+	return !affectSurvivesRespawn(def)
+}
+
+// affectSurvivesRespawn reports whether an affect is PROVABLY benign to its bearer and so may be KEPT across a
+// respawn (#318) — the whitelist half of affectStrippedOnRespawn. An affect survives ONLY when every harm
+// surface a def can carry is structurally absent:
+//   - no modifier REDUCES a stat (every additive modifier >= 0, every multiplicative >= 1);
+//   - it declares no prevents tags (any CC is harm by construction);
+//   - its category is not a known affliction (detrimentalCategories);
+//   - it carries no event/reaction handlers (onEvent op-lists, onEventLua, onReactionLua) — a proc can harm
+//     the bearer, and an opaque Lua body can't be verified, so any handler disqualifies it;
+//   - every tick op is benign (opsBenignOnSelf, recursing if/chance/check branches): pure restoration/
+//     narration only. A deal_damage or a modify_resource tick (whose pool polarity the engine can't know, so
+//     it gates every one) makes the tick non-benign — a modify_resource-based regen buff is stripped too, a
+//     safe false positive (author a genuine HoT with heal/restore, which the engine treats as benign).
+//
+// A nil def can't be proven benign, so it does not survive (fail toward stripping). Pure read of the immutable def.
+func affectSurvivesRespawn(def *affectDef) bool {
+	if def == nil {
+		return false
+	}
+	for _, m := range def.modifiers {
+		if m.add && m.value < 0 {
+			return false // a flat stat reduction
+		}
+		if !m.add && m.value < 1 {
+			return false // a multiplicative stat reduction (×<1)
+		}
+	}
+	if len(def.prevents) > 0 {
+		return false
+	}
+	if detrimentalCategories[def.category] {
+		return false
+	}
+	if len(def.onEvent) > 0 || len(def.onEventLua) > 0 || len(def.onReactionLua) > 0 {
+		return false // a proc (op-list or opaque Lua) can harm the bearer — can't prove it benign
+	}
+	return opsBenignOnSelf(def.tickOps)
+}
+
+// benignTickOps are the op kinds a PROVABLY-benign self-affect tick may use: pure resource restoration or
+// pure narration, none of which can harm the bearer. Every other op — deal_damage, modify_resource (polarity
+// unknown, gated by the engine on every cross-player write), apply_affect, dispel/remove_affect, any grant/
+// flag/craft write, or an unknown/future kind — is treated as potentially harmful, so an affect whose tick
+// uses one is stripped on respawn (#318).
+var benignTickOps = map[string]bool{
+	"heal": true, "restore": true, "act": true, "send": true,
+}
+
+// opsBenignOnSelf reports whether EVERY op in a tick op-list is benign (benignTickOps), recursing through the
+// if/chance/check flow branches so a save-gated or chance-gated deal_damage/drain hidden in a band is still
+// caught. The flow ops themselves (if/chance/check) are pure control flow; only their nested op-lists carry
+// effect. An unknown op kind is NOT benign (fail toward stripping). An empty list is benign (a timer-only tick).
+func opsBenignOnSelf(ops []effectOp) bool {
+	for i := range ops {
+		op := &ops[i]
+		switch op.kind {
+		case "if", "chance":
+			if !opsBenignOnSelf(op.then) || !opsBenignOnSelf(op.els) {
+				return false
+			}
+		case "check":
+			if op.check == nil {
+				return false
+			}
+			for bi := range op.check.bands {
+				if !opsBenignOnSelf(op.check.bands[bi].ops) {
+					return false
+				}
+			}
+		default:
+			if !benignTickOps[op.kind] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // abilityDisposition is the harmful/helpful/neutral intent of an ability or op (docs/ABILITIES.md
 // §7). It is what drives the PvP gate: ONLY dispHarmful routes through pvp_allowed. The op-level
 // guard (guardHarmful) also keys off disposition so a debuff apply_affect is gated while a buff is not.

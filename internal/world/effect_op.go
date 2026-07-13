@@ -330,9 +330,13 @@ func init() {
 //     op-list, so a script can kill and then debuff the respawned player. (security review, F1.)
 //   - An op-list run by a fired event handler or an affect tick is a fresh ctx with a fresh dead-set.
 //
-// The durable form of that invariant belongs at the respawnPlayer chokepoint (clear hostile affects /
-// open the spawn-protection window there), where every death path inherits it and no caller can forget.
-// Tracked as #318. Nothing here is a substitute for it.
+// The durable form of that invariant lives at the respawnPlayer chokepoint: stripHostileAffects (#318) now
+// purges every affect NOT provably benign (a debuff, CC, DoT, drain, or proc) that the victim carried into
+// death there, so any hostile affect PRESENT at death (a death-triggered handler's debuff, a DoT/CC tick) is
+// cleared no matter which death path applied it — no caller can forget. Harm a SEPARATE later call lands after
+// respawn completes (a Lua script's own `h:apply_affect`, scenario 1) is normal gated harm on a living player;
+// the complementary spawn-protection window that would refuse it is tracked as a follow-up. Nothing here is a
+// substitute for the chokepoint.
 //
 // INVARIANT the guard rests on: die() is the only thing that bumps the generation, and the only op in the
 // vocabulary that removes a LIVING target. An op that ever extracts or relocates a living entity without

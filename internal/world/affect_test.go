@@ -42,6 +42,39 @@ func affectTestZone(t *testing.T) (*Zone, *Entity) {
 		ref: "oncebuff", stacking: stackIgnore, maxStacks: 1, duration: 10,
 		modifiers: []affectModifier{{attr: "strength", add: true, value: 5}},
 	})
+	// bleed: a pure DoT whose category is NOT a known affliction and which has no stat-reducing modifier and
+	// no prevents — so affectIsDetrimental does NOT flag it. Its deal_damage tick is what makes it hostile for
+	// the respawn purge (#318): the strip must not depend on a builder categorizing a DoT correctly.
+	z.defs.affect.register("bleed", &affectDef{
+		ref: "bleed", name: "Bleeding", category: "wound", stacking: stackRefresh, maxStacks: 1, duration: 30,
+		hasTick: true, tickInterval: 3, tickOps: []effectOp{{kind: "deal_damage", dmgType: "physical", amount: 4}},
+	})
+	// drain: a benign-looking mana-DRAIN DoT — no negative modifier, no prevents, benign category, tick is a
+	// negative modify_resource (NOT deal_damage). Only the whitelist catches it (#318 security review).
+	z.defs.affect.register("drain", &affectDef{
+		ref: "drain", name: "Draining", category: "aura", stacking: stackRefresh, maxStacks: 1, duration: 30,
+		hasTick: true, tickInterval: 3, tickOps: []effectOp{{kind: "modify_resource", resource: "hp", amount: -5}},
+	})
+	// gatedbleed: a save-GATED DoT — the deal_damage is nested in a check band, so a top-level scan misses it;
+	// the recursive whitelist (opsBenignOnSelf) still classifies it hostile (#318 security review).
+	z.defs.affect.register("gatedbleed", &affectDef{
+		ref: "gatedbleed", name: "Gated Bleed", category: "aura", stacking: stackRefresh, maxStacks: 1, duration: 30,
+		hasTick: true, tickInterval: 3, tickOps: []effectOp{{
+			kind:  "check",
+			check: &checkSpec{bands: []checkBand{{ops: []effectOp{{kind: "deal_damage", dmgType: "physical", amount: 4}}}}},
+		}},
+	})
+	// proccurse: a benign-shaped affect carrying an opaque Lua reaction handler — a proc surface can harm the
+	// bearer and can't be verified, so any handler disqualifies survival (#318 security review).
+	z.defs.affect.register("proccurse", &affectDef{
+		ref: "proccurse", name: "Proc Curse", category: "aura", stacking: stackRefresh, maxStacks: 1, duration: 30,
+		onReactionLua: map[eventKind]string{evOnDamageTaken: "-- opaque"},
+	})
+	// hottick: a genuinely-benign heal-over-time — a heal tick, no modifier/prevents/proc — SURVIVES respawn.
+	z.defs.affect.register("hottick", &affectDef{
+		ref: "hottick", name: "Regenerating", category: "blessing", stacking: stackRefresh, maxStacks: 1, duration: 30,
+		hasTick: true, tickInterval: 3, tickOps: []effectOp{{kind: "heal", resource: "hp", amount: 4}},
+	})
 
 	s := newTestPlayerEntity(z, "Hero")
 	z.players["Hero"] = s
@@ -72,6 +105,90 @@ func TestStackingRefresh(t *testing.T) {
 	}
 	if got := attr(e, "strength"); got != 8 {
 		t.Fatalf("refresh must not double the modifier: strength = %v, want 8", got)
+	}
+}
+
+// TestAffectStrippedOnRespawnPredicate: the respawn-purge classifier (#318) is a benign WHITELIST — it strips
+// every hostile shape (stat-reducing debuff, CC, poison, a plain deal_damage DoT, a modify_resource DRAIN, a
+// save-gated deal_damage nested in a check band, and a proc-carrying affect) while KEEPING a provably-benign
+// buff, an empty affect, and a heal-over-time.
+func TestAffectStrippedOnRespawnPredicate(t *testing.T) {
+	z, _ := affectTestZone(t)
+	cases := []struct {
+		ref  string
+		want bool // want stripped
+	}{
+		{"weaken", true},     // -2 strength (stat reduction)
+		{"root", true},       // prevents move (CC)
+		{"poison", true},     // -2 strength modifier
+		{"bleed", true},      // benign category, only a deal_damage tick
+		{"drain", true},      // benign category, a negative modify_resource tick (not deal_damage)
+		{"gatedbleed", true}, // deal_damage nested in a check band (a top-level scan would miss it)
+		{"proccurse", true},  // an opaque Lua reaction handler — a proc surface, unverifiable
+		{"oncebuff", false},  // +5 strength buff — a blessing survives respawn
+		{"extender", false},  // no modifier/prevents/tick/proc — nothing hostile, survives
+		{"hottick", false},   // a heal-over-time tick — benign, survives
+	}
+	for _, tc := range cases {
+		def := z.affectDefs().get(tc.ref)
+		if def == nil {
+			t.Fatalf("def %q not registered", tc.ref)
+		}
+		if got := affectStrippedOnRespawn(def); got != tc.want {
+			t.Errorf("affectStrippedOnRespawn(%q) = %v, want stripped=%v", tc.ref, got, tc.want)
+		}
+	}
+	// A nil def can't be proven benign, so it fails toward stripping (though no nil-def instance ever exists).
+	if !affectStrippedOnRespawn(nil) {
+		t.Error("affectStrippedOnRespawn(nil) should be true (fail toward stripping)")
+	}
+}
+
+// TestBenignTickOpsAreRealOps guards the respawn-strip whitelist (#318) against drift: every kind in
+// benignTickOps must be a REAL registered op. A typo (a benign kind that no longer matches an op name) would
+// silently make that op non-benign and OVER-strip — safe for security but a lost-blessing correctness bug.
+// (The whitelist's DEFAULT is fail-safe: an unknown/new op strips, never survives, so drift can only
+// over-strip, never leak harm.)
+func TestBenignTickOpsAreRealOps(t *testing.T) {
+	for kind := range benignTickOps {
+		if _, ok := effectOpHandlers[kind]; !ok {
+			t.Errorf("benignTickOps has %q, which is not a registered op (typo? renamed op?) — it would over-strip", kind)
+		}
+	}
+}
+
+// TestStripHostileAffectsKeepsBuffs: stripHostileAffects removes every hostile affect (debuff, CC, DoT) and
+// their derived modifiers/prevents, while leaving a beneficial buff and its modifier intact (#318).
+func TestStripHostileAffectsKeepsBuffs(t *testing.T) {
+	_, e := affectTestZone(t)
+	applyAffect(e, "weaken", attachOpts{}, nil)   // -2 str (hostile)
+	applyAffect(e, "root", attachOpts{}, nil)     // prevents move (hostile)
+	applyAffect(e, "bleed", attachOpts{}, nil)    // deal_damage DoT (hostile)
+	applyAffect(e, "oncebuff", attachOpts{}, nil) // +5 str (beneficial)
+	// Before: 10 base - 2 (weaken) + 5 (buff) = 13; move is prevented.
+	if got := attr(e, "strength"); got != 13 {
+		t.Fatalf("pre-strip strength = %v, want 13", got)
+	}
+	if !preventsTag(e, "move") {
+		t.Fatal("pre-strip: root should prevent move")
+	}
+
+	stripHostileAffects(e)
+
+	for _, ref := range []string{"weaken", "root", "bleed"} {
+		if hasAffect(e, ref) {
+			t.Errorf("hostile affect %q survived the respawn strip", ref)
+		}
+	}
+	if !hasAffect(e, "oncebuff") {
+		t.Error("beneficial buff was wrongly stripped on respawn")
+	}
+	// After: the debuff's -2 and root's prevents are gone; the +5 buff remains → 10 + 5 = 15.
+	if got := attr(e, "strength"); got != 15 {
+		t.Fatalf("post-strip strength = %v, want 15 (base 10 + buff 5, debuff gone)", got)
+	}
+	if preventsTag(e, "move") {
+		t.Error("post-strip: root's move-prevent should be cleared")
 	}
 }
 

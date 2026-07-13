@@ -369,6 +369,20 @@ func (z *Zone) newCorpse(victim *Entity) *Entity {
 // ruleset is a later content/ruleset knob (a player corpse + drop-on-death is a Phase 11/ruleset
 // decision, not wired here). The player keeps their gear (no drop) this slice. Single-writer.
 func (z *Zone) respawnPlayer(victim *Entity) {
+	// Strip hostile affects FIRST (#318): death is a clean slate — no debuff, CC, or DoT that any death path
+	// (a data op-list, a death-triggered OnKill/OnDamageTaken handler, an affect tick, a Lua on_death hook)
+	// left on the victim may follow them to the temple. Done BEFORE the vital restore so a max-vital-reducing
+	// debuff is gone when we heal to full (else we'd restore to a debuffed, lower max). This is the durable
+	// form of the invariant the #69 runOps cross-respawn guard only enforces for the data op-list path — every
+	// death path funnels through here, so no caller can forget.
+	//
+	// SCOPE: this strips affects PRESENT on the victim at death. Harm a SEPARATE later call applies after
+	// respawn completes — a Lua script that does `h:damage` (kill+respawn inline) then a fresh `h:apply_affect`
+	// (scenario 1 in #318) — is normal gated harm on a living player, NOT a surviving affect, and is left to a
+	// follow-up spawn-protection window. Note that safe-room does NOT cover it: a MOB actor's harm short-
+	// circuits pvpAllowed (mob->player is always allowed) BEFORE the safe-room veto, so a mob's post-respawn
+	// apply lands even in a safe temple — closing it needs the actor-agnostic protection window, tracked separately.
+	stripHostileAffects(victim)
 	// Restore vitals to full (re-set each vital resource current to its derived max) so the player is
 	// alive again. resourceCurrent already clamps; setting to the max is the "fully healed on respawn"
 	// minimal rule.
