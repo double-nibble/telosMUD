@@ -79,9 +79,19 @@ type NATSJetStream struct {
 }
 
 // durableConsumerConfig builds the per-consumer JetStream config. Extracted from Consume so the production
-// values — above all MaxAckPending=1, which is load-bearing rather than tuning (#266) — are pinned by a
-// HERMETIC test rather than only by the broker-gated tier.
-func durableConsumerConfig(subj, consumerID string) jetstream.ConsumerConfig {
+// values — above all MaxAckPending, which is load-bearing rather than tuning (#266) — are pinned by a
+// HERMETIC test rather than only by the broker-gated tier. maxAckPending comes from the resolved
+// ConsumeConfig (#312): the default is 1 (the serializing posture both current consumers require); a caller
+// may raise it only for a reorder-tolerant consumer (see ConsumeConfig.MaxAckPending).
+func durableConsumerConfig(subj, consumerID string, maxAckPending int) jetstream.ConsumerConfig {
+	// Fail closed on an invalid value regardless of caller: NATS reads MaxAckPending<=0 as UNLIMITED, which
+	// would silently defeat the serialization every current consumer depends on. resolveConsumeConfig already
+	// clamps, but this is the function whose whole purpose is to be the single, isolable definition of the
+	// consumer config — so a future second caller passing an unresolved 0 can never produce the unlimited-ack
+	// posture here either.
+	if maxAckPending <= 0 {
+		maxAckPending = 1
+	}
 	return jetstream.ConsumerConfig{
 		Durable:       consumerID,
 		Name:          consumerID,
@@ -91,7 +101,7 @@ func durableConsumerConfig(subj, consumerID string) jetstream.ConsumerConfig {
 		MaxDeliver:    DefaultMaxDeliver,
 		AckWait:       jsAckWait,
 		BackOff:       consumerBackoff(),
-		MaxAckPending: 1,
+		MaxAckPending: maxAckPending,
 	}
 }
 
@@ -191,10 +201,11 @@ func (b *NATSJetStream) PublishDurable(ctx context.Context, subj string, msg Mes
 // MaxDeliver is a NATS constraint; past the schedule's end the last entry repeats.
 //
 // The consumer delivers the backlog (DeliverAll) then live, in stream order.
-func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, bool) AckDecision) (Consumer, error) {
+func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, bool) AckDecision, opts ...ConsumeOption) (Consumer, error) {
+	cfg := resolveConsumeConfig(opts...)
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
-	cons, err := b.stream.CreateOrUpdateConsumer(ctx, durableConsumerConfig(subj, consumerID))
+	cons, err := b.stream.CreateOrUpdateConsumer(ctx, durableConsumerConfig(subj, consumerID, cfg.MaxAckPending))
 	if err != nil {
 		return nil, fmt.Errorf("commbus: ensure consumer %s: %w", consumerID, err)
 	}

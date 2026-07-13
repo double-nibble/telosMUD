@@ -25,13 +25,38 @@ import (
 // single-goroutine, so it blocks head-of-line whatever the real config says). Only the broker-gated tier
 // observed it before, which left the default CI blind. So we pin the CONFIG itself.
 func TestDurableConsumerConfigPinsMaxAckPending(t *testing.T) {
-	cfg := durableConsumerConfig(DtellSubject("alice"), "alice")
-	assert.Equal(t, 1, cfg.MaxAckPending,
-		"MaxAckPending must be 1: a successor must never overtake a delay-NAK'd message and advance the cursor past it")
+	// The production posture is the DEFAULT (#312): a Consume with no options resolves MaxAckPending==1, and
+	// that value flows into the consumer config. Both current consumers (COMMS_TELL, WORLD_EVENTS) take it.
+	def := resolveConsumeConfig().MaxAckPending
+	assert.Equal(t, 1, def,
+		"the default MaxAckPending must be 1: a successor must never overtake a delay-NAK'd message and advance the cursor past it")
+	cfg := durableConsumerConfig(DtellSubject("alice"), "alice", def)
+	assert.Equal(t, 1, cfg.MaxAckPending, "the resolved default (1) must flow into the consumer config")
 	assert.Equal(t, DefaultMaxDeliver, cfg.MaxDeliver)
 	assert.Equal(t, consumerBackoff(), cfg.BackOff)
 	assert.Equal(t, jsAckWait, cfg.AckWait)
 	assert.Greater(t, cfg.MaxDeliver, len(cfg.BackOff), "NATS err_code 10116: MaxDeliver must exceed len(BackOff)")
+}
+
+// TestConsumeOptionMaxAckPending pins the #312 option seam: the constraint is now a per-consumer option
+// defaulting to 1, not a transport-hardcoded literal. No options keeps the serializing default; a non-
+// positive value keeps the default (never an accidental unlimited-ack posture); a reorder-tolerant consumer
+// can raise it, and the value threads through into the consumer config.
+func TestConsumeOptionMaxAckPending(t *testing.T) {
+	assert.Equal(t, 1, resolveConsumeConfig().MaxAckPending, "no options => the serializing default (1)")
+	assert.Equal(t, 1, resolveConsumeConfig(nil).MaxAckPending, "a nil option is skipped, not a panic")
+	assert.Equal(t, 1, resolveConsumeConfig(WithMaxAckPending(0)).MaxAckPending, "0 keeps the default (never unlimited-ack)")
+	assert.Equal(t, 1, resolveConsumeConfig(WithMaxAckPending(-5)).MaxAckPending, "a negative value keeps the default")
+	assert.Equal(t, 8, resolveConsumeConfig(WithMaxAckPending(8)).MaxAckPending, "a reorder-tolerant consumer may raise it")
+
+	// The override threads through to the actual JetStream consumer config the broker would receive.
+	cfg := durableConsumerConfig(DtellSubject("bob"), "bob", resolveConsumeConfig(WithMaxAckPending(8)).MaxAckPending)
+	assert.Equal(t, 8, cfg.MaxAckPending)
+
+	// durableConsumerConfig itself fails closed: an unresolved <= 0 from any future caller clamps to 1, never
+	// NATS's "0 == unlimited" posture that would silently defeat serialization.
+	assert.Equal(t, 1, durableConsumerConfig(DtellSubject("bob"), "bob", 0).MaxAckPending, "raw 0 clamps to 1 (never unlimited)")
+	assert.Equal(t, 1, durableConsumerConfig(DtellSubject("bob"), "bob", -3).MaxAckPending, "a raw negative clamps to 1")
 }
 
 // TestConsumerBackoffFitsMaxDeliver pins the NATS constraint the real broker enforces (err_code 10116:

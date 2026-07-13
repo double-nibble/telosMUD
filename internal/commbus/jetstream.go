@@ -198,11 +198,64 @@ type JetStream interface {
 	// real-time tell). handler returns an AckDecision: AckDelivered advances past the message,
 	// RetryTransient NAKs it onto the NakBackoff schedule (parked after DefaultMaxDeliver attempts), and
 	// DropPoison discards it now. Stop tears the consumer down. A Disabled handle returns a no-op Consumer.
-	Consume(subj, consumerID string, handler func(msg Message, backlog bool) AckDecision) (Consumer, error)
+	//
+	// opts customize the consumer (#312). With no options the production posture applies (MaxAckPending==1,
+	// the serializing default both current consumers require); a future reorder-tolerant consumer opts out
+	// via WithMaxAckPending rather than the transport relaxing the constraint globally.
+	Consume(subj, consumerID string, handler func(msg Message, backlog bool) AckDecision, opts ...ConsumeOption) (Consumer, error)
 
 	// Close releases the JetStream handle (the underlying connection is shared with the transient bus
 	// in production, so Close here is a logical close of the JetStream context). Idempotent.
 	Close() error
+}
+
+// ConsumeConfig carries the per-consumer overrides a Consume call resolves from its options (#312). Its zero
+// value is NOT the default — resolveConsumeConfig seeds the production posture first, then applies options —
+// so a field left unset (or set <= 0) keeps that default.
+type ConsumeConfig struct {
+	// MaxAckPending caps how many delivered-but-unacked messages the broker keeps in flight for this
+	// consumer. The default (1) SERIALIZES delivery, which is load-bearing — not tuning — for both existing
+	// durable consumers:
+	//   - COMMS_TELL: the world's per-sender delivered-cursor would let a successor advance past a delay-
+	//     NAK'd message, suppressing it as a duplicate on redelivery (silent loss);
+	//   - WORLD_EVENTS: scopebus's per-source `applied` high-water has the identical overtaking hazard.
+	// The constraint lives in the transport today; making it a per-consumer field lets a FUTURE consumer
+	// whose delivered-progress model tolerates reordering (a seen-SET rather than a high-water cursor) raise
+	// it, WITHOUT relaxing it for the ordered consumers. <= 0 means "use the default".
+	//
+	// Raising this alone only grants the BROKER permission to have >1 message unacked in flight — it does
+	// NOT by itself make the client faster: the consume callback still runs messages serially on one
+	// goroutine, so a consumer that raises this and changes nothing else inherits the reordering hazard with
+	// none of the throughput gain. A real reorder-tolerant consumer also needs client-side handler
+	// concurrency and likely a revisited AckWait (jsAckWait) once many messages are pending per consumer.
+	MaxAckPending int
+}
+
+// ConsumeOption customizes a durable consumer at Consume time (#312). No options == the production default
+// (MaxAckPending == 1).
+type ConsumeOption func(*ConsumeConfig)
+
+// WithMaxAckPending overrides the consumer's MaxAckPending (default 1). n <= 0 keeps the default. ONLY safe
+// for a consumer whose delivered-progress model tolerates reordering (see ConsumeConfig.MaxAckPending); the
+// two current consumers (COMMS_TELL, WORLD_EVENTS) require the serializing default and must NOT set this.
+func WithMaxAckPending(n int) ConsumeOption {
+	return func(c *ConsumeConfig) { c.MaxAckPending = n }
+}
+
+// resolveConsumeConfig seeds the load-bearing production defaults, then applies opts over them. A resolved
+// MaxAckPending is always >= 1 (a caller passing <= 0 keeps the serializing default) so the transport never
+// builds a consumer with an invalid unlimited-ack posture by accident.
+func resolveConsumeConfig(opts ...ConsumeOption) ConsumeConfig {
+	cfg := ConsumeConfig{MaxAckPending: 1} // the serializing default both ordered consumers require
+	for _, o := range opts {
+		if o != nil {
+			o(&cfg)
+		}
+	}
+	if cfg.MaxAckPending <= 0 {
+		cfg.MaxAckPending = 1
+	}
+	return cfg
 }
 
 // Consumer is a live durable-consumer handle. Stop ends delivery and releases it; idempotent.
@@ -220,7 +273,7 @@ func DisabledJetStream() JetStream { return disabledJS{} }
 type disabledJS struct{}
 
 func (disabledJS) PublishDurable(context.Context, string, Message) error { return nil }
-func (disabledJS) Consume(string, string, func(Message, bool) AckDecision) (Consumer, error) {
+func (disabledJS) Consume(string, string, func(Message, bool) AckDecision, ...ConsumeOption) (Consumer, error) {
 	return disabledConsumer{}, nil
 }
 func (disabledJS) Close() error { return nil }
@@ -257,7 +310,12 @@ type memConsumer struct {
 // consumer's cursor (DeliverPending), then waits on the wake signal for new appends. Each delivered
 // message runs handler with bounded redelivery; a permanently-NAKing message is parked (logged via
 // the handler returning false maxDeliver times) and the cursor advances past it so it never storms.
-func (js *MemJetStream) Consume(subj, consumerID string, handler func(Message, bool) AckDecision) (Consumer, error) {
+//
+// opts are accepted for interface parity (#312) but have no effect here: the in-memory model delivers one
+// message at a time on a single goroutine (blocking for the handler's ack before the next), so it is already
+// effectively MaxAckPending==1 and a higher value would not change its behavior — the MaxAckPending contract
+// is a broker property exercised against the real NATS consumer, not this stand-in.
+func (js *MemJetStream) Consume(subj, consumerID string, handler func(Message, bool) AckDecision, _ ...ConsumeOption) (Consumer, error) {
 	js.mu.Lock()
 	if js.closed {
 		js.mu.Unlock()
