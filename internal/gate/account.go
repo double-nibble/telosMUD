@@ -25,7 +25,9 @@ type AccountClient interface {
 	ListCharacters(ctx context.Context, accountID string) ([]CharacterInfo, error)
 	// IssueSessionAssertion mints the signed assertion the gate carries in Attach (Phase 14.3). An empty
 	// string is returned (no error) when account has no signing key — the world then runs unverified.
-	IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (string, error)
+	// manageTiers (#369) is the resolved "may see/use the staff tier verbs" capability the gate uses as a
+	// LOCAL visibility gate for promote/demote; the account service stays the authoritative authz.
+	IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (assertion string, manageTiers bool, err error)
 	// StartDeviceAuth begins a browser OAuth login (Phase 15), returning the device_code, the one-click link
 	// to show the player, and the suggested poll interval.
 	StartDeviceAuth(ctx context.Context, connInfo string) (deviceCode, verificationURI string, interval time.Duration, err error)
@@ -82,9 +84,11 @@ func (stubAccountClient) ListCharacters(_ context.Context, accountID string) ([]
 	return []CharacterInfo{{ID: accountID, Name: accountID}}, nil
 }
 
-// IssueSessionAssertion on the stub returns no token (the stub is the no-auth fallback).
-func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string) (string, error) {
-	return "", nil
+// IssueSessionAssertion on the stub returns no token and no staff capability (the stub is the no-auth
+// fallback: no accounts, no tiers, so promote/demote stay invisible — consistent with the stub's
+// SetAccountTier refusal).
+func (stubAccountClient) IssueSessionAssertion(_ context.Context, _, _, _ string) (string, bool, error) {
+	return "", false, nil
 }
 
 // SetAccountTier on the stub refuses: without an account service there is no tier authority (the dev/no-auth
@@ -161,14 +165,14 @@ func (g *grpcAccountClient) ListCharacters(ctx context.Context, accountID string
 	return out, nil
 }
 
-func (g *grpcAccountClient) IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (string, error) {
+func (g *grpcAccountClient) IssueSessionAssertion(ctx context.Context, accountID, characterID, sessionID string) (string, bool, error) {
 	resp, err := g.cli.IssueSessionAssertion(ctx, &accountv1.IssueSessionAssertionRequest{
 		AccountId: accountID, CharacterId: characterID, SessionId: sessionID,
 	})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return resp.GetAssertion(), nil
+	return resp.GetAssertion(), resp.GetManageTiers(), nil
 }
 
 func (g *grpcAccountClient) StartDeviceAuth(ctx context.Context, connInfo string) (string, string, time.Duration, error) {
