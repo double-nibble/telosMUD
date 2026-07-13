@@ -146,6 +146,47 @@ func (a *Affected) expire(e *Entity, inst *affectInstance, parent *effectCtx) {
 	e.zone.log.Debug("affect expired", "ref", inst.def.ref, "rid", e.rid)
 }
 
+// stripHostileAffects HARD-removes every affect hostile to a respawning player (#318) — the chokepoint that
+// makes "no hostile effect survives respawn" hold for EVERY death path that leaves an affect on the victim
+// BEFORE die() -> respawnPlayer runs: a data op-list (already covered by the #69 runOps guard), a death-
+// triggered OnKill / OnDamageTaken handler that debuffed the victim, a DoT/CC applied by an affect tick, or a
+// Lua on_death hook. No caller has to remember to clean up — the strip lives at the one place every player
+// death funnels through.
+//
+// It deliberately fires NO lifecycle hooks (on_expire / OnAffectExpire): death is a PURGE, not a natural
+// expiry, and firing an on_expire handler here would re-open the very hole this closes — a death-triggered
+// handler landing FRESH harm on the just-respawned player. So this drops the instances directly and only
+// recomputes the derived modifier/prevents maps (a stripped debuff/CC must stop affecting the now-alive
+// player) and refreshes comms hear-access (a silence/deafen that gated a channel is gone). Beneficial affects
+// (buffs, heal-over-time) are LEFT: a respawn keeps your blessings. hasActiveAffects/needsRegen still drives
+// the tick, so a now-affectless entity's tick self-cancels on its next fire. Single-writer: zone goroutine
+// (respawnPlayer). nil/absent Affected component, or no hostile affect, is a no-op.
+func stripHostileAffects(e *Entity) {
+	a, ok := Get[*Affected](e)
+	if !ok || len(a.list) == 0 {
+		return
+	}
+	kept := make([]*affectInstance, 0, len(a.list))
+	removed := false
+	for _, inst := range a.list {
+		if affectStrippedOnRespawn(inst.def) {
+			delete(a.byKey, keyFor(inst.def, inst.source))
+			removed = true
+			continue
+		}
+		kept = append(kept, inst)
+	}
+	if !removed {
+		return // no hostile affect: leave list/byKey and the derived maps untouched (no needless recompute)
+	}
+	a.list = kept
+	a.recomputeMods()
+	markAttrsDirty(e)
+	if e.zone != nil {
+		e.zone.republishCommsOnAccessChange(e) // a stripped silence/deafen may have restored a channel floor
+	}
+}
+
 // recomputeMods rebuilds the entity's summed modifier maps + the prevents union from the CURRENT
 // active affect set. Called on any apply/stack/expire. Magnitude scales an ADDITIVE modifier
 // (poison's -2*stacks strength) and the stack count multiplies it; multiplicative modifiers compose
@@ -259,6 +300,15 @@ func (a *Affected) tickOnce(e *Entity, pulse uint64) {
 	snapshot := make([]*affectInstance, len(a.list))
 	copy(snapshot, a.list)
 	for _, inst := range snapshot {
+		// RE-ENTRANCY GUARD (#318 / security review). A DoT's own KILLING tick runs the whole death funnel
+		// INLINE — fireOnTick -> runOps -> deal_damage -> die -> respawnPlayer -> stripHostileAffects — right
+		// here inside this loop, and the strip removes hostile instances (this one, and any later snapshot
+		// entry) from the live set. Skip any instance no longer present, so we neither re-fire a hostile tick
+		// on the just-respawned player nor run the on_expire we deliberately suppressed during the strip. This
+		// also correctly skips an instance a sibling affect's on_expire/dispel removed earlier in the loop.
+		if a.byKey[keyFor(inst.def, inst.source)] != inst {
+			continue
+		}
 		if inst.def.hasTick && inst.def.tickInterval > 0 {
 			inst.sinceTick++
 			if inst.sinceTick >= inst.def.tickInterval {
