@@ -365,6 +365,29 @@ func (z *Zone) sendPrompt(s *session) {
 	s.send(promptFrameMarkup(z.promptMarkup(s))) // vitals-bearing prompt when `vitals on` (#40), else "> "
 }
 
+// promptAfterAsync emits the trailing prompt for an ASYNC command (one that returned with ctx.deferPrompt
+// set and posted its output back to the inbox, e.g. cmdWho's cross-shard path) — but ONLY if s is still a
+// LIVE, resident session in this zone (#371). The async window is unbounded (a roster read has a timeout),
+// so during it the player may have:
+//   - logged out / left, or walked to a sibling zone (intra-shard transfer) — delPlayer removed the map
+//     entry, so z.players no longer maps the character (or maps a different, reconnected *session); OR
+//   - entered a cross-shard handoff — the session is FROZEN but stays in z.players until it is reaped
+//     (drain.go initiateHandoff → later delPlayer), so it is still mapped for a bounded window. Its frames
+//     belong to the handoff machinery (its entity may be detached from the room), so we must not prompt it.
+//
+// The map-identity check catches the first class; the frozen/pending check catches the second — the same
+// "mid-handoff session's frames aren't ours" predicate flushHUD uses (vitals.go). The output frame itself is
+// still written unconditionally by the caller (a non-blocking send to an abandoned channel is harmless);
+// only the prompt is gated. Zone-goroutine only (single-writer over z.players and s).
+func (z *Zone) promptAfterAsync(s *session) {
+	if s == nil || s.frozen || s.pending {
+		return
+	}
+	if live, ok := z.players[s.character]; ok && live == s {
+		z.sendPrompt(s)
+	}
+}
+
 // diffItems emits the minimal GMCP Char.Items frames for one location and returns the new per-id snapshot
 // to store on the session. On the FIRST emit for the location (last == nil — a login, reconnect, or
 // handoff arrival) it sends the FULL Char.Items.List so a fresh client gets the whole panel in one frame;
