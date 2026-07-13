@@ -251,8 +251,9 @@ func (z *Zone) mailDeleteCmd(s *session, arg string) {
 
 // mailSendCmd sends a mail. The on-zone half captures the ENGINE-SET sender + sanitizes the recipient,
 // subject, and body (P8-A2 / P8-A7), then the off-zone half resolves the recipient against the directory
-// (refusing a never-seen name — P8-A8/recipient resolution), stores it, and — if the recipient is ONLINE
-// — publishes a "you have new mail" notify to their gate (the comms-bus sink). The tail is
+// (refusing a never-seen name — P8-A8/recipient resolution), stores it, and — if the recipient is
+// CURRENTLY CONNECTED per the presence roster (#325, not the placement) — publishes a "you have new mail"
+// notify to their gate (the comms-bus sink). The tail is
 // "<name> <subject> | <body>"; without a '|' the whole subject tail is the subject and the body is empty.
 func (z *Zone) mailSendCmd(s *session, rest string) {
 	name, tail := split(rest)
@@ -300,17 +301,17 @@ func (z *Zone) mailSendCmd(s *session, rest string) {
 		defer cancel()
 
 		// RECIPIENT RESOLUTION (P8-A8 / never-silently-lost): refuse a never-seen name. The directory is
-		// the epoch-authoritative existence check (a character that has ever logged in has a placement). A
+		// the epoch-authoritative EXISTENCE check (a character that has ever logged in has a placement). A
 		// directory MISS refuses; a directory ERROR degrades to accept-and-store (never lose mail on a
-		// transient Redis blip); NO directory (single-shard/bare) accepts-and-stores (durable-always).
-		online := false
+		// transient Redis blip); NO directory (single-shard/bare) accepts-and-stores (durable-always). This
+		// is the placement's job — existence/routing — and it stays here; the notify gate below no longer
+		// derives "online" from it (#325: a placement means "has ever logged in", not "is connected now").
 		if dir != nil {
-			shardID, found, derr := dir.PlayerShard(ctx, target)
+			_, found, derr := dir.PlayerShard(ctx, target)
 			if derr == nil && !found {
 				writeFrameTo(out, textFrame("There is no player by that name."))
 				return
 			}
-			online = derr == nil && found && shardID != ""
 		}
 
 		id, err := store.SendMail(ctx, target, from, subject, body)
@@ -332,17 +333,16 @@ func (z *Zone) mailSendCmd(s *session, rest string) {
 		// bus is a clean no-op. The notify carries NO body — just a ping — so it can't leak the mail text to
 		// a path that skips the recipient's own inbox scoping.
 		//
-		// `online` means "has a placement naming a shard", i.e. IS CURRENTLY HOSTED SOMEWHERE. Since #70 a
-		// clean logout tombstones the shard field, so a cleanly-quit recipient now yields shardID == "" and
-		// gets NO ping — the mail is still stored, and they read it on login. That is the behavior the name
-		// always promised and did not deliver.
-		//
-		// It is still not exactly "connected": a player who LINK-DIED (or whose shard crashed) keeps a shard
-		// field until their next login, so they are counted as hosted and get a ping they will only ever see
-		// on relog. Harmless, and the residue is discussed in #325. The right oracle for "currently
-		// connected" is the presence roster; this path deliberately never consults presence for ROUTING
-		// (P8-A4), but a notification gate is not routing.
-		if online && bus != nil {
+		// GATED ON PRESENCE, not placement (#325). The right oracle for "is the recipient connected right
+		// now" is the presence roster (rosterConnected); the directory placement answers only "exists / where
+		// to route" and persists across logout (and since #320 is written on every login), so gating on it
+		// pinged offline players. A notification gate is not ROUTING — the P8-A4 rule that a tell must never
+		// ROUTE off presence does not apply here — so consulting presence for this decision is correct. When
+		// presence is disabled or unreadable rosterConnected returns false and we send no ping; the mail is
+		// stored regardless and the recipient sees it when they next run `mail` (there is no automatic
+		// on-login notice — the ping is the only proactive signal, and it is a nicety). A ~1s-stale roster can miss a
+		// just-connected recipient or ping a just-departed one; both are self-correcting and harmless.
+		if bus != nil && z.rosterConnected(ctx, target) {
 			_ = bus.Publish(ctx, commbus.TellSubject(target), commbus.Message{
 				AuthorID:   from,
 				AuthorName: fromName,
