@@ -75,6 +75,42 @@ func TestReconcileRetryDeliversAfterTransientFullInbox(t *testing.T) {
 	t.Fatal("bounded retry never delivered the dropped reconcile into the inbox")
 }
 
+// TestReconcileRetryNotStarvedByCommsBudget is the #345 guard (reconcile direction): the zone-shape reconcile
+// retry draws from its OWN budget (maxReconcileRetryGoroutines), so a fully-exhausted COMMS republish budget
+// must not starve a reconcile retry. We pin the comms budget to zero and prove a dropped reconcile is still
+// re-delivered — the converse of TestCommsRepublishRetryNotStarvedByReconcileBudget.
+func TestReconcileRetryNotStarvedByCommsBudget(t *testing.T) {
+	withFastReconcileRetry(t, 5*time.Millisecond, 50)
+	src := content.NewMemSource()
+	src.SetPack(reloadTestPackMultiRoom())
+	bus := contentbus.NewMemBus()
+	defer bus.Close()
+	s := newReloadShard(t, src, bus)
+	z := s.Zone()
+	defer s.reloader.stop()
+
+	// Comms republish budget exhausted to zero. If reconcile shared it, the reconcile drop below would be abandoned.
+	oldComms := maxCommsRepublishRetryGoroutines
+	maxCommsRepublishRetryGoroutines = 0
+	t.Cleanup(func() { maxCommsRepublishRetryGoroutines = oldComms })
+
+	fillInbox(z)
+	s.reloader.reconcileZone(retryTestInvalidation())
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case m := <-z.inbox:
+			if rm, ok := m.(reconcileZoneMsg); ok && rm.zoneRef == "rt" {
+				return // reconcile retry ran independently of the exhausted comms budget (#345)
+			}
+		default:
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	t.Fatal("reconcile was starved by the exhausted COMMS republish budget — the budgets are not independent (#345)")
+}
+
 // TestReconcileRetryExhausts proves the retry gives up after a bounded number of attempts (rather than
 // spinning forever) when the inbox stays saturated — the in-flight goroutine terminates.
 func TestReconcileRetryExhausts(t *testing.T) {

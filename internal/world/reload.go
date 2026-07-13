@@ -29,9 +29,25 @@ var (
 	reconcileRetryAttempts = 5
 	// reconcileRetryBackoff is the base inter-attempt delay; attempt N waits N×this (linear backoff).
 	reconcileRetryBackoff = 50 * time.Millisecond
-	// maxReconcileRetryGoroutines caps concurrent retry goroutines so a reload storm against a saturated
-	// shard cannot spawn unbounded goroutines; past the cap a drop is logged and abandoned (re-run remedy).
+	// maxReconcileRetryGoroutines caps concurrent zone-shape reconcile retry goroutines so a reload storm
+	// against a saturated shard cannot spawn unbounded goroutines; past the cap a drop is logged and
+	// abandoned (re-run remedy).
 	maxReconcileRetryGoroutines int64 = 128
+	// maxCommsRepublishRetryGoroutines is the SEPARATE cap for comms hear-set republish retries (#345). Comms
+	// republish (retryRepublishComms) and zone-shape reconcile (retryReconcile) both re-post dropped hot-reload
+	// messages on short-lived goroutines, but they guard DIFFERENT failure classes — a lost republish leaves a
+	// stale, too-permissive hear-set (security-relevant, #75); a lost reconcile leaves a ghost room — so they
+	// draw from INDEPENDENT counters: a storm of one can no longer starve the other's retry-goroutine budget.
+	//
+	// Sized at PARITY with the reconcile cap, deliberately (distsys review). Both retries are 1:Z (one per
+	// hosted zone) after #269 coalesced a K-channel edit to a single republish per zone, but a channel edit
+	// fans to EVERY hosted zone and there is no hard cap on zones-per-shard (s.zones grows at runtime). A
+	// SMALLER comms budget would make the security-relevant class — whose "re-run the reload" remedy is the
+	// WEAKER one (an identical edit may emit no KindChannel invalidation, so the retry is effectively the
+	// primary remedy) — the FIRST to be truncated on a many-zone shard, exactly backwards. The extra ~128
+	// short-lived, briefly-sleeping goroutines cost is negligible, so the security-weighted path gets equal
+	// headroom rather than less.
+	maxCommsRepublishRetryGoroutines int64 = 128
 )
 
 // reload.go is the shard-side hot-reload applier (docs/PHASE4-PLAN.md §5). It subscribes to the
@@ -77,10 +93,15 @@ type reloader struct {
 	log     *slog.Logger
 
 	// Bounded-retry delivery of a dropped zone-shape reconcile (#191 PR 3/3). retryInFlight caps concurrent
-	// retry goroutines; retryDone is closed once at stop() to cancel any in-flight retry promptly.
+	// reconcile retry goroutines; retryDone is closed once at stop() to cancel any in-flight retry promptly.
 	retryInFlight atomic.Int64
-	retryDone     chan struct{}
-	stopOnce      sync.Once
+	// commsRetryInFlight is the SEPARATE counter for comms hear-set republish retries (#345): it caps
+	// retryRepublishComms independently of retryInFlight so a comms-republish storm and a zone-shape
+	// reconcile storm can't starve each other's retry budget (they guard different failure classes — a
+	// too-permissive hear-set vs a ghost room). Bounded by maxCommsRepublishRetryGoroutines.
+	commsRetryInFlight atomic.Int64
+	retryDone          chan struct{}
+	stopOnce           sync.Once
 
 	// Reconcile-on-join (#212 slice 4 PR D): appliedContentVersion is the monotonic content version this
 	// shard's in-memory prototypes reflect (seeded at boot from the version the content was loaded at). On
@@ -380,8 +401,9 @@ func (r *reloader) reloadChannel(inv contentbus.Invalidation) {
 // disarm, which precedes the zone's registry read. So the republish reflects all coalesced edits, not just the
 // first. The zone handler disarms the flag before recomputing, so an edit landing mid-republish re-arms and
 // gets its own pass.
-// This also collapses the retry fan-out from K:Z down to 1:Z, which is what keeps a KindChannel drop-storm
-// from starving the shared reconcile-retry budget (the caveat retryRepublishComms records).
+// This also collapses the retry fan-out from K:Z down to 1:Z, bounding how much of the comms republish retry
+// budget (its OWN commsRetryInFlight since #345, no longer shared with reconcile) a KindChannel drop-storm can
+// consume — at most one retry goroutine per hosted zone (the caveat retryRepublishComms records).
 func (r *reloader) republishCommsToZones(ref string) {
 	if r == nil || r.shard == nil {
 		return
@@ -482,18 +504,25 @@ func (r *reloader) retryReconcile(z *Zone, msg reconcileZoneMsg) {
 // review recorded: (a) the operator "re-run the reload" remedy is weaker than reconcile's — re-applying an
 // IDENTICAL edit may emit no KindChannel invalidation, so it can be a no-op; a genuinely stuck hear-set clears
 // only on the player's next toggle/handoff/relog. (b) A channel reload fans to every hosted zone, but the
-// coalescing flag (#269) collapses a K-channel edit to ONE republish (and so at most ONE retry) per zone, so
-// a KindChannel burst now consumes the shared maxReconcileRetryGoroutines budget 1:Z rather than K:Z — the
-// starvation window is bounded to the zone count. Past the cap the drop is abandoned with a loud warn.
-// Self-terminates on success, exhaustion, or reloader stop (retryDone).
+// coalescing flag (#269) collapses a K-channel edit to ONE republish (and so at most ONE retry) per zone.
+//
+// Retry budget (#345): comms republish draws from its OWN commsRetryInFlight counter, SEPARATE from the
+// reconcile budget (retryInFlight), each capped independently (both 128). #269 already collapsed a K-channel
+// burst to 1:Z republishes; the independent counter means neither a comms-republish storm nor a zone-shape
+// reconcile storm can exhaust the other's retry-GOROUTINE capacity (they guard different failure classes — a
+// too-permissive hear-set vs a ghost room). NOTE the independence is at the goroutine-budget layer only: both
+// classes still post into the SAME per-zone inbox, so within one saturated hot zone a reconcile storm can
+// still make a comms postOrDrop to that zone fail (and burn its attempts) — separate budgets decouple the
+// shard-wide goroutine pools, not per-zone inbox delivery. Past the cap the drop is abandoned with a loud
+// warn. Self-terminates on success, exhaustion, or reloader stop (retryDone).
 func (r *reloader) retryRepublishComms(z *Zone, ref string) {
 	// The coalescing flag (#269) stays ARMED across the retry: it means "a republish is queued OR being
 	// retried for this zone", so a concurrent channel edit correctly coalesces onto this in-flight one rather
 	// than racing a second delivery. Whoever stops carrying the republish must disarm it — the zone handler on
 	// a successful delivery, or this goroutine if it abandons the drop — or the flag would latch and suppress
 	// every future republish to this zone.
-	if r.retryInFlight.Add(1) > maxReconcileRetryGoroutines {
-		r.retryInFlight.Add(-1)
+	if r.commsRetryInFlight.Add(1) > maxCommsRepublishRetryGoroutines {
+		r.commsRetryInFlight.Add(-1)
 		z.commsRepublishArmed.Store(false)
 		r.log.Warn("hot-reload comms republish dropped (retry budget exhausted); this zone's comms hear-sets "+
 			"stay stale until re-run (a coalesced republish covers every channel edited in the burst, not just this one)",
@@ -501,7 +530,7 @@ func (r *reloader) retryRepublishComms(z *Zone, ref string) {
 		return
 	}
 	go func() {
-		defer r.retryInFlight.Add(-1)
+		defer r.commsRetryInFlight.Add(-1)
 		for attempt := 1; attempt <= reconcileRetryAttempts; attempt++ {
 			select {
 			case <-r.retryDone:

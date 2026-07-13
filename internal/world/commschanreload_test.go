@@ -171,6 +171,40 @@ func TestRetryRepublishCommsDeliversAfterDrop(t *testing.T) {
 	}
 }
 
+// TestCommsRepublishRetryNotStarvedByReconcileBudget is the #345 guard (comms direction): comms republish
+// retries draw from their OWN budget (maxCommsRepublishRetryGoroutines), so a fully-exhausted RECONCILE
+// budget must not starve a comms republish retry. We pin the reconcile budget to zero and prove a dropped
+// comms republish is still re-delivered. Before #345 both drew from maxReconcileRetryGoroutines, so this
+// would have been abandoned (a stale, too-permissive hear-set — the #75 security-relevant miss).
+func TestCommsRepublishRetryNotStarvedByReconcileBudget(t *testing.T) {
+	sh := coalesceShard(t)
+	z := sh.Zone()
+
+	// Reconcile budget exhausted to zero. If comms still shared it, the republish drop below would be abandoned.
+	oldRec := maxReconcileRetryGoroutines
+	maxReconcileRetryGoroutines = 0
+	t.Cleanup(func() { maxReconcileRetryGoroutines = oldRec })
+
+	// Fill the inbox so the fan-out's postOrDrop DROPS and hands the drop to bounded-retry.
+	for i := 0; i < cap(z.inbox); i++ {
+		z.inbox <- republishCommsMsg{ref: "filler"}
+	}
+	sh.reloader.republishCommsToZones("confession")
+
+	// The comms retry (its own budget) re-delivers once there is room, despite the zeroed reconcile budget.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case m := <-z.inbox:
+			if rc, ok := m.(republishCommsMsg); ok && rc.ref == "confession" {
+				return // comms retry ran independently of the exhausted reconcile budget (#345)
+			}
+		case <-deadline:
+			t.Fatal("comms republish was starved by the exhausted RECONCILE budget — the budgets are not independent (#345)")
+		}
+	}
+}
+
 // inboxHasRepublishComms non-blockingly drains z's inbox looking for a republishCommsMsg naming ref.
 func inboxHasRepublishComms(z *Zone, ref string) bool {
 	for {
@@ -271,10 +305,11 @@ func TestCoalesceFlagReleasedOnRetryExhaustion(t *testing.T) {
 	sh := coalesceShard(t)
 	z := sh.Zone()
 
-	// Force the retry budget to zero so the dropped fan-out is abandoned immediately (no retry goroutine).
-	old := maxReconcileRetryGoroutines
-	maxReconcileRetryGoroutines = 0
-	t.Cleanup(func() { maxReconcileRetryGoroutines = old })
+	// Force the COMMS republish budget to zero so the dropped fan-out is abandoned immediately (no retry
+	// goroutine). #345: comms republish draws from its own budget, distinct from the reconcile budget.
+	old := maxCommsRepublishRetryGoroutines
+	maxCommsRepublishRetryGoroutines = 0
+	t.Cleanup(func() { maxCommsRepublishRetryGoroutines = old })
 
 	// Fill the inbox so the fan-out's postOrDrop drops.
 	for i := 0; i < cap(z.inbox); i++ {
