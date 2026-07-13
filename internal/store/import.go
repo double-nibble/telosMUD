@@ -798,7 +798,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	for _, hd := range pk.HelpDefs {
 		body, err := json.Marshal(helpBody{
 			Title: hd.Title, Category: hd.Category, Keywords: hd.Keywords,
-			Body: hd.Body, SeeAlso: hd.SeeAlso,
+			Body: hd.Body, SeeAlso: hd.SeeAlso, MinRank: hd.MinRank,
 		})
 		if err != nil {
 			return fmt.Errorf("store: marshal help_def %s body: %w", hd.Ref, err)

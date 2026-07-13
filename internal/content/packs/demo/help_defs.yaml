@@ -60,3 +60,21 @@ help_defs:
       wanderers ({{FG_CYAN}}!{{RESET}}) and landmarks, with the room's description below it.
       Turn it back off with {{FG_CYAN}}overworld off{{RESET}} to walk the plains as ordinary rooms.
     see_also: [movement, getting_started]
+
+  # A STAFF-ONLY topic (#351): min_rank > 0 hides it from mortals in both the index and a direct
+  # `help staff` lookup (which falls through to "no help", never leaking the topic's existence). 1 is
+  # "any tier above the baseline" in the default ladder (player 0 < builder 20 < admin 40), so builders
+  # and admins see it and ordinary players cannot. This showcases documenting staff commands without
+  # exposing the text to players.
+  - ref: help:staff
+    title: Staff Commands
+    category: Staff
+    keywords: [staff, wiz, wizard, immortal]
+    min_rank: 1
+    body: |-
+      You wield builder/admin powers.  Inspect anyone or anything with {{FG_CYAN}}stat <target>{{RESET}},
+      reload content with {{FG_CYAN}}reload{{RESET}} and pull a fresh content version with {{FG_CYAN}}pull{{RESET}}, and
+      toggle see-all sight with {{FG_CYAN}}holylight{{RESET}} or hide yourself with {{FG_CYAN}}wizinvis{{RESET}}.
+      Change an account's trust tier with {{FG_CYAN}}promote <character> <tier>{{RESET}} and
+      {{FG_CYAN}}demote <character>{{RESET}}.  These verbs are invisible to ordinary players.
+    see_also: [getting_started]
