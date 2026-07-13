@@ -2,8 +2,10 @@ package commbus
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -76,6 +78,15 @@ type NATSJetStream struct {
 	stream jetstream.Stream
 	name   string // the stream name (COMMS_TELL | WORLD_EVENTS): the low-cardinality metric label
 	log    *slog.Logger
+
+	// nc is the underlying NATS connection. TODAY dialJetStream creates a DEDICATED connection per handle
+	// (newJetStreamFromConn is split out so a future wiring MAY share the transient bus's — hence "from
+	// conn"); either way Close does not close it (logical close only). Retained so the parkmon can subscribe
+	// to the broker's MAX_DELIVERIES advisory, a CORE NATS subject the jetstream context does not expose (#311).
+	nc *nats.Conn
+	// parkSub is the live MAX_DELIVERIES advisory subscription (#311); Unsubscribed on Close. nil when the
+	// subscribe failed (never fatal — the per-park ERROR log remains the operator backstop).
+	parkSub *nats.Subscription
 }
 
 // durableConsumerConfig builds the per-consumer JetStream config. Extracted from Consume so the production
@@ -157,12 +168,110 @@ func newJetStreamFromConn(nc *nats.Conn, streamName, subjectFilter string) (*NAT
 	if err != nil {
 		return nil, fmt.Errorf("commbus: ensure stream %s: %w", streamName, err)
 	}
-	return &NATSJetStream{
+	b := &NATSJetStream{
 		js:     js,
 		stream: stream,
 		name:   streamName,
 		log:    slog.With("component", "commbus", "transport", "jetstream", "stream", streamName),
-	}, nil
+		nc:     nc,
+	}
+	b.subscribeParkAdvisory()
+	return b, nil
+}
+
+// jsMaxDeliveriesAdvisoryPrefix is the broker's per-consumer "message parked (max deliveries exhausted)"
+// advisory subject prefix. The full subject is <prefix><stream>.<consumer>; the parkmon filters to this
+// stream's consumers with a trailing ">" (#311).
+const jsMaxDeliveriesAdvisoryPrefix = "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES."
+
+// parkAdvisorySubject is the MAX_DELIVERIES advisory subject filtered to streamName's consumers.
+func parkAdvisorySubject(streamName string) string {
+	return jsMaxDeliveriesAdvisoryPrefix + streamName + ".>"
+}
+
+// parkAdvisoryQueue is the SHARED queue-group name the parkmon subscribes under, so a park is counted
+// EXACTLY ONCE cluster-wide. Every process running a consumer on this stream (every world shard for
+// COMMS_TELL; every director for WORLD_EVENTS) subscribes to the same stream-wide advisory subject — a
+// plain subscription would fan the advisory to ALL of them and multiply the count by the process count.
+// A queue group makes the broker deliver each advisory to exactly one member.
+func parkAdvisoryQueue(streamName string) string {
+	return "telos-parkmon-" + streamName
+}
+
+// maxDeliveriesAdvisory is the subset of the broker's io.nats.jetstream.advisory.v1.max_deliveries payload
+// the parkmon reads (for the log; the counter is labeled by stream regardless).
+type maxDeliveriesAdvisory struct {
+	Stream     string `json:"stream"`
+	Consumer   string `json:"consumer"`
+	StreamSeq  uint64 `json:"stream_seq"`
+	Deliveries int    `json:"deliveries"`
+}
+
+// parkObserver is the park test-seam signature (see parkAdvisoryObserver).
+type parkObserver func(streamName, consumer string, streamSeq uint64)
+
+// parkAdvisoryObserver, when set, is invoked for every MAX_DELIVERIES advisory the parkmon processes — a
+// TEST SEAM so the gated broker test can assert the park path fired (the OTel counter itself is not readily
+// observable in a test). Unset (nil) in production. An atomic.Pointer, not a bare var, because it is READ on
+// the NATS delivery goroutine (handleParkAdvisory) while a gated test WRITES it from setup/cleanup — a plain
+// package var would be an unsynchronized read/write under the race detector.
+var parkAdvisoryObserver atomic.Pointer[parkObserver]
+
+// subscribeParkAdvisory wires the park counter off the broker's MAX_DELIVERIES advisory (#311). The
+// handler-side detection (in Consume) only fires when the MaxDeliver-th delivery lands in THIS process and
+// the handler runs — it misses a park via AckWait-expiry (a hung/lost-ack consumer) or across a restart. The
+// advisory fires for EVERY park regardless of which redelivery path exhausted the budget, so it is the
+// authoritative signal for WHICH parks happen and thus the right source for durable_parked_total (a park is
+// permanent loss — the counter is the alert route).
+//
+// It is an ALERT counter, not an exact one: the advisory is an ephemeral core-NATS message (no broker
+// buffering for a disconnected subscription), so a park published while NO group member is connected is not
+// replayed. The QUEUE GROUP — not the auto-resubscribe — is what bounds that window: the broker balances
+// each advisory to one CONNECTED member, so a single process reconnecting is invisible (another member takes
+// it); the miss window shrinks to "every member down simultaneously" (a full-fleet outage at the instant of
+// a park), which is negligible at fleet scale. Never fatal: a subscribe failure is logged and leaves the
+// per-park ERROR log (in Consume) as the operator backstop; the counter degrades, nothing crashes.
+func (b *NATSJetStream) subscribeParkAdvisory() {
+	if b.nc == nil {
+		return
+	}
+	subj := parkAdvisorySubject(b.name)
+	sub, err := b.nc.QueueSubscribe(subj, parkAdvisoryQueue(b.name), func(m *nats.Msg) {
+		b.handleParkAdvisory(m.Data)
+	})
+	if err != nil {
+		b.log.Warn("commbus: could not subscribe to the MAX_DELIVERIES park advisory; park COUNTING is degraded "+
+			"(the per-park ERROR log still fires for in-process parks)", "subject", subj, "err", err)
+		return
+	}
+	b.parkSub = sub
+	b.log.Debug("commbus: park advisory monitor subscribed", "subject", subj, "queue", parkAdvisoryQueue(b.name))
+}
+
+// handleParkAdvisory counts one parked message off the broker advisory (#311) and logs it as the incident it
+// is (permanent loss). Runs on a NATS client goroutine. A malformed payload still counts the park (the
+// advisory subject alone proves a park happened) but logs without the seq/consumer detail.
+func (b *NATSJetStream) handleParkAdvisory(data []byte) {
+	var adv maxDeliveriesAdvisory
+	if err := json.Unmarshal(data, &adv); err != nil {
+		// b.log already carries the stream field (slog.With at construction), so it is not repeated here.
+		b.log.Error("durable message PARKED (max deliveries) — it is LOST; advisory payload unparseable",
+			"err", err)
+		metrics.DurableParked(context.Background(), b.name)
+		notifyParkObserver(b.name, "", 0)
+		return
+	}
+	b.log.Error("durable message PARKED (max deliveries) — it is LOST (authoritative broker advisory)",
+		"consumer", adv.Consumer, "stream_seq", adv.StreamSeq, "deliveries", adv.Deliveries)
+	metrics.DurableParked(context.Background(), b.name)
+	notifyParkObserver(b.name, adv.Consumer, adv.StreamSeq)
+}
+
+// notifyParkObserver invokes the test seam if one is set (see parkAdvisoryObserver).
+func notifyParkObserver(streamName, consumer string, streamSeq uint64) {
+	if obs := parkAdvisoryObserver.Load(); obs != nil {
+		(*obs)(streamName, consumer, streamSeq)
+	}
 }
 
 // PublishDurable publishes msg on subj with the Nats-Msg-Id header set to msg.IdempotencyKey, so the
@@ -250,12 +359,15 @@ func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, b
 		default: // RetryTransient
 			// The final attempt failing means the broker will PARK this message — permanent loss, since
 			// the durable consumer is never deleted and so never replays it. That is an incident, not a
-			// routine drop: surface it loudly rather than losing the tell in silence.
+			// routine drop: surface it loudly with the author/seq context only this in-process path has.
+			// The COUNTER (durable_parked_total), however, is owned by the broker MAX_DELIVERIES advisory
+			// (subscribeParkAdvisory, #311), NOT incremented here — this path is best-effort (it misses an
+			// AckWait-expiry or across-restart park), and double-counting the advisory-visible in-process
+			// park would corrupt the count. So: rich log here, authoritative count there.
 			if attempt >= DefaultMaxDeliver {
 				b.log.Error("durable message PARKED after exhausting the redelivery budget — it is LOST",
 					"subject", m.Subject(), "author", msg.AuthorID, "seq", msg.Seq,
 					"attempts", attempt, "window", totalNakWindow())
-				metrics.DurableParked(context.Background(), b.name)
 			}
 			_ = m.NakWithDelay(nakBackoff(attempt))
 		}
@@ -267,8 +379,16 @@ func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, b
 	return &natsConsumer{cc: cc}, nil
 }
 
-// Close is a logical close: it does not close the shared NATS connection (the transient bus owns it).
-func (b *NATSJetStream) Close() error { return nil }
+// Close is a logical close: it does not close the shared NATS connection (the transient bus owns it). It
+// DOES tear down the park advisory subscription (#311) so a stopped handle stops counting (a fresh handle
+// subscribes its own parkmon at construction). Idempotent.
+func (b *NATSJetStream) Close() error {
+	if b.parkSub != nil {
+		_ = b.parkSub.Unsubscribe()
+		b.parkSub = nil
+	}
+	return nil
+}
 
 // natsConsumer adapts a jetstream.ConsumeContext to the Consumer interface.
 type natsConsumer struct{ cc jetstream.ConsumeContext }

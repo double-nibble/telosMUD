@@ -147,3 +147,55 @@ func TestJetStreamRealBoundedRedelivery(t *testing.T) {
 	assert.Equal(t, int64(DefaultMaxDeliver), poisonAttempts.Load(),
 		"real NATS must redeliver a transient-NAKing tell exactly MaxDeliver times, then park")
 }
+
+// TestJetStreamRealParkAdvisory is the gated end-to-end proof for #311: when a durable message PARKS
+// (exhausts MaxDeliver), the broker publishes a MAX_DELIVERIES advisory, the parkmon (subscribed at
+// NewJetStream time) receives it, and the AUTHORITATIVE park counter fires — regardless of the handler-side
+// best-effort path. The MemJetStream cannot produce a broker advisory, so this behavior is provable only
+// against a real NATS server (the hermetic wiring is pinned in jetstream_parkadvisory_test.go).
+func TestJetStreamRealParkAdvisory(t *testing.T) {
+	url := natsURL(t)
+
+	oldMax := DefaultMaxDeliver
+	DefaultMaxDeliver = 3 // shrink so the bounded run parks quickly
+	t.Cleanup(func() { DefaultMaxDeliver = oldMax })
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	target := "itparkadv-" + suffix
+	author := "bob-" + suffix
+	subj := DtellSubject(target)
+	ctx := context.Background()
+
+	// Observe the authoritative park path. Filter to OUR consumer so a sibling test's park on the same stream
+	// can't satisfy this assertion. Set BEFORE NewJetStream so the parkmon it subscribes is already observed.
+	parked := make(chan uint64, 4)
+	obs := parkObserver(func(stream, consumer string, seq uint64) {
+		if stream == jsStreamName && consumer == target {
+			parked <- seq
+		}
+	})
+	parkAdvisoryObserver.Store(&obs)
+	t.Cleanup(func() { parkAdvisoryObserver.Store(nil) })
+
+	js, err := NewJetStream(url) // subscribes the parkmon (queue group) for COMMS_TELL
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = js.Close() })
+
+	require.NoError(t, js.PublishDurable(ctx, subj, Message{
+		AuthorID: author, AuthorName: "Bob", Seq: 1, IdempotencyKey: NewIdempotencyKey(author, 1), Body: "poison",
+	}))
+
+	cons, err := js.Consume(subj, target, func(_ Message, _ bool) AckDecision {
+		return RetryTransient // always transient-fail -> parks after DefaultMaxDeliver
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cons.Stop() })
+
+	// The park (and thus the advisory) lands after the full bounded retry window. Allow generous slack.
+	select {
+	case <-parked:
+		// The authoritative broker advisory counted the park — #311 done-when.
+	case <-time.After(totalNakWindow() + 10*time.Second):
+		t.Fatal("the MAX_DELIVERIES advisory never reached the parkmon after the message parked (#311)")
+	}
+}
