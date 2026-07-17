@@ -294,4 +294,18 @@ func (z *Zone) cmdChannel(s *session, def *channelDef, text string) {
 		return
 	}
 	z.log.Debug("channel published", "channel", def.ref, "author", authorID, "seq", seq)
+
+	// CAPTURE for `history` (#348): after a successful publish, record the fully-RENDERED line in the
+	// shard's per-channel scrollback ring so it can be replayed by anyone def.canHear admits AT FETCH TIME
+	// (the P8-D3 invariant enforced in cmdHistory). history==0 is a content opt-OUT (no ring for this
+	// channel), so we skip capture entirely — byte-identical to a pre-#348 shard for a channel with no
+	// buffer. A nil store is a bare/storeless zone (never-fatal). NOTE: this ring is SHARD-LOCAL, so on a
+	// multi-shard fleet it holds only THIS shard's authored lines — partial by construction (deferred
+	// slices 2/3: cross-shard aggregation + durability); see channelhistory.go.
+	if def.history > 0 {
+		if h := z.channelHistory(); h != nil {
+			h.append(def.ref, def.history, chanHistoryEntry{authorID: authorID, body: line})
+			z.log.Debug("channel history captured (shard-local; partial on a multi-shard fleet)", "channel", def.ref, "author", authorID)
+		}
+	}
 }

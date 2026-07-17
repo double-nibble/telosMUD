@@ -261,6 +261,14 @@ type Shard struct {
 	// shard publishes to nowhere and is byte-identical to a pre-Phase-8 shard.
 	comms *commSource
 
+	// chanHistory is the shard's #348 SHARD-LOCAL channel scrollback (channelhistory.go): a bounded
+	// per-channel ring of recently-published lines, captured at the local publish path (cmdChannel) and
+	// read back via `history <channel>` behind a FETCH-TIME canHear gate. Always non-nil on a constructed
+	// shard; a bare/storeless test zone reaches nil via z.channelHistory() and simply captures/serves
+	// nothing (the never-fatal degradation). PARTIAL BY CONSTRUCTION on a multi-shard fleet — see the file
+	// header — because a shard only sees its OWN players' lines; cross-shard aggregation is a deferred slice.
+	chanHistory *chanHistory
+
 	// presence is the shard's Phase-8 cross-shard `who` plumbing (presence.go): the resident-player set
 	// THIS shard hosts plus the background loop that publishes it to the shared presence roster (Redis in
 	// prod). Always non-nil (DISABLED — a nil roster, every method a no-op — until WithPresence wires one),
@@ -388,6 +396,10 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		// Comms SOURCE plumbing (comm.go), DISABLED until WithComms wires a live RoleWorld bus — a
 		// shard with no comms bus publishes channel lines to nowhere (the never-fatal degradation).
 		comms: newCommSource(),
+		// SHARD-LOCAL channel scrollback (channelhistory.go, #348): a bounded per-channel recent-lines ring
+		// captured at the local publish path. Always non-nil (empty until a channel with history>0 is spoken
+		// on); shared read-only-handle by every hosted zone via z.channelHistory(), exactly like comms.
+		chanHistory: newChanHistory(),
 		// Cross-shard presence tracker (presence.go), DISABLED until WithPresence wires a live roster — a
 		// shard with no roster does no presence I/O and `who` reads the zone-local list (pre-8.4 behavior).
 		presence: newPresenceTracker(),

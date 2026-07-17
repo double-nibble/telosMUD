@@ -22,12 +22,77 @@ import (
 func commsCommands() []*Command {
 	return []*Command{
 		{Name: "channels", Run: cmdChannels},
+		{Name: "history", Run: cmdHistory},
 		{Name: "ignore", Run: cmdIgnore},
 		{Name: "afk", Run: cmdAFK},
 		// `tells` (alias `replay`) — the in-session recent-tells ring (#349, tellhistory.go). A mortal
 		// convenience (no MinRank); pair-privacy holds by construction (the ring is per-session).
 		{Name: "tells", Aliases: []string{"replay"}, Run: cmdTells},
 	}
+}
+
+// cmdHistory replays a channel's recent SHARD-LOCAL scrollback (`history <channel>`) for #348. It is the
+// retrieval half the P8-D3 channel_def deferred, and it honors that def's load-bearing invariant: the
+// fetch is gated on def.canHear against the LIVE entity AT FETCH TIME (step b), so a player who LOST hear
+// access cannot replay lines from when they had it. It gates on canHear ONLY — a player who toggled the
+// channel OFF is still a member and may read history (the toggle is a display preference, not access).
+//
+// Existence is not secret (the `channels` list already shows every channel + its access state), so an
+// unknown ref reports plainly. The buffer is SHARD-LOCAL and thus PARTIAL on a multi-shard fleet
+// (channelhistory.go) — this command serves only what the local shard captured.
+func cmdHistory(c *Context) error {
+	z, s := c.z, c.s
+	ref := strings.ToLower(strings.TrimSpace(c.Rest()))
+	if ref == "" {
+		c.Send("Usage: history <channel>")
+		return nil
+	}
+	// (a) RESOLVE the channel from the loaded channel_defs (mirrors cmdChannels). Existence is not secret.
+	def := z.channelDefs().get(ref)
+	if def == nil {
+		c.Send("There is no channel called '" + ref + "'.")
+		return nil
+	}
+	// (b) FETCH-TIME GATE (the P8-D3 invariant): evaluate the LIVE hear predicate against the LIVE entity
+	// now, NOT "was a member when the line was said". A player who dropped below the channel's access
+	// (a stripped flag / an attribute back under the floor) must be refused and see ZERO privileged lines.
+	if !def.canHear(s.entity) {
+		c.Send("You can't hear that channel.")
+		return nil
+	}
+	// Degrade cleanly on a bare/storeless zone (no shard) — never panic (the empty-engine invariant).
+	h := z.channelHistory()
+	if h == nil {
+		c.Send("No recent history.")
+		return nil
+	}
+	// (c) Snapshot the ring and re-apply the FETCHING player's ignore set, so history matches the LIVE
+	// gate funnel (which drops an ignored author's line before the player ever sees it — P8-A6). Applying
+	// it here keeps replay and live delivery consistent for the same reader.
+	entries := h.snapshot(def.ref)
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if s.comms.ignored(e.authorID) {
+			continue
+		}
+		lines = append(lines, e.body)
+	}
+	// (d) Render: the bodies are pre-rendered (format + color intact), joined under a header. Nothing
+	// buffered (a history==0 channel, an empty ring, or every line ignored) reports plainly.
+	if len(lines) == 0 {
+		c.Send("No recent history on " + def.name + ".")
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("Recent history on ")
+	b.WriteString(def.name)
+	b.WriteString(":")
+	for _, ln := range lines {
+		b.WriteByte('\n')
+		b.WriteString(ln)
+	}
+	c.Send(b.String())
+	return nil
 }
 
 // cmdChannels lists the player's channels with on/off state (bare `channels`) or toggles one

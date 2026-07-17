@@ -286,6 +286,17 @@ func (z *Zone) commSourceOrNil() *commSource {
 	return z.shard.comms
 }
 
+// channelHistory returns the shard's SHARD-LOCAL channel-scrollback store (#348, channelhistory.go), or
+// nil on a bare zone (no shard). The publish path uses it to CAPTURE a rendered line and the `history`
+// command uses it to serve buffered lines; nil means "no scrollback here" — a storeless unit zone
+// captures/serves nothing and never panics (the never-fatal degradation, mirroring commSourceOrNil).
+func (z *Zone) channelHistory() *chanHistory {
+	if z.shard == nil {
+		return nil
+	}
+	return z.shard.chanHistory
+}
+
 // tellJS returns the shard's durable-tell JetStream handle, or nil on a bare zone. A shard always has
 // a non-nil handle (DisabledJetStream when off), so a real run never sees nil here.
 func (z *Zone) tellJS() commbus.JetStream {
