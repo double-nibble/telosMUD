@@ -178,6 +178,17 @@ type Living struct {
 	// first statement, released only by respawnPlayer — a dead mob is extracted and never returns.
 	// Transient, never persisted. COW-safe: written through mutableLiving.
 	dying bool
+	// protectedUntil is the pulse the player's post-respawn SPAWN-PROTECTION window (#394) elapses on:
+	// while z.pulses.pulse < protectedUntil, guardHarmful refuses every harmful op aimed at this player,
+	// ACTOR-AGNOSTICALLY. It cannot live in the PvP policy because pvpAllowed short-circuits `return true`
+	// for a mob attacker before the safe-room veto (pvp.go), so a mob's kill-then-apply would still land a
+	// debuff on the just-respawned player even in a safe temple (#318 scenario 1). Set by respawnPlayer;
+	// cleared to 0 the instant this player itself initiates a harmful op (the guardHarmful cancel hook —
+	// the standard "acting hostilely drops the shield" rule) or when it simply lapses. Only ever set on a
+	// player (isPlayer-gated). Transient — never persisted, and meaningless across a handoff (the pulse
+	// counter is per-zone; a lost window fails toward harm-allowed, acceptable for a seconds-long grace).
+	// COW-safe: written through mutableLiving. 0 = not protected.
+	protectedUntil uint64
 	// fighting is the current combat target (a live entity), nil when not fighting. Set by startFight
 	// (combat.go) and cleared by stopFight; the per-zone round driver swings every posFighting entity
 	// at its `fighting` target each PULSE_VIOLENCE. Transient — never persisted (combat drops on a

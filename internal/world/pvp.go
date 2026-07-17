@@ -93,6 +93,35 @@ func pvpAllowed(actor, target *Entity) bool {
 	return hasFlag(actor, flagPvP) && hasFlag(target, flagPvP)
 }
 
+// --- Spawn protection (#394) -----------------------------------------------------------------------
+
+// spawnProtectionPulses is the length of the post-respawn SPAWN-PROTECTION window (#394) in heartbeat
+// pulses. It is a package var (not const) so it is operator-tunable (#368, "config wiring may be
+// minimal" — a real per-pack knob is a follow-up) and so a test can shrink it to drive the open->expire
+// boundary deterministically. Default ~5s at the heartbeat cadence; 0 disables the window entirely.
+var spawnProtectionPulses = pulsesPerSecond * 5
+
+// spawnProtected reports whether e is a player still inside its post-respawn spawn-protection window.
+// False for a nil/mob target, or a player whose window has lapsed or was never set — so a mob target
+// (which pvpAllowed would let a mob harm anyway) is never treated as protected. Zone-goroutine read.
+func (z *Zone) spawnProtected(e *Entity) bool {
+	return e != nil && e.living != nil && isPlayer(e) && e.living.protectedUntil > z.pulses.pulse
+}
+
+// clearSpawnProtection drops e's spawn-protection window because e took a hostile action — the standard
+// MUD rule that acting hostilely forfeits your shield. A no-op unless e is a currently-protected player,
+// so it can be called unconditionally on every harmful op's actor. Emits a one-line notice on the actual
+// drop. COW-safe (written through mutableLiving).
+func (z *Zone) clearSpawnProtection(e *Entity) {
+	if !z.spawnProtected(e) {
+		return
+	}
+	mutableLiving(e).protectedUntil = 0
+	if s, ok := sessionOf(e); ok {
+		s.send(textFrame("Your spawn protection fades as you take hostile action."))
+	}
+}
+
 // zonePvpPolicy returns the pack's Lua pvp_allowed body + the zone runtime to run it on, if a
 // policy is defined and a live zone is reachable from the actor/target. Empty body => use the
 // engine default.

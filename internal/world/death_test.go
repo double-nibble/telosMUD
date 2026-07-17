@@ -600,6 +600,219 @@ func TestLethalDotTickRespawnStripsInline(t *testing.T) {
 	}
 }
 
+// --- Spawn protection (#394) -------------------------------------------------------------------
+
+// spawnProtZone builds a demo zone with a low-hp player standing in the market (a non-safe room), plus a
+// helper to make a mob actor's harmful-op ctx. spawnProtectionPulses is shrunk for a deterministic boundary.
+func spawnProtSetup(t *testing.T) (*Zone, *session) {
+	t.Helper()
+	z := newDemoZone("midgaard", newProtoCache())
+	z.combatRand = rand.New(rand.NewSource(1))
+	market := z.rooms["midgaard:room:market"]
+	s := &session{character: "Victim", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(s, "Victim")
+	Move(s.entity, market)
+	z.players["Victim"] = s
+	return z, s
+}
+
+// mobHarmCtx returns a harmful-op ctx whose actor is a fresh mob in the player's room.
+func mobHarmCtx(z *Zone, victim *Entity, name string) *effectCtx {
+	mob := combatMob(z, victim, name, "", 100)
+	return &effectCtx{z: z, actor: mob, source: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(2))}
+}
+
+// TestSpawnProtectionWindowOpenThenExpires is the deterministic open->expire boundary: respawnPlayer opens
+// the window; a mob's harm is refused while it is open; after exactly spawnProtectionPulses ticks it lapses
+// and the SAME harm now lands.
+func TestSpawnProtectionWindowOpenThenExpires(t *testing.T) {
+	old := spawnProtectionPulses
+	spawnProtectionPulses = 3
+	defer func() { spawnProtectionPulses = old }()
+
+	z, s := spawnProtSetup(t)
+	z.respawnPlayer(s.entity)
+	if !z.spawnProtected(s.entity) {
+		t.Fatal("window should be open immediately after respawn")
+	}
+	setResourceCurrent(s.entity, "hp", 50)
+	c := mobHarmCtx(z, s.entity, "goblin")
+
+	// While protected: a mob's harm is a clean no-op (0 damage, hp untouched).
+	if dealt := dealDamage(c, s.entity, 30, "physical"); dealt != 0 {
+		t.Fatalf("protected player took %d damage, want 0", dealt)
+	}
+	if got := resourceCurrent(s.entity, "hp"); got != 50 {
+		t.Fatalf("protected player hp = %d, want 50 (harm refused)", got)
+	}
+
+	// Advance to the boundary: after exactly spawnProtectionPulses ticks the window is closed.
+	for i := uint64(0); i < spawnProtectionPulses; i++ {
+		z.pulses.tick()
+	}
+	if z.spawnProtected(s.entity) {
+		t.Fatal("window should have expired after spawnProtectionPulses ticks")
+	}
+	if dealt := dealDamage(c, s.entity, 30, "physical"); dealt <= 0 {
+		t.Fatalf("post-expiry harm dealt %d, want > 0 (window lapsed, harm lands)", dealt)
+	}
+	if got := resourceCurrent(s.entity, "hp"); got >= 50 {
+		t.Fatalf("post-expiry hp = %d, want < 50 (damage landed after the window lapsed)", got)
+	}
+}
+
+// TestSpawnProtectionDropsOnProtectedPlayerHostileAction is the cancellation hook: a just-respawned player
+// who INITIATES a harmful op forfeits its own window immediately, and harm from a mob then lands on it.
+func TestSpawnProtectionDropsOnProtectedPlayerHostileAction(t *testing.T) {
+	old := spawnProtectionPulses
+	spawnProtectionPulses = 100 // long enough that only the cancel hook can drop it
+	defer func() { spawnProtectionPulses = old }()
+
+	z, s := spawnProtSetup(t)
+	z.respawnPlayer(s.entity)
+	if !z.spawnProtected(s.entity) {
+		t.Fatal("window should be open after respawn")
+	}
+
+	// The protected PLAYER attacks a mob (a harmful op it is the actor of) -> its shield drops.
+	target := combatMob(z, s.entity, "goblin", "", 100)
+	pc := &effectCtx{z: z, actor: s.entity, source: s.entity, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(3))}
+	if dealt := dealDamage(pc, target, 10, "physical"); dealt <= 0 {
+		t.Fatalf("protected player's own attack dealt %d, want > 0 (its harm is not blocked)", dealt)
+	}
+	if z.spawnProtected(s.entity) {
+		t.Fatal("window should drop the instant the protected player acts hostilely")
+	}
+
+	// A mob's harm now lands on the (no-longer-protected) player.
+	setResourceCurrent(s.entity, "hp", 50)
+	c := mobHarmCtx(z, s.entity, "orc")
+	if dealt := dealDamage(c, s.entity, 30, "physical"); dealt <= 0 {
+		t.Fatalf("harm on the unprotected player dealt %d, want > 0", dealt)
+	}
+}
+
+// TestSpawnProtectionSelfHarmExempt proves a protected player's OWN self-directed harmful op (actor==target)
+// is neither refused nor a cancellation trigger — the window survives a self-effect.
+func TestSpawnProtectionSelfHarmExempt(t *testing.T) {
+	old := spawnProtectionPulses
+	spawnProtectionPulses = 100
+	defer func() { spawnProtectionPulses = old }()
+
+	z, s := spawnProtSetup(t)
+	z.respawnPlayer(s.entity)
+	setResourceCurrent(s.entity, "hp", 50)
+
+	// Self-harm: actor == target. It is exempt from both the refusal and the cancel hook.
+	sc := &effectCtx{z: z, actor: s.entity, source: s.entity, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(4))}
+	if dealt := dealDamage(sc, s.entity, 10, "physical"); dealt <= 0 {
+		t.Fatalf("self-harm dealt %d, want > 0 (self is exempt from spawn protection)", dealt)
+	}
+	if !z.spawnProtected(s.entity) {
+		t.Fatal("a self-directed harmful op must NOT drop the player's own spawn protection")
+	}
+}
+
+// TestSpawnProtectionRefusesMobLuaKillThenApply is the #318 scenario-1 clincher: a MOB's Lua does
+// target:damage{999} (kill + respawn inline) then a fresh target:apply_affect{debuff} on the now-respawned
+// player. The debuff lands NOTHING — actor-agnostic spawn protection refuses it in BOTH a safe and a
+// non-safe respawn room. Safe-room alone can't close it: a mob's harm short-circuits pvpAllowed BEFORE the
+// safe-room veto, so a mob's post-respawn apply would otherwise land even in a safe temple.
+func TestSpawnProtectionRefusesMobLuaKillThenApply(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		safe bool
+	}{
+		{"non-safe room", false},
+		{"safe room", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			z := newDemoZone("midgaard", newProtoCache())
+			z.combatRand = rand.New(rand.NewSource(1))
+			z.defs.affect.register("weaken", &affectDef{
+				ref: "weaken", name: "Weakened", stacking: stackRefresh, maxStacks: 1, duration: 20,
+				modifiers: []affectModifier{{attr: "max_hp", add: true, value: -5}},
+			})
+			room := z.rooms["midgaard:room:market"]
+			if tc.safe {
+				if room.room.namedFlags == nil {
+					room.room.namedFlags = map[string]bool{}
+				}
+				room.room.namedFlags[flagSafe] = true
+			}
+			s := &session{character: "Victim", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+			z.newPlayerEntity(s, "Victim")
+			s.entity.short = "Victim"
+			Move(s.entity, room)
+			z.players["Victim"] = s
+			setResourceCurrent(s.entity, "hp", 10) // low enough that the 999 hit empties the pool
+
+			mob := combatMob(z, s.entity, "goblin", "", 100)
+			z.lua.L.SetGlobal("target", z.lua.newHandle(s.entity))
+
+			// Kill + respawn inline (a mob's harm lands even in a safe room — the #318 vulnerability).
+			if err := z.lua.runChunkWithSelf("kill", `target:damage{amount=999, type="physical"}`, mob); err != nil {
+				t.Fatal(err)
+			}
+			if position(s.entity) == posDead {
+				t.Fatal("victim left dead (respawn did not run)")
+			}
+			// A fresh, SEPARATE apply on the just-respawned player — must be refused by spawn protection.
+			if err := z.lua.runChunkWithSelf("dbf", `target:apply_affect("weaken")`, mob); err != nil {
+				t.Fatal(err)
+			}
+			if hasAffect(s.entity, "weaken") {
+				t.Fatalf("[%s] a post-respawn debuff landed on a spawn-protected player", tc.name)
+			}
+			if got, full := resourceCurrent(s.entity, "hp"), resourceMax(s.entity, "hp"); got != full {
+				t.Fatalf("[%s] post-respawn hp = %d, want full %d (harm during window)", tc.name, got, full)
+			}
+		})
+	}
+}
+
+// TestSpawnProtectionNoAggroWedgeOnSwingPath drives the REAL swing pipeline (resolveSwing), not a direct
+// dealDamage: an aggressive mob swinging at a protected player deals 0 while the window is open, but keeps
+// its target and fighting position (no aggro wedge), and its swing lands real damage once the window lapses.
+func TestSpawnProtectionNoAggroWedgeOnSwingPath(t *testing.T) {
+	old := spawnProtectionPulses
+	spawnProtectionPulses = 3
+	defer func() { spawnProtectionPulses = old }()
+
+	z, s := combatZone(t)
+	z.defs.combat.register("mobatk", autoHitProfile(an("$actor.damroll"))) // always hits; +0 bonus
+	mob := combatMob(z, s.entity, "goblin", "mobatk", 100)
+	equipWeapon(mob, &Weapon{diceNum: 6, diceSize: 1, damageType: "slash"}) // 6d1 = 6 raw
+	z.startFight(mob, s.entity)
+
+	z.respawnPlayer(s.entity) // open the window at the real chokepoint
+	if !z.spawnProtected(s.entity) {
+		t.Fatal("player should be protected after respawn")
+	}
+	full := resourceMax(s.entity, "hp")
+
+	// Swing during the window: 0 damage, but the fight link + fighting position survive (no wedge).
+	z.resolveSwing(mob, s.entity, 0, rand.New(rand.NewSource(1)), newBudget())
+	if got := resourceCurrent(s.entity, "hp"); got != full {
+		t.Fatalf("protected player took %d damage from a swing, want 0", full-got)
+	}
+	if mob.living.fighting != s.entity {
+		t.Fatal("mob dropped its target while swinging at a protected player (aggro wedge)")
+	}
+	if position(mob) != posFighting {
+		t.Fatal("mob left the fighting position (aggro wedge)")
+	}
+
+	// After the window lapses, the SAME swing lands real damage.
+	for i := uint64(0); i < spawnProtectionPulses; i++ {
+		z.pulses.tick()
+	}
+	z.resolveSwing(mob, s.entity, 0, rand.New(rand.NewSource(1)), newBudget())
+	if got := resourceCurrent(s.entity, "hp"); got >= full {
+		t.Fatalf("post-window hp = %d, want < %d (swing lands after the window lapses)", got, full)
+	}
+}
+
 // --- Threat list + retargeting -----------------------------------------------------------------
 
 // TestThreatPicksHighestThreatTarget proves a mob fighting in a room re-targets the attacker with the

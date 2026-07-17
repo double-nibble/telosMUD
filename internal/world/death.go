@@ -393,9 +393,16 @@ func (z *Zone) respawnPlayer(victim *Entity) {
 	}
 	setPosition(victim, posStanding)
 	// Release die()'s entry latch (#69): the player is alive again, so a LATER death must run the full
-	// funnel. A mob never reaches here — it is corpsed and extracted with the latch still held.
+	// funnel. A mob never reaches here — it is corpsed and extracted with the latch still held. Also OPEN
+	// the spawn-protection window (#394): for the seconds after respawn, guardHarmful refuses every harmful
+	// op aimed at this player, actor-agnostically — closing #318 scenario 1 (a mob's kill-then-apply, which
+	// short-circuits pvpAllowed before the safe-room veto). The window is a pulse deadline (deterministic in
+	// the direct-dispatch unit harness) and drops early the instant the player itself acts hostilely.
 	if l := mutableLiving(victim); l != nil {
 		l.dying = false
+		if spawnProtectionPulses > 0 {
+			l.protectedUntil = z.pulses.pulse + spawnProtectionPulses
+		}
 	}
 	// NOTE: a player slain while already standing in the start room respawns IN PLACE — location is
 	// unchanged. Anything trying to detect "did my target just die?" across a sub-call must therefore
