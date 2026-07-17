@@ -107,12 +107,33 @@ func (p *Pool) LoadCharacter(ctx context.Context, name string) (world.CharSnapsh
 func (p *Pool) CreateCharacter(ctx context.Context, name, zoneRef, roomRef string) (world.PersistID, error) {
 	id := uuid.New()
 	emptyState, _ := json.Marshal(world.StateJSON{})
-	_, err := p.pool.Exec(ctx,
+	// Character insert + its creation-audit row in ONE transaction (#350). This is the dev/login create
+	// path (no owning account), so the actor is the SYSTEM (NULL actor_id) — nobody promoted or purchased
+	// this character; the engine created it on first login.
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO characters (id, name, zone_ref, room_ref, state_version, state, last_login_at)
 		 VALUES ($1, $2, $3, $4, 0, $5, now())`,
-		id, name, nullStr(zoneRef), nullStr(roomRef), emptyState)
-	if err != nil {
+		id, name, nullStr(zoneRef), nullStr(roomRef), emptyState); err != nil {
 		return "", fmt.Errorf("store: create character %q: %w", name, err)
+	}
+	if err := appendAuditTx(ctx, tx, world.AuditEvent{
+		SubjectType: world.AuditSubjectCharacter,
+		SubjectID:   id.String(),
+		SubjectName: name,
+		ActorType:   world.AuditActorSystem,
+		EventKind:   world.AuditKindCharacterCreated,
+		Payload:     world.AuditPayload(map[string]any{"zone": zoneRef, "room": roomRef}),
+	}); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("store: commit: %w", err)
 	}
 	return world.PersistID(id.String()), nil
 }

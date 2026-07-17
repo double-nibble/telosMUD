@@ -81,6 +81,10 @@ func registerCommands() []*Command {
 	// Mail (Phase 8.7): the durable inbox. Registered last with the other comms commands so it never
 	// shadows a movement/look/say verb.
 	base = append(base, mailCommands()...)
+	// Audit (#350): the durable permanent-change trail. Bare `audit` is a mortal self-view; `audit <name>`
+	// is staff-gated inside the handler. Registered last with the other low-priority commands so it never
+	// shadows a movement/look/say verb.
+	base = append(base, auditCommands()...)
 	// Screen utilities (#31): `clear` — engine-owned raw-ANSI output, universal. Low-priority so `cl` still
 	// abbreviates to `close`.
 	base = append(base, screenCommands()...)

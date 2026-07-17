@@ -135,6 +135,7 @@ func opAdvanceTrack(c *effectCtx, op *effectOp) error {
 	step := trackStep(c.target, op.track)
 	subject := c.target
 	for step < len(def.thresholds) && progress >= def.thresholds[step] {
+		crossed := def.thresholds[step] // the threshold this iteration crosses (before step++ advances it)
 		step++
 		if grants := def.steps[step-1]; len(grants) > 0 {
 			runOps(c, grants) // the step grant op-list runs on the same ctx (c.target = the advancing entity)
@@ -146,6 +147,11 @@ func opAdvanceTrack(c *effectCtx, op *effectOp) error {
 		if def.levelAttr != "" {
 			c.z.fireEvent(c, evOnLevel, subject, nil, float64(step))
 		}
+		// Durable audit (#350): record each NEWLY-crossed step exactly once. dedup_key is "<track>:<step>"
+		// (the stored high-water step), so a re-advance that crosses no new step never reaches here and a
+		// replay of an already-recorded step dedups on the unique index. A mob subject / not-yet-saved
+		// player / storeless shard is a no-op (the helper guards).
+		c.z.auditTrackStep(subject, op.track, step, crossed)
 	}
 	setTrackStep(c.target, op.track, step)
 	return nil

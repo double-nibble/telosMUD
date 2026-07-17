@@ -28,7 +28,13 @@ func opModifyAttributeBase(c *effectCtx, op *effectOp) error {
 	if !guardCrossPlayerWrite(c, c.target) {
 		return nil // gated cross-player write: clean no-op
 	}
-	setAttrBase(c.target, op.attr, attrBaseValue(c.target, op.attr)+op.amount)
+	// Capture the pre-write base so the audit row carries old/new/delta (#350). Read BEFORE setAttrBase.
+	old := attrBaseValue(c.target, op.attr)
+	newVal := old + op.amount
+	setAttrBase(c.target, op.attr, newVal)
+	// Durable audit (#350): a permanent attribute-base grant is a tracked event. Enqueued off the zone
+	// goroutine; a no-op for a mob target, a not-yet-saved player, or a storeless shard (the helper guards).
+	c.z.auditAttributeBase(c.target, op.attr, old, newVal)
 	// A grant op can cross a channel's access predicate (here a min_attr floor), so re-publish the
 	// target's comms config — the same mid-session hear-set refresh the affect apply/expire sites do.
 	// Without it a player who drops below (or rises to) a channel's floor keeps a stale subscription

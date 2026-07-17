@@ -303,10 +303,12 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	var charStore world.CharacterStore
 	var defSource content.DefinitionSource
 	var mailStore world.MailStore
+	var auditSink world.AuditSink
 	if livePool != nil {
 		charStore = livePool
 		defSource = livePool
 		mailStore = livePool // Phase 8.7: the same pool backs the durable mail inbox (nil => mail disabled)
+		auditSink = livePool // #350: the SAME pool backs the durable audit trail (nil => auditing disabled)
 	}
 
 	// Optional content bus for hot reload (slice 4.3). NATS unreachable => hot reload DISABLED
@@ -376,6 +378,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithScopeBus(scopeBus, lc.Regions).
 			WithScopeSnapshot(scopeSnap(livePool)). // #44: seed each zone's scope replica from the store on join
 			WithMail(mailStore).
+			WithAudit(auditSink). // #350: durable audit trail (nil pool => auditing disabled)
 			WithTells(tellJS), nil
 	}
 	dir := directory.NewRedis(rdb, "telos")
@@ -471,6 +474,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 		WithOccupancyPublisher(dir).  // #42: heartbeat each hosted zone's player count for weighted placement
 		WithRebalance(dir).           // #42: execute the coordinator's per-zone rebalance directives
 		WithMail(mailStore).
+		WithAudit(auditSink). // #350: durable audit trail (nil pool => auditing disabled)
 		WithTells(tellJS), chooseDrainTarget
 }
 
