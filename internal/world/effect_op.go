@@ -484,6 +484,29 @@ func guardHarmful(c *effectCtx, target *Entity) bool {
 		}
 		return false
 	}
+	// SPAWN-PROTECTION CANCELLATION (#394): a just-respawned player who INITIATES a harmful op forfeits
+	// their OWN protection window — the standard "acting hostilely drops the shield" rule. guardHarmful is
+	// the one funnel every harmful op (melee swing, spell, Lua h:damage, cross-player write) passes through,
+	// so no attack path can forget to drop it. Attempt-based: the window drops even if THIS op is then
+	// refused for another reason. Skipped for self-harm (actor==target) so a protected player's own
+	// self-effect never drops the shield. Placed before enforcement so a protected player attacking another
+	// protected player correctly loses its own shield AND is still denied by the target's.
+	if c.actor != target {
+		c.z.clearSpawnProtection(c.actor)
+	}
+	// SPAWN-PROTECTION ENFORCEMENT (#394): harm aimed at a player still inside its post-respawn window is
+	// refused cleanly (no partial effect). ACTOR-AGNOSTIC — a MOB attacker short-circuits pvpAllowed
+	// (pvp.go: mob->player is always allowed) BEFORE the safe-room veto, so this cannot live in the PvP
+	// policy; it sits here in the one in-op funnel, ahead of the mob-target no-op below. spawnProtected is
+	// false for a mob target, so mob targets still fall through to the PvE no-op. Self-harm is exempt.
+	if c.actor != target && c.z.spawnProtected(target) {
+		c.z.log.Debug("spawn-protection: harmful op refused (respawn window)",
+			"actor", c.actor.short, "target", target.short, "until", target.living.protectedUntil)
+		if s, has := sessionOf(c.actor); has {
+			s.send(textFrame(target.Name() + " is protected and cannot be harmed yet."))
+		}
+		return false
+	}
 	// PvP only: against a non-player (a mob) the gate is a no-op (always allowed).
 	if !isPlayer(target) {
 		return true
@@ -513,7 +536,16 @@ func guardCrossPlayerWrite(c *effectCtx, target *Entity) bool {
 		return false
 	}
 	if target == c.actor || !isPlayer(target) {
-		return true // self-write or a mob/ally write — not a cross-player harm vector
+		// A self-write or a mob/ally write is not a cross-player harm vector — it proceeds ungated.
+		// But a NON-self harmful write (a mob target: dispel/remove_affect/modify_resource on a monster)
+		// is still a hostile action by the actor, so it must forfeit the actor's own spawn-protection
+		// window (#394) — uniformly with dealDamage/applyDebuff, which drop it via guardHarmful. Without
+		// this a protected player could strip a boss's buffs or drain its pool with impunity through the
+		// window while a plain sword swing would have dropped the shield.
+		if target != c.actor {
+			c.z.clearSpawnProtection(c.actor)
+		}
+		return true
 	}
 	return guardHarmful(c, target)
 }
