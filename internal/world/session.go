@@ -236,6 +236,15 @@ type session struct {
 	// the conventional MUD behavior.
 	lastTellFrom string
 
+	// tellLog is the in-session recent-tells ring (#349, tellhistory.go): the last tellLogMax tells this
+	// player SENT and RECEIVED, interleaved chronologically, surfaced via the `tells` command. Zone-owned
+	// (only the zone goroutine appends — sendTell for outbound, deliverDrainedTell for inbound), so it needs
+	// no lock, exactly like lastTellFrom. It is TRANSIENT session-scoped state: NOT persisted and NOT carried
+	// on the handoff snapshot, so it RESETS on relog and on a cross-shard walk — deliberately mirroring
+	// lastTellFrom above (a recent-activity convenience, not a durable ledger). Durable cross-session history
+	// is DEFERRED to slice 2 (write-amplification concerns; see tellhistory.go). nil until the first tell.
+	tellLog []tellLogEntry
+
 	// comms is the player's in-memory receiver-side comms state (Phase 8.6, commsstate.go): channel
 	// toggles, the ignore list, the AFK flag/message. Zone-owned (only the zone goroutine reads/writes
 	// it), so it needs no lock — exactly like tellCursor. Loaded from StateJSON.Comms on login, carried

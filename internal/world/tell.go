@@ -155,15 +155,29 @@ func (z *Zone) sendTell(s *session, targetName, body string) {
 	// DATA — CleanLine strips control/ANSI/IAC so the render can never forge a prefix; the same
 	// sanitizer the channel + input paths use. The Seq is assigned LATER, in the FIFO publisher, so it
 	// is monotonic in publish order (the order the stream is appended).
+	clean := textsan.CleanLine(strings.TrimSpace(body))
 	cs.enqueueTell(tellJob{
 		authorID:   s.character,
 		authorName: actor.Name(),
 		target:     target,
-		body:       textsan.CleanLine(strings.TrimSpace(body)),
+		body:       clean,
 		out:        s.out,
 		dir:        z.dir(),
 		log:        z.log,
 	})
+
+	// Capture the SENT side into the in-session tell ring (#349, tellhistory.go). This is OPTIMISTIC and
+	// captures at enqueue time, on the zone goroutine, BEFORE the async publisher (publishOne, comm.go) runs
+	// its directory existence check + echo. KNOWN DIVERGENCE (accepted for slice 1): on a resolve-miss
+	// ("no player by that name") or a publish failure ("tells temporarily offline"), publishOne shows the
+	// sender an ERROR and never emits the "You tell X" echo — yet this entry is already in the ring, so
+	// `tells` then shows a "You told X" line the sender never actually saw. It is the sender's OWN ring
+	// (no privacy leak), and the resolve-miss already reveals non-existence via the error, so the wart is
+	// cosmetic. The clean fix — record at publishOne's confirmed-echo point — needs the session/ring threaded
+	// onto tellJob and a post back to the zone goroutine (session state is zone-owned); deferred as a
+	// follow-up. The sender lacks the target's live *Entity, so the display name falls back to the
+	// (sanitized) target id, which is also what a successful live echo shows. Zone goroutine, single-writer.
+	s.recordTell(tellLogEntry{outbound: true, other: target, otherName: target, body: clean, at: time.Now()})
 }
 
 // safeTellTarget sanitizes a player-supplied tell target into a token safe to use as BOTH a directory
@@ -280,6 +294,17 @@ func (z *Zone) deliverDrainedTell(m tellDeliverMsg) bool {
 	s.tellCursor[author] = m.msg.Seq // advance the per-sender cursor (rides StateJSON.Tells on save)
 	s.lastTellFrom = author          // the `reply` target
 	z.log.Debug("durable tell delivered", "to", m.target, "from", author, "seq", m.msg.Seq)
+
+	// Capture the RECEIVED side into the in-session tell ring (#349, tellhistory.go), for BOTH a live tell and
+	// a backlog (offline catch-up) drain — a backlog tell was really received, so it belongs in the history.
+	// But SKIP a tell whose author this player IGNORES: the ignore funnel drops it at the GATE before the
+	// player ever sees it (the world emits unfiltered above), so recording it would put a line in the history
+	// the player never actually saw. Skipping here keeps the ring == what was rendered to the socket. The body
+	// is the sanitized delivered body (m.msg.Body), not the framed render line (that prefix is re-added by the
+	// history render). Zone goroutine, single-writer.
+	if !s.comms.ignored(author) {
+		s.recordTell(tellLogEntry{outbound: false, other: author, otherName: m.msg.AuthorName, body: m.msg.Body, at: time.Now()})
+	}
 
 	// AFK auto-reply (Phase 8.6): a LIVE tell to an AFK target sends a one-line "X is AFK: <msg>" back to
 	// the SENDER over their concrete tell subject — so the sender learns the target is away. NOT for a

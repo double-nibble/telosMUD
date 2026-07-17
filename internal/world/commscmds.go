@@ -24,6 +24,9 @@ func commsCommands() []*Command {
 		{Name: "channels", Run: cmdChannels},
 		{Name: "ignore", Run: cmdIgnore},
 		{Name: "afk", Run: cmdAFK},
+		// `tells` (alias `replay`) — the in-session recent-tells ring (#349, tellhistory.go). A mortal
+		// convenience (no MinRank); pair-privacy holds by construction (the ring is per-session).
+		{Name: "tells", Aliases: []string{"replay"}, Run: cmdTells},
 	}
 }
 
