@@ -229,6 +229,13 @@ type Shard struct {
 	// keeps the pre-4.2 ephemeral behavior with zero extra goroutines or work.
 	saver *saver
 
+	// auditor is the shard's async audit-trail writer (auditor.go, #350): one per shard, shared by
+	// every hosted zone, drained by a single background goroutine started in Run — the same lifecycle
+	// as the saver. It does the off-zone-goroutine AppendAudit for the world-emitted events (death,
+	// attribute grant, track step). Always non-nil but DISABLED (a no-op) unless WithAudit wired a
+	// sink — so a storeless shard audits nothing and is byte-identical to a pre-#350 shard.
+	auditor *auditor
+
 	// protos is the per-shard prototype cache shared read-only by every hosted zone. It is held
 	// here too (not only on each zone) so the hot-reload applier can swap entries into the one
 	// shared cache (reload.go). nil only on a zero-value shard; newBareShard leaves it for the
@@ -374,6 +381,7 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		handoffSem:       make(chan struct{}, maxConcurrentHandoffs),
 		placement:        newPlacementWriter(),
 		saver:            newSaver(nil, nil), // disabled until WithPersistence configures it
+		auditor:          newAuditor(nil),    // disabled until WithAudit configures it (#350)
 		// Empty global-definition bundle (defs.go); the constructor registers content into it
 		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
 		defs: newDefRegistries(),
@@ -549,6 +557,21 @@ func (s *Shard) WithPresence(rost roster.Roster, shardID string) *Shard {
 func (s *Shard) WithMail(store MailStore) *Shard {
 	if store != nil {
 		s.mail = store
+	}
+	return s
+}
+
+// WithAudit wires the shard's #350 durable audit trail: the sink the world-emitted events (death,
+// attribute grant, track step) are appended through. sink MUST be an AuditSink (the same *store.Pool
+// that backs CharacterStore/MailStore in prod, or a MemStore in tests — ONE shared character_audit
+// table, also written by telos-account in-transaction). It is OPTIONAL and never fatal: a nil sink
+// leaves auditing DISABLED — the emit sites and the `audit` command degrade cleanly, the existing tests
+// stay green, and the shard is byte-identical to a pre-#350 one. MUST be called before Run (the drainer
+// goroutine is started there, the saver's lifecycle). Returns the shard for chaining; the production
+// constructor wires it from the same pool, tests inject a MemStore.
+func (s *Shard) WithAudit(sink AuditSink) *Shard {
+	if sink != nil {
+		s.auditor = newAuditor(sink)
 	}
 	return s
 }
@@ -821,6 +844,7 @@ func (s *Shard) ZoneByID(id string) *Zone { return s.zoneByID(id) }
 // goroutine. A disabled saver's run returns immediately (no goroutine cost for a storeless boot).
 func (s *Shard) Run(ctx context.Context) {
 	go s.saver.run(ctx)          // off-zone-goroutine character writer (no-op if disabled)
+	go s.auditor.run(ctx)        // off-zone-goroutine audit-trail writer (#350; no-op if disabled)
 	go s.runPlacementWriter(ctx) // off-zone-goroutine directory placement writer (#320; no-op without a directory)
 	go s.presence.run(ctx)       // off-zone-goroutine cross-shard `who` heartbeat (no-op if disabled)
 	go s.comms.publishLoop(ctx)  // off-zone-goroutine single-writer durable-tell publisher (8.5)

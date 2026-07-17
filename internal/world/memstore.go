@@ -2,6 +2,8 @@ package world
 
 import (
 	"context"
+	"encoding/json"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -38,11 +40,20 @@ type MemStore struct {
 	// from another, like the real store hit concurrently). nextMailID mints fake message ids.
 	mail       []MailEntry
 	nextMailID int
+
+	// audit is the in-memory audit trail (#350), a flat slice of every appended event. It mirrors the pgx
+	// `character_audit` table semantics EXACTLY — exactly-once on (subject_id|event_kind|dedup_key) via
+	// auditKeys, newest-first reads by subject id and by character name — so the hermetic audit tests
+	// assert the same contract the gated Postgres test asserts against the real store. Guarded by the same
+	// mu (the async auditor writes from its drainer goroutine while a read command reads, like the real
+	// store hit concurrently). auditKeys is the dedup set the ON CONFLICT DO NOTHING guard models.
+	audit     []AuditEntry
+	auditKeys map[string]bool
 }
 
 // NewMemStore returns an empty in-memory store/checkpointer.
 func NewMemStore() *MemStore {
-	return &MemStore{rows: map[string]CharSnapshot{}, ckpt: map[string]CharSnapshot{}}
+	return &MemStore{rows: map[string]CharSnapshot{}, ckpt: map[string]CharSnapshot{}, auditKeys: map[string]bool{}}
 }
 
 // key normalizes a character name the way CITEXT does (case-insensitive), so "Alice" and "alice"
@@ -250,9 +261,133 @@ func (m *MemStore) DeleteMail(_ context.Context, player string, pos int) (bool, 
 	return false, nil
 }
 
-// Compile-time assertions that *MemStore satisfies all three tiers.
+// --- AuditSink (#350) ------------------------------------------------------------------------
+
+// AppendAudit records ev, returning recorded=false when the idempotency key (subject_id|event_kind|
+// dedup_key) already exists — the exact ON CONFLICT DO NOTHING semantics of the pgx store. A zero
+// ev.At defaults to the current clock (the SQL DEFAULT now() analog) so a read has a real timestamp to
+// order by. Guarded by mu (the auditor drains from a background goroutine).
+func (m *MemStore) AppendAudit(_ context.Context, ev AuditEvent) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := auditDedupKey(ev.SubjectID, ev.EventKind, ev.DedupKey)
+	if m.auditKeys[k] {
+		return false, nil // idempotency key already present: a benign retry, nothing recorded
+	}
+	m.auditKeys[k] = true
+	at := ev.At
+	if at.IsZero() {
+		at = time.Now()
+	}
+	m.audit = append(m.audit, AuditEntry{
+		SubjectType: ev.SubjectType,
+		SubjectID:   ev.SubjectID,
+		SubjectName: ev.SubjectName,
+		ActorType:   ev.ActorType,
+		ActorID:     ev.ActorID,
+		EventKind:   ev.EventKind,
+		// Round-trip the payload through JSON so the mem path yields the SAME Go types the pgx JSONB
+		// column does (every number becomes float64, etc.) — otherwise a hermetic test would assert one
+		// type and the gated Postgres test another. A marshal failure leaves the payload nil (the row is
+		// still recorded; the payload is best-effort observability).
+		Payload: jsonRoundTrip(ev.Payload),
+		At:      at,
+	})
+	return true, nil
+}
+
+// jsonRoundTrip marshals then unmarshals a payload map so its value types match what a JSONB column
+// round-trip produces (numbers -> float64). Returns nil on any error (best-effort — the audit row is
+// still recorded; the payload is observability, not correctness).
+func jsonRoundTrip(payload map[string]any) map[string]any {
+	if len(payload) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// auditDedupKey builds the composite idempotency key the mem dedup set is keyed on — the mirror of the
+// pgx UNIQUE (subject_id, event_kind, dedup_key) index. The '\x1f' unit separator keeps the three parts
+// unambiguous (no field can contain it) so distinct triples never collide into one key.
+func auditDedupKey(subjectID, eventKind, dedupKey string) string {
+	return subjectID + "\x1f" + eventKind + "\x1f" + dedupKey
+}
+
+// ListAuditForSubject returns subjectID's trail newest-first, capped at limit (a copy, so a caller
+// can't mutate the store). SCOPED to subject_id — only that subject's rows are reachable.
+func (m *MemStore) ListAuditForSubject(_ context.Context, subjectID string, limit int) ([]AuditEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.auditWhereLocked(func(e AuditEntry) bool { return e.SubjectID == subjectID }, limit), nil
+}
+
+// ListAuditForCharacterName returns the trail for character NAME (case-insensitive, matching the CITEXT
+// column) newest-first, capped at limit. This is the staff `audit <name>` query and the player self-view.
+func (m *MemStore) ListAuditForCharacterName(_ context.Context, name string, limit int) ([]AuditEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// An empty name matches nothing — mirroring the pgx path, where account rows store subject_name as SQL
+	// NULL (never ''), so `WHERE subject_name = ''` returns no rows. Without this guard the mem predicate
+	// `'' == ''` would spuriously match every account (NULL-name) row, diverging from the store.
+	if name == "" {
+		return nil, nil
+	}
+	key := memKey(name)
+	return m.auditWhereLocked(func(e AuditEntry) bool { return e.SubjectName != "" && memKey(e.SubjectName) == key }, limit), nil
+}
+
+// auditWhereLocked returns the entries matching pred, newest-first (At DESC, later-insert first as the
+// tie-break — the mem analog of the pgx `ORDER BY at DESC, id DESC`), capped at limit. It collects every
+// match, sorts, THEN caps, so the cap keeps the newest rows even when insertion order differs from At
+// order (a caller-supplied timestamp). Caller holds mu. This is the projection every mem audit read goes
+// through, so the scoping (a query only ever returns its subject's rows) holds for the mem path exactly
+// as the SQL WHERE does.
+func (m *MemStore) auditWhereLocked(pred func(AuditEntry) bool, limit int) []AuditEntry {
+	// Walk reverse insertion order first so equal-At rows carry a stable later-insert-first order into
+	// the stable sort below (the `id DESC` tie-break analog).
+	var out []AuditEntry
+	for i := len(m.audit) - 1; i >= 0; i-- {
+		if pred(m.audit[i]) {
+			out = append(out, m.audit[i])
+		}
+	}
+	sortAuditNewestFirst(out)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// sortAuditNewestFirst is a stable newest-first sort by At, used so the MemStore read order matches the
+// pgx `ORDER BY at DESC`. The input arrives in reverse-insertion order, so a stable sort keeps a
+// same-instant tie as later-insert-first (the `id DESC` tie-break analog) — keeping the hermetic and
+// gated tests asserting the same order.
+func sortAuditNewestFirst(entries []AuditEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].At.After(entries[j].At)
+	})
+}
+
+// auditCount is a test helper: the total number of stored audit rows. Kept unexported (tests live in the
+// same package) so it never becomes part of the public surface.
+func (m *MemStore) auditCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.audit)
+}
+
+// Compile-time assertions that *MemStore satisfies every tier.
 var (
 	_ CharacterStore = (*MemStore)(nil)
 	_ Checkpointer   = (*MemStore)(nil)
 	_ MailStore      = (*MemStore)(nil)
+	_ AuditSink      = (*MemStore)(nil)
 )

@@ -73,15 +73,37 @@ func (p *Pool) CreateAccountCharacter(ctx context.Context, accountID, name, zone
 		state = []byte("{}")
 	}
 	id := uuid.New()
-	_, err := p.pool.Exec(ctx,
+	// Character insert + its creation-audit row land in ONE transaction (#350): a crash can't leave a
+	// character with no creation record or a record with no character. The audit is idempotent by
+	// construction here — one insert per new UUID inside the enclosing tx.
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO characters (id, account_id, name, zone_ref, room_ref, state_version, state, chargen, last_login_at)
 		 VALUES ($1, $2, $3, $4, $5, 0, $6, $7, now())`,
-		id, accountID, name, nullStr(zoneRef), nullStr(roomRef), state, nullBytes(chargen))
-	if err != nil {
+		id, accountID, name, nullStr(zoneRef), nullStr(roomRef), state, nullBytes(chargen)); err != nil {
 		if isUniqueViolation(err) {
 			return "", ErrNameTaken
 		}
 		return "", fmt.Errorf("store: create character %q for account %s: %w", name, accountID, err)
+	}
+	if err := appendAuditTx(ctx, tx, world.AuditEvent{
+		SubjectType: world.AuditSubjectCharacter,
+		SubjectID:   id.String(),
+		SubjectName: name,
+		ActorType:   world.AuditActorAccount,
+		ActorID:     accountID,
+		EventKind:   world.AuditKindCharacterCreated,
+		Payload:     world.AuditPayload(map[string]any{"zone": zoneRef, "room": roomRef}),
+	}); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("store: commit: %w", err)
 	}
 	return id.String(), nil
 }
@@ -161,11 +183,25 @@ func (p *Pool) CreateAccountWithIdentity(ctx context.Context, provider, provider
 		return "", fmt.Errorf("store: create identity: %w", err)
 	}
 	if bootstrapAdmin {
+		roleAuditID := uuid.New()
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO account_role_audit (id, actor_account, target_account, old_tier, new_tier)
 			 VALUES ($1, NULL, $2, NULL, $3)`,
-			uuid.New(), acct, TierAdmin); err != nil {
+			roleAuditID, acct, TierAdmin); err != nil {
 			return "", fmt.Errorf("store: audit bootstrap admin: %w", err)
+		}
+		// Also record the grant in the UNIFIED #350 trail (a deliberate superset of account_role_audit —
+		// the redundancy is intentional so staff read ONE table). System actor (NULL actor_id, like the
+		// bootstrap): nobody promoted this account, the config-pin did. old_tier is null (the initial grant).
+		if err := appendAuditTx(ctx, tx, world.AuditEvent{
+			SubjectType: world.AuditSubjectAccount,
+			SubjectID:   acct.String(),
+			ActorType:   world.AuditActorSystem,
+			EventKind:   world.AuditKindTierChanged,
+			DedupKey:    roleAuditID.String(),
+			Payload:     world.AuditPayload(map[string]any{"old_tier": nil, "new_tier": TierAdmin}),
+		}); err != nil {
+			return "", err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -242,11 +278,28 @@ func (p *Pool) SetAccountTier(ctx context.Context, actorAccountID, targetAccount
 	if _, err := tx.Exec(ctx, `UPDATE accounts SET tier = $1 WHERE id = $2`, newTier, targetAccountID); err != nil {
 		return "", fmt.Errorf("store: set tier update: %w", err)
 	}
+	roleAuditID := uuid.New()
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO account_role_audit (id, actor_account, target_account, old_tier, new_tier)
 		 VALUES ($1, $2, $3, $4, $5)`,
-		uuid.New(), actorAccountID, targetAccountID, oldTier, newTier); err != nil {
+		roleAuditID, actorAccountID, targetAccountID, oldTier, newTier); err != nil {
 		return "", fmt.Errorf("store: set tier audit: %w", err)
+	}
+	// UNIFIED #350 trail (superset of account_role_audit): the acting admin is the actor. Same tx, so a
+	// CAS-conflict path (which returns above without writing) records nothing — correct. DedupKey is the
+	// account_role_audit row id: a stable per-change key so a SECOND tier change on the SAME account does
+	// NOT collide with the first on the (subject_id, event_kind, dedup_key) unique index (an empty key
+	// would make ON CONFLICT DO NOTHING silently drop every promotion after the first).
+	if err := appendAuditTx(ctx, tx, world.AuditEvent{
+		SubjectType: world.AuditSubjectAccount,
+		SubjectID:   targetAccountID,
+		ActorType:   world.AuditActorAccount,
+		ActorID:     actorAccountID,
+		EventKind:   world.AuditKindTierChanged,
+		DedupKey:    roleAuditID.String(),
+		Payload:     world.AuditPayload(map[string]any{"old_tier": oldTier, "new_tier": newTier}),
+	}); err != nil {
+		return "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", fmt.Errorf("store: commit: %w", err)
@@ -308,11 +361,26 @@ func (p *Pool) SetAccountTierSystem(ctx context.Context, targetAccountID, newTie
 	if _, err := tx.Exec(ctx, `UPDATE accounts SET tier = $1 WHERE id = $2`, newTier, targetAccountID); err != nil {
 		return "", fmt.Errorf("store: set tier (system) update: %w", err)
 	}
+	roleAuditID := uuid.New()
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO account_role_audit (id, actor_account, target_account, old_tier, new_tier)
 		 VALUES ($1, NULL, $2, $3, $4)`,
-		uuid.New(), targetAccountID, oldTier, newTier); err != nil {
+		roleAuditID, targetAccountID, oldTier, newTier); err != nil {
 		return "", fmt.Errorf("store: set tier (system) audit: %w", err)
+	}
+	// UNIFIED #350 trail (superset of account_role_audit): the break-glass CLI is a SYSTEM actor (NULL
+	// actor_id, like the account_role_audit row above) — whoever ran it had DB/host access, which is the
+	// authorization, not an in-game account. DedupKey is the per-change role-audit row id (see SetAccountTier)
+	// so repeated recovery writes on one account each record a distinct row.
+	if err := appendAuditTx(ctx, tx, world.AuditEvent{
+		SubjectType: world.AuditSubjectAccount,
+		SubjectID:   targetAccountID,
+		ActorType:   world.AuditActorSystem,
+		EventKind:   world.AuditKindTierChanged,
+		DedupKey:    roleAuditID.String(),
+		Payload:     world.AuditPayload(map[string]any{"old_tier": oldTier, "new_tier": newTier}),
+	}); err != nil {
+		return "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", fmt.Errorf("store: commit: %w", err)

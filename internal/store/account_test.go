@@ -238,6 +238,23 @@ func TestSetAccountTierAuditTrail(t *testing.T) {
 	assert.Contains(t, got, auditRow{actor, target, TierPlayer, TierBuilder}, "the promote audit row (old=player,new=builder)")
 	assert.Contains(t, got, auditRow{actor, target, TierBuilder, TierPlayer}, "the demote audit row (old=builder,new=player)")
 	assert.Contains(t, got, auditRow{actor, target, TierPlayer, TierPlayer}, "the no-op audit row (audit every write)")
+
+	// The UNIFIED #350 trail (character_audit) ALSO recorded all three tier changes, one row each. This is
+	// the dedup-key regression guard: the idempotency index is (subject_id, event_kind, dedup_key), so if
+	// tier_changed rows shared an empty dedup_key every write after the first would silently collide away —
+	// each SetAccountTier must carry a distinct dedup_key (the account_role_audit row id).
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM character_audit WHERE subject_id = $1`, target)
+	})
+	trail, err := p.ListAuditForSubject(ctx, target, 50)
+	require.NoError(t, err)
+	tierRows := 0
+	for _, e := range trail {
+		if e.EventKind == world.AuditKindTierChanged {
+			tierRows++
+		}
+	}
+	assert.Equal(t, 3, tierRows, "the unified trail records EVERY tier change (distinct dedup_key per write)")
 }
 
 // TestSetAccountTierCASConflict (#165) pins the compare-and-set: a write whose expectedOldTier does NOT match

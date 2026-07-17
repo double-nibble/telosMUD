@@ -243,6 +243,13 @@ func (z *Zone) die(victim, killer *Entity, parent *effectCtx) {
 	l.dying = true
 	l.deaths++
 
+	// Durable audit (#350): record the player's permanent death exactly once. This sits INSIDE the
+	// l.dying-latched, deaths-bumped once-only region, so a re-entrant die() (a DoT tick landing the same
+	// round as the killing swing) early-returned above and never reaches here — and the deaths counter is
+	// the idempotency key, so even a retry that somehow arrived would dedup on the unique index. A mob death
+	// emits nothing (the helper's isPlayer guard); a storeless shard is a no-op.
+	z.auditPlayerDeath(victim, killer, l.deaths)
+
 	z.act("$n is DEAD!", victim, nil, nil, "", "", ToRoom)
 
 	// --- OnKill (the reserved combat event, now LIT). subject=KILLER (the event is ABOUT the slayer —
