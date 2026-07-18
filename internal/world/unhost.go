@@ -142,6 +142,14 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 	// belongs INSIDE the lock: a player attaching resolves the zone through zoneByID under this same mutex, so
 	// once we have removed the zone from s.zones no new attach can find it, and any attach that already found
 	// it has bumped pop.
+	//
+	// CAREFUL: "any attach that already found it has bumped pop" is NOT true as stated, for any path that
+	// resolves the zone under mu and then delivers ASYNCHRONOUSLY through the inbox — pop is bumped by the
+	// handler, not by the resolve. The intra-shard transfer path is fixed here: claimTransferTarget takes an
+	// `incoming` claim in the same mu hold as the resolve, and quiescent() folds it in (#409). Login attach
+	// (server.go, zoneByID then zone.post(attachMsg)) and cross-shard Prepare (handoff_server.go) have the
+	// same shape and are NOT yet covered — see the follow-up issue. Do not add a third such path without a
+	// claim.
 	s.mu.Lock()
 	if s.zones[id] != z {
 		s.mu.Unlock()
@@ -149,8 +157,9 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 	}
 	if !z.quiescent() {
 		s.mu.Unlock()
-		return fmt.Errorf("unhost %q: not quiescent (%d resident player(s), %d parked logout flush(es)) — "+
-			"drain the zone first", id, z.pop.Load(), z.stashed.Load())
+		return fmt.Errorf("unhost %q: not quiescent (%d resident player(s), %d parked logout flush(es), "+
+			"%d inbound transfer(s) in flight) — drain the zone first",
+			id, z.pop.Load(), z.stashed.Load(), z.incoming.Load())
 	}
 	delete(s.zones, id)
 	// A pending handoff token indexed to this zone can never be bound now; drop it rather than leave the index

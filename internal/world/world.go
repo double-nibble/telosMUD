@@ -634,6 +634,40 @@ func (s *Shard) zoneByID(id string) *Zone {
 	return s.zones[id]
 }
 
+// claimTransferTarget resolves a zone as the destination of an intra-shard transfer AND claims the arrival on
+// it, in ONE hold of mu. It returns nil if this shard is not a legitimate destination for the zone, in which
+// case NO claim was taken and the caller must fall through to the cross-shard path.
+//
+// The single hold is the whole point (#409). Resolving with zoneByID and claiming afterwards leaves a gap: a
+// concurrent UnhostZone — which checks quiescence under this SAME mutex — can complete the entire teardown in
+// between, and the claim then lands on a dead zone whose `post` abandons the send. The handover is dropped and
+// the counter never comes back down, so the fix meant to prevent the orphan produces one plus a wedged
+// counter. Under one hold the two orders are both safe: claim first and UnhostZone sees incoming > 0 and
+// refuses; unhost first and this returns nil, before the source has mutated anything, so the move simply takes
+// the cross-shard branch.
+//
+// Hosting the zone object is NOT sufficient to be its destination. A drain or a rebalance flips the zone's
+// LEASE to a peer before the zone drains, marking it handedOff under this same mutex (lease.go) while we go on
+// hosting the object until it empties. Admitting a walker into a zone we no longer own would keep it resident
+// — and, now that quiescence blocks teardown on that resident, keep US hosting and mutating a zone whose lease
+// and adopted copy live on another shard. That is two live writers on one zone scope, the invariant the whole
+// single-writer design exists to protect. Refusing here instead sends the walker down the cross-shard branch,
+// which routes them to the zone's NEW owner: they follow the zone rather than pinning a stale copy of it.
+//
+// `draining` covers the same hazard one step earlier, and additionally closes a gap in BeginDrain's wait set:
+// that set skips local bootstrap zones, so a resident of one could otherwise walk into a leased zone after the
+// drain had already flushed and reclaimed it, reproducing the original orphan on the drain path.
+func (s *Shard) claimTransferTarget(zoneID string) *Zone {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	z := s.zones[zoneID]
+	if z == nil || s.handedOff[zoneID] || s.draining {
+		return nil
+	}
+	z.claimInboundTransfer()
+	return z
+}
+
 // zonesList snapshots the currently-hosted zones under mu, so an iterator (Run launch, Drain,
 // BeginDrain) is safe against a concurrent HostZone and never ranges the live map.
 func (s *Shard) zonesList() []*Zone {
