@@ -281,14 +281,21 @@ func (rt *luaRuntime) hMove(l *lua.LState) int {
 		l.Push(lua.LFalse)
 		return 1
 	}
-	destZone, destRoom := parseRef(ref)
-	// Cross-zone exit: reserved no-op. Never a direct cross-zone Move (single-writer boundary).
-	if destZone != "" && destZone != rt.zone.id {
+	destZone, _ := parseRef(ref)
+	// Split deliberately into ownsZoneRef here and localRoom below, rather than one localRoom call: the two
+	// failures are different and only one is worth reporting. A cross-zone target is a RESERVED capability
+	// (logged), an unknown room is a dangling authored ref (silent). Collapsing them would lose that.
+	//
+	// Cross-zone exit: reserved no-op. Never a direct cross-zone Move (single-writer boundary). ownsZoneRef,
+	// not a raw `== z.id`: inside an instance (#72) every authored ref names the template, and a strict
+	// comparison would silently immobilize every scripted mob in every instance — wanderers, chasers, maze
+	// content — as a debug-level no-op.
+	if !rt.zone.ownsZoneRef(destZone) {
 		rt.log.Debug("h:move cross-zone target reserved (no-op)", "rid", e.rid, "dir", dir, "dest", destZone)
 		l.Push(lua.LFalse)
 		return 1
 	}
-	to := rt.zone.rooms[destRoom]
+	to := rt.zone.localRoom(ref)
 	if to == nil {
 		l.Push(lua.LFalse)
 		return 1

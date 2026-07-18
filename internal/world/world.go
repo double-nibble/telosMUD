@@ -1192,8 +1192,9 @@ func (z *Zone) spawnRoom(ref ProtoRef) *Entity {
 // Three cases by (live entity, new prototype):
 //   - UPDATE (both present): re-point the singleton's fields, below — the common edit.
 //   - ADD (no live entity, prototype present): a room NEW to this zone's graph. Spawn it live so exits INTO
-//     it (resolved by ProtoRef at move time) resolve. Guarded to THIS zone by the ref's zone prefix
-//     (parseRef), since the invalidation fans out to every hosted zone. New rooms have no occupants, so this
+//     it (resolved by ProtoRef at move time) resolve. Guarded to rooms THIS zone owns (ownsZoneRef over the
+//     ref's zone prefix), since the invalidation fans out to every hosted zone. New rooms have no occupants,
+//     so this
 //     is safe; zone resets are NOT re-run (a bare room). CAVEAT: boot assigns a room to a zone by its
 //     content `rooms:` LIST membership (build.go buildZone), not by ref prefix — the prefix==zone rule is
 //     the same one cross-zone exit ROUTING already relies on (parseRef), so it is de-facto load-bearing, but
@@ -1215,7 +1216,12 @@ func (z *Zone) resyncRoom(ref ProtoRef) {
 		// before the reconcile post — but a LoadDefinition/build failure for that ref would). The ADD then
 		// silently no-ops and the desired room is simply not spawned until the next full reload re-converges.
 		if p != nil {
-			if zoneOf, _ := parseRef(ref); zoneOf == z.id {
+			// ownsZoneRef so the gate keeps meaning "a room THIS zone owns" once ids and content refs can
+			// differ (#72). Note this gate is not what decides whether an INSTANCE takes a hot reload —
+			// reconciles are routed by actor id at reload.go's `z.id != inv.Ref` skip, so an instance never
+			// receives its template's invalidation in the first place. That skip is the instance-freeze
+			// mechanism; this is only the ownership test, and it stays correct either way.
+			if zoneOf, _ := parseRef(ref); z.ownsZoneRef(zoneOf) {
 				z.spawnRoom(ref)
 				z.log.Debug("hot reload: new room added to live zone", "ref", ref)
 			}

@@ -94,8 +94,11 @@ func cmdFlee(c *Context) error {
 		c.Send("You can't flee that way.")
 		return nil
 	}
-	destZone, destRoom := parseRef(ref)
-	if (destZone != "" && destZone != c.z.id) || c.z.rooms[destRoom] == nil {
+	// Flee never crosses a zone: only an exit THIS zone owns is a valid escape. ownsZoneRef, not a raw
+	// `== z.id`, so an instance's authored refs read as its own (#72) — otherwise every exit in an instance
+	// looks cross-zone and flee is refused everywhere, with move() already refusing to walk while fighting.
+	to := c.z.localRoom(ref)
+	if to == nil {
 		c.Send("You can't flee that way.")
 		return nil
 	}
@@ -122,11 +125,11 @@ func cmdFlee(c *Context) error {
 	c.z.disengage(c.Actor)
 	c.z.act("You flee "+dir+"!", c.Actor, nil, nil, "", "", ToActor)
 	c.z.actConceal("$n flees "+dir+"!", c.Actor, ToRoom) // #100: silent to those who can't see the fleer
-	Move(c.Actor, c.z.rooms[destRoom])
+	Move(c.Actor, to)
 	c.z.actConceal("$n arrives, panting.", c.Actor, ToRoom) // #100: silent to those who can't see the fleer
 	// Arrival hooks: a webbed destination roots the entrant; an aggressive mob there re-engages.
 	applyRoomAffectsTo(c.Actor)
-	c.z.aggroOnEntry(c.Actor, c.z.rooms[destRoom])
+	c.z.aggroOnEntry(c.Actor, to)
 	if c.s != nil {
 		c.z.lookRoom(c.s)
 	}
