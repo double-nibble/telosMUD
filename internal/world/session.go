@@ -71,6 +71,59 @@ type session struct {
 	// and entity together on a transfer, so only one zone goroutine ever touches the pair.
 	entity *Entity
 
+	// account is the ACCOUNT id from the VERIFIED session assertion (server.go's assertion.Verify claims),
+	// set on fresh-login attach and carried across a cross-shard handoff on the SIGNED snapshot (#72).
+	//
+	// It exists for exactly one reason: the instance caps are charged per ACCOUNT (instance.go's
+	// instanceLimits — a per-character cap is routed around by alts, a per-script cap by one script minting
+	// for many players), and MintInstance refuses an empty account rather than sharing a bucket. So this is
+	// a SECURITY field: it must only ever come from a signature-checked claim. It is deliberately NOT
+	// derivable from anything the client sends and is NEVER settable from Lua — a content-supplied account
+	// would make the per-account cap self-service.
+	//
+	// Empty on the dev/unverified path (no verify key) and on an insecure keyless handoff arrival, which
+	// correctly degrades to "this session may not mint an instance" rather than to a shared bucket.
+	// Zone-goroutine-owned like tier.
+	account string
+
+	// anchorZone / anchorRoom are the EXIT ANCHOR (#72): the authored zone + room this player entered their
+	// current instance FROM. Both are empty whenever the player is not inside an instance.
+	//
+	// The anchor is what makes an instance durable-safe. An instance is unleased and in no directory, so a
+	// durable location or a placement record naming one resolves to no shard and dead-ends a reconnect (the
+	// design panel killed the alternative — projecting the TEMPLATE ref — because the placement `zone` is the
+	// gate's ROUTING key and its invariant is "the recorded zone is the zone that holds the session"; a
+	// template that some other shard hosts makes a reconnect dial that shard, miss the residency index, and
+	// fresh-log a character this shard is still holding). So every durable write taken while the player is
+	// inside an instance persists the ANCHOR instead: dumpCharacter's zone_ref AND room_ref (durableLocation),
+	// registerPlacement, and clearPlacement. The degraded reconnect is then "you are standing at the dungeon
+	// door", not "you are at the temple with no idea what happened".
+	//
+	// It is also the DESTINATION for every involuntary exit: the drain eject (BeginDrain), and a respawn in an
+	// instance whose template authors no start room (respawnPlayer). evictToAnchor is the single mechanism.
+	//
+	// PARTY MODEL: v1 binds an instance PER PLAYER — one player, one instance — so the anchor lives on the
+	// session and each occupant carries their own. For a party the binding key becomes the group, and these
+	// two fields would move to the group record (every member of a party that entered together shares one
+	// anchor, and an eject would have to move the whole group so a party is never split across the boundary);
+	// the entry gate would additionally have to decide what happens to a member who joins mid-run. Nothing
+	// here assumes one occupant, so the mechanism survives; only the KEY changes.
+	//
+	// Zone-goroutine-owned, and they ride an intra-shard transfer with the session (that is how walking a
+	// multi-room instance keeps its anchor). transferIn CLEARS them on arrival in any non-instance zone, so a
+	// stale anchor can never outlive the visit.
+	anchorZone string
+	anchorRoom ProtoRef
+
+	// instanceMintPending marks that this session has an instance mint IN FLIGHT on the shard's mint worker
+	// (#72, instance_entry.go). Entry is a two-phase async flow — the entrance zone posts a request and
+	// returns immediately, a worker builds the zone OFF every zone goroutine, and the result comes back as an
+	// instanceReadyMsg — so between the two phases the player is still standing in the entrance room, playing
+	// normally. This flag is what makes a second entry attempt in that window a clean refusal rather than a
+	// second full zone build (which the mint RATE limit would eventually catch, but only after the damage).
+	// Cleared when the result lands, and on leave/link-death, so it can never latch. Zone-goroutine-owned.
+	instanceMintPending bool
+
 	// tier is the account trust tier (#27) from the VERIFIED session assertion, set on fresh-login attach.
 	// player/builder/admin (content-defined ladder); "" (== baseline) on the dev/unverified path. It is the
 	// input the zone uses to DERIVE the reserved builder/admin/holylight flags on spawn (applyTierFlags). The

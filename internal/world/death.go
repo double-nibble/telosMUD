@@ -419,12 +419,45 @@ func (z *Zone) respawnPlayer(victim *Entity) {
 	// NOTE: a player slain while already standing in the start room respawns IN PLACE — location is
 	// unchanged. Anything trying to detect "did my target just die?" across a sub-call must therefore
 	// compare deathGen, never location (#69; see the SC2/M1 guards in ability.go and commands.go).
-	if start := z.resolveRoom(z.startRoom); start != nil && start != victim.location {
+	start := z.resolveRoom(z.startRoom)
+	if start != nil && start != victim.location {
 		Move(victim, start)
 	}
-	if s, ok := sessionOf(victim); ok {
-		s.send(textFrame("You have been slain! You awaken at the temple, alive but shaken."))
-		z.lookRoom(s)
+	s, hasSession := sessionOf(victim)
+	// DEATH INSIDE AN INSTANCE (#72). There is no cross-zone respawn in the engine — respawnPlayer moves the
+	// victim within its OWN zone — so an instance respawns its occupants in the instance. That is the RIGHT
+	// answer and is what a dungeon wants: you die at the boss and wake at the dungeon entrance, with the run
+	// still in progress. It is deliberately not "eject on death": a wipe that ends the run is a CONTENT rule
+	// (the template can author whatever it likes on_death), not an engine one.
+	//
+	// The failure case is a template that authors NO start room. Then z.startRoom is "" and resolveRoom
+	// returns nil, so the block above moves nobody — leaving the player standing in the boss room at full
+	// health, alive, having lost nothing. MintInstance now refuses such a template outright (validateMintTemplate),
+	// so this cannot arise from content as loaded; it survives as the fail-safe for the paths that can still
+	// produce it — a reload that removes the start room under a live instance (instances are reload-FROZEN, so
+	// the zone keeps its rooms, but a pack edit plus a later mint would be caught at the mint), or a zone built
+	// by a path that bypasses the sink. Evict to the anchor rather than leave them where they died.
+	if start == nil && z.isInstance() && hasSession {
+		// POSTED, never done inline. We are deep inside die() -> dealDamage -> a combat round or a Lua harm op,
+		// and every frame above goes on touching this entity after we return. A cross-zone transfer releases
+		// ownership of the session and entity to another goroutine, so doing it from here would leave those
+		// frames reading an object another actor now owns. The eviction runs on a clean top-of-loop stack
+		// instead; the player stands revived in the boss room for the width of one queue hop.
+		z.log.Warn("player died in an instance whose template authors no start room; evicting to the exit anchor",
+			"player", victim.short, "zone", z.id)
+		z.post(evictToAnchorMsg{
+			character: s.character,
+			reason:    "You have been slain! You awaken outside, alive but shaken.",
+		})
+	}
+	if hasSession {
+		if start != nil {
+			s.send(textFrame("You have been slain! You awaken at the temple, alive but shaken."))
+			z.lookRoom(s)
+		}
+		// With no start room the look is deliberately SKIPPED: the room they are standing in is the one they
+		// just died in, and showing it would read as "you woke up where you fell". The eviction's own arrival
+		// look, one message later, is the honest one.
 	}
 	z.log.Debug("player died -> respawned", "player", victim.short, "room", targetShort(victim.location))
 }

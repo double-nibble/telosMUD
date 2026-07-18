@@ -147,7 +147,13 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// and on a handoff re-dial (token != "" — the tier's applied flags ride the entity snapshot, not this
 	// claim), which correctly means "player, unless the verified claim elevated it". Never trusted from an
 	// unverified source: only a signature-checked claim sets it.
-	var loginTier string
+	// loginAccount is the ACCOUNT id from the same VERIFIED assertion (#72). It is carried to the session
+	// because the instanced-zone caps are charged per ACCOUNT (instance.go) — a per-character cap is routed
+	// around by alts and a per-script cap by one script minting for many players — so an unattributable mint
+	// is refused rather than sharing a bucket. Like the tier it is set ONLY from a signature-checked claim:
+	// never from attach.GetCharacterId()'s neighbourhood of client-supplied fields, and never from Lua. Empty
+	// on the dev/unverified path (no verify key), which correctly means "this session may not mint".
+	var loginTier, loginAccount string
 	if token == "" && s.shard.verifyKey != nil {
 		claims, err := assertion.Verify(s.shard.verifyKey, attach.GetSessionAssertion(), time.Now())
 		if err != nil {
@@ -162,6 +168,10 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			return status.Error(codes.Unauthenticated, "session assertion mismatch")
 		}
 		loginTier = claims.Tier
+		// The identity check above (claims.Character == the attaching character) is what makes this account
+		// binding trustworthy: the claim is signed, and it is signed for THIS character, so a compromised gate
+		// cannot replay one account's assertion to charge another account's instance quota.
+		loginAccount = claims.Account
 	}
 
 	// Phase 16.4b: a draining shard refuses a FRESH login (it is handing its zones + players to a peer and is
@@ -319,6 +329,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		loaded:      loaded,
 		loadedOK:    loadedOK,
 		tier:        loginTier,
+		account:     loginAccount,
 	})
 	s.log.Debug("player stream ready", "character", character, "zone", zone.id)
 

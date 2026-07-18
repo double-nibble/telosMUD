@@ -429,10 +429,25 @@ func deletePack(ctx context.Context, tx pgx.Tx, pack string) error {
 	return nil
 }
 
+// insertZone writes one zone row. The stable columns (ref/name/start_room/reset_secs) are first-class; the
+// open-ended remainder rides the `body` JSONB, exactly as the prototype and room rows do.
+//
+// `instanceable` (#72) is the FIRST occupant of that zone body, and it has to be carried here or the DB
+// round-trip silently drops it: the flag would parse from YAML, survive an in-memory load, and then come back
+// FALSE through Postgres — turning the instance opt-in off for the whole fleet the moment content is served
+// from the store instead of the embed. That is the field-drop trap this repo has shipped repeatedly (Round 35's
+// `primary` on resourceBody, and Track 11 before it). The direction of the drop here is fail-CLOSED (a zone
+// that opted in stops being mintable, rather than one that did not opting in), so it degrades to "the dungeon
+// door stops working" rather than to a security hole — but it is still a silent, environment-dependent
+// divergence between the embedded and stored content, which is exactly what the round-trip test exists to catch.
 func insertZone(ctx context.Context, tx pgx.Tx, pack string, z content.ZoneDTO) error {
+	body, err := json.Marshal(zoneBody{Instanceable: z.Instanceable})
+	if err != nil {
+		return fmt.Errorf("store: marshal zone body %s: %w", z.Ref, err)
+	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO zones (ref, pack, name, start_room, reset_secs) VALUES ($1,$2,$3,$4,$5)`,
-		z.Ref, pack, z.Name, nullStr(z.StartRoom), z.ResetSecs); err != nil {
+		`INSERT INTO zones (ref, pack, name, start_room, reset_secs, body) VALUES ($1,$2,$3,$4,$5,$6)`,
+		z.Ref, pack, z.Name, nullStr(z.StartRoom), z.ResetSecs, body); err != nil {
 		return fmt.Errorf("store: insert zone %s: %w", z.Ref, err)
 	}
 	return nil

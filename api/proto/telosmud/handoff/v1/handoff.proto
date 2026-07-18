@@ -178,4 +178,21 @@ message PlayerSnapshot {
   // is only ever trusted from a signed source. Empty for a player at the baseline tier (the common case) — the
   // destination then applies no elevation, identical to the pre-#106 fail-closed behavior (a dropped tier).
   string tier = 16;
+  // account is the player's ACCOUNT id (#72), carried so a cross-shard walk does not silently strip a
+  // session's ability to enter an instanced zone. The instanced-zone caps are charged per ACCOUNT
+  // (internal/world/instance.go: a per-character cap is routed around by alts, a per-script cap by one script
+  // minting for many players), and the world sets session.account ONLY from a signature-checked source. Without
+  // this field a player who walked from shard A to shard B would arrive with no account and be refused entry to
+  // every dungeon until they relogged.
+  //
+  // It rides the SIGNED payload (bound by snapshot_sig) for the same reason the tier does, though the threat is
+  // milder: the account grants no elevation and is never applied to the entity — it is purely an accounting key
+  // — so forging it buys an attacker only the ability to charge someone else's instance quota (a
+  // denial-of-service against that account's cap, and a false attribution in the mint logs). That is worth
+  // signing but is not the tier's privilege-escalation class. An insecure keyless destination STRIPS it, exactly
+  // as it strips the tier, so an unauthenticated Prepare can never plant one.
+  //
+  // Empty is a valid and safe value: the destination session then may not mint an instance, which is the same
+  // fail-closed posture a dev/unverified login has.
+  string account = 17;
 }

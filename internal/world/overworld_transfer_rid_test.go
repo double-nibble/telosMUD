@@ -21,7 +21,7 @@ func TestIntraShardTransferReassignsLocalRIDs(t *testing.T) {
 	commsOf(s).toggleOverride["overworld"] = true
 	Move(e, D.rooms["darkwood:room:grove"])
 
-	D.transferOut(s, O, "overworld:room:c2_r19", "exit", e.location)
+	D.transferOut(s, O, "overworld:room:c2_r19", "$n leaves exit.")
 	O.handle(<-O.inbox)
 
 	// (1) The rid must be UNIQUE within the destination zone (no collision with a room/mob/item).

@@ -9,7 +9,10 @@ import (
 // T2/T6/T9/T15). This is the NON-HARM half of the world API: RNG, the deterministic clock,
 // structured logging, room scan/broadcast, bounded entity creation, and zone-wheel scheduling.
 //
-// NO harm surface here (no dealDamage/applyDebuff/guardHarmful) — that is slice 7.3c. Every
+// NO harm surface here (no dealDamage/applyDebuff/guardHarmful) — that is slice 7.3c, with ONE stated
+// exception: mud.send_to_instance (#72, luainstance.go) is a forced relocation of a possibly non-consenting
+// player, which IS harm, and it runs the harm gate itself. It is registered here because it is the world
+// primitive content calls, not because it is exempt — see its own doc comment. Every
 // function runs INLINE on the single-writer zone goroutine (the runtime is only entered from
 // Zone.Run); mud.after schedules on the zone TIMER WHEEL (pulse.go), never the OS scheduler,
 // never a new goroutine (T6). Determinism (T9): mud.random/mud.roll draw the per-zone seeded
@@ -85,6 +88,11 @@ func (rt *luaRuntime) installMudTable() {
 		"cancel":      rt.mudCancel,
 		"pvp_allowed": rt.mudPvpAllowed,
 		"fire":        rt.mudFire,
+		// send_to_instance is the ONE gated surface in this table (#72, luainstance.go). It lives here because
+		// it is the world/util primitive content reaches for, but it is NOT non-harm: forcing another player
+		// through a zone boundary into private content is harm, so it runs the same mayRelocate gate
+		// h:teleport and h:recall run, before it does anything else. See the file header's scope note.
+		"send_to_instance": rt.mudSendToInstance,
 	}
 	L.SetFuncs(mud, fns)
 

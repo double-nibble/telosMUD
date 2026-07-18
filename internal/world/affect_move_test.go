@@ -39,7 +39,7 @@ func TestAffectTickSurvivesIntraShardMove(t *testing.T) {
 		bRoom = ref
 		break
 	}
-	A.transferOut(s, B, bRoom, "north", e.location)
+	A.transferOut(s, B, bRoom, "$n leaves north.")
 	B.handle(<-B.inbox)
 	if B.players["Mover"] == nil || e.zone != B {
 		t.Fatal("player not re-homed to B after transfer")

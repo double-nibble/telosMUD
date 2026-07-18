@@ -893,14 +893,29 @@ type AbilityMessagesDTO struct {
 // and mob prototypes it owns, and its reset script. start_room names the room a fresh login
 // spawns in (Zone.startRoom).
 type ZoneDTO struct {
-	Ref       string     `json:"ref" yaml:"ref"`
-	Name      string     `json:"name" yaml:"name"`
-	StartRoom string     `json:"start_room" yaml:"start_room"`
-	ResetSecs int        `json:"reset_secs" yaml:"reset_secs"`
-	Rooms     []RoomDTO  `json:"rooms" yaml:"rooms"`
-	Items     []ProtoDTO `json:"item_prototypes" yaml:"item_prototypes"`
-	Mobs      []ProtoDTO `json:"mob_prototypes" yaml:"mob_prototypes"`
-	Resets    []ResetDTO `json:"resets" yaml:"resets"`
+	Ref       string `json:"ref" yaml:"ref"`
+	Name      string `json:"name" yaml:"name"`
+	StartRoom string `json:"start_room" yaml:"start_room"`
+	ResetSecs int    `json:"reset_secs" yaml:"reset_secs"`
+	// Instanceable is the content-side OPT-IN to being used as an instance template (#72). Default FALSE:
+	// a zone may not be minted into a private copy unless its author says so.
+	//
+	// The engine cannot decide this and must not guess. A mint runs the template's full boot resets, so every
+	// item and mob the zone declares is created fresh in the copy; a player alone in a private copy can strip
+	// it, walk out through any foreign-zone exit (the transfer carries their whole inventory subtree), and
+	// repeat. Without an opt-in that is an uncapped GENERATION faucet — not a dupe — scaling with mint rate
+	// times account count, and it reaches EVERY zone in content, including zones whose in-world access another
+	// builder deliberately gated behind a locked door, a quest or a level check. A private copy has no doorman.
+	//
+	// So the decision is content's, as it must be (the engine states no policy about WHICH zones may be
+	// instanced), but the engine ENFORCES it at the mint sink. A zone authored as a dungeon-for-instancing
+	// sets `instanceable: true` and accepts that its resets are a faucet it has budgeted for; every other
+	// zone is refused by default, which is the fail-closed direction.
+	Instanceable bool       `json:"instanceable,omitempty" yaml:"instanceable"`
+	Rooms        []RoomDTO  `json:"rooms" yaml:"rooms"`
+	Items        []ProtoDTO `json:"item_prototypes" yaml:"item_prototypes"`
+	Mobs         []ProtoDTO `json:"mob_prototypes" yaml:"mob_prototypes"`
+	Resets       []ResetDTO `json:"resets" yaml:"resets"`
 }
 
 // RoomDTO is one room definition. ref is the stable PK / exit target; name is the display

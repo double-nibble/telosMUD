@@ -305,19 +305,57 @@ func dumpCharacter(s *session) CharSnapshot {
 	st.AppliedSeq = s.appliedSeq
 	st.Tells = dumpTellCursor(s) // Phase 8.5 — the durable-tell delivered-cursor (OQ-4)
 	st.Comms = dumpCommsState(s) // Phase 8.6 — the receiver-side comms-state subtree (P8-D7)
+	zoneRef, room := durableLocation(s)
 	return CharSnapshot{
 		PID:          pid,
 		Name:         s.character,
-		ZoneRef:      durableZoneRef(s.entity.zone),
-		RoomRef:      string(roomRef(e.location)),
+		ZoneRef:      zoneRef,
+		RoomRef:      room,
 		StateVersion: s.stateVersion,
 		State:        st,
 	}
 }
 
-// durableZoneRef is one of the three WRITE-side halves of the instance-shaped durable-location guard (#411).
-// It returns the zone id to persist as a character's location, or "" when that zone is a runtime-minted
-// instance.
+// durableLocation returns the (zone_ref, room_ref) pair to PERSIST for a session — the single producer of a
+// character's durable location, and the place the exit anchor (#72) is written.
+//
+// For an ordinary zone it is exactly what it always was: the live zone and the live room. For a player INSIDE
+// a runtime-minted instance it is the EXIT ANCHOR — the authored zone and room they entered from — written
+// POSITIVELY, as a pair.
+//
+// The pair is the point, and it is what #411 could not yet do. #411 knew an instance id must not be
+// persisted, but with no anchor to substitute it could only decline to write the zone (durableZoneRef
+// returning "", read as "preserve" at every sink). That left room_ref still holding the instance's AUTHORED
+// room — a real ref like crypt:room:tomb, because an instance hosts its template's rooms — so the row was a
+// preserved entrance zone paired with a room from a different zone entirely. A reconnect then resolved the
+// anchor ZONE and start-roomed inside it: the player woke in the temple rather than at the door they went in
+// by. Writing both halves from one source removes the mismatch by construction.
+//
+// The zone-only preserve remains as the FAIL-SAFE for an anchorless instance occupant, which should not exist
+// (entry is the only way in and it sets the anchor before releasing the session) but must not corrupt a row
+// if it ever does — see durableZoneRef.
+func durableLocation(s *session) (zoneRef, room string) {
+	if s == nil || s.entity == nil {
+		return "", ""
+	}
+	z := s.entity.zone
+	if z != nil && z.isInstance() && s.anchorZone != "" {
+		// The anchor is by construction an AUTHORED zone this shard hosts (entry is same-shard: you enter from
+		// a room, so the entrance zone is local, and the instance is minted here). So the reconnect routes to
+		// this shard, and — for as long as the anchor zone stays here — to a zone that can honor the room.
+		return s.anchorZone, string(s.anchorRoom)
+	}
+	return durableZoneRef(z), string(roomRef(s.entity.location))
+}
+
+// durableZoneRef is one of the three WRITE-side halves of the instance-shaped durable-location guard (#411),
+// now the ANCHORLESS FAIL-SAFE beneath durableLocation (#72). It returns the zone id to persist as a
+// character's location, or "" when that zone is a runtime-minted instance and no anchor is available.
+//
+// Reaching the "" branch is a BUG, not a routine path: entry sets the anchor before it releases the session,
+// so every legitimate instance occupant has one and durableLocation answers above this. It survives because
+// the consequence of getting it wrong is a corrupted durable row (see below) and because a defensive
+// preserve is strictly better than persisting an ephemeral id.
 //
 // The read side (playServer.resolveAttachZone) already refuses an instance-shaped ZoneRef, because honoring
 // one would log a reconnecting player straight into a live private instance — possibly somebody else's
@@ -343,17 +381,18 @@ func dumpCharacter(s *session) CharSnapshot {
 // row the same entrance-anchor preservation the placement record gets for free (registerPlacement simply does
 // not write).
 //
-// The anchor being preserved is the player's LAST AUTHORED zone, which is where they entered from. The
-// authoritative exit anchor — including the ROOM, which this preservation does NOT restore (room_ref still
-// takes the instance's authored room, so a reconnect lands at the anchor zone's start room) — is slice 3's.
+// The preserved value is the player's LAST AUTHORED zone, which for an instance occupant is their entrance by
+// construction. It is NOT the anchor proper — it restores no room — which is exactly why the anchor exists and
+// why this is now only the floor under it.
 func durableZoneRef(z *Zone) string {
 	if z == nil {
 		return ""
 	}
 	if z.isInstance() {
 		// z.log already carries zone= and template= (newInstanceZone), so they are not repeated here.
-		z.log.Warn("not persisting an INSTANCE as a character's durable location; the stored zone is left as it " +
-			"is. A player inside an instance persists their exit anchor (#72), never the ephemeral copy")
+		z.log.Warn("persisting no zone for a player inside an instance: the session carries NO EXIT ANCHOR, " +
+			"which should be impossible (entry sets it). Falling back to preserving the stored zone; the " +
+			"player's room_ref will be an instance room and a reconnect will start-room them")
 		return ""
 	}
 	return z.id

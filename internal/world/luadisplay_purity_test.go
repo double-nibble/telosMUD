@@ -55,6 +55,12 @@ var renderOpClass = map[string]map[string]bool{
 		"random": true, "roll": true,
 		"broadcast": true, "spawn": true, "transform": true, "summon": true,
 		"after": true, "cancel": true, "fire": true,
+		// send_to_instance (#72) queues a zone BUILD and a cross-zone transfer of a player — the single most
+		// mutating op in this table. FORBIDDEN in a render for the obvious reason and for a subtler one: a
+		// display sheet is player-triggered at arbitrary frequency (look/score spam), so a render that could
+		// reach it would let a player drive unbounded mint attempts against their own account's rate limit,
+		// and — via a template rendered for OTHER viewers — against theirs.
+		"send_to_instance": true,
 	},
 	// world/region scope READS (luascope.go) — SAFE
 	"world":  {"flag": false, "get": false},
@@ -197,7 +203,7 @@ func TestDisplayOpClassificationDriftGuard(t *testing.T) {
 		}
 	}
 
-	// Pin the EXACT forbidden set (27 qualified ops), so silently dropping a gate — or reclassifying a mutating
+	// Pin the EXACT forbidden set (28 qualified ops), so silently dropping a gate — or reclassifying a mutating
 	// op as safe — fails here too. Kept in lockstep with the guarded call sites across all six files.
 	wantForbidden := map[string]bool{
 		"handle.send": true, "handle.act": true, "handle.say": true, "handle.emote": true,
@@ -206,7 +212,8 @@ func TestDisplayOpClassificationDriftGuard(t *testing.T) {
 		"handle.move": true, "handle.teleport": true, "handle.recall": true,
 		"mud.random": true, "mud.roll": true, "mud.broadcast": true, "mud.spawn": true,
 		"mud.transform": true, "mud.summon": true, "mud.after": true, "mud.cancel": true, "mud.fire": true,
-		"gmcp.send": true, "screen.show": true,
+		"mud.send_to_instance": true,
+		"gmcp.send":            true, "screen.show": true,
 		"global.signal_region": true, "global.signal_world": true,
 	}
 	gotForbidden := map[string]bool{}
@@ -247,8 +254,11 @@ var forbiddenOpCall = map[string]string{
 	"mud.broadcast": "mud.broadcast(self:room(), 'x')", "mud.spawn": "mud.spawn('p', self:room())",
 	"mud.transform": "mud.transform(self, 'p')", "mud.summon": "mud.summon(self)",
 	"mud.after": "mud.after(1, function() end)", "mud.cancel": "mud.cancel(nil)",
-	"mud.fire":  "mud.fire('pack:X', self)",
-	"gmcp.send": "gmcp.send(self, 'Mud.X', {})", "screen.show": "screen.frame():show(self)",
+	"mud.fire": "mud.fire('pack:X', self)",
+	// denyInDisplay runs BEFORE the handle/template args are read, so a template ref that names nothing still
+	// trips the guard — which is the property being asserted.
+	"mud.send_to_instance": "mud.send_to_instance(self, 'crypt')",
+	"gmcp.send":            "gmcp.send(self, 'Mud.X', {})", "screen.show": "screen.frame():show(self)",
 	"global.signal_region": "signal_region('e')", "global.signal_world": "signal_world('e')",
 }
 

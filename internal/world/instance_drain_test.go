@@ -38,6 +38,7 @@ func TestDrainExcludesInstancesFromTheHandover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	markInstanceable(t, lc, "darkwood", "crypt") // the #72 content opt-in; see markInstanceable
 	leaser := &recordingLeaser{fakeLeaser: newFakeLeaser()}
 	dialFailed := func(string) (handoffv1.HandoffClient, error) {
 		return nil, fmt.Errorf("no peer in this test")
@@ -313,6 +314,7 @@ func TestMintRefusedWhenTheDrainStartsMidBuild(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		markInstanceable(t, lc, "darkwood", "crypt") // the #72 content opt-in; see markInstanceable
 		sh.WithScopeBus(scopebus.New(commbus.NewMemBus()), lc.Regions).WithScopeSnapshot(src)
 	})
 	defer cancel()

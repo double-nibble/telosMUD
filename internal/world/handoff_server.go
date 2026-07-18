@@ -68,14 +68,21 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 		// port that accepted an unsigned Prepare is a known-prototype item-injection vector (an econ dupe);
 		// a single-shard world never legitimately receives a handoff, so refusing is the correct fail-closed.
 		return nil, err
-	} else if snap.GetTier() != "" {
+	} else if snap.GetTier() != "" || snap.GetAccount() != "" {
 		// #106 blast-radius guard, on the INSECURE keyless path only: the carried TIER re-derives elevation
 		// (holylight/builder/admin) at the destination, so it must be trusted ONLY from an authenticated
 		// snapshot. An insecure keyless shard did not verify the signature, so an unsigned/forged Prepare
 		// could otherwise inject tier="admin" and the attach path would grant it. Strip the tier here so an
 		// insecure keyless deployment applies NO elevation from a handoff — the pre-#106 fail-closed posture.
 		// A keyed shard (above) already had the tier bound by the verified signature.
+		//
+		// The carried ACCOUNT (#72) is stripped on exactly the same terms. It grants no elevation, so this is
+		// not the tier's escalation class — but it IS the key the instanced-zone caps are charged to, and an
+		// unsigned Prepare could otherwise name any account: exhausting a victim's concurrent instance cap and
+		// mint rate limit, and attributing the mints to them in the logs. A stripped account means the arriving
+		// session may not mint, which is the fail-closed answer an unauthenticated snapshot deserves.
 		snap.Tier = ""
+		snap.Account = ""
 	}
 	// FAIL CLOSED on an instance-shaped target (#411). An instance is shard-local by construction: it takes no
 	// directory lease, is never in the placement pool, and no peer can resolve it — so a cross-shard Prepare

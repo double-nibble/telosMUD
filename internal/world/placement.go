@@ -140,26 +140,70 @@ func (z *Zone) registerPlacement(s *session) {
 	if z.shard == nil || z.shard.dir == nil || z.shard.shardID == "" || s == nil || s.character == "" {
 		return
 	}
-	// SKIP on an instance (#411), one of the three write-side halves of the durable-location guard (see
-	// durableZoneRef for the durable row, and clearPlacement below for the tombstone). The placement record is
-	// the reconnect-ROUTING spine since #320: the gate resolves a returning player by asking ShardForZone for
-	// the recorded zone. An instance is unleased and in no directory at all, so a record naming one resolves to
-	// no shard — the reconnect dead-ends — and if it somehow did resolve it would route a player into a private
-	// copy by id. Either way the honest record for a player inside an instance is their exit ANCHOR (#72),
-	// which slice 3 defines.
-	//
-	// Skipping the write leaves the player's last REGISTERED placement standing, which is a strictly better
-	// reconnect target than an ephemeral id. Note carefully what that does NOT cover: the quit path writes
-	// this record too, and it writes it even for a player inside an instance — see clearPlacement, which must
-	// still fire its tombstone and therefore guards itself DIFFERENTLY (an empty zone, not an early return).
-	// "Recording nothing" is this site's answer alone; it is not the record's whole story.
-	if z.isInstance() {
-		// z.log already carries zone= and template= (newInstanceZone).
-		z.log.Warn("not recording a directory placement for a player inside an instance: an instance is unleased "+
-			"and resolves to no shard, so the record could only dead-end a reconnect", "player", s.character)
+	zoneID := placementZoneRef(z, s)
+	if zoneID == "" {
+		// The anchorless-instance fail-safe (see placementZoneRef). This site must SKIP rather than write the
+		// empty ref, and the asymmetry with clearPlacement below is not a style choice — the two Lua scripts
+		// treat an empty zone differently. `registerPlacement` HSETs the field UNCONDITIONALLY, so an empty ref
+		// here would CLOBBER the stored zone with "" and destroy the very anchor we are trying to preserve;
+		// `clearPlayerShard` guards the field on ARGV[2] ~= '', so there an empty ref genuinely means "leave it
+		// alone". Skipping leaves the player's last good placement standing, which is #411's behavior and the
+		// right degraded outcome.
 		return
 	}
-	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch, nonce: s.nonce})
+	z.shard.placement.offer(placementOp{
+		playerID: s.character, zoneID: zoneID, epoch: s.epoch, nonce: s.nonce,
+	})
+}
+
+// placementZoneRef is the zone a placement write should NAME for this session — the shared rule for both the
+// registration and the logout tombstone (#72), and one of the write-side halves of the instance-shaped
+// durable-location guard (#411; see durableLocation for the durable row).
+//
+// The placement record is the reconnect-ROUTING spine since #320: the gate resolves a returning player by
+// asking ShardForZone for the recorded zone. Its invariant is "the recorded zone is the zone that holds the
+// session". An instance takes no lease and is in no directory at all, so a record naming one resolves to no
+// shard and the reconnect dead-ends; and if it somehow DID resolve it would route a player into a private copy
+// by id, one they may never have entered. So a player inside an instance records their exit ANCHOR.
+//
+// The anchor keeps the #320 invariant honest rather than bending it, which is why this is a positive write and
+// not the #411 skip it replaces. Recording nothing at all (the #411 behavior) merely left the last good record
+// standing, which was the anchor only by luck of the last walk; this makes it the anchor by intent, and keeps
+// it CURRENT as the player walks between rooms of the instance.
+//
+// BE PRECISE ABOUT THE SHARD INVARIANT — it holds AT ENTRY and is not maintained afterwards.
+//
+// At entry it is true by construction: you enter an instance from a room, so the entrance zone is hosted here,
+// and MintInstance builds the copy on this shard. So the anchor names a zone THIS shard hosts, ShardForZone
+// resolves to us, and the shard holding the live instance is the one that answers a reconnect.
+//
+// NOTHING KEEPS IT TRUE FOR THE DURATION OF THE VISIT. The anchor zone is an ordinary leased zone and can be
+// rebalanced or drained to a PEER while the player is inside the instance. The anchor is not updated when that
+// happens (it names a zone id, and the id does not move), so from then on the record routes a reconnect to the
+// PEER — which has no session for this character and fresh-logs them from durable state, while THIS shard is
+// still holding the live one. That is the double-own shape, and the outcome is the classic one: two copies of
+// the character, the loser's state discarded at save time.
+//
+// This is NOT a regression and not specific to instances: pre-#72 the record named the last authored zone the
+// player stood in, and a rebalance of THAT zone produced exactly the same race. The degradation is identical;
+// the anchor neither introduces nor worsens it. It is stated here only because the paragraph above used to
+// assert the same-shard property flatly, which would let a future reader take it as a maintained safety
+// invariant and build on it. It is an entry-time property that decays. The fence for it is filed separately.
+//
+// The "" fallback is for an anchorless instance occupant, which entry makes impossible. At the sink an empty
+// zone means "leave the stored zone alone" (the clearPlayerShard script treats ARGV[2] == ” as a no-op on the
+// field; RegisterPlacement likewise), so the degraded outcome is #411's — the last authored zone stands.
+func placementZoneRef(z *Zone, s *session) string {
+	if !z.isInstance() {
+		return z.id
+	}
+	if s.anchorZone != "" {
+		return s.anchorZone
+	}
+	// z.log already carries zone= and template= (newInstanceZone).
+	z.log.Warn("placement write for a player inside an instance with NO EXIT ANCHOR (entry should have set "+
+		"one); recording no zone rather than an ephemeral id that resolves to no shard", "player", s.character)
+	return ""
 }
 
 // clearPlacement enqueues the clean-logout tombstone: drop this player's `shard` field, keeping their epoch
@@ -198,29 +242,23 @@ func (z *Zone) clearPlacement(s *session) {
 	// is still pending REPLACES it — without this the tombstone would leave the record naming the zone the
 	// player walked out of, and a later reconnect would route by that stale zone.
 	//
-	// EXCEPT from an instance (#411), where the zone is dropped but the TOMBSTONE STILL FIRES. This site is
-	// guarded differently from registerPlacement, and the difference is the whole point:
+	// From inside an instance this carries the exit ANCHOR (placementZoneRef, #72) and the tombstone STILL
+	// FIRES. Both halves matter, and they are why this site cannot simply mirror whatever registerPlacement
+	// does:
 	//
-	//   - It cannot early-return like registerPlacement does. The clear is what stops the record from claiming
-	//     a shard that is exiting still hosts this player; skipping it is a stale-routing bug of its own.
-	//   - It cannot carry z.id either. ClearPlayerShard deliberately PRESERVES `zone` across the tombstone
+	//   - It must never skip. The clear is what stops the record from claiming a shard that is exiting still
+	//     hosts this player; skipping it is a stale-routing bug of its own.
+	//   - It must never carry z.id. ClearPlayerShard deliberately PRESERVES `zone` across the tombstone
 	//     because it is the reconnect routing key, so writing an instance id here is the one write on this
 	//     path that OUTLIVES both the session and the instance. The instance is reaped seconds later,
 	//     ShardForZone then finds no lease for it, and per the #320 policy the gate does not fall back to
-	//     place.ShardID — so the player routes by home zone until some future registerPlacement happens to
-	//     overwrite the field. Nothing self-heals it in between.
+	//     place.ShardID — so the player would route by home zone until some future registerPlacement happened
+	//     to overwrite the field. Nothing self-heals it in between.
 	//
-	// An empty zone is exactly "clear the shard, leave the stored zone alone" (the clearPlayerShard script
-	// treats ARGV[2] == '' as a no-op on the field, internal/directory/redis.go), which preserves whatever
-	// authored zone the player was last registered in — their entrance anchor by construction, since
-	// registerPlacement never recorded the instance.
-	zoneID := z.id
-	if z.isInstance() {
-		// z.log already carries zone= and template= (newInstanceZone).
-		z.log.Warn("tombstoning a logout from inside an instance WITHOUT the zone: the placement record's zone "+
-			"outlives the instance, so recording an ephemeral id would dangle permanently", "player", s.character)
-		zoneID = ""
-	}
+	// The anchor is a durable authored ref, so it is safe to OUTLIVE the instance in a way the instance id
+	// never was: it names a real leased zone that resolves for as long as the content defines it. A quit from
+	// inside a dungeon therefore comes back at the dungeon door.
+	zoneID := placementZoneRef(z, s)
 	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: zoneID, epoch: s.epoch, nonce: s.nonce, clear: true})
 }
 

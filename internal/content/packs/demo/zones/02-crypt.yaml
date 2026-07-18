@@ -3,6 +3,17 @@ zones:
     name: The Forgotten Crypt
     start_room: crypt:room:entrance
     reset_secs: 90
+    # The demo's one INSTANCEABLE zone (#72). Opting in is the author saying "a private copy of this zone may
+    # be minted for a party" — and, implicitly, "I have budgeted for my resets running once per copy".
+    #
+    # That second half is why the flag exists and why it defaults to false. A mint runs the whole boot reset
+    # list, so every item and mob below is created fresh in each copy; a player alone in one can strip it, walk
+    # out, and mint another. The engine caps how MANY copies exist (per-account, per-shard, a mint rate limit),
+    # so the faucet is bounded — but it is still a faucet, and only the author of a zone can say whether its
+    # loot table is one they are willing to hand out on those terms. Midgaard, darkwood and the overworld
+    # deliberately do NOT set this: they are the shared, persistent world, and a private copy of a town would
+    # duplicate its shopkeepers' stock and route around every locked door in it.
+    instanceable: true
     rooms:
       - ref: crypt:room:entrance
         name: A Crumbling Stair
