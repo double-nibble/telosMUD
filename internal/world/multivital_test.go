@@ -13,8 +13,8 @@ import (
 
 // registerVital registers a secondary vital `ref` capped by attribute `maxAttr` (base `max`), with the
 // given on_depleted op-list. Call BEFORE creating the mob so its first attr() read resolves the cap.
-func registerVital(z *Zone, ref, maxAttr string, max float64, vital, primary bool, onDepleted []effectOp) {
-	z.defs.attr.register(maxAttr, &attributeDef{ref: maxAttr, base: litNode{v: max}})
+func registerVital(z *Zone, ref, maxAttr string, maxVal float64, vital, primary bool, onDepleted []effectOp) {
+	z.defs.attr.register(maxAttr, &attributeDef{ref: maxAttr, base: litNode{v: maxVal}})
 	z.defs.res.register(ref, &resourceDef{
 		ref: ref, maxAttr: maxAttr, vital: vital, primary: primary, onDepleted: onDepleted,
 	})
@@ -268,11 +268,11 @@ func TestRespawnRestoresAllVitals(t *testing.T) {
 
 	z.respawnPlayer(s.entity)
 
-	if got, max := resourceCurrent(s.entity, "hp"), resourceMax(s.entity, "hp"); got != max {
-		t.Fatalf("respawned hp = %d, want full %d", got, max)
+	if got, want := resourceCurrent(s.entity, "hp"), resourceMax(s.entity, "hp"); got != want {
+		t.Fatalf("respawned hp = %d, want full %d", got, want)
 	}
-	if got, max := resourceCurrent(s.entity, "sanity"), resourceMax(s.entity, "sanity"); got != max {
-		t.Fatalf("respawned sanity = %d, want full %d (respawn must restore ALL vitals)", got, max)
+	if got, want := resourceCurrent(s.entity, "sanity"), resourceMax(s.entity, "sanity"); got != want {
+		t.Fatalf("respawned sanity = %d, want full %d (respawn must restore ALL vitals)", got, want)
 	}
 }
 
@@ -314,20 +314,16 @@ func TestRedirectCarriesRoutedPool(t *testing.T) {
 // so we assert the boundary conditions through the same table shapes rather than capturing the log.)
 func TestLintVitalResourcesBoundary(t *testing.T) {
 	// The lint is a slog-only side effect; drive it across the three shapes to prove it doesn't panic and
-	// that the logic branches (single vital / multi+primary / multi+none) are all exercised.
-	single := map[string]*resourceDef{"hp": {ref: "hp", vital: true}}
-	multiWithPrimary := map[string]*resourceDef{
-		"hp":     {ref: "hp", vital: true, primary: true},
-		"sanity": {ref: "sanity", vital: true},
+	// that the logic branches (single vital / multi+primary / multi+none) are all exercised. Only the
+	// multi_no_primary shape reaches the WARN branch.
+	cases := map[string]map[string]*resourceDef{
+		"single":             {"hp": {ref: "hp", vital: true}},
+		"multi_with_primary": {"hp": {ref: "hp", vital: true, primary: true}, "sanity": {ref: "sanity", vital: true}},
+		"multi_no_primary":   {"blood": {ref: "blood", vital: true}, "hp": {ref: "hp", vital: true}},
 	}
-	multiNoPrimary := map[string]*resourceDef{
-		"blood": {ref: "blood", vital: true},
-		"hp":    {ref: "hp", vital: true},
+	for name, table := range cases {
+		t.Run(name, func(_ *testing.T) { lintVitalResources(table) })
 	}
-	// None of these should panic; the WARN branch is reached only by multiNoPrimary.
-	lintVitalResources(single)
-	lintVitalResources(multiWithPrimary)
-	lintVitalResources(multiNoPrimary)
 }
 
 // TestLintDealDamageResources proves the new content-lint flags a deal_damage whose `resource` names an
