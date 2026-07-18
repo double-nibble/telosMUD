@@ -24,6 +24,17 @@ var (
 	_ content.DefinitionSource = (*Pool)(nil)
 )
 
+// zoneBody is the JSONB tail shape for a zone row. The zones table has carried a `body` column since the
+// first definition migration; this is its first occupant.
+//
+// Instanceable (#72) is the content-side opt-in to being minted as an instance template. It MUST round-trip
+// through here: without it the flag parses from YAML, survives an in-memory load, and returns FALSE from
+// Postgres, so a zone its author opted in stops being mintable as soon as content is served from the store.
+// Same field-drop trap as the Living/Lua/Bind gaps on protoBody below, and as Round 35's `primary`.
+type zoneBody struct {
+	Instanceable bool `json:"instanceable,omitempty"`
+}
+
 // protoBody is the JSONB tail shape for an item/mob prototype row: the optional component
 // templates. It mirrors the component fields of content.ProtoDTO so a round-trip through the
 // DB column reproduces the same prototype the embedded YAML would.
@@ -79,7 +90,7 @@ func (p *Pool) LoadPacks(ctx context.Context, enabled []string) ([]content.Pack,
 
 	// Zones.
 	rows, err := p.pool.Query(ctx,
-		`SELECT ref, pack, name, COALESCE(start_room, ''), reset_secs
+		`SELECT ref, pack, name, COALESCE(start_room, ''), reset_secs, body
 		   FROM zones WHERE pack = ANY($1) ORDER BY pack, ref`, enabled)
 	if err != nil {
 		return nil, fmt.Errorf("store: query zones: %w", err)
@@ -87,9 +98,20 @@ func (p *Pool) LoadPacks(ctx context.Context, enabled []string) ([]content.Pack,
 	for rows.Next() {
 		var z content.ZoneDTO
 		var pk string
-		if err := rows.Scan(&z.Ref, &pk, &z.Name, &z.StartRoom, &z.ResetSecs); err != nil {
+		var body []byte
+		if err := rows.Scan(&z.Ref, &pk, &z.Name, &z.StartRoom, &z.ResetSecs, &body); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("store: scan zone: %w", err)
+		}
+		// The JSONB tail. A row written before the body was populated defaults to '{}' (the column's schema
+		// default), which unmarshals to the zero zoneBody — instanceable=false, the fail-closed default.
+		if len(body) > 0 {
+			var zb zoneBody
+			if err := json.Unmarshal(body, &zb); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("store: unmarshal zone body %s: %w", z.Ref, err)
+			}
+			z.Instanceable = zb.Instanceable
 		}
 		pp := pack(pk)
 		pp.Zones = append(pp.Zones, z)

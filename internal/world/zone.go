@@ -319,6 +319,13 @@ type attachMsg struct {
 	// dev/unverified path and on a handoff re-dial (the applied flags ride the entity snapshot), meaning
 	// "player unless a signature-checked claim elevated it".
 	tier string
+
+	// account is the ACCOUNT id from the same VERIFIED session assertion (#72, server.go), carried so the
+	// session can charge the per-account instanced-zone caps. Empty on the dev/unverified path and on a
+	// handoff re-dial (which carries the account on the SIGNED snapshot instead, like the tier). Unlike the
+	// tier it grants no elevation and is not applied to the entity — it is purely an accounting key — but it
+	// is held to the same provenance rule: only ever set from a signature-checked claim.
+	account string
 }
 
 // inputMsg carries one line of player input. seq is the gate's session-scoped input
@@ -791,6 +798,14 @@ func (z *Zone) handle(m msg) {
 		z.attach(v)
 	case transferInMsg:
 		z.transferIn(v)
+	case instanceReadyMsg:
+		// Hop 3 of the async instance entry (#72): the shard's mint worker finished building (or failed) and
+		// this — the ENTRANCE zone, which still owns the session — completes or abandons the crossing.
+		z.instanceReady(v)
+	case evictToAnchorMsg:
+		z.evictToAnchor(v)
+	case ejectInstanceMsg:
+		z.ejectAllToAnchors(v.resp)
 	case prepareMsg:
 		z.prepare(v)
 	case abortPendingMsg:
@@ -1181,6 +1196,34 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// (The cross-shard handoff path REBUILDS the entity from a snapshot via this zone's allocator, so it
 	// gets fresh local rids for free; only this intra-shard live-object fast path must re-home explicitly.)
 	z.rehomeSubtree(s.entity)
+	// EXIT ANCHOR lifecycle (#72). The anchor is meaningful only while the player is inside an instance, so
+	// arriving anywhere ELSE clears it — and this is the single clear point, covering every way out at once:
+	// walking through an exit that names another zone (which is just an ordinary cross-zone move, since #410's
+	// ownsZoneRef makes an instance a closed copy whose foreign exits leave normally), the drain eject, and the
+	// anchorless-respawn eviction. Arriving in an INSTANCE keeps it, which is what lets a player walk from room
+	// to room inside a dungeon without losing the door they came in by.
+	//
+	// Clearing it here rather than at each departure point is deliberate: the departure sites are many and
+	// growing, the arrival site is one, and a stale anchor is not inert — it would be persisted as the player's
+	// durable location (durableLocation) long after they left, sending a later reconnect to a door they are
+	// nowhere near.
+	if !z.isInstance() {
+		s.anchorZone, s.anchorRoom = "", ""
+	}
+	// Any in-flight instance mint this session had is moot now, whichever zone we are (#72).
+	//
+	// instanceMintPending is scoped to ONE origin zone: instanceReady clears it, but only on the zone that
+	// took the request. A player who asks to enter and then WALKS AWAY before the (unbounded) build finishes
+	// leaves that reply landing on a zone which no longer holds them — it returns without clearing, because
+	// there is nothing there to clear — while the session travels on with the flag still set. It would then
+	// latch for the rest of the session: requestInstanceEntry refuses "the way is already opening" forever,
+	// and the player can never enter a dungeon again until they relog.
+	//
+	// Clearing on arrival is the right place because it is the same fact the anchor clear expresses: a
+	// transfer is a change of custody, so whatever the previous owner had outstanding for this session is not
+	// ours to wait on. It is safe on the ENTRY transfer too — instanceReady has already cleared the flag by
+	// the time it calls transferOut, so this is a no-op there rather than a race with it.
+	s.instanceMintPending = false
 	z.setPlayer(s.character, s)
 	// Belt-and-suspenders combat clear: transferOut already disengaged the mover (and move() refuses
 	// to walk while fighting), so this is normally a no-op. But it GUARANTEES the destination never
@@ -1410,6 +1453,14 @@ func (z *Zone) attach(m attachMsg) {
 		if curZone != nil {
 			curZone.Store(z)
 		}
+		// Refresh the account from THIS connection's verified assertion (#72). A re-attach re-verified a fresh,
+		// signature-checked claim bound to this character (server.go), so it is at least as trustworthy as what
+		// the session already holds — and refreshing repairs a session whose account was lost, most importantly
+		// one that arrived over an insecure keyless handoff. Guarded on non-empty so the dev/unverified path
+		// (no verify key, so no claim) cannot BLANK a good account on reconnect.
+		if m.account != "" {
+			s.account = m.account
+		}
 		s.detached = false
 		s.attachGen++
 		s.send(attachedFrame(z.id))
@@ -1430,7 +1481,10 @@ func (z *Zone) attach(m attachMsg) {
 		if epoch < 1 {
 			epoch = 1
 		}
-		s = &session{character: character, out: out, epoch: epoch, currentZone: curZone, tier: m.tier, nonce: newSessionNonce()}
+		s = &session{
+			character: character, out: out, epoch: epoch, currentZone: curZone,
+			tier: m.tier, account: m.account, nonce: newSessionNonce(),
+		}
 		z.newPlayerEntity(s, character)
 		z.log.Debug("fresh login epoch seeded", "player", character, "epoch", epoch, "resume", resumeEpoch, "tier", m.tier)
 		if curZone != nil {
@@ -1607,6 +1661,14 @@ func (z *Zone) prepare(m prepareMsg) {
 		// keyless (dev/test) shard that skips signature verification also skips carrying elevation into a trust
 		// boundary, since those deployments are single-shard and never hand off.
 		tier: m.snap.GetTier(),
+		// Adopt the ACCOUNT id carried on the same SIGNED snapshot (#72), so a cross-shard walk does not leave
+		// the player unable to enter a dungeon on the far side until they relog. It grants nothing — it is the
+		// key the instanced-zone caps are charged to — but it is held to the same provenance rule as the tier:
+		// only from a signed source, and STRIPPED by an insecure keyless destination (handoff_server.go), so
+		// this is empty and the arriving session may not mint. There is deliberately NO exit anchor on the
+		// snapshot: an instance is shard-local and never a handoff destination, so a session that crosses a
+		// shard boundary is by definition not inside one.
+		account: m.snap.GetAccount(),
 	}
 	e := z.newPlayerEntity(s, character)
 	// Rehydrate the receiver-side comms-state subtree carried on the snapshot (Phase 8.6) so toggles/

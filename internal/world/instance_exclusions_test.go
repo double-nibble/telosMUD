@@ -317,87 +317,139 @@ func TestDurableZoneRefRefusesAnInstance(t *testing.T) {
 
 // TestDurableLocationGuardIsSymmetric is the WRITE side of the guard above, and the reason it exists is that
 // the read side's justification — "no write path stores an instance-shaped ZoneRef" — is an ASSUMPTION with
-// an expiry date. Slice 3 (#72) puts players inside instances, at which point dumpCharacter's
-// `s.entity.zone.id` and registerPlacement's `z.id` both start writing exactly the shape the read side is
-// there to refuse. A read guard whose only adversary is its own slice's write path is not a guard; this makes
-// slice 3's exit anchor an enforcement rather than a convention.
+// an expiry date. #72 puts players inside instances, at which point dumpCharacter's `s.entity.zone.id` and
+// registerPlacement's `z.id` would both start writing exactly the shape the read side is there to refuse. A
+// read guard whose only adversary is its own slice's write path is not a guard.
 //
-// THERE ARE THREE WRITE SITES, and they do NOT all do the same thing — "both writers fail closed to no
-// location" is the version of this claim that shipped a bug, so it is stated precisely here:
+// #411 made all three write sites decline to record the instance. #72 makes them record the EXIT ANCHOR — the
+// zone and room the player entered from — which is what this asserts. The distinction is not cosmetic: #411
+// could only PRESERVE (leave whatever was on the row alone), which happened to be the entrance zone by luck
+// of the last walk and left room_ref naming a room in a different zone; the anchor is written positively,
+// as a pair, and stays current as the player walks around inside the instance.
 //
-//   - dumpCharacter (the durable row + the Redis checkpoint) PRESERVES. It hands "" to the store, and the
-//     sink reads "" as "leave zone_ref alone", so the entrance anchor already on the row survives. A
-//     CLEARING write there is worse than useless: room_ref keeps the template's authored ref, so the row
-//     becomes a real room with no zone and the reconnect start-rooms the player (or, if the shard's home
-//     zone IS the template, materializes them inside the SHARED copy).
-//   - registerPlacement SKIPS. It writes nothing at all, so the player's last good placement stands.
-//   - clearPlacement STILL FIRES, with an empty zone. Dropping the tombstone would leave the record naming
-//     a shard that is exiting; carrying the instance id would HSET an ephemeral zone into a record that
-//     deliberately OUTLIVES the session (ClearPlayerShard preserves `zone` as the reconnect routing key),
-//     and nothing ever overwrites it — ShardForZone finds no lease for a reaped instance and the gate does
-//     not fall back to place.ShardID (#320).
+// THE THREE WRITE SITES DO NOT ALL BEHAVE THE SAME, and "they all fail closed to no location" is the version
+// of this claim that shipped a bug, so each is stated precisely:
+//
+//   - dumpCharacter (the durable row + the Redis checkpoint) writes the anchor ZONE AND ROOM together.
+//   - registerPlacement writes the anchor zone.
+//   - clearPlacement STILL FIRES and carries the anchor zone. Dropping the tombstone would leave the record
+//     naming a shard that is exiting; carrying the INSTANCE id would HSET an ephemeral zone into a record
+//     that deliberately OUTLIVES the session (ClearPlayerShard preserves `zone` as the reconnect routing
+//     key), and nothing would ever overwrite it.
+//
+// The anchorless sub-test is the FAIL-SAFE, not a supported state: entry sets the anchor before it releases
+// the session. It is pinned because the two placement scripts disagree about what an empty zone means —
+// `registerPlacement` HSETs the field unconditionally (so an empty ref CLOBBERS the stored zone), while
+// `clearPlayerShard` guards on ARGV[2] ~= ” (so an empty ref preserves) — which is why one site skips and the
+// other writes empty.
 func TestDurableLocationGuardIsSymmetric(t *testing.T) {
+	const (
+		instZone   = "darkwood#deadbeef"
+		anchorZone = "midgaard"
+		anchorRoom = ProtoRef("midgaard:room:market")
+	)
+
 	// --- the durable character row -------------------------------------------------------------------------
-	if got := durableZoneRef(newInstanceZone("darkwood#deadbeef", "darkwood")); got != "" {
-		t.Fatalf("dumpCharacter would persist %q as a character's durable location. The row is dangling by "+
-			"construction (the instance is reaped in minutes) AND it is a poisoned record aimed straight at the "+
-			"read guard, which would otherwise log a reconnecting player into a live private dungeon", got)
+	// durableLocation is the single producer of the pair. Both halves must come from the anchor: an anchor
+	// zone paired with an INSTANCE room is the internally inconsistent row #411 could not avoid, and it
+	// start-rooms the player on reconnect.
+	inst := newInstanceZone(instZone, "darkwood")
+	instRoom := inst.newEntity("darkwood:room:lair")
+	Add(instRoom, &Room{})
+	anchored := &session{character: "Hero", entity: inst.newEntity("Hero"), anchorZone: anchorZone, anchorRoom: anchorRoom}
+	anchored.entity.zone = inst
+	Move(anchored.entity, instRoom)
+	if z, r := durableLocation(anchored); z != anchorZone || r != string(anchorRoom) {
+		t.Fatalf("durableLocation inside an instance = (%q, %q), want the exit anchor (%q, %q). Persisting the "+
+			"instance id dangles by construction (it is reaped in minutes) and aims a poisoned record straight "+
+			"at the read guard; persisting the anchor ZONE with the INSTANCE room is the #411 shape that "+
+			"start-rooms the player", z, r, anchorZone, anchorRoom)
 	}
-	// The CONTROL: an ordinary zone is still persisted, so the guard is not "we stopped saving locations".
-	if got := durableZoneRef(newZone("darkwood")); got != "darkwood" {
-		t.Fatalf("durableZoneRef(authored darkwood) = %q, want darkwood", got)
+	// The CONTROL: an ordinary zone still persists its own live location, so this is not "we stopped saving".
+	plain := newZone("darkwood")
+	plainRoom := plain.newEntity("darkwood:room:grove")
+	Add(plainRoom, &Room{})
+	ordinary := &session{character: "Hero", entity: plain.newEntity("Hero")}
+	ordinary.entity.zone = plain
+	Move(ordinary.entity, plainRoom)
+	if z, r := durableLocation(ordinary); z != "darkwood" || r != "darkwood:room:grove" {
+		t.Fatalf("durableLocation in an ORDINARY zone = (%q, %q), want (darkwood, darkwood:room:grove)", z, r)
 	}
-	if got := durableZoneRef(nil); got != "" {
-		t.Fatalf("durableZoneRef(nil) = %q, want empty", got)
+	// The FAIL-SAFE: an instance occupant with no anchor preserves rather than persisting the ephemeral id.
+	anchorless := &session{character: "Hero", entity: inst.newEntity("Ghost")}
+	anchorless.entity.zone = inst
+	Move(anchorless.entity, instRoom)
+	if z, _ := durableLocation(anchorless); z != "" {
+		t.Fatalf("durableLocation for an ANCHORLESS instance occupant = %q, want \"\" (preserve at the sink); "+
+			"persisting an instance id is what the read guard exists to refuse", z)
 	}
 
 	// --- the directory placement record --------------------------------------------------------------------
 	// The placement record is the reconnect-ROUTING spine since #320: the gate resolves a returning player by
 	// asking ShardForZone for the recorded zone. An instance is unleased and in no directory at all, so a
-	// record naming one resolves to no shard and dead-ends the reconnect.
+	// record naming one resolves to no shard and dead-ends the reconnect. The anchor is an AUTHORED zone this
+	// shard hosts, so it keeps the record's invariant ("the recorded zone is the zone that holds the session")
+	// honest rather than bending it.
 	sh := NewShardFromContent(nil, nil, "midgaard", "", newFakeLocator(), nil)
 	sh.shardID = "shard-a"
-	sess := &session{character: "Hero", epoch: 1}
-
-	inst := newInstanceZone("darkwood#deadbeef", "darkwood")
 	inst.shard = sh
-	inst.registerPlacement(sess)
-	if ops, _ := sh.placement.take(); len(ops) != 0 {
-		t.Fatalf("registerPlacement enqueued %d op(s) for a player inside an INSTANCE: the recorded zone is "+
-			"unleased and resolves to no shard, so the reconnect dead-ends instead of falling back to the "+
-			"player's last good placement", len(ops))
-	}
-	// The CONTROL: an ordinary zone still records, so the refusal is not "placement stopped working".
-	plain := newZone("darkwood")
 	plain.shard = sh
+	sess := &session{character: "Hero", epoch: 1, anchorZone: anchorZone, anchorRoom: anchorRoom}
+
+	inst.registerPlacement(sess)
+	ops, _ := sh.placement.take()
+	if len(ops) != 1 || ops[0].zoneID != anchorZone {
+		t.Fatalf("registerPlacement from inside an instance enqueued %+v, want one op naming the anchor %q. "+
+			"An instance id resolves to no shard (the reconnect dead-ends); the anchor resolves to THIS shard, "+
+			"which is the one holding the live instance", ops, anchorZone)
+	}
+	// The FAIL-SAFE, and the asymmetry with the tombstone below: with no anchor this site must write NOTHING.
+	// The registerPlacement Lua HSETs `zone` unconditionally, so offering an empty ref would clobber the stored
+	// anchor with "" — destroying exactly what the preserve is trying to keep.
+	inst.registerPlacement(&session{character: "Hero", epoch: 1})
+	if ops, _ := sh.placement.take(); len(ops) != 0 {
+		t.Fatalf("registerPlacement enqueued %d op(s) for an ANCHORLESS instance occupant. The Lua HSETs the "+
+			"zone field unconditionally, so this CLOBBERS the player's last good placement with an empty "+
+			"string rather than preserving it", len(ops))
+	}
+	// The CONTROL: an ordinary zone still records itself.
 	plain.registerPlacement(sess)
-	if ops, _ := sh.placement.take(); len(ops) == 0 {
-		t.Fatal("registerPlacement recorded nothing for an ORDINARY zone either — the refusal is too broad")
+	if ops, _ := sh.placement.take(); len(ops) != 1 || ops[0].zoneID != "darkwood" {
+		t.Fatalf("registerPlacement from an ORDINARY zone enqueued %+v, want one op naming darkwood — the "+
+			"instance branch is too broad", ops)
 	}
 
 	// --- the clean-logout tombstone ------------------------------------------------------------------------
 	// The one that OUTLIVES both the session and the instance. ClearPlayerShard deliberately preserves the
 	// `zone` field across the tombstone because it is the reconnect routing key, so a quit from inside an
-	// instance HSETs an ephemeral id into a durable record and the instance is reaped seconds later. Nothing
-	// self-heals it: no later write happens until the player's next login, and until then the gate resolves
-	// them through a zone with no lease.
+	// instance would HSET an ephemeral id into a durable record — and the instance is reaped seconds later.
+	// Nothing self-heals it: no later write happens until the player's next login, and until then the gate
+	// resolves them through a zone with no lease. The anchor is a durable authored ref, so it is safe to
+	// outlive the instance in a way the instance id never was.
 	inst.clearPlacement(sess)
-	ops, _ := sh.placement.take()
-	if len(ops) != 1 {
+	ops, _ = sh.placement.take()
+	switch {
+	case len(ops) != 1:
 		t.Fatalf("clearPlacement enqueued %d op(s) from inside an instance, want 1: the tombstone must still "+
 			"FIRE — dropping it leaves the placement record claiming an exiting shard still hosts the player",
 			len(ops))
-	}
-	if !ops[0].clear {
+	case !ops[0].clear:
 		t.Fatalf("clearPlacement enqueued a REGISTRATION (%+v), not a tombstone", ops[0])
+	case ops[0].zoneID != anchorZone:
+		t.Fatalf("clearPlacement carried zone %q into the tombstone, want the anchor %q. An instance id here "+
+			"is the one write on this path that outlives both the session and the instance: it is reaped "+
+			"seconds later, ShardForZone then finds no lease, and per #320 the gate will NOT fall back to "+
+			"place.ShardID — the player routes by home zone until some future registerPlacement overwrites it",
+			ops[0].zoneID, anchorZone)
 	}
-	if ops[0].zoneID != "" {
-		t.Fatalf("clearPlacement carried zone %q into the tombstone. ClearPlayerShard HSETs a non-empty zone "+
-			"and preserves it across the tombstone as the reconnect routing key, so this records an EPHEMERAL "+
-			"id in a durable record; the instance is reaped seconds later, ShardForZone then finds no lease, "+
-			"and per #320 the gate will NOT fall back to place.ShardID — the player is routed by home zone "+
-			"until some future registerPlacement happens to overwrite it. An empty zone is the fix: the Lua "+
-			"script reads it as 'leave the stored zone untouched'", ops[0].zoneID)
+	// The FAIL-SAFE here goes the OTHER way from registerPlacement's: an empty zone is exactly "clear the
+	// shard, leave the stored zone alone" (clearPlayerShard guards the field on ARGV[2] ~= ''), so the
+	// tombstone fires and preserves.
+	inst.clearPlacement(&session{character: "Hero", epoch: 1})
+	ops, _ = sh.placement.take()
+	if len(ops) != 1 || !ops[0].clear || ops[0].zoneID != "" {
+		t.Fatalf("clearPlacement for an ANCHORLESS instance occupant enqueued %+v, want one tombstone with an "+
+			"EMPTY zone (fire, and leave the stored zone untouched)", ops)
 	}
 	// The CONTROL: quitting an ORDINARY zone still carries that zone, or a logout that coalesced over a
 	// pending zone-change registration would leave the record naming the zone the player walked out of.
@@ -405,12 +457,19 @@ func TestDurableLocationGuardIsSymmetric(t *testing.T) {
 	ops, _ = sh.placement.take()
 	if len(ops) != 1 || !ops[0].clear || ops[0].zoneID != "darkwood" {
 		t.Fatalf("clearPlacement from an ORDINARY zone enqueued %+v, want one tombstone carrying darkwood — "+
-			"the instance guard is too broad", ops)
+			"the instance branch is too broad", ops)
 	}
 }
 
 // TestSavingFromInsideAnInstancePreservesTheDurableAnchor is the PRODUCER-to-SINK half of the durable-row
 // guard, and the reason durableZoneRef's "" cannot mean "fail closed to no location" (#411).
+//
+// SINCE #72 THIS IS THE FAIL-SAFE PATH, not the normal one. An instance occupant now carries an exit ANCHOR
+// and durableLocation writes it positively as a (zone, room) pair, so the "" preserve is reached only by an
+// anchorless occupant — which entry makes impossible. It is still pinned, and pinned here rather than merged
+// into the anchor tests, because the SINK contract it describes ("" == leave the stored zone alone, in all
+// three tiers) is what keeps that unreachable case from corrupting a row instead of merely degrading it. See
+// TestDurableLocationInsideAnInstanceIsTheAnchor for the path a real player takes.
 //
 // "" reaching the sink as a CLEARING write is strictly worse than storing the instance id would have been:
 // RoomRef is not blanked (an instance hosts its TEMPLATE's authored rooms, so the snapshot carries a real

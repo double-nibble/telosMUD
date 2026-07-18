@@ -377,6 +377,22 @@ func (rt *luaRuntime) hRecall(l *lua.LState) int {
 // PLAYER to move is harm (a grief vector), so it is gated through guardHarmful against e (the
 // same gate dealDamage uses): a non-consenting player in a safe room is not relocated. nil
 // invocation => not allowed (fail-closed).
+//
+// BE PRECISE ABOUT WHAT THIS DOES AND DOES NOT GATE — a call to it is not by itself evidence that
+// a path is policed. Two exemptions are broad enough that most real invocations never reach the
+// guard at all:
+//
+//   - SELF IS EXEMPT (e == rt.inv.actor), and self is the majority of call sites. A script moving
+//     the actor that invoked it — the ordinary case for h:teleport, h:recall and the instance door
+//     idiom — returns true here without any policy being consulted. For those sites this is a
+//     no-op, not a chokepoint.
+//   - A MOB ACTOR IS UNGATED. Even on the non-self, player-target path, guardHarmful -> pvpAllowed
+//     short-circuits on !isPlayer(ACTOR) BEFORE the safe-room veto, so a mob-actor invocation
+//     (a mob tick, an aggro handler, a mob ability) passes unconditionally: neither pvp policy nor
+//     safe rooms nor consent applies. That is a deliberate long-standing property — mobs are
+//     supposed to be able to shove players around inside observable space — but it means this gate
+//     is NOT sufficient for any primitive whose destination leaves observable space. See
+//     luainstance.go, where mud.send_to_instance is self-only for exactly this reason.
 func (rt *luaRuntime) mayRelocate(e *Entity) bool {
 	if rt.inv == nil || rt.inv.actor == nil {
 		return false

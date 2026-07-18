@@ -119,6 +119,12 @@ func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 		// reserved FLAGS are not — those were removed from the dump/restore path (H-1) precisely because the
 		// flag-restore bypasses the content op guard. Empty for a baseline player (no elevation to carry).
 		Tier: s.tier,
+		// Carry the ACCOUNT id (#72) so a cross-shard walk does not strip the session's ability to enter an
+		// instanced zone — the caps are charged per account, and the world sets session.account only from a
+		// signature-checked source, so without this the arriving session would have none and every dungeon door
+		// would refuse them until they relogged. Bound by snapshotSigningInput like the tier; stripped by an
+		// insecure keyless destination for the same reason.
+		Account: s.account,
 	}
 }
 

@@ -227,6 +227,10 @@ type instanceRecord struct {
 	account  string    // the account the slot is charged to
 	minted   time.Time // when the slot was reserved — the post-mint grace runs from here
 	idle     int       // consecutive reaper ticks observed quiescent; reset by any sign of life
+	// abandoned marks an instance that was minted successfully but that its entrant never entered — hop 3 of
+	// the entry flow decided not to move the player (they quit, walked away, engaged, or the destination stopped
+	// being claimable). See abandonInstance for what the flag changes and why it is not a record deletion.
+	abandoned bool
 }
 
 // mintBucket is one account's fixed-window mint counter. A fixed window (not a token bucket) because the
@@ -420,14 +424,27 @@ func (s *Shard) instanceTemplateCounts() map[string]int {
 // empty zone (buildZone boots empty for unknown content behind a Debug line — the worst failure shape in this
 // package) and stops an arbitrary attacker-chosen string from becoming a live zone id on this shard.
 //
-// THE HOME ZONE AND LOCAL BOOTSTRAP ZONES ARE DELIBERATELY ALLOWED as templates, rather than accidentally so.
-// UnhostZone refuses to tear either of them down, so the asymmetry is worth stating: those refusals key on
-// the ZONE ID (`id == s.home`, `s.isLocalZone(id)`), and an instance's id is `<template>#<serial>`, which is
-// never equal to either. So an instance of the home zone is an ordinary instance — unleased, private, and
-// reapable — and it does not shadow, replace or endanger the original, which stays hosted under its own id
-// and remains the login fallback. Refusing them would instead be an engine-side POLICY about which authored
-// content may be instanced, which is content's call to make (slice 3 owns the entry gate); the invariants
-// this sink defends are the id grammar and the existence of the content.
+// THE OPT-IN IS THE THIRD CHECK, and it is the one that bounds the mechanism's blast radius.
+//
+// A mint runs the template's full boot resets: every item and mob the zone declares, created fresh in a private
+// copy. A player alone in that copy can strip it, walk out through any foreign-zone exit (the transfer carries
+// their whole inventory subtree), and mint again. That is not a dupe — it is an uncapped GENERATION FAUCET,
+// scaling with mint rate times account count. Without an opt-in it reached EVERY zone in loaded content,
+// including zones whose in-world access another builder deliberately gated behind a locked door, a quest or a
+// level check: a private copy has no doorman, so instancing routes around every in-world gate at once.
+//
+// WHICH zones may be instanced is content's call, not the engine's — the engine states no policy about it. But
+// content cannot MAKE that call unless the engine gives it a way to, and enforces the answer. `instanceable`
+// on the zone definition is that way, and this is where it is enforced. Default false: a zone is not an
+// instance template unless its author said so, which is the fail-closed direction (a missing opt-in breaks a
+// dungeon door, a missing refusal breaks the economy).
+//
+// THE HOME ZONE AND LOCAL BOOTSTRAP ZONES are consequently no longer allowed by default either, and that is a
+// deliberate tightening rather than a side effect: they are the zones a player is most likely to be able to
+// reach, so they are the worst faucets. An author who genuinely wants one instanced sets the flag on it, and
+// the note that made this safe still holds — UnhostZone's refusals key on the ZONE ID (`id == s.home`,
+// `s.isLocalZone(id)`), and an instance's id is `<template>#<serial>`, never equal to either, so an instance of
+// the home zone would not shadow, replace or endanger the original.
 func (s *Shard) validateMintTemplate(templateRef string) error {
 	switch {
 	case templateRef == "":
@@ -441,6 +458,44 @@ func (s *Shard) validateMintTemplate(templateRef string) error {
 		return fmt.Errorf("mint instance of %q: shard has no retained content to build from", templateRef)
 	case s.content.Zone(templateRef) == nil:
 		return fmt.Errorf("mint instance of %q: no such zone in loaded content", templateRef)
+	case !s.content.Zone(templateRef).Instanceable:
+		// The content-side opt-in. See the header: every zone being instanceable is an uncapped item faucet
+		// (a mint runs the zone's boot resets) that also routes around every in-world access gate.
+		return fmt.Errorf("mint instance of %q: the zone is not declared instanceable; a zone must opt in with "+
+			"`instanceable: true` before it can be used as an instance template", templateRef)
+	}
+	// A START ROOM IS MANDATORY FOR AN INSTANCE, and this is where that is discovered — loudly, at mint, in
+	// front of the builder who authored the template — rather than at a player's death hours later (#72).
+	//
+	// An ordinary zone can get away without one: nothing routes a fresh login into a zone that is not somebody's
+	// durable location, and resolveRoom's fallback to a nil start room simply leaves the caller's ref standing.
+	// An INSTANCE cannot, for two independent reasons:
+	//
+	//   - Entry lands via transferIn's resolveRoom(""), which IS the start-room fallback. With no start room it
+	//     resolves nil, transferIn takes its "destination has no rooms" branch, and the player is DISCONNECTED —
+	//     mid-entry, having done nothing wrong.
+	//   - respawnPlayer moves the victim to resolveRoom(z.startRoom). With no start room that is nil, so a
+	//     player who dies at the boss is revived, at full health, standing in the boss room. The engine has no
+	//     cross-zone respawn to fall back on; death.go evicts them to their anchor instead, which is a correct
+	//     but degraded outcome nobody authored.
+	//
+	// The ref must also name a room the template actually declares. A start_room pointing at a room that was
+	// renamed or moved to another zone produces exactly the same nil, one indirection later.
+	zd := s.content.Zone(templateRef)
+	if zd.StartRoom == "" {
+		return fmt.Errorf("mint instance of %q: the template declares no start_room, which an instance requires "+
+			"(entry lands in the start room, and a death inside would have nowhere to respawn)", templateRef)
+	}
+	hasStart := false
+	for _, r := range zd.Rooms {
+		if r.Ref == zd.StartRoom {
+			hasStart = true
+			break
+		}
+	}
+	if !hasStart {
+		return fmt.Errorf("mint instance of %q: the template's start_room %q names no room the template declares",
+			templateRef, zd.StartRoom)
 	}
 	return nil
 }
@@ -469,7 +524,13 @@ func (s *Shard) reserveInstanceSlot(id, templateRef, accountID string) error {
 	}
 	held := 0
 	for _, rec := range s.instances {
-		if rec.account == accountID {
+		// ABANDONED instances do not count against their account (#72 M3). The zone still exists until the
+		// reaper retires it — so it still counts toward perShard above, which is an honest bound on live zones
+		// — but the account should not be billed for a copy nobody is in and nobody can re-enter. Without this
+		// exclusion, two commands (ask to enter, then walk away or quit) pin one of the account's slots for the
+		// mint grace plus the idle ticks, ~3 minutes, at essentially no cost to the caller: a self-inflicted
+		// lockout for an ordinary player who changed their mind, and a cheap self-denial-of-service otherwise.
+		if rec.account == accountID && !rec.abandoned {
 			held++
 		}
 	}
@@ -573,9 +634,17 @@ func (s *Shard) reapIdleInstances(ctx context.Context) {
 		if z == nil {
 			continue // reserved but not published yet (a mint in flight), or already torn down
 		}
-		if now.Sub(rec.minted) < instanceMintGrace {
+		if now.Sub(rec.minted) < instanceMintGrace && !rec.abandoned {
 			// Nobody has had the chance to enter yet. Entry is a separate mechanism that necessarily runs
 			// after the mint returns, so an ungraced instance would be reaped out from under its own party.
+			//
+			// An ABANDONED instance skips the grace, because the grace's entire premise is false for it: the
+			// grace exists to protect a copy whose entrant has not arrived YET, and hop 3 has already decided
+			// this one's entrant is never arriving. Nobody else can reach it (an instance id is unguessable and
+			// is never handed to content), so waiting out the remaining grace protects nothing and just holds a
+			// zone, an actor goroutine and a Lua VM. It still has to pass the quiescence check below and
+			// UnhostZone's re-check under mu, so this shortens the wait without weakening the entering-vs-reaping
+			// race argument at all.
 			rec.idle = 0
 			continue
 		}
@@ -600,6 +669,28 @@ func (s *Shard) reapIdleInstances(ctx context.Context) {
 		}
 		slog.Info("reaped idle zone instance", "zone", id)
 	}
+}
+
+// abandonInstance marks a successfully-minted instance as one its entrant never entered (#72 M3). Called from
+// the ENTRANCE ZONE's goroutine at hop 3, on every path that decides not to move the player after the mint
+// succeeded. Idempotent; a no-op for an id with no record (already reaped).
+//
+// IT IS DELIBERATELY NOT A RECORD DELETION, and that distinction is the whole design. The reaper iterates
+// s.instances and resolves each record through s.zones; a record with no zone is skipped, but a ZONE WITH NO
+// RECORD is never visited at all. So deleting the record here would free the cap slot and permanently orphan
+// the zone object, its actor goroutine and its Lua VM — trading a 3-minute slot pin for an unbounded leak, on a
+// path an attacker controls. The flag frees the slot NOW and leaves the record in place so the reaper still
+// finds, retires and accounts for the zone.
+//
+// It also does not tear the zone down here. UnhostZone is a BLOCKING teardown (it waits on the zone's actor)
+// and this runs on a zone goroutine — calling it would stall the entrance zone, which is the exact failure the
+// whole async entry flow exists to avoid (see instance_entry.go's header).
+func (s *Shard) abandonInstance(id string) {
+	s.mu.Lock()
+	if rec := s.instances[id]; rec != nil {
+		rec.abandoned = true
+	}
+	s.mu.Unlock()
 }
 
 // resetInstanceIdle clears an instance's consecutive-quiescent counter.

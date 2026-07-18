@@ -194,6 +194,12 @@ func mergeZone(dst, src ZoneDTO) ZoneDTO {
 	if src.ResetSecs != 0 {
 		dst.ResetSecs = src.ResetSecs
 	}
+	// Instanceable follows the same last-non-zero rule as the scalars above: a file that leaves it unset does
+	// not CLEAR an opt-in another file in the same zone tree granted. It is deliberately not a plain
+	// last-write-wins assignment, which would let the merge order silently revoke the flag.
+	if src.Instanceable {
+		dst.Instanceable = true
+	}
 	dst.Rooms = mergeByKey(dst.Rooms, src.Rooms, func(r RoomDTO) string { return r.Ref })
 	dst.Items = mergeByKey(dst.Items, src.Items, func(p ProtoDTO) string { return p.Ref })
 	dst.Mobs = mergeByKey(dst.Mobs, src.Mobs, func(p ProtoDTO) string { return p.Ref })

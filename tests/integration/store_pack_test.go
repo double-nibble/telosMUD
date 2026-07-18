@@ -201,6 +201,32 @@ func TestStorePackRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip mismatch:\n DB  = %+v\n YAML= %+v", dbZones, yamlZones)
 	}
 
+	// Zone-level scalar (#72): `instanceable` is the content opt-in to being minted as an instance template,
+	// and it rides the zones.body JSONB — a column that existed since the first definition migration but had
+	// NO occupant until this flag, so neither insertZone nor LoadPacks touched it.
+	//
+	// That is precisely the field-drop trap this repo keeps re-shipping (Round 35's `primary` on resourceBody;
+	// Track 11 before it): a new definition field parses from YAML, survives an in-memory load, and comes back
+	// ZERO through Postgres. The normalized zone DeepEqual above would catch it, but only as an opaque
+	// whole-struct diff across every zone in the pack — so assert it directly and by NAME, and assert it in
+	// BOTH directions, because the two failures are different bugs:
+	//
+	//   - crypt true->false is the DROP (the write or the read lost the field), and it silently disables the
+	//     dungeon door on any deployment served from the store rather than the embed.
+	//   - midgaard false->true would be a DEFAULT-ON bug (e.g. a NULL body read as "unset means allowed"),
+	//     which is the security-relevant direction: it re-opens the uncapped faucet for every zone.
+	dbCrypt := fromDB.Zone("crypt")
+	require.NotNil(t, dbCrypt, "crypt zone survived the round trip")
+	assert.True(t, dbCrypt.Instanceable,
+		"round-trip DROPPED zones.instanceable for crypt: the flag parses from YAML but returns false from "+
+			"Postgres, so the instance opt-in silently stops working wherever content is served from the store")
+	dbTown := fromDB.Zone("midgaard")
+	require.NotNil(t, dbTown, "midgaard zone survived the round trip")
+	assert.False(t, dbTown.Instanceable,
+		"round-trip turned zones.instanceable ON for midgaard, which never opted in. Defaulting the opt-in to "+
+			"true re-opens the uncapped item faucet (a mint runs the zone's boot resets into a private copy) "+
+			"for every zone in content")
+
 	// Pack-level scalar (persistence review): DefaultCombat rides pack_meta.default_combat — it is
 	// NEITHER zone content nor one of the six def slices, so neither DeepEqual reaches it. A drop on its
 	// store import/load path is the same top-level-field-drop class this test closes, so pin it directly.

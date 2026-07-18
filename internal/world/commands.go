@@ -535,7 +535,7 @@ func (z *Zone) move(s *session, dir string) bool {
 	// That single predicate is what makes an instance a closed copy of its template.
 	if !z.ownsZoneRef(destZone) && z.shard != nil {
 		if dest := z.shard.claimTransferTarget(destZone); dest != nil {
-			z.transferOut(s, dest, destRoom, dir, from)
+			z.transferOut(s, dest, destRoom, "$n leaves "+dir+".")
 			return true
 		}
 	}
@@ -623,7 +623,11 @@ func (z *Zone) move(s *session, dir string) bool {
 // Single-writer note: once the session is removed here and posted to dest, only dest's
 // goroutine touches the session/entity. The brief overlap is bounded by handing them off
 // through the inbox, never by sharing them across two live owners.
-func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string, _ *Entity) {
+//
+// departMsg is the act() line the room left behind sees ("$n leaves east.", "$n vanishes."). It is a full
+// message rather than a direction because #72 added two callers that are not walks: stepping into an instance
+// and being evicted out of one, neither of which has a direction to name.
+func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, departMsg string) {
 	// Own the claim move() took on dest, so it is released on EVERY exit from this function and not only the
 	// one that reaches the send (#409). Only transferIn releases a claim otherwise, and it never runs if we
 	// leave without posting — a panic below is recovered by dispatchSafe/handle, which run no compensator. A
@@ -641,8 +645,10 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 	// owned *Entity that dest's round driver would deref), and an opponent left behind must not stay
 	// posFighting at a now-departed target. The room scan still finds opponents here (pre-detach).
 	z.disengage(s.entity)
-	z.actConceal("$n leaves "+dir+".", s.entity, ToRoom) // #100: silent to those who can't see the mover
-	Move(s.entity, nil)                                  // detach from the source room before handing off
+	if departMsg != "" {
+		z.actConceal(departMsg, s.entity, ToRoom) // #100: silent to those who can't see the mover
+	}
+	Move(s.entity, nil) // detach from the source room before handing off
 	z.delPlayer(s.character)
 	// Forward in-flight input to dest until the reader loop observes the new
 	// currentZone (which dest.transferIn Stores). dest dedups by appliedSeq.

@@ -658,7 +658,7 @@ func TestDeferredCastTargetTransferAborts(t *testing.T) {
 		bRoom = ref
 		break
 	}
-	A.transferOut(target, B, bRoom, "north", target.entity.location)
+	A.transferOut(target, B, bRoom, "$n leaves north.")
 	B.handle(<-B.inbox)
 	if B.players["Target"] == nil || target.entity.zone != B {
 		t.Fatal("target not re-homed to B")

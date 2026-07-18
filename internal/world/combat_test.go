@@ -622,7 +622,7 @@ func TestNoFightingPointerCrossesZoneOnTransfer(t *testing.T) {
 	// random B room via map iteration is flaky now: an aggressive mob in the destination legitimately
 	// re-engages the arrival via aggroOnEntry, which is correct behavior, not a crossed pointer.)
 	bRoom := B.startRoom
-	A.transferOut(s, B, bRoom, "north", s.entity.location)
+	A.transferOut(s, B, bRoom, "$n leaves north.")
 	B.handle(<-B.inbox)
 
 	// The moved entity carries NO fighting pointer and is NOT posFighting on the destination.

@@ -230,6 +230,21 @@ type Shard struct {
 	mintRate       map[string]*mintBucket
 	instanceLimits instanceLimits
 
+	// mintQ is the shard's instance-mint work queue (#72, instance_entry.go): the seam that keeps MintInstance
+	// — a full zone build plus a store round trip, hundreds of milliseconds to seconds — OFF the entrance
+	// zone's actor goroutine. A zone posts a request and returns immediately; a worker builds and posts the
+	// result back through the entrance zone's inbox. Never nil (Run starts the workers; a shard that is never
+	// Run simply has nothing draining it, and the enqueue is non-blocking so that is a clean refusal).
+	mintQ chan instanceMintReq
+
+	// instanceEjectWindow is true ONLY while BeginDrain is blocked on its instance-eject barrier (#72). It is
+	// what lets claimEjectTarget admit an intra-shard arrival into a zone of an already-draining shard, which
+	// claimTransferTarget refuses outright — and it is what bounds that exception in TIME rather than leaving
+	// it as an unguarded hole. Guarded by mu, and READ in the same hold the claim is taken in, so a late eject
+	// arriving after the barrier has given up is refused atomically rather than landing a player in a zone the
+	// drain has already flushed and disconnected.
+	instanceEjectWindow bool
+
 	// handoffSem bounds the number of CONCURRENT in-flight cross-shard handoffs (Prepare RPCs) this shard
 	// runs — so a graceful drain's fan-out over a whole zone doesn't fire N simultaneous Prepares at one
 	// target and stampede it (16.4b review). A normal move (rare) is never throttled by a 32-deep slot pool.
@@ -405,10 +420,15 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		instances:      map[string]*instanceRecord{},
 		mintRate:       map[string]*mintBucket{},
 		instanceLimits: defaultInstanceLimits(),
-		handoffSem:     make(chan struct{}, maxConcurrentHandoffs),
-		placement:      newPlacementWriter(),
-		saver:          newSaver(nil, nil), // disabled until WithPersistence configures it
-		auditor:        newAuditor(nil),    // disabled until WithAudit configures it (#350)
+		// The mint queue is allocated at CONSTRUCTION, not in Run, so a request posted before the workers start
+		// is buffered rather than refused. (A nil channel would also be safe — the enqueue is a select with a
+		// default, and a nil channel is never ready, so it would take the refusal branch — but "your entry was
+		// refused because the shard had not finished booting" is a worse answer than "it waits a moment".)
+		mintQ:      make(chan instanceMintReq, instanceMintQueueDepth),
+		handoffSem: make(chan struct{}, maxConcurrentHandoffs),
+		placement:  newPlacementWriter(),
+		saver:      newSaver(nil, nil), // disabled until WithPersistence configures it
+		auditor:    newAuditor(nil),    // disabled until WithAudit configures it (#350)
 		// Empty global-definition bundle (defs.go); the constructor registers content into it
 		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
 		defs: newDefRegistries(),
@@ -676,11 +696,53 @@ func (s *Shard) zoneByID(id string) *Zone {
 // `draining` covers the same hazard one step earlier, and additionally closes a gap in BeginDrain's wait set:
 // that set skips local bootstrap zones, so a resident of one could otherwise walk into a leased zone after the
 // drain had already flushed and reclaimed it, reproducing the original orphan on the drain path.
+//
+// An INSTANCE destination is legitimate here and is NOT refused — this is the claim entry into an instance
+// takes (instanceReady). That is the one asymmetry with claimEjectTarget, which does refuse one, and the
+// asymmetry is intentional in that direction: "eject" must never mean "into another private copy", while
+// "transfer" is exactly how a player gets into one. Stated because the sibling's refusal would otherwise read
+// as an omission here.
 func (s *Shard) claimTransferTarget(zoneID string) *Zone {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	z := s.zones[zoneID]
 	if z == nil || s.handedOff[zoneID] || s.draining {
+		return nil
+	}
+	z.claimInboundTransfer()
+	return z
+}
+
+// claimEjectTarget is claimTransferTarget for ONE caller: an instance walking its occupants back out to their
+// exit anchors as a graceful drain begins (#72). It resolves and claims under one hold of mu exactly like its
+// sibling, and differs in exactly one refusal — it does NOT refuse a draining shard — so it is deliberately a
+// separate function rather than a boolean parameter on the real one.
+//
+// WHY SKIPPING `draining` IS NECESSARY. BeginDrain sets s.draining as its very first act, and the eject has to
+// happen BEFORE step 1 hands any lease to a peer (an anchor zone whose lease has already flipped is no longer
+// ours to admit anyone into, and its own drainZone has already fanned its players off). So the whole eject
+// runs inside the draining flag, and claimTransferTarget would refuse every anchor on the shard.
+//
+// WHY IT IS SAFE HERE AND NOWHERE ELSE. The danger of admitting an arrival into a draining shard is TIME: the
+// claim is taken now, the arrival is handled by the destination at an unbounded later moment, and if that
+// moment is after step 3 the player lands in a zone that has already been durably flushed and told to
+// disconnect its residents — dropped with the process, uncounted and unflushed. The earlier attempt at this
+// eject skipped the refusal with no bound at all and did exactly that. The bound here is
+// s.instanceEjectWindow: it is set true only while ejectInstanceOccupants is BLOCKED on its barrier, it is
+// cleared on every exit from that function, and it is read in the SAME mu hold the claim is taken in — so a
+// late eject whose barrier has already given up finds the window closed and claims nothing, atomically.
+//
+// It additionally refuses an instance as a DESTINATION. An anchor is always an authored zone, so this cannot
+// trigger; it is here because "eject" must never mean "into another private copy", and stating it costs
+// nothing.
+func (s *Shard) claimEjectTarget(zoneID string) *Zone {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.instanceEjectWindow {
+		return nil
+	}
+	z := s.zones[zoneID]
+	if z == nil || s.handedOff[zoneID] || z.isInstance() {
 		return nil
 	}
 	z.claimInboundTransfer()
@@ -917,6 +979,13 @@ func (s *Shard) Run(ctx context.Context) {
 	// tick: instances take no lease, so no renewal goroutine exists for them to ride on. It only reads atomics
 	// and calls UnhostZone, so it never touches zone state.
 	go s.runInstanceReaper(ctx)
+	// Instance MINT workers (#72, instance_entry.go). They exist so MintInstance — a full zone build plus a
+	// seedZone store round trip — never runs on a zone actor: an entrance zone posts a request and returns
+	// immediately, a worker builds off-goroutine, and the result comes back through the entrance zone's inbox.
+	// Off every zone goroutine; they touch zone state only by message-passing.
+	for i := 0; i < instanceMintWorkers; i++ {
+		go s.runInstanceMintWorker(ctx)
+	}
 	// Hot reload runs on the bus's own subscription goroutine (no shard goroutine of its own);
 	// just tear the subscription down when the shard stops so a restart doesn't double-subscribe.
 	if s.reloader != nil {

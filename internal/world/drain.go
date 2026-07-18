@@ -311,32 +311,43 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 	// be dropped with the process with nothing in the readout saying so. What an instance's occupant gets is a
 	// clean reconnect from durable state — the drain's ordinary degraded outcome — not silence.
 	//
-	// WHAT IS NOT HERE. Walking an instance's occupants OUT to a drainable zone before the drain would upgrade
-	// that reconnect to a seamless redirect. That is slice 3's (#72) job, not this slice's, and deliberately:
-	//   - There is no ENTRY path in this slice, so an OCCUPIED instance cannot occur in production yet. An
-	//     eject here would be speculative machinery on the SIGTERM critical path, which is the worst place to
-	//     put code no production flow can reach.
-	//   - Where an instance's occupant belongs on the way out is the exit ANCHOR, which slice 3 defines.
-	//     Without it an eject can only guess a destination, and a guessed destination that is itself mid-drain
-	//     is a claim/release split across two goroutines — precisely the wedge transferOut's own compensator
-	//     exists to prevent.
-	// When the anchor lands, the eject belongs before the `initial` snapshot below, so an ejected player is
-	// counted in the zone they are actually redirected from.
-	zones := make([]*Zone, 0)    // the ACCOUNTING set: every zone this shard owes a flush + reclaim
-	handover := make([]*Zone, 0) // the subset with a lease to hand a peer: the redirect + quiescence set
+	// Their occupants ARE walked out first — step 0 below (#72). That is what turns an instance occupant's
+	// SIGTERM outcome from "dropped, reconnect from durable state" into the ordinary seamless redirect: once
+	// they are standing in their anchor zone, they are an ordinary resident of an ordinary leased zone and the
+	// handover below moves them with everyone else.
+	zones := make([]*Zone, 0)     // the ACCOUNTING set: every zone this shard owes a flush + reclaim
+	handover := make([]*Zone, 0)  // the subset with a lease to hand a peer: the redirect + quiescence set
+	instances := make([]*Zone, 0) // the subset to walk back out to their exit anchors first
 	for _, z := range s.zonesList() {
 		if s.isLocalZone(z.id) {
 			continue
 		}
 		zones = append(zones, z)
 		if z.isInstance() {
+			instances = append(instances, z)
 			continue
 		}
 		handover = append(handover, z)
 	}
 
-	// Snapshot the population BEFORE draining so Redirected = initial - stragglers-at-deadline. Over `zones`,
-	// so an instance's occupants are in the denominator; they will come back out as Reclaimed in step 3.
+	// 0. Walk every instance's occupants back out to the zone+room they entered from (#72), BEFORE any lease
+	// moves and before the population snapshot below.
+	//
+	// The ORDER is the whole design. Ejecting first means an occupant is counted in — and redirected from —
+	// the anchor zone they are actually standing in when step 1 runs, so the tally needs no special case and
+	// the player needs no special handling: they are simply a resident of a drainable zone. Ejecting after the
+	// snapshot would count them twice; ejecting after step 1 would push them into a zone whose lease had
+	// already gone to a peer and whose own drain had already fanned its players off.
+	//
+	// It BLOCKS (see ejectInstanceOccupants), and that is not a cost to be optimized away — it is what bounds
+	// the eject's claim window in time. It is bounded by its own barrier, selects on ctx throughout, and
+	// degrades to the pre-#72 behavior (occupants reclaimed as stragglers) rather than to a stall.
+	s.ejectInstanceOccupants(ctx, instances)
+
+	// Snapshot the population AFTER the eject so Redirected = initial - stragglers-at-deadline stays honest:
+	// an ejected player is now resident in their anchor zone and will be counted there. Still over `zones`, so
+	// any occupant the eject could NOT move (no anchor, a wedged instance, a barrier timeout) is still in the
+	// denominator and comes back out as Reclaimed in step 3 rather than vanishing from the tally.
 	initial := int64(0)
 	for _, z := range zones {
 		initial += z.pop.Load()

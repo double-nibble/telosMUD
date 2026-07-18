@@ -48,6 +48,14 @@ func runningShardWith(t *testing.T, zones []string, home string, configure func(
 	if err != nil {
 		t.Fatalf("load embedded demo pack: %v", err)
 	}
+	// Opt the fixture templates in. `instanceable` is a CONTENT decision the mint sink enforces (#72: without
+	// it every loaded zone is an item faucet, since a mint runs the template's boot resets into a private copy
+	// a player can strip and walk out of). The demo pack grants it to `crypt` only — deliberately, because
+	// midgaard/darkwood are the shared persistent world. These lifecycle tests mint `darkwood` throughout for
+	// its room/proto fixtures, so they grant it here rather than in the pack, which keeps the pack's own
+	// statement honest and keeps the OPT-IN ITSELF under test where it belongs
+	// (TestMintRefusesANonInstanceableZone) instead of being silently satisfied by a fixture everything shares.
+	markInstanceable(t, lc, "darkwood", "crypt")
 	sh := NewShardFromContent(lc, zones, home, "", nil, nil)
 	if configure != nil {
 		configure(sh)
@@ -60,6 +68,22 @@ func runningShardWith(t *testing.T, zones []string, home string, configure func(
 		return sh.runCtx != nil && sh.runWG != nil
 	})
 	return sh, cancel
+}
+
+// markInstanceable grants the #72 content opt-in to the named zones of an already-loaded pack, so a fixture
+// can mint them without the demo pack having to declare every test zone an instance template.
+//
+// It fails loudly on an unknown ref: a silent no-op here would make every mint in the calling test refuse for
+// the opt-in reason, and the test would then "pass" a cap or reaper assertion that never ran a mint at all.
+func markInstanceable(t *testing.T, lc *content.LoadedContent, refs ...string) {
+	t.Helper()
+	for _, ref := range refs {
+		zd := lc.Zone(ref)
+		if zd == nil {
+			t.Fatalf("markInstanceable: no zone %q in the loaded pack", ref)
+		}
+		zd.Instanceable = true
+	}
 }
 
 // withLimits builds a runningShardWith configure hook that sets the instance caps.
@@ -236,6 +260,7 @@ func TestMintInstanceTakesNoLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	markInstanceable(t, lc, "darkwood", "crypt") // the #72 content opt-in; see markInstanceable
 	leaser := newFakeLeaser()
 	sh := NewShardFromContent(lc, []string{"midgaard"}, "midgaard", "", nil, nil).
 		WithZoneLeasing(leaser, "shard-a", time.Second, 10*time.Millisecond, nil)
@@ -469,6 +494,7 @@ func TestUnhostInstanceSkipsTheDirectoryRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	markInstanceable(t, lc, "darkwood", "crypt") // the #72 content opt-in; see markInstanceable
 	leaser := &erroringLeaser{fakeLeaser: newFakeLeaser()}
 	sh := NewShardFromContent(lc, []string{"midgaard", "darkwood"}, "midgaard", "", nil, nil).
 		WithZoneLeasing(leaser, "shard-a", time.Second, time.Hour, nil)
@@ -748,6 +774,7 @@ func TestMintedInstanceReceivesRegionDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	markInstanceable(t, lc, "darkwood", "crypt") // the #72 content opt-in; see markInstanceable
 	sh := NewShardFromContent(lc, []string{"midgaard", "darkwood"}, "midgaard", "", nil, nil)
 	sh.WithScopeBus(scopebus.New(commbus.NewMemBus()), lc.Regions)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -807,6 +834,7 @@ func TestInstanceScopeRegistrationBalances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	markInstanceable(t, lc, "darkwood", "crypt") // the #72 content opt-in; see markInstanceable
 	sh := NewShardFromContent(lc, []string{"midgaard", "darkwood"}, "midgaard", "", nil, nil)
 	sh.WithScopeBus(scopebus.New(commbus.NewMemBus()), lc.Regions)
 	ctx, cancel := context.WithCancel(context.Background())

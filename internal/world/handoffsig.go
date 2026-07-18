@@ -28,13 +28,48 @@ import (
 // verify key (missing, malformed, or over tampered fields).
 var ErrSnapshotSig = errors.New("handoff: snapshot signature verification failed")
 
-// snapshotSigningInput builds the canonical byte string the handoff signature covers. It length-prefixes
-// every field (8-byte big-endian length + bytes) so no concatenation of one field's tail with the next's
-// head can collide with a different field split — the classic canonicalization pitfall. It binds exactly
+// snapshotSigningInput builds the canonical byte string the handoff signature covers. It binds exactly
 // the fields that decide WHERE a player lands and WHAT state they carry: the routing tuple
 // (character/epoch/target zone+room) and the whole carried entity subtree (persist id, version, applied
 // seq, comms + entity state json). The volatile transport fields (session id, from-shard, target addr)
 // are intentionally out of scope — they do not affect integrity and would only make the signature brittle.
+//
+// CANONICALIZATION HAS TWO OBLIGATIONS, and length-prefixing only discharges the first.
+//
+//   - BOUNDARIES. Every field is written as an 8-byte big-endian length followed by its bytes, so no
+//     concatenation of one field's tail with the next's head can collide with a different field split.
+//   - PRESENCE. Every field is written UNCONDITIONALLY, including when it is empty (a zero-length,
+//     length-prefixed write). This is the obligation the original one-optional-field design did not have
+//     to think about, and it is the one that matters here.
+//
+// Why presence is not optional any more. `tier` was once appended only-when-non-empty, and that was sound
+// while it was the ONLY optional field: presence was unambiguous, because there was exactly one field a
+// trailing value could belong to. Adding a SECOND append-if-non-empty field on the same terms destroys
+// that. Two snapshots with a single non-empty optional — (tier=X, account="") and (tier="", account=X) —
+// produce byte-identical inputs, so ONE signature verifies for BOTH. That is a field-confusion attack, not
+// a theoretical one: the handoff wire is plaintext (world.go dials peers with insecure creds), and
+// (tier="", account="<uuid>") is the overwhelmingly common snapshot shape for an ordinary player. An
+// on-path attacker rewrites such a Prepare into (tier="<uuid>", account=""), the signature still verifies,
+// and the destination feeds the victim's account id to applyTierFlags. It grants nothing TODAY only because
+// grantedFlags returns nil for an unknown tier name — but the trust ladder is CONTENT-DEFINED, so a builder
+// who authors a trust_tier_defs rung named after an account uuid converts this into privilege escalation.
+// Writing both unconditionally makes field position FIXED, so a value can never migrate between fields.
+//
+// WIRE-FORMAT CONSEQUENCE, stated explicitly because it is a real operational cost. Writing the optionals
+// unconditionally CHANGES the digest for every snapshot, including the tier-only and account-only shapes
+// that previously matched a pre-#106 / pre-#72 signer. A rolling deploy therefore has an old-signer /
+// new-verifier (and new-signer / old-verifier) skew window in which cross-shard handoffs between mismatched
+// versions FAIL VERIFICATION. That failure is FAIL-CLOSED and is the acceptable direction: the source keeps
+// the player, the handoff is refused, and the player simply does not cross a zone boundary until the fleet
+// is uniform. Nothing is lost and nothing is forged; a walk stalls.
+//
+// The repo has NO stated policy on handoff signature-format changes — there is no compatibility contract
+// document, and the only precedent is the tier's own inline argument, which chose the append-if-non-empty
+// shape specifically to AVOID this skew for the common case. So this is a deliberate departure from that
+// precedent: the tier bought digest-compatibility with an encoding that is only safe for one optional
+// field, and that purchase is exactly what created the collision above. Correctness of the digest outranks
+// a bounded, fail-closed rollout window. Any FUTURE field added here must likewise be written
+// unconditionally and appended at the END; do not reintroduce a conditional write.
 func snapshotSigningInput(req *handoffv1.PrepareRequest) []byte {
 	snap := req.GetSnapshot()
 	h := sha256.New()
@@ -65,18 +100,18 @@ func snapshotSigningInput(req *handoffv1.PrepareRequest) []byte {
 	writeU64(snap.GetAppliedSeq())
 	writeStr(snap.GetCommsState())
 	writeStr(snap.GetStateJson())
-	// The account trust tier (#106) is elevation-bearing, so it MUST be bound by the signature — otherwise a
-	// network attacker could flip an in-flight handoff's tier and the destination would re-derive admin from it.
-	// It is appended ONLY WHEN NON-EMPTY: a baseline player (tier=="", the overwhelming common case) then digests
-	// byte-identically to a pre-#106 signer, so a rolling upgrade does not break ordinary handoffs — only an
-	// ELEVATED player (staff, rare) handed off across a mixed-version boundary sees a signature mismatch, which
-	// fails CLOSED (the source keeps them; they retry). This is safe canonicalization, not a length-prefix
-	// footgun: the field's presence is a pure function of the value being authenticated, so a party without the
-	// key cannot make a tier="" and a tier="admin" snapshot collide (the latter includes the extra bytes; the
-	// digest differs), and the same-code verifier always recomputes the identical presence decision.
-	if t := snap.GetTier(); t != "" {
-		writeStr(t)
-	}
+	// The two elevation/accounting fields, at FIXED positions, written unconditionally. See the presence
+	// obligation in the doc comment: an empty value is a zero-length length-prefixed write, never an omission,
+	// so no value can ever migrate from one of these fields to the other under a still-valid signature.
+	//
+	// tier (#106) is elevation-bearing: a network attacker who could flip an in-flight handoff's tier would have
+	// the destination re-derive builder/admin from it.
+	writeStr(snap.GetTier())
+	// account (#72) is an ACCOUNTING key. Unbound, an attacker could rewrite an in-flight handoff's account and
+	// have the destination charge that player's instance mints to a victim's quota — exhausting the victim's
+	// concurrent cap and mint rate limit, and falsely attributing the mints in the audit log. It grants no
+	// elevation, so it is a milder class than the tier, but it is bound on identical terms.
+	writeStr(snap.GetAccount())
 
 	return h.Sum(nil)
 }
