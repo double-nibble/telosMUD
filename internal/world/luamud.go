@@ -72,6 +72,7 @@ func (rt *luaRuntime) installMudTable() {
 	mud := L.NewTable()
 	fns := map[string]lua.LGFunction{
 		"random":      rt.mudRandom,
+		"zone":        rt.mudZone,
 		"roll":        rt.mudRoll,
 		"now":         rt.mudNow,
 		"log":         rt.mudLog,
@@ -144,6 +145,29 @@ func (rt *luaRuntime) mudNow(l *lua.LState) int {
 		pulse = rt.zone.pulses.pulse
 	}
 	l.Push(lua.LNumber(pulse))
+	return 1
+}
+
+// mudZone returns the id of the zone the script is running in — `darkwood` in the authored zone,
+// `darkwood#<serial>` in a runtime-minted instance of it (#411).
+//
+// It exists so content can write the zone filter CORRECTLY. The demo pack's original idiom for "is this
+// world broadcast for my zone" was `if ev.zone ~= "darkwood" then return end` — a comparison against the
+// AUTHORED ref, which is exactly what every instance of darkwood also matches. One director schedule then
+// spawns the boss, with its full loot table, in the template AND in every live private copy. The correct
+// idiom is `if ev.zone ~= mud.zone() then return end`: the event names the authored target zone, mud.zone()
+// names THIS actor, and they differ inside an instance.
+//
+// (The engine also suppresses reserved schedule delivery to instances — scope.go — so the demo would be safe
+// either way. Both exist deliberately: the engine bound is what makes the ENGINE's own reserved events safe,
+// and this is what lets content express the same distinction for its own events, which the engine cannot
+// know the semantics of.)
+func (rt *luaRuntime) mudZone(l *lua.LState) int {
+	if rt.zone == nil {
+		l.Push(lua.LNil)
+		return 1
+	}
+	l.Push(lua.LString(rt.zone.id))
 	return 1
 }
 

@@ -634,6 +634,36 @@ func advisoryReloadRemovals(s *reloadScope, wasLive func(ref string) bool) []str
 	return dedupeSorted(advisories)
 }
 
+// pinnedInstanceAdvisories surfaces (NON-BLOCKING, #411) every zone in this reload's scope that has live
+// runtime-minted INSTANCES. Those instances are pinned to the content they were minted from: reload.go
+// withholds both the zone-shape reconcile and the Lua fan-out from them, so a party mid-run finishes the
+// version they entered on.
+//
+// That freeze is correct — a converge that tears down rooms would delete the room a party is standing in —
+// but it is INVISIBLE without this. A builder edits a dungeon, the readout reports success, and the runs in
+// flight keep the old behavior with nothing anywhere explaining it. The line names the count so the operator
+// can decide whether to wait for the reaper (instances are short-lived) or stop caring.
+//
+// Scoped by the zone's last-writer pack, exactly like the #309 advisories, so a reload of an unrelated pack
+// does not narrate every dungeon on the shard. A nil shard (a bare validate-only reloader) yields nothing.
+func pinnedInstanceAdvisories(s *Shard, scope *reloadScope) []string {
+	if s == nil || scope == nil {
+		return nil
+	}
+	var advisories []string
+	for template, n := range s.instanceTemplateCounts() {
+		if n == 0 || !scope.zoneInScope(template) {
+			continue
+		}
+		advisories = append(advisories, fmt.Sprintf(
+			"zone %q has %d live instance(s), which are PINNED to the content they were minted from: this "+
+				"reload does NOT reach them (no room reconcile, no Lua recompile). They pick it up when they "+
+				"are reaped and the next one is minted", template, n))
+	}
+	sort.Strings(advisories)
+	return advisories
+}
+
 // dedupeSorted collapses adjacent duplicates in a sorted slice (two resets in one zone spawning the same
 // removed proto produce identical advisory lines).
 func dedupeSorted(in []string) []string {

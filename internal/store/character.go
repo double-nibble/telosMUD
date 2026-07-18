@@ -161,9 +161,17 @@ func (p *Pool) SaveCharacter(ctx context.Context, snap world.CharSnapshot) (uint
 		// chargen = NULL clears the Phase-14.8 first-spawn marker in the SAME write that persists the built
 		// state — so application + clear are atomic from the DB's view: a crash before this save re-applies
 		// from the still-empty state (the additive racial mods never double-apply).
+		// zone_ref = COALESCE($2::text, zone_ref): an EMPTY ZoneRef means "leave the stored location alone", never
+		// "clear it" (#411). The world's only producer of ZoneRef (dumpCharacter) returns "" for a player who
+		// is inside a runtime-minted zone INSTANCE, whose ephemeral id must never be persisted — but room_ref
+		// still carries the template's AUTHORED ref, so a clearing write would leave the row internally
+		// inconsistent: a real room with no zone. The reconnect then falls back to the home zone, cannot
+		// resolve that room there, and start-rooms the player — durable location loss, in Postgres, for every
+		// instance occupant on every save tick and every SIGTERM. Preserving instead keeps the entrance anchor
+		// the row already holds. No caller ever legitimately intends to CLEAR a character's zone.
 		`UPDATE characters
 		    SET state = $1,
-		        zone_ref = $2,
+		        zone_ref = COALESCE($2::text, zone_ref),
 		        room_ref = $3,
 		        state_version = state_version + 1,
 		        chargen = NULL,

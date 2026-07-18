@@ -140,6 +140,25 @@ func (z *Zone) registerPlacement(s *session) {
 	if z.shard == nil || z.shard.dir == nil || z.shard.shardID == "" || s == nil || s.character == "" {
 		return
 	}
+	// SKIP on an instance (#411), one of the three write-side halves of the durable-location guard (see
+	// durableZoneRef for the durable row, and clearPlacement below for the tombstone). The placement record is
+	// the reconnect-ROUTING spine since #320: the gate resolves a returning player by asking ShardForZone for
+	// the recorded zone. An instance is unleased and in no directory at all, so a record naming one resolves to
+	// no shard — the reconnect dead-ends — and if it somehow did resolve it would route a player into a private
+	// copy by id. Either way the honest record for a player inside an instance is their exit ANCHOR (#72),
+	// which slice 3 defines.
+	//
+	// Skipping the write leaves the player's last REGISTERED placement standing, which is a strictly better
+	// reconnect target than an ephemeral id. Note carefully what that does NOT cover: the quit path writes
+	// this record too, and it writes it even for a player inside an instance — see clearPlacement, which must
+	// still fire its tombstone and therefore guards itself DIFFERENTLY (an empty zone, not an early return).
+	// "Recording nothing" is this site's answer alone; it is not the record's whole story.
+	if z.isInstance() {
+		// z.log already carries zone= and template= (newInstanceZone).
+		z.log.Warn("not recording a directory placement for a player inside an instance: an instance is unleased "+
+			"and resolves to no shard, so the record could only dead-end a reconnect", "player", s.character)
+		return
+	}
 	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch, nonce: s.nonce})
 }
 
@@ -178,7 +197,31 @@ func (z *Zone) clearPlacement(s *session) {
 	// Carry the zone. The writer coalesces per player, so a logout offered while a zone-change registration
 	// is still pending REPLACES it — without this the tombstone would leave the record naming the zone the
 	// player walked out of, and a later reconnect would route by that stale zone.
-	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: z.id, epoch: s.epoch, nonce: s.nonce, clear: true})
+	//
+	// EXCEPT from an instance (#411), where the zone is dropped but the TOMBSTONE STILL FIRES. This site is
+	// guarded differently from registerPlacement, and the difference is the whole point:
+	//
+	//   - It cannot early-return like registerPlacement does. The clear is what stops the record from claiming
+	//     a shard that is exiting still hosts this player; skipping it is a stale-routing bug of its own.
+	//   - It cannot carry z.id either. ClearPlayerShard deliberately PRESERVES `zone` across the tombstone
+	//     because it is the reconnect routing key, so writing an instance id here is the one write on this
+	//     path that OUTLIVES both the session and the instance. The instance is reaped seconds later,
+	//     ShardForZone then finds no lease for it, and per the #320 policy the gate does not fall back to
+	//     place.ShardID — so the player routes by home zone until some future registerPlacement happens to
+	//     overwrite the field. Nothing self-heals it in between.
+	//
+	// An empty zone is exactly "clear the shard, leave the stored zone alone" (the clearPlayerShard script
+	// treats ARGV[2] == '' as a no-op on the field, internal/directory/redis.go), which preserves whatever
+	// authored zone the player was last registered in — their entrance anchor by construction, since
+	// registerPlacement never recorded the instance.
+	zoneID := z.id
+	if z.isInstance() {
+		// z.log already carries zone= and template= (newInstanceZone).
+		z.log.Warn("tombstoning a logout from inside an instance WITHOUT the zone: the placement record's zone "+
+			"outlives the instance, so recording an ephemeral id would dangle permanently", "player", s.character)
+		zoneID = ""
+	}
+	z.shard.placement.offer(placementOp{playerID: s.character, zoneID: zoneID, epoch: s.epoch, nonce: s.nonce, clear: true})
 }
 
 // runPlacementWriter drains pending placements off every zone goroutine, performing the blocking Redis

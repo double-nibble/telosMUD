@@ -178,7 +178,13 @@ zones:
         lua: |
           on_world("spawn.boss", function(ev)
             -- The world broadcast fans out to EVERY hosted zone; only the scheduled boss's own zone reacts.
-            if ev.zone ~= "darkwood" then return end
+            -- Compare the event's target zone against mud.zone() — THIS actor's zone id — never against the
+            -- authored ref "darkwood" (#411). A runtime-minted instance of darkwood is built from darkwood's
+            -- content, so its rooms and this very script are identical, and a hardcoded ref would match
+            -- inside every private copy: one schedule would spawn the boss, with its full loot table, in the
+            -- shared zone AND in every instance at once. mud.zone() answers "darkwood#<serial>" there, so the
+            -- copy correctly declines. This is the general idiom for any zone-targeted world event.
+            if ev.zone ~= mud.zone() then return end
             -- Spawn the SCHEDULED proto (ev.proto) in the herald's room (the lair). mud.spawn needs a room
             -- HANDLE, and self:room() is this script's handle to where it stands — so the herald is placed in
             -- the room the boss should appear. Reading ev.proto keeps the reactor general (a second schedule

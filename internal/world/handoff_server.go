@@ -77,6 +77,15 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 		// A keyed shard (above) already had the tier bound by the verified signature.
 		snap.Tier = ""
 	}
+	// FAIL CLOSED on an instance-shaped target (#411). An instance is shard-local by construction: it takes no
+	// directory lease, is never in the placement pool, and no peer can resolve it — so a cross-shard Prepare
+	// naming one is either a poisoned/pre-migration record or a probe. Refusing by SHAPE (not by "do we host
+	// it") is what makes the answer the same on every shard, and it is what stops a peer from injecting a
+	// player into a live private instance whose id it guessed or observed.
+	if isInstanceID(req.GetTargetZoneId()) {
+		slog.Warn("handoff prepare refused: instance-shaped target zone", "zone", req.GetTargetZoneId())
+		return nil, status.Errorf(codes.InvalidArgument, "zone %q is not a valid handoff destination", req.GetTargetZoneId())
+	}
 	z := h.shard.zoneByID(req.GetTargetZoneId())
 	if z == nil {
 		return nil, status.Errorf(codes.NotFound, "zone %q not hosted on this shard", req.GetTargetZoneId())
@@ -164,6 +173,16 @@ func (h *handoffServer) Abort(_ context.Context, req *handoffv1.AbortRequest) (*
 // lease itself; the caller (the draining source) owns the atomic flip so ShardForZone never observes an
 // ownerless gap. Errors (FailedPrecondition) if this shard can't host the zone (not running / no content).
 func (h *handoffServer) AdoptZone(ctx context.Context, req *handoffv1.AdoptZoneRequest) (*handoffv1.AdoptZoneResponse, error) {
+	// FAIL CLOSED on an instance-shaped zone id (#411), BEFORE the signature verify. An instance is never
+	// leased, so it can never legitimately be handed over; and this ordering is deliberate — the shape check
+	// is a local string test, strictly cheaper than a signature verify and far cheaper than the directory
+	// round trip the fence below needs, so an unauthenticated peer cannot use this id class to make us do
+	// either. It leaks nothing: instance ids are never valid here for anyone.
+	if isInstanceID(req.GetZoneId()) {
+		slog.Warn("adopt zone refused: instance-shaped zone id (instances are shard-local and unleased)",
+			"zone", req.GetZoneId(), "from", req.GetFromShardId(), "to", req.GetToShardId())
+		return nil, status.Errorf(codes.InvalidArgument, "zone %q cannot be adopted", req.GetZoneId())
+	}
 	// Authenticate BEFORE any state work, exactly as Prepare does. #262: a KEYED shard used to adopt on a
 	// wholly unauthenticated request, so anyone with network reach to a world port could force it to host a
 	// zone (lease takeover / resource exhaustion). #315 then made the authorization SINGLE-USE.

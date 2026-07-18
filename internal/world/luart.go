@@ -241,6 +241,16 @@ func newLuaRuntime(zoneID string, log *slog.Logger) *luaRuntime {
 	return rt
 }
 
+// reseed replaces the script RNG's source. Called ONLY at zone construction, before the zone's actor starts
+// — an instance salts its seed so its loot stream is not an offline-computable function of its id (#411, and
+// see newInstanceZone for the full argument). Never call it on a running zone: rt.rng is zone-goroutine-owned.
+func (rt *luaRuntime) reseed(seed int64) {
+	if rt == nil {
+		return
+	}
+	rt.rng = rand.New(rand.NewSource(seed)) //nolint:gosec // gameplay determinism, not security — same as the constructor
+}
+
 // close tears down the VM. Called on zone stop, on the zone goroutine.
 func (rt *luaRuntime) close() {
 	if rt == nil || rt.L == nil {

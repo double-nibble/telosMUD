@@ -295,15 +295,48 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 	// ownership to hand to a peer (the target already built its own copy) — exclude them from the
 	// drain's handoff + redirect accounting. Their players are not redirected (there is nowhere to
 	// redirect them to); a clean shutdown still durably flushes them via s.Drain() below.
-	zones := make([]*Zone, 0)
+	//
+	// INSTANCES are excluded from the HANDOVER, by their OWN predicate rather than by widening isLocalZone —
+	// the two zone classes are unleased for completely different reasons and every other site treats them
+	// differently. An instance in the handover set is a guaranteed zero-drop violation on every SIGTERM:
+	// handoverZoneTo has no lease to flip, and drainPlayer hands each occupant off IN PLACE to `z.id` — an
+	// instance id no peer can resolve, let alone host — so every Prepare fails, every occupant stays resident,
+	// and all of them are dropped as stragglers at the deadline.
+	//
+	// They are NOT excluded from the ACCOUNTING. That is the other half and it is just as load-bearing: an
+	// instance stays in `zones`, so it is counted in `initial`, durably flushed by s.Drain, and told to
+	// clean-disconnect + classify its residents in step 3 exactly like every other zone. Dropping instances
+	// out of the set entirely would trade an OVER-count of Redirected (they were never redirectable) for an
+	// UNDER-count that is far worse: their occupants would vanish from the tally, get no reclaim notice, and
+	// be dropped with the process with nothing in the readout saying so. What an instance's occupant gets is a
+	// clean reconnect from durable state — the drain's ordinary degraded outcome — not silence.
+	//
+	// WHAT IS NOT HERE. Walking an instance's occupants OUT to a drainable zone before the drain would upgrade
+	// that reconnect to a seamless redirect. That is slice 3's (#72) job, not this slice's, and deliberately:
+	//   - There is no ENTRY path in this slice, so an OCCUPIED instance cannot occur in production yet. An
+	//     eject here would be speculative machinery on the SIGTERM critical path, which is the worst place to
+	//     put code no production flow can reach.
+	//   - Where an instance's occupant belongs on the way out is the exit ANCHOR, which slice 3 defines.
+	//     Without it an eject can only guess a destination, and a guessed destination that is itself mid-drain
+	//     is a claim/release split across two goroutines — precisely the wedge transferOut's own compensator
+	//     exists to prevent.
+	// When the anchor lands, the eject belongs before the `initial` snapshot below, so an ejected player is
+	// counted in the zone they are actually redirected from.
+	zones := make([]*Zone, 0)    // the ACCOUNTING set: every zone this shard owes a flush + reclaim
+	handover := make([]*Zone, 0) // the subset with a lease to hand a peer: the redirect + quiescence set
 	for _, z := range s.zonesList() {
 		if s.isLocalZone(z.id) {
 			continue
 		}
 		zones = append(zones, z)
+		if z.isInstance() {
+			continue
+		}
+		handover = append(handover, z)
 	}
 
-	// Snapshot the population BEFORE draining so Redirected = initial - stragglers-at-deadline.
+	// Snapshot the population BEFORE draining so Redirected = initial - stragglers-at-deadline. Over `zones`,
+	// so an instance's occupants are in the denominator; they will come back out as Reclaimed in step 3.
 	initial := int64(0)
 	for _, z := range zones {
 		initial += z.pop.Load()
@@ -327,7 +360,7 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 	sentPlayers := map[string]bool{}
 	defer func() { s.retireDrainTargets(sentPlayers) }()
 
-	for _, z := range zones {
+	for _, z := range handover {
 		targetID, targetAddr, cerr := choose(z.id, int(z.pop.Load()))
 		if cerr != nil {
 			slog.Warn("drain: no target for zone; its players will be reclaimed from durable state",
@@ -352,12 +385,29 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 	// `pop == 0`: a zone can read empty while it still owes a parked logout flush, or while a player is in
 	// flight to it on the intra-shard transfer path (#409) — see allZonesQuiescent and Zone.quiescent. This
 	// matches what RebalanceZone, the single-zone analog, has always waited for.
+	//
+	// The RESIDENCY wait is over `handover`, NOT `zones`: an instance was never redirected, so nothing will
+	// ever make its pop fall and waiting on one would burn the whole deadline every time — starving the
+	// durable flush in step 3, which is the part that actually protects the players in it.
+	//
+	// The `incoming` gate is over `zones`, INCLUDING instances, and that asymmetry is deliberate. Quiescence
+	// is three counters and only two of them are about redirection; `incoming` is #409's in-flight
+	// intra-shard ARRIVAL claim, taken by claimTransferTarget in the same mu hold that resolves the
+	// destination. Excluding instances from it would say "nobody is in flight" while a live session is, and
+	// step 3 would then order the flush + straggler reclaim AHEAD of the arrival — the player lands in a zone
+	// that has already been flushed and disconnected and is dropped with the process, uncounted and
+	// unflushed. That is exactly the failure allZonesQuiescent's doc-comment describes.
+	//
+	// Unreachable today (no entry path routes into an instance; that is slice 3, #72), and armed the moment
+	// slice 3 points claimTransferTarget at an instance destination — which is why it is closed by
+	// construction here rather than left as a note. It costs nothing: an OCCUPIED instance has pop > 0, not
+	// incoming > 0, so the "don't wait on a pinned instance" property above is untouched.
 	dl := time.After(deadline)
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
 wait:
 	for {
-		if allZonesQuiescent(zones) {
+		if allZonesQuiescent(handover) && noArrivalsInFlight(zones) {
 			break wait
 		}
 		select {
@@ -376,9 +426,21 @@ wait:
 	// BeginDrain returns. The flush is only ENQUEUED to the async saver, not confirmed durable (a saver-drain
 	// barrier is a tracked follow-up); the reclaim notice's wording is honest about that.
 	//
+	// This step runs over `zones`, the ACCOUNTING set, so it covers the instances the handover skipped: their
+	// occupants are flushed durably and get a reclaim notice + a tally entry rather than disappearing.
+	//
 	// Both the post and the collect select on ctx so a zone whose loop has stopped consuming (a lease fence
 	// cancelling worldCtx mid-drain, or a wedged handler) can never block shutdown past the drain deadline —
 	// on either timeout the zone's residents are counted best-effort as infra-fault via the atomic pop.
+	//
+	// They ALSO select on z.dead, which is what z.post does and what a raw channel send here has to do by
+	// hand (#411). A zone can be torn down between this drain's zonesList() snapshot and now: the instance
+	// reaper rides runCtx and keeps sweeping during a drain — s.draining gates minting, not reaping — so an
+	// empty instance is retired out from under us. Its inbox is still BUFFERED, so the send succeeds against
+	// a stopped actor, and the collect then waits for a reply that nobody is left to send: the drain sits
+	// there until the caller's context expires, which on SIGTERM is the whole shutdown deadline (~45s in
+	// cmd/telos-world) spent on a shard with nothing left to do. Availability, not durability — the flush
+	// barriers run on their own fresh contexts — which is precisely why it would read as "shutdown is slow".
 	if dropped := s.Drain(ctx); dropped > 0 {
 		slog.Warn("drain: some straggler flushes never reached the saver queue; those players will load stale state",
 			"dropped", dropped)
@@ -389,19 +451,25 @@ wait:
 		select {
 		case z.inbox <- reclaimStragglersMsg{resp: ch}:
 			resps[i] = ch
+		case <-z.dead:
+			resps[i] = nil // torn down mid-drain; it is quiescent by UnhostZone's precondition, so nothing is owed
 		case <-ctx.Done():
 			resps[i] = nil // couldn't post; accounted in the collect loop below
 		}
 	}
 	for i, z := range zones {
 		if resps[i] == nil {
-			res.ReclaimedInfra += int(z.pop.Load()) // never posted (ctx expired); best-effort count
+			res.ReclaimedInfra += int(z.pop.Load()) // never posted (ctx expired, or the zone is gone); best-effort
 			continue
 		}
 		select {
 		case t := <-resps[i]:
 			res.ReclaimedInfra += t.infra
 			res.ReclaimedClient += t.client
+		case <-z.dead:
+			// Torn down after we posted: nothing will drain that inbox. UnhostZone only removes a QUIESCENT
+			// zone, so pop is 0 here and this adds nothing — it is the wait that had to end, not the count.
+			res.ReclaimedInfra += int(z.pop.Load())
 		case <-ctx.Done():
 			// Posted but the zone didn't answer before the drain ctx expired; count its residents (pop, which
 			// includes any pending arrival — a minor over-count acceptable in this degraded path) as infra.
@@ -433,6 +501,25 @@ wait:
 func allZonesQuiescent(zs []*Zone) bool {
 	for _, z := range zs {
 		if !z.quiescent() {
+			return false
+		}
+	}
+	return true
+}
+
+// noArrivalsInFlight reports whether NO zone in zs has an intra-shard transfer claimed toward it (#409). It is
+// the one third of quiescence that BeginDrain applies to EVERY hosted zone rather than only to the ones it can
+// hand a peer.
+//
+// The split exists because the three counters answer different questions. `pop` and `stashed` are about
+// RESIDENCY, which for a zone the drain cannot redirect (an instance) will never fall — waiting on it just
+// burns the deadline. `incoming` is about a live session that is ALREADY in flight to that zone on this shard,
+// which has nothing to do with whether the zone is redirectable: concluding "drained" with one outstanding
+// orders step 3's durable flush + straggler reclaim ahead of the arrival, and the player is dropped with the
+// process, uncounted and unflushed.
+func noArrivalsInFlight(zs []*Zone) bool {
+	for _, z := range zs {
+		if z.incoming.Load() != 0 {
 			return false
 		}
 	}

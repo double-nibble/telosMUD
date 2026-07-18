@@ -217,6 +217,19 @@ type Shard struct {
 	// drainable zone.
 	localZones map[string]bool
 
+	// instances / mintRate / instanceLimits are the runtime-minted instanced-zone bookkeeping (#411,
+	// instance.go): instance zone id -> the record its cap slot is charged against, and per-account mint-rate
+	// buckets. Both guarded by mu — the SAME mutex that guards s.zones — so a mint's cap check and its
+	// publish into s.zones are one atomic decision, and so UnhostZone can drop a zone and free its cap slot
+	// in one hold. instanceLimits is set at construction and read-only after (WithInstanceLimits, before Run).
+	//
+	// An instance is hosted UNLEASED, like a local bootstrap zone, so it appears in s.zones but in none of the
+	// lease/placement/handoff maps. It is also the only zone class this shard creates on its own initiative
+	// rather than being told to, which is why its bound lives here rather than in the directory.
+	instances      map[string]*instanceRecord
+	mintRate       map[string]*mintBucket
+	instanceLimits instanceLimits
+
 	// handoffSem bounds the number of CONCURRENT in-flight cross-shard handoffs (Prepare RPCs) this shard
 	// runs — so a graceful drain's fan-out over a whole zone doesn't fire N simultaneous Prepares at one
 	// target and stampede it (16.4b review). A normal move (rare) is never throttled by a 32-deep slot pool.
@@ -386,10 +399,16 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		actorDone:        map[string]chan struct{}{},
 		rebalancing:      map[string]bool{},
 		rebalanceBackoff: map[string]time.Time{},
-		handoffSem:       make(chan struct{}, maxConcurrentHandoffs),
-		placement:        newPlacementWriter(),
-		saver:            newSaver(nil, nil), // disabled until WithPersistence configures it
-		auditor:          newAuditor(nil),    // disabled until WithAudit configures it (#350)
+		// Instanced-zone bookkeeping (#411, instance.go). The limits default here rather than at first use so
+		// a shard built by ANY constructor is capped — a zero-valued cap would mean "unbounded", which for the
+		// per-shard bound is a resource-exhaustion hole rather than a permissive default.
+		instances:      map[string]*instanceRecord{},
+		mintRate:       map[string]*mintBucket{},
+		instanceLimits: defaultInstanceLimits(),
+		handoffSem:     make(chan struct{}, maxConcurrentHandoffs),
+		placement:      newPlacementWriter(),
+		saver:          newSaver(nil, nil), // disabled until WithPersistence configures it
+		auditor:        newAuditor(nil),    // disabled until WithAudit configures it (#350)
 		// Empty global-definition bundle (defs.go); the constructor registers content into it
 		// before any zone runs and shares the SAME bundle pointer with every hosted zone.
 		defs: newDefRegistries(),
@@ -894,6 +913,10 @@ func (s *Shard) Run(ctx context.Context) {
 	go s.runPlacementWriter(ctx) // off-zone-goroutine directory placement writer (#320; no-op without a directory)
 	go s.presence.run(ctx)       // off-zone-goroutine cross-shard `who` heartbeat (no-op if disabled)
 	go s.comms.publishLoop(ctx)  // off-zone-goroutine single-writer durable-tell publisher (8.5)
+	// Idle-instance reaper (#411, instance.go). Its OWN shard-level ticker, deliberately NOT the lease-renewal
+	// tick: instances take no lease, so no renewal goroutine exists for them to ride on. It only reads atomics
+	// and calls UnhostZone, so it never touches zone state.
+	go s.runInstanceReaper(ctx)
 	// Hot reload runs on the bus's own subscription goroutine (no shard goroutine of its own);
 	// just tear the subscription down when the shard stops so a restart doesn't double-subscribe.
 	if s.reloader != nil {
@@ -967,12 +990,22 @@ func (s *Shard) Drain(ctx context.Context) (dropped int) {
 		return 0
 	}
 	zones := s.zonesList()
-	dones := make([]chan int, 0, len(zones))
+	type pending struct {
+		z    *Zone
+		done chan int
+	}
+	waits := make([]pending, 0, len(zones))
 	for _, z := range zones {
 		done := make(chan int, 1)
 		select {
 		case z.inbox <- drainFlushMsg{ctx: ctx, done: done}:
-			dones = append(dones, done)
+			waits = append(waits, pending{z: z, done: done})
+		case <-z.dead:
+			// Torn down between the snapshot above and now — the instance reaper keeps sweeping during a drain
+			// (#411). The inbox is still buffered, so a raw send would SUCCEED against a stopped actor and the
+			// wait below would then block until ctx expires (the whole shutdown deadline). z.post watches this
+			// channel for exactly this reason; a raw send has to do it by hand. Nothing is owed: UnhostZone only
+			// removes a quiescent zone.
 		case <-ctx.Done():
 			return dropped // a zone whose loop has stopped consuming must not block shutdown
 		}
@@ -980,10 +1013,12 @@ func (s *Shard) Drain(ctx context.Context) (dropped int) {
 	// WAIT for each zone to have DUMPED its players onto the saver queue (#282). Posting alone proves
 	// nothing: a saver barrier taken immediately afterwards could drain an empty queue and report success
 	// while the zones' saves were still sitting unposted in their inboxes.
-	for _, done := range dones {
+	for _, w := range waits {
 		select {
-		case n := <-done:
+		case n := <-w.done:
 			dropped += n
+		case <-w.z.dead:
+			// Torn down after we posted; nothing will ever answer. Same reasoning as the post above.
 		case <-ctx.Done():
 			return dropped
 		}

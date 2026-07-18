@@ -130,6 +130,9 @@ func (rt *luaRuntime) scopeSignalRegion(l *lua.LState) int {
 	if rt.denyInDisplay(l, "signal_region") {
 		return 0
 	}
+	if rt.denyInInstance(l, "signal_region") {
+		return 0
+	}
 	if rt.zone == nil || rt.zone.scopes == nil || rt.zone.scopes.regionID == "" {
 		rt.log.Debug("signal_region ignored (region-less zone)")
 		return 0
@@ -144,8 +147,37 @@ func (rt *luaRuntime) scopeSignalWorld(l *lua.LState) int {
 	if rt.denyInDisplay(l, "signal_world") {
 		return 0
 	}
+	if rt.denyInInstance(l, "signal_world") {
+		return 0
+	}
 	rt.enqueueScopeSignal(l, scopebus.World())
 	return 0
+}
+
+// denyInInstance refuses a signal-UP from a runtime-minted zone instance (#411), LOUDLY, and reports whether
+// it refused.
+//
+// WHY REFUSED. A signal is a zone COMMANDING its director, and the envelope carries no source (scopeSignalJob
+// is scope+event+payload). A director therefore cannot tell one private party's progress from the shared
+// world's. The concrete case is the demo's own boss loop: the goblin chief's death fires
+// signal_world("boss.died"), which the director's scheduler intercepts to RESCHEDULE the shared world timer
+// (internal/director/schedule_run.go). A party in a private copy killing their own boss would push the whole
+// server's next scheduled spawn out, repeatedly, for free. Attribution — letting a director distinguish and
+// act on an instance's report — is its own piece of work, not something to allow through by default.
+//
+// WHY LOUD. The pre-existing region-less path is a Debug no-op, which is the wrong shape here: content
+// authored against the template works in playtest and is inert in every copy, and a builder has no way to
+// discover that from the outside. A Warn naming the zone AND the event is the only signal they get. It reads
+// the event name off the stack (never consuming it) purely so the log can say which one.
+func (rt *luaRuntime) denyInInstance(l *lua.LState, fn string) bool {
+	if rt.zone == nil || !rt.zone.isInstance() {
+		return false
+	}
+	event, _ := l.Get(1).(lua.LString)
+	rt.log.Warn("signal-up REFUSED from a zone instance: a director cannot attribute a private copy's report, "+
+		"so an instance may never drive shared world state",
+		"call", fn, "event", string(event), "zone", rt.zone.id, "template", rt.zone.template)
+	return true
 }
 
 // enqueueScopeSignal reads (event, payload?) off the Lua stack, marshals the payload table, and hands the

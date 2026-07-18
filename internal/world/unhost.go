@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/double-nibble/telosmud/internal/metrics"
 )
 
 // unhost.go — the runtime zone-REMOVE primitive (#288), the inverse of HostZone's runtime zone-add.
@@ -119,7 +121,15 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 
 	// Ownership check OFF mu (it does directory I/O). A read failure fails closed: leaving a zombie zone is a
 	// leak, tearing down a zone we may still own is a correctness break.
-	if s.leaser != nil {
+	//
+	// SKIPPED ENTIRELY for an instance (#411). An instance takes no directory lease — there is no key to read
+	// and the answer would always be "unowned" — so the read is pure cost with a failure mode. And that
+	// failure mode is severe: the check fails CLOSED, so a single Redis blip during a reaper sweep would
+	// refuse the teardown, and because nothing ever re-leases an instance the refusal is permanent. Every
+	// instance minted for the life of the process would leak its zone object, its actor goroutine, its Lua VM
+	// and its cap slot. On top of that it is a directory round trip PER INSTANCE per sweep, on the shared
+	// cluster Redis every shard and the placement coordinator depend on.
+	if s.leaser != nil && !isInstanceID(id) {
 		owner, _, err := s.leaser.ZoneLease(ctx, id)
 		if err != nil {
 			return fmt.Errorf("unhost %q: read lease owner: %w", id, err)
@@ -162,6 +172,22 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 			id, z.pop.Load(), z.stashed.Load(), z.incoming.Load())
 	}
 	delete(s.zones, id)
+	// Give an instance's cap slot back in the SAME hold that removed the zone (#411), so the account's quota
+	// and the live-instance count can never disagree with s.zones. Doing it outside the lock would leave a
+	// window where a concurrent mint reads a slot as taken by a zone that no longer exists — a slow leak of an
+	// account's quota across a busy reap.
+	instRec := s.instances[id]
+	delete(s.instances, id)
+	// The gauge is LABELED by template, so its value must be the count for THAT template, computed in this
+	// same hold (see instanceCountLocked). `len(s.instances)` — the shard-wide total — is wrong here in the
+	// way that does not self-correct: this is the DOMINANT teardown path (the reaper retires instances through
+	// UnhostZone; releaseInstanceSlot only ever runs on a failed mint), so reaping the last instance of
+	// template A would set series{template=A} to whatever OTHER templates still have live and then never
+	// sample it again. It would report live instances of A, forever, with none.
+	var liveForTemplate int64
+	if instRec != nil {
+		liveForTemplate = s.instanceCountLocked(instRec.template)
+	}
 	// A pending handoff token indexed to this zone can never be bound now; drop it rather than leave the index
 	// pointing at a stopped actor.
 	for token, tz := range s.tokenIndex {
@@ -220,6 +246,9 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 	// `post` abandons its send instead of filling the buffer and then blocking a sender forever — including
 	// the saver's shared drainer, which acks back into a zone inbox WITHOUT a context to bail on.
 	close(z.dead)
+	if instRec != nil {
+		metrics.SetInstances(ctx, liveForTemplate, instRec.template)
+	}
 	slog.Info("unhosted zone at runtime", "zone", id, "shard", s.addr)
 	return nil
 }

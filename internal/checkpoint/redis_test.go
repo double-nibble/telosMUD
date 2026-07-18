@@ -161,3 +161,59 @@ func TestCheckpointOverwritesThePriorValue(t *testing.T) {
 		t.Fatalf("checkpoint did not overwrite: got zone %q version %d, want crypt/43", got.ZoneRef, got.StateVersion)
 	}
 }
+
+// TestCheckpointEmptyZoneRefPreservesTheStoredZone pins the "" contract (#411): an empty ZoneRef means
+// "leave the stored location alone", NOT "clear it".
+//
+// The world's only producer of ZoneRef (world.dumpCharacter) returns "" for a player who is inside a
+// runtime-minted zone INSTANCE, because the instance's id is ephemeral and must never be persisted — a
+// durable row naming a reaped instance is dangling by construction, and it is also a poisoned record aimed
+// at the login path's instance guard. But RoomRef is NOT empty on that path: an instance hosts its
+// TEMPLATE's authored rooms, so the snapshot carries a real room ref like "darkwood:room:lair".
+//
+// So a blanking write produces an internally inconsistent mirror — a real room with no zone — and this is
+// the tier the login path PREFERS whenever it is the fresher of the two. The reconnect falls back to the
+// home zone, cannot resolve that room there, and start-rooms the player. The save cadence alone (~10s) would
+// do it to every dungeon occupant.
+func TestCheckpointEmptyZoneRefPreservesTheStoredZone(t *testing.T) {
+	r := newTestRedis(t)
+	ctx := context.Background()
+
+	anchored := fullSnapshot() // zone darkwood: where the player was before they stepped into the instance
+	if err := r.Checkpoint(ctx, anchored); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	// The instance-occupant checkpoint: no zone, but a real (template-authored) room.
+	inside := fullSnapshot()
+	inside.ZoneRef, inside.RoomRef, inside.StateVersion = "", "darkwood:room:lair", 43
+	if err := r.Checkpoint(ctx, inside); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	got, found, err := r.LoadCheckpoint(ctx, anchored.Name)
+	if err != nil || !found {
+		t.Fatalf("LoadCheckpoint: found=%v err=%v", found, err)
+	}
+	if got.ZoneRef != anchored.ZoneRef {
+		t.Fatalf("an empty ZoneRef CLEARED the checkpoint's zone (now %q, was %q) while room_ref kept %q. The "+
+			"mirror now holds a real room with no zone: the login path prefers this tier when it is fresher, "+
+			"falls back to the home zone, cannot resolve that room there, and start-rooms the player — durable "+
+			"location loss on every save tick for anyone inside a zone instance (#411)",
+			got.ZoneRef, anchored.ZoneRef, got.RoomRef)
+	}
+	// Everything else must still be overwritten: this is a targeted preserve, not a frozen record.
+	if got.StateVersion != 43 || got.RoomRef != "darkwood:room:lair" {
+		t.Fatalf("the rest of the checkpoint stopped overwriting: version %d room %q, want 43/darkwood:room:lair",
+			got.StateVersion, got.RoomRef)
+	}
+	// The CONTROL: a non-empty ZoneRef still overwrites, so "" is the only preserving value.
+	moved := fullSnapshot()
+	moved.ZoneRef, moved.StateVersion = "crypt", 44
+	if err := r.Checkpoint(ctx, moved); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if got, _, _ := r.LoadCheckpoint(ctx, anchored.Name); got.ZoneRef != "crypt" {
+		t.Fatalf("a real zone change was not written: zone %q, want crypt", got.ZoneRef)
+	}
+}

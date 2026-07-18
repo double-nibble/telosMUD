@@ -384,7 +384,7 @@ func (sr *scopeReplication) seedZone(ctx context.Context, z *Zone) {
 	defer cancel()
 
 	// Region first: its staleness window is the one we can afford to widen.
-	regionID := sr.regionForZone(z.id)
+	regionID := sr.regionFor(z)
 	var regionSeed map[string]json.RawMessage
 	if regionID != "" {
 		if raw, err := sr.snapshot.SnapshotRegionState(ctx, regionID); err != nil {
@@ -422,7 +422,7 @@ func (sr *scopeReplication) registerZone(z *Zone) {
 	if sr == nil {
 		return
 	}
-	regionID := sr.regionForZone(z.id)
+	regionID := sr.regionFor(z)
 	if regionID == "" {
 		return // not a region member; world-scope deltas still reach it via zonesList
 	}
@@ -445,6 +445,28 @@ func (sr *scopeReplication) registerZone(z *Zone) {
 		}
 	}
 	sr.log.Debug("registered runtime-hosted zone for scope replication", "zone", z.id, "region", regionID)
+}
+
+// regionFor returns the region a live zone belongs to, resolving by id and falling back to the zone's
+// TEMPLATE (#411).
+//
+// region_defs list AUTHORED zone refs, so an instance's synthetic id can never appear in one and a raw
+// regionForZone(z.id) misses. The consequence is not "no region" but SILENT INERTNESS: region:get reads
+// empty inside every copy of a dungeon, so content authored against the template — a war flag, a world-event
+// gate — works perfectly in playtest and does nothing in every instance, with no error anywhere to find it by.
+//
+// This is the READ direction only, and only the read direction may widen to the template. Writes UP (a zone
+// commanding its director) stay refused: the signal envelope carries no source, so a director cannot tell one
+// private party's progress from the shared world's, and letting an instance report up would let a party
+// drive shared world state by farming a copy. See scopeSignalRegion.
+func (sr *scopeReplication) regionFor(z *Zone) string {
+	if z == nil {
+		return ""
+	}
+	if r := sr.regionForZone(z.id); r != "" {
+		return r
+	}
+	return sr.regionForZone(z.template)
 }
 
 // regionForZone returns the region id a zone belongs to per the shard's loaded region_defs, or "".
@@ -476,6 +498,11 @@ func (sr *scopeReplication) onScopeEvent(kind, regionID, event string, payload j
 			return
 		}
 		m = scopeDeltaMsg{kind: kind, key: p.Key, value: p.Value}
+		// A STATE delta reaches EVERY zone including instances: an instance reads world/region state exactly
+		// like its template (regionFor resolves its region by template for the same reason). Pass "" so the
+		// instance filter below never withholds one — state is the read direction, and reads are allowed.
+		sr.postToScopeZones(kind, regionID, "", m)
+		return
 	case contentbus.PullResultEvent:
 		// Operator feedback for a coordinated pull (#230): NOT a Lua on_world effect — the shard consumes
 		// it to tell the requesting builder how their `pull` settled, then stops (no on_world fan-out).
@@ -484,7 +511,7 @@ func (sr *scopeReplication) onScopeEvent(kind, regionID, event string, payload j
 	default:
 		m = scopeEventMsg{kind: kind, event: event, payload: payload}
 	}
-	sr.postToScopeZones(kind, regionID, m)
+	sr.postToScopeZones(kind, regionID, event, m)
 }
 
 // deliverPullResult fans a director's pull-outcome broadcast (#230) to hosted zones as a pullResultMsg;
@@ -516,11 +543,49 @@ func (sr *scopeReplication) deliverPullResult(payload json.RawMessage) {
 	}
 }
 
+// reservedScheduleEvents are the ENGINE-RESERVED scoped events a runtime-minted instance never receives
+// (#411). Today that is the scheduled-boss spawn the director's schedule loop broadcasts
+// (director.SpawnBossEvent — duplicated as a literal because world must not import director; the direction
+// of that dependency is director -> world).
+//
+// WHY. A schedule is a WORLD-scope object with world-scope scarcity: one boss, one loot table, on one timer.
+// The broadcast fans out to every hosted zone, so with instances live it would spawn that boss in the
+// template AND in every private copy of it simultaneously. Each kill then signals boss.died back up, which
+// reschedules the ONE shared world timer, last-writer-wins. The scarce thing stops being scarce and the
+// shared timer becomes player-drivable.
+//
+// It is a deliberately NARROW list — reserved engine events only. A content-authored world event still
+// reaches instances, because the engine cannot know whether the author means it to; mud.zone() (luamud.go) is
+// how content expresses that choice for its own events.
+var reservedScheduleEvents = map[string]bool{
+	"spawn.boss": true,
+}
+
+// deliverableToInstance reports whether a scoped event may be delivered to an instance zone.
+func deliverableToInstance(event string) bool { return !reservedScheduleEvents[event] }
+
+// ReservedScheduleEvent reports whether event is engine-reserved and therefore withheld from instance zones.
+//
+// Exported for ONE reason: reservedScheduleEvents duplicates director.SpawnBossEvent as a string literal
+// (world must not import director — the dependency runs director -> world), and a duplicated literal with no
+// link between the two ends is a silent-break waiting to happen. Rename the director's constant and the
+// exclusion here simply stops matching: the boss fan-out this list exists to stop is re-enabled, in every
+// live instance, with no error and no failing test anywhere. internal/director's parity test binds the two
+// through this function so that rename fails the build instead.
+func ReservedScheduleEvent(event string) bool { return reservedScheduleEvents[event] }
+
 // postToScopeZones posts m to every zone the scope addresses: a world scope to all hosted zones, a region
-// scope only to that region's hosted member zones.
-func (sr *scopeReplication) postToScopeZones(kind, regionID string, m msg) {
+// scope only to that region's hosted member zones. `event` is "" for a STATE delta, which every zone
+// receives — an instance reads region/world state exactly like its template (that is what regionFor is for);
+// only reserved remote EFFECTS are withheld from it.
+func (sr *scopeReplication) postToScopeZones(kind, regionID, event string, m msg) {
 	if kind == "world" {
 		for _, z := range sr.shard.zonesList() {
+			if z.isInstance() && !deliverableToInstance(event) {
+				sr.log.Debug("withholding a reserved scoped event from a zone instance",
+					"zone", z.id, "template", z.template, "event", event)
+				continue
+			}
 			z.post(m)
 		}
 		return
@@ -534,9 +599,16 @@ func (sr *scopeReplication) postToScopeZones(kind, regionID string, m msg) {
 	}
 	sr.mu.RUnlock()
 	for _, zoneID := range targets {
-		if z := sr.shard.zoneByID(zoneID); z != nil {
-			z.post(m)
+		z := sr.shard.zoneByID(zoneID)
+		if z == nil {
+			continue
 		}
+		if z.isInstance() && !deliverableToInstance(event) {
+			sr.log.Debug("withholding a reserved scoped event from a zone instance",
+				"zone", z.id, "template", z.template, "event", event)
+			continue
+		}
+		z.post(m)
 	}
 }
 

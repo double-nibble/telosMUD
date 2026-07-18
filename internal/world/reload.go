@@ -450,6 +450,24 @@ func (r *reloader) reconcileZone(inv contentbus.Invalidation) {
 		startRoom: ProtoRef(inv.StartRoom),
 	}
 	for _, z := range r.shard.zonesList() { // mu-guarded against a runtime HostZone (16.4a)
+		if z.isInstance() {
+			// FROZEN (#411): a live instance is PINNED to the content it was minted from and never reconciles.
+			// Note this is an EXPLICIT refusal, not the `z.id != inv.Ref` mismatch below doing the work by
+			// accident — an instance's id is `<template>#<serial>`, so it never equals a ref and the loop
+			// happens to skip it. That accident is exactly the kind of thing a later "match by template"
+			// refactor removes without noticing.
+			//
+			// WHY FREEZE. A reconcile is a diff-and-CONVERGE that tears down rooms absent from the desired
+			// set. Applied to a zone with a party inside it, a builder's mid-run edit deletes the room they
+			// are standing in. And "the run you started is the run you finish" is the instanced semantic
+			// anyway: an instance is one bounded pass over a fixed room graph, and it is short-lived, so the
+			// edit lands on the next mint — seconds to minutes away — with nobody's run corrupted.
+			if z.template == inv.Ref {
+				r.log.Debug("zone-shape reconcile withheld from a pinned zone instance; it keeps the content it "+
+					"was minted from until it is reaped", "zone", z.id, "template", z.template, "version", inv.Version)
+			}
+			continue
+		}
 		if z.id != inv.Ref {
 			continue
 		}
@@ -621,6 +639,37 @@ func (r *reloader) notifyZones(kind, ref string) {
 		return
 	}
 	for _, z := range r.shard.zonesList() { // mu-guarded: safe against a runtime HostZone (16.4a)
+		if z.isInstance() {
+			// FROZEN (#411), the other half of the reconcile freeze above — and unlike that one this is not a
+			// no-op today, it is a real behavior change. notifyZones fans out to EVERY hosted zone by id-free
+			// broadcast, so without this an instance DID recompile its Lua and re-register its live handlers
+			// mid-run. Combined with the shared prototype cache (an instance sets z.protos = s.protos), a
+			// reload left a running dungeon with new scripts and new prototypes over the OLD room graph the
+			// reconcile above correctly refused to touch — the least coherent of the three possible states.
+			//
+			// RESIDUAL, stated plainly, because "an instance is frozen" is NOT true — what is frozen is the
+			// zone's ROOM GRAPH and its ACTIVE handler re-registration. Three shared surfaces still move
+			// under a running instance, and skipping the message here is what leaves them uneven:
+			//
+			//  1. The protoCache is shared (an instance sets z.protos = s.protos) and is swapped by the
+			//     reload. An entity SPAWNED in an instance after a reload gets the new prototype; entities
+			//     already alive keep the one they alias.
+			//  2. The compiled-Lua cache is only HALF frozen, and NOT in the direction the word suggests.
+			//     Skipping reloadLua means rt.chunks is not flushed, no chunkGen bump (so old mud.after
+			//     timers keep firing), no breaker reset, and no reloadEntityScriptsForProto walk — live
+			//     entities keep their registered handlers. But chunkFor is SOURCE-AWARE: its `src` argument
+			//     comes from these same shared registries, so the next call for any def whose source changed
+			//     RECOMPILES from the new body. New Lua therefore does reach a running instance, lazily and
+			//     one def at a time, mixed with old-generation timers.
+			//  3. z.defs is the shared per-shard registry (adoptLocked points every zone at s.defs), so
+			//     reloaded item / resource / ability / loot defs are visible to an instance IMMEDIATELY —
+			//     nothing here touches that at all.
+			//
+			// Freezing content properly means per-instance pinning (its own cache generation and def
+			// snapshot), which is a bigger change than this slice. What is fixed here is the destructive
+			// part: the room graph a party is standing in no longer converges under them mid-run.
+			continue
+		}
 		// NON-BLOCKING fan-out: a blocking post here would let ONE saturated (or wedged) zone inbox
 		// head-of-line-stall every LATER zone's invalidation shard-wide, and a wedged zone would halt hot
 		// reload entirely (distsys review) — so a full inbox DROPS the message. This carries only the LUA

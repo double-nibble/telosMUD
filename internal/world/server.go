@@ -30,6 +30,57 @@ type playServer struct {
 	log   *slog.Logger // scoped logger: component=play
 }
 
+// resolveAttachZone decides which hosted zone an attaching connection is handed to, in priority order:
+// a pending handoff token, then a session this shard still HOLDS (the #321 residency index), then the
+// character's durable zone_ref, then the home zone as the fallback. Returns nil only when this shard hosts
+// no home zone at all.
+//
+// Extracted from Connect so the routing decision is directly testable — it is a security boundary (it
+// answers "which live zone does this identity get to enter"), and driving it through a full Play stream to
+// exercise one branch is how a branch ends up untested.
+func (s *playServer) resolveAttachZone(character, token string, loaded CharSnapshot, loadedOK bool) *Zone {
+	zone := s.shard.zoneByID(s.shard.home)
+	var resident *Zone
+	if token == "" {
+		resident = s.shard.zoneForResidentCharacter(character)
+	}
+	switch {
+	case token != "":
+		if z := s.shard.zoneForToken(token); z != nil {
+			zone = z
+		}
+		// If no zone holds the token, fall through with the home zone; the zone's attach
+		// rejects the unknown token rather than spawning a fresh character.
+	case resident != nil:
+		// A session for this character is still held on this shard: route to its actual zone so attach
+		// re-binds it. This is authoritative over the (possibly stale) durable zone_ref (#321).
+		zone = resident
+	case loadedOK && loaded.ZoneRef != "" && isInstanceID(loaded.ZoneRef):
+		// FAIL CLOSED on an instance-shaped durable location (#411). No write path stores one — a player's
+		// durable location while inside an instance is the exit ANCHOR, never the instance itself (#72) — so a
+		// row in this shape is a poisoned record or a pre-migration artifact. Honoring it would log a
+		// reconnecting player straight into a live private instance, one they may never have entered and whose
+		// occupants are somebody else's party. Falling back to home is the same degraded outcome an
+		// unhostable durable zone already gets. Note this branch must stay ABOVE the zoneByID branch below:
+		// the instance IS hosted and IS resolvable, so the shape check is the only thing standing in the way.
+		s.log.Warn("durable zone_ref names a zone INSTANCE; refusing it and falling back to the home zone",
+			"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
+	case loadedOK && loaded.ZoneRef != "":
+		if z := s.shard.zoneByID(loaded.ZoneRef); z != nil {
+			zone = z
+		} else {
+			// This shard does not host the player's durable zone, so we cannot honor it. Falling back to
+			// home preserves the pre-#320 behavior (they land in the home start room) rather than refusing
+			// the login outright — the gate cannot yet re-resolve, because the directory placement records
+			// a SHARD, not a zone. Fixing that is the second half of #320; until then this WARN is the
+			// operator's signal that a rebalance stranded someone's durable location.
+			s.log.Warn("durable zone not hosted on this shard; falling back to the home zone (the player's saved location is lost)",
+				"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
+		}
+	}
+	return zone
+}
+
 func registerPlay(gs *grpc.Server, s *Shard) {
 	playv1.RegisterPlayServer(gs, &playServer{
 		shard: s,
@@ -189,35 +240,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// transfer (between the source's delPlayer and the destination's setPlayer the session is in no zone's
 	// players map), where the index misses and we fall back to the stale durable zone. That is intrinsic to
 	// the message-passing handoff and strictly narrower than the pre-fix window; tracked as a follow-up.
-	zone := s.shard.zoneByID(s.shard.home)
-	var resident *Zone
-	if token == "" {
-		resident = s.shard.zoneForResidentCharacter(character)
-	}
-	switch {
-	case token != "":
-		if z := s.shard.zoneForToken(token); z != nil {
-			zone = z
-		}
-		// If no zone holds the token, fall through with the home zone; the zone's attach
-		// rejects the unknown token rather than spawning a fresh character.
-	case resident != nil:
-		// A session for this character is still held on this shard: route to its actual zone so attach
-		// re-binds it. This is authoritative over the (possibly stale) durable zone_ref (#321).
-		zone = resident
-	case loadedOK && loaded.ZoneRef != "":
-		if z := s.shard.zoneByID(loaded.ZoneRef); z != nil {
-			zone = z
-		} else {
-			// This shard does not host the player's durable zone, so we cannot honor it. Falling back to
-			// home preserves the pre-#320 behavior (they land in the home start room) rather than refusing
-			// the login outright — the gate cannot yet re-resolve, because the directory placement records
-			// a SHARD, not a zone. Fixing that is the second half of #320; until then this WARN is the
-			// operator's signal that a rebalance stranded someone's durable location.
-			s.log.Warn("durable zone not hosted on this shard; falling back to the home zone (the player's saved location is lost)",
-				"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
-		}
-	}
+	zone := s.resolveAttachZone(character, token, loaded, loadedOK)
 	if zone == nil {
 		s.log.Error("no zone to attach to", "character", character, "home", s.shard.home)
 		return status.Error(codes.Unavailable, "no hosted zone; reconnect")
