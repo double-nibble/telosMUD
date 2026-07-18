@@ -452,9 +452,20 @@ func parseAttributeBase(a content.AttributeDTO) (formulaNode, error) {
 // zone is left EMPTY (no rooms, no start room) — the bare-engine boot: a login to an empty
 // zone is rejected cleanly (Zone.join / resolveRoom guards), never a panic.
 func (z *Zone) buildZone(lc *content.LoadedContent) {
-	zd := lc.Zone(z.id)
+	// By TEMPLATE, not id: this is the one genuinely content-shaped question in the zone lifecycle, so it is
+	// the one place the two must differ for an instance (#72). They are equal for every zone that exists
+	// today, so this is inert until instances land.
+	//
+	// Normalize an unset template to the id first. newZone always sets it, but a hand-built Zone struct
+	// literal (a few tests) does not, and an empty template would look up `lc.Zone("")`, find nothing, and
+	// boot the zone EMPTY behind a Debug line — a zone silently having no rooms is the worst failure shape in
+	// this package, so fail safe rather than fail quiet.
+	if z.template == "" {
+		z.template = z.id
+	}
+	zd := lc.Zone(z.template)
 	if zd == nil {
-		z.log.Debug("zone has no loaded content; booting empty", "zone", z.id)
+		z.log.Debug("zone has no loaded content; booting empty", "zone", z.id, "template", z.template)
 		return
 	}
 	for _, r := range zd.Rooms {

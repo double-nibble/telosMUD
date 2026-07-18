@@ -114,8 +114,11 @@ func findInContents(container *Entity, rid RuntimeID) *Entity {
 // "midgaard:room:temple"); the zone is the leading segment and the room key is the
 // whole ref (the room map is keyed by full ProtoRef, so O(1) lookup by ref). A bare ref
 // with no colon is a local room with an empty zone. This is the typed successor to the
-// old string parseRef and feeds the same (zone, room) routing decision in Zone.move:
-// zone == "" or zone == z.id is a local move; a different zone routes cross-zone.
+// old string parseRef and feeds the same (zone, room) routing decision in Zone.move.
+//
+// Do NOT compare the returned zone against z.id directly — ask ownsZoneRef. A raw `== z.id` is wrong for an
+// instanced zone (#72), whose rooms carry their template's authored refs; the lint test in
+// identity_lint_test.go fails the build on one.
 func parseRef(ref ProtoRef) (zone string, room ProtoRef) {
 	s := string(ref)
 	for i := 0; i < len(s); i++ {
@@ -124,4 +127,43 @@ func parseRef(ref ProtoRef) (zone string, room ProtoRef) {
 		}
 	}
 	return "", ref
+}
+
+// ownsZoneRef reports whether zoneID — the zone segment parseRef returned for some room ref — names content
+// THIS zone hosts. True for a bare local ref (""), for our own id, and for our template, which differ only in
+// an instanced zone (#72): an instance's rooms keep their AUTHORED refs, so every ref inside `crypt#7` names
+// zone `crypt`. That is what lets all instances share the immutable per-shard protoCache, and it is why a raw
+// `zoneID != z.id` reads every exit in an instance as leaving the zone.
+//
+// This is the ROUTING question — "does this ref stay inside me" — and it is the only one that may widen to the
+// template. It is NOT the isolation question. Anything asking "may this actor reach that" must stay strict on
+// z.id, or a script in `crypt#7` eventually resolves a handle into `crypt#9`. Two different questions that
+// happen to have the same shape; do not collapse them into one helper.
+//
+// The rule for telling them apart: the ROOM MAP is the isolation boundary, and this zone-segment test is only
+// a pre-filter in front of it. `z.rooms` is per-*Zone — two instances of one template hold different maps
+// containing different entities, both keyed by the same authored refs — so widening the pre-filter changes
+// only WHETHER we consult our own map, never WHICH map. No *Zone holds a pointer into another's rooms. A
+// caller that reaches an entity some other way, without that lookup standing behind it, is asking the
+// isolation question and must not use this.
+//
+// Note this only decides the inside-out direction. An exit in `town` naming `crypt:room:entrance` still
+// resolves to the template zone, never to an instance — routing a player INTO an instance is a separate
+// mechanism (#72's entry binding), not something this predicate can express.
+func (z *Zone) ownsZoneRef(zoneID string) bool {
+	return zoneID == "" || zoneID == z.id || zoneID == z.template
+}
+
+// localRoom resolves a room ref that this zone hosts, or nil if the ref names another zone or an unknown room.
+// It is the chokepoint for "is this ref mine, and if so which room": parseRef + ownsZoneRef + the room map, in
+// the one order that is correct for an instance.
+//
+// Callers that need to distinguish "not mine" from "mine but unknown" (move, which routes the first case
+// cross-zone and refuses the second) must use parseRef + ownsZoneRef directly; everyone else wants this.
+func (z *Zone) localRoom(ref ProtoRef) *Entity {
+	zoneID, room := parseRef(ref)
+	if !z.ownsZoneRef(zoneID) {
+		return nil
+	}
+	return z.rooms[room]
 }

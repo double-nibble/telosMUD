@@ -529,7 +529,11 @@ func (z *Zone) move(s *session, dir string) bool {
 	// window in which a concurrent UnhostZone tears the destination down before transferOut's handover is
 	// claimed, dropping the handover on a dead inbox. A nil claim means the zone is no longer hosted here, so
 	// this falls through to the cross-shard branch with nothing yet mutated.
-	if destZone != "" && destZone != z.id && z.shard != nil {
+	//
+	// ownsZoneRef, not a raw `!= z.id`: an instance (#72) hosts its template's AUTHORED room refs, so every
+	// exit naming a template room stays inside the instance and an exit naming any other zone leaves normally.
+	// That single predicate is what makes an instance a closed copy of its template.
+	if !z.ownsZoneRef(destZone) && z.shard != nil {
 		if dest := z.shard.claimTransferTarget(destZone); dest != nil {
 			z.transferOut(s, dest, destRoom, dir, from)
 			return true
@@ -537,7 +541,7 @@ func (z *Zone) move(s *session, dir string) bool {
 	}
 
 	// Cross-shard (cross-zone) move: hand the player off rather than moving locally.
-	if destZone != "" && destZone != z.id {
+	if !z.ownsZoneRef(destZone) {
 		if z.handoff == nil {
 			// Single-shard zone with no directory: the boundary is sealed.
 			s.send(textFrame("The way is sealed."))

@@ -356,7 +356,12 @@ func areaTargets(c *effectCtx, area string) []*Entity {
 				// SAME-ZONE CONTAINMENT: a cross-zone (or cross-shard) exit is excluded ENTIRELY. We
 				// never look the room up anywhere but THIS zone's own map, so a destination this zone
 				// does not own is simply absent — no cross-goroutine *Entity is ever reached.
-				if destZone != "" && destZone != z.id {
+				//
+				// ownsZoneRef keeps that true for an instance (#72) without shrinking the spell: an
+				// instance's authored refs name the template, so a raw `!= z.id` would exclude EVERY
+				// exit and silently degrade room_and_adjacent to room-only inside every copy — the
+				// same content quietly behaving differently in an instance than in the template.
+				if !z.ownsZoneRef(destZone) {
 					if z.log != nil {
 						z.log.Debug("areaTargets: cross-zone exit excluded (same-zone containment)",
 							"dir", dir, "dest_zone", destZone, "this_zone", z.id)

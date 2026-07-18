@@ -45,7 +45,17 @@ const linkDeadGrace = 60 * time.Second
 // runs on the single zone goroutine. From there everything (join/input/leave) is
 // sequential and single-threaded.
 type Zone struct {
-	id        string
+	id string
+	// template names the CONTENT this zone is built from. For every zone that exists today it equals id, and
+	// the distinction is inert. It exists for #72's instanced zones: a runtime-minted copy has a synthetic id
+	// (`<template>#<serial>`) but is built from — and hosts the authored rooms of — its template.
+	//
+	// The two are NOT interchangeable. `id` answers "which live zone actor is this" — leases, placement, the
+	// residency index, logs. `template` answers "whose content is this" — the content lookup in buildZone, and
+	// the locality decision in ownsZoneRef. Reach for `id` by default; use `template` only where the question
+	// is genuinely about content, because an instance's rooms carry their AUTHORED refs (that is what lets
+	// every instance share the immutable per-shard protoCache) and so name the template, never the instance.
+	template  string
 	rooms     map[ProtoRef]*Entity // room entities, keyed by their ProtoRef (MUDLIB §4)
 	players   map[string]*session  // connection state, keyed by character id
 	startRoom ProtoRef             // ProtoRef of the room a fresh login spawns in
@@ -637,7 +647,10 @@ func (whoRenderMsg) zoneMsg()      {}
 
 func newZone(id string) *Zone {
 	z := &Zone{
-		id:                id,
+		id: id,
+		// A plain zone IS its own content: it hosts the rooms authored under its own ref. Only an instance
+		// (#72) overrides this, to the ref it was minted from.
+		template:          id,
 		dead:              make(chan struct{}),
 		whoCooldown:       defaultWhoCooldown,
 		rooms:             map[ProtoRef]*Entity{},

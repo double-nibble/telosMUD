@@ -620,11 +620,13 @@ func localRoomByRef(z *Zone, ref ProtoRef) *Entity {
 	if z == nil {
 		return nil
 	}
-	zoneID, roomRef := parseRef(ref)
-	if zoneID != "" && zoneID != z.id {
-		return nil // cross-zone destination: no handle in this zone (T7)
-	}
-	return z.rooms[roomRef]
+	// Zone.localRoom applies the same rule, ownsZoneRef-aware so an instance's authored refs resolve to ITS
+	// own rooms (#72). Without that, `self:room():exits()` hands back a bare string instead of a room handle
+	// for every exit inside an instance, and content doing `x.to:occupants()` errors on a string.
+	//
+	// The nil-zone guard above is now this wrapper's only reason to exist: Lua callers can reach here with no
+	// zone wired (a bare handle in a test runtime), where a method call would panic.
+	return z.localRoom(ref)
 }
 
 // hOccupants returns the LIVING occupants (players + mobs) of the entity as handles — meaningful on a ROOM
