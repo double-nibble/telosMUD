@@ -48,6 +48,9 @@ var renderOpClass = map[string]map[string]bool{
 	// mud table (luamud.go)
 	"mud": {
 		"now": false, "log": false, "scan": false, "pvp_allowed": false,
+		// zone() reads the zone's own id (#411) — a pure read of immutable construction-time state, and the
+		// one thing a display template may legitimately want it for is branching on which copy it is rendering.
+		"zone": false,
 		// random/roll draw rt.rng (the #58 combat stream) — FORBIDDEN (a render must not advance sim entropy)
 		"random": true, "roll": true,
 		"broadcast": true, "spawn": true, "transform": true, "summon": true,

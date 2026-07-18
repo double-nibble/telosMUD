@@ -117,15 +117,30 @@ func (m *MemStore) SaveCharacter(_ context.Context, snap CharSnapshot) (uint64, 
 	}
 	snap.PID = cur.PID // identity is immutable; never let a save rewrite it
 	snap.StateVersion = cur.StateVersion + 1
+	if snap.ZoneRef == "" {
+		// "Leave the stored location alone", never "clear it" — the same contract both real tiers implement
+		// (zone_ref = COALESCE(...) in internal/store, the read-modify-write in internal/checkpoint), for the
+		// same reason: dumpCharacter returns "" for a player inside a zone INSTANCE (#411), whose ephemeral id
+		// must not be persisted, while RoomRef still carries the template's authored ref. A clearing write
+		// leaves a real room with no zone, and the reconnect start-rooms the player.
+		snap.ZoneRef = cur.ZoneRef
+	}
 	m.rows[k] = snap
 	return snap.StateVersion, true, nil
 }
 
-// Checkpoint writes snap as the latest "Redis" checkpoint for snap.Name, overwriting the prior one.
+// Checkpoint writes snap as the latest "Redis" checkpoint for snap.Name, overwriting the prior one. An empty
+// ZoneRef preserves the stored one, matching both durable tiers (see SaveCharacter).
 func (m *MemStore) Checkpoint(_ context.Context, snap CharSnapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ckpt[memKey(snap.Name)] = snap
+	k := memKey(snap.Name)
+	if snap.ZoneRef == "" {
+		if prev, ok := m.ckpt[k]; ok {
+			snap.ZoneRef = prev.ZoneRef
+		}
+	}
+	m.ckpt[k] = snap
 	return nil
 }
 

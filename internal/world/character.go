@@ -308,11 +308,55 @@ func dumpCharacter(s *session) CharSnapshot {
 	return CharSnapshot{
 		PID:          pid,
 		Name:         s.character,
-		ZoneRef:      s.entity.zone.id,
+		ZoneRef:      durableZoneRef(s.entity.zone),
 		RoomRef:      string(roomRef(e.location)),
 		StateVersion: s.stateVersion,
 		State:        st,
 	}
+}
+
+// durableZoneRef is one of the three WRITE-side halves of the instance-shaped durable-location guard (#411).
+// It returns the zone id to persist as a character's location, or "" when that zone is a runtime-minted
+// instance.
+//
+// The read side (playServer.resolveAttachZone) already refuses an instance-shaped ZoneRef, because honoring
+// one would log a reconnecting player straight into a live private instance — possibly somebody else's
+// party's. That refusal was justified by "no write path stores one", which was true only for as long as no
+// player could be inside an instance. This IS the write path (Zone.registerPlacement and Zone.clearPlacement
+// are the others), and slice 3 (#72) puts players in instances, so the assumption has to become an
+// enforcement before that lands rather than after.
+//
+// "" MEANS "LEAVE THE STORED LOCATION ALONE", NOT "NO LOCATION". That distinction is the whole correctness of
+// this function, and getting it wrong is worse than storing the instance id would have been:
+//
+//   - The snapshot's ROOM ref is not blanked and cannot be — an instance hosts its TEMPLATE's authored rooms,
+//     so it is a real ref like darkwood:room:lair. A CLEARING write therefore produces an internally
+//     inconsistent record: a real room with no zone. resolveAttachZone's `ZoneRef != ""` guard is false, it
+//     falls back to the home zone, resolveRoom cannot find that room there, and the player lands at the start
+//     room. Every save-cadence tick and every drain flush would do it, to every occupant.
+//   - Sharper still: if the shard's home zone IS the template, the room DOES resolve — and the player
+//     materializes inside the SHARED copy of an instanced room, bypassing whatever entry gating slice 3 adds.
+//
+// So every sink reads "" as preserve: `zone_ref = COALESCE($2, zone_ref)` in internal/store, the
+// read-modify-write in internal/checkpoint, and the same rule in MemStore. dumpCharacter is the only producer
+// of ZoneRef and never legitimately intends a clear, which is what makes that safe — and it gives the durable
+// row the same entrance-anchor preservation the placement record gets for free (registerPlacement simply does
+// not write).
+//
+// The anchor being preserved is the player's LAST AUTHORED zone, which is where they entered from. The
+// authoritative exit anchor — including the ROOM, which this preservation does NOT restore (room_ref still
+// takes the instance's authored room, so a reconnect lands at the anchor zone's start room) — is slice 3's.
+func durableZoneRef(z *Zone) string {
+	if z == nil {
+		return ""
+	}
+	if z.isInstance() {
+		// z.log already carries zone= and template= (newInstanceZone), so they are not repeated here.
+		z.log.Warn("not persisting an INSTANCE as a character's durable location; the stored zone is left as it " +
+			"is. A player inside an instance persists their exit anchor (#72), never the ephemeral copy")
+		return ""
+	}
+	return z.id
 }
 
 // dumpStateComponents marshals the ENTITY-scoped content subtree of a character — the

@@ -237,6 +237,26 @@ type ObjectLoader interface {
 // degradation for the storeless/bare boot. target is the resolved room/container the objects belong
 // in (captured now so the post-back doesn't re-resolve).
 func (z *Zone) resetPersistent(r *content.ResetDTO, target *Entity) {
+	// FAIL CLOSED in an instance (#411). This is a durable ITEM DUPE, not a tidiness issue.
+	//
+	// LoadObjects is keyed by the AUTHORED room/container ref, which is identical across every instance of a
+	// template, and persistentDone is per-ZONE so it does not dedup between them. N live instances would each
+	// load the same durable rows and spawn their own live copy of a UNIQUE durable object — which players can
+	// then loot and carry out of the instance into the shared world. The refusal is at RUNTIME (here) rather
+	// than only at load time because the op is content-authored and the instance is runtime-minted: no
+	// load-time check can know a given zone will one day be instanced.
+	//
+	// LOUD, because a builder whose persistent reset silently did nothing in every copy of their dungeon has
+	// no way to discover it. Marked done first so the refusal is logged once at boot, not on every repop tick.
+	if z.isInstance() {
+		if !z.persistentDone[persistentKey(r)] {
+			z.persistentDone[persistentKey(r)] = true
+			z.log.Warn("persistent reset op REFUSED inside a zone instance: durable objects are shared by "+
+				"authored ref across every instance, so loading them here would duplicate them",
+				"op", r.Op, "proto", r.Proto, "room", r.Room, "into", r.Into, "template", z.template)
+		}
+		return
+	}
 	key := persistentKey(r)
 	if z.persistentDone[key] {
 		// Already loaded once (or attempted): a repop tick must never re-spawn a durable object.
@@ -338,6 +358,16 @@ var pulsesPerSecond uint64 = uint64(time.Second / pulseInterval)
 // (idempotent on a full zone). The script is captured by value at build time — no I/O on the tick.
 func (z *Zone) startRepop(resets []content.ResetDTO, resetSecs int) {
 	if z.repopPulse != nil || resetSecs <= 0 || len(resets) == 0 {
+		return
+	}
+	// No timed repop inside an instance (#411). An instance is a single bounded run of its content, and a
+	// template that respawns its boss on the reset timer while the party is still standing in the lair is
+	// farmable: the same instance yields the boss's full loot table every reset_secs, forever, with no
+	// world-level scarcity to bound it. The BOOT reset still runs (buildZone -> runResets, above) — the
+	// dungeon is populated exactly once, which is the instanced semantic. Making this opt-in per content is a
+	// follow-up; the default has to be the safe one.
+	if z.isInstance() {
+		z.log.Debug("timed repop suppressed inside a zone instance", "zone", z.id, "template", z.template)
 		return
 	}
 	stride := uint64(resetSecs) * pulsesPerSecond

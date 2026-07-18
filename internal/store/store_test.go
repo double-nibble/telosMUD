@@ -896,3 +896,59 @@ func TestCurrentContentVersionNoRow(t *testing.T) {
 		t.Fatalf("no content_version row must return ErrNoContentVersion, got %v", err)
 	}
 }
+
+// TestSaveCharacterEmptyZoneRefPreservesTheStoredZone pins the "" contract at the DURABLE sink (#411): an
+// empty ZoneRef means "leave zone_ref alone", never "write SQL NULL over it".
+//
+// The world's only producer of ZoneRef (world.dumpCharacter) returns "" for a player who is inside a
+// runtime-minted zone INSTANCE, whose ephemeral id must never be persisted. RoomRef is NOT empty on that
+// path — an instance hosts its TEMPLATE's authored rooms — so a clearing write leaves the row internally
+// inconsistent: a real room ref with no zone. On reconnect the world's ZoneRef != "" guard is false, it falls
+// back to the home zone, cannot resolve that room there, and start-rooms the player. The ordinary save
+// cadence does it to every dungeon occupant, and so does the drain's flush on every SIGTERM.
+func TestSaveCharacterEmptyZoneRefPreservesTheStoredZone(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	name := "GatedZoneRefChar-" + time.Now().Format("150405.000000")
+	t.Cleanup(func() {
+		_, _ = p.pool.Exec(context.Background(), `DELETE FROM characters WHERE name = $1`, name)
+	})
+
+	// The entrance anchor: where the player was before they stepped into the instance.
+	if _, err := p.CreateCharacter(ctx, name, "midgaard", "midgaard:room:temple"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	snap, found, err := p.LoadCharacter(ctx, name)
+	if err != nil || !found {
+		t.Fatalf("load after create: found=%v err=%v", found, err)
+	}
+
+	// The instance-occupant save: no zone, but a real (template-authored) room.
+	snap.ZoneRef, snap.RoomRef = "", "darkwood:room:lair"
+	if _, ok, err := p.SaveCharacter(ctx, snap); err != nil || !ok {
+		t.Fatalf("save: ok=%v err=%v", ok, err)
+	}
+	reloaded, _, err := p.LoadCharacter(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ZoneRef != "midgaard" {
+		t.Fatalf("an empty ZoneRef wrote SQL NULL over zone_ref (now %q, was midgaard) while room_ref kept %q. "+
+			"The row is a real room with no zone: the reconnect falls back to the home zone, cannot resolve that "+
+			"room there, and start-rooms the player — permanent durable location loss for every instance "+
+			"occupant on every save tick (#411)", reloaded.ZoneRef, reloaded.RoomRef)
+	}
+	if reloaded.RoomRef != "darkwood:room:lair" {
+		t.Fatalf("room_ref = %q, want darkwood:room:lair — the preserve must be zone_ref ONLY", reloaded.RoomRef)
+	}
+
+	// The CONTROL: a real zone change is still written, so "" is the only preserving value.
+	reloaded.ZoneRef, reloaded.RoomRef = "crypt", "crypt:room:entrance"
+	if _, ok, err := p.SaveCharacter(ctx, reloaded); err != nil || !ok {
+		t.Fatalf("save (zone change): ok=%v err=%v", ok, err)
+	}
+	if again, _, _ := p.LoadCharacter(ctx, name); again.ZoneRef != "crypt" {
+		t.Fatalf("a real zone change was not written: zone_ref = %q, want crypt", again.ZoneRef)
+	}
+}

@@ -73,6 +73,22 @@ func (r *Redis) Checkpoint(ctx context.Context, snap world.CharSnapshot) error {
 		StateVersion: snap.StateVersion,
 		State:        snap.State,
 	}
+	// An EMPTY ZoneRef means "leave the stored location alone", never "clear it" — the same contract the
+	// Postgres tier states in its UPDATE (zone_ref = COALESCE(...), internal/store/character.go, #411). The
+	// world's only producer of ZoneRef (dumpCharacter) returns "" for a player inside a runtime-minted zone
+	// INSTANCE, whose ephemeral id must never be persisted; blanking the mirror instead would make THIS tier
+	// the one that loses the location, and it is the tier the login path prefers whenever it is fresher.
+	//
+	// A read-modify-write, not a script: it only runs on the "" path (an instance occupant), so the common
+	// checkpoint stays a single SET. It is no less atomic than the write it guards — a checkpoint is a
+	// last-writer-wins overwrite of the whole value either way — and a read failure degrades to the empty
+	// zone rather than dropping the checkpoint, which is the same "widen the crash window by one field"
+	// outcome the tier already tolerates.
+	if v.ZoneRef == "" {
+		if prev, found, err := r.LoadCheckpoint(ctx, snap.Name); err == nil && found {
+			v.ZoneRef = prev.ZoneRef
+		}
+	}
 	data, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("checkpoint: marshal %q: %w", snap.Name, err)

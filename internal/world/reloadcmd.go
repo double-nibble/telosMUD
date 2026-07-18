@@ -257,11 +257,22 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 	// a removal lands only when the publish below drives the zone-shape reconcile — AFTER this line — so at
 	// validate time the cache is the "before" graph. A target absent from the re-read content but still live
 	// here is one this reload removes. Computed for both a dry run and a real reload.
-	advisories := advisoryReloadRemovals(newReloadScope(full, scoped), func(ref string) bool {
+	scope := newReloadScope(full, scoped)
+	advisories := advisoryReloadRemovals(scope, func(ref string) bool {
 		return r.cache != nil && r.cache.get(ProtoRef(ref)) != nil
 	})
 	for _, a := range advisories {
 		r.log.Warn("reload: advisory — a not-reloaded pack depends on content this reload removes", "detail", a)
+	}
+	// #411: ADVISORY (non-blocking) — a zone being reloaded has live INSTANCES, which are PINNED to the
+	// content they were minted from (reload.go freezes both the shape reconcile and the Lua fan-out for them).
+	// Without this line the freeze is invisible: a builder edits a dungeon, the readout says the reload
+	// succeeded, and the parties currently inside keep playing the old version with nothing to explain why.
+	// Same shape as the #309 advisories above and computed for a dry run too, so `reload --check` answers
+	// "who is mid-run right now" before the edit lands.
+	for _, a := range pinnedInstanceAdvisories(r.shard, scope) {
+		r.log.Warn("reload: advisory — a reloaded zone has live instances, which stay on their minted content", "detail", a)
+		advisories = append(advisories, a)
 	}
 	if checkOnly {
 		// Pre-flight: the content validated, but a dry run deliberately publishes nothing.

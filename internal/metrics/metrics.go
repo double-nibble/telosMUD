@@ -21,6 +21,7 @@ var meter = otel.Meter(scope)
 var (
 	tickLag          metric.Float64Histogram
 	occupancy        metric.Int64Gauge
+	zoneInstances    metric.Int64Gauge
 	framesDropped    metric.Int64Counter
 	streamStalled    metric.Int64Counter
 	gateConns        metric.Int64UpDownCounter
@@ -40,7 +41,13 @@ func init() {
 		metric.WithDescription("Zone heartbeat overrun: how long a pulse's callbacks ran past the 250ms budget"),
 		metric.WithUnit("ms"))
 	occupancy, _ = meter.Int64Gauge("telos.zone.occupancy",
-		metric.WithDescription("Live players in a zone"))
+		metric.WithDescription("Live players in a zone. Labeled by the zone's TEMPLATE, so every runtime-minted "+
+			"instance of a zone (#411) reports onto the template's series rather than minting a new one — an "+
+			"instance id is player-driven and unbounded, which as an attribute is thousands of dead series."))
+	zoneInstances, _ = meter.Int64Gauge("telos.zone.instances",
+		metric.WithDescription("Live runtime-minted zone instances on this shard (#411), labeled by template. "+
+			"This is where instanced load is visible: telos.zone.occupancy deliberately collapses every copy of "+
+			"a template onto one series to keep its attribute set bounded."))
 	framesDropped, _ = meter.Int64Counter("telos.gate.frames_dropped_total",
 		metric.WithDescription("Server frames dropped because a player's outbound buffer was full (slow client)"))
 	streamStalled, _ = meter.Int64Counter("telos.world.stream_stalled_total",
@@ -93,6 +100,14 @@ func RecordTickLag(ctx context.Context, zone string, ms float64) {
 func SetOccupancy(ctx context.Context, zone string, n int64) {
 	if occupancy != nil {
 		occupancy.Record(ctx, n, metric.WithAttributes(attribute.String("zone", zone)))
+	}
+}
+
+// SetInstances reports how many runtime-minted zone instances (#411) are live on this shard. The `template`
+// attribute is the CONTENT zone they were minted from — bounded by the pack, unlike an instance id.
+func SetInstances(ctx context.Context, n int64, template string) {
+	if zoneInstances != nil {
+		zoneInstances.Record(ctx, n, metric.WithAttributes(attribute.String("template", template)))
 	}
 }
 

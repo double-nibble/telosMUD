@@ -757,7 +757,7 @@ func (z *Zone) Run(ctx context.Context) {
 			// scale signal. The Go ticker coalesces missed ticks, so a slow zone shows a widening gap here.
 			now := time.Now()
 			if lag := now.Sub(lastTick) - pulseInterval; lag > 0 {
-				metrics.RecordTickLag(ctx, z.id, float64(lag.Microseconds())/1000.0)
+				metrics.RecordTickLag(ctx, z.metricZone(), float64(lag.Microseconds())/1000.0)
 			}
 			lastTick = now
 			z.pulses.tick()
@@ -1022,7 +1022,7 @@ func (z *Zone) join(s *session, room ProtoRef) {
 	// entity + the loaded comms state. A disabled bus is a clean no-op.
 	z.publishCommsConfig(s)
 	z.log.Debug("player joined", "player", s.character, "room", r.proto, "population", len(z.players))
-	metrics.SetOccupancy(context.Background(), z.id, int64(len(z.players)))
+	metrics.SetOccupancy(context.Background(), z.metricZone(), int64(len(z.players)))
 }
 
 // resolveRoom returns the room entity for the given ProtoRef, falling back to the start
@@ -1108,7 +1108,7 @@ func (z *Zone) leave(id string) {
 	// the durable stream for their next host to drain (never delivered to a gone socket) (8.5).
 	z.stopTellConsumer(id)
 	z.log.Debug("player left", "player", id, "population", len(z.players))
-	metrics.SetOccupancy(context.Background(), z.id, int64(len(z.players)))
+	metrics.SetOccupancy(context.Background(), z.metricZone(), int64(len(z.players)))
 }
 
 // claimInboundTransfer takes the in-flight claim that makes this zone's quiescence check honest: the source
@@ -2234,6 +2234,26 @@ func (z *Zone) dropFinalFlush(id string) (CharSnapshot, bool) {
 // Readable from any goroutine (all three are atomics).
 func (z *Zone) quiescent() bool {
 	return z.pop.Load() == 0 && z.stashed.Load() == 0 && z.incoming.Load() == 0
+}
+
+// metricZone is the zone label for an OTel attribute — the TEMPLATE, never the id (#411).
+//
+// Logs and metrics deliberately want OPPOSITE answers here. The zone LOGGER keeps the instance id (and adds
+// `template=`; see newInstanceZone), because an operator reading a log needs to know which copy misbehaved.
+// A metric must not: an instance id is minted per dungeon run, so as an attribute it is unbounded,
+// player-driven cardinality — thousands of dead time series that never get another sample.
+//
+// The cost is that every live copy of a template reports occupancy onto ONE series, so the gauge reads as
+// "the last copy that reported" rather than a sum. That is accepted: per-instance occupancy is not a signal
+// anyone alerts on, and the aggregate that IS a signal — how many instances exist — has its own gauge
+// (metrics.SetInstances), which is where instance load is visible.
+func (z *Zone) metricZone() string { return z.template }
+
+// reseedCombat mixes salt into the zone's combat RNG. Construction-time only, before the actor starts —
+// combatRand is zone-goroutine-owned. See newInstanceZone for why an instance re-seeds at all when newZone
+// already seeds this stream from entropy.
+func (z *Zone) reseedCombat(salt int64) {
+	z.combatRand = rand.New(rand.NewSource(rand.Int63() ^ salt)) //nolint:gosec // gameplay roll, not security
 }
 
 // resolveHandoffPid recovers a handed-off player's durable PersistID BY NAME when the handoff
