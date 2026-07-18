@@ -348,17 +348,16 @@ func (s *Shard) BeginDrain(ctx context.Context, choose TargetChooser, deadline t
 		z.post(drainZoneMsg{})
 	}
 
-	// 2. Wait until every zone has emptied (players redirected) or the deadline elapses.
+	// 2. Wait until every zone has QUIESCED (players redirected) or the deadline elapses. Quiescence, not
+	// `pop == 0`: a zone can read empty while it still owes a parked logout flush, or while a player is in
+	// flight to it on the intra-shard transfer path (#409) — see allZonesQuiescent and Zone.quiescent. This
+	// matches what RebalanceZone, the single-zone analog, has always waited for.
 	dl := time.After(deadline)
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
 wait:
 	for {
-		remaining := int64(0)
-		for _, z := range zones {
-			remaining += z.pop.Load()
-		}
-		if remaining == 0 {
+		if allZonesQuiescent(zones) {
 			break wait
 		}
 		select {
@@ -418,6 +417,26 @@ wait:
 	metrics.DrainReclaimed(ctx, res.ReclaimedInfra, "infra")
 	metrics.DrainReclaimed(ctx, res.ReclaimedClient, "client")
 	return res, nil
+}
+
+// allZonesQuiescent reports whether every zone in zs has nothing left outstanding — no resident player, no
+// parked logout flush, and no intra-shard transfer in flight toward it (Zone.quiescent). It is BeginDrain's
+// wait-until-empty predicate, factored out so the three counters that make up "empty" can be pinned by a
+// table-driven test rather than only through a timing-sensitive drain.
+//
+// `pop == 0` alone was the old predicate and is NOT emptiness. A player walking between two zones of THIS
+// shard has already left the source's players map and only bumps the destination's pop when the destination
+// dequeues their transferInMsg; for the width of that queue hop both zones read pop 0 while a live session is
+// in flight (#409). Concluding "drained" there lets the durable flush + straggler reclaim in step 3 be
+// ordered AHEAD of the arrival, so the player lands in a zone that has already been flushed and disconnected
+// and is then dropped with the process — uncounted, unflushed. `stashed` is the same trap one hop back.
+func allZonesQuiescent(zs []*Zone) bool {
+	for _, z := range zs {
+		if !z.quiescent() {
+			return false
+		}
+	}
+	return true
 }
 
 // isDraining reports whether a graceful drain is in progress (fresh logins are refused). Guarded by mu.

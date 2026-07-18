@@ -81,6 +81,19 @@ type Zone struct {
 	// pop == 0 is NOT "this zone is empty" — see quiescent().
 	stashed atomic.Int64
 
+	// incoming counts players who have LEFT a source zone on the intra-shard transfer path but whose
+	// transferInMsg this zone has not dequeued yet. transferOut removes the player from the source and
+	// hands them over through the inbox, so for the width of that queue hop the session belongs to
+	// NEITHER zone's players map and pop is 0 on both sides. Without this counter UnhostZone can pass its
+	// quiescence check in exactly that window, tear the destination down, and abandon the post — leaving
+	// the session attached to no room, owned by no zone, with the source's forwarding entry pointing at a
+	// stopped actor (#409). Claimed by the SOURCE atomically with resolving this zone as a live host
+	// (Shard.claimTransferTarget), released by transferIn on every path (including its no-rooms rejection).
+	//
+	// Same shape as pop and stashed and the same lesson as #288: pop == 0 is not emptiness — see
+	// quiescent(). Off-goroutine writer (the source zone) + destination-goroutine writer, hence atomic.
+	incoming atomic.Int64
+
 	// commsRepublishArmed coalesces a burst of channel_def reloads into ONE republish per zone (#269).
 	// republishAllComms recomputes EVERY player's FULL hear-set and is ref-INDEPENDENT, so K channel edits
 	// produce K identical republishes where one suffices. The off-goroutine reloader CAS-arms this before
@@ -1085,12 +1098,50 @@ func (z *Zone) leave(id string) {
 	metrics.SetOccupancy(context.Background(), z.id, int64(len(z.players)))
 }
 
-// transferIn receives a player handed over from a sibling zone on the same shard (the
-// destination side of an intra-shard cross-zone walk; the source side is Zone.move).
+// claimInboundTransfer takes the in-flight claim that makes this zone's quiescence check honest: the source
+// has already dropped the player from its own players map, so between that drop and this zone dequeueing the
+// handover the session is in NO zone's map and pop reads 0 on both sides. UnhostZone passing its check in that
+// window tears this zone down and abandons the post, leaving a live session attached to no room and owned by
+// no zone (#409). transferIn releases the claim unconditionally.
+//
+// It is NOT enough to take the claim just before the send. Taking it must be ATOMIC with resolving this zone
+// as a live host, which is why the shard-hosted path goes through Shard.claimTransferTarget (one hold of
+// s.mu, the same mutex UnhostZone checks quiescence under) and this bare form exists only for a zone the
+// caller already holds outside any shard — a test harness, or a placement into a zone that cannot be
+// concurrently unhosted. A claim taken on an already-torn-down zone is worse than none: `post` abandons its
+// send on z.dead, so the handover is dropped AND the counter never comes back down.
+func (z *Zone) claimInboundTransfer() {
+	z.incoming.Add(1)
+}
+
+// postTransferIn hands a session to this zone on the intra-shard transfer path. The caller MUST already hold
+// an in-flight claim for it (Shard.claimTransferTarget, or claimInboundTransfer for an unhostable zone):
+// transferIn releases one unconditionally, so a producer that skipped the claim drives the counter negative
+// and wedges the zone against ever being unhosted or drained.
+func (z *Zone) postTransferIn(s *session, room ProtoRef) {
+	z.post(transferInMsg{s: s, room: room})
+}
+
+// transferIn receives a player handed over from a sibling zone on the same shard (the destination side of an
+// intra-shard cross-zone walk; the source side is Zone.move).
+//
 // It takes ownership of the existing player struct — same out channel, same appliedSeq,
 // no snapshot, no epoch bump — registers it here, points its currentZone at this zone so
 // the reader loop now routes input to us, announces the arrival, and shows the room.
 func (z *Zone) transferIn(m transferInMsg) {
+	// Release the in-flight claim the source took on our behalf (#409). Deferred so it covers the no-rooms
+	// rejection below and a recovered panic too: leak it and this zone can never be unhosted again.
+	//
+	// A NEGATIVE count is the same wedge from the other side — permanently non-quiescent — so a producer that
+	// posted without claiming is worth saying out loud rather than leaving as a silent hang. It cannot happen
+	// through claimTransferTarget; it is the failure mode of a future path that posts a transferInMsg directly.
+	defer func() {
+		if n := z.incoming.Add(-1); n < 0 {
+			z.log.Error("BUG: inbound-transfer claim underflow — a transferInMsg was posted without claiming; "+
+				"this zone can no longer reach quiescence and will never be unhosted or drained",
+				"zone", z.id, "incoming", n)
+		}
+	}()
 	s := m.s
 	r := z.resolveRoom(m.room)
 	if r == nil {
@@ -2160,11 +2211,16 @@ func (z *Zone) dropFinalFlush(id string) (CharSnapshot, bool) {
 // has leave() park their final snapshot in pendingFinalFlush and then leave z.players, so pop drops to zero
 // while a durable write is still owed. The createdMsg that replays it is delivered to THIS zone's inbox; stop
 // the actor first and that write is silently lost, along with everything the player did inside the create
-// window. Both counters must be zero before a zone can be torn down or considered drained.
+// window.
 //
-// Readable from any goroutine (both are atomics).
+// `incoming` is the same trap one hop out: a player walking here on the intra-shard transfer path has already
+// been removed from the SOURCE's players map, and only bumps our pop when we dequeue their transferInMsg. For
+// the width of that queue hop they are in no zone's map at all, so pop is 0 on both sides while a live session
+// is in flight (#409). All three counters must be zero before a zone can be torn down or considered drained.
+//
+// Readable from any goroutine (all three are atomics).
 func (z *Zone) quiescent() bool {
-	return z.pop.Load() == 0 && z.stashed.Load() == 0
+	return z.pop.Load() == 0 && z.stashed.Load() == 0 && z.incoming.Load() == 0
 }
 
 // resolveHandoffPid recovers a handed-off player's durable PersistID BY NAME when the handoff

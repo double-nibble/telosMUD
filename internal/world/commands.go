@@ -525,8 +525,12 @@ func (z *Zone) move(s *session, dir string) bool {
 	// also hosts. Transfer the player in-process — no handoff, no snapshot, no epoch
 	// bump, no directory change, no gate re-dial. The session keeps the same out channel
 	// and appliedSeq. transferOut hands the session+entity to dest, so we release ownership.
+	// Resolve AND claim the destination in one hold of the shard mutex (#409): a bare zoneByID here leaves a
+	// window in which a concurrent UnhostZone tears the destination down before transferOut's handover is
+	// claimed, dropping the handover on a dead inbox. A nil claim means the zone is no longer hosted here, so
+	// this falls through to the cross-shard branch with nothing yet mutated.
 	if destZone != "" && destZone != z.id && z.shard != nil {
-		if dest := z.shard.zoneByID(destZone); dest != nil {
+		if dest := z.shard.claimTransferTarget(destZone); dest != nil {
 			z.transferOut(s, dest, destRoom, dir, from)
 			return true
 		}
@@ -616,6 +620,17 @@ func (z *Zone) move(s *session, dir string) bool {
 // goroutine touches the session/entity. The brief overlap is bounded by handing them off
 // through the inbox, never by sharing them across two live owners.
 func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string, _ *Entity) {
+	// Own the claim move() took on dest, so it is released on EVERY exit from this function and not only the
+	// one that reaches the send (#409). Only transferIn releases a claim otherwise, and it never runs if we
+	// leave without posting — a panic below is recovered by dispatchSafe/handle, which run no compensator. A
+	// leaked claim is permanent: dest can never be unhosted or rebalanced again, and every later BeginDrain on
+	// this process burns its whole deadline waiting for a quiescence that will never come.
+	posted := false
+	defer func() {
+		if !posted {
+			dest.incoming.Add(-1)
+		}
+	}()
 	// Combat exclusion is ENFORCED in move() (refuses while posFighting), so a fighting player never
 	// reaches here. disengage anyway, BEFORE detaching from the room: no `fighting` pointer or
 	// posFighting may cross to dest's goroutine (the transferred entity would otherwise carry a SOURCE-
@@ -630,7 +645,10 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, dir string
 	z.forwarding[s.character] = dest
 	z.log.Debug("intra-shard transfer out", "player", s.character,
 		"from_zone", z.id, "to_zone", dest.id, "room", destRoom)
-	dest.post(transferInMsg{s: s, room: destRoom})
+	// The claim on dest was taken atomically with resolving it (claimTransferTarget, #409); from here it is
+	// transferIn's to release on every path, so disarm our compensator.
+	posted = true
+	dest.postTransferIn(s, destRoom)
 }
 
 // who lists every player currently online in the zone (the zone-local fallback when presence is
