@@ -587,13 +587,34 @@ func guardCrossPlayerWrite(c *effectCtx, target *Entity) bool {
 // The swing path no longer re-reads the vital to compute the applied amount (that read corrupts if death/
 // respawn fires mid-call); it reads the returned int / c.lastDamage instead. Returns the damage actually
 // applied (0 on a gated block / a non-living target). Single-writer: zone goroutine.
-func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType string) int {
+// resource selects WHICH pool the blow lands on (#71 multi-vital): an explicit resource ref routes the
+// damage to that pool; "" routes to the target's primary vital (a swing / untyped damage — the legacy
+// behavior). A depletion drives death only when the hit pool is VITAL (vitalDepleted), so a blow to a
+// non-vital pool (a stagger/mana bar) subtracts without killing.
+func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource string) int {
 	c.lastDamage = 0
 	if target == nil || target.living == nil {
 		return 0
 	}
-	// THE GATE, first — before any state is touched. A blocked harmful op is a clean no-op.
+	// THE GATE, first — before any state is touched. A blocked harmful op is a clean no-op. (The gate also
+	// drops the ATTACKER's spawn-protection shield on the attempt, #394, so the immunity discard below
+	// short-circuits the OUTCOME only, never the attempt.)
 	if !guardHarmful(c, target) {
+		return 0
+	}
+	// Resolve WHICH vital/resource pool this blow hits (#71). An explicit `resource` routes there; empty
+	// falls back to the primary vital. A NAMED pool the target has no capacity for (derived max <= 0 — a
+	// mindless construct with no "sanity") is NATURAL IMMUNITY: discard here, before mitigation/reaction/
+	// threat, exactly like a fully-resisted hit — never write its current negative (which would read as
+	// depleted and, for a vital, instant-kill). The default (resource == "") path is unguarded to keep the
+	// legacy swing/DoT behavior byte-for-byte; the checkpoint's vitalDepleted still gates on max > 0.
+	pool := resource
+	if pool == "" {
+		pool = vitalResource(target)
+	}
+	if resource != "" && resourceMax(target, pool) <= 0 {
+		c.z.log.Debug("deal_damage: target immune (no capacity in pool); discarded",
+			"target", target.short, "pool", pool)
 		return 0
 	}
 	dmg := mitigate(target, raw, dmgType)
@@ -609,18 +630,19 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType string) int {
 	// reaction threads THIS ctx's eventBudget (T12 invariant 3) so an OnDamageTaken→reaction→damage loop
 	// is bounded. Observe-then-recheck: we re-read the recorded mutations here and apply only what the
 	// checkpoint permits ("amount" is the sole modify field; concentration's cancelAffect is dropped).
-	if dmg = c.z.applyDamageReaction(c, target, dmg, raw, dmgType); dmg <= 0 {
+	if dmg = c.z.applyDamageReaction(c, target, dmg, raw, dmgType, pool); dmg <= 0 {
 		c.z.log.Debug("deal_damage fully negated by an OnDamageTaken reaction", "target", target.short)
 		return 0
 	}
-	// Apply to the target's vital resource pool (the first vital resource — hp in the demo). The pool
-	// clamps its current at 0 (resources.go); the depletion checkpoint below turns a 0-crossing into death.
-	pool := vitalResource(target)
+	// A vital-less target (no explicit resource routed the blow, and the target has no primary vital)
+	// takes no pool write — discard but report the mitigated amount (legacy behavior for a bare entity).
 	if pool == "" {
 		c.z.log.Debug("deal_damage: target has no vital resource; damage discarded", "target", target.short)
 		c.lastDamage = dmg
 		return dmg
 	}
+	// Apply to the resolved pool. The pool clamps its current at 0 (resources.go); the depletion
+	// checkpoint below turns a 0-crossing into death when (and only when) the pool is a VITAL resource.
 	cur := resourceCurrent(target, pool)
 	setResourceCurrent(target, pool, cur-dmg)
 	c.lastDamage = dmg
@@ -651,13 +673,14 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType string) int {
 		c.z.fireEvent(c, evOnHit, src, target, float64(dmg))
 	}
 
-	// --- Depletion checkpoint (6.5, the uniform death seam): the applied damage emptied the vital pool ->
-	// run the content on_depleted hook (which may CANCEL death by reviving the victim) then die(). source
-	// is the killer attribution (nil for a sourceless death — no OnKill subject). Idempotent via the
-	// posDead latch (onVitalDepleted/die). Shares this ctx's budget/depth so a death inside an event
-	// cascade stays bounded. resourceCurrent already clamped at 0; <= 0 is the depleted test.
-	if resourceCurrent(target, pool) <= 0 {
-		c.z.onVitalDepleted(target, src, c)
+	// --- Depletion checkpoint (6.5, the uniform death seam): the applied damage emptied a VITAL pool ->
+	// run that pool's on_depleted hook (which may CANCEL death by reviving the victim) then die(). Death
+	// keys on vitalDepleted (the pool must be vital AND have max > 0), so damage to a non-vital pool is
+	// never lethal and a 0-max pool can never trigger a corpse. source is the killer attribution (nil for
+	// a sourceless death — no OnKill subject). Idempotent via the posDead latch (onVitalDepleted/die).
+	// Shares this ctx's budget/depth so a death inside an event cascade stays bounded.
+	if vitalDepleted(target, pool) {
+		c.z.onVitalDepleted(target, src, pool, c)
 	}
 	return dmg
 }
@@ -715,30 +738,53 @@ func applyDebuff(c *effectCtx, target *Entity, affectRef string, opts attachOpts
 	return true
 }
 
-// vitalResource returns the ref of the target's content-defined VITAL resource (hp in the demo), or ""
-// if none. The shared mitigation pipeline subtracts damage from it. The pick is DETERMINISTIC — the
-// lowest ref by sort order among the vital resources — so a pack that (against the convention) defines
-// more than one vital still resolves the same pool every time, not whichever Go's randomized map
-// iteration yields first. Content convention is ONE vital; lintVitalResources warns at load on >1.
-// Reads the registry (lock-free atomic.Load).
+// vitalResource returns the ref of the target's PRIMARY (default-damage) vital resource (hp in the
+// demo), or "" if the target has no vital at all. Unrouted damage — a melee swing, a deal_damage with
+// no explicit `resource` — subtracts from this pool. The pick is DETERMINISTIC: the vital flagged
+// `primary` wins (the lowest-ref one if, against convention, several are); absent any primary flag it
+// falls back to the lowest ref by sort order, so the choice never depends on Go's randomized map
+// iteration. lintVitalResources nudges an author to designate a primary once >1 vital exists. Reads the
+// registry (lock-free atomic.Load).
 //
-// MULTI-VITAL UNSUPPORTED (latent flag, NOT this slice): the 6.5 death seam damages and tests depletion
-// against THIS single lowest-ref pool (dealDamage's checkpoint) while the cancel re-check uses
-// vitalCurrent — both collapse to the same lowest-ref vital here, so they cannot disagree TODAY. But if
-// content ever marks two resources `vital`, only the lowest-ref pool damages/kills and the other is dead
-// config (a target could sit at 0 in a higher-ref vital and never die). Multi-vital is unsupported; a
-// real "death when ANY/ALL vitals deplete" policy is a future design decision, not a bug here.
+// MULTI-VITAL (#71): a pack may mark more than one resource `vital`; each is INDEPENDENTLY lethal —
+// deal_damage can route to any of them via `resource`, and depleting any vital drives death at the
+// dealDamage checkpoint (see vitalDepleted). This function only resolves the DEFAULT pool for unrouted
+// damage; the checkpoint and the death seam operate on whichever pool a given blow actually hit.
 func vitalResource(e *Entity) string {
 	if e == nil || e.zone == nil {
 		return ""
 	}
-	chosen := ""
+	lowest, primary := "", ""
 	for ref, def := range e.zone.resourceDefs().table() {
-		if def.vital && (chosen == "" || ref < chosen) {
-			chosen = ref
+		if !def.vital {
+			continue
+		}
+		if lowest == "" || ref < lowest {
+			lowest = ref
+		}
+		if def.primary && (primary == "" || ref < primary) {
+			primary = ref
 		}
 	}
-	return chosen
+	if primary != "" {
+		return primary
+	}
+	return lowest
+}
+
+// vitalDepleted reports whether `pool` is a VITAL resource on `e` that has bottomed out — the exact
+// predicate the death seam keys on (#71). It is TRUE only when the pool's def is `vital`, its derived
+// max is > 0 (a 0-max pool is natural immunity, NOT a corpse-in-waiting — this is the structural guard
+// that a mislabeled or capacity-less pool can never trigger death), and its current is <= 0. Used at
+// BOTH the dealDamage depletion checkpoint and onVitalDepleted's cancel re-check so the two can never
+// disagree about "is this death real?" A non-vital pool (mana, a stagger bar) can be damaged to 0 but
+// is never lethal here. Zone-goroutine read (registry atomic.Load + resource reads).
+func vitalDepleted(e *Entity, pool string) bool {
+	if e == nil || e.zone == nil || pool == "" {
+		return false
+	}
+	def := e.zone.resourceDefs().get(pool)
+	return def != nil && def.vital && resourceMax(e, pool) > 0 && resourceCurrent(e, pool) <= 0
 }
 
 // isPlayer reports whether e is a player-controlled entity (the gate's "is this a PvP target?"

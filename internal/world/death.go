@@ -101,12 +101,15 @@ func (co *CorpseOwner) looterIsOwner(s *session) bool {
 // nil/empty op-list => nothing runs (engine default death). A hook that exhausts the depth/width budget
 // simply does not run — the victim then dies the engine-default way (no revive, since the cancel can only
 // happen if the hook actually ran and raised the vital).
-func (z *Zone) onVitalDepleted(victim, killer *Entity, parent *effectCtx) {
+func (z *Zone) onVitalDepleted(victim, killer *Entity, pool string, parent *effectCtx) {
 	if victim == nil || victim.living == nil || position(victim) == posDead {
 		return
 	}
 	gen := deathGen(victim)
-	if pool := vitalResource(victim); pool != "" {
+	// Run the on_depleted hook of the pool that ACTUALLY depleted (#71) — with multiple vitals each carries
+	// its own hook, so a sanity-death must run sanity's last-gasp, not hp's. pool is the routed pool from
+	// the dealDamage checkpoint (never "" — the checkpoint only fires for a vital pool it just emptied).
+	if pool != "" {
 		if def := z.resourceDefs().get(pool); def != nil && len(def.onDepleted) > 0 {
 			dc := z.deathCtx(victim, killer, parent)
 			z.runDeathHook(dc, def.onDepleted, victim)
@@ -127,11 +130,13 @@ func (z *Zone) onVitalDepleted(victim, killer *Entity, parent *effectCtx) {
 	if deathGen(victim) != gen {
 		return
 	}
-	// THE CANCEL RE-CHECK: after any on_depleted hook ran, re-read the vital. A hook that revived the
-	// victim above 0 (death-ward / second wind) cancels the death declaratively — abort cleanly with no
-	// die/corpse/respawn and the posDead latch left unset (the victim fights on at its revived hp). A
-	// vital-less victim reads the 1<<30 sentinel (vitalCurrent) and so is never "depleted" here either.
-	if vitalCurrent(victim) > 0 {
+	// THE CANCEL RE-CHECK: after any on_depleted hook ran, re-read THE POOL THAT DEPLETED. A hook that
+	// revived the victim above 0 in that pool (death-ward / second wind) cancels the death declaratively —
+	// abort cleanly with no die/corpse/respawn and the posDead latch left unset (the victim fights on at
+	// its revived level). The check is POOL-LOCAL (#71): with multiple vitals, a sanity-death is cancelled
+	// by reviving sanity, not by hp being full. vitalDepleted also re-asserts the pool is vital with max >
+	// 0, so a 0-max pool can never fall through to die() even if this seam were reached with one.
+	if !vitalDepleted(victim, pool) {
 		return
 	}
 	z.die(victim, killer, parent)

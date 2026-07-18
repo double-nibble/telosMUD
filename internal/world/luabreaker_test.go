@@ -271,7 +271,7 @@ func TestSpawnCensusDecrementsOnDeath(t *testing.T) {
 	}
 	setResourceCurrent(goblin, "hp", 1)
 	c := &effectCtx{z: z, actor: goblin, source: goblin, rng: rt.rng}
-	dealDamage(c, goblin, 100, "force") // kill -> makeCorpse -> dropLuaSpawn
+	dealDamage(c, goblin, 100, "force", "") // kill -> makeCorpse -> dropLuaSpawn
 	if rt.luaSpawnsLive != 0 {
 		t.Fatalf("live spawns after the Lua-spawned mob died = %d, want 0 (census decremented)", rt.luaSpawnsLive)
 	}

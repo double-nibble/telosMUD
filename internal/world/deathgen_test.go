@@ -303,7 +303,7 @@ func TestDeathGenerationIsInstanceOwnedNotProtoShared(t *testing.T) {
 // TestOnVitalDepletedDoesNotDieTwice is a real dupe bug the death generation exposed and fixes. An
 // on_depleted hook that re-deals lethal damage re-enters onVitalDepleted recursively. The INNERMOST frame
 // (the one the depth cap stops from running a hook) reaches die() and corpses the mob. As the stack
-// unwound, every outer frame still saw vitalCurrent == 0 — a corpsed mob's resCur is never restored — and
+// unwound, every outer frame still saw the vital at 0 — a corpsed mob's resCur is never restored — and
 // called die() AGAIN: a second corpse, a second OnKill, and a second resolveLoot. That last one is an item
 // dupe. The entry-time posDead check cannot help: those frames were already inside.
 //

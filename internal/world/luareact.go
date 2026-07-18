@@ -525,7 +525,7 @@ func (z *Zone) fireToHitReaction(c *effectCtx, attacker, target *Entity) float64
 // It threads `c` (the SAME eventBudget — T12 invariant 3) so an OnDamageTaken→reaction→damage loop
 // is bounded by the shared cascade budget. `raw`/`dmgType` are the PRE-mitigation blow (needed so a
 // redirect re-mitigates against newTarget's resistances, not the original target's). Zone goroutine.
-func (z *Zone) applyDamageReaction(c *effectCtx, target *Entity, dmg int, raw float64, dmgType string) int {
+func (z *Zone) applyDamageReaction(c *effectCtx, target *Entity, dmg int, raw float64, dmgType, resource string) int {
 	if z == nil || z.lua == nil || target == nil {
 		return dmg
 	}
@@ -546,7 +546,7 @@ func (z *Zone) applyDamageReaction(c *effectCtx, target *Entity, dmg int, raw fl
 	// applied here — the subject did NOT take the damage (it redirected away), so its concentration is
 	// not jeopardized by a blow it never absorbed.
 	if r.newTarget != nil {
-		z.applyDamageRedirect(c, target, r, raw, dmgType)
+		z.applyDamageRedirect(c, target, r, raw, dmgType, resource)
 		return 0
 	}
 
@@ -603,7 +603,7 @@ func (z *Zone) applyDamageReaction(c *effectCtx, target *Entity, dmg int, raw fl
 // no direct entity-state write happens here (the binding-funnel lint stays green). The ORIGINAL harm
 // originator (c.source / c.actor) is preserved as the attribution so threat/OnHit/death attribute to the
 // real attacker, not the redirecting subject. Zone goroutine.
-func (z *Zone) applyDamageRedirect(c *effectCtx, origTarget *Entity, r *reaction, raw float64, dmgType string) {
+func (z *Zone) applyDamageRedirect(c *effectCtx, origTarget *Entity, r *reaction, raw float64, dmgType, resource string) {
 	newTarget := r.newTarget
 	if newTarget == nil || newTarget.living == nil {
 		return
@@ -623,8 +623,10 @@ func (z *Zone) applyDamageRedirect(c *effectCtx, origTarget *Entity, r *reaction
 		depth: depthOf(r.c, c), eventBudget: budgetOf(r.c, c),
 	}
 	z.log.Debug("rx:replace_target redirect: re-running blow against new target",
-		"orig", origTarget.short, "new", newTarget.short, "raw", raw, "type", dmgType)
-	_ = dealDamage(rc, newTarget, raw, dmgType)
+		"orig", origTarget.short, "new", newTarget.short, "raw", raw, "type", dmgType, "resource", resource)
+	// Carry the ORIGINAL blow's routed pool ref (#71) so a redirected sanity-strike lands on the new
+	// target's sanity, not its hp — re-resolved (and immunity-checked) against the new target inside dealDamage.
+	_ = dealDamage(rc, newTarget, raw, dmgType, resource)
 }
 
 // depthOf returns the firing reaction ctx's depth when present (so the redirect re-enters one level

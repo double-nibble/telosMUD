@@ -414,6 +414,10 @@ type resourceBody struct {
 	OnDepleted        []any             `json:"on_depleted,omitempty"`     // [G-D] death hook (6.3b)
 	PerRound          bool              `json:"per_round,omitempty"`       // [G9] per-round reaction budget (6.4b)
 	Gauge             bool              `json:"gauge,omitempty"`           // #50: player-facing HUD pool (Char.Vitals filter)
+	// Primary is the #71 default-damage-pool flag. It rides the schemaless body JSONB so adding it needs no
+	// migration; without persisting it a DB round-trip would drop a multi-vital pack's primary designation
+	// and default damage would fall back to the arbitrary lowest-ref pool (the def-table field-drop class).
+	Primary bool `json:"primary,omitempty"`
 }
 
 type dmgBody struct {
@@ -667,6 +671,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 			r.OnEventLua, r.OnReactionLua = b.OnEventLua, b.OnReactionLua
 			r.PerRound = b.PerRound
 			r.Gauge = b.Gauge
+			r.Primary = b.Primary
 		}
 		pp := pack(pk)
 		pp.Resources = append(pp.Resources, r)

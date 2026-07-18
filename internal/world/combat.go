@@ -630,16 +630,6 @@ func avoidanceSucceeded(res checkResult) bool {
 	}
 }
 
-// vitalCurrent returns the current value of an entity's first vital resource (hp), or a large sentinel
-// when it has none (so a "depleted?" test on a vital-less entity is never true). Zone-goroutine read.
-func vitalCurrent(e *Entity) int {
-	pool := vitalResource(e)
-	if pool == "" {
-		return 1 << 30 // no vital pool: never "depleted"
-	}
-	return resourceCurrent(e, pool)
-}
-
 // hitOrCrit picks the combat-message key for a landed swing.
 func hitOrCrit(crit bool) string {
 	if crit {

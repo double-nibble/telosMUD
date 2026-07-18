@@ -682,12 +682,18 @@ type FormulaNodeDTO = any
 // DERIVED attribute that caps the pool (so gear/affects that raise max_hp flow through derivation);
 // the engine holds `current`. vital + on_depleted is how "hp at 0 = death" is content (5.2/combat).
 type ResourceDTO struct {
-	Ref               string `json:"ref" yaml:"ref"`
-	DisplayName       string `json:"display_name" yaml:"display_name"`
-	MaxAttr           string `json:"max_attr" yaml:"max_attr"`
-	Vital             bool   `json:"vital" yaml:"vital"`
-	Regen             int    `json:"regen" yaml:"regen"`                           // per-tick flat regen (reserved; ticks ride 5.2)
-	DepletedThreshold int    `json:"depleted_threshold" yaml:"depleted_threshold"` // reserved (vital depletion, 5.2)
+	Ref         string `json:"ref" yaml:"ref"`
+	DisplayName string `json:"display_name" yaml:"display_name"`
+	MaxAttr     string `json:"max_attr" yaml:"max_attr"`
+	Vital       bool   `json:"vital" yaml:"vital"`
+	// Primary designates THIS vital as the default-damage pool — the one unrouted damage (a melee swing,
+	// a deal_damage with no `resource`) subtracts from (#71 multi-vital). It only matters when a pack
+	// defines MORE THAN ONE vital: without it the engine falls back to the lowest-ref vital by sort order,
+	// which is an arbitrary (and footgun-prone: "blood" sorts before "hp") pick. With exactly one vital it
+	// is redundant. lintVitalResources warns when >1 vital exists and none is flagged primary.
+	Primary           bool `json:"primary" yaml:"primary"`
+	Regen             int  `json:"regen" yaml:"regen"`                           // per-tick flat regen (reserved; ticks ride 5.2)
+	DepletedThreshold int  `json:"depleted_threshold" yaml:"depleted_threshold"` // reserved (vital depletion, 5.2)
 	// RegenInCombat lets a resource keep regenerating while its owner is FIGHTING. Default false: the
 	// engine PAUSES passive regen for an entity in combat (the classic Diku "no rest mid-fight" rule), so
 	// a mob's hp regen does not claw back a fresh player's swings round after round. A pack that wants
@@ -713,11 +719,12 @@ type ResourceDTO struct {
 	// modify/replace_target/consume_resource). Distinct from OnEventLua so a dual-fired checkpoint never
 	// runs one handler twice.
 	OnReactionLua map[string]string `json:"on_reaction_lua" yaml:"on_reaction_lua"`
-	// OnDepleted is the op-list the engine runs when a VITAL resource hits 0 — the [G-D] death hook
+	// OnDepleted is the op-list the engine runs when THIS VITAL resource hits 0 — the [G-D] death hook
 	// (Phase 6.3b). It runs ON the dying entity (the victim is $actor) BEFORE the engine's die() drops
 	// combat and builds the corpse, so content can narrate or fire a last-gasp effect. An empty/absent
 	// list means "default death" (the engine still runs die()); the op-list is additive flavor, not a
-	// replacement for the engine death machinery. Only meaningful on a vital resource.
+	// replacement for the engine death machinery. Only meaningful on a vital resource. With multiple vital
+	// pools (#71) each vital carries its OWN on_depleted, run for the pool that actually depleted.
 	OnDepleted []any `json:"on_depleted" yaml:"on_depleted"`
 }
 

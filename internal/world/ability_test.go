@@ -109,7 +109,7 @@ func TestOpDealDamageThroughMitigation(t *testing.T) {
 	setResourceCurrent(mob, "hp", 100)
 	c := seededCtx(z, caster.entity, mob, dispHarmful)
 	// fire is neutral (×1.0), no soak: a 20 raw deals 20.
-	dealDamage(c, mob, 20, "fire")
+	dealDamage(c, mob, 20, "fire", "")
 	if got := resourceCurrent(mob, "hp"); got != 80 {
 		t.Fatalf("fire 20 -> hp %d, want 80", got)
 	}
@@ -376,7 +376,7 @@ func TestPvPGuardBlocksHarmfulOpOnDirectInvoke(t *testing.T) {
 	c := seededCtx(z, caster.entity, victim.entity, dispHarmful)
 
 	// deal_damage directly — NO step-4 ran. The shared mitigation pipeline's guard must block it.
-	if dealt := dealDamage(c, victim.entity, 50, "fire"); dealt != 0 {
+	if dealt := dealDamage(c, victim.entity, 50, "fire", ""); dealt != 0 {
 		t.Fatalf("direct deal_damage on a protected player must deal 0, dealt %d", dealt)
 	}
 	if resourceCurrent(victim.entity, "hp") != 100 {
@@ -429,7 +429,7 @@ func TestPvPGateNoOpVsMobAndBuff(t *testing.T) {
 	setResourceCurrent(mob, "hp", 100)
 	c := seededCtx(z, caster.entity, mob, dispHarmful)
 	// Harmful op vs a mob: always proceeds (PvP only).
-	if dealt := dealDamage(c, mob, 30, "fire"); dealt != 30 {
+	if dealt := dealDamage(c, mob, 30, "fire", ""); dealt != 30 {
 		t.Fatalf("harmful op vs a mob must proceed: dealt %d, want 30", dealt)
 	}
 	// A helpful buff on a non-consenting player: never gated.

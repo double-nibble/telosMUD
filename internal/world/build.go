@@ -104,7 +104,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, r := range lc.Resources {
 		rd := &resourceDef{
 			ref: r.Ref, displayName: r.DisplayName, maxAttr: r.MaxAttr,
-			vital: r.Vital, regen: r.Regen, regenInCombat: r.RegenInCombat,
+			vital: r.Vital, primary: r.Primary, regen: r.Regen, regenInCombat: r.RegenInCombat,
 			depletedThreshold: r.DepletedThreshold,
 			perRound:          r.PerRound,
 			gauge:             r.Gauge,
@@ -285,10 +285,16 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, err := range lintAttributeCycles(d.attr.table()) {
 		slog.Error("content: attribute derivation cycle (def will resolve to 0)", "err", err)
 	}
-	// Load-time content-lint: combat + death assume ONE vital resource per pack (vitalResource picks
-	// deterministically by sorted ref, but >1 vital is a content modelling error — only the lowest-ref
-	// one ever takes damage / drives death). Warn loudly so an author sees it at load, not in a fight.
+	// Load-time content-lint: multiple vital resources are supported (#71 multi-vital, each independently
+	// lethal), but with >1 vital and none flagged `primary` the default-damage pool falls back to an
+	// arbitrary sorted-ref pick — nudge the author to designate one.
 	lintVitalResources(d.res.table())
+	// Load-time content-lint (#71): a deal_damage op's `resource` (the routed pool) must name a registered
+	// resource — a typo silently discards the blow at runtime (max<=0 immunity). Warn so an author sees it.
+	for _, m := range lintDealDamageResources(d) {
+		slog.Warn("content: deal_damage.resource does not name a registered resource (blow will be discarded)",
+			"owner", m.owner, "resource", m.resource)
+	}
 	// Load-time content-lint (docs/REMAINING.md §4): every learn_profession op's `profession` must name a
 	// registered kind:"profession" bundle. professionIsCapped/uncapped resolve the D2 cap by looking up
 	// that bundle (ref == the membership ref by convention); a miss means the trade grants nothing AND its
@@ -304,52 +310,41 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		"channels", d.channel.len())
 }
 
-// lintVitalResources warns if a pack registers more than one VITAL resource. The combat/death machinery
-// (vitalResource, the swing's apply stage, the 6.3b on_depleted path) models ONE vital pool (hp); a
-// second is a content error — vitalResource deterministically picks the lowest ref, so only it ever
-// takes damage and the others silently never deplete. Build-time only; logs at WARN with the offending
-// refs (sorted) so an author sees it at load. Does not abort boot (content-lint discipline).
+// lintVitalResources nudges an author who defines MORE THAN ONE vital resource (#71 multi-vital) to
+// designate a `primary` — the pool unrouted damage (a melee swing, a deal_damage with no `resource`)
+// hits. Multiple vitals are fully supported (each is independently lethal; deal_damage routes to a
+// chosen pool), but with none flagged primary the default-damage pool falls back to the lowest ref by
+// sort order — an arbitrary, footgun-prone pick ("blood" sorts before "hp"). Build-time only; logs at
+// WARN with the sorted vitals + the fallback pool. Does not abort boot (content-lint discipline).
 func lintVitalResources(table map[string]*resourceDef) {
 	var vitals []string
+	hasPrimary := false
 	for ref, def := range table {
 		if def != nil && def.vital {
 			vitals = append(vitals, ref)
+			if def.primary {
+				hasPrimary = true
+			}
 		}
 	}
-	if len(vitals) > 1 {
+	if len(vitals) > 1 && !hasPrimary {
 		sort.Strings(vitals)
-		slog.Warn("content: more than one VITAL resource defined; only the lowest ref takes damage / drives death",
-			"vitals", vitals, "used", vitals[0])
+		slog.Warn("content: multiple VITAL resources defined but none flagged `primary`; unrouted damage defaults to the lowest ref — designate a primary",
+			"vitals", vitals, "fallback", vitals[0])
 	}
 }
 
-// learnProfessionMiss is one content-lint finding: a learn_profession op whose `profession` does not name
-// a kind:"profession" bundle. owner locates the offending op-list.
-type learnProfessionMiss struct {
-	owner      string
-	profession string
-}
-
-// lintLearnProfessionRefs walks every registered op-list (ability on_resolve + on_event, bundle grants,
-// track step grants, affect on_event + tick, resource on_event + on_depleted) and returns a finding for each learn_profession op whose
-// `profession` does NOT name a registered kind:"profession" bundle. This machine-checks the
-// ref==profession-bundle-ref convention that professionIsCapped/uncapped keys the D2 cap off
-// (docs/REMAINING.md §4): a miss means the learned trade grants nothing and its cap resolution silently
-// defaults to CAPPED. Build-time only; the caller logs (does not abort boot — the runtime already defaults
-// conservatively), like the other content-lints.
-func lintLearnProfessionRefs(d *defRegistries) []learnProfessionMiss {
-	isProfBundle := func(ref string) bool {
-		b := d.bundle.get(ref)
-		return b != nil && b.kind == "profession"
-	}
-	var misses []learnProfessionMiss
+// walkContentOps visits EVERY parsed op in the pack — every registered op-list (ability on_resolve +
+// on_event, bundle grants, track step grants, affect on_event + tick, resource on_event + on_depleted),
+// recursing into flow-op branches (then/els) and check bands. `owner` locates the op-list for a lint
+// message. The op-payload content-lints (learn_profession refs, deal_damage pools) share this one
+// traversal so a newly-reachable op-list is covered by every lint at once.
+func walkContentOps(d *defRegistries, visit func(owner string, op *effectOp)) {
 	var walk func(owner string, ops []effectOp)
 	walk = func(owner string, ops []effectOp) {
 		for i := range ops {
 			op := &ops[i]
-			if op.kind == "learn_profession" && !isProfBundle(op.profession) {
-				misses = append(misses, learnProfessionMiss{owner: owner, profession: op.profession})
-			}
+			visit(owner, op)
 			walk(owner, op.then)
 			walk(owner, op.els)
 			if op.check != nil {
@@ -385,6 +380,56 @@ func lintLearnProfessionRefs(d *defRegistries) []learnProfessionMiss {
 		}
 		walk("resource "+ref+" on_depleted", def.onDepleted)
 	}
+}
+
+// dealDamageResourceMiss is one content-lint finding: a deal_damage op whose `resource` (the routed pool,
+// #71 multi-vital) does NOT name a registered resource. owner locates the offending op-list.
+type dealDamageResourceMiss struct {
+	owner    string
+	resource string
+}
+
+// lintDealDamageResources flags each deal_damage whose `resource` names a pool that is NOT a registered
+// resource — an author typo that, at runtime, discards the blow as "no capacity" immunity (dealDamage's
+// max<=0 guard) and so silently does nothing. Empty `resource` (route to the primary vital) is the common
+// case and never flagged. Build-time only; the caller logs at WARN (does not abort boot). NOTE: a
+// runtime-supplied pool string (Lua h:damage{resource=...}) can't be seen here — the runtime vital-gate is
+// the real defense; this only catches static content typos.
+func lintDealDamageResources(d *defRegistries) []dealDamageResourceMiss {
+	var misses []dealDamageResourceMiss
+	walkContentOps(d, func(owner string, op *effectOp) {
+		if op.kind == "deal_damage" && op.resource != "" && d.res.get(op.resource) == nil {
+			misses = append(misses, dealDamageResourceMiss{owner: owner, resource: op.resource})
+		}
+	})
+	return misses
+}
+
+// learnProfessionMiss is one content-lint finding: a learn_profession op whose `profession` does not name
+// a kind:"profession" bundle. owner locates the offending op-list.
+type learnProfessionMiss struct {
+	owner      string
+	profession string
+}
+
+// lintLearnProfessionRefs walks every registered op-list (ability on_resolve + on_event, bundle grants,
+// track step grants, affect on_event + tick, resource on_event + on_depleted) and returns a finding for each learn_profession op whose
+// `profession` does NOT name a registered kind:"profession" bundle. This machine-checks the
+// ref==profession-bundle-ref convention that professionIsCapped/uncapped keys the D2 cap off
+// (docs/REMAINING.md §4): a miss means the learned trade grants nothing and its cap resolution silently
+// defaults to CAPPED. Build-time only; the caller logs (does not abort boot — the runtime already defaults
+// conservatively), like the other content-lints.
+func lintLearnProfessionRefs(d *defRegistries) []learnProfessionMiss {
+	isProfBundle := func(ref string) bool {
+		b := d.bundle.get(ref)
+		return b != nil && b.kind == "profession"
+	}
+	var misses []learnProfessionMiss
+	walkContentOps(d, func(owner string, op *effectOp) {
+		if op.kind == "learn_profession" && !isProfBundle(op.profession) {
+			misses = append(misses, learnProfessionMiss{owner: owner, profession: op.profession})
+		}
+	})
 	return misses
 }
 

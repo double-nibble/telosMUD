@@ -154,7 +154,7 @@ func TestConcentrationDropsOnFailedSave(t *testing.T) {
 	mob := combatMob(z, caster, "ogre", "", 100)
 	c := &effectCtx{z: z, actor: mob, source: mob, target: caster, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
 	setResourceCurrent(caster, "hp", 100)
-	applied := dealDamage(c, caster, 10, "slash")
+	applied := dealDamage(c, caster, 10, "slash", "")
 
 	if applied <= 0 {
 		t.Fatalf("damage applied = %d, want > 0 (concentration breaking does NOT soak the hit)", applied)
@@ -181,7 +181,7 @@ func TestConcentrationHoldsOnPassedSave(t *testing.T) {
 	mob := combatMob(z, caster, "ogre", "", 100)
 	c := &effectCtx{z: z, actor: mob, source: mob, target: caster, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
 	setResourceCurrent(caster, "hp", 100)
-	dealDamage(c, caster, 10, "slash")
+	dealDamage(c, caster, 10, "slash", "")
 
 	if !hasAffect(caster, "concentration") {
 		t.Fatal("concentration dropped on a PASSED save — it should still be active")
@@ -295,7 +295,7 @@ func TestDamageShieldAmountReducesOnly(t *testing.T) {
 	mob := combatMob(z, caster, "ogre", "", 100)
 	setResourceCurrent(caster, "hp", 100)
 	c := &effectCtx{z: z, actor: mob, source: mob, target: caster, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
-	applied := dealDamage(c, caster, 10, "slash")
+	applied := dealDamage(c, caster, 10, "slash", "")
 	if applied != 6 {
 		t.Fatalf("applied = %d, want 6 (10 - 4 shield; reduce-only delta honored)", applied)
 	}
@@ -313,7 +313,7 @@ func TestDamageShieldAmountReducesOnly(t *testing.T) {
 	mob2 := combatMob(z, caster2, "ogre2", "", 100)
 	setResourceCurrent(caster2, "hp", 100)
 	c2 := &effectCtx{z: z, actor: mob2, source: mob2, target: caster2, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
-	applied2 := dealDamage(c2, caster2, 10, "slash")
+	applied2 := dealDamage(c2, caster2, 10, "slash", "")
 	if applied2 != 10 {
 		t.Fatalf("applied = %d, want 10 (a POSITIVE amount delta is dropped — no amplification past the original)", applied2)
 	}
@@ -356,7 +356,7 @@ func TestReplaceTargetReGatesOntoNonConsentingPlayer(t *testing.T) {
 
 	c := &effectCtx{z: z, actor: attacker, source: attacker, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
 	setResourceCurrent(mob, "hp", 100)
-	dealDamage(c, mob, 10, "slash")
+	dealDamage(c, mob, 10, "slash", "")
 
 	// The bystander took NO damage (the retarget was gate-blocked).
 	if got := resourceCurrent(bystander.entity, "hp"); got != 100 {
@@ -405,7 +405,7 @@ func TestReplaceTargetRedirectsBlowReMitigatedAgainstNewTarget(t *testing.T) {
 	redirectMobTo(z, mob, guardee)
 
 	c := &effectCtx{z: z, actor: attacker, source: attacker, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
-	applied := dealDamage(c, mob, 10, "slash")
+	applied := dealDamage(c, mob, 10, "slash", "")
 
 	// dealDamage to the ORIGINAL target returns 0 (the blow moved off it).
 	if applied != 0 {
@@ -447,7 +447,7 @@ func TestReplaceTargetRedirectFiresNewTargetOwnReaction(t *testing.T) {
 	redirectMobTo(z, mob, guardee)
 
 	c := &effectCtx{z: z, actor: attacker, source: attacker, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
-	dealDamage(c, mob, 10, "slash")
+	dealDamage(c, mob, 10, "slash", "")
 
 	if got := resourceCurrent(mob, "hp"); got != 100 {
 		t.Fatalf("original target hp = %d, want 100 (blow redirected away)", got)
@@ -479,7 +479,7 @@ func TestReplaceTargetRedirectLoopTerminates(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		dealDamage(c, a, 10, "slash")
+		dealDamage(c, a, 10, "slash", "")
 		close(done)
 	}()
 	select {
@@ -491,7 +491,7 @@ func TestReplaceTargetRedirectLoopTerminates(t *testing.T) {
 	// The zone still serves: a fresh harmful op against a third target still works.
 	mob := combatMob(z, attacker, "ogre", "", 100)
 	c2 := &effectCtx{z: z, actor: attacker, source: attacker, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
-	if dealDamage(c2, mob, 5, "slash") <= 0 {
+	if dealDamage(c2, mob, 5, "slash", "") <= 0 {
 		t.Fatal("the zone did not keep serving after the bounded redirect loop")
 	}
 }
@@ -591,7 +591,7 @@ func TestReactionLoopIsBudgetBounded(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		dealDamage(c, caster, 10, "slash")
+		dealDamage(c, caster, 10, "slash", "")
 		close(done)
 	}()
 	select {
@@ -602,7 +602,7 @@ func TestReactionLoopIsBudgetBounded(t *testing.T) {
 	}
 	// The zone still serves: a fresh harmful op against the mob still works.
 	c2 := &effectCtx{z: z, actor: caster, source: caster, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
-	if dealDamage(c2, mob, 5, "slash") <= 0 {
+	if dealDamage(c2, mob, 5, "slash", "") <= 0 {
 		t.Fatal("the zone did not keep serving after the bounded reaction loop")
 	}
 }
