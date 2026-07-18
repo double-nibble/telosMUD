@@ -101,7 +101,7 @@ func TestOnVitalDepletedIdempotent(t *testing.T) {
 	}
 
 	// A second depletion (stand-in for a DoT tick landing on the already-dead mob) must be a clean no-op.
-	z.onVitalDepleted(mob, s.entity, nil)
+	z.onVitalDepleted(mob, s.entity, "hp", nil)
 	if got := countCorpses(); got != 1 {
 		t.Fatalf("second onVitalDepleted built a duplicate corpse: %d corpses, want 1 (latch failed)", got)
 	}
@@ -639,7 +639,7 @@ func TestSpawnProtectionWindowOpenThenExpires(t *testing.T) {
 	c := mobHarmCtx(z, s.entity, "goblin")
 
 	// While protected: a mob's harm is a clean no-op (0 damage, hp untouched).
-	if dealt := dealDamage(c, s.entity, 30, "physical"); dealt != 0 {
+	if dealt := dealDamage(c, s.entity, 30, "physical", ""); dealt != 0 {
 		t.Fatalf("protected player took %d damage, want 0", dealt)
 	}
 	if got := resourceCurrent(s.entity, "hp"); got != 50 {
@@ -653,7 +653,7 @@ func TestSpawnProtectionWindowOpenThenExpires(t *testing.T) {
 	if z.spawnProtected(s.entity) {
 		t.Fatal("window should have expired after spawnProtectionPulses ticks")
 	}
-	if dealt := dealDamage(c, s.entity, 30, "physical"); dealt <= 0 {
+	if dealt := dealDamage(c, s.entity, 30, "physical", ""); dealt <= 0 {
 		t.Fatalf("post-expiry harm dealt %d, want > 0 (window lapsed, harm lands)", dealt)
 	}
 	if got := resourceCurrent(s.entity, "hp"); got >= 50 {
@@ -677,7 +677,7 @@ func TestSpawnProtectionDropsOnProtectedPlayerHostileAction(t *testing.T) {
 	// The protected PLAYER attacks a mob (a harmful op it is the actor of) -> its shield drops.
 	target := combatMob(z, s.entity, "goblin", "", 100)
 	pc := &effectCtx{z: z, actor: s.entity, source: s.entity, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(3))}
-	if dealt := dealDamage(pc, target, 10, "physical"); dealt <= 0 {
+	if dealt := dealDamage(pc, target, 10, "physical", ""); dealt <= 0 {
 		t.Fatalf("protected player's own attack dealt %d, want > 0 (its harm is not blocked)", dealt)
 	}
 	if z.spawnProtected(s.entity) {
@@ -687,7 +687,7 @@ func TestSpawnProtectionDropsOnProtectedPlayerHostileAction(t *testing.T) {
 	// A mob's harm now lands on the (no-longer-protected) player.
 	setResourceCurrent(s.entity, "hp", 50)
 	c := mobHarmCtx(z, s.entity, "orc")
-	if dealt := dealDamage(c, s.entity, 30, "physical"); dealt <= 0 {
+	if dealt := dealDamage(c, s.entity, 30, "physical", ""); dealt <= 0 {
 		t.Fatalf("harm on the unprotected player dealt %d, want > 0", dealt)
 	}
 }
@@ -705,7 +705,7 @@ func TestSpawnProtectionSelfHarmExempt(t *testing.T) {
 
 	// Self-harm: actor == target. It is exempt from both the refusal and the cancel hook.
 	sc := &effectCtx{z: z, actor: s.entity, source: s.entity, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(4))}
-	if dealt := dealDamage(sc, s.entity, 10, "physical"); dealt <= 0 {
+	if dealt := dealDamage(sc, s.entity, 10, "physical", ""); dealt <= 0 {
 		t.Fatalf("self-harm dealt %d, want > 0 (self is exempt from spawn protection)", dealt)
 	}
 	if !z.spawnProtected(s.entity) {

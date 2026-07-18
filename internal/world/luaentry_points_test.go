@@ -253,7 +253,7 @@ func TestTriggerDeathFires(t *testing.T) {
 
 	// Kill the victim: dealDamage -> depletion -> die() -> fireDeath -> makeCorpse (drops script).
 	c := &effectCtx{z: z, actor: killer, source: killer, rng: z.lua.rng}
-	dealDamage(c, victim, 100, "force")
+	dealDamage(c, victim, 100, "force", "")
 
 	// The death handler ran and recorded the killer — but the entry was DROPPED at extraction, so
 	// we cannot read it after the fact. Instead assert the LEAK FIX: no entityScript remains.
@@ -578,7 +578,7 @@ func TestLuaBusHandlerBudgetShared(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		c := &effectCtx{z: z, actor: b, source: b, rng: z.lua.rng}
-		dealDamage(c, a, 1, "force") // a takes 1 from b -> a's OnDamageTaken fires -> ping-pong
+		dealDamage(c, a, 1, "force", "") // a takes 1 from b -> a's OnDamageTaken fires -> ping-pong
 		close(done)
 	}()
 	select {

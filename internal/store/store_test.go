@@ -398,7 +398,9 @@ func TestChannelBodyHearAccessRoundTrips(t *testing.T) {
 // round-trip (the store field-drop class). Import (marshal) + export (unmarshal) share resourceBody, so
 // a mistyped/missing json tag would silently drop a pool's HUD-visibility on a DB reload.
 func TestResourceBodyGaugeRoundTrips(t *testing.T) {
-	in := resourceBody{Regen: 1, PerRound: true, Gauge: true}
+	// Gauge (#50) and Primary (#71) both ride the JSONB body — pin that neither is dropped, the def-table
+	// field-drop class the demo caught before (attrBody.Stat / the round-11 store trap).
+	in := resourceBody{Regen: 1, PerRound: true, Gauge: true, Primary: true}
 	b, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -409,6 +411,9 @@ func TestResourceBodyGaugeRoundTrips(t *testing.T) {
 	}
 	if !out.Gauge {
 		t.Fatalf("resource gauge flag dropped in body round-trip: %+v", out)
+	}
+	if !out.Primary {
+		t.Fatalf("resource primary flag (#71) dropped in body round-trip: %+v", out)
 	}
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("resourceBody round-trip changed the value: %+v -> %+v", in, out)

@@ -331,13 +331,17 @@ type attributeDef struct {
 // (maxAttr) — so gear/affects that raise that attribute flow through to the cap (§1.2). The engine
 // holds `current` per entity (Living); this def supplies max/vital/regen. Immutable after build.
 type resourceDef struct {
-	ref               string
-	displayName       string
-	maxAttr           string // derived-attr ref capping the pool; "" => no cap (unbounded)
-	vital             bool   // depletion drives death (on_depleted) — wired in 5.2/combat
-	regen             int    // per-tick flat regen (reserved; regen ticks ride 5.2)
-	regenInCombat     bool   // keep regenerating while the owner is fighting (default false: pause in combat)
-	depletedThreshold int    // reserved (vital depletion threshold)
+	ref         string
+	displayName string
+	maxAttr     string // derived-attr ref capping the pool; "" => no cap (unbounded)
+	vital       bool   // depletion drives death (on_depleted) — wired in 5.2/combat
+	// primary designates the DEFAULT-damage vital (#71 multi-vital): unrouted damage (a swing, a
+	// deal_damage with no `resource`) hits this pool. Only consulted when >1 vital exists — vitalResource
+	// prefers the primary-flagged vital, else falls back to the lowest-ref one. Immutable after build.
+	primary           bool
+	regen             int  // per-tick flat regen (reserved; regen ticks ride 5.2)
+	regenInCombat     bool // keep regenerating while the owner is fighting (default false: pause in combat)
+	depletedThreshold int  // reserved (vital depletion threshold)
 	// perRound marks a per-round REACTION budget ([G9], combat.go topUpReactions): a resource topped up to
 	// its derived max at the start of EVERY combat round, so a reactor gets a bounded number of reactions
 	// (opportunity attacks) per round and a spent reaction does not refill until the next round. Content

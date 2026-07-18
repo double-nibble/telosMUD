@@ -103,7 +103,7 @@ func TestBossLoopDeathSignal(t *testing.T) {
 	// Kill it through the real death pipeline (dealDamage -> depletion -> die -> the "death" trigger).
 	hp := resourceCurrent(chief, "hp")
 	c := &effectCtx{z: z, actor: chief, source: chief, target: chief, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
-	dealDamage(c, chief, float64(hp)+50, "slash")
+	dealDamage(c, chief, float64(hp)+50, "slash", "")
 
 	// The death handler signal_world's boss.died UP to the world scope. The LOAD-BEARING key is `ref` (the
 	// SCHEDULE ref the director matches on to reschedule the weekly timer, director.onBossDied) — assert it,

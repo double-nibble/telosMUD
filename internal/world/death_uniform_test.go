@@ -46,7 +46,7 @@ func dealRaw(z *Zone, attacker, target *Entity, raw float64, dmgType string) int
 		z: z, actor: attacker, source: attacker, target: target,
 		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1)),
 	}
-	return dealDamage(c, target, raw, dmgType)
+	return dealDamage(c, target, raw, dmgType, "")
 }
 
 // --- Spell / AoE kill (the core 6.5 gap) -------------------------------------------------------
@@ -314,7 +314,7 @@ func TestPingPongOnDepletedTerminates(t *testing.T) {
 		z: z, actor: b, source: b, target: a, mag: 1, disp: dispHarmful,
 		rng: rand.New(rand.NewSource(1)),
 	}
-	dealDamage(c, a, 50, "slash")
+	dealDamage(c, a, 50, "slash", "")
 
 	// Both ended dead (the hooks only damage; neither revives). The point of the test is that we GET HERE.
 	if position(a) != posDead {

@@ -60,14 +60,16 @@ func rollOpAmount(c *effectCtx, op *effectOp) float64 {
 	return amt
 }
 
-// opDealDamage: deal_damage(target, {amount|<N>d<S>, type}). Routes through the SHARED mitigation
-// pipeline (dealDamage -> guardHarmful + resist/soak). The amount is either a flat `amount` or rolled
-// dice, scaled by the ctx magnitude (a DoT's stacks). A blocked harmful op (PvP) is a clean no-op.
+// opDealDamage: deal_damage(target, {amount|<N>d<S>, type, resource}). Routes through the SHARED
+// mitigation pipeline (dealDamage -> guardHarmful + resist/soak). The amount is either a flat `amount`
+// or rolled dice, scaled by the ctx magnitude (a DoT's stacks). The optional `resource` names WHICH
+// vital/resource pool the blow hits (#71 multi-vital); empty = the primary vital (a swing). A blocked
+// harmful op (PvP) is a clean no-op.
 func opDealDamage(c *effectCtx, op *effectOp) error {
 	if c.target == nil {
 		return fmt.Errorf("deal_damage: no target")
 	}
-	dealDamage(c, c.target, rollOpAmount(c, op), op.dmgType)
+	dealDamage(c, c.target, rollOpAmount(c, op), op.dmgType, op.resource)
 	return nil
 }
 

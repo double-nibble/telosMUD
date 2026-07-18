@@ -67,7 +67,7 @@ func (rt *luaRuntime) helpfulCtx(target *Entity) *effectCtx {
 	}
 }
 
-// --- h:damage{amount=, type=, can_avoid=} — routes dealDamage (the gate is first inside it) --
+// --- h:damage{amount=, type=, resource=, can_avoid=} — routes dealDamage (gate is first inside it) --
 
 // hDamage applies damage to the handle's entity AS TARGET. It routes the existing dealDamage
 // funnel, which runs guardHarmful FIRST (so a protected player in a safe room is a clean no-op,
@@ -82,12 +82,16 @@ func (rt *luaRuntime) hDamage(l *lua.LState) int {
 	opts := l.CheckTable(2)
 	amount := optTableNumber(opts, "amount", 0)
 	dmgType := optTableString(opts, "type", "")
+	// `resource` routes the blow to a specific vital/resource pool (#71 multi-vital); "" = the primary
+	// vital. This is a runtime string the load-time lint can't see, so dealDamage's own vital-gate +
+	// max>0 immunity discard are the safety net (a non-vital / capacity-less pool can't kill).
+	resource := optTableString(opts, "resource", "")
 	c := rt.harmCtx(target)
 	if c == nil || target == nil {
 		l.Push(lua.LNumber(0))
 		return 1
 	}
-	applied := dealDamage(c, target, amount, dmgType)
+	applied := dealDamage(c, target, amount, dmgType, resource)
 	l.Push(lua.LNumber(applied))
 	return 1
 }
