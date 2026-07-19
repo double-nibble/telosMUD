@@ -75,6 +75,15 @@ func SetLuaCaps(instrBudget, callDeadlineMS int) error {
 	if err := luasandbox.ValidateCaps(instrBudget, callDeadlineMS); err != nil {
 		return err
 	}
+	// The HOST-SPECIFIC bound, and the reason validation lives here rather than in luasandbox: only the world
+	// knows its own tick. luasandbox's MaxCallDeadlineMS is a full second, which is FOUR zone pulses — one
+	// content call could swallow four consecutive heartbeats, so combat rounds and affect ticks stop landing
+	// for every player in that zone while one script runs. luasandbox cannot see pulseInterval; this can.
+	if d := time.Duration(luasandbox.ClampCallDeadlineMS(callDeadlineMS)) * time.Millisecond; d >= pulseInterval {
+		return fmt.Errorf("lua call deadline %v is at or above the zone pulse interval %v: one content call "+
+			"could then swallow a whole heartbeat, so combat rounds and affect ticks stop landing for every "+
+			"player in that zone while it runs", d, pulseInterval)
+	}
 	luaInstrBudget = luasandbox.ClampInstrBudget(instrBudget)
 	luaCallDeadline = time.Duration(luasandbox.ClampCallDeadlineMS(callDeadlineMS)) * time.Millisecond
 	slog.Info("lua sandbox caps", "instr_budget", luaInstrBudget, "call_deadline", luaCallDeadline)

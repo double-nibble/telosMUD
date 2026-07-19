@@ -127,6 +127,13 @@ type Opts struct {
 // host installs its own tables into the returned state's globals afterward. The state is NOT goroutine-safe;
 // touch it from one serialized goroutine.
 func New(opts Opts) *lua.LState {
+	// Clamp the PAIR, not just each field. ValidateCaps is the loud operator-facing check, but it runs only
+	// at the two SetLuaCaps sites — so `New(Opts{InstrBudget: MaxInstrBudget})` with a default deadline was
+	// accepted silently through the API this package advertises as safe, arming exactly the disarmed-breaker
+	// posture ValidateCaps rejects. A future embedder or a third host tier would ship it with no error. This
+	// makes the invariant structural: an unreachable budget is lowered to what the deadline can actually
+	// execute, so the budget always remains the guard that fires first.
+	opts.InstrBudget = clampBudgetToDeadline(opts.InstrBudget, opts.CallDeadlineMS)
 	L := lua.NewState(lua.Options{
 		CallStackSize:   CallStackSize,
 		RegistrySize:    RegistrySize,
@@ -152,24 +159,46 @@ func New(opts Opts) *lua.LState {
 const (
 	// MinInstrBudget is low enough for a trivial handler and high enough that nothing legitimate trips it.
 	MinInstrBudget = 1_000
-	// MaxInstrBudget bounds the stall an operator can configure. At 10M instructions a single call is already
-	// ~100ms, which is many zone ticks — past here the budget has stopped being a bound in any useful sense.
+	// MaxInstrBudget bounds the stall an operator can configure. Reaching anywhere near it also requires
+	// raising the DEADLINE; see ValidateCaps, which is the check that actually matters.
 	//
-	// Reaching anywhere near it also requires raising the DEADLINE; see ValidateCaps, which is the check that
-	// actually matters.
+	// THE OTHER DIMENSION IS MEMORY, and it is the one with no cap at all. RegistryMaxSize bounds the value
+	// stack and StrByteCap bounds amplifier OUTPUT, but nothing bounds table growth. Measured allocation for
+	// a single call of `t[i]={i,i,i}`: ~3MB at the 100k default, ~355MB at this ceiling — and the abort does
+	// not release it until GC. So a shard configured near the top trades a bounded stall for an OOM-kill,
+	// which is the harder failure. Treat this as a wall-clock bound that also happens to be a memory bound
+	// nobody has measured for their content.
 	MaxInstrBudget = 10_000_000
 
 	// InstrPerMS is the engine's calibrated Lua instruction rate: how many VM instructions a call may be
-	// assumed to execute per millisecond of wall clock.
+	// assumed to execute per millisecond of wall clock. ValidateCaps uses it to reject a budget the deadline
+	// can never reach.
 	//
-	// Deliberately CONSERVATIVE — measured throughput on ordinary hardware is several times this — because it
-	// is used to reject unreachable budgets, and rejecting a configuration that would actually have worked is
-	// a worse error than allowing a slightly generous one.
-	InstrPerMS = 100_000
+	// MEASURED, and the measurement is the point. Against the pinned fork on fast Apple silicon, on the
+	// production path (budget armed AND a deadline context, so the per-instruction ctx.Done() select is in
+	// the loop, which is what the engine actually runs):
+	//
+	//	while true do x=x+1 end              ~90,000 instr/ms
+	//	while true do i=i+1 t[i]={i,i} end   ~37,000 instr/ms
+	//
+	// So real throughput is at or BELOW 100k/ms, not several times above it — an earlier version of this
+	// constant assumed the latter and was wrong in the unsafe direction. Over-estimating the rate makes
+	// ValidateCaps demand too little deadline, so a mis-paired configuration PASSES and the wall clock still
+	// wins: exactly the breaker reweighting the check exists to prevent, with the operator told the engine
+	// verified the pair.
+	//
+	// 20k/ms is deliberately below even the table-allocating figure, and below what a slower core (the ARM
+	// nodes this runs on) achieves. It means a budget raise must be matched by roughly 5x the wall clock —
+	// which is the honest price, because instructions are not free and the deadline is what bounds the stall.
+	// Erring low costs an operator a larger deadline than strictly needed; erring high silently disarms the
+	// breaker, which is not a trade worth making.
+	InstrPerMS = 20_000
 	// MinCallDeadlineMS: below a millisecond the secondary guard fires on scheduler noise rather than on
 	// stalls, aborting correct scripts.
 	MinCallDeadlineMS = 1
-	// MaxCallDeadlineMS: a full second of wall clock is already far longer than any tick budget.
+	// MaxCallDeadlineMS: a full second of wall clock is far longer than any tick budget. It is the package's
+	// bound, and it is deliberately loose — luasandbox is host-agnostic and cannot know the host's tick. The
+	// HOST tightens it: world.SetLuaCaps refuses a deadline that would let one call swallow a zone pulse.
 	MaxCallDeadlineMS = 1_000
 )
 
@@ -231,6 +260,16 @@ func ValidateCaps(instrBudget, callDeadlineMS int) error {
 			budget, deadline, reachable, (budget+InstrPerMS-1)/InstrPerMS)
 	}
 	return nil
+}
+
+// clampBudgetToDeadline lowers a budget to what the deadline can actually reach, so the instruction guard
+// stays the one that fires. Returns the ALREADY-CLAMPED budget (so callers can arm it directly).
+func clampBudgetToDeadline(instrBudget, callDeadlineMS int) int {
+	budget := ClampInstrBudget(instrBudget)
+	if reachable := ClampCallDeadlineMS(callDeadlineMS) * InstrPerMS; budget > reachable {
+		return reachable
+	}
+	return budget
 }
 
 // ClampCallDeadlineMS is ClampInstrBudget for the wall-clock deadline. See it for why this clamps.

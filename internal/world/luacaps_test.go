@@ -74,3 +74,25 @@ func TestLuaCapsAreActuallyArmedOnAZone(t *testing.T) {
 		t.Fatalf("abort classified as %v, want AbortBudget", got)
 	}
 }
+
+// TestSetLuaCapsRefusesADeadlineThatOutlivesAPulse is the host-specific bound, and the reason validation was
+// moved to the injection point in the first place.
+//
+// luasandbox's own ceiling is a full second — it is host-agnostic and cannot know the tick. But a zone pulses
+// every 250ms, so a call allowed to run a second swallows four consecutive heartbeats: combat rounds stop
+// landing and affect ticks stop firing for every player in that zone while one script runs. Only the world
+// can make that check.
+func TestSetLuaCapsRefusesADeadlineThatOutlivesAPulse(t *testing.T) {
+	budget, deadline := luaInstrBudget, luaCallDeadline
+	t.Cleanup(func() { luaInstrBudget, luaCallDeadline = budget, deadline })
+
+	ms := int(pulseInterval / time.Millisecond)
+	if err := SetLuaCaps(0, ms); err == nil {
+		t.Fatalf("a %dms deadline was accepted at a %v pulse; one call could then swallow a whole heartbeat",
+			ms, pulseInterval)
+	}
+	// Comfortably under the pulse is fine — the bound must not be a blanket refusal of any raise.
+	if err := SetLuaCaps(0, ms/5); err != nil {
+		t.Fatalf("a deadline well under the pulse was refused: %v", err)
+	}
+}

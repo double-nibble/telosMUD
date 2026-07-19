@@ -32,7 +32,16 @@ tunables:
   # It must also be REACHABLE within the deadline below — the engine refuses a pair where the wall clock
   # would always fire first, because a budget that never fires does not merely do nothing: every runaway then
   # looks like a transient deadline abort, which the circuit breaker weights 5x more lightly and stops
-  # quarantining. Budget/100000 is roughly the milliseconds you need. So a 1000000 budget needs at least 10ms.
+  # quarantining. Budget/20000 is the milliseconds you need, so a 200000 budget needs at least 10ms.
+  #
+  # That ratio is measured, not nominal: real throughput is ~90k instructions/ms for a tight arithmetic loop
+  # and ~37k/ms for anything allocating tables, and the engine calibrates below both so the check is honest
+  # on slower cores too.
+  #
+  # Raising the budget therefore costs wall clock, and wall clock is the real budget: the deadline must stay
+  # under the 250ms zone pulse (telos-world refuses otherwise), because a call that outlives a pulse stops
+  # combat rounds and affect ticks landing for every player in that zone. Consider also that instructions
+  # allocate — a table-building loop reaches hundreds of MB per call at the top of the range.
   #
   # Raise it if legitimate content is aborting with "instruction budget exceeded"; that message names the
   # script, so check the script is not accidentally unbounded before raising the ceiling for everyone.
