@@ -382,6 +382,12 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithTells(tellJS), nil
 	}
 	dir := directory.NewRedis(rdb, "telos")
+	// #340: the directory is COORDINATION STATE, not cache — report (loudly) if this Redis is configured to
+	// evict it. Deliberately NOT a boot refusal: this same client also serves the checkpoint tier, so
+	// mandating noeviction on it is not unambiguously safe until the two are split. See CheckEvictionPolicy.
+	evCtx, evCancel := context.WithTimeout(ctx, 3*time.Second)
+	dir.CheckEvictionPolicy(evCtx)
+	evCancel()
 	ckpt := checkpoint.NewRedis(rdb, "telos") // ~10s Redis checkpoint tier of the ladder
 	// Cross-shard `who` roster (Phase 8.4): the same Redis the directory uses, namespaced "<ns>:presence:*"
 	// so it never collides with the directory's "<ns>:dir:*". Each shard writes ONLY its own residents

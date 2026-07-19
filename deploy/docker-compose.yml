@@ -29,7 +29,17 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # `--maxmemory-policy noeviction` (#340). This Redis holds the directory, which is COORDINATION STATE
+    # rather than cache: zone lease generations (the fence that makes a signed AdoptZone single-use), the
+    # director's leader-election lease, shard registrations, instance-template claims. Evicting any of those
+    # produces a WRONG answer, not a slow one — and several are TTL'd, so `volatile-*` is unsafe too, not
+    # just `allkeys-*`. The services log an Error if they find an evicting policy here.
+    #
+    # No `--maxmemory` ceiling is pinned, deliberately: this compose has no container memory limit, so
+    # noeviction cannot produce either an OOM-kill or write errors. A deployment that DOES cap Redis memory
+    # (the k8s manifests) must think about that pairing before copying this line — see the wiki's
+    # "Read this before setting noeviction".
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports:
       - "6379:6379"
     healthcheck:

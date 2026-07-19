@@ -75,6 +75,12 @@ func main() {
 		rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 		defer func() { _ = rdb.Close() }()
 		dir = directory.NewRedis(rdb, "telos")
+		// #340: report an evicting directory Redis. The director has the most to lose here — its own
+		// LEADER-ELECTION lease is a TTL'd key, and evicting it lets two directors both believe they lead —
+		// so it is the tier most worth telling. Warn-only; see CheckEvictionPolicy for why not fatal.
+		evCtx, evCancel := context.WithTimeout(ctx, 3*time.Second)
+		dir.CheckEvictionPolicy(evCtx)
+		evCancel()
 		rosterSrc = presence.NewRedis(rdb, "telos") // #90: same Redis + namespace as the who roster
 		claimer = dir
 		slog.Info("leader election enabled", "instance", instanceID)
