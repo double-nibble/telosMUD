@@ -559,6 +559,16 @@ func (sr *scopeReplication) deliverPullResult(payload json.RawMessage) {
 	}
 	var summary string
 	switch {
+	case r.OK && r.Detail != "":
+		// A FORCED pull (#427): Detail carries the packs the live-hosted-pack guard blocked and the operator
+		// overrode. Naming them here is the whole point of running the guard under force — an override the
+		// operator cannot see the consequences of is not an audited action.
+		summary = fmt.Sprintf("pull: content version %q installed and hot-reloaded across the fleet.\r\n"+
+			"  FORCE-PRUNED past the live-hosted-pack guard: %s\r\n"+
+			"  Players inside those zones keep playing from shard memory for now, but a drain or restart "+
+			"CANNOT rebuild the zones — its occupants are dropped and reclaimed to their home start room. "+
+			"REDIRECT them first, THEN roll a reboot. Also check no world shard pins these packs via "+
+			"TELOS_CONTENT_PACKS, or it will refuse to boot.", r.Version, r.Detail)
 	case r.OK:
 		summary = fmt.Sprintf("pull: content version %q installed and hot-reloaded across the fleet.", r.Version)
 	case r.Version == "":

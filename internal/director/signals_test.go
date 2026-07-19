@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/contentbus"
 	"github.com/double-nibble/telosmud/internal/scopebus"
@@ -317,20 +319,28 @@ type fakePuller struct {
 	calls chan pullArgs
 	block chan struct{}
 	err   error
+	// forced is what the puller reports back as force-pruned, so a test can assert the record reaches the
+	// operator rather than dying in the director's process (#427).
+	forced []string
 }
 
-type pullArgs struct{ version, actor string }
+// pullArgs records what the director handed the puller. It carries `force` (#427) so a test can assert the
+// override survives the whole payload -> actor -> worker path rather than being silently dropped.
+type pullArgs struct {
+	version, actor string
+	force          bool
+}
 
-func (p *fakePuller) Pull(ctx context.Context, version, actor string) error {
+func (p *fakePuller) Pull(ctx context.Context, spec PullSpec) (PullOutcome, error) {
 	if p.block != nil {
 		select {
 		case <-p.block:
 		case <-ctx.Done():
-			return ctx.Err() // the director's directorPullTimeout fired
+			return PullOutcome{}, ctx.Err() // the director's directorPullTimeout fired
 		}
 	}
-	p.calls <- pullArgs{version, actor}
-	return p.err
+	p.calls <- pullArgs{spec.Version, spec.Actor, spec.Force}
+	return PullOutcome{ForcedPacks: p.forced}, p.err
 }
 
 func pullSignal(t *testing.T, key string, req contentbus.PullRequest) signalMsg {
@@ -668,4 +678,84 @@ func TestDirectorPullTimeoutReleasesSlot(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("a request after a timed-out pull did not proceed (slot still held?)")
 	}
+}
+
+// TestDirectorPassesForceThroughToThePuller pins the #427 override across the full payload -> actor ->
+// worker path. The gate on Force is entirely shard-side (the pull signal is not signed), so the director's
+// only job is to carry the flag faithfully; a director that dropped it would silently turn every forced
+// pull back into a vetoed one, and the operator's override would appear to do nothing.
+func TestDirectorPassesForceThroughToThePuller(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		p := &fakePuller{calls: make(chan pullArgs, 1)}
+		d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+		d.leader.Store(true)
+
+		// A FRESH timestamp: a forced request older than forceMaxAge is deliberately downgraded (see
+		// forceTooStale), so a 1970 stamp would test the downgrade rather than the pass-through.
+		m := pullSignal(t, "shard-1:1", contentbus.PullRequest{
+			Version: "v1", Actor: "Ada", AtUnixMs: time.Now().UnixMilli(), Force: force,
+		})
+		d.handleSignal(context.Background(), m)
+		if !<-m.ack {
+			t.Fatal("pull-request signal was NAK'd")
+		}
+		select {
+		case got := <-p.calls:
+			if got.force != force {
+				t.Fatalf("puller received force=%v, want %v", got.force, force)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("the leader director did not run the coordinated pull")
+		}
+	}
+}
+
+// TestDirectorDowngradesAStaleForcedPull covers the freshness bound (#427). A forced pull waives a guard
+// whose entire value is that it reflects CURRENT occupancy, on the strength of a judgement the operator made
+// when they typed the command. The request rides a DURABLE at-least-once stream that deliberately NAKs on a
+// non-leader, so a failover can delay delivery arbitrarily — long enough for the one idle player the
+// operator waived to have become a raid. A stale override is downgraded to an ordinary guarded pull.
+func TestDirectorDowngradesAStaleForcedPull(t *testing.T) {
+	p := &fakePuller{calls: make(chan pullArgs, 1)}
+	d := New("", newMemStore(), slog.Default()).WithContentPuller(p)
+	d.leader.Store(true)
+
+	stale := time.Now().Add(-2 * forceMaxAge).UnixMilli()
+	m := pullSignal(t, "shard-1:1", contentbus.PullRequest{Version: "v1", Actor: "Ada", AtUnixMs: stale, Force: true})
+	d.handleSignal(context.Background(), m)
+	require.True(t, <-m.ack)
+
+	select {
+	case got := <-p.calls:
+		require.False(t, got.force,
+			"a forced pull older than forceMaxAge must be downgraded to a guarded pull — the guard re-vetoes "+
+				"and the operator re-issues against what is true NOW")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the pull did not run")
+	}
+}
+
+// TestForceTooStale covers the boundary directly, including the zero-timestamp case: an absent AtUnixMs
+// predates the field rather than being ancient, so treating it as stale would silently disable the override
+// for an older shard instead of protecting anything.
+func TestForceTooStale(t *testing.T) {
+	require.False(t, forceTooStale(0), "an absent timestamp must not be treated as stale")
+	require.False(t, forceTooStale(-1))
+	require.False(t, forceTooStale(time.Now().UnixMilli()))
+	require.False(t, forceTooStale(time.Now().Add(-forceMaxAge/2).UnixMilli()))
+	require.True(t, forceTooStale(time.Now().Add(-2*forceMaxAge).UnixMilli()))
+}
+
+// TestPullResultDetailCarriesTheForcedPacks is the fix for the finding that Result.PruneForced was
+// write-only state. The director runs on a different host from the builder who typed the command; before
+// this, the packs an operator overrode were computed, logged locally, and dropped — so the in-game success
+// line for a forced pull was byte-identical to an ordinary one. An override whose consequences never reach
+// the operator is not an audited action.
+func TestPullResultDetailCarriesTheForcedPacks(t *testing.T) {
+	require.Empty(t, pullResultDetail(PullOutcome{}),
+		"an ordinary pull's success line must be unchanged")
+	require.Empty(t, pullResultDetail(PullOutcome{ForcedPacks: nil}),
+		"a forced pull that blocked nothing is an ordinary pull")
+	require.Equal(t, "dungeons, raids", pullResultDetail(PullOutcome{ForcedPacks: []string{"dungeons", "raids"}}),
+		"a real override must name the packs, so the operator learns what they overrode")
 }

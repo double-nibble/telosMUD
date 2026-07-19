@@ -3,7 +3,9 @@ package contentpull
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
+	"strings"
 )
 
 // guard.go is the live-hosted-pack PRUNE GUARD (#212 slice 4 PR E2). A director-coordinated pull can DROP a
@@ -114,4 +116,57 @@ func prunePreview(current, incoming []string) []string {
 	}
 	sort.Strings(pruned)
 	return pruned
+}
+
+// pruneDecision turns the guard's blocked list into either a REFUSAL or a forced-prune record (#427).
+//
+// It is a separate pure function because it is the whole of the override's decision logic, and Pull itself
+// opens a real Postgres pool — so without this seam the branch could only be exercised against a live
+// database. A nil error with a non-empty result means the pull proceeds and these packs are being stripped
+// against the guard's advice.
+//
+// Note force does NOT skip the guard: the caller still runs it, and the blocked list still reaches here.
+// Force downgrades the veto to a report. An operator who overrides needs to know exactly what they
+// overrode, and so does whoever reads the log afterwards.
+func pruneDecision(version string, blocked []string, force bool) (forced []string, err error) {
+	if len(blocked) == 0 {
+		return nil, nil
+	}
+	if !force {
+		return nil, fmt.Errorf(
+			"refusing content version %q: it would strip live-hosted pack(s) [%s] — players are in those zones; "+
+				"drain them or roll a reboot before removing the pack(s), or re-run with force to override",
+			version, strings.Join(blocked, ", "))
+	}
+	// Decision only. The Warn that RECORDS the force-prune is emitted by the caller AFTER the import
+	// commits (LogForcedPrune) — logging it here would assert a strip that an import failure then rolled
+	// back, and the one durable-ish record of a break-glass action should not describe something that
+	// did not happen.
+	slog.Info("content pull: prune guard blocked pack(s) and force was requested; proceeding to import",
+		"version", version, "packs", blocked)
+	return blocked, nil
+}
+
+// LogForcedPrune records a completed force-prune, AFTER the import has committed. Split from pruneDecision
+// so the log describes what actually happened rather than what was about to be attempted (an import that
+// then failed would otherwise leave a Warn asserting a strip that rolled back).
+//
+// It says what actually happens to people, because it is easy to assume "force" evicts somebody and it does
+// not: nothing on this path touches a running zone. Shard memory is authoritative, so players inside a
+// stripped pack's zones keep playing and can walk out, and a party inside an instance copy finishes its run.
+// What breaks is everything AFTER — no new instance copy of a stripped template can be minted, saved
+// character locations stop resolving, and crucially a DRAIN OR RESTART cannot rebuild those zones, so the
+// handover fails and the occupants are dropped and reclaimed to their home start room. That makes
+// "redirect them FIRST, then reboot" the instruction, not "reboot".
+func LogForcedPrune(version string, forced []string) {
+	if len(forced) == 0 {
+		return
+	}
+	slog.Warn("content pull: FORCE-PRUNED live-hosted pack(s) — the prune guard blocked these and was "+
+		"deliberately overridden. Players currently inside keep playing from shard memory and can walk out, "+
+		"but no new instance copies can be minted and a DRAIN OR RESTART cannot rebuild these zones: their "+
+		"occupants are disconnected and reclaimed to their home start room. REDIRECT those characters FIRST, "+
+		"then roll a reboot. Also confirm no world shard pins these packs via TELOS_CONTENT_PACKS, or it "+
+		"will refuse to boot",
+		"version", version, "packs", forced)
 }

@@ -272,15 +272,69 @@ func (d *Director) handlePullRequest(ctx context.Context, payload json.RawMessag
 		pullCtx, cancel := context.WithTimeout(ctx, directorPullTimeout)
 		defer cancel()
 		d.log.Info("director: coordinated pull starting", "version", req.Version, "actor", req.Actor, "shard", source)
-		if err := d.puller.Pull(pullCtx, req.Version, req.Actor); err != nil {
+		if req.Force && forceTooStale(req.AtUnixMs) {
+			// A forced pull waives a guard whose entire value is that it reflects CURRENT occupancy, on the
+			// strength of a human judgement made when the operator typed the command. The request rides a
+			// DURABLE at-least-once stream that deliberately NAKs on a non-leader, so a failover can delay
+			// delivery arbitrarily — long enough for the idle player the operator waived to have become a
+			// full raid. Downgrade a stale override to an ordinary pull: the guard then re-vetoes, and the
+			// operator re-issues against what is true now. Break-glass should be tightly time-bound.
+			d.log.Warn("director: coordinated pull requested with FORCE but the request is stale; "+
+				"DOWNGRADING to a normal (guarded) pull — re-issue it if the override is still intended",
+				"version", req.Version, "actor", req.Actor, "age", time.Since(time.UnixMilli(req.AtUnixMs)))
+			req.Force = false
+		}
+		if req.Force {
+			// The audit record for an override. Warn, not Info: this is a deliberate decision to strip
+			// content the fleet may be hosting, and the post-incident question is always who and when.
+			d.log.Warn("director: coordinated pull requested with FORCE — the live-hosted-pack prune guard "+
+				"will be overridden; packs it would have blocked are stripped anyway",
+				"version", req.Version, "actor", req.Actor)
+		}
+		out, err := d.puller.Pull(pullCtx, PullSpec{Version: req.Version, Actor: req.Actor, Force: req.Force})
+		if err != nil {
 			d.log.Warn("director: coordinated pull failed", "version", req.Version, "actor", req.Actor, "err", err)
 			d.broadcastPullResult(ctx, req.Version, req.Actor, false, err.Error())
 			return
 		}
-		d.log.Info("director: coordinated pull complete", "version", req.Version, "actor", req.Actor)
-		d.broadcastPullResult(ctx, req.Version, req.Actor, true, "")
+		d.log.Info("director: coordinated pull complete", "version", req.Version, "actor", req.Actor,
+			"force_pruned", out.ForcedPacks)
+		// Carry the forced-prune record back to the OPERATOR, not just into this process's log. The director
+		// runs on a different host from the builder who typed the command; without this the success line for
+		// a forced pull is byte-identical to an ordinary one.
+		d.broadcastPullResult(ctx, req.Version, req.Actor, true, pullResultDetail(out))
 	}()
 	return true
+}
+
+// pullResultDetail renders the operator-facing detail carried back on a SUCCESSFUL pull. Empty for an
+// ordinary pull (including a forced one that blocked nothing), so the existing success line is unchanged;
+// non-empty only when a force actually overrode the guard, which is the case the operator must see.
+//
+// Pure, so the seam that carries the break-glass record back to the person who typed the command is
+// testable without a live scope bus — that record dying in the director's process is exactly the defect
+// this exists to fix.
+func pullResultDetail(out PullOutcome) string {
+	if len(out.ForcedPacks) == 0 {
+		return ""
+	}
+	return strings.Join(out.ForcedPacks, ", ")
+}
+
+// forceMaxAge bounds how long a FORCED pull request stays forced. See the downgrade in handlePullRequest:
+// the override is a point-in-time human judgement about live occupancy, and the durable signal path can
+// delay delivery across a leader failover. Generous relative to an operator standing at a prompt, short
+// relative to how fast a dungeon fills up.
+const forceMaxAge = 2 * time.Minute
+
+// forceTooStale reports whether a request's issue time is too old for its force flag to still be honored.
+// A zero/absent timestamp is treated as NOT stale: it predates the field rather than being ancient, and
+// failing closed on it would silently disable the override for an older shard rather than protect anything.
+func forceTooStale(atUnixMs int64) bool {
+	if atUnixMs <= 0 {
+		return false
+	}
+	return time.Since(time.UnixMilli(atUnixMs)) > forceMaxAge
 }
 
 // broadcastPullResult tells the fleet how a coordinated pull settled (#230), so the shard hosting the
