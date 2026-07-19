@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -81,8 +82,16 @@ func main() {
 	if len(cfg.Zones) > 0 {
 		homeZone = cfg.Zones[0]
 	}
+	// #340: the gate READS the directory to route logins, so an evicting policy degrades it to mis-routing
+	// (an evicted shard registration sends a returning player to the home zone instead of where they were)
+	// rather than to corruption. Report it; never refuse — the gate is the sole player-facing entry point and
+	// a boot refusal here is a total outage over state it only reads.
+	gateDir := directory.NewRedis(rdb, "")
+	evCtx, evCancel := context.WithTimeout(ctx, 3*time.Second)
+	gateDir.CheckEvictionPolicy(evCtx)
+	evCancel()
 	dir := loginDirectory{
-		redis:    directory.NewRedis(rdb, ""),
+		redis:    gateDir,
 		homeZone: homeZone,
 		fallback: cfg.WorldTarget,
 	}

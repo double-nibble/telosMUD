@@ -30,7 +30,11 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # See deploy/docker-compose.yml for why the directory needs `noeviction` (#340): this Redis holds
+    # coordination state — zone lease generations, the director's leader-election lease, shard registrations
+    # — whose eviction produces wrong answers rather than slow ones. redis:7's default is already noeviction;
+    # pinned so it survives an image or config change.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports:
       - "6380:6379"
     healthcheck:
