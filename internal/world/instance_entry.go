@@ -128,6 +128,103 @@ type ejectInstanceMsg struct {
 
 func (ejectInstanceMsg) zoneMsg() {}
 
+// anchorsMsg asks an instance which zones its occupants are anchored to (#421). The answer is a SET of
+// authored zone ids, deduped by the zone itself.
+//
+// It is a query rather than maintained state, and that is the whole design. A counter or a set kept in step
+// with the anchors would have to be decremented on every path by which an anchor stops being one — and four
+// of those paths (a cross-shard exit, a clean quit, a link-death reap, and a failed drain-step-0 eject)
+// destroy the session WITHOUT passing through transferIn, the single documented clear point. Each missed
+// decrement would permanently pin a zone against rebalance and unhost: a silent wedge, in the machinery
+// whose whole purpose is to keep zones movable.
+//
+// Asking costs nothing worth saving. It happens only when a rebalance directive lands, which is rare, and
+// the fan-out is bounded by the per-shard instance cap. A timeout answers "no anchors", which fails OPEN —
+// correct, because this is a playability guard and not the correctness fence (#432 is that).
+//
+// resp is buffered(1) by the caller, so the zone never blocks answering — same contract as ejectInstanceMsg.
+type anchorsMsg struct {
+	resp chan []string
+}
+
+func (anchorsMsg) zoneMsg() {}
+
+// reportAnchors answers an anchorsMsg with the distinct anchor zones of this instance's occupants. Runs on
+// the zone goroutine, so reading z.players and each session's anchor is race-free.
+func (z *Zone) reportAnchors(resp chan []string) {
+	seen := make(map[string]struct{}, len(z.players))
+	out := make([]string, 0, len(z.players))
+	for _, s := range z.players {
+		if s == nil || s.anchorZone == "" {
+			continue
+		}
+		if _, dup := seen[s.anchorZone]; dup {
+			continue
+		}
+		seen[s.anchorZone] = struct{}{}
+		out = append(out, s.anchorZone)
+	}
+	resp <- out
+}
+
+// anchorQueryBarrier bounds how long a rebalance waits for the instances to report their anchors. Short:
+// this runs on the lease-renewal path, and a wedged instance must cost a rebalance a brief pause and then
+// fail open, never a stall. Var for tests.
+var anchorQueryBarrier = 2 * time.Second
+
+// zoneIsAnchored reports whether any live instance on this shard has an occupant anchored to zoneID (#421).
+//
+// WHY IT MATTERS. The anchor is written into the placement record — the reconnect ROUTING key — on every
+// durable write while a player is inside an instance. Its "the anchor names a zone THIS shard hosts"
+// property holds at entry and is not maintained: hand that zone's lease to a peer and the record starts
+// routing reconnects to a shard that has no session for the character, which fresh-logs them from the
+// durable row while this shard still holds the live one.
+//
+// FAILS OPEN, deliberately. A timeout, a wedged instance, a shutting-down shard — all answer "not anchored",
+// and the rebalance proceeds. That is the right default because this is NOT the correctness fence: #432 is,
+// and it works at the durable sink where it cannot be forgotten. What this buys is playability — a party
+// mid-dungeon does not have a reconnecting member pulled out to the anchor room while the rest of them are
+// somewhere that member can no longer reach.
+func (s *Shard) zoneIsAnchored(ctx context.Context, zoneID string) bool {
+	var instances []*Zone
+	for _, z := range s.zonesList() {
+		if z.isInstance() {
+			instances = append(instances, z)
+		}
+	}
+	if len(instances) == 0 {
+		return false
+	}
+	deadline := time.After(anchorQueryBarrier)
+	resps := make([]chan []string, 0, len(instances))
+	for _, z := range instances {
+		ch := make(chan []string, 1)
+		select {
+		case z.inbox <- anchorsMsg{resp: ch}:
+			resps = append(resps, ch)
+		case <-z.dead:
+		case <-ctx.Done():
+		case <-deadline:
+			slog.Debug("anchor query: instance inbox saturated; treating it as unanchored", "zone", z.id)
+		}
+	}
+	for _, ch := range resps {
+		select {
+		case anchors := <-ch:
+			for _, a := range anchors {
+				if a == zoneID {
+					return true
+				}
+			}
+		case <-ctx.Done():
+			return false
+		case <-deadline:
+			return false
+		}
+	}
+	return false
+}
+
 // runInstanceMintWorker drains the shard's mint queue, building each instance OFF every zone goroutine.
 // Started by Run (instanceMintWorkers of them).
 //

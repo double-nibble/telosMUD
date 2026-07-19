@@ -806,6 +806,8 @@ func (z *Zone) handle(m msg) {
 		z.evictToAnchor(v)
 	case ejectInstanceMsg:
 		z.ejectAllToAnchors(v.resp)
+	case anchorsMsg:
+		z.reportAnchors(v.resp)
 	case prepareMsg:
 		z.prepare(v)
 	case abortPendingMsg:
