@@ -36,6 +36,7 @@ func login(t *testing.T, shard *Shard, z *Zone, name string) chan *playv1.Server
 	out := make(chan *playv1.ServerFrame, 64)
 	var cz atomic.Pointer[Zone]
 	loaded, loadedOK, _ := shard.loadCharacterSnapshot(context.Background(), name)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.post(attachMsg{character: name, out: out, curZone: &cz, loaded: loaded, loadedOK: loadedOK})
 	waitPlayer(t, z, name, true)
 	return out

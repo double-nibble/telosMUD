@@ -93,7 +93,15 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 		slog.Warn("handoff prepare refused: instance-shaped target zone", "zone", req.GetTargetZoneId())
 		return nil, status.Errorf(codes.InvalidArgument, "zone %q is not a valid handoff destination", req.GetTargetZoneId())
 	}
-	z := h.shard.zoneByID(req.GetTargetZoneId())
+	// RESOLVE THE TARGET AND CLAIM THE ARRIVAL, atomically under s.mu (#413). A bare zoneByID here left the
+	// same resolve-then-deliver-async window the intra-shard transfer had (#409): the pending session is
+	// registered by the HANDLER, so between this resolve and the inbox send below a concurrent UnhostZone
+	// could pass quiescence, delete the zone and close(z.dead) — and the send would be abandoned.
+	//
+	// This position is already the correct one: everything that decides WHETHER to admit this handoff has run
+	// (signature verify, the keyless refusal, the tier/account strip, the instance-shape refusal), so no
+	// refusal can return with the claim held.
+	z := h.shard.claimArrivalTarget(req.GetTargetZoneId())
 	if z == nil {
 		return nil, status.Errorf(codes.NotFound, "zone %q not hosted on this shard", req.GetTargetZoneId())
 	}
@@ -111,11 +119,22 @@ func (h *handoffServer) Prepare(ctx context.Context, req *handoffv1.PrepareReque
 	// deadline, or a stopped zone can't wedge this handler goroutine forever.
 	select {
 	case z.inbox <- m:
+		// Enqueued: the arrival claim is now Zone.prepare's to release.
 	case <-ctx.Done():
+		// The ctx arm is the COMMON failure, not an exotic one — an RPC deadline elapsing while this send is
+		// blocked on a busy zone's full inbox is ordinary backpressure. It returns with the claim taken and
+		// the message enqueued NOWHERE, so nothing downstream will ever release it; without this release a
+		// routine, cleanly-aborted handoff would permanently wedge the destination zone against every future
+		// unhost, rebalance and drain deadline — strictly worse than the race this claim exists to fix.
+		z.releaseInboundArrival("prepare-not-posted")
 		return nil, ctx.Err()
 	}
 	select {
 	case <-ctx.Done():
+		// NO release here. The message IS enqueued, so Zone.prepare owns the claim and will release it when
+		// the zone dequeues it — whether or not this handler is still around to hear the reply (the channel
+		// is buffered). Releasing here too would double-decrement: a negative counter is the same permanent
+		// non-quiescence wedge, reached from the other side.
 		return nil, ctx.Err()
 	case err := <-reply:
 		if err != nil {

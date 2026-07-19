@@ -52,6 +52,7 @@ func TestEmptyShardBootsAndRejectsLoginCleanly(t *testing.T) {
 
 	out := make(chan *playv1.ServerFrame, 16)
 	var cz atomic.Pointer[Zone]
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.post(attachMsg{character: "Lost", out: out, curZone: &cz})
 
 	// We must get a clean text frame, and the zone must keep running (no panic killed it).

@@ -180,6 +180,7 @@ func TestUnhostZoneRefusesAZoneHoldingAPendingHandoff(t *testing.T) {
 
 	z := sh.zoneByID("darkwood")
 	reply := make(chan error, 1)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.post(prepareMsg{
 		snap:  &handoffv1.PlayerSnapshot{CharacterId: "Traveller"},
 		epoch: 1,

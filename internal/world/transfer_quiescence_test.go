@@ -73,23 +73,25 @@ func parkZoneActor(t *testing.T, z *Zone) (release func()) {
 	}
 }
 
-// stallSourceMidTransfer opens the window the `incoming` claim actually exists for, deterministically and
-// without any test hook in production code: the SOURCE zone's goroutine sits INSIDE transferOut, having taken
-// the destination's claim and NOT yet enqueued the arrival.
+// stallProducersInto opens the window the `incoming` claim actually exists for, deterministically and without
+// any test hook in production code: ANY producer that has resolved dst and is about to hand it a message sits
+// blocked INSIDE its send, with the claim taken and the message enqueued nowhere.
 //
-// It does that by parking dst's actor and then filling dst's inbox to CAPACITY. Zone.post blocks on a full
-// inbox, so the next producer — the source, in postTransferIn — stops there, mid-handler, after delPlayer.
-// The fill needs no synchronization of its own: its last post can only complete once the actor has dequeued
-// the parking message and blocked in its reply send, so on return the actor is provably parked and the inbox
-// provably full. Releasing drains the fillers, and the source's pending send then lands.
+// It is deliberately producer-AGNOSTIC — nothing here touches a source zone — because all three producers
+// have the same shape (#409/#413): the intra-shard transfer's transferOut, the login attach in server.go, and
+// the cross-shard Handoff.Prepare. It works by parking dst's actor and then filling dst's inbox to CAPACITY.
+// Zone.post blocks on a full inbox, so the next producer stops there, mid-flight. The fill needs no
+// synchronization of its own: its last post can only complete once the actor has dequeued the parking message
+// and blocked in its reply send, so on return the actor is provably parked and the inbox provably full.
+// Releasing drains the fillers, and the producer's pending send then lands.
 //
 // This is strictly stronger than parking the destination with the arrival ALREADY QUEUED, which is what the
 // drain and rebalance tests below used to do. In that shape the inbox's FIFO order alone puts the arrival
 // ahead of any later reclaim, so those tests passed even against the pre-fix predicate — they documented the
-// shape without pinning it. Here the arrival is in NO queue at all: the ONLY trace of the in-flight player
+// shape without pinning it. Here the arrival is in NO queue at all: the ONLY trace of the in-flight session
 // anywhere in the process is the claim, so a predicate that does not consult `incoming` cannot see them, and
 // the test fails against pre-fix semantics as it should.
-func stallSourceMidTransfer(t *testing.T, dst *Zone) (release func()) {
+func stallProducersInto(t *testing.T, dst *Zone) (release func()) {
 	t.Helper()
 	release = parkZoneActor(t, dst)
 	filled := make(chan struct{})
@@ -113,25 +115,20 @@ func stallSourceMidTransfer(t *testing.T, dst *Zone) (release func()) {
 	return release
 }
 
-// waitStalledMidTransfer blocks until src's goroutine is provably inside transferOut with the claim taken and
-// the handover NOT yet enqueued — the state stallSourceMidTransfer arranges. The three conditions together
-// admit no other reading: the walker has left src's players map, dst holds a claim for them, and dst's inbox
-// is still full to capacity (so the arrival cannot be sitting in it).
-func waitStalledMidTransfer(t *testing.T, src, dst *Zone) {
-	t.Helper()
-	waitCond(t, "the source is stalled mid-transferOut (claim taken, handover not yet queued)", func() bool {
-		return src.pop.Load() == 0 && dst.incoming.Load() == 1 && len(dst.inbox) == cap(dst.inbox)
-	})
-}
-
-// interceptTransfer runs `walk` (an intra-shard crossing out of src) and INTERCEPTS the handover: it returns
-// the transferInMsg itself, with dst's claim still held, dst's actor fully LIVE, and dst's inbox empty. The
-// caller completes the crossing whenever it likes with dst.post(arrival).
+// interceptArrival runs `trigger` (anything that resolves dst as an arrival destination and then delivers to
+// it asynchronously) and INTERCEPTS the message: it returns the message itself, with dst's claim still held,
+// dst's actor fully LIVE, and dst's inbox empty. The caller completes the delivery whenever it likes with
+// dst.post(arrival).
 //
-// This is the window the fix exists for, held open for as long as a test needs it: a live session that has
-// left the source's players map, is in no zone's players map, and is queued NOWHERE — its entire existence
-// recorded by the `incoming` claim and nothing else. Any quiescence consumer that does not read the claim must
-// conclude the zone is empty.
+// This is the window the fix exists for, held open for as long as a test needs it: a live session that is in
+// no zone's players map and is queued NOWHERE — its entire existence recorded by the `incoming` claim and
+// nothing else. Any quiescence consumer that does not read the claim must conclude the zone is empty.
+//
+// `want` identifies the intercepted message among the inbox fillers (everything else is discarded). `stalled`
+// is the PREMISE predicate: it must become true once the producer is provably blocked in its send with the
+// message enqueued nowhere. It must be CLAIM-FREE — never `dst.incoming == 1` — or the harness cannot be
+// pointed at an unfixed path: it would hang here and fail by TIMEOUT rather than by assertion, and red-by-
+// timeout is indistinguishable from a broken test. The claim is asserted AFTER the intercept instead, below.
 //
 // Why it goes to this trouble rather than simply parking dst with the arrival queued (what these tests used to
 // do): a queued arrival is ordered by FIFO ahead of any later flush/reclaim the consumer posts, so the test
@@ -141,49 +138,63 @@ func waitStalledMidTransfer(t *testing.T, src, dst *Zone) {
 // quiescence, which again hides the pre-fix behavior. Handing the message to the test is what gives the window
 // negative power against a live destination.
 //
-// The mechanics: stall the source in its send (stallSourceMidTransfer), then drain dst's inbox from the TEST
-// goroutine until the source's now-unblocked send lands in our hands. Filler messages are discarded; only the
-// arrival is kept. Releasing the park then leaves an ordinary idle zone.
-func interceptTransfer(t *testing.T, src, dst *Zone, walk func()) transferInMsg {
+// The mechanics: stall the producer in its send (stallProducersInto), then drain dst's inbox from the TEST
+// goroutine until the now-unblocked send lands in our hands. Releasing the park then leaves an ordinary idle
+// zone.
+func interceptArrival(t *testing.T, dst *Zone, want func(msg) bool, stalled func() bool, trigger func()) msg {
 	t.Helper()
-	release := stallSourceMidTransfer(t, dst)
-	walk()
-	waitStalledMidTransfer(t, src, dst)
+	release := stallProducersInto(t, dst)
+	trigger()
+	waitCond(t, "the producer is stalled mid-delivery (claim taken, message not yet queued)", stalled)
 
-	var arrival transferInMsg
+	var arrival msg
 	deadline := time.After(10 * time.Second)
-	for {
+	for arrival == nil {
 		select {
 		case m := <-dst.inbox:
-			if tm, ok := m.(transferInMsg); ok {
-				arrival = tm
-			} else {
-				continue // an inbox filler: discard and keep making room for the stalled send
+			if want(m) {
+				arrival = m
 			}
+			// Anything else is an inbox filler (or unrelated traffic): discard it and keep making room for
+			// the stalled send.
 		case <-deadline:
 			release()
-			t.Fatalf("the stalled source never landed its handover on zone %q", dst.id)
+			t.Fatalf("the stalled producer never landed its message on zone %q", dst.id)
 		}
-		break
 	}
 
 	// The park is no longer needed: with the arrival in hand, the destination can run freely and still not
-	// receive the walker. Wait for a full round trip through its goroutine so "live and idle" is asserted, not
+	// receive the session. Wait for a full round trip through its goroutine so "live and idle" is asserted, not
 	// assumed, before a test starts drawing conclusions from what it does next.
 	release()
 	waitCond(t, "the destination drains the remaining inbox fillers", func() bool { return len(dst.inbox) == 0 })
 	if _, ok := probePresent(dst, "nobody"); !ok {
 		t.Fatalf("zone %q did not answer a presence probe: its actor is not running, so a test that reads "+
-			"its quiescence would be measuring a wedged zone rather than an in-flight transfer", dst.id)
+			"its quiescence would be measuring a wedged zone rather than an in-flight arrival", dst.id)
 	}
+	// THE CLAIM, asserted rather than waited on (see the `stalled` note above). This is the red line for an
+	// unfixed producer: the message is in the test's hands and in no queue, so if the producer took no claim
+	// this reads 0 and the zone looks empty to every quiescence consumer.
 	if n := dst.incoming.Load(); n != 1 {
-		t.Fatalf("zone %q incoming = %d after intercepting the handover, want 1: the claim is the ONLY "+
-			"record that a live session is on its way here (#409)", dst.id, n)
+		t.Fatalf("zone %q incoming = %d after intercepting the arrival, want 1: the claim is the ONLY "+
+			"record that a live session is on its way here (#409/#413)", dst.id, n)
 	}
 	if n := dst.pop.Load(); n != 0 {
-		t.Fatalf("zone %q pop = %d: the handover was delivered after all, so the window is not open", dst.id, n)
+		t.Fatalf("zone %q pop = %d: the arrival was delivered after all, so the window is not open", dst.id, n)
 	}
 	return arrival
+}
+
+// interceptTransfer is interceptArrival specialized to the intra-shard transfer producer (#409): `walk` is a
+// crossing out of src, and the premise is that src's goroutine is inside transferOut past delPlayer with the
+// handover not yet enqueued. The premise predicate is claim-free for the reason interceptArrival documents.
+func interceptTransfer(t *testing.T, src, dst *Zone, walk func()) transferInMsg {
+	t.Helper()
+	m := interceptArrival(t, dst,
+		func(m msg) bool { _, ok := m.(transferInMsg); return ok },
+		func() bool { return src.pop.Load() == 0 && len(dst.inbox) == cap(dst.inbox) },
+		walk)
+	return m.(transferInMsg)
 }
 
 // newWalker builds a hand-made session with its own currentZone pointer (what a real connection has and what
@@ -238,7 +249,7 @@ func TestUnhostZoneRefusesADestinationWithATransferInFlight(t *testing.T) {
 			"attached to no room and owned by no zone, with the source forwarding their input to a stopped "+
 			"actor (#409)", err)
 	}
-	if !strings.Contains(err.Error(), "1 inbound transfer") {
+	if !strings.Contains(err.Error(), "1 inbound arrival") {
 		t.Fatalf("the refusal must name the in-flight transfer, got %v", err)
 	}
 	if sh.zoneByID("darkwood") == nil {
@@ -259,7 +270,7 @@ func TestUnhostZoneRefusesADestinationWithATransferInFlight(t *testing.T) {
 	if err == nil {
 		t.Fatal("UnhostZone tore down a zone with a resident player")
 	}
-	if strings.Contains(err.Error(), "1 inbound transfer") {
+	if strings.Contains(err.Error(), "1 inbound arrival") {
 		t.Fatalf("transferIn leaked its in-flight claim; the zone can never be unhosted again: %v", err)
 	}
 	if !strings.Contains(err.Error(), "1 resident player") {
@@ -312,7 +323,7 @@ func TestTransferInReleasesItsInFlightClaim(t *testing.T) {
 			z := tc.zone(t)
 			s := newTestPlayerEntity(z, "Arriver")
 
-			z.claimInboundTransfer()
+			z.claimInboundArrival()
 			z.postTransferIn(s, tc.room)
 			if got := z.incoming.Load(); got != 1 {
 				t.Fatalf("incoming after the claim = %d, want 1 (the claim is taken BEFORE the send, "+
@@ -440,44 +451,92 @@ func panicOnTransferShard(t *testing.T) (*Shard, func()) {
 	}
 }
 
-// TestTransferInReportsClaimUnderflow pins the OTHER end of the same wedge. transferIn releases a claim
-// unconditionally, so a producer that posts a transferInMsg without claiming first drives the counter
-// NEGATIVE — and a negative counter never reaches zero either. The zone is then permanently non-quiescent:
-// unhostable, un-rebalanceable, and a drain deadline burned in full, with no symptom at the point of the bug.
+// TestTransferInReportsClaimUnderflow pins the OTHER end of the same wedge, for ALL THREE producers that
+// release an arrival claim (#409/#413). Each handler releases unconditionally, so a producer that delivers
+// without claiming first drives the counter NEGATIVE — and a negative counter never reaches zero either. The
+// zone is then permanently non-quiescent: unhostable, un-rebalanceable, and a drain deadline burned in full,
+// with no symptom at the point of the bug.
 //
-// It cannot happen through claimTransferTarget, which is the whole reason it must be LOUD: it is the failure
-// mode of a future path that posts the message directly, and a silent hang gives that author nothing to go on.
+// It cannot happen through the claiming resolvers, which is the whole reason it must be LOUD: it is the
+// failure mode of a future path that delivers the message directly, and a silent hang gives that author
+// nothing to go on. The report must also NAME the producer — one shared releaseInboundArrival serves three
+// handlers, and "some arrival was unbalanced" would leave the reader to guess which of the three.
 func TestTransferInReportsClaimUnderflow(t *testing.T) {
+	demoZone := func() *Zone {
+		return NewMultiShard([]string{"darkwood"}, "darkwood", "", nil, nil).zoneByID("darkwood")
+	}
 	tests := []struct {
 		name         string
-		claim        bool
-		wantIncoming int64
-		wantReport   bool
+		deliver      func(t *testing.T, z *Zone)
+		wantProducer string
 	}{
-		{name: "claimed by the producer", claim: true, wantIncoming: 0},
-		{name: "posted without a claim", claim: false, wantIncoming: -1, wantReport: true},
+		{
+			name:         "intra-shard transfer",
+			wantProducer: "transfer",
+			deliver: func(t *testing.T, z *Zone) {
+				t.Helper()
+				z.transferIn(transferInMsg{s: newTestPlayerEntity(z, "Arriver"), room: "darkwood:room:grove"})
+			},
+		},
+		{
+			name:         "login attach",
+			wantProducer: "attach",
+			deliver: func(t *testing.T, z *Zone) {
+				t.Helper()
+				z.attach(attachMsg{character: "Newbie", out: make(chan *playv1.ServerFrame, 64)})
+			},
+		},
+		{
+			name:         "cross-shard prepare",
+			wantProducer: "prepare",
+			deliver: func(t *testing.T, z *Zone) {
+				t.Helper()
+				reply := make(chan error, 1)
+				z.prepare(prepareMsg{
+					snap:  &handoffv1.PlayerSnapshot{CharacterId: "Wayfarer", Name: "Wayfarer"},
+					room:  "darkwood:room:grove",
+					epoch: 1, token: "t", reply: reply,
+				})
+				<-reply
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			z := NewMultiShard([]string{"darkwood"}, "darkwood", "", nil, nil).zoneByID("darkwood")
-			errs := &errorLog{}
-			z.log = slog.New(errs) // set before any actor exists; this test drives the handler by hand
-			s := newTestPlayerEntity(z, "Arriver")
-
-			if tc.claim {
-				z.claimInboundTransfer()
-			}
-			z.transferIn(transferInMsg{s: s, room: "darkwood:room:grove"})
-
-			if got := z.incoming.Load(); got != tc.wantIncoming {
-				t.Fatalf("incoming after transferIn = %d, want %d", got, tc.wantIncoming)
-			}
-			got := errs.contains("underflow")
-			if got != tc.wantReport {
-				t.Fatalf("claim-underflow reported = %v, want %v: a negative counter wedges this zone "+
-					"against ever being unhosted or drained and must not be silent (#409); errors seen: %v",
-					got, tc.wantReport, errs.messages())
-			}
+			t.Run("claimed by the producer", func(t *testing.T) {
+				z := demoZone()
+				errs := &errorLog{}
+				z.log = slog.New(errs) // set before any actor exists; this test drives the handler by hand
+				z.claimInboundArrival()
+				tc.deliver(t, z)
+				if got := z.incoming.Load(); got != 0 {
+					t.Fatalf("incoming after a CLAIMED delivery = %d, want 0", got)
+				}
+				if errs.contains("underflow") {
+					t.Fatalf("a correctly-claimed delivery reported an underflow: %v", errs.messages())
+				}
+			})
+			t.Run("delivered without a claim", func(t *testing.T) {
+				z := demoZone()
+				errs := &errorLog{}
+				z.log = slog.New(errs)
+				tc.deliver(t, z)
+				if got := z.incoming.Load(); got != -1 {
+					t.Fatalf("incoming after an UNCLAIMED delivery = %d, want -1", got)
+				}
+				if !errs.contains("underflow") {
+					t.Fatalf("no claim-underflow report: a negative counter wedges this zone against ever "+
+						"being unhosted or drained and must not be silent (#409); errors seen: %v",
+						errs.messages())
+				}
+				// And it names WHICH producer is unbalanced. Three handlers share one release site, so a
+				// report that did not say which would leave an operator to guess among all three.
+				if !errs.contains(tc.wantProducer) {
+					t.Fatalf("the underflow report does not name the producer %q, so an operator cannot "+
+						"tell which of the three arrival paths is unbalanced; got: %v",
+						tc.wantProducer, errs.messages())
+				}
+			})
 		})
 	}
 }
@@ -491,10 +550,18 @@ type errorLog struct {
 
 func (l *errorLog) Enabled(_ context.Context, lvl slog.Level) bool { return lvl >= slog.LevelError }
 
+// Handle records the message WITH its attributes rendered in. The attrs are not decoration here: the
+// arrival-claim underflow report names the offending producer in an attr ("producer", "attach"), and a
+// recorder that kept only the message could not tell the three apart.
 func (l *errorLog) Handle(_ context.Context, r slog.Record) error {
+	line := r.Message
+	r.Attrs(func(a slog.Attr) bool {
+		line += " " + a.Key + "=" + a.Value.String()
+		return true
+	})
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.msgs = append(l.msgs, r.Message)
+	l.msgs = append(l.msgs, line)
 	return nil
 }
 
@@ -592,7 +659,7 @@ func TestClaimTransferTargetIsAtomicWithTeardown(t *testing.T) {
 			t.Fatalf("incoming after claimTransferTarget = %d, want 1", got)
 		}
 		err := sh.UnhostZone(context.Background(), "darkwood")
-		if err == nil || !strings.Contains(err.Error(), "1 inbound transfer") {
+		if err == nil || !strings.Contains(err.Error(), "1 inbound arrival") {
 			t.Fatalf("a claimed destination must refuse teardown, got %v", err)
 		}
 
@@ -1158,7 +1225,7 @@ func assertFrame(t *testing.T, s *session, substr string) {
 // real Redis directory and a real AdoptZone over bufconn because the teardown's ownership precondition is
 // answered by the directory — a fake leaser could not distinguish a correct refusal from a lucky one.
 //
-// Like the drain test, the walker is stalled in the REAL window (stallSourceMidTransfer): the handover is not
+// Like the drain test, the walker is stalled in the REAL window (stallProducersInto): the handover is not
 // queued to darkwood, so nothing but the claim records that a live session is on its way there. A rebalance
 // whose wait predicate does not consult `incoming` sees an empty zone and tears it down.
 func TestRebalanceKeepsAZoneWithATransferInFlight(t *testing.T) {

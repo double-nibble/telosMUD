@@ -328,7 +328,7 @@ func TestTransferInLandsRoomAffects(t *testing.T) {
 
 	// A player arrives via transferIn into the webbed room.
 	arriver := newTestPlayerEntity(z, "Arriver")
-	z.claimInboundTransfer() // transferIn releases a claim unconditionally; take one so the counter balances
+	z.claimInboundArrival() // transferIn releases a claim unconditionally; take one so the counter balances
 	z.transferIn(transferInMsg{s: arriver, room: room.proto})
 
 	if !preventsTag(arriver.entity, "move") {

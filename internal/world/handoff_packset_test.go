@@ -24,6 +24,7 @@ func TestPrepareRejectsUnknownItemPrototype(t *testing.T) {
 	snap := &handoffv1.PlayerSnapshot{CharacterId: "Ghosty", Name: "Ghosty", StateJson: string(raw)}
 
 	reply := make(chan error, 1)
+	dst.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dst.prepare(prepareMsg{snap: snap, room: "", epoch: 1, token: "tok", reply: reply})
 	if err := <-reply; err == nil {
 		t.Fatal("prepare accepted a handoff carrying an unknown item prototype; want rejection")
@@ -35,6 +36,7 @@ func TestPrepareRejectsUnknownItemPrototype(t *testing.T) {
 	// A clean carry (no items) is accepted and parks a pending entity.
 	snapOK := &handoffv1.PlayerSnapshot{CharacterId: "Cleanly", Name: "Cleanly"}
 	replyOK := make(chan error, 1)
+	dst.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dst.prepare(prepareMsg{snap: snapOK, room: "", epoch: 1, token: "tok2", reply: replyOK})
 	if err := <-replyOK; err != nil {
 		t.Fatalf("prepare rejected a clean no-carry handoff: %v", err)
@@ -54,6 +56,7 @@ func TestPrepareRejectsOversizedCarry(t *testing.T) {
 	small := StateJSON{Inventory: []ItemJSON{{ProtoRef: known}, {ProtoRef: known}}}
 	rawSmall, _ := json.Marshal(small)
 	replyS := make(chan error, 1)
+	dst.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dst.prepare(prepareMsg{
 		snap:  &handoffv1.PlayerSnapshot{CharacterId: "SmallBag", Name: "SmallBag", StateJson: string(rawSmall)},
 		epoch: 1, token: "s", reply: replyS,
@@ -68,6 +71,7 @@ func TestPrepareRejectsOversizedCarry(t *testing.T) {
 	}
 	rawBig, _ := json.Marshal(big)
 	replyB := make(chan error, 1)
+	dst.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dst.prepare(prepareMsg{
 		snap:  &handoffv1.PlayerSnapshot{CharacterId: "BigBag", Name: "BigBag", StateJson: string(rawBig)},
 		epoch: 1, token: "b", reply: replyB,

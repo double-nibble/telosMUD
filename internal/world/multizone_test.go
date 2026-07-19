@@ -128,7 +128,7 @@ func TestIntraShardForwarding(t *testing.T) {
 // placement goes through the real zone goroutine and exercises no special test path.
 func placeTestPlayer(t *testing.T, z *Zone, s *session, room ProtoRef) {
 	t.Helper()
-	z.claimInboundTransfer() // the shard-hosted path claims under s.mu (claimTransferTarget); this is the bare form
+	z.claimInboundArrival() // the shard-hosted path claims under s.mu (claimTransferTarget); this is the bare form
 	z.postTransferIn(s, room)
 }
 

@@ -131,6 +131,7 @@ func TestPrepareSanitizesSnapshotName(t *testing.T) {
 	z := newDemoZone("midgaard", newProtoCache())
 
 	reply := make(chan error, 1)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.prepare(prepareMsg{
 		snap:  &handoffv1.PlayerSnapshot{CharacterId: "Walker", Name: "Wa\x1blk\x07er"},
 		room:  "midgaard:room:temple",

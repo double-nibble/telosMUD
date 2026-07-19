@@ -18,6 +18,7 @@ func TestAttachRecordsVerifiedTier(t *testing.T) {
 	var cz atomic.Pointer[Zone]
 	loaded, loadedOK, _ := shard.loadCharacterSnapshot(context.Background(), "Buildy")
 
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.post(attachMsg{character: "Buildy", out: out, curZone: &cz, loaded: loaded, loadedOK: loadedOK, tier: "admin"})
 	waitPlayer(t, z, "Buildy", true)
 
@@ -39,6 +40,7 @@ func TestAttachDefaultsTierToPlayer(t *testing.T) {
 	var cz atomic.Pointer[Zone]
 	loaded, loadedOK, _ := shard.loadCharacterSnapshot(context.Background(), "Plain")
 
+	z.claimInboundArrival()                                                                           // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.post(attachMsg{character: "Plain", out: out, curZone: &cz, loaded: loaded, loadedOK: loadedOK}) // no tier
 	waitPlayer(t, z, "Plain", true)
 
@@ -198,6 +200,7 @@ func TestAdminLoginAppliesTierFlags(t *testing.T) {
 		out := make(chan *playv1.ServerFrame, 64)
 		var cz atomic.Pointer[Zone]
 		loaded, loadedOK, _ := shard.loadCharacterSnapshot(context.Background(), name)
+		z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 		z.post(attachMsg{character: name, out: out, curZone: &cz, loaded: loaded, loadedOK: loadedOK, tier: tier})
 		waitPlayer(t, z, name, true)
 		return z.players[name].entity

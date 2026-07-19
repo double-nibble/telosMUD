@@ -294,14 +294,13 @@ func TestHandoffIngressRefusesInstanceIDs(t *testing.T) {
 func TestDurableZoneRefRefusesAnInstance(t *testing.T) {
 	sh, cancel := runningShard(t, []string{"midgaard", "darkwood"}, "midgaard")
 	defer cancel()
-	ps := &playServer{shard: sh, log: sh.zones["midgaard"].log}
 
 	inst := mustMint(t, sh, "darkwood", "acct-1")
 	if sh.ZoneByID(inst.id) == nil {
 		t.Fatal("the minted instance is not hosted; the test would pass vacuously")
 	}
 
-	got := ps.resolveAttachZone("Hero", "", CharSnapshot{ZoneRef: inst.id}, true)
+	got := resolveAttachZone(sh, "Hero", "", CharSnapshot{ZoneRef: inst.id}, true)
 	if got == inst {
 		t.Fatal("a durable zone_ref naming a live INSTANCE attached the player straight into it")
 	}
@@ -310,7 +309,7 @@ func TestDurableZoneRefRefusesAnInstance(t *testing.T) {
 	}
 	// The CONTROL: an ordinary hosted durable zone is still honored, so the refusal is not "durable zone_ref
 	// is ignored".
-	if got := ps.resolveAttachZone("Hero", "", CharSnapshot{ZoneRef: "darkwood"}, true); got != sh.ZoneByID("darkwood") {
+	if got := resolveAttachZone(sh, "Hero", "", CharSnapshot{ZoneRef: "darkwood"}, true); got != sh.ZoneByID("darkwood") {
 		t.Fatalf("an ordinary durable zone_ref routed to %q, want darkwood", got.id)
 	}
 }

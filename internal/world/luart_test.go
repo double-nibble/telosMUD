@@ -494,6 +494,7 @@ func TestBareZoneHasInertLua(t *testing.T) {
 
 	out := make(chan *playv1.ServerFrame, 16)
 	var cz atomic.Pointer[Zone]
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.post(attachMsg{character: "Inert", out: out, curZone: &cz})
 	got := nextOutput(t, &session{character: "Inert", out: out})
 	if !strings.Contains(got, "no rooms") {
