@@ -10,6 +10,7 @@ import (
 
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/store"
+	"github.com/double-nibble/telosmud/tests/dblock"
 	"github.com/double-nibble/telosmud/tests/helpers"
 )
 
@@ -49,6 +50,7 @@ func uniq(t *testing.T, s string) string {
 // TestImportVersionRefusesForeignPackRefs is the headline: the collision is refused with a message naming
 // the owning pack and the remedy, instead of a raw SQLSTATE, and the whole import rolls back.
 func TestImportVersionRefusesForeignPackRefs(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	seeded, incoming := uniq(t, "seedpack"), uniq(t, "pullpack")
@@ -87,6 +89,7 @@ func TestImportVersionRefusesForeignPackRefs(t *testing.T) {
 // TestPurgePackThenImportSucceeds is the documented cutover, end to end: the refusal names a command, the
 // command works, and the pull then imports cleanly. A remedy nobody has verified is not a remedy.
 func TestPurgePackThenImportSucceeds(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	seeded, incoming := uniq(t, "seedpack"), uniq(t, "pullpack")
@@ -117,6 +120,7 @@ func TestPurgePackThenImportSucceeds(t *testing.T) {
 // is structurally invisible to that guard. The supported way to drop a registered pack is a manifest that
 // omits it, which prunes it UNDER the guard.
 func TestPurgePackRefusesARegisteredPack(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	registered := uniq(t, "registeredpack")
@@ -140,6 +144,7 @@ func TestPurgePackRefusesARegisteredPack(t *testing.T) {
 // reason the check is table-driven over every global-ref-PK table rather than just the zone tree. Two packs
 // with entirely DISJOINT zones can still collide on a shared attribute ref.
 func TestForeignRefDetectionCoversNonZoneTables(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	seeded, incoming := uniq(t, "seedpack"), uniq(t, "pullpack")
@@ -163,6 +168,7 @@ func TestForeignRefDetectionCoversNonZoneTables(t *testing.T) {
 // world's enabled set comes from the registry, so its rows are inert — and refusing it would break
 // environments that work today. The check must fire on an ACTUAL collision, never on mere unregisteredness.
 func TestDisjointSeedPackDoesNotBlockAPull(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	seeded, incoming := uniq(t, "seedpack"), uniq(t, "pullpack")
@@ -178,6 +184,7 @@ func TestDisjointSeedPackDoesNotBlockAPull(t *testing.T) {
 // always overwrite its OWN refs. `make seed` twice, or a re-import of the same pack, must keep working —
 // the check's `allowed` set is the batch's own names precisely so this stays a strip-replace.
 func TestReSeedingTheSamePackStillStripReplaces(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	pack := uniq(t, "seedpack")
@@ -194,6 +201,7 @@ func TestReSeedingTheSamePackStillStripReplaces(t *testing.T) {
 // another pack in the same version is legitimate and must not be mistaken for a foreign collision. Getting
 // this ordering wrong would break the ordinary rename-a-pack deploy.
 func TestImportVersionStillPrunesAPackItLegitimatelyDrops(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	oldPack, newPack := uniq(t, "oldpack"), uniq(t, "newpack")
@@ -221,6 +229,7 @@ func TestImportVersionStillPrunesAPackItLegitimatelyDrops(t *testing.T) {
 // an operator to `--purge-pack` a registered pack prints a command PurgePack is guaranteed to refuse, which
 // costs them the time to try it and teaches them the tool is broken.
 func TestImportPacksRefusesForeignPackRefs(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	pulled, reseeded := uniq(t, "pulledpack"), uniq(t, "seedpack")
@@ -258,6 +267,7 @@ func TestImportPacksRefusesForeignPackRefs(t *testing.T) {
 // TestUnregisteredOwnerStillGetsThePurgeRemedy is the other half: the seed→pull case DOES get the purge
 // command, and following it must actually work. Together these pin that the remedy tracks the registry.
 func TestUnregisteredOwnerStillGetsThePurgeRemedy(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
 	seeded, incoming := uniq(t, "seedpack"), uniq(t, "pullpack")
@@ -293,8 +303,10 @@ func cleanupPacks(ctx context.Context, p *store.Pool, packs ...string) {
 				if have != want {
 					continue
 				}
-				// A version with no packs prunes everything the registry lists. These tests are the only
-				// writers of the registry in this package, so this cannot strip content another test needs.
+				// A version with no packs prunes everything the registry lists. Safe ONLY because the
+				// caller holds the content-registry advisory lock (helpers.LockContentRegistry) for the
+				// whole test — without it this wipes the registry out from under a concurrently running
+				// test in another package, which is exactly the interference that turned CI red.
 				_, _, _, _ = p.ImportVersion(ctx, nil, store.VersionMeta{
 					ContentSHA: "cleanup-" + want, ManifestVersion: "cleanup",
 				})
