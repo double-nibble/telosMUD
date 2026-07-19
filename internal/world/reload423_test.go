@@ -307,3 +307,54 @@ func settleRefresh(t *testing.T, sh *Shard) {
 		return !sh.reloader.contentRefreshInFlight.Load() && !sh.reloader.contentStale.Load()
 	}, 5*time.Second, time.Millisecond, "the content refresh never quiesced")
 }
+
+// --- Scenario 2 visibility (#423) --------------------------------------------------------------------
+//
+// The validate gate stops BROKEN content from auto-deploying. It does nothing about content that is merely
+// VALID-but-unreviewed, because validatePacks is a HEALTH gate, not a PROVENANCE one — so the issue's
+// second scenario stays live: stage rows in pack A, never reload it, let somebody's reload of pack B carry
+// them fleet-wide. changedPacks does not stop that; it makes it legible, which is the difference between
+// an unreviewed deploy that is silent and one an operator can find afterwards.
+
+// TestChangedPacksSpotsAStagedZoneEdit is the core case: a zone whose room set moved between snapshots.
+func TestChangedPacksSpotsAStagedZoneEdit(t *testing.T) {
+	prev := content.Merge([]content.Pack{refreshTestPack()})
+	next := content.Merge([]content.Pack{refreshTestPack(
+		content.RoomDTO{Ref: "ct:room:entry", Name: "The Entry", Long: "Entry.", Exits: map[string]string{}},
+		content.RoomDTO{Ref: "ct:room:added", Name: "Added", Long: "Added.", Exits: map[string]string{}},
+	)})
+	require.Equal(t, []string{"ct"}, changedPacks(prev, next))
+	require.Empty(t, changedPacks(prev, prev), "an identical snapshot must report nothing")
+}
+
+// TestChangedPacksSpotsTheInstanceableFlag is the one that matters most, and the reason `instanceable` is
+// in the fingerprint at all: it is the control that bounds the instance faucet (#72), and it is the exact
+// flag the issue's cross-pack scenario turns on. A staged `instanceable: true` changes NO room and NO
+// exit, so a room-set-only comparison would call the snapshot unchanged and the deploy would stay silent.
+func TestChangedPacksSpotsTheInstanceableFlag(t *testing.T) {
+	base := refreshTestPack()
+	staged := refreshTestPack()
+	require.True(t, base.Zones[0].Instanceable, "fixture precondition")
+	base.Zones[0].Instanceable = false
+
+	require.Equal(t, []string{"ct"}, changedPacks(content.Merge([]content.Pack{base}), content.Merge([]content.Pack{staged})),
+		"an instanceable opt-in changes no room and no exit — it must still be reported")
+}
+
+// TestChangedPacksSpotsAnAddedOrRemovedZone covers both directions of the set difference, since a zone
+// DELETED from a pack emits no invalidation of its own and is otherwise the hardest change to notice.
+func TestChangedPacksSpotsAnAddedOrRemovedZone(t *testing.T) {
+	one := content.Merge([]content.Pack{{Pack: "p", Zones: []content.ZoneDTO{{Ref: "a"}}}})
+	two := content.Merge([]content.Pack{{Pack: "p", Zones: []content.ZoneDTO{{Ref: "a"}, {Ref: "b"}}}})
+	require.Equal(t, []string{"b"}, changedPacks(one, two), "an added zone")
+	require.Equal(t, []string{"b"}, changedPacks(two, one), "a removed zone")
+}
+
+// TestChangedPacksIsNilSafe — the first refresh after boot has no previous snapshot on some paths, and a
+// diff that panicked there would take out the refresh goroutine.
+func TestChangedPacksIsNilSafe(t *testing.T) {
+	lc := content.Merge([]content.Pack{refreshTestPack()})
+	require.Nil(t, changedPacks(nil, lc))
+	require.Nil(t, changedPacks(lc, nil))
+	require.Nil(t, changedPacks(nil, nil))
+}
