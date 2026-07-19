@@ -44,9 +44,9 @@ func TestCharacterProgressionSubtreesRoundTrip(t *testing.T) {
 	snap.State.Resources = map[string]world.ResourceJSON{"hp": {Cur: 42}, "mana": {Cur: 17}}
 	snap.State.Affects = []world.AffectJSON{{ID: "poison", Remaining: 30, Mag: 2.5, Stacks: 3}}
 
-	_, ok, err := pool.SaveCharacter(ctx, snap)
+	res, err := pool.SaveCharacter(ctx, snap)
 	require.NoError(t, err)
-	require.True(t, ok, "CAS save at the matching version should apply")
+	require.Equal(t, world.SaveApplied, res.Outcome, "CAS save at the matching version should apply")
 
 	reloaded, found, err := pool.LoadCharacter(ctx, name)
 	require.NoError(t, err)

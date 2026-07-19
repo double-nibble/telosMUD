@@ -51,6 +51,12 @@ import (
 // shrink it to exercise the timeout->thaw path quickly.
 var handoffRPCTimeout = 5 * time.Second
 
+// handoffClaimTimeout bounds the ownership mint at the top of a handoff (#432). It is deliberately
+// short and carved out of the overall handoffRPCTimeout budget: the mint is a single indexed UPDATE
+// on one row, so a slow one means the store is unhealthy, and a handoff that fails fast leaves the
+// player standing where they were rather than frozen while a wedged Postgres is waited on.
+var handoffClaimTimeout = 2 * time.Second
+
 // maxConcurrentHandoffs bounds the in-flight cross-shard handoff Prepares this shard runs at once, so a
 // graceful drain's fan-out over a whole zone paces its Prepares against the target instead of stampeding it
 // (16.4b review). A normal move is never throttled by a 32-deep pool.
@@ -1250,10 +1256,19 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 		ctx, cancel := context.WithTimeout(context.Background(), handoffRPCTimeout)
 		defer cancel()
 		character := snap.GetCharacterId()
-		newEpoch := epoch + 1
 		log := slog.With("component", "handoff", "player", character, "dest_zone", destZone)
 
-		fail := func(reason string) { src.post(handoffFailMsg{id: character, reason: reason}) }
+		// newEpoch is minted LATER, immediately before Prepare (see the mint block below). It is declared
+		// here so `fail` can carry it: every failure path after the mint must hand the epoch back to the
+		// source, or a thawed player is left holding an epoch below their own row and every save they
+		// make afterwards is refused as not-owner — a wedge manufactured by the rollback itself.
+		// Adopting is safe because the mint is exclusive: nobody else holds that value, and a failed
+		// handoff leaves the source the sole owner again. Before the mint it is 0, and the adoption is
+		// a max(), so a pre-mint failure adopts nothing.
+		var newEpoch uint64
+		fail := func(reason string) {
+			src.post(handoffFailMsg{id: character, reason: reason, adoptEpoch: newEpoch})
+		}
 
 		// Resolve the destination in two hops: which SHARD owns the zone, then where that
 		// shard is reachable. The zone exit named only a logical zone ("darkwood"); the
@@ -1277,6 +1292,57 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			log.Warn("cannot reach destination shard", "dest_shard", destShardID, "addr", addr, "err", err)
 			fail("destination unreachable")
 			return
+		}
+
+		// MINT the destination's ownership epoch from the durable row, not from our own (#432). A handoff
+		// is an ownership claim exactly as a login is, and both must draw from the SAME atomic counter or
+		// they can collide: a login mints row+1 while a concurrent handoff computes session+1, and if the
+		// row has not been saved since the session's last claim those are the same number. Two live
+		// copies at one epoch both satisfy `owner_epoch <= k`, and the fence silently degrades to the
+		// state_version ping-pong it was built to end.
+		//
+		// The mint sits HERE, after the destination is fully resolved and reachable, rather than at the
+		// top of the handoff. Minting earlier was correct but costly in two ways: every failed move —
+		// including one a player can drive at movement-command rate by walking at an exit whose
+		// destination shard is down — paid a `characters` row UPDATE, and the gap between "the row is
+		// raised" and "the source session has adopted the new epoch" spanned two directory round-trips
+		// and a peer dial. That gap is the window in which a cadence save enqueued before the move comes
+		// back not-owner against an epoch this very shard minted (Zone.ownershipLost bails on a frozen
+		// session for exactly that reason). Minting last shrinks it to the Prepare RPC.
+		//
+		// Falling back to epoch+1 keeps a storeless/ephemeral shard behaving exactly as before. The
+		// async-create window (a character whose CreateCharacter has not yet returned its PID) resolves
+		// the row BY NAME instead — the row may already exist even though this snapshot has no id, and
+		// treating that case as "nothing to fence" would leave the one exclusivity hole the shared
+		// counter is meant to close.
+		newEpoch = epoch + 1
+		if s.saver != nil && s.saver.store != nil {
+			cctx, ccancel := context.WithTimeout(context.Background(), handoffClaimTimeout)
+			pid := PersistID(snap.GetPersistId())
+			var cerr error
+			if pid == "" {
+				if row, found, lerr := s.saver.store.LoadCharacter(cctx, character); lerr == nil && found {
+					pid = row.PID
+				}
+			}
+			if pid != "" {
+				var ep uint64
+				ep, cerr = s.saver.store.ClaimCharacter(cctx, pid, epoch)
+				if cerr == nil {
+					newEpoch = ep
+				}
+			}
+			ccancel()
+			if cerr != nil {
+				// The claim is what makes the destination's epoch exclusive; proceeding on an unminted
+				// guess is the collision this exists to prevent. Fail instead — the source thaws the
+				// player where they stand, which is a movement hiccup, not data loss. newEpoch is still
+				// 0 here (the assignment above only runs on success), so `fail` adopts nothing.
+				newEpoch = 0
+				log.Warn("ownership claim for the handoff failed; aborting the move", "err", cerr)
+				fail("destination unreachable")
+				return
+			}
 		}
 
 		// Prepare the destination: it rehydrates the player as a pending entity. Sign the request so a

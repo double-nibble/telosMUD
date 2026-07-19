@@ -506,8 +506,8 @@ func TestSavingFromInsideAnInstancePreservesTheDurableAnchor(t *testing.T) {
 		t.Fatal("the snapshot carries no room either, so this test cannot show the inconsistent row")
 	}
 
-	if _, ok, err := mem.SaveCharacter(ctx, snap); err != nil || !ok {
-		t.Fatalf("SaveCharacter: ok=%v err=%v", ok, err)
+	if res, err := mem.SaveCharacter(ctx, snap); err != nil || res.Outcome != SaveApplied {
+		t.Fatalf("SaveCharacter: outcome=%v err=%v", res.Outcome, err)
 	}
 	if err := mem.Checkpoint(ctx, snap); err != nil {
 		t.Fatal(err)
@@ -539,8 +539,8 @@ func TestSavingFromInsideAnInstancePreservesTheDurableAnchor(t *testing.T) {
 	Move(s2.entity, dw.rooms["darkwood:room:grove"])
 	moved := dumpCharacter(s2)
 	moved.StateVersion = row.StateVersion
-	if _, ok, err := mem.SaveCharacter(ctx, moved); err != nil || !ok {
-		t.Fatalf("SaveCharacter (ordinary zone): ok=%v err=%v", ok, err)
+	if res, err := mem.SaveCharacter(ctx, moved); err != nil || res.Outcome != SaveApplied {
+		t.Fatalf("SaveCharacter (ordinary zone): outcome=%v err=%v", res.Outcome, err)
 	}
 	if again, _, _ := mem.LoadCharacter(ctx, "Hero"); again.ZoneRef != "darkwood" {
 		t.Fatalf("an ordinary zone change was not persisted: zone_ref = %q, want darkwood", again.ZoneRef)

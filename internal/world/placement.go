@@ -18,15 +18,21 @@ import (
 //
 // This file adds the missing write: every time a player becomes RESIDENT in a zone on this shard — a fresh
 // login, a link-dead resume, a cross-shard arrival, or an intra-shard zone transfer — we record
-// (shard, zone, epoch). None of those advance the epoch, which is why the directory exposes a separate
-// RegisterPlacement that accepts an equal epoch rather than reusing the strictly-greater handoff CAS.
+// (shard, zone, epoch). RegisterPlacement accepts an EQUAL epoch rather than reusing the strictly-greater
+// handoff CAS, because several of those paths legitimately re-assert an epoch they already hold.
 //
-// WHY SAME-EPOCH ACCEPTANCE IS SAFE (the load-bearing invariant, distsys review): an epoch value maps to
-// exactly ONE shard. Only the handoff coordinator bumps it, and exactly one casPlacement commits each bump,
-// so between handoffs the player sits on a single shard and only intra-shard transfers run at a constant
-// epoch. An equal-epoch write can therefore only ever rewrite the ZONE within the shard that already owns
-// the player — never name a different shard. That is what makes "accept equal" incapable of rolling a
-// player back to a shard they left.
+// WHY SAME-EPOCH ACCEPTANCE IS SAFE (the load-bearing invariant). The original derivation — "only the
+// handoff coordinator bumps the epoch, and exactly one casPlacement commits each bump" — is NO LONGER
+// TRUE as of #432, and leaving it here would have the next reader build on a false premise. A fresh
+// LOGIN now bumps the epoch too (server.go), and it commits that bump through this accept-equal
+// register, not through casPlacement.
+//
+// The conclusion survives on a stronger footing: every ownership claim — login and handoff alike — mints
+// its epoch from ONE atomic counter, `characters.owner_epoch`, via CharacterStore.ClaimCharacter. No two
+// claimants can ever receive the same value, so an epoch STILL maps to exactly one shard; it is now
+// mint exclusivity that guarantees it rather than CAS exclusivity. An equal-epoch write therefore
+// remains incapable of naming a different shard: only the single holder of that epoch can present it,
+// and all it can rewrite is the ZONE within the shard that already owns the player.
 //
 // The write is BLOCKING Redis I/O and every call site runs on a zone goroutine, so it is handed to a
 // background worker. The hand-off is a COALESCING map, not a FIFO queue: only a player's LATEST placement

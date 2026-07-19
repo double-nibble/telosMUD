@@ -40,21 +40,21 @@ func newCountingStore(delay time.Duration) *countingStore {
 	return &countingStore{MemStore: NewMemStore(), delay: delay, started: make(chan struct{})}
 }
 
-func (c *countingStore) SaveCharacter(ctx context.Context, snap CharSnapshot) (uint64, bool, error) {
+func (c *countingStore) SaveCharacter(ctx context.Context, snap CharSnapshot) (SaveResult, error) {
 	c.once.Do(func() { close(c.started) })
 	if c.delay > 0 {
 		select {
 		case <-time.After(c.delay):
 		case <-ctx.Done():
-			return 0, false, ctx.Err()
+			return SaveResult{}, ctx.Err()
 		}
 	}
 	c.saved.Add(1)
-	v, ok, err := c.MemStore.SaveCharacter(ctx, snap)
-	if ok && err == nil {
+	res, err := c.MemStore.SaveCharacter(ctx, snap)
+	if err == nil && res.Outcome == SaveApplied {
 		c.applied.Add(1)
 	}
-	return v, ok, err
+	return res, err
 }
 
 // runDrainShard starts the shard and returns a stop func that blocks until Run returns.

@@ -416,6 +416,11 @@ type handedOffMsg struct{ id string }
 type handoffFailMsg struct {
 	id     string
 	reason string
+	// adoptEpoch is the ownership epoch beginHandoff MINTED for this move before it failed (#432).
+	// The mint already raised the durable row, so a source thawed back at its old epoch would have
+	// every later save refused by a value it minted itself. The thaw adopts it (a max, never a
+	// lowering). Zero when no mint happened — a storeless shard, or a failure before the mint.
+	adoptEpoch uint64
 }
 
 // prepareMsg is the destination side: rehydrate the snapshot as a PENDING player in
@@ -453,6 +458,24 @@ type freezeExpireMsg struct {
 // it, so the next save's CAS matches. Reconciliation is single-writer (only the zone touches the
 // session) — the saver never mutates entity state off-goroutine (docs/PHASE4-PLAN.md §4).
 type saveConflictMsg struct{ id string }
+
+// saveNotOwnerMsg is posted BACK to the zone by the saver when a save lost the OWNERSHIP fence
+// (#432): the durable row's owner_epoch has moved past the epoch this session was minted at, so
+// another live copy of this character has claimed it and this one is a zombie.
+//
+// It is deliberately NOT a saveConflictMsg. A conflict means "somebody wrote; re-read and write
+// again", and answering an ownership loss that way is an unbounded loop on the shared saver drainer
+// that can never succeed — the retry rebases state_version, and the predicate it keeps losing on is
+// owner_epoch. It is also not a decision the saver may take alone: only the zone goroutine may read
+// or touch the session, and only it can tell a genuine zombie from a save that was merely in flight
+// across a legitimate epoch raise.
+//
+// ourEpoch is the epoch the refused snapshot carried; ownerEpoch is what the row holds now.
+type saveNotOwnerMsg struct {
+	id         string
+	ourEpoch   uint64
+	ownerEpoch uint64
+}
 
 // saveOkMsg carries a successful Postgres flush's bumped state_version back to the zone, so the
 // session's stateVersion advances in lockstep with the row (every save CASes on the prior value).
@@ -636,6 +659,7 @@ func (abortPendingMsg) zoneMsg()   {}
 func (pendingExpireMsg) zoneMsg()  {}
 func (freezeExpireMsg) zoneMsg()   {}
 func (saveConflictMsg) zoneMsg()   {}
+func (saveNotOwnerMsg) zoneMsg()   {}
 func (saveOkMsg) zoneMsg()         {}
 func (saveReconcileMsg) zoneMsg()  {}
 func (drainFlushMsg) zoneMsg()     {}
@@ -836,6 +860,8 @@ func (z *Zone) handle(m msg) {
 		z.leave(v.id)
 	case saveConflictMsg:
 		z.saveConflict(v.id)
+	case saveNotOwnerMsg:
+		z.ownershipLost(v)
 	case saveOkMsg:
 		z.saveOk(v.id, v.newVersion)
 	case saveReconcileMsg:
@@ -1464,6 +1490,16 @@ func (z *Zone) attach(m attachMsg) {
 			s.account = m.account
 		}
 		s.detached = false
+		// Adopt an ownership claim the login path minted for this reconnect, if it minted one (#432).
+		// server.go skips the claim when it can see the session is still resident here, so in the common
+		// case resumeEpoch is merely the resumed directory value and this raises nothing. It is a max(),
+		// never an assignment: a session's epoch must only ever go UP, or a re-attach could hand a live
+		// player an epoch below the row's and wedge every save it makes afterwards.
+		if resumeEpoch > s.epoch {
+			z.log.Debug("re-attach adopting a newer ownership epoch",
+				"player", character, "old_epoch", s.epoch, "new_epoch", resumeEpoch)
+			s.epoch = resumeEpoch
+		}
 		s.attachGen++
 		s.send(attachedFrame(z.id))
 		z.log.Debug("player re-attached", "player", character, "applied_seq", s.appliedSeq, "gen", s.attachGen)
@@ -1474,11 +1510,14 @@ func (z *Zone) attach(m attachMsg) {
 		z.sendPrompt(s)
 
 	default:
-		// Fresh login. Seed the epoch from the directory's persisted placement (read off the
-		// zone goroutine in server.go, threaded in as resumeEpoch) so it stays globally
-		// monotonic per player: a relog after any prior cross-shard move resumes at the stored
-		// epoch, and the NEXT move computes stored+1 — which the placement CAS accepts. Seed to
-		// EXACTLY the stored value (not +1); brand-new characters (resumeEpoch 0) start at 1.
+		// Fresh login. resumeEpoch is the epoch server.go CLAIMED for this login (#432) — minted
+		// atomically from the durable row, so it is strictly greater than any epoch a prior copy of
+		// this character holds and no two claimants can share it. It falls back to the directory's
+		// persisted placement epoch when there was nothing to claim against (a brand-new name, a
+		// storeless boot, or a re-attach whose claim server.go deliberately skipped), which keeps the
+		// pre-#432 monotonicity property: a relog after a cross-shard move resumes at the stored epoch
+		// and the next move computes stored+1, which the placement CAS accepts. Brand-new characters
+		// (resumeEpoch 0) start at 1.
 		epoch := resumeEpoch
 		if epoch < 1 {
 			epoch = 1
@@ -2023,6 +2062,21 @@ func (z *Zone) handoffFailed(v handoffFailMsg) {
 		return
 	}
 	s.frozen = false
+	// Adopt the epoch the failed handoff minted (#432). beginHandoff raised the durable row before the
+	// move failed, so without this the thawed player holds an epoch BELOW their own row and every save
+	// they make afterwards is refused as not-owner — a wedge produced by the rollback itself. Safe
+	// because the mint was exclusive: no other copy holds this value, and a failed handoff leaves this
+	// session the sole owner again. Zero when the handoff failed BEFORE minting, so this is a no-op there.
+	if v.adoptEpoch > s.epoch {
+		s.epoch = v.adoptEpoch
+		// Re-register the placement at the adopted epoch. The directory still holds the PRE-handoff value
+		// (SetPlayerShard never ran, or lost), and ClearPlayerShard fences the clean-logout tombstone on
+		// an EXACT epoch match — so without this the player's next quit offers the adopted epoch, misses,
+		// and the tombstone is silently rejected, leaving the record naming this shard after a clean
+		// logout. That is exactly the condition #70's tombstone exists to prevent. The register CAS
+		// accepts a strictly greater epoch, so it applies.
+		z.registerPlacement(s)
+	}
 	// Disengaged before freeze (the cross-shard path), so this is normally a no-op; stopFight defends
 	// against a future fighting-player freeze leaving the thawed player soft-locked posFighting with the
 	// driver retired (distsys S1). Restore the entity to the room it tried to leave: move() detached it
@@ -2119,6 +2173,100 @@ func (z *Zone) enqueueSave(id string, s *session, reason saveReason) {
 		return
 	}
 	z.saver.enqueue(saveRequest{snap: dumpCharacter(s), zone: z, id: id, reason: reason})
+}
+
+// ownershipLost handles a save refused by the OWNERSHIP fence (#432): the durable row's owner_epoch
+// has moved past this session's, so another live copy of the character has claimed it. Runs on the
+// zone goroutine — the only goroutine that may read or mutate a session.
+//
+// STALENESS CHECK FIRST, and it is the non-obvious half. A not-owner verdict describes the epoch the
+// refused SNAPSHOT carried, not the session's epoch now. A session legitimately RAISES its own epoch
+// (a cross-shard redirect adopts the handoff's minted epoch; a re-attach adopts a fresh login claim),
+// and any save already in flight when that happens comes back not-owner through no fault of its own.
+// Acting on it would disconnect the very session that just won the claim. So a verdict whose epoch is
+// below the session's current one is discarded as an echo of the past.
+//
+// Otherwise this session is a zombie: it cannot persist anything, ever again, because only a fresh
+// claim mints an epoch and this one will never get another. Continuing to accept its commands would
+// generate play that is silently unsaveable, so it is removed WITHOUT a save — saving is exactly what
+// the fence just refused — after a clear notice.
+//
+// WHAT THIS DOES NOT UNDO, stated plainly because the fence is easy to overclaim: the legitimate owner
+// elsewhere is untouched, but the WORLD is not. Anything the zombie externalized before it was detected
+// — items dropped for a confederate to pick up, materials spent, a turn-in credited — landed in ANOTHER
+// character's row, under that character's own epoch, and is unreachable from here. An epoch on row X
+// cannot fence a write to row Y. So the fence removes the ROLLBACK and with it the repeatability: a
+// duplication that needed only patience becomes a one-shot, alerted, crash-equivalent discard of the
+// zombie's own side. Closing the remainder needs a cross-row conservation invariant — durable item
+// identity plus paired transfer audit rows — which the engine does not have, and which is tracked
+// separately as its own piece of work.
+func (z *Zone) ownershipLost(m saveNotOwnerMsg) {
+	s := z.players[m.id]
+	if s == nil {
+		// The player walked to a sibling zone between the save's enqueue and this verdict. Forward it,
+		// exactly as leave() does — otherwise the zombie keeps playing unsaveably in the next zone,
+		// which is the one outcome this handler exists to prevent.
+		if dest := z.forwarding[m.id]; dest != nil {
+			dest.post(m)
+		}
+		return
+	}
+	// A FROZEN session is mid-handoff, and THIS shard minted the epoch that beat the save. beginHandoff
+	// raises the row before the destination RPCs, while the source session still holds its old epoch —
+	// so a cadence save enqueued before the move returns not-owner naming an epoch we minted ourselves.
+	// No epoch comparison can tell that apart from a genuine zombie, and evicting here would kick a
+	// legitimate player mid-move, discard their in-flight delta, and strand the redirect. The handoff
+	// already owns this session's fate on both branches: on success the source copy is reaped without a
+	// save, on failure it thaws and adopts the minted epoch.
+	if s.frozen || s.pending {
+		z.log.Debug("ignoring a not-owner verdict for a session mid-handoff; the handoff owns its fate",
+			"player", m.id, "verdict_epoch", m.ourEpoch)
+		return
+	}
+	// Compare against the epoch that BEAT us, not the one the refused snapshot carried. A session
+	// legitimately raises its own epoch (a re-attach adopting a fresh login claim, a redirect, a failed
+	// handoff adopting its mint), and a save already in flight across that raise comes back not-owner
+	// through no fault of its own. If the session has already caught up to (or past) the winning epoch,
+	// it IS the owner and the verdict is an echo.
+	if m.ownerEpoch <= s.epoch {
+		z.log.Debug("ignoring a stale not-owner verdict: the session already holds the winning epoch",
+			"player", m.id, "verdict_epoch", m.ourEpoch, "owner_epoch", m.ownerEpoch, "session_epoch", s.epoch)
+		return
+	}
+	// The alertable signal. A double-own is not supposed to be reachable; when one is detected, the
+	// operator wants to know which character and which two epochs, not just that a save was dropped.
+	z.log.Warn("evicting a session that lost ownership of its character: another copy has claimed it",
+		"event", "ownership_lost", "player", m.id, "zone", z.id,
+		"session_epoch", s.epoch, "owner_epoch", m.ownerEpoch)
+	if s.out != nil && !s.detached {
+		displacedKick(s.out, s.appliedSeq)
+	}
+	// Remove without a save. The pending final-flush stash (if any) is dropped for the same reason:
+	// replaying it later would be the force-write under another name.
+	z.dropFinalFlush(m.id)
+	z.leaveNoSave(m.id, s)
+}
+
+// leaveNoSave removes a session and unwinds its zone-side registrations WITHOUT any durable write —
+// the shape reapHandedOffOrphan uses for a handed-off source copy, reused for an ownership eviction
+// (#432). Zone goroutine.
+func (z *Zone) leaveNoSave(id string, s *session) {
+	if s.entity != nil && s.entity.location != nil {
+		z.actConceal("$n leaves.", s.entity, ToRoom)
+		Move(s.entity, nil)
+	}
+	if z.lua != nil && s.entity != nil {
+		z.lua.dropEntityScript(s.entity.rid)
+	}
+	if z.shard != nil && s.token != "" {
+		z.shard.dropToken(s.token) // mirror reapHandedOffOrphan: never leak a token entry
+	}
+	z.delPlayer(id)
+	z.presenceLeave(id)
+	z.stopTellConsumer(id)
+	// leave() ends with this and reapHandedOffOrphan forgets it; without it an evicted session leaves
+	// the zone's occupancy gauge permanently inflated (z.pop is correct either way, via delPlayer).
+	metrics.SetOccupancy(context.Background(), z.metricZone(), int64(len(z.players)))
 }
 
 // saveOk advances the session's state_version to the value the Postgres CAS bumped it to, so the

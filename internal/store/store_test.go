@@ -94,12 +94,12 @@ func TestCharacterCRUD(t *testing.T) {
 		AFK:      true,
 		AFKMsg:   "back soon",
 	}
-	newV, ok, err := p.SaveCharacter(ctx, snap)
-	if err != nil || !ok {
-		t.Fatalf("save (matching version): ok=%v err=%v, want ok", ok, err)
+	res, err := p.SaveCharacter(ctx, snap)
+	if err != nil || res.Outcome != world.SaveApplied {
+		t.Fatalf("save (matching version): outcome=%v err=%v, want applied", res.Outcome, err)
 	}
-	if newV != 1 {
-		t.Fatalf("save bumped version to %d, want 1", newV)
+	if res.NewVersion != 1 {
+		t.Fatalf("save bumped version to %d, want 1", res.NewVersion)
 	}
 
 	reloaded, _, err := p.LoadCharacter(ctx, name)
@@ -142,15 +142,16 @@ func TestCharacterCRUD(t *testing.T) {
 		t.Fatalf("reloaded ignore list = %v, want 2 entries", reloaded.State.Comms.Ignore)
 	}
 
-	// A STALE save (still holding version 0) must LOSE the CAS — the zombie-writer fence.
+	// A STALE save (still holding version 0) must LOSE the CAS — the zombie-writer fence. It carries the
+	// same owner epoch as the winner, so the refusal is the state_version contention miss specifically.
 	stale := snap
 	stale.StateVersion = 0
-	_, ok, err = p.SaveCharacter(ctx, stale)
+	res, err = p.SaveCharacter(ctx, stale)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
-		t.Fatal("stale save at version 0 must lose the CAS after the row moved to version 1")
+	if res.Outcome != world.SaveStaleVersion {
+		t.Fatalf("stale save at version 0 must lose the CAS after the row moved to version 1: outcome=%v", res.Outcome)
 	}
 
 	// Loading an unknown name is found=false, not an error.
@@ -203,7 +204,7 @@ func TestSaveCharacterConcurrentCAS(t *testing.T) {
 
 	const writers = 8
 	type result struct {
-		ok      bool
+		outcome world.SaveOutcome
 		version uint64
 		err     error
 		room    string
@@ -223,21 +224,22 @@ func TestSaveCharacterConcurrentCAS(t *testing.T) {
 			snap := base
 			snap.RoomRef = roomForWriter(i)
 			start.Wait() // released simultaneously below
-			v, ok, err := p.SaveCharacter(ctx, snap)
-			results[i] = result{ok: ok, version: v, err: err, room: snap.RoomRef}
+			res, err := p.SaveCharacter(ctx, snap)
+			results[i] = result{outcome: res.Outcome, version: res.NewVersion, err: err, room: snap.RoomRef}
 		}(i)
 	}
 
 	start.Done() // fire all writers at once: the CAS now genuinely contends on the single row.
 	done.Wait()
 
-	// INVARIANT 1: exactly one writer won the CAS; every other was cleanly rejected (ok=false, no error).
+	// INVARIANT 1: exactly one writer won the CAS; every other was cleanly rejected (a refusal outcome, no
+	// error). All writers share the base snapshot's owner epoch, so the losers lose on state_version.
 	wins, winner := 0, -1
 	for i, r := range results {
 		if r.err != nil {
-			t.Fatalf("writer %d returned an ERROR (a lost CAS must be ok=false, not an error): %v", i, r.err)
+			t.Fatalf("writer %d returned an ERROR (a lost CAS must be a refusal outcome, not an error): %v", i, r.err)
 		}
-		if r.ok {
+		if r.outcome == world.SaveApplied {
 			wins++
 			winner = i
 			if r.version != 1 {
@@ -926,8 +928,8 @@ func TestSaveCharacterEmptyZoneRefPreservesTheStoredZone(t *testing.T) {
 
 	// The instance-occupant save: no zone, but a real (template-authored) room.
 	snap.ZoneRef, snap.RoomRef = "", "darkwood:room:lair"
-	if _, ok, err := p.SaveCharacter(ctx, snap); err != nil || !ok {
-		t.Fatalf("save: ok=%v err=%v", ok, err)
+	if res, err := p.SaveCharacter(ctx, snap); err != nil || res.Outcome != world.SaveApplied {
+		t.Fatalf("save: outcome=%v err=%v", res.Outcome, err)
 	}
 	reloaded, _, err := p.LoadCharacter(ctx, name)
 	if err != nil {
@@ -945,8 +947,8 @@ func TestSaveCharacterEmptyZoneRefPreservesTheStoredZone(t *testing.T) {
 
 	// The CONTROL: a real zone change is still written, so "" is the only preserving value.
 	reloaded.ZoneRef, reloaded.RoomRef = "crypt", "crypt:room:entrance"
-	if _, ok, err := p.SaveCharacter(ctx, reloaded); err != nil || !ok {
-		t.Fatalf("save (zone change): ok=%v err=%v", ok, err)
+	if res, err := p.SaveCharacter(ctx, reloaded); err != nil || res.Outcome != world.SaveApplied {
+		t.Fatalf("save (zone change): outcome=%v err=%v", res.Outcome, err)
 	}
 	if again, _, _ := p.LoadCharacter(ctx, name); again.ZoneRef != "crypt" {
 		t.Fatalf("a real zone change was not written: zone_ref = %q, want crypt", again.ZoneRef)

@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -216,8 +217,19 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	var loadedOK bool
 	if token == "" {
 		lctx, lcancel := context.WithTimeout(stream.Context(), 2*time.Second)
-		loaded, loadedOK = s.shard.loadCharacterSnapshot(lctx, character)
+		var unreadable bool
+		loaded, loadedOK, unreadable = s.shard.loadCharacterSnapshot(lctx, character)
 		lcancel()
+		if unreadable {
+			// The durable tier is configured but could not be read. Falling through would take the
+			// BRAND-NEW-character branch for a character that very likely has a row — spawning a blank
+			// copy in the start room, whose create then collides on the unique name, leaving the player
+			// with an ephemeral session that persists nothing (#432). Refusing is both honest and the
+			// same fail-closed rule the ownership claim below applies.
+			s.log.Error("durable character read failed; refusing the login rather than spawning a blank copy",
+				"character", character)
+			return status.Error(codes.Unavailable, "character store unavailable; reconnect")
+		}
 	}
 
 	// Decide which hosted zone this connection starts in. This runs AFTER the snapshot load because the
@@ -255,6 +267,58 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		s.log.Error("no zone to attach to", "character", character, "home", s.shard.home)
 		return status.Error(codes.Unavailable, "no hosted zone; reconnect")
 	}
+	// CLAIM OWNERSHIP (#432). A login is an ownership assertion, and until this existed it was not
+	// expressed as one anywhere: the epoch was RESUMED at its stored value, so a second login on a
+	// different shard came up holding the same epoch as the copy it was displacing, and the two
+	// force-wrote over each other. ClaimCharacter mints the next epoch atomically from the durable row,
+	// so every claimant gets a distinct, strictly greater value and an epoch names exactly one live copy.
+	//
+	// The floor is max(directory, row) and is a FLOOR, not a source. The directory contributes the
+	// placement epoch of a character whose last handoff outran its last save; the row contributes the
+	// authoritative high-water mark. Taking the max is what keeps an evicted or unreachable directory
+	// (Redis, TTL'd, #340) from minting BELOW a live character's last epoch — which would wedge them
+	// into a session whose every save is refused for its whole lifetime. A directory read failure
+	// already degrades to 0 above; with the row in the floor, that costs nothing.
+	//
+	// WHEN WE DO NOT CLAIM:
+	//   - token != ""  — a handoff re-dial. Its epoch was already minted by the source's beginHandoff
+	//     and rides the signed Prepare; claiming here would bump the row past the arriving session and
+	//     wedge the very player being handed to us.
+	//   - a session for this character is STILL HELD on this shard (the #321 residency index) — a
+	//     re-attach, not a new claim. We already own it. Claiming would raise the row above the held
+	//     session's epoch, and until it adopted the new value its in-flight saves would come back
+	//     not-owner: a live player, unsaveable and (worse) evictable, from an ordinary reconnect.
+	//   - no durable row (a brand-new name, or a storeless/ephemeral boot) — there is nothing to fence
+	//     and nothing to fence against. The row is created at owner_epoch 0 and the first save arms it.
+	claimed := resumeEpoch
+	if token == "" && loadedOK && loaded.PID != "" && s.shard.saver != nil && s.shard.saver.store != nil &&
+		s.shard.zoneForResidentCharacter(character) == nil {
+		floor := resumeEpoch
+		if loaded.OwnerEpoch > floor {
+			floor = loaded.OwnerEpoch
+		}
+		cctx, ccancel := context.WithTimeout(stream.Context(), 2*time.Second)
+		ep, cerr := s.shard.saver.store.ClaimCharacter(cctx, loaded.PID, floor)
+		ccancel()
+		switch {
+		case cerr == nil:
+			claimed = ep
+			s.log.Debug("ownership claimed", "character", character, "epoch", ep, "floor", floor)
+		case errors.Is(cerr, ErrNoCharacterRow):
+			// The row vanished between the load and the claim (a soft delete). Nothing to fence; fall
+			// through unclaimed and let the ordinary login path handle the missing row.
+			s.log.Warn("ownership claim found no row; continuing unfenced", "character", character)
+		default:
+			// FAIL CLOSED. We could admit this login at the resumed epoch, as the code did before — but
+			// a session that could not claim cannot be proven to be the owner, and the same store outage
+			// that refused the claim will refuse its saves. Admitting it means hours of play that is
+			// silently unpersistable, which is strictly worse for the player than being told to
+			// reconnect. Unavailable is the code the gate already retries on.
+			s.log.Error("ownership claim failed; refusing the login", "character", character, "err", cerr)
+			return status.Error(codes.Unavailable, "could not claim character ownership; reconnect")
+		}
+	}
+
 	var currentZone atomic.Pointer[Zone]
 	currentZone.Store(zone)
 
@@ -324,7 +388,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		token:       token,
 		out:         out,
 		curZone:     &currentZone,
-		resumeEpoch: resumeEpoch,
+		resumeEpoch: claimed,
 		inputSeq:    attach.GetInputSeq(),
 		loaded:      loaded,
 		loadedOK:    loadedOK,

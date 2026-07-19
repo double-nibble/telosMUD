@@ -327,9 +327,9 @@ func TestPendingChargenRoundTrip(t *testing.T) {
 	assert.Equal(t, 15.0, snap.PendingChargen.Attrs["strength"])
 
 	// The first save (after the world applies + persists the built state) clears the marker.
-	_, ok, err := p.SaveCharacter(ctx, snap)
+	res, err := p.SaveCharacter(ctx, snap)
 	require.NoError(t, err)
-	require.True(t, ok)
+	require.Equal(t, world.SaveApplied, res.Outcome)
 	snap2, found, err := p.LoadCharacter(ctx, name)
 	require.NoError(t, err)
 	require.True(t, found)
