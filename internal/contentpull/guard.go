@@ -14,6 +14,20 @@ import (
 // first. The uncoordinated CLI importer (cmd/telos-pull) has no fleet view and sets no guard, so this is
 // purely the in-game/coordinated path's extra safety.
 //
+// # The deferred-harm argument applies to LEASED zones only (#416)
+//
+// The paragraph below argues a prune is survivable because shard memory is authoritative, so the harm is
+// deferred to the next reconcile — i.e. to the rolling reboot the guard is telling the operator to do
+// anyway. That reasoning holds for a leased zone. It does NOT hold for an INSTANCE TEMPLATE: instances are
+// minted continuously, and the very next MintInstance after a prune fails validateMintTemplate with "no
+// such zone", which is a runtime failure with no operator action in between.
+//
+// Instances also take no lease, and a dungeon template is typically never in cfg.Zones at all, so the
+// hosting question had to be answered a second way. The locator now also consults a TTL'd template-in-use
+// claim each shard heartbeats. That adds a THIRD window to the two enumerated below: a template whose first
+// copy is being minted right now is advertised at mint rather than on a tick, so the window is narrow, but a
+// dropped kick leaves it unadvertised until the next heartbeat.
+//
 // The guard is ADVISORY, not a transactional invariant. Zone hosting is a fleet/directory fact, not a
 // Postgres row, so ImportVersion's tx cannot lock it — there are two windows the pre-flight check cannot
 // close: (1) a zone can become hosted (a player walks in) AFTER the check but before the prune commits;

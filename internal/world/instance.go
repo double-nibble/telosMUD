@@ -386,6 +386,10 @@ func (s *Shard) MintInstance(ctx context.Context, templateRef, accountID string)
 	// Metrics label by TEMPLATE (see zone.go's occupancy/tick-lag sites): an instance id is unbounded,
 	// player-driven cardinality and must never become an OTel attribute. The VALUE must be per-template too —
 	// see instanceCountLocked for why the shard-wide total is not merely imprecise here but wrong.
+	// Advertise the template NOW rather than waiting for the heartbeat's next tick (#416). This matters most
+	// for a template's FIRST live copy: with no prior claim in the directory, the prune guard would read
+	// "nobody is using this" for a zone a party is standing in. Non-blocking — never make a mint wait on Redis.
+	s.kickTemplateUse(templateRef)
 	metrics.SetInstances(ctx, liveForTemplate, templateRef)
 	slog.Info("minted zone instance", "zone", id, "template", templateRef, "account", accountID,
 		"live_for_template", liveForTemplate, "live_instances", liveTotal)
@@ -627,6 +631,127 @@ func (s *Shard) runInstanceReaper(ctx context.Context) {
 		case <-t.C:
 			s.reapIdleInstances(ctx)
 		}
+	}
+}
+
+var (
+	// templateUseInterval is the cadence of the template-in-use heartbeat (#416).
+	//
+	// It is the reaper's interval but NOT the reaper's ticker, and that separation is the whole point. The
+	// heartbeat first rode the reaper's tick, which made its renewal cadence `interval + sweepDuration` —
+	// and the sweep is serial over UnhostZone, each call waiting up to unhostActorGrace (10s) on an actor
+	// (#419). Five wedged instances therefore stretched the gap past the TTL and lapsed EVERY claim on the
+	// shard, including healthy templates with parties inside them, which is precisely the fail-open #416
+	// exists to close. Worse, wedged actors are a correlated condition (a stalled store, GC pressure), and
+	// the sweep is longest right after a busy period — exactly when live templates matter most.
+	//
+	// A TTL sized against a cadence that a colocated operation can stretch without bound is a margin on
+	// paper. Its own goroutine makes the cadence real.
+	templateUseInterval = 15 * time.Second
+
+	// templateUseTTL is how long a published claim survives without renewal.
+	//
+	// Three intervals, not one: a TTL equal to the cadence lapses on any tick that runs slightly late, and a
+	// lapsed claim reads to the prune guard as "nobody is using this template" — the one answer that lets a
+	// pack be stripped out from under live parties. Three means two consecutive missed renewals before that
+	// can happen, while still expiring a genuinely crashed shard's claim inside a minute.
+	templateUseTTL = 3 * templateUseInterval
+)
+
+// runTemplateUsePublisher heartbeats this shard's in-use instance templates to the directory (#416).
+// Started by Run, on its OWN goroutine and ticker — see templateUseInterval for why it is not the reaper's.
+//
+// It also serves the mint KICK. A template whose first copy has just been minted would otherwise be
+// invisible to the prune guard until the next tick, and that is the worst case there is: a brand-new
+// template has no prior claim to fall back on, so the guard would read "nobody is using this" for a zone a
+// party is standing in. The kick advertises on creation, so the claim's lifecycle is
+// advertise-on-create → renew-on-tick → expire-on-death, with no cold-start hole.
+func (s *Shard) runTemplateUsePublisher(ctx context.Context) {
+	if s.tmplUsePublisher == nil {
+		return // no directory: nothing to advertise to
+	}
+	t := time.NewTicker(templateUseInterval)
+	defer t.Stop()
+	s.publishTemplatesInUse(ctx) // advertise immediately; do not make a restart wait a full interval
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.publishTemplatesInUse(ctx)
+		case tmpl := <-s.tmplUseKick:
+			// One template, one write — the freshly minted one. The periodic sweep still covers it from the
+			// next tick on, so a dropped kick (full channel) costs at most one interval.
+			s.publishTemplateClaims(ctx, []string{tmpl})
+		}
+	}
+}
+
+// kickTemplateUse asks the publisher goroutine to advertise template NOW, without blocking the caller.
+//
+// Non-blocking on purpose. The caller is a mint worker, and there are only a few of them: letting a slow
+// directory occupy one would turn a Redis blip into player-visible mint latency, or into mint refusals once
+// the queue backs up. A dropped kick is not a lost claim — the periodic sweep picks the template up on the
+// next tick.
+func (s *Shard) kickTemplateUse(template string) {
+	if s.tmplUsePublisher == nil || s.tmplUseKick == nil || template == "" {
+		return
+	}
+	select {
+	case s.tmplUseKick <- template:
+	default:
+	}
+}
+
+// publishTemplatesInUse heartbeats the DISTINCT templates this shard currently has live instances of (#416).
+//
+// One claim per TEMPLATE, never per instance. A template ref is authored content, so the keyspace is bounded
+// by the pack; an instance id is minted per dungeon run from 128 bits of randomness, and putting an
+// unbounded player-driven keyspace into the directory is exactly what #411 declined to do when it made
+// instances unleased.
+//
+// It counts RESERVED records too, not only published ones. A reserved record is a mint in flight — positive
+// evidence that somebody is running copies of this template right now — and the asymmetry decides it: over-
+// advertising delays a legitimate prune by at most the TTL, while under-advertising strips a pack out from
+// under a live party. The only cost of a mint that then fails is one TTL of an unprunable template.
+//
+// Runs off every zone goroutine.
+func (s *Shard) publishTemplatesInUse(ctx context.Context) {
+	// Snapshot under mu, publish outside it: the publish is network I/O and must not be held across the
+	// mutex that every routing read (zoneByID, claimTransferTarget) takes.
+	s.mu.Lock()
+	seen := make(map[string]struct{}, len(s.instances))
+	templates := make([]string, 0, len(s.instances))
+	for _, rec := range s.instances {
+		if _, dup := seen[rec.template]; dup {
+			continue
+		}
+		seen[rec.template] = struct{}{}
+		templates = append(templates, rec.template)
+	}
+	s.mu.Unlock()
+	s.publishTemplateClaims(ctx, templates)
+}
+
+// publishTemplateClaims writes one batch of template claims. Best-effort: a failure leaves the claims to
+// lapse and the next tick retries, logged at Warn because a lapsed claim is the precondition for the very
+// fail-open this signal exists to close — it should be visible to an operator, not buried at Debug.
+// templateUsePublishTimeout bounds one batched claim write. One round trip, so this is generous.
+const templateUsePublishTimeout = 2 * time.Second
+
+func (s *Shard) publishTemplateClaims(ctx context.Context, templates []string) {
+	if s.tmplUsePublisher == nil || len(templates) == 0 {
+		return
+	}
+	pctx, cancel := context.WithTimeout(ctx, templateUsePublishTimeout)
+	defer cancel()
+	// ONE batched call, not one per template. A serial loop under a single shared deadline degrades in the
+	// worst possible shape: once the budget is spent, every REMAINING template silently fails, and Go
+	// randomizes map order so the starved subset rotates each tick — a lapse that is both invisible and
+	// unreproducible. Batching makes the whole tick one round trip and one outcome.
+	if err := s.tmplUsePublisher.SetTemplatesInUse(pctx, templates, s.shardID, templateUseTTL); err != nil {
+		slog.Warn("instance template in-use publish failed; the claims may lapse and a content pull could "+
+			"prune a pack that has live instances", "templates", templates, "err", err)
 	}
 }
 

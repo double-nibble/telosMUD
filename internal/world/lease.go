@@ -77,6 +77,25 @@ func (s *Shard) WithOccupancyPublisher(p ZoneOccupancyPublisher) *Shard {
 	return s
 }
 
+// TemplateUsePublisher advertises that this shard is running live instances of a content template (#416),
+// so the content-pull prune guard can see a template that has copies but no lease. *directory.Redis
+// satisfies it; nil disables publishing.
+type TemplateUsePublisher interface {
+	// SetTemplatesInUse claims a BATCH in one call. Batched rather than one call per template because a
+	// serial loop under a shared deadline fails in the worst shape available: once the budget is spent every
+	// remaining template silently fails, and Go randomizes map order, so the starved subset rotates each
+	// tick — a lapse that is invisible in logs and unreproducible when an operator goes looking.
+	SetTemplatesInUse(ctx context.Context, templates []string, shardID string, ttl time.Duration) error
+}
+
+// WithTemplateUsePublisher wires the directory port the shard heartbeats its in-use instance TEMPLATES to
+// (#416). Optional, and disabled on any shard without a directory — a single-shard or test deployment has
+// no fleet-coordinated pull to guard against.
+func (s *Shard) WithTemplateUsePublisher(p TemplateUsePublisher) *Shard {
+	s.tmplUsePublisher = p
+	return s
+}
+
 // leaseParams returns the effective ttl + renew cadence (applying defaults for zero values).
 func (s *Shard) leaseParams() (ttl, renew time.Duration) {
 	ttl = s.leaseTTL
