@@ -132,7 +132,30 @@ type MailReaper interface {
 // over internal/contentpull) so the director package stays free of the git/store/content dependencies.
 // A nil puller means the director does not run coordinated pulls.
 type ContentPuller interface {
-	Pull(ctx context.Context, version, actor string) error
+	Pull(ctx context.Context, spec PullSpec) (PullOutcome, error)
+}
+
+// PullOutcome is what a completed pull reports BACK. It exists because the request side was made a struct
+// while the response side stayed a bare error, which left the forced-prune record with nowhere to go: the
+// packs an operator overrode were computed, logged in the director's process, and then dropped on the floor
+// before reaching the person who typed the command. A break-glass action whose report does not reach the
+// operator is not audited, it is just logged somewhere else.
+type PullOutcome struct {
+	// ForcedPacks are packs the live-hosted-pack guard BLOCKED that a forced pull stripped anyway (#427).
+	// Empty on every ordinary pull, including a forced one that turned out to block nothing.
+	ForcedPacks []string
+}
+
+// PullSpec is one coordinated-pull request as the director hands it to the puller. It is a STRUCT rather
+// than positional arguments deliberately: Force is a player-affecting override, and a positional bool at an
+// interface boundary is how one gets passed by accident. (It also retires the `actor` parameter the old
+// signature declared and the implementation ignored.)
+type PullSpec struct {
+	Version string // the published content version (git tag/SHA) to install
+	Actor   string // the character id who requested it, for logging/audit
+	// Force overrides the live-hosted-pack prune guard. The guard STILL RUNS when it is set — the blocked
+	// list is computed, logged and reported back — it simply no longer aborts the pull. See #427.
+	Force bool
 }
 
 // New builds a director for a scope. regionID "" makes the WORLD director; a non-empty ref makes that

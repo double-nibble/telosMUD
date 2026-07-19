@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -111,5 +112,69 @@ func TestFleetPruneGuardPropagatesListerError(t *testing.T) {
 
 	if _, err := guard(context.Background(), fakeLister{err: boom}, []string{"a"}); !errors.Is(err, boom) {
 		t.Fatalf("guard err = %v, want it to wrap the lister error", err)
+	}
+}
+
+// --- #427: the operator override -------------------------------------------------------------------
+
+// TestPruneDecision covers the whole of the override's decision logic. The guard is advisory by design,
+// but before #427 a blocked pack aborted the entire pull with no way to say "I know, do it anyway" — and
+// since #416 made the guard see instance templates, one idle player in a dungeon copy could hold every
+// content deploy indefinitely.
+func TestPruneDecision(t *testing.T) {
+	cases := []struct {
+		name       string
+		blocked    []string
+		force      bool
+		wantErr    bool
+		wantForced []string
+	}{
+		{name: "nothing blocked proceeds", blocked: nil, force: false},
+		{name: "nothing blocked, force is a no-op", blocked: nil, force: true},
+		{name: "blocked without force REFUSES", blocked: []string{"dungeons"}, force: false, wantErr: true},
+		{
+			name:    "blocked WITH force proceeds and records what was overridden",
+			blocked: []string{"dungeons", "raids"}, force: true,
+			wantForced: []string{"dungeons", "raids"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			forced, err := pruneDecision("v1", tc.blocked, tc.force)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected a refusal")
+				}
+				// The refusal must point at the way out, or the operator is stuck with no next step.
+				if !strings.Contains(err.Error(), "force") {
+					t.Fatalf("the refusal must mention the override; got: %v", err)
+				}
+				if forced != nil {
+					t.Fatalf("a refusal must record nothing as force-pruned; got %v", forced)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(forced, tc.wantForced) {
+				t.Fatalf("forced = %v, want %v", forced, tc.wantForced)
+			}
+		})
+	}
+}
+
+// TestForceDoesNotSkipTheGuard is the distinction the whole design turns on. Force must DOWNGRADE the
+// veto, never bypass the check: the blocked list has to be computed so it can be reported back and logged.
+// A "fix" that short-circuits the guard when force is set would pass every other test here and quietly
+// destroy the audit trail — so this asserts the packs survive into the result.
+func TestForceDoesNotSkipTheGuard(t *testing.T) {
+	forced, err := pruneDecision("v1", []string{"dungeons"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forced) != 1 || forced[0] != "dungeons" {
+		t.Fatalf("a forced prune must REPORT what it overrode (got %v) — otherwise the operator and the "+
+			"post-incident log never learn which packs were stripped against advice", forced)
 	}
 }

@@ -360,22 +360,28 @@ type contentPuller struct {
 	dir *directory.Redis
 }
 
-func (p contentPuller) Pull(ctx context.Context, version, _ string) error {
+func (p contentPuller) Pull(ctx context.Context, spec director.PullSpec) (director.PullOutcome, error) {
 	opts := contentpull.Options{
 		ContentURL:  p.cfg.Content.URL,
-		Version:     version,
+		Version:     spec.Version,
 		Token:       p.cfg.Content.Token,
 		CacheDir:    p.cfg.Content.CacheDir,
 		PostgresDSN: p.cfg.Postgres.DSN,
 		NATSURL:     p.cfg.NATS.URL,
+		// The guard is still WIRED under force (below) — ForcePrune only downgrades its veto to a report,
+		// so the operator learns what they overrode instead of it silently not being checked.
+		ForcePrune: spec.Force,
 	}
 	// The prune guard needs the fleet directory to know which zones are hosted; without Redis there is no
 	// fleet, so a single-process director prunes freely.
 	if p.dir != nil {
 		opts.PruneGuard = contentpull.FleetPruneGuard(zoneLocator{dir: p.dir})
 	}
-	_, err := contentpull.Pull(ctx, opts)
-	return err
+	res, err := contentpull.Pull(ctx, opts)
+	if err != nil {
+		return director.PullOutcome{}, err
+	}
+	return director.PullOutcome{ForcedPacks: res.PruneForced}, nil
 }
 
 // shardForZoner is the fleet lookup the prune-guard locator needs — satisfied by *directory.Redis. It is

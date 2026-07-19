@@ -31,4 +31,16 @@ type PullRequest struct {
 	Version  string `json:"version"` // the published content version (a git tag/SHA) to install
 	Actor    string `json:"actor"`   // the builder character id who ran `pull`
 	AtUnixMs int64  `json:"at"`      // wall-clock ms when the request was issued
+	// Force asks the director to OVERRIDE the live-hosted-pack prune guard (#427). The guard is explicitly
+	// advisory (see contentpull/guard.go), and an advisory check with no override is really a veto: since
+	// #416 taught it about instance templates, one idle player inside a dungeon copy blocks every content
+	// deploy that would prune any pack, with nothing an operator can do but wait them out.
+	//
+	// omitempty, and false is the SAFE default, so the wire stays compatible in the direction that matters:
+	// an older shard that does not know the field emits no `force` key and the director decodes false —
+	// never an accidental override. The shard-side ADMIN capability gate is the only check on this value
+	// (the pull signal is not signed the way handoff Commit/Abort is, #314); that is the same trust model
+	// `pull` already has — any shard can already request any version — so this widens an existing surface
+	// rather than opening a new one.
+	Force bool `json:"force,omitempty"`
 }

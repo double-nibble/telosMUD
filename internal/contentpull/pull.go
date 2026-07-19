@@ -36,6 +36,17 @@ type Options struct {
 	// stops hot-stripping a pack players are standing in. nil (telos-pull / CI) skips it: the CLI importer
 	// has no fleet view. See guard.go.
 	PruneGuard PruneGuard
+
+	// ForcePrune OVERRIDES the guard's veto (#427). The guard still RUNS and its blocked list is still
+	// computed, logged and returned in Result.PruneForced — force downgrades the veto to a report, it does
+	// not skip the check. That distinction is the whole point: an operator who overrides needs to know
+	// exactly WHAT they overrode, and the post-incident log needs it too.
+	//
+	// It exists because the guard is explicitly advisory (see guard.go's header) and an advisory check with
+	// no override is really a veto. Since #416 taught it about instance templates, and an instance is never
+	// reaped while occupied, one idle player inside a dungeon copy indefinitely blocks every content deploy
+	// that would prune any pack.
+	ForcePrune bool
 }
 
 // Result reports what a pull did. On a Check run only SHA/ManifestVersion/Packs are set (Checked=true).
@@ -47,6 +58,7 @@ type Result struct {
 	Packs           []string // the version's pack set (sorted)
 	Pruned          []string // packs a prior version had that this one drops
 	Changed         bool     // false => the SHA already matched Postgres (no import/broadcast)
+	PruneForced     []string // packs the guard BLOCKED that an operator force-pruned anyway (#427)
 	Published       int      // hot-reload invalidations broadcast
 	Checked         bool     // true => a Check dry run (validated only)
 }
@@ -135,11 +147,11 @@ func Pull(ctx context.Context, opts Options) (Result, error) {
 			if err != nil {
 				return Result{}, err
 			}
-			if len(blocked) > 0 {
-				return Result{}, fmt.Errorf(
-					"refusing content version %q: it would strip live-hosted pack(s) [%s] — players are in those zones; drain them or roll a reboot before removing the pack(s)",
-					opts.Version, strings.Join(blocked, ", "))
+			forced, gerr := pruneDecision(opts.Version, blocked, opts.ForcePrune)
+			if gerr != nil {
+				return Result{}, gerr
 			}
+			base.PruneForced = forced
 		}
 	}
 
@@ -154,6 +166,9 @@ func Pull(ctx context.Context, opts Options) (Result, error) {
 	base.Version = version
 	base.Pruned = pruned
 	base.Changed = changed
+	// The import committed, so a forced prune is now a FACT rather than an intention — record it here, not
+	// at the decision point (see LogForcedPrune).
+	LogForcedPrune(opts.Version, base.PruneForced)
 	if !changed {
 		return base, nil // the SHA already matched Postgres — nothing imported, skip the broadcast
 	}

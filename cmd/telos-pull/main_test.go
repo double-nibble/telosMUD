@@ -14,6 +14,7 @@ import (
 	"github.com/double-nibble/telosmud/db"
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/contentpull"
 	"github.com/double-nibble/telosmud/internal/contentstore"
 	"github.com/double-nibble/telosmud/internal/store"
 )
@@ -200,4 +201,105 @@ func TestGatedImport(t *testing.T) {
 	if lc.Zone(pack) == nil {
 		t.Fatalf("imported pack's zone not found in Postgres; zones=%d", len(lc.Zones))
 	}
+}
+
+// --- #427: the forced-prune record must survive contentpull.Pull ------------------------------------
+//
+// This is the FIRST link of the chain that carries a break-glass record back to the operator:
+//
+//	contentpull.Pull sets Result.PruneForced   <-- covered here (needs a real pool + a real git version)
+//	  -> cmd/telos-director maps it to PullOutcome.ForcedPacks
+//	  -> director's pullResultDetail renders it into PullResult.Detail
+//	  -> world's deliverPullResult shows it to the builder
+//
+// Every later link has a unit test. Without this one, deleting the assignment in Pull leaves the whole
+// suite GREEN while the operator silently stops being told what they overrode — which is exactly what a
+// review mutation demonstrated. The rest of the chain being tested is not a substitute for its source.
+
+// blockAll is a PruneGuard that vetoes every pack it is asked about, standing in for "the fleet is hosting
+// these" without needing a live directory.
+func blockAll(_ context.Context, _ contentpull.ZoneLister, pruned []string) ([]string, error) {
+	return pruned, nil
+}
+
+// TestGatedForcedPrunePopulatesPruneForced (gated on TELOS_TEST_DSN) drives the real pipeline against a
+// real Postgres: import v1 with two packs, then pull a version that drops one while the guard blocks it.
+// Without force the pull must refuse and the registry must be untouched; with force it must commit AND
+// report the overridden pack.
+func TestGatedForcedPrunePopulatesPruneForced(t *testing.T) {
+	dsn := os.Getenv("TELOS_TEST_DSN")
+	if dsn == "" {
+		t.Skip("TELOS_TEST_DSN not set; skipping the Postgres force-prune test")
+	}
+	ctx := context.Background()
+	if err := db.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// v1 registers both packs, so dropping one in v2 is a real prune the guard can veto.
+	both := samplePack("keepme")
+	for k, v := range samplePack("dropme") {
+		both[k] = v
+	}
+	repo1 := buildContentRepo(t, both, []string{"keepme", "dropme"}, false)
+	cfg1 := cfgFor(repo1, t)
+	cfg1.Postgres.DSN = dsn
+	if _, err := contentpull.Pull(ctx, contentpull.Options{
+		ContentURL: cfg1.Content.URL, Version: cfg1.Content.Version, CacheDir: cfg1.Content.CacheDir,
+		PostgresDSN: dsn,
+	}); err != nil {
+		t.Fatalf("seeding v1: %v", err)
+	}
+
+	// v2 drops `dropme`, and the guard says it is live-hosted.
+	repo2 := buildContentRepo(t, samplePack("keepme"), []string{"keepme"}, false)
+	cfg2 := cfgFor(repo2, t)
+	opts := contentpull.Options{
+		ContentURL: cfg2.Content.URL, Version: cfg2.Content.Version, CacheDir: cfg2.Content.CacheDir,
+		PostgresDSN: dsn, PruneGuard: blockAll,
+	}
+
+	// Without force: refused, and nothing changed.
+	if _, err := contentpull.Pull(ctx, opts); err == nil {
+		t.Fatal("a blocked prune must refuse without force")
+	}
+	cur, err := pool.CurrentContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsStr(cur.Packs, "dropme") {
+		t.Fatal("a refused pull must leave the registry untouched")
+	}
+
+	// With force: committed, AND the overridden pack is reported.
+	opts.ForcePrune = true
+	res, err := contentpull.Pull(ctx, opts)
+	if err != nil {
+		t.Fatalf("a forced pull must proceed past the guard: %v", err)
+	}
+	if !containsStr(res.PruneForced, "dropme") {
+		t.Fatalf("Result.PruneForced = %v, want it to name the pack the operator overrode — this is the ONLY "+
+			"record that reaches the person who typed the command", res.PruneForced)
+	}
+	cur, err = pool.CurrentContentVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsStr(cur.Packs, "dropme") {
+		t.Fatal("a forced prune must actually strip the pack from the registry")
+	}
+}
+
+func containsStr(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }
