@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/metrics"
 )
 
@@ -279,7 +280,14 @@ var (
 // tempted, so it owes an async hand-off (mint off the actor, deliver the result back by message); the
 // plumbing for that is slice 3's, and this contract is the marker for it.
 func (s *Shard) MintInstance(ctx context.Context, templateRef, accountID string) (*Zone, error) {
-	if err := s.validateMintTemplate(templateRef); err != nil {
+	// ONE snapshot of the live content for this whole mint (#418). The reloader swaps s.content while the
+	// shard runs, so re-reading it per check would let validate and build disagree: the template could pass
+	// `instanceable: true` against version N and then be BUILT against N+1, where a reload deleted it —
+	// buildZone would boot the instance empty behind a Debug line and hand a player a zone with no rooms.
+	// Taking it once makes the whole mint atomic with respect to content, which is also the semantic a
+	// builder expects: one run is one version.
+	lc := s.liveContent()
+	if err := validateMintTemplate(lc, templateRef); err != nil {
 		return nil, err
 	}
 	if accountID == "" {
@@ -319,7 +327,14 @@ func (s *Shard) MintInstance(ctx context.Context, templateRef, accountID string)
 	// outside mu too.
 	z := newInstanceZone(id, templateRef)
 	z.protos = s.protos
-	z.buildZone(s.content)
+	// REFUSE an incomplete build (#418). validateMintTemplate proved the SNAPSHOT declares a start room; it
+	// cannot prove the prototype cache has one, because the snapshot and the cache converge on independent
+	// paths after a reload. Entry lands via transferIn's resolveRoom(""), so an instance whose start room
+	// did not spawn DISCONNECTS the entrant mid-entry — after transferOut has already released them. A
+	// refusal here is a "the way will not open" line and the player keeps playing.
+	if err := z.buildZone(lc); err != nil {
+		return nil, fmt.Errorf("mint instance of %q: %w", templateRef, err)
+	}
 
 	// Seed the scope replica BEFORE the zone is reachable, exactly as HostZone does (#280): once it is in
 	// s.zones a world-scope delta can be posted to its inbox, and applyScopeSeed is a full-map REPLACE, so a
@@ -445,7 +460,10 @@ func (s *Shard) instanceTemplateCounts() map[string]int {
 // the note that made this safe still holds — UnhostZone's refusals key on the ZONE ID (`id == s.home`,
 // `s.isLocalZone(id)`), and an instance's id is `<template>#<serial>`, never equal to either, so an instance of
 // the home zone would not shadow, replace or endanger the original.
-func (s *Shard) validateMintTemplate(templateRef string) error {
+// It takes the content snapshot as an ARGUMENT rather than reading s.content, so that the caller's single
+// snapshot (#418) is provably the one validated — a method reading the live pointer could not be, since the
+// reloader swaps it underneath.
+func validateMintTemplate(lc *content.LoadedContent, templateRef string) error {
 	switch {
 	case templateRef == "":
 		return fmt.Errorf("mint instance: no template zone named")
@@ -454,11 +472,14 @@ func (s *Shard) validateMintTemplate(templateRef string) error {
 		// well-formedness: any '#' at all is refused, because the separator's exclusivity is the invariant.
 		return fmt.Errorf("mint instance of %q: a template ref may not contain %q (it is reserved for instance ids)",
 			templateRef, instanceSep)
-	case s.content == nil:
+	case lc == nil:
 		return fmt.Errorf("mint instance of %q: shard has no retained content to build from", templateRef)
-	case s.content.Zone(templateRef) == nil:
+	case lc.Zone(templateRef) == nil:
+		// REACHABLE AT RUNTIME since #418, not only on a typo: the snapshot now tracks reloads, so a builder
+		// who deletes a dungeon out from under a player lands here. The player-facing surface is
+		// instance_entry.go's refusal line, which is deliberately generic for exactly this reason.
 		return fmt.Errorf("mint instance of %q: no such zone in loaded content", templateRef)
-	case !s.content.Zone(templateRef).Instanceable:
+	case !lc.Zone(templateRef).Instanceable:
 		// The content-side opt-in. See the header: every zone being instanceable is an uncapped item faucet
 		// (a mint runs the zone's boot resets) that also routes around every in-world access gate.
 		return fmt.Errorf("mint instance of %q: the zone is not declared instanceable; a zone must opt in with "+
@@ -481,7 +502,7 @@ func (s *Shard) validateMintTemplate(templateRef string) error {
 	//
 	// The ref must also name a room the template actually declares. A start_room pointing at a room that was
 	// renamed or moved to another zone produces exactly the same nil, one indirection later.
-	zd := s.content.Zone(templateRef)
+	zd := lc.Zone(templateRef)
 	if zd.StartRoom == "" {
 		return fmt.Errorf("mint instance of %q: the template declares no start_room, which an instance requires "+
 			"(entry lands in the start room, and a death inside would have nowhere to respawn)", templateRef)

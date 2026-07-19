@@ -437,3 +437,53 @@ func findMob(zones []content.ZoneDTO, ref string) *content.ProtoDTO {
 	}
 	return nil
 }
+
+// TestInstanceableWithdrawalSurvivesAReImport is the DB half of #418's security direction.
+//
+// #418 made the shard's content snapshot track reloads, so an `instanceable` flip now takes effect on a
+// running fleet instead of waiting for a rolling reboot. That is only true if a re-import actually CHANGES
+// the stored flag — and `instanceable` rides the `zones.body` JSONB, the column this repo has now shipped
+// three separate field-drops through (Round 35's `primary`, Round 11's def-table fields, and `instanceable`
+// itself). TestStorePackRoundTrip pins that the flag arrives; nothing pinned that it can be TAKEN AWAY.
+//
+// The asymmetry matters because the two directions fail differently. A dropped write on the true->true
+// path is a dungeon door that stops working — annoying, obvious, reported within the hour. A dropped write
+// on the true->FALSE path is a builder revoking the instance opt-in, seeing the deploy succeed, and the
+// faucet staying open: a mint runs the zone's boot resets into a private copy a player can strip and walk
+// out of, and it routes around whatever in-world gate the revocation was meant to restore. Silent, and in
+// the unsafe direction.
+//
+// It reads through content.LoadPacks, which is exactly what the shard's refresh calls under LoadWithCore.
+func TestInstanceableWithdrawalSurvivesAReImport(t *testing.T) {
+	p := helpers.OpenTestPool(t)
+	ctx := context.Background()
+
+	pk, found, err := content.LoadPack(content.DemoPack)
+	require.NoError(t, err)
+	require.True(t, found, "embedded demo pack present")
+
+	// v1: as authored. `crypt` is the demo pack's opted-in instance template.
+	require.NoError(t, p.ImportPack(ctx, pk), "import v1")
+	v1, err := content.Load(ctx, p, []string{content.DemoPack})
+	require.NoError(t, err)
+	require.NotNil(t, v1.Zone("crypt"))
+	require.True(t, v1.Zone("crypt").Instanceable, "precondition: crypt opts in at v1")
+
+	// v2: the builder WITHDRAWS the opt-in and re-imports, the way a real revocation lands.
+	withdrawn := pk
+	withdrawn.Zones = append([]content.ZoneDTO(nil), pk.Zones...)
+	for i := range withdrawn.Zones {
+		if withdrawn.Zones[i].Ref == "crypt" {
+			withdrawn.Zones[i].Instanceable = false
+		}
+	}
+	require.NoError(t, p.ImportPack(ctx, withdrawn), "import v2 with the opt-in withdrawn")
+
+	v2, err := content.Load(ctx, p, []string{content.DemoPack})
+	require.NoError(t, err)
+	require.NotNil(t, v2.Zone("crypt"), "crypt still exists at v2")
+	assert.False(t, v2.Zone("crypt").Instanceable,
+		"a re-import did NOT clear zones.instanceable for crypt: the withdrawal parses from YAML, the import "+
+			"reports success, and Postgres keeps serving true — so every shard's content refresh (#418) reads "+
+			"the opt-in as still granted and the instance faucet stays open after the builder closed it")
+}

@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -139,12 +140,40 @@ type Shard struct {
 	residentMu   sync.Mutex
 	residentZone map[string]*Zone
 
-	// content is the full loaded content — every pack's prototypes are already in protos (defineContent
-	// fills from ALL loaded zones, not just the hosted set). Retained so HostZone (Phase 16.4a runtime
-	// zone-add) can build a zone this shard did NOT host at boot: a standby re-claiming a draining peer's
-	// zone. nil on a demo/test shard built without a LoadedContent (its zones are pre-built) — HostZone then
-	// errors. Set by NewShardFromContent.
-	content *content.LoadedContent
+	// content is the shard's LIVE view of loaded content — every pack's prototypes are already in protos
+	// (defineContent fills from ALL loaded zones, not just the hosted set). Retained so HostZone (Phase
+	// 16.4a runtime zone-add) can build a zone this shard did NOT host at boot (a standby re-claiming a
+	// draining peer's zone), and so MintInstance (#72) can build an instance from its template. nil on a
+	// demo/test shard built without a LoadedContent (its zones are pre-built) — both then error.
+	//
+	// SEEDED by NewShardFromContent and REFRESHED by the hot reloader (#418, reload.go
+	// refreshContentSnapshot). It was write-once until then, and that was a real bug: every zone BUILT at
+	// runtime — every HostZone after a rebalance, and every single instance mint — was assembled from the
+	// content this process happened to boot with, while its prototypes came from the live reloaded cache.
+	// A long-lived process drifted further from the deployed content with each mint, and a template a
+	// reload had DELETED still minted.
+	//
+	// Deliberately atomic rather than mu-guarded: the two readers (HostZone, the instance mint worker)
+	// both build OUTSIDE mu on purpose, so putting the snapshot under mu would either re-introduce that
+	// contention or hand the builders a pointer read under a lock they no longer hold — which is the same
+	// unsynchronized read with more ceremony.
+	//
+	// CONTRACT, AND IT IS NARROW. The refreshed snapshot is authoritative for ZONE SHAPE — a zone's room
+	// set, start room, resets, reset_secs, and its `instanceable` opt-in — plus Regions, the one exception
+	// below. It is NOT authoritative for the other pack-GLOBAL defs (attributes, resources, abilities,
+	// formulas, wear slots, the pvp policy…): those are registered once at construction (defineGlobals)
+	// into atomic-swap registries this refresh does not touch, and they still need a rolling reboot (see
+	// reloadcmd.go sharedDefKinds). Read one of those off this snapshot and you will get a value the
+	// running registries do not have. Prototypes are likewise NOT read from here — the protoCache is the
+	// live authority for those, swapped per-ref by the reloader.
+	//
+	// REGIONS ARE THE EXCEPTION, and only because they have no registry: scope.go resolves region
+	// membership by scanning lc.Regions directly, so there is no second copy for the snapshot to disagree
+	// with. Adding any other global to that list means giving it a registry first.
+	//
+	// It also tracks only the BOOT pack set (reloader.enabled). A deploy that ENABLES A NEW PACK does not
+	// appear here and still needs a rolling reboot, same as it did before.
+	content atomic.Pointer[content.LoadedContent]
 
 	// runCtx / runWG are captured by Run so HostZone can launch a runtime-added zone's actor on the shard's
 	// lifetime ctx and have Run's Wait() cover it. closed flips true (under mu) once Run has observed ctx
@@ -379,7 +408,7 @@ func newShard(zoneIDs []string, home, addr string, dir Locator, peers HandoffDia
 // production path; the demo lives only in the YAML/DB.
 func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr string, dir Locator, peers HandoffDialer) *Shard {
 	s := newBareShard(home, addr, dir, peers)
-	s.content = lc // retained for HostZone (16.4a): a standby builds a not-yet-hosted zone from this
+	s.setContent(lc) // retained for HostZone (16.4a) + MintInstance (#72); refreshed by the reloader (#418)
 	protos := newProtoCache()
 	s.protos = protos
 	defineContent(protos, lc) // fill the cache once from all loaded zones, before any zone runs
@@ -387,7 +416,12 @@ func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr
 	for _, id := range zoneIDs {
 		z := newZone(id)
 		z.protos = protos
-		z.buildZone(lc) // spawn room singletons + run resets (empty if the zone wasn't loaded)
+		// Boot TOLERATES an incomplete build: "the engine boots with zero content" is the bare-engine
+		// invariant, so a zone with no loaded definition comes up empty and rejects logins cleanly rather
+		// than failing the process. Runtime builds (HostZone, MintInstance) refuse instead — see buildZone.
+		if err := z.buildZone(lc); err != nil {
+			slog.Warn("zone built incompletely at boot; it will serve a clean rejection on login", "zone", id, "err", err)
+		}
 		s.adopt(id, z)
 	}
 	if s.zones[home] == nil && len(zoneIDs) > 0 {
@@ -395,6 +429,27 @@ func NewShardFromContent(lc *content.LoadedContent, zoneIDs []string, home, addr
 	}
 	return s
 }
+
+// liveContent returns the shard's current content snapshot, or nil on a shard built without one (the
+// demo/test path). It is the ONLY read of s.content: every caller that needs the snapshot more than once
+// must take it ONCE and pass the value down, never call this repeatedly.
+//
+// That is not style. The snapshot is swapped by the reloader while the shard runs (#418), so two calls can
+// return two different versions — and the callers here are exactly the ones where that splits a validate
+// from its build. validateMintTemplate can pass `instanceable: true` against version N while buildZone runs
+// against N+1, where the template was deleted, landing in buildZone's "booting empty" branch: a live zone
+// with no rooms, which is the worst failure shape in this package.
+func (s *Shard) liveContent() *content.LoadedContent { return s.content.Load() }
+
+// setContent publishes a new content snapshot. Called at construction and by the hot reloader's refresh
+// (#418). See the s.content field comment for the snapshot's deliberately narrow contract — zone SHAPE
+// only, never pack-global defs, never prototypes.
+//
+// It affects only zones built AFTER it lands. A live instance stays pinned to the content it was minted
+// from (#411's reload freeze) and a live persistent zone converges through the zone-shape reconcile, which
+// is a separate, per-zone, version-guarded path. Publishing here must never be mistaken for applying a
+// reload to anything already running.
+func (s *Shard) setContent(lc *content.LoadedContent) { s.content.Store(lc) }
 
 // newBareShard allocates the Shard struct with its routing maps; callers then build and
 // adopt the hosted zones. The saver starts DISABLED (nil store + checkpointer); WithPersistence
@@ -818,7 +873,11 @@ func (s *Shard) HostZone(ctx context.Context, id string) (*Zone, error) {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("HostZone %q: shard shutting down", id)
 	}
-	if s.content == nil {
+	// ONE snapshot of the live content, taken here and used for both the guard and the build below (#418).
+	// Reading s.content twice would let a reload land between them, so the guard could pass against one
+	// version and the build run against another.
+	lc := s.liveContent()
+	if lc == nil {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("HostZone %q: shard has no retained content to build from", id)
 	}
@@ -827,7 +886,13 @@ func (s *Shard) HostZone(ctx context.Context, id string) (*Zone, error) {
 	// Build OUTSIDE mu: buildZone spawns room singletons + runs resets, which shouldn't block routing reads.
 	z := newZone(id)
 	z.protos = s.protos
-	z.buildZone(s.content)
+	// REFUSE an incomplete runtime build (#418). This zone is about to become a drain's handover
+	// destination: publishing it roomless would adopt it, arm lease renewal, and then disconnect every
+	// player handed into it ("destination has no rooms"), with the directory reporting a healthy claimed
+	// zone that nothing self-heals. Failing here leaves the zone unowned — visible and re-claimable.
+	if err := z.buildZone(lc); err != nil {
+		return nil, fmt.Errorf("HostZone %q: %w", id, err)
+	}
 
 	// Seed the zone's scope replica from the authoritative store BEFORE adoptLocked below publishes it into
 	// s.zones (#280). Once it is in s.zones a world-scope delta can be posted to its inbox via zonesList, and
@@ -1277,6 +1342,21 @@ func defineRoom(c *protoCache, ref ProtoRef, name, desc string) *Prototype {
 // exits/name/desc by reference until something COWs them (nothing does in the demo).
 func (z *Zone) spawnRoom(ref ProtoRef) *Entity {
 	e := z.spawn(ref)
+	if e == nil {
+		// NEVER store a nil room (#418). z.spawn returns nil for a ref with no prototype in the cache, and a
+		// nil entry in z.rooms is a state nothing else in this package produces or expects: countProtoInZone
+		// (reset.go) walks every room and dereferences it with no guard, so a single nil entry turns any
+		// roam-reset repop into a nil-pointer panic on the zone goroutine.
+		//
+		// This was unreachable while the content snapshot was frozen at boot — the snapshot was by
+		// construction a subset of what defineContent had already put in the cache. #418 made the snapshot
+		// track reloads while the cache is fed ref-by-ref off the bus, so the two now converge on independent
+		// paths and the snapshot can briefly name a room whose prototype has not swapped in yet. Skipping the
+		// room here is what turns that window into a build the CALLER can refuse (buildZone reports it),
+		// rather than a live zone carrying a landmine.
+		z.log.Error("room prototype missing at build time; the room is skipped", "zone", z.id, "room", ref)
+		return nil
+	}
 	z.rooms[ref] = e
 	return e
 }
