@@ -12,12 +12,14 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 
 	"github.com/double-nibble/telosmud/internal/config"
 	"github.com/double-nibble/telosmud/internal/contentpull"
 	"github.com/double-nibble/telosmud/internal/contentstore"
+	"github.com/double-nibble/telosmud/internal/store"
 )
 
 func main() {
@@ -27,6 +29,7 @@ func main() {
 	dir := flag.String("dir", ".", "the content-repo directory (for --emit-manifest)")
 	manifestVersion := flag.String("manifest-version", "", "the version/tag to stamp into the emitted manifest (for --emit-manifest)")
 	ciRun := flag.String("ci-run", "", "the CI run URL to record in the emitted manifest (for --emit-manifest)")
+	purgePack := flag.String("purge-pack", "", "remove every row belonging to this pack, then exit (the seed→pull cutover step; refuses a pack in the content registry)")
 	flag.Parse()
 
 	// --emit-manifest operates on a LOCAL content tree (no config, no Postgres, no git) — the content
@@ -50,10 +53,48 @@ func main() {
 		slog.Error("config load failed", "err", err)
 		os.Exit(1)
 	}
+	if *purgePack != "" {
+		if err := runPurge(context.Background(), cfg, *purgePack); err != nil {
+			slog.Error("telos-pull --purge-pack failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(context.Background(), cfg, *check); err != nil {
 		slog.Error("telos-pull failed", "err", err)
 		os.Exit(1)
 	}
+}
+
+// runPurge removes a stale pack's rows — the operator remedy named by the seed→pull cutover refusal
+// (#366). Definition refs are GLOBAL, so a pack telos-seed imported before this deployment moved to the
+// content store collides with a pulled pack shipping the same refs, and the import refuses rather than
+// dying on a raw duplicate-key error. This is the one-command version of the hand-written SQL purge the
+// staging cutover needed.
+//
+// It is CLI-only on purpose. The in-game `pull` surface must not be able to strip content: a purge has no
+// equivalent of the director's live-hosted-pack prune guard, which is precisely why store.PurgePack
+// refuses a pack that is in the content registry — an orphan pack is by definition NOT in the registry,
+// so it is structurally invisible to that guard and could never be checked by it.
+func runPurge(ctx context.Context, cfg config.Config, pack string) error {
+	pool, err := store.Open(ctx, cfg.Postgres.DSN)
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+	defer pool.Close()
+
+	// Name what is going away BEFORE doing it, so an operator who typo'd the pack name sees it in the log.
+	zones, zerr := pool.PackZones(ctx, pack)
+	if zerr != nil {
+		slog.Warn("could not list the pack's zones before purging (continuing)", "pack", pack, "err", zerr)
+	}
+	if err := pool.PurgePack(ctx, pack); err != nil {
+		return err
+	}
+	slog.Warn("purged pack — its rows are gone. If any shard is still HOSTING one of these zones it keeps "+
+		"running from memory, but the zone cannot be rebuilt after a restart: treat this as a rolling reboot",
+		"pack", pack, "zones", zones)
+	return nil
 }
 
 // run executes the shared pull pipeline (internal/contentpull) and logs the outcome. It returns an

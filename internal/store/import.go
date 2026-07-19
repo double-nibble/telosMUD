@@ -73,6 +73,18 @@ func (p *Pool) ImportPacks(ctx context.Context, packs []content.Pack) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
+	// Seed→pull cutover guard (#366), the REVERSE direction: pull `reference`, then re-run `make seed`, and
+	// `demo` collides the other way. `allowed` is this batch's own names — a re-seed of the same pack
+	// strip-replaces as it always has, but colliding with a pack somebody else owns is refused with the
+	// remedy rather than a raw duplicate-key SQLSTATE. See foreignrefs.go.
+	if err := assertNoForeignRefsTx(ctx, tx, packs, packNames(packs)); err != nil {
+		return err
+	}
+	// LIMIT, so the guard is not over-trusted: two packs IN THE SAME BATCH sharing a ref are both in
+	// `allowed`, so the check passes them and the insert still dies on the shared-ref PK with a raw 23505.
+	// That is a content-authoring error rather than the cross-import cutover collision #366 is about, and
+	// the doc comment above already names it as a supported failure — but it is the same failure CLASS, so
+	// do not read a clean run here as "no ref can collide".
 	for _, pk := range packs {
 		if err := importPackTx(ctx, tx, pk); err != nil {
 			return err
@@ -82,6 +94,15 @@ func (p *Pool) ImportPacks(ctx context.Context, packs []content.Pack) error {
 		return fmt.Errorf("store: commit import: %w", err)
 	}
 	return nil
+}
+
+// packNames is the pack-name set of a batch, i.e. the packs an import legitimately owns and may overwrite.
+func packNames(packs []content.Pack) []string {
+	out := make([]string, 0, len(packs))
+	for i := range packs {
+		out = append(out, packs[i].Pack)
+	}
+	return out
 }
 
 // ImportVersion imports a PUBLISHED content version atomically (#212 slice 4): in ONE transaction it
@@ -170,6 +191,14 @@ func (p *Pool) ImportVersion(ctx context.Context, packs []content.Pack, meta Ver
 		}
 	}
 	sort.Strings(pruned)
+
+	// Seed→pull cutover guard (#366). AFTER the prune (so a pack this version legitimately drops has
+	// already gone and cannot false-positive) and BEFORE the inserts (so the operator gets an actionable
+	// refusal instead of a raw duplicate-key SQLSTATE). Inside the singleton lock held above, so it cannot
+	// race a concurrent importer. See foreignrefs.go.
+	if err := assertNoForeignRefsTx(ctx, tx, packs, packNames(packs)); err != nil {
+		return 0, nil, false, err
+	}
 
 	// Strip-replace each named pack (same per-pack tx body as ImportPacks).
 	for _, pk := range packs {
@@ -645,7 +674,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 	}
 	// Combat profiles (Phase 6.3a): the whole to-hit/avoidance/damage SHAPE is content, so it all
-	// rides the JSONB body (combatProfileBody). ref+pack is the per-kind PK. The loader reads it back
+	// rides the JSONB body (combatProfileBody). ref is the PK (GLOBAL across packs — see foreignrefs.go). The loader reads it back
 	// into the same CombatProfileDTO the embedded YAML produces.
 	for _, cp := range pk.CombatProfiles {
 		body, err := json.Marshal(combatProfileBody{
@@ -661,7 +690,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 	}
 	// Channels (Phase 8.3): the whole channel SHAPE (verb/color/format/access/...) rides the JSONB body
-	// (channelBody). ref+pack is the per-kind PK. The loader reads it back into the same ChannelDTO the
+	// (channelBody). ref is the PK (GLOBAL across packs — see foreignrefs.go). The loader reads it back into the same ChannelDTO the
 	// embedded YAML produces, so YAML and Postgres packs register channels identically.
 	for _, ch := range pk.Channels {
 		body, err := json.Marshal(channelBody{
@@ -678,7 +707,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 	}
 	// Regions (Phase 10.3): the region SHAPE (name + member zone refs) rides the JSONB body (regionBody).
-	// ref+pack is the per-kind PK. The loader reads it back into the same RegionDTO the embedded YAML
+	// ref is the PK (GLOBAL across packs — see foreignrefs.go). The loader reads it back into the same RegionDTO the embedded YAML
 	// produces, so YAML and Postgres packs define regions identically.
 	for _, rg := range pk.Regions {
 		body, err := json.Marshal(regionBody{Name: rg.Name, Zones: rg.Zones})
@@ -692,7 +721,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 	}
 	// Tracks (Phase 11.2): the track SHAPE (progress/level attrs, thresholds, per-step grant op-lists)
-	// rides the JSONB body (trackBody). ref+pack is the per-kind PK. The loader reads it back into the same
+	// rides the JSONB body (trackBody). ref is the PK (GLOBAL across packs — see foreignrefs.go). The loader reads it back into the same
 	// TrackDTO the embedded YAML produces, so YAML and Postgres packs define tracks identically.
 	for _, tr := range pk.Tracks {
 		body, err := json.Marshal(trackBody{
@@ -709,7 +738,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 	}
 	// Bundles (Phase 11.4b): the bundle SHAPE (kind + grant op-list) rides the JSONB body (bundleBody).
-	// ref+pack is the per-kind PK. The loader reads it back into the same BundleDTO the embedded YAML
+	// ref is the PK (GLOBAL across packs — see foreignrefs.go). The loader reads it back into the same BundleDTO the embedded YAML
 	// produces, so YAML and Postgres packs define bundles identically.
 	for _, bn := range pk.Bundles {
 		body, err := json.Marshal(bundleBody{Kind: bn.Kind, Uncapped: bn.Uncapped, Grants: bn.Grants})
@@ -722,7 +751,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert bundle %s: %w", bn.Ref, err)
 		}
 	}
-	// Rarity tiers + loot tables (Phase 12.1): ref+pack PK, the shape in the JSONB body. Round-trip into
+	// Rarity tiers + loot tables (Phase 12.1): bare `ref` PK, GLOBAL across packs (see foreignrefs.go), the shape in the JSONB body. Round-trip into
 	// the same DTOs the embedded YAML produces.
 	for _, rt := range pk.RarityTiers {
 		body, err := json.Marshal(rarityTierBody{
@@ -737,7 +766,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert rarity_tier %s: %w", rt.Ref, err)
 		}
 	}
-	// Named affixes (#37): ref+pack PK, the attr + roll range in the JSONB body.
+	// Named affixes (#37): (pack, ref) PK, so it cannot collide across packs, the attr + roll range in the JSONB body.
 	for _, af := range pk.Affixes {
 		body, err := json.Marshal(affixBody{Attr: af.Attr, Min: af.Min, Max: af.Max})
 		if err != nil {
@@ -758,7 +787,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert loot_table %s: %w", lt.Ref, err)
 		}
 	}
-	// Spawn schedules (Phase 12.4): ref+pack PK, the schedule shape in the JSONB body.
+	// Spawn schedules (Phase 12.4): bare `ref` PK, GLOBAL across packs (see foreignrefs.go), the schedule shape in the JSONB body.
 	for _, sc := range pk.SpawnSchedules {
 		body, err := json.Marshal(spawnScheduleBody{
 			Proto: sc.Proto, Zone: sc.Zone, Room: sc.Room,
@@ -772,7 +801,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert spawn_schedule %s: %w", sc.Ref, err)
 		}
 	}
-	// Recipes (Phase 13.5): ref+pack PK, the recipe shape in the JSONB body.
+	// Recipes (Phase 13.5): bare `ref` PK, GLOBAL across packs (see foreignrefs.go), the recipe shape in the JSONB body.
 	for _, rc := range pk.Recipes {
 		body, err := json.Marshal(recipeBody{
 			Name: rc.Name, Aliases: rc.Aliases,
@@ -787,7 +816,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert recipe %s: %w", rc.Ref, err)
 		}
 	}
-	// Wear slots (#35): ref+pack PK, the label/order/kind in the JSONB body.
+	// Wear slots (#35): (pack, ref) PK, so it cannot collide across packs, the label/order/kind in the JSONB body.
 	for _, ws := range pk.WearSlots {
 		body, err := json.Marshal(wearSlotBody{Label: ws.Label, Order: ws.Order, Kind: ws.Kind})
 		if err != nil {
@@ -798,7 +827,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert wear_slot %s: %w", ws.Ref, err)
 		}
 	}
-	// Chargens (Phase 14.8): ref+pack PK, the step list in the JSONB body.
+	// Chargens (Phase 14.8): bare `ref` PK, GLOBAL across packs (see foreignrefs.go), the step list in the JSONB body.
 	for _, cg := range pk.Chargens {
 		body, err := json.Marshal(chargenBody{Steps: cg.Steps})
 		if err != nil {
@@ -809,7 +838,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert chargen %s: %w", cg.Ref, err)
 		}
 	}
-	// Help topics (#64): ref+pack PK, the title/category/keywords/body/see_also in the JSONB body.
+	// Help topics (#64): bare `ref` PK, GLOBAL across packs (see foreignrefs.go), the title/category/keywords/body/see_also in the JSONB body.
 	for _, hd := range pk.HelpDefs {
 		body, err := json.Marshal(helpBody{
 			Title: hd.Title, Category: hd.Category, Keywords: hd.Keywords,
@@ -823,7 +852,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			return fmt.Errorf("store: insert help_def %s: %w", hd.Ref, err)
 		}
 	}
-	// Player toggles (#358): ref+pack PK, the name/words/default_on/desc in the JSONB body.
+	// Player toggles (#358): bare `ref` PK, GLOBAL across packs (see foreignrefs.go), the name/words/default_on/desc in the JSONB body.
 	for _, tg := range pk.ToggleDefs {
 		body, err := json.Marshal(toggleBody{
 			Name: tg.Name, Words: tg.Words, DefaultOn: tg.DefaultOn, Desc: tg.Desc,
