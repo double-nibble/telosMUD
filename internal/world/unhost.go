@@ -184,9 +184,17 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 	// UnhostZone; releaseInstanceSlot only ever runs on a failed mint), so reaping the last instance of
 	// template A would set series{template=A} to whatever OTHER templates still have live and then never
 	// sample it again. It would report live instances of A, forever, with none.
-	var liveForTemplate int64
+	//
+	// PUBLISHED IN THIS HOLD, not after the actor wait below (#419). The value is computed under mu, so the
+	// COMPUTE order is serialized — but once the sweep reaps concurrently, the PUBLISH order is not, and the
+	// gap between them spans an actor wait of up to unhostActorGrace. Two workers retiring the last two
+	// copies of one template compute 1 and 0; if the one that computed 1 happens to finish its wait last, the
+	// gauge settles at 1 with nothing live and is never sampled again — the exact permanent over-report the
+	// paragraph above exists to prevent, re-entered through the publish side instead of the compute side.
+	// SetInstances is an in-memory last-value Record, no I/O, so publishing under mu is cheap and makes
+	// compute-and-publish atomic together.
 	if instRec != nil {
-		liveForTemplate = s.instanceCountLocked(instRec.template)
+		metrics.SetInstances(ctx, s.instanceCountLocked(instRec.template), instRec.template)
 	}
 	// A pending handoff token indexed to this zone can never be bound now; drop it rather than leave the index
 	// pointing at a stopped actor.
@@ -231,6 +239,25 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 		stopActor()
 	}
 
+	// ANNOUNCE THE ZONE DEAD HERE, at the commit point — not after the wait below (#419).
+	//
+	// Everything above this line is irreversible: the zone is out of s.zones, its record is out of
+	// s.instances, its actor is cancelled. So "nothing will ever drain this inbox again" is already true, and
+	// `dead` is what makes every later post ABANDON its send rather than fill the buffer and then block a
+	// sender forever — including the saver's shared drainer, which acks back into a zone inbox with NO
+	// context to bail on.
+	//
+	// It used to be closed after the actor wait, so both error exits below returned with the zone removed and
+	// `dead` still open. That is a shard-wide durable-write wedge, and the correlation is what makes it
+	// serious: the only way to reach the grace-timeout exit is a wedged actor that has stopped draining its
+	// inbox, which is exactly the state in which a straggler save-ack blocks forever. Same class as the #288
+	// saver wedge. The reaper made that exit routine rather than exotic, so it has to be closed on every path.
+	//
+	// Closing before the actor has finished unwinding is safe: the zone is quiescent by precondition, so
+	// nothing is left to deliver, and a post the actor itself makes during teardown would be abandoned —
+	// which is the correct outcome for a zone that is going away.
+	close(z.dead)
+
 	// Wait for the actor to return. The zone goroutine tears down its Lua VM in Run's defer, on the only
 	// goroutine that ever touched it, so "the zone is gone" is not true until this closes.
 	if done != nil {
@@ -241,13 +268,6 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 		case <-time.After(unhostActorGrace):
 			return fmt.Errorf("unhost %q: zone actor did not stop within %s", id, unhostActorGrace)
 		}
-	}
-	// The actor is gone for good, so nothing will ever drain this inbox again. Announce it, and every later
-	// `post` abandons its send instead of filling the buffer and then blocking a sender forever — including
-	// the saver's shared drainer, which acks back into a zone inbox WITHOUT a context to bail on.
-	close(z.dead)
-	if instRec != nil {
-		metrics.SetInstances(ctx, liveForTemplate, instRec.template)
 	}
 	slog.Info("unhosted zone at runtime", "zone", id, "shard", s.addr)
 	return nil

@@ -51,6 +51,17 @@ func (f *fakeTemplateUsePublisher) setErr(err error) {
 	f.mu.Unlock()
 }
 
+// reset forgets every recorded claim without swapping the publisher out. Swapping was the earlier approach
+// and it was racy: the mint KICK publishes asynchronously on the shard's own goroutine, so a kick still in
+// flight would land on the REPLACEMENT publisher and look like a fresh claim.
+func (f *fakeTemplateUsePublisher) reset() {
+	f.mu.Lock()
+	f.got = map[string]string{}
+	f.ttls = map[string]time.Duration{}
+	f.batches = nil
+	f.mu.Unlock()
+}
+
 func (f *fakeTemplateUsePublisher) snapshot() (map[string]string, map[string]time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -255,21 +266,24 @@ func TestPublishTemplatesInUseStopsClaimingAReapedTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	sh.publishTemplatesInUse(context.Background())
-	if got, _ := pub.snapshot(); got["darkwood"] != "shard-a" {
-		t.Fatalf("precondition: darkwood should be claimed, got %v", got)
-	}
+	// Wait for the claim to arrive via the ASYNC mint kick, not just via a direct publish. That wait is what
+	// makes the rest of this test deterministic: it proves the kick has already been consumed, so no late
+	// kick can land after the reset below and masquerade as a re-claim.
+	waitCond(t, "the mint kick to publish darkwood's claim", func() bool {
+		got, _ := pub.snapshot()
+		return got["darkwood"] == "shard-a"
+	})
 
-	// Retire the copy, then take a FRESH publisher so the next sweep's claims are the only thing observed —
-	// the previous claim is a real key in production and expires on its TTL, not on this call.
+	// Retire the copy, then forget the recorded claims so the next sweep's output is the only thing observed.
+	// The real key is not deleted in production either — it expires on its TTL, which is the whole point of
+	// a heartbeat: stop renewing and it goes away on its own.
 	if err := sh.UnhostZone(context.Background(), inst.id); err != nil {
 		t.Fatalf("unhost the instance: %v", err)
 	}
-	fresh := newFakeTemplateUsePublisher()
-	sh.WithTemplateUsePublisher(fresh)
+	pub.reset()
 	sh.publishTemplatesInUse(context.Background())
 
-	if got, _ := fresh.snapshot(); len(got) != 0 {
+	if got, _ := pub.snapshot(); len(got) != 0 {
 		t.Fatalf("the shard re-claimed %v after its last copy was reaped; a stale claim makes the pack "+
 			"permanently unprunable", got)
 	}
