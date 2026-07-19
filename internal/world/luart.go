@@ -34,14 +34,52 @@ const (
 	luaCallStackSize   = luasandbox.CallStackSize   // T4 — recursion blowout (build-time Options.CallStackSize)
 	luaRegistrySize    = luasandbox.RegistrySize    // T4 — value-stack floor
 	luaRegistryMaxSize = luasandbox.RegistryMaxSize // T4 — value-stack ceiling
-	luaInstrBudget     = luasandbox.InstrBudget     // T3 — per-call instruction cap (fork count abort)
 	luaStrByteCap      = luasandbox.StrByteCap      // T13 — amplifier OUTPUT byte cap
 	luaPatternInputCap = luasandbox.PatternInputCap // T13 — pattern INPUT byte cap
+)
 
-	// luaCallDeadline is the per-call wall-clock deadline (T3), armed via SetContext — catches a
-	// low-instruction stall the count cannot (a GC pause). Derived from the shared millisecond constant.
+// The two OPERATOR-TUNABLE Lua caps (#368). Defaults are the shared luasandbox values, so an untouched
+// deployment behaves exactly as it did when these were constants.
+//
+// Vars rather than consts, and set through SetLuaCaps rather than read from config here: internal/world must
+// not reach into the config package (a shard is constructed by cmd/telos-world, which owns the config), and
+// luasandbox must not either — it is deliberately host-agnostic, being the single source of truth for the
+// sandbox and the parity boundary against the gopher-lua fork. So the value is injected downward from the
+// binary, twice.
+var (
+	// luaInstrBudget is T3 — the per-call instruction cap (fork count abort), and the PRIMARY bound. It is
+	// what stops a runaway loop from stalling a zone's actor goroutine, which on this engine means stalling
+	// every player in that zone.
+	luaInstrBudget = luasandbox.InstrBudget
+
+	// luaCallDeadline is the per-call wall-clock deadline (T3), armed via SetContext — the SECONDARY guard,
+	// catching a low-instruction stall the count cannot (a GC pause, host load). Already scaled up under
+	// `-race`, and an operator override composes with that rather than fighting it: the default this starts
+	// from is whichever the build selected.
 	luaCallDeadline = luasandbox.CallDeadline * time.Millisecond
 )
+
+// SetLuaCaps validates and applies the operator's Lua sandbox tunables (#368). A zero value leaves that cap
+// at its compiled-in default. It returns an error — and changes nothing — for a configuration the engine
+// cannot honor.
+//
+// VALIDATION LIVES HERE, at the injection point, rather than in the config package. That keeps internal/config
+// a leaf (importing luasandbox from there linked a Lua interpreter into telos-gate and three other binaries
+// that never build a VM), and it makes the safe thing structural: a host cannot apply the caps without
+// validating them, whereas a separate config-side Validate is something a new binary can forget to call.
+//
+// MUST BE CALLED BEFORE ANY ZONE IS BUILT, and that is a real constraint rather than a formality: these are
+// read on every zone's Lua path from the zone's own goroutine, so mutating them after zones exist is a data
+// race. The binary calls this once, after obs.Init and before constructing the shard.
+func SetLuaCaps(instrBudget, callDeadlineMS int) error {
+	if err := luasandbox.ValidateCaps(instrBudget, callDeadlineMS); err != nil {
+		return err
+	}
+	luaInstrBudget = luasandbox.ClampInstrBudget(instrBudget)
+	luaCallDeadline = time.Duration(luasandbox.ClampCallDeadlineMS(callDeadlineMS)) * time.Millisecond
+	slog.Info("lua sandbox caps", "instr_budget", luaInstrBudget, "call_deadline", luaCallDeadline)
+	return nil
+}
 
 // luaRuntime is a zone's Lua VM plus the engine-owned state the sandbox depends on. It is
 // zone-owned: created at zone build, torn down on zone stop, touched ONLY by the zone

@@ -83,6 +83,28 @@ type luaDirector struct {
 	api *API
 }
 
+// The operator-tunable Lua caps for the DIRECTOR's sandbox (#368), set by SetLuaCaps before any script is
+// compiled. Zero => the luasandbox defaults. Package vars for the same reason the world's are: neither
+// internal/director nor internal/luasandbox may reach into the config package, so the binary injects.
+var (
+	directorLuaInstrBudget    int
+	directorLuaCallDeadlineMS int
+)
+
+// SetLuaCaps validates and applies the operator's Lua sandbox tunables to the director tier (#368). It
+// returns an error — and changes nothing — for a configuration the engine cannot honor.
+//
+// MUST BE CALLED BEFORE the world script is compiled: the values are read at runtime construction. The
+// binary calls it once after obs.Init. Validation is here, at the injection point, for the same reason it is
+// in world.SetLuaCaps — a host cannot apply the caps without validating them.
+func SetLuaCaps(instrBudget, callDeadlineMS int) error {
+	if err := luasandbox.ValidateCaps(instrBudget, callDeadlineMS); err != nil {
+		return err
+	}
+	directorLuaInstrBudget, directorLuaCallDeadlineMS = instrBudget, callDeadlineMS
+	return nil
+}
+
 // newLuaDirector compiles the world script, installs the `director` host table, and runs the script's top
 // level so its `on_signal` definition lands in the sandbox globals. A compile/load error is returned so the
 // caller can decide (the director logs it and runs without orchestration rather than crashing the tier).
@@ -91,7 +113,12 @@ func newLuaDirector(log *slog.Logger, script string) (*luaDirector, error) {
 		log = slog.Default()
 	}
 	ld := &luaDirector{log: log.With("subsystem", "director-lua")}
-	ld.rt = luasandbox.NewRuntime(ld.log, luasandbox.Opts{})
+	// #368: the operator's Lua caps, injected the same way the world injects them into its own sandbox.
+	// Zero fields mean "engine default", so an untouched deployment is unchanged.
+	ld.rt = luasandbox.NewRuntime(ld.log, luasandbox.Opts{
+		InstrBudget:    directorLuaInstrBudget,
+		CallDeadlineMS: directorLuaCallDeadlineMS,
+	})
 	ld.installDirectorTable()
 	if err := ld.rt.Compile(worldScriptKey, script); err != nil {
 		ld.rt.Close()

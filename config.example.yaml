@@ -10,3 +10,39 @@ redis:
   addr: localhost:6379
 nats:
   url: nats://localhost:4222
+
+# Operator-tunable engine limits (#368). Every field is optional; omitting one (or leaving it 0) uses the
+# compiled-in default, so an untouched deployment behaves exactly as it always has.
+#
+# These are validated FAIL-CLOSED at boot: a value the engine cannot honor refuses the start and names the
+# constraint, rather than being silently clamped to something you did not choose.
+#
+# Not every timeout in the engine is here, deliberately. Several have ordering invariants — the adopt-confirm
+# deadline must cover the handoff pending TTL, the drain-reservation TTL is derived from the drain deadline —
+# and a plausible-looking value for one of those would break an invariant a test exists to pin. What is
+# exposed are bounds whose only relationship is to the workload.
+# Both lines below are COMMENTED OUT on purpose. Setting a value here PINS it: future default changes stop
+# reaching you, and an explicit lua_call_deadline_ms defeats the automatic `-race` scaling described below,
+# because it is the unset-means-default sentinel that routes to it.
+tunables:
+  # The per-call Lua VM instruction cap: the PRIMARY bound on a content script, and what stops a runaway loop
+  # from stalling a zone's actor goroutine — which on this engine means stalling every player in that zone.
+  # Default 100000. Range 1000..10000000. Env: TELOS_LUA_INSTR_BUDGET
+  #
+  # It must also be REACHABLE within the deadline below — the engine refuses a pair where the wall clock
+  # would always fire first, because a budget that never fires does not merely do nothing: every runaway then
+  # looks like a transient deadline abort, which the circuit breaker weights 5x more lightly and stops
+  # quarantining. Budget/100000 is roughly the milliseconds you need. So a 1000000 budget needs at least 10ms.
+  #
+  # Raise it if legitimate content is aborting with "instruction budget exceeded"; that message names the
+  # script, so check the script is not accidentally unbounded before raising the ceiling for everyone.
+  # lua_instr_budget: 100000
+
+  # The per-call Lua wall-clock deadline in milliseconds: the SECONDARY guard, catching stalls the instruction
+  # count cannot see (a GC pause, host load, a slow builtin). Default 5 (automatically scaled up in `-race`
+  # builds, whose instrumentation makes every VM op ~10x slower). Range 1..1000.
+  # Env: TELOS_LUA_CALL_DEADLINE_MS
+  #
+  # Raising this is the usual need on a busy or noisy host. LOWERING it below what a legitimate builtin needs
+  # spuriously aborts correct scripts, which is why there is a floor.
+  # lua_call_deadline_ms: 5

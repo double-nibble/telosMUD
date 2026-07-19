@@ -23,15 +23,16 @@ import (
 // surface does not, so the simple arm→run→disarm holds. The VM is not goroutine-safe; the host drives it from
 // one serialized goroutine.
 
-// callDeadline is CallDeadline as a duration.
-const callDeadline = CallDeadline * time.Millisecond
-
 // Runtime wraps a sandboxed LState with the compiled-chunk cache and the breaker.
 type Runtime struct {
 	L       *lua.LState
 	log     *slog.Logger
 	chunks  map[string]*lua.FunctionProto
 	breaker *breaker
+	// callDeadline is this runtime's per-call wall-clock bound, resolved at construction from Opts (#368).
+	// Per-runtime rather than package-global so a host can tune it without changing it for every other
+	// sandbox in the process.
+	callDeadline time.Duration
 }
 
 // NewRuntime builds a Runtime over a fresh sandboxed LState. printTarget, if non-empty, routes the script's
@@ -45,6 +46,9 @@ func NewRuntime(log *slog.Logger, opts Opts) *Runtime {
 		log:     log.With("subsystem", "luasandbox"),
 		chunks:  map[string]*lua.FunctionProto{},
 		breaker: newBreaker(),
+		// Resolved once here rather than read per call: the deadline is a property of how this runtime was
+		// configured, and re-deriving it on the hot path would invite a future reader to make it mutable.
+		callDeadline: time.Duration(ClampCallDeadlineMS(opts.CallDeadlineMS)) * time.Millisecond,
 	}
 	rt.L = New(opts)
 	// Route the script's `print` to the runtime logger. New installed a no-op print (the LFunction can't be
@@ -157,7 +161,7 @@ func (rt *Runtime) CallGlobal(breakerKey, fnName string, nret int, pushArgs func
 // host builtin must not synchronously re-enter Lua here).
 func (rt *Runtime) call(breakerKey, origin string, nargs, nret int) error {
 	L := rt.L
-	ctx, cancel := context.WithTimeout(context.Background(), callDeadline)
+	ctx, cancel := context.WithTimeout(context.Background(), rt.callDeadline)
 	defer cancel()
 	L.SetContext(ctx)
 	L.ResetInstructionCount()
