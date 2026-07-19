@@ -47,6 +47,17 @@ func main() {
 	}
 	shutdown := obs.Init(cfg.Service, cfg.LogLevel)
 
+	// #368: same fail-closed treatment as telos-world. The director runs the world-director script (#47) in
+	// its own luasandbox Runtime, so the same caps apply to it.
+	if err := cfg.Tunables.Err(); err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
+	}
+	if err := director.SetLuaCaps(cfg.Tunables.LuaInstrBudget, cfg.Tunables.LuaCallDeadlineMS); err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

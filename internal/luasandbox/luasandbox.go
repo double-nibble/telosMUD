@@ -35,6 +35,7 @@
 package luasandbox
 
 import (
+	"fmt"
 	"math/rand"
 
 	lua "github.com/yuin/gopher-lua"
@@ -96,6 +97,25 @@ type Opts struct {
 	// or per-scope streams passes its own).
 	Rng *rand.Rand
 
+	// InstrBudget overrides the per-call VM-instruction cap. 0 => the InstrBudget default.
+	//
+	// INJECTED, never read from config here. This package is deliberately host-agnostic — it is the single
+	// source of truth for the sandbox and the parity boundary against the gopher-lua fork — so it must not
+	// import a config package. The host reads the operator's setting and passes it down.
+	//
+	// The caller is responsible for validating the value; see ClampInstrBudget for the bounds and why they
+	// exist. A zero here means "default", not "unlimited": a cap that can be turned off by omission would be
+	// the wrong failure direction for the guard that stops a runaway loop from stalling the host goroutine.
+	InstrBudget int
+
+	// CallDeadlineMS overrides the per-call wall-clock deadline in milliseconds. 0 => the CallDeadline
+	// default for this build (which is already scaled up under -race; see deadline_race.go).
+	//
+	// SECONDARY to the instruction budget, and an operator raising or lowering it should know that: the
+	// budget is the real per-call bound, and this catches the stalls a count cannot — a GC pause, host load,
+	// a slow builtin. Setting it too low spuriously aborts correct scripts.
+	CallDeadlineMS int
+
 	// Print is the value bound to the global `print`. nil => a no-op (a script's print is swallowed). A host
 	// that wants print routed to its logger passes an LFunction built on the returned state — but since the
 	// state does not exist before New, the common pattern is to override print via L.SetGlobal after New.
@@ -119,7 +139,111 @@ func New(opts Opts) *lua.LState {
 	}
 	b := &builder{L: L, rng: rng}
 	b.strip(opts.Print)
+	L.SetInstructionBudget(ClampInstrBudget(opts.InstrBudget))
 	return L
+}
+
+// Bounds on the operator-tunable Lua caps (#368).
+//
+// They exist because these are not free knobs. The instruction budget is the PRIMARY per-call bound — the
+// thing that stops a runaway loop from stalling a zone's actor goroutine, which on this engine means
+// stalling every player in that zone — so a value low enough to abort ordinary content or high enough to
+// stop bounding anything are both ways of breaking the engine through configuration.
+const (
+	// MinInstrBudget is low enough for a trivial handler and high enough that nothing legitimate trips it.
+	MinInstrBudget = 1_000
+	// MaxInstrBudget bounds the stall an operator can configure. At 10M instructions a single call is already
+	// ~100ms, which is many zone ticks — past here the budget has stopped being a bound in any useful sense.
+	//
+	// Reaching anywhere near it also requires raising the DEADLINE; see ValidateCaps, which is the check that
+	// actually matters.
+	MaxInstrBudget = 10_000_000
+
+	// InstrPerMS is the engine's calibrated Lua instruction rate: how many VM instructions a call may be
+	// assumed to execute per millisecond of wall clock.
+	//
+	// Deliberately CONSERVATIVE — measured throughput on ordinary hardware is several times this — because it
+	// is used to reject unreachable budgets, and rejecting a configuration that would actually have worked is
+	// a worse error than allowing a slightly generous one.
+	InstrPerMS = 100_000
+	// MinCallDeadlineMS: below a millisecond the secondary guard fires on scheduler noise rather than on
+	// stalls, aborting correct scripts.
+	MinCallDeadlineMS = 1
+	// MaxCallDeadlineMS: a full second of wall clock is already far longer than any tick budget.
+	MaxCallDeadlineMS = 1_000
+)
+
+// ClampInstrBudget returns the effective instruction budget for a requested value: the default for 0, and
+// the requested value clamped into [MinInstrBudget, MaxInstrBudget] otherwise.
+//
+// Clamping rather than erroring, because this is the LAST line and it must always produce a usable bound.
+// The host validates and refuses a bad value loudly at boot (config.Validate); this exists so that a value
+// arriving here by some path that skipped validation still yields a sandbox that is bounded.
+func ClampInstrBudget(n int) int {
+	switch {
+	case n == 0:
+		return InstrBudget
+	case n < MinInstrBudget:
+		return MinInstrBudget
+	case n > MaxInstrBudget:
+		return MaxInstrBudget
+	}
+	return n
+}
+
+// ValidateCaps checks the two Lua caps against their individual bounds AND against each other (#368).
+//
+// # The cross-field invariant, and why it is the important half
+//
+// The instruction budget is the PRIMARY bound and the wall-clock deadline is the SECONDARY stall guard —
+// but only while the budget is actually reachable within the deadline. Raise the budget past what the
+// deadline permits and the budget stops firing entirely: every runaway now aborts on the wall clock instead.
+//
+// That is not merely a knob that quietly does nothing. It silently re-weights the circuit breaker. A
+// tight-loop instruction abort is weighted 0.5 (pathological but deterministic — quarantine this script);
+// a wall-clock abort is weighted 0.1 (probably transient host load — do not punish a script for the host
+// being busy, or an attacker could trip a victim's breaker by inducing load). So an operator who raises the
+// budget "to give content more room" converts every genuinely-runaway script from something the breaker
+// quarantines after ~20 failures into something it needs ~100 for, and a script failing 4 times in 5 goes
+// from tripping the breaker to never tripping it at all.
+//
+// An operator who genuinely wants a bigger budget must therefore also grant the wall clock to spend it in,
+// which makes the real cost — a zone actor stalled for that long, and every player in that zone with it —
+// explicit rather than hidden.
+func ValidateCaps(instrBudget, callDeadlineMS int) error {
+	if n := instrBudget; n != 0 && (n < MinInstrBudget || n > MaxInstrBudget) {
+		return fmt.Errorf("lua instruction budget %d is outside [%d, %d]: it is the primary bound on a content "+
+			"script, and a value below the floor aborts ordinary content while one above the ceiling stops "+
+			"bounding the zone-actor stall it exists to prevent", n, MinInstrBudget, MaxInstrBudget)
+	}
+	if ms := callDeadlineMS; ms != 0 && (ms < MinCallDeadlineMS || ms > MaxCallDeadlineMS) {
+		return fmt.Errorf("lua call deadline %dms is outside [%d, %d]: below the floor the secondary stall "+
+			"guard fires on scheduler noise and aborts correct scripts; above the ceiling it is longer than any "+
+			"tick budget and guards nothing", ms, MinCallDeadlineMS, MaxCallDeadlineMS)
+	}
+	budget, deadline := ClampInstrBudget(instrBudget), ClampCallDeadlineMS(callDeadlineMS)
+	if reachable := deadline * InstrPerMS; budget > reachable {
+		return fmt.Errorf("lua instruction budget %d cannot be reached within a %dms call deadline (at most "+
+			"~%d instructions run in that time): the wall-clock guard would fire first, so the budget would "+
+			"never bound anything AND every runaway script would be classified as a transient deadline abort, "+
+			"which the circuit breaker weights 5x more lightly and would stop quarantining. Raise "+
+			"lua_call_deadline_ms to at least %d, or lower the budget",
+			budget, deadline, reachable, (budget+InstrPerMS-1)/InstrPerMS)
+	}
+	return nil
+}
+
+// ClampCallDeadlineMS is ClampInstrBudget for the wall-clock deadline. See it for why this clamps.
+func ClampCallDeadlineMS(ms int) int {
+	switch {
+	case ms == 0:
+		return CallDeadline
+	case ms < MinCallDeadlineMS:
+		return MinCallDeadlineMS
+	case ms > MaxCallDeadlineMS:
+		return MaxCallDeadlineMS
+	}
+	return ms
 }
 
 // builder holds the per-build state the strip + capped wrappers close over (mirrors internal/world's
@@ -175,7 +299,6 @@ func (b *builder) strip(printFn *lua.LFunction) {
 	b.setGlobals(env)
 
 	// Arm the default per-call budget so the abort path is live; Runtime.Call re-arms per call.
-	L.SetInstructionBudget(InstrBudget)
 	L.ResetInstructionCount()
 }
 

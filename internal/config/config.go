@@ -31,6 +31,16 @@ type Config struct {
 	DevAutoAuth                bool   `yaml:"dev_auto_auth"`                   // Phase 15.6: bypass OAuth with the bare name login (DEV/TEST ONLY)
 	DevAutoAuthAllowRemoteBind bool   `yaml:"dev_auto_auth_allow_remote_bind"` // permit a dev-autoauth gate on a non-loopback bind (sandboxed orchestration only; see gate bind guard)
 
+	// Tunables are the operator-adjustable engine limits (#368). Defaults match the compiled-in values, so
+	// an untouched deployment behaves exactly as before.
+	//
+	// NOT every timeout in the engine belongs here, and that is deliberate. Several have ordering or
+	// relationship invariants — adoptConfirmDeadline must be >= pendingTTL, the drain-reservation TTL is
+	// derived from the drain deadline (#334) — and exposing those as free knobs would let a plausible-looking
+	// value break an invariant a test exists to pin. What is exposed here are bounds whose only relationship
+	// is to the workload.
+	Tunables TunablesConfig `yaml:"tunables"`
+
 	// GateWriteTimeout (Phase 16.3) bounds a single outbound write to a telnet client; a wedged client that
 	// blocks a write past this is disconnected so it can't pin a writer goroutine / hold its slot. 0 disables.
 	GateWriteTimeout time.Duration `yaml:"gate_write_timeout"`
@@ -147,6 +157,42 @@ func Default() Config {
 		Zones:     []string{"midgaard"},
 	}
 }
+
+// TunablesConfig holds the operator-adjustable engine limits (#368). A zero field means "use the
+// compiled-in default", so a partially-specified block is not a way to accidentally disable a bound.
+//
+// PLAIN DATA, validated by the subsystem that owns the bounds — world.SetLuaCaps for these two. This
+// package stays a LEAF (stdlib + yaml only), which is not tidiness: importing internal/luasandbox from here
+// to reach a pair of int constants linked a Lua interpreter into telos-gate, telos-migrate, telos-pull and
+// telos-seed, none of which ever construct a VM. The next tunables in this block have their bounds in
+// internal/world, so the same import would drag the whole world package into every binary.
+//
+// It also makes the safer thing structural: the setter returns an error, so a host cannot inject without
+// validating, whereas a separate Validate() here is something a fourth binary can simply forget to call.
+type TunablesConfig struct {
+	// LuaInstrBudget is the per-call Lua VM instruction cap — the PRIMARY bound on a content script, and the
+	// thing that stops a runaway loop from stalling a zone's actor goroutine. On this engine that means
+	// stalling every player in that zone, which is why it is bounds-checked rather than taken as given.
+	// TELOS_LUA_INSTR_BUDGET. 0 => the engine default (100k).
+	LuaInstrBudget int `yaml:"lua_instr_budget"`
+
+	// LuaCallDeadlineMS is the per-call Lua wall-clock deadline in milliseconds — the SECONDARY guard,
+	// catching stalls the instruction count cannot see (a GC pause, host load, a slow builtin).
+	// TELOS_LUA_CALL_DEADLINE_MS. 0 => the engine default, which is already scaled up under `-race`.
+	//
+	// Raising it is the usual operator need (a busy host tripping the stall guard on legitimate content).
+	// LOWERING it below what a legitimate builtin needs spuriously aborts correct scripts, which is why the
+	// validator has a floor.
+	LuaCallDeadlineMS int `yaml:"lua_call_deadline_ms"`
+
+	// err carries a malformed TELOS_* value forward so the host refuses the boot rather than silently
+	// running the default. Unexported: it is not configuration, it is a parse outcome.
+	err error
+}
+
+// Err reports a malformed tunable env value, if any. The host checks it alongside the subsystem's own
+// validation.
+func (t TunablesConfig) Err() error { return t.err }
 
 // PathFromEnv returns the config file path from TELOS_CONFIG (may be empty).
 func PathFromEnv() string { return os.Getenv("TELOS_CONFIG") }
@@ -293,6 +339,27 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_CONTENT_PACKS"); ok {
 		c.ContentPacks = splitCSV(v)
+	}
+	// Tunables (#368). A malformed value is IGNORED here rather than silently coerced to 0 — 0 means "use
+	// the default", so parsing "abc" as 0 would quietly hand back the default while the operator believed
+	// their setting had taken. Validate() then reports anything out of range.
+	// A malformed value is RECORDED as an error rather than ignored. Atoi("abc") yields 0, and 0 means "use
+	// the default" — so coercing would hand back the default while the operator believed their setting had
+	// taken, which is the silent misconfiguration this whole feature exists to end. The host reports it and
+	// refuses the boot.
+	if v, ok := os.LookupEnv("TELOS_LUA_INSTR_BUDGET"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Tunables.LuaInstrBudget = n
+		} else {
+			c.Tunables.err = fmt.Errorf("TELOS_LUA_INSTR_BUDGET=%q is not a number", v)
+		}
+	}
+	if v, ok := os.LookupEnv("TELOS_LUA_CALL_DEADLINE_MS"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Tunables.LuaCallDeadlineMS = n
+		} else {
+			c.Tunables.err = fmt.Errorf("TELOS_LUA_CALL_DEADLINE_MS=%q is not a number", v)
+		}
 	}
 }
 

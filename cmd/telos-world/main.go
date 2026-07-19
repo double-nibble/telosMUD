@@ -108,6 +108,19 @@ func main() {
 	}
 	shutdown := obs.Init(cfg.Service, cfg.LogLevel)
 
+	// #368: the operator-tunable engine limits. FAIL-CLOSED — a value the engine cannot honor refuses the
+	// boot and names the constraint, rather than being silently clamped to something the operator did not
+	// choose. AFTER obs.Init so the refusal is structured like every other boot gate, and before any zone
+	// exists (SetLuaCaps documents why that ordering is load-bearing).
+	if err := cfg.Tunables.Err(); err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
+	}
+	if err := world.SetLuaCaps(cfg.Tunables.LuaInstrBudget, cfg.Tunables.LuaCallDeadlineMS); err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
+	}
+
 	// SIGINT/SIGTERM triggers a graceful DRAIN; the zone/lease lifetime (worldCtx) is deliberately SEPARATE
 	// so the drain runs while the zones are still LIVE (the flush + handoff must precede the zone loops
 	// stopping — PERSISTENCE.md §6), then worldCtx is cancelled to stop them. A lease-loss FENCE (onFence =
