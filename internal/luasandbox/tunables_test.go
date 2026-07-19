@@ -3,6 +3,7 @@ package luasandbox
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // tunables_test.go — #368: the sandbox's clamp, which is the LAST line rather than the interface.
@@ -87,9 +88,9 @@ func TestValidateCapsRejectsAnUnreachableBudget(t *testing.T) {
 		wantErrFragment string
 	}{
 		{"the shipped defaults", 0, 0, ""},
-		{"a modest raise the default deadline can still execute", 250_000, 0, ""},
-		{"a big raise WITH the wall clock to spend it in", 1_000_000, 20, ""},
-		{"the ceiling, with a deadline that can actually reach it", MaxInstrBudget, 100, ""},
+		{"a modest raise the default deadline can still execute", CallDeadline * InstrPerMS / 2, 0, ""},
+		{"a big raise WITH the wall clock to spend it in", 20 * InstrPerMS, 20, ""},
+		{"the ceiling, with a deadline that can actually reach it", MaxInstrBudget, MaxCallDeadlineMS, ""},
 		// Derived from the constants rather than hard-coded: the DEFAULT deadline differs by build (5ms
 		// normally, 50ms under -race, since the detector makes every VM op ~10x slower). A literal here would
 		// be "unreachable" in one build and comfortably reachable in the other.
@@ -122,23 +123,48 @@ func TestValidateCapsRejectsAnUnreachableBudget(t *testing.T) {
 	}
 }
 
-// TestTheDeadlineOverrideIsActuallyArmed. The budget half was covered; the deadline half was not, and a
-// version that parsed the deadline and then ignored it would have passed everything.
+// TestTheDeadlineOverrideIsActuallyArmed. The budget half was covered from the start; the deadline half was
+// not, and a version that parsed the deadline and dropped it would have passed everything.
 //
-// Asserted by which guard fires: a generous budget with a 1ms deadline must abort on the WALL CLOCK, and the
-// classification is the observable — it is also what the breaker weights on.
+// It is asserted through the PAIR CLAMP rather than by racing the wall clock. The clamp now guarantees the
+// budget is always the guard that fires — which is the point of it — so "spin until the deadline trips" is no
+// longer reachable, and a timing assertion would be a flake anyway. Instead: a longer configured deadline
+// must yield a proportionally larger effective budget, which is only true if the deadline reached the
+// runtime. And rt.callDeadline is checked directly, since that is the value Run actually arms.
 func TestTheDeadlineOverrideIsActuallyArmed(t *testing.T) {
-	rt := NewRuntime(nil, Opts{InstrBudget: MaxInstrBudget, CallDeadlineMS: MinCallDeadlineMS})
+	rt := NewRuntime(nil, Opts{CallDeadlineMS: 20})
 	defer rt.Close()
-	if err := rt.Compile("spin", "for i = 1, 100000000 do end"); err != nil {
+	if want := 20 * time.Millisecond; rt.callDeadline != want {
+		t.Fatalf("rt.callDeadline = %v, want %v — the configured deadline never reached the runtime",
+			rt.callDeadline, want)
+	}
+
+	// The same budget request under two deadlines must produce different effective budgets: the deadline is
+	// what bounds it.
+	short := clampBudgetToDeadline(MaxInstrBudget, 1)
+	long := clampBudgetToDeadline(MaxInstrBudget, 10)
+	if short >= long {
+		t.Fatalf("effective budget was %d at a 1ms deadline and %d at 10ms; the deadline must bound the "+
+			"budget, so a longer one has to permit more", short, long)
+	}
+}
+
+// TestABudgetAbortStillFiresUnderTheDefaults is the property the pair clamp exists to preserve: for ordinary
+// configurations the INSTRUCTION guard is what stops a runaway, so the breaker weights it as the pathological
+// abort it is (0.5) rather than as transient host load (0.1).
+func TestABudgetAbortStillFiresUnderTheDefaults(t *testing.T) {
+	rt := NewRuntime(nil, Opts{})
+	defer rt.Close()
+	if err := rt.Compile("spin", "while true do end"); err != nil {
 		t.Fatalf("compile: %v", err)
 	}
 	err := rt.LoadGlobals("spin")
 	if err == nil {
-		t.Fatal("a 100M-iteration loop completed; neither guard fired")
+		t.Fatal("an infinite loop ran to completion")
 	}
-	if got := ClassifyError(err); got != AbortDeadline {
-		t.Fatalf("abort classified as %v, want AbortDeadline — with a 10M budget and a 1ms deadline the WALL "+
-			"CLOCK must be what stops it, which is only true if the configured deadline reached the runtime", got)
+	if got := ClassifyError(err); got != AbortBudget {
+		t.Fatalf("a runaway under the SHIPPED DEFAULTS was classified as %v, want AbortBudget. If the wall "+
+			"clock is winning at the defaults, every runaway is weighted as transient load and the breaker "+
+			"stops quarantining broken scripts", got)
 	}
 }

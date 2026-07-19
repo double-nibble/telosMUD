@@ -345,8 +345,8 @@ func (c *Config) applyEnv() {
 	// their setting had taken. Validate() then reports anything out of range.
 	// A malformed value is RECORDED as an error rather than ignored. Atoi("abc") yields 0, and 0 means "use
 	// the default" — so coercing would hand back the default while the operator believed their setting had
-	// taken, which is the silent misconfiguration this whole feature exists to end. The host reports it and
-	// refuses the boot.
+	// taken, which is the silent misconfiguration this whole feature exists to end. The host reads Err() and
+	// refuses the boot. Only the LAST malformed value is reported; the boot stops either way.
 	if v, ok := os.LookupEnv("TELOS_LUA_INSTR_BUDGET"); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Tunables.LuaInstrBudget = n
