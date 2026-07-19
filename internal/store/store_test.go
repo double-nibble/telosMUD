@@ -13,6 +13,7 @@ import (
 	"github.com/double-nibble/telosmud/db"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/world"
+	"github.com/double-nibble/telosmud/tests/dblock"
 )
 
 // store_test.go holds the GATED Postgres integration test(s) that MUST stay co-located with the
@@ -444,6 +445,7 @@ func TestLootTableBodyOnRollRoundTrips(t *testing.T) {
 // batch where a later pack fails rolls back the earlier packs too, so Postgres never lands at a torn
 // half-version. It also confirms a clean multi-pack batch imports both packs.
 func TestImportPacksAtomic(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := testPool(t)
 	ctx := context.Background()
 
@@ -543,6 +545,7 @@ func countRows(t *testing.T, p *Pool, table, pack string) int {
 // the version bumps once; the losers see the SHA already present and no-op. TestImportVersion covers the
 // SEQUENTIAL idempotency (a redelivery); this asserts the concurrent race it was only reasoned about.
 func TestImportVersionConcurrentSameSHA(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := testPool(t)
 	ctx := context.Background()
 
@@ -616,6 +619,7 @@ func TestImportVersionConcurrentSameSHA(t *testing.T) {
 // the atomicity a clock-free reload racing a pull relies on), and a bump touches ONLY version, never the
 // published-content identity (content_sha / manifest_version / the pack registry).
 func TestBumpContentVersion(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := testPool(t)
 	ctx := context.Background()
 
@@ -694,6 +698,7 @@ func TestBumpContentVersion(t *testing.T) {
 // TestImportVersion (gated) exercises the #212 slice-4 versioned import: the monotonic version bump,
 // the pack registry, and orphan pruning across versions.
 func TestImportVersion(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := testPool(t)
 	ctx := context.Background()
 
@@ -805,6 +810,7 @@ func TestImportVersion(t *testing.T) {
 // TestPackZones (gated) covers the PR-E2 prune-guard lookup: PackZones returns exactly a pack's zone refs
 // (sorted), and an empty list for a pack that owns no zones.
 func TestPackZones(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := testPool(t)
 	ctx := context.Background()
 
@@ -870,6 +876,7 @@ func containsAll(xs []string, want ...string) bool {
 // error — so telos-account can bootstrap on the demo default there yet still fail closed on a genuine error.
 // Gated store tests run serially, and the singleton is restored under defer, so deleting it here is safe.
 func TestCurrentContentVersionNoRow(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	p := testPool(t)
 	ctx := context.Background()
 

@@ -549,6 +549,23 @@ func (r *reloader) refreshContentSnapshot() {
 			"packs", r.enabled, "previous_zones", realZones(prev))
 		return
 	}
+	// WHICH PACKS ACTUALLY CHANGED (#423). The validate gate above stops BROKEN content from auto-deploying;
+	// it does nothing about content that is merely VALID-but-unreviewed, because validatePacks is a HEALTH
+	// gate, not a PROVENANCE one. That leaves the issue's second scenario live: a builder stages rows in
+	// pack A and never reloads, somebody reloads pack B, and A's staged content goes live fleet-wide — with
+	// no reload of A, no --check, and an audit record naming the wrong packs.
+	//
+	// Making it VISIBLE is not a fix, and this comment should not be read as one. But an unreviewed
+	// cross-pack deploy that is merely silent is strictly worse than one that is logged: this is the only
+	// place in the system that can see both the old and the new content and say whose rows moved. Blocking
+	// it needs a per-pack deployed-version notion the schema does not have (content_version is one global
+	// singleton row), which is a different change.
+	if changed := changedPacks(prev, lc); len(changed) > 0 && prev != nil {
+		r.log.Info("content snapshot: these packs' definitions CHANGED in this refresh — if a pack here was "+
+			"not the one deployed or reloaded, its rows were staged and are now live fleet-wide without a "+
+			"reload of their own",
+			"changed_packs", changed, "version", before)
+	}
 	r.shard.setContent(lc)
 	r.snapshotContentVersion.Store(before)
 	r.log.Info("content snapshot refreshed; new zone builds and instance mints use the current content",
@@ -646,6 +663,57 @@ func (r *reloader) currentContentVersion(ctx context.Context) (uint64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// changedPacks reports which packs' zone definitions differ between two snapshots, sorted.
+//
+// It compares by ZONE, not by pack, because a LoadedContent is a merged zone list — the pack a zone came
+// from is not carried on the merged struct, so the comparison is keyed on the zone ref and attributed by
+// its content. A zone added, removed, or altered is what a builder's staged rows look like from here.
+//
+// Cheap by construction: it walks the two zone slices once and compares a stable per-zone fingerprint
+// (room refs + start room + reset count + the instanceable flag) rather than deep-comparing DTOs, so it
+// costs nothing meaningful on a path that just did a full content read. `instanceable` is deliberately in
+// the fingerprint: it is the control that bounds the instance faucet (#72), and it is the exact flag the
+// issue's cross-pack scenario turns on.
+func changedPacks(prev, next *content.LoadedContent) []string {
+	if prev == nil || next == nil {
+		return nil
+	}
+	fingerprints := func(lc *content.LoadedContent) map[string]string {
+		out := make(map[string]string, len(lc.Zones))
+		for i := range lc.Zones {
+			z := &lc.Zones[i]
+			rooms := make([]string, 0, len(z.Rooms))
+			for _, r := range z.Rooms {
+				rooms = append(rooms, r.Ref)
+			}
+			sort.Strings(rooms)
+			out[z.Ref] = fmt.Sprintf("%s|%d|%t|%s", z.StartRoom, len(z.Resets), z.Instanceable, strings.Join(rooms, ","))
+		}
+		return out
+	}
+	before, after := fingerprints(prev), fingerprints(next)
+	seen := map[string]bool{}
+	for ref, fp := range after {
+		if before[ref] != fp {
+			seen[ref] = true
+		}
+	}
+	for ref := range before {
+		if _, still := after[ref]; !still {
+			seen[ref] = true
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for ref := range seen {
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // zoneCountOf is a nil-safe zone count for the refresh log line (a shard can have no previous snapshot).

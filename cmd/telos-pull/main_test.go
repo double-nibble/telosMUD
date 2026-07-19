@@ -17,6 +17,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/contentpull"
 	"github.com/double-nibble/telosmud/internal/contentstore"
 	"github.com/double-nibble/telosmud/internal/store"
+	"github.com/double-nibble/telosmud/tests/dblock"
 )
 
 // buildContentRepo writes a content tree + a manifest (with the correct content hash unless
@@ -155,6 +156,7 @@ func TestRun_ConfigGuards(t *testing.T) {
 // TestGatedImport (gated on TELOS_TEST_DSN): a real import lands the pack rows in Postgres and they
 // read back through the normal content Source path.
 func TestGatedImport(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	dsn := os.Getenv("TELOS_TEST_DSN")
 	if dsn == "" {
 		t.Skip("TELOS_TEST_DSN not set; skipping Postgres import test")
@@ -227,6 +229,7 @@ func blockAll(_ context.Context, _ contentpull.ZoneLister, pruned []string) ([]s
 // Without force the pull must refuse and the registry must be untouched; with force it must commit AND
 // report the overridden pack.
 func TestGatedForcedPrunePopulatesPruneForced(t *testing.T) {
+	dblock.LockContentRegistry(t)
 	dsn := os.Getenv("TELOS_TEST_DSN")
 	if dsn == "" {
 		t.Skip("TELOS_TEST_DSN not set; skipping the Postgres force-prune test")
