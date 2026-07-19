@@ -71,6 +71,7 @@ func (r *Redis) leaseKey(leaseID string) string    { return r.ns + ":dir:lease:"
 func (r *Redis) drainResvKey(target string) string { return r.ns + ":dir:drainresv:" + target }
 func (r *Redis) drainingKey(shardID string) string { return r.ns + ":dir:draining:" + shardID }
 func (r *Redis) occKey(zoneID string) string       { return r.ns + ":dir:occ:" + zoneID }
+func (r *Redis) tmplUseKey(template string) string { return r.ns + ":dir:tmplinuse:" + template }
 func (r *Redis) rebalanceKey(zoneID string) string { return r.ns + ":dir:rebalance:" + zoneID }
 func (r *Redis) cooldownKey(zoneID string) string  { return r.ns + ":dir:cooldown:" + zoneID }
 
@@ -983,4 +984,68 @@ func (r *Redis) PlayerShard(ctx context.Context, playerID string) (string, bool,
 		return "", false, err
 	}
 	return place.ShardID, true, nil
+}
+
+// --- Instance-template in-use signal (#416) ----------------------------------------------------------
+//
+// The content-pull PRUNE GUARD asks the directory "is this zone hosted?" before letting a pull strip a
+// pack's rows. That question resolves through the zone LEASE — and an instance takes no lease (#411).
+// Worse, the natural authoring shape for a dungeon template is a zone that is never in cfg.Zones at all:
+// you do not want the raw template walkable, so nothing ever claims it.
+//
+// So a pack whose template has forty live instances, with parties standing inside them, reads as NOT
+// HOSTED, the guard passes, and the pack is pruned out from under them. The guard's whole purpose,
+// defeated by the one zone class it cannot see.
+//
+// The guard's doc argues a prune is survivable because shard memory is authoritative and the harm is
+// deferred to the next reconcile. That reasoning holds for a leased zone an operator is about to drain. It
+// does not hold here: instances are minted CONTINUOUSLY, and the very next MintInstance after the prune
+// fails validateMintTemplate with "no such zone" — a runtime failure with no operator action in between.
+//
+// This is the shard-local analogue of a lease, and it is deliberately the CHEAPEST possible one:
+//
+//   - Keyed by TEMPLATE, never by instance id. A template is an authored ref, so the keyspace is bounded
+//     by content. Instance ids are player-driven and unbounded, and must never become a Redis keyspace.
+//   - TTL'd, so a crashed shard's claim expires on its own. Nothing has to reap it.
+//   - NO generation counter, and therefore none of the #315 exposure that made zone leases permanent
+//     keys: nothing is signed against this value and nothing is fenced on it. It answers exactly one
+//     question — "is anybody running copies of this right now" — and carries no authority beyond it.
+
+// SetTemplatesInUse records that shardID currently hosts live instances of every named template, each with
+// a TTL so a crashed shard's claims age out. Called on the publisher's heartbeat cadence.
+//
+// ONE pipelined round trip for the whole batch. A serial call per template under a shared deadline degrades
+// in the worst available shape: once the budget is spent every remaining template silently fails to publish,
+// and the caller iterates a map, so the starved subset differs each tick. That produces a lapse that is
+// invisible in logs and unreproducible when an operator investigates — and a lapsed claim is exactly what
+// lets a pull prune a pack with live parties inside it.
+//
+// Last writer wins across shards, which is correct for the question being asked: any shard still running
+// copies keeps re-writing the key on its own tick, so the key lives exactly as long as somebody is using the
+// template, and a constant TTL means a second writer can never SHORTEN another shard's claim. The stored
+// shard id is diagnostic — a "who" for an operator reading the key — never a routing answer, because more
+// than one shard may hold copies at once.
+func (r *Redis) SetTemplatesInUse(ctx context.Context, templates []string, shardID string, ttl time.Duration) error {
+	if len(templates) == 0 {
+		return nil
+	}
+	pipe := r.rdb.Pipeline()
+	for _, t := range templates {
+		pipe.Set(ctx, r.tmplUseKey(t), shardID, ttl)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// TemplateInUse reports whether any live shard has instances of template right now.
+//
+// A missing key is a definite NO, not an error: the key's absence is exactly how "nobody is running copies"
+// is represented, and the TTL makes that the steady state. A Redis error is propagated so the prune guard
+// fails CLOSED — an unreachable directory must never be read as "nothing is using this, go ahead and prune".
+func (r *Redis) TemplateInUse(ctx context.Context, template string) (bool, error) {
+	n, err := r.rdb.Exists(ctx, r.tmplUseKey(template)).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }

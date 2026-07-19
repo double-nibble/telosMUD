@@ -197,6 +197,15 @@ type Shard struct {
 	// coordinator then falls back to zone-count balancing).
 	occPublisher ZoneOccupancyPublisher
 
+	// tmplUsePublisher advertises which instance TEMPLATES this shard is running copies of, on the instance
+	// reaper's cadence (#416) — the signal that lets the content-pull prune guard see a template with live
+	// instances but no lease. nil disables it.
+	tmplUsePublisher TemplateUsePublisher
+	// tmplUseKick carries a freshly minted template to the publisher goroutine so its claim lands at CREATE
+	// time rather than on the next tick — the cold-start hole, where a brand-new template has no prior claim
+	// for the guard to fall back on. Buffered + non-blocking send: a mint worker must never wait on Redis.
+	tmplUseKick chan string
+
 	// rebalancePort reads/refreshes/clears the coordinator's per-zone rebalance directive (#42 slice 3); the
 	// owning shard polls it on the lease-renewal tick and executes a single-zone drain. nil disables it (no
 	// coordinator-driven rebalancing — the shard still serves + is drained on SIGTERM as before).
@@ -417,8 +426,12 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		// Instanced-zone bookkeeping (#411, instance.go). The limits default here rather than at first use so
 		// a shard built by ANY constructor is capped — a zero-valued cap would mean "unbounded", which for the
 		// per-shard bound is a resource-exhaustion hole rather than a permissive default.
-		instances:      map[string]*instanceRecord{},
-		mintRate:       map[string]*mintBucket{},
+		instances: map[string]*instanceRecord{},
+		mintRate:  map[string]*mintBucket{},
+		// Sized well above any plausible number of DISTINCT templates a single tick could see first mints
+		// of. A full channel drops the kick (non-blocking send) and the periodic sweep covers it, so this is
+		// a latency bound, not a correctness one.
+		tmplUseKick:    make(chan string, 64),
 		instanceLimits: defaultInstanceLimits(),
 		// The mint queue is allocated at CONSTRUCTION, not in Run, so a request posted before the workers start
 		// is buffered rather than refused. (A nil channel would also be safe — the enqueue is a select with a
@@ -979,6 +992,18 @@ func (s *Shard) Run(ctx context.Context) {
 	// tick: instances take no lease, so no renewal goroutine exists for them to ride on. It only reads atomics
 	// and calls UnhostZone, so it never touches zone state.
 	go s.runInstanceReaper(ctx)
+	// Instance TEMPLATE-in-use heartbeat (#416, instance.go). Its OWN goroutine and ticker, NOT the reaper's:
+	// the reaper's sweep is serial over UnhostZone and can run for tens of seconds (#419), which would stretch
+	// the heartbeat's cadence past its own TTL and lapse every claim on the shard. No-op without a directory.
+	go s.runTemplateUsePublisher(ctx)
+	// A shard that LEASES zones is part of a fleet, and a fleet has coordinated content pulls to guard
+	// against. Wiring the leaser but not this publisher is therefore a misconfiguration, not a choice — and a
+	// silent one: instances would keep minting while the prune guard saw none of them, exactly the #416 hole,
+	// with nothing failing anywhere. Say so once at startup.
+	if s.leaser != nil && s.tmplUsePublisher == nil {
+		slog.Warn("this shard leases zones but publishes no instance-template claims; a coordinated content " +
+			"pull cannot see its live instances and may prune a pack out from under them (#416)")
+	}
 	// Instance MINT workers (#72, instance_entry.go). They exist so MintInstance — a full zone build plus a
 	// seedZone store round trip — never runs on a zone actor: an entrance zone posts a request and returns
 	// immediately, a worker builds off-goroutine, and the result comes back through the entrance zone's inbox.

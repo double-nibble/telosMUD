@@ -363,13 +363,30 @@ func (p contentPuller) Pull(ctx context.Context, version, _ string) error {
 
 // shardForZoner is the fleet lookup the prune-guard locator needs — satisfied by *directory.Redis. It is
 // an interface so the ErrNotFound→not-hosted / other-error→propagate mapping is unit-testable without Redis.
+//
+// TemplateInUse is the second half (#416): a zone can be in use as an INSTANCE TEMPLATE without any shard
+// holding its lease, so the lease lookup alone cannot answer "is this zone live".
 type shardForZoner interface {
 	ShardForZone(ctx context.Context, zone string) (string, error)
+	TemplateInUse(ctx context.Context, template string) (bool, error)
 }
 
 // zoneLocator adapts the fleet directory to contentpull.ZoneLocator: a zone is "hosted" when the directory
 // has a live shard owning it; the unclaimed sentinel (ErrNotFound) maps to not-hosted, any other error
 // propagates (the guard fails closed on incomplete fleet info).
+//
+// # Why the lease lookup is not the whole answer (#416)
+//
+// A lease means "a shard owns this zone". Instances (#411) take no lease, and the natural authoring shape
+// for a dungeon template is a zone that is never in cfg.Zones at all — the raw template is not meant to be
+// walkable, so nothing ever claims it. A template with forty live copies and parties inside them therefore
+// resolved to ErrNotFound and read as NOT HOSTED, so the guard passed and the pull stripped the pack out
+// from under them.
+//
+// That is worse than the deferred harm the guard's doc reasons about. Stripping a leased zone's rows does
+// not yank the running zone, because shard memory is authoritative. But instances are minted CONTINUOUSLY,
+// and the next mint after the prune fails validateMintTemplate with "no such zone" — a runtime failure with
+// no operator action in between.
 type zoneLocator struct{ dir shardForZoner }
 
 func (z zoneLocator) ZoneHosted(ctx context.Context, zone string) (bool, error) {
@@ -377,8 +394,24 @@ func (z zoneLocator) ZoneHosted(ctx context.Context, zone string) (bool, error) 
 	if err == nil {
 		return true, nil
 	}
-	if errors.Is(err, directory.ErrNotFound) {
-		return false, nil
+	if !errors.Is(err, directory.ErrNotFound) {
+		return false, err
 	}
-	return false, err
+	// No lease. Before concluding "not hosted", ask whether the zone is live as an INSTANCE TEMPLATE.
+	// An error here PROPAGATES rather than degrading to the unleased answer we already have: an
+	// instance-aware lookup that fails must not be read as "nothing is using this, go ahead and prune",
+	// which is precisely the fail-open this whole check exists to close.
+	inUse, terr := z.dir.TemplateInUse(ctx, zone)
+	if terr != nil {
+		return false, terr
+	}
+	if inUse {
+		// Say WHY, because the two blocking reasons have different operator remedies and the refusal alone
+		// cannot be told apart. A leased zone means "drain it and retry". This means "a party is inside a
+		// live copy right now" — wait for them to finish, or eject them. Without this line an operator sees
+		// only "pack blocked" for a zone that appears in no lease anywhere.
+		slog.Info("prune guard: zone has no lease but is LIVE as an instance template (parties are inside "+
+			"copies of it right now); the pull is refused until they leave", "zone", zone)
+	}
+	return inUse, nil
 }
