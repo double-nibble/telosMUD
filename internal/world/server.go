@@ -31,55 +31,108 @@ type playServer struct {
 	log   *slog.Logger // scoped logger: component=play
 }
 
-// resolveAttachZone decides which hosted zone an attaching connection is handed to, in priority order:
+// attachRoute names WHICH branch of the attach-routing decision was taken. It exists so the decision can run
+// entirely under s.mu (see resolveAttachZoneLocked) while its two operator-facing WARNs are emitted by the
+// caller AFTER the lock is released: s.mu is the shard's hot routing mutex — every zoneByID, every claim,
+// every UnhostZone quiescence check takes it — and a log handler is arbitrary caller-supplied code that may
+// do I/O. Logging under it would put a disk write on the critical section of the whole shard's routing.
+type attachRoute int
+
+const (
+	attachRouteHome     attachRoute = iota // the fallback: brand-new character, or nothing better resolved
+	attachRouteToken                       // a pending handoff token names the zone holding the pending player
+	attachRouteResident                    // a session for this character is still held on this shard (#321)
+	attachRouteDurable                     // the character's durable zone_ref, hosted here and honored
+	// attachRouteDurableUnhosted and attachRouteDurableInstance both END at the home zone; they are distinct
+	// so the caller can report WHY the player's saved location was not honored.
+	attachRouteDurableUnhosted // the durable zone_ref names a zone this shard does not host (#320)
+	attachRouteDurableInstance // the durable zone_ref is instance-shaped and refused by shape (#411)
+)
+
+// resolveAttachZoneLocked decides which hosted zone an attaching connection is handed to, in priority order:
 // a pending handoff token, then a session this shard still HOLDS (the #321 residency index), then the
-// character's durable zone_ref, then the home zone as the fallback. Returns nil only when this shard hosts
-// no home zone at all.
+// character's durable zone_ref, then the home zone as the fallback. It returns nil only when this shard hosts
+// no home zone at all, plus the route taken so the caller can log it.
 //
-// Extracted from Connect so the routing decision is directly testable — it is a security boundary (it
-// answers "which live zone does this identity get to enter"), and driving it through a full Play stream to
-// exercise one branch is how a branch ends up untested.
-func (s *playServer) resolveAttachZone(character, token string, loaded CharSnapshot, loadedOK bool) *Zone {
-	zone := s.shard.zoneByID(s.shard.home)
+// THE CALLER MUST HOLD s.mu. It takes s.residentMu inside, which is the established order (UnhostZone does
+// exactly this; residentMu is a leaf and never reaches back for s.mu). Running the WHOLE four-branch decision
+// under one hold is what lets claimAttachTarget resolve and claim atomically (#413) — and it is a
+// strengthening in its own right: before this the decision took THREE separate acquisitions across TWO
+// mutexes (home, then residency, then token/zoneByID), so it was not even atomic with itself, and a zone
+// could be unhosted between the branch that chose it and the branch that read it.
+//
+// Kept as its own function, separate from the claim, so the routing decision stays directly testable — it is
+// a security boundary (it answers "which live zone does this identity get to enter"), and driving it through
+// a full Play stream to exercise one branch is how a branch ends up untested.
+func (s *Shard) resolveAttachZoneLocked(character, token string, loaded CharSnapshot, loadedOK bool) (*Zone, attachRoute) {
+	zone := s.zones[s.home]
 	var resident *Zone
 	if token == "" {
-		resident = s.shard.zoneForResidentCharacter(character)
+		s.residentMu.Lock()
+		resident = s.residentZone[character]
+		s.residentMu.Unlock()
 	}
 	switch {
 	case token != "":
-		if z := s.shard.zoneForToken(token); z != nil {
-			zone = z
+		if z := s.tokenIndex[token]; z != nil {
+			return z, attachRouteToken
 		}
 		// If no zone holds the token, fall through with the home zone; the zone's attach
 		// rejects the unknown token rather than spawning a fresh character.
 	case resident != nil:
 		// A session for this character is still held on this shard: route to its actual zone so attach
 		// re-binds it. This is authoritative over the (possibly stale) durable zone_ref (#321).
-		zone = resident
+		return resident, attachRouteResident
 	case loadedOK && loaded.ZoneRef != "" && isInstanceID(loaded.ZoneRef):
 		// FAIL CLOSED on an instance-shaped durable location (#411). No write path stores one — a player's
 		// durable location while inside an instance is the exit ANCHOR, never the instance itself (#72) — so a
 		// row in this shape is a poisoned record or a pre-migration artifact. Honoring it would log a
 		// reconnecting player straight into a live private instance, one they may never have entered and whose
 		// occupants are somebody else's party. Falling back to home is the same degraded outcome an
-		// unhostable durable zone already gets. Note this branch must stay ABOVE the zoneByID branch below:
+		// unhostable durable zone already gets. Note this branch must stay ABOVE the zones[] branch below:
 		// the instance IS hosted and IS resolvable, so the shape check is the only thing standing in the way.
-		s.log.Warn("durable zone_ref names a zone INSTANCE; refusing it and falling back to the home zone",
-			"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
+		return zone, attachRouteDurableInstance
 	case loadedOK && loaded.ZoneRef != "":
-		if z := s.shard.zoneByID(loaded.ZoneRef); z != nil {
-			zone = z
-		} else {
-			// This shard does not host the player's durable zone, so we cannot honor it. Falling back to
-			// home preserves the pre-#320 behavior (they land in the home start room) rather than refusing
-			// the login outright — the gate cannot yet re-resolve, because the directory placement records
-			// a SHARD, not a zone. Fixing that is the second half of #320; until then this WARN is the
-			// operator's signal that a rebalance stranded someone's durable location.
-			s.log.Warn("durable zone not hosted on this shard; falling back to the home zone (the player's saved location is lost)",
-				"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
+		if z := s.zones[loaded.ZoneRef]; z != nil {
+			return z, attachRouteDurable
 		}
+		// This shard does not host the player's durable zone, so we cannot honor it. Falling back to
+		// home preserves the pre-#320 behavior (they land in the home start room) rather than refusing
+		// the login outright — the gate cannot yet re-resolve, because the directory placement records
+		// a SHARD, not a zone. Fixing that is the second half of #320; until then the caller's WARN is the
+		// operator's signal that a rebalance stranded someone's durable location.
+		return zone, attachRouteDurableUnhosted
 	}
-	return zone
+	return zone, attachRouteHome
+}
+
+// claimAttachTarget resolves the attach destination AND claims the arrival on it, in ONE hold of mu (#413).
+// It is the login path's analog of claimTransferTarget, and it exists for the same reason: server.go resolves
+// the zone and then delivers an attachMsg through the zone's INBOX, with pop bumped by the handler's
+// setPlayer. Between the two a concurrent UnhostZone — which checks quiescence under this SAME mutex — could
+// pass its check, delete the zone and close(z.dead), abandoning the post. The player's stream then never
+// receives Attached and the gate does not re-resolve on it (#324): a login black hole.
+//
+// Returns nil (claiming nothing) only when this shard hosts no home zone at all, which the caller turns into
+// an Unavailable. Zone.attach releases the claim on every path.
+//
+// WHY IT TAKES NO LEGITIMACY REFUSALS. It deliberately does NOT reuse claimTransferTarget, whose two refusals
+// are both wrong here — the same reason claimEjectTarget is a separate function rather than a boolean
+// parameter:
+//
+//   - `draining`: a draining shard still admits a handoff RE-DIAL (server.go refuses only a FRESH login while
+//     draining), so refusing here would break the in-flight cross-shard move that re-dial completes;
+//   - `handedOff`: a player already prepared into a zone whose lease flipped mid-drain has their pending
+//     session in THAT zone and nowhere else; refusing the bind would strand them.
+func (s *Shard) claimAttachTarget(character, token string, loaded CharSnapshot, loadedOK bool) (*Zone, attachRoute) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	z, route := s.resolveAttachZoneLocked(character, token, loaded, loadedOK)
+	if z == nil {
+		return nil, route
+	}
+	z.claimInboundArrival()
+	return z, route
 }
 
 func registerPlay(gs *grpc.Server, s *Shard) {
@@ -262,11 +315,73 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// transfer (between the source's delPlayer and the destination's setPlayer the session is in no zone's
 	// players map), where the index misses and we fall back to the stale durable zone. That is intrinsic to
 	// the message-passing handoff and strictly narrower than the pre-fix window; tracked as a follow-up.
-	zone := s.resolveAttachZone(character, token, loaded, loadedOK)
+	//
+	// RESOLVE THE ATTACH ZONE AND CLAIM THE ARRIVAL, atomically under s.mu (#413). See claimAttachTarget:
+	// resolving here and posting the attachMsg below is a resolve-then-deliver-async window, and a concurrent
+	// UnhostZone could otherwise pass quiescence in it, tear the zone down and abandon the post — a login
+	// whose stream never receives Attached, which the gate does not re-resolve on (#324).
+	//
+	// THE RESIDENCY READ IS SINGLE, AND THAT IS WHY THE ORDER IS THIS WAY (#432 + #413). Two things key off
+	// "is this character still resident on this shard": the routing decision (route to the zone that HOLDS
+	// the session) and the ownership-claim skip below (a re-attach must not mint a new epoch). They must
+	// agree. Taking two separate reads with a blocking store round trip between them is what makes them
+	// disagree, and the divergence is not symmetric:
+	//
+	//   - resident at the CLAIM check, gone by the ROUTING read: the claim is SKIPPED, then the routing
+	//     falls through to the durable zone_ref, and Zone.attach takes its fresh-login default at the merely
+	//     RESUMED directory epoch — unclaimed. That is precisely the pre-#432 posture: two live copies
+	//     holding the same epoch, force-writing over each other. `unindexResident` runs from delPlayer, i.e.
+	//     the ordinary link-dead reap, which is exactly what races a reconnect — this is reachable, not
+	//     theoretical.
+	//   - the mirror (gone at routing, resident at the claim check) is BENIGN: an over-claim, which attach's
+	//     re-attach branch absorbs via `if resumeEpoch > s.epoch`.
+	//
+	// So the resolve runs FIRST and the claim reads `route == attachRouteResident` rather than taking its
+	// own look at the index. There is then exactly ONE observation of residency for this login, taken under
+	// one hold of s.mu, and the two consumers cannot disagree by construction.
+	//
+	// The consequence — the arrival claim is held across the ClaimCharacter round trip (up to 2s) — is
+	// correct rather than merely tolerable: the destination zone is protected for the WHOLE span in which
+	// this login is committed to it. The cost is that an unhost or drain of that zone is REFUSED for up to
+	// 2s, which is a refusal (retryable, self-clearing) and not a wedge.
+	zone, route := s.shard.claimAttachTarget(character, token, loaded, loadedOK)
 	if zone == nil {
+		// Decided BEFORE any epoch is minted, deliberately: a shard with no hosted zone would otherwise burn
+		// a ClaimCharacter — and thus an ownership generation — on every retry of a login it always refuses.
 		s.log.Error("no zone to attach to", "character", character, "home", s.shard.home)
 		return status.Error(codes.Unavailable, "no hosted zone; reconnect")
 	}
+	// LIVE INSURANCE, registered before anything that can return or panic while the claim is held.
+	//
+	// It used to be dead by construction (the claim was taken below the ownership claim, with only
+	// straight-line code after it). It is NOT dead any more: the ClaimCharacter fail-closed return below
+	// runs with the claim held, and that is the path this exists for. It also covers the two WARNs — a log
+	// handler is arbitrary caller-supplied code that may panic — which is why it is registered ABOVE them.
+	//
+	// The asymmetry is what justifies it: a leaked claim is PERMANENT — nothing else ever releases it, so
+	// the zone can never be unhosted or rebalanced again and every BeginDrain on this process burns its
+	// whole deadline — while a spurious release is impossible from here, because `posted` is set on the one
+	// path that hands the claim to Zone.attach.
+	posted := false
+	defer func() {
+		if !posted {
+			zone.releaseInboundArrival("attach-not-posted")
+		}
+	}()
+	// The routing decision's operator-facing WARNs, emitted OUT from under s.mu (the shard's hot routing
+	// mutex: a log handler is arbitrary code that may do I/O, and every zone resolve on this shard queues
+	// behind it). Both routes end at the home zone with the player's saved location not honored.
+	switch route {
+	case attachRouteDurableInstance:
+		s.log.Warn("durable zone_ref names a zone INSTANCE; refusing it and falling back to the home zone",
+			"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
+	case attachRouteDurableUnhosted:
+		s.log.Warn("durable zone not hosted on this shard; falling back to the home zone (the player's saved location is lost)",
+			"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
+	case attachRouteHome, attachRouteToken, attachRouteResident, attachRouteDurable:
+		// Nothing to report: the route either honored the player's location or is the ordinary fallback.
+	}
+
 	// CLAIM OWNERSHIP (#432). A login is an ownership assertion, and until this existed it was not
 	// expressed as one anywhere: the epoch was RESUMED at its stored value, so a second login on a
 	// different shard came up holding the same epoch as the copy it was displacing, and the two
@@ -284,15 +399,16 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	//   - token != ""  — a handoff re-dial. Its epoch was already minted by the source's beginHandoff
 	//     and rides the signed Prepare; claiming here would bump the row past the arriving session and
 	//     wedge the very player being handed to us.
-	//   - a session for this character is STILL HELD on this shard (the #321 residency index) — a
-	//     re-attach, not a new claim. We already own it. Claiming would raise the row above the held
-	//     session's epoch, and until it adopted the new value its in-flight saves would come back
-	//     not-owner: a live player, unsaveable and (worse) evictable, from an ordinary reconnect.
+	//   - route == attachRouteResident — a session for this character is STILL HELD on this shard (the #321
+	//     residency index), so this is a re-attach, not a new claim. We already own it. Claiming would raise
+	//     the row above the held session's epoch, and until it adopted the new value its in-flight saves
+	//     would come back not-owner: a live player, unsaveable and (worse) evictable, from an ordinary
+	//     reconnect. Read off the ROUTE, not off a second look at the index — see the single-read note above.
 	//   - no durable row (a brand-new name, or a storeless/ephemeral boot) — there is nothing to fence
 	//     and nothing to fence against. The row is created at owner_epoch 0 and the first save arms it.
 	claimed := resumeEpoch
 	if token == "" && loadedOK && loaded.PID != "" && s.shard.saver != nil && s.shard.saver.store != nil &&
-		s.shard.zoneForResidentCharacter(character) == nil {
+		route != attachRouteResident {
 		floor := resumeEpoch
 		if loaded.OwnerEpoch > floor {
 			floor = loaded.OwnerEpoch
@@ -314,6 +430,9 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			// that refused the claim will refuse its saves. Admitting it means hours of play that is
 			// silently unpersistable, which is strictly worse for the player than being told to
 			// reconnect. Unavailable is the code the gate already retries on.
+			//
+			// This return runs with the arrival claim HELD: the deferred release above is what keeps a
+			// store outage from converting every refused login into a permanently un-unhostable zone.
 			s.log.Error("ownership claim failed; refusing the login", "character", character, "err", cerr)
 			return status.Error(codes.Unavailable, "could not claim character ownership; reconnect")
 		}
@@ -395,6 +514,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		tier:        loginTier,
 		account:     loginAccount,
 	})
+	posted = true // the arrival claim is now Zone.attach's to release (#413)
 	s.log.Debug("player stream ready", "character", character, "zone", zone.id)
 
 	// Phase 14.4 single-session lock: on a FRESH login (a handoff re-dial already holds the lock under the

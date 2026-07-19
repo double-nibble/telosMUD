@@ -91,14 +91,22 @@ type Zone struct {
 	// pop == 0 is NOT "this zone is empty" — see quiescent().
 	stashed atomic.Int64
 
-	// incoming counts players who have LEFT a source zone on the intra-shard transfer path but whose
-	// transferInMsg this zone has not dequeued yet. transferOut removes the player from the source and
-	// hands them over through the inbox, so for the width of that queue hop the session belongs to
-	// NEITHER zone's players map and pop is 0 on both sides. Without this counter UnhostZone can pass its
-	// quiescence check in exactly that window, tear the destination down, and abandon the post — leaving
-	// the session attached to no room, owned by no zone, with the source's forwarding entry pointing at a
-	// stopped actor (#409). Claimed by the SOURCE atomically with resolving this zone as a live host
-	// (Shard.claimTransferTarget), released by transferIn on every path (including its no-rooms rejection).
+	// incoming counts ARRIVALS this zone has been resolved as the destination of but has not dequeued yet.
+	// Three producers resolve a zone under s.mu and then deliver ASYNCHRONOUSLY through its inbox, so for
+	// the width of that queue hop pop does not count the session at all:
+	//
+	//   - the intra-shard transfer (#409): transferOut removes the player from the SOURCE first, so the
+	//     session is in NEITHER zone's players map and pop reads 0 on both sides;
+	//   - the LOGIN attach (#413): server.go resolves the zone and posts an attachMsg, and pop bumps only
+	//     when the handler's setPlayer runs;
+	//   - the cross-shard Handoff.Prepare (#413): handoff_server.go resolves the zone and delivers a
+	//     prepareMsg through the inbox, and the pending session is registered by the handler.
+	//
+	// Without this counter UnhostZone can pass its quiescence check in exactly those windows, tear the
+	// destination down, and abandon the post — a transferred walker left attached to no room and owned by
+	// no zone, or a login whose stream never receives Attached (a black hole). Claimed by the PRODUCER
+	// atomically with resolving this zone as a live host (Shard.claimTransferTarget / claimAttachTarget /
+	// claimArrivalTarget), released by the handler on every path (see releaseInboundArrival).
 	//
 	// Same shape as pop and stashed and the same lesson as #288: pop == 0 is not emptiness — see
 	// quiescent(). Off-goroutine writer (the source zone) + destination-goroutine writer, hence atomic.
@@ -1154,24 +1162,49 @@ func (z *Zone) leave(id string) {
 	metrics.SetOccupancy(context.Background(), z.metricZone(), int64(len(z.players)))
 }
 
-// claimInboundTransfer takes the in-flight claim that makes this zone's quiescence check honest: the source
-// has already dropped the player from its own players map, so between that drop and this zone dequeueing the
-// handover the session is in NO zone's map and pop reads 0 on both sides. UnhostZone passing its check in that
-// window tears this zone down and abandons the post, leaving a live session attached to no room and owned by
-// no zone (#409). transferIn releases the claim unconditionally.
+// claimInboundArrival takes the in-flight claim that makes this zone's quiescence check honest: an arrival is
+// on its way here but the producer resolved this zone and delivers ASYNCHRONOUSLY through the inbox, so
+// between the resolve and this zone's handler running, pop does not yet count the session. UnhostZone passing
+// its check in that window tears this zone down and abandons the post (#409/#413).
+//
+// THREE producers take this claim, and they are exactly the three resolve-then-deliver-async paths into a
+// zone; every one of them resolves and claims in ONE hold of s.mu, the same mutex UnhostZone checks
+// quiescence under:
+//
+//   - the intra-shard transfer (Shard.claimTransferTarget / claimEjectTarget), released by transferIn;
+//   - the LOGIN attach (Shard.claimAttachTarget), released by Zone.attach;
+//   - the cross-shard Handoff.Prepare (Shard.claimArrivalTarget), released by Zone.prepare — and by the
+//     handoff server itself when its inbox send loses to the RPC context.
 //
 // It is NOT enough to take the claim just before the send. Taking it must be ATOMIC with resolving this zone
-// as a live host, which is why the shard-hosted path goes through Shard.claimTransferTarget (one hold of
-// s.mu, the same mutex UnhostZone checks quiescence under) and this bare form exists only for a zone the
-// caller already holds outside any shard — a test harness, or a placement into a zone that cannot be
-// concurrently unhosted. A claim taken on an already-torn-down zone is worse than none: `post` abandons its
-// send on z.dead, so the handover is dropped AND the counter never comes back down.
-func (z *Zone) claimInboundTransfer() {
+// as a live host, which is why every producer goes through one of the claiming resolvers above; this bare
+// form exists only for a zone the caller already holds outside any shard — a test harness, or a placement
+// into a zone that cannot be concurrently unhosted. A claim taken on an already-torn-down zone is worse than
+// none: `post` abandons its send on z.dead, so the arrival is dropped AND the counter never comes back down.
+func (z *Zone) claimInboundArrival() {
 	z.incoming.Add(1)
 }
 
+// releaseInboundArrival drops one in-flight arrival claim. `why` names the PRODUCER whose claim this is
+// ("transfer", "attach", "prepare", ...) and exists for the underflow report below.
+//
+// A NEGATIVE count is the same wedge as a leaked one, from the other side: the zone is permanently
+// non-quiescent, so it can never be unhosted or rebalanced and every BeginDrain on this process burns its
+// whole deadline — with no symptom at the point of the bug. It cannot happen through the claiming resolvers;
+// it is the failure mode of a future path that posts an arrival message directly, or of a producer that
+// releases twice. Both are silent hangs unless said out loud, and the release site is the only place that
+// knows WHICH producer is unbalanced — hence one shared implementation naming `why` rather than an inline
+// decrement per handler.
+func (z *Zone) releaseInboundArrival(why string) {
+	if n := z.incoming.Add(-1); n < 0 {
+		z.log.Error("BUG: inbound-arrival claim underflow — an arrival was delivered without claiming, or "+
+			"released twice; this zone can no longer reach quiescence and will never be unhosted or drained",
+			"producer", why, "incoming", n)
+	}
+}
+
 // postTransferIn hands a session to this zone on the intra-shard transfer path. The caller MUST already hold
-// an in-flight claim for it (Shard.claimTransferTarget, or claimInboundTransfer for an unhostable zone):
+// an in-flight claim for it (Shard.claimTransferTarget, or claimInboundArrival for an unhostable zone):
 // transferIn releases one unconditionally, so a producer that skipped the claim drives the counter negative
 // and wedges the zone against ever being unhosted or drained.
 func (z *Zone) postTransferIn(s *session, room ProtoRef) {
@@ -1186,18 +1219,9 @@ func (z *Zone) postTransferIn(s *session, room ProtoRef) {
 // the reader loop now routes input to us, announces the arrival, and shows the room.
 func (z *Zone) transferIn(m transferInMsg) {
 	// Release the in-flight claim the source took on our behalf (#409). Deferred so it covers the no-rooms
-	// rejection below and a recovered panic too: leak it and this zone can never be unhosted again.
-	//
-	// A NEGATIVE count is the same wedge from the other side — permanently non-quiescent — so a producer that
-	// posted without claiming is worth saying out loud rather than leaving as a silent hang. It cannot happen
-	// through claimTransferTarget; it is the failure mode of a future path that posts a transferInMsg directly.
-	defer func() {
-		if n := z.incoming.Add(-1); n < 0 {
-			z.log.Error("BUG: inbound-transfer claim underflow — a transferInMsg was posted without claiming; "+
-				"this zone can no longer reach quiescence and will never be unhosted or drained",
-				"zone", z.id, "incoming", n)
-		}
-	}()
+	// rejection below and a recovered panic too: leak it and this zone can never be unhosted again. The
+	// underflow report lives in releaseInboundArrival, shared with the attach and prepare producers.
+	defer z.releaseInboundArrival("transfer")
 	s := m.s
 	r := z.resolveRoom(m.room)
 	if r == nil {
@@ -1310,6 +1334,13 @@ func (z *Zone) transferIn(m transferInMsg) {
 // correctly. Either way an Attached frame goes out first; session.send stamps it with
 // the resume point (appliedSeq) via ServerFrame.ack_input_seq.
 func (z *Zone) attach(m attachMsg) {
+	// Release the in-flight arrival claim server.go took when it resolved this zone (#413), exactly as
+	// transferIn does. FIRST statement and deferred so it covers every bail — the handoff-token mismatch, an
+	// unknown token, a frozen mid-handoff re-dial, the re-attach, the fresh login, and a panic. (The net for
+	// that panic is Zone.handle's own recover, not dispatchSafe: dispatchSafe wraps the COMMAND path and
+	// never sees an attachMsg.) A release placed at the bottom of the happy path would leak on the
+	// rejections, and a leaked claim is permanent: the zone could never be unhosted or drained again.
+	defer z.releaseInboundArrival("attach")
 	character, token, out, curZone, resumeEpoch := m.character, m.token, m.out, m.curZone, m.resumeEpoch
 	s := z.players[character]
 	// Eagerly reap a handed-off ORPHAN before the switch (the direct fix for a reconnect routed
@@ -1614,6 +1645,12 @@ func (z *Zone) createCharacter(s *session) {
 // player map but not yet in its room's occupant set — invisible until the gate's
 // re-dial activates it.
 func (z *Zone) prepare(m prepareMsg) {
+	// Release the in-flight arrival claim handoff_server.go took when it resolved this zone (#413). FIRST
+	// statement and deferred, so it covers all seven early returns below (the idempotent retry, the stale
+	// epoch, an already-present character, no placeable room, the carry byte cap, unknown prototypes, the
+	// node cap) as well as the success path and a panic recovered by Zone.handle. Leak it and this zone can never be
+	// unhosted or drained again.
+	defer z.releaseInboundArrival("prepare")
 	character := m.snap.GetCharacterId()
 	if existing := z.players[character]; existing != nil {
 		switch {

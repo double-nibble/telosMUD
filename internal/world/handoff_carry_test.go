@@ -73,6 +73,7 @@ func TestCrossShardCarrySeam(t *testing.T) {
 
 	// Destination prepare rehydrates the pending entity from the snapshot.
 	reply := make(chan error, 1)
+	dst.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dst.prepare(prepareMsg{snap: snap, room: "", epoch: 5, token: "tok", reply: reply})
 	if err := <-reply; err != nil {
 		t.Fatalf("prepare replied error: %v", err)
@@ -166,6 +167,7 @@ func TestCrossShardCarryParityWithSaveLoad(t *testing.T) {
 	dstZone := newDemoZone("midgaard", newProtoCache())
 	hsnap := buildSnapshot(src)
 	reply := make(chan error, 1)
+	dstZone.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dstZone.prepare(prepareMsg{snap: hsnap, room: "", epoch: 2, token: "tok", reply: reply})
 	if err := <-reply; err != nil {
 		t.Fatalf("prepare replied error: %v", err)
@@ -366,6 +368,7 @@ func TestCrossShardTierCarry(t *testing.T) {
 
 	// Destination prepare parks the pending session carrying the tier but WITHOUT the derived flags yet.
 	reply := make(chan error, 1)
+	dst.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dst.prepare(prepareMsg{snap: snap, room: "", epoch: 2, token: "tok", reply: reply})
 	if err := <-reply; err != nil {
 		t.Fatalf("prepare replied error: %v", err)
@@ -401,6 +404,7 @@ func TestCrossShardBaselineTierCarry(t *testing.T) {
 		t.Fatalf("a baseline player must carry an empty tier, got %q", snap.GetTier())
 	}
 	reply := make(chan error, 1)
+	dst.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dst.prepare(prepareMsg{snap: snap, room: "", epoch: 2, token: "tok", reply: reply})
 	if err := <-reply; err != nil {
 		t.Fatalf("prepare replied error: %v", err)

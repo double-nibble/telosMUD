@@ -788,7 +788,7 @@ func (s *Shard) claimTransferTarget(zoneID string) *Zone {
 	if z == nil || s.handedOff[zoneID] || s.draining {
 		return nil
 	}
-	z.claimInboundTransfer()
+	z.claimInboundArrival()
 	return z
 }
 
@@ -824,7 +824,43 @@ func (s *Shard) claimEjectTarget(zoneID string) *Zone {
 	if z == nil || s.handedOff[zoneID] || z.isInstance() {
 		return nil
 	}
-	z.claimInboundTransfer()
+	z.claimInboundArrival()
+	return z
+}
+
+// claimArrivalTarget resolves a zone as the destination of a CROSS-SHARD Handoff.Prepare AND claims the
+// arrival on it, in ONE hold of mu — the same atomicity claimTransferTarget exists for (#409), applied to the
+// sibling path that had the identical resolve-then-deliver-async shape (#413). Prepare resolves the zone here
+// and then delivers a prepareMsg through the zone's INBOX; the pending session is registered by the handler,
+// so between the two, pop counts nothing and a concurrent UnhostZone could pass quiescence, delete the zone
+// and close(z.dead) — abandoning the send. Returns nil (claiming nothing) if the zone is not hosted.
+//
+// WHY IT TAKES NO LEGITIMACY REFUSALS, unlike both its siblings. Prepare's admission policy is decided by the
+// CALLER, before this point and deliberately so: the snapshot signature is verified, a keyless shard refuses
+// outright (#260), an unsigned carry has its tier/account stripped (#106/#72), and an instance-shaped target
+// is refused by shape (#411). What is left for this function is one question — is the zone hosted here — and
+// answering it atomically with the claim. Reusing claimTransferTarget would smuggle in two refusals that are
+// wrong for this path, which is why this is a separate function rather than a flag on that one:
+//
+//   - `draining` would break the handoff RE-DIAL a draining shard deliberately still admits (server.go
+//     refuses a fresh login while draining but accepts a token bind, so an in-flight cross-shard move
+//     completes);
+//   - `handedOff` would strand a player already PREPARED here when the zone's lease flips mid-drain: their
+//     pending session lives in this zone and only this zone can bind it.
+//
+// NOTE (follow-up, deliberately out of scope for a race fix): whether Prepare SHOULD refuse a handedOff or
+// draining destination is a genuine double-writer question with a real trade-off on both sides — admitting
+// pins a player into a zone another shard now owns; refusing fails a handoff the source has already committed
+// to and cannot cheaply undo. It is a policy change, not a race fix, and mixing it in here would hide one in
+// the other.
+func (s *Shard) claimArrivalTarget(zoneID string) *Zone {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	z := s.zones[zoneID]
+	if z == nil {
+		return nil
+	}
+	z.claimInboundArrival()
 	return z
 }
 

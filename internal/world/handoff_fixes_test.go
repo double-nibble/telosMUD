@@ -253,6 +253,7 @@ func TestFreezeExpireReapsHandedOff(t *testing.T) {
 	// start room. Drive attach directly with a fresh out channel.
 	var cz atomic.Pointer[Zone]
 	out2 := make(chan *playv1.ServerFrame, 16)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.attach(attachMsg{character: "Mover", out: out2, curZone: &cz})
 	ns := z.players["Mover"]
 	if ns == nil {
@@ -362,6 +363,7 @@ func TestPrepareAdoptsCarriedPersistID(t *testing.T) {
 	z := newDemoZone("midgaard", newProtoCache())
 
 	reply := make(chan error, 1)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.prepare(prepareMsg{
 		snap: &handoffv1.PlayerSnapshot{
 			CharacterId:  "Arriver",
@@ -409,6 +411,7 @@ func TestAttachReapsHandedOffOrphanAsFreshLogin(t *testing.T) {
 	// A reconnect routed back to the source: attach must reap + proceed as fresh login.
 	var cz atomic.Pointer[Zone]
 	out2 := make(chan *playv1.ServerFrame, 16)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.attach(attachMsg{character: "Returner", out: out2, curZone: &cz})
 
 	ns := z.players["Returner"]
@@ -463,6 +466,7 @@ func TestAttachRejectsInFlightFrozenCopy(t *testing.T) {
 
 	var cz atomic.Pointer[Zone]
 	out2 := make(chan *playv1.ServerFrame, 16)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.attach(attachMsg{character: "InFlight", out: out2, curZone: &cz})
 
 	// The original frozen session must remain untouched and the new stream rejected.
@@ -514,6 +518,7 @@ func TestPrepareRejectsUnplaceableRoom(t *testing.T) {
 	z := newZone("empty") // no rooms spawned, no start room -> resolveRoom returns nil
 
 	reply := make(chan error, 1)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.prepare(prepareMsg{
 		snap:  &handoffv1.PlayerSnapshot{CharacterId: "Drifter", Name: "Drifter"},
 		room:  "empty:room:nowhere",

@@ -66,6 +66,7 @@ func TestHandoffDoublePrepareIdempotentThenRejected(t *testing.T) {
 
 	// First Prepare parks a pending player keyed at the deterministic token.
 	reply := make(chan error, 1)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.prepare(prepareMsg{snap: snap, room: "", epoch: epoch, token: tok, reply: reply})
 	if err := <-reply; err != nil {
 		t.Fatalf("first prepare replied error: %v", err)
@@ -78,6 +79,7 @@ func TestHandoffDoublePrepareIdempotentThenRejected(t *testing.T) {
 	// IDEMPOTENT RETRY: same (character, epoch) -> same token -> reply nil, and the SAME
 	// *session survives (no rival copy, no mutation).
 	reply2 := make(chan error, 1)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.prepare(prepareMsg{snap: snap, room: "", epoch: epoch, token: tok, reply: reply2})
 	if err := <-reply2; err != nil {
 		t.Fatalf("idempotent retry (same token) replied error: %v", err)
@@ -89,6 +91,7 @@ func TestHandoffDoublePrepareIdempotentThenRejected(t *testing.T) {
 	// DUPLICATE AT THE SAME EPOCH, DIFFERENT TOKEN: rejected as a stale/duplicate epoch, and
 	// the original pending copy is left untouched (no second pending entity).
 	reply3 := make(chan error, 1)
+	z.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	z.prepare(prepareMsg{snap: snap, room: "", epoch: epoch, token: "forged-different-token", reply: reply3})
 	if code := status.Code(<-reply3); code != codes.FailedPrecondition {
 		t.Fatalf("different-token same-epoch prepare: code = %s, want FailedPrecondition", code)

@@ -1311,7 +1311,7 @@ func TestEjectPhaseIsTimeBoundedOnASaturatedInstance(t *testing.T) {
 	drainEjectBarrier = 250 * time.Millisecond
 	defer func() { drainEjectBarrier = old }()
 
-	release := stallSourceMidTransfer(t, inst) // parks the actor AND fills its inbox to capacity
+	release := stallProducersInto(t, inst) // parks the actor AND fills its inbox to capacity
 	defer release()
 
 	done := make(chan struct{})
@@ -1503,8 +1503,7 @@ func TestInstanceJourney(t *testing.T) {
 	// 6. RELOG. The login path's zone resolution must honor the row — and in particular must not have been
 	// handed an instance-shaped ref to refuse, which is the failure mode #411's read guard exists for and the
 	// one the anchor makes unreachable from the write side.
-	ps := &playServer{shard: sh, log: sh.zoneByID("midgaard").log}
-	if got := ps.resolveAttachZone("Pilgrim", "", row, true); got != origin {
+	if got := resolveAttachZone(sh, "Pilgrim", "", row, true); got != origin {
 		t.Fatalf("a relog after a dungeon run resolved to %v, want the anchor zone midgaard", got)
 	}
 }
@@ -1558,7 +1557,7 @@ func TestTransferInMaintainsTheAnchorInvariant(t *testing.T) {
 				anchorZone: "midgaard", anchorRoom: "midgaard:room:guildhall",
 			}
 			inst.newPlayerEntity(s, "Hero")
-			tc.dest.claimInboundTransfer() // the bare form of the claim claimTransferTarget takes under s.mu
+			tc.dest.claimInboundArrival() // the bare form of the claim claimTransferTarget takes under s.mu
 			tc.dest.transferIn(transferInMsg{s: s, room: tc.room})
 			held := s.anchorZone != "" || s.anchorRoom != ""
 			if held != tc.wantAnchorKept {
@@ -1690,6 +1689,7 @@ func TestAccountRidesTheSignedHandoff(t *testing.T) {
 	dest.startRoom = "darkwood:room:grove"
 	snap.Account = "acct-42"
 	reply := make(chan error, 1)
+	dest.claimInboundArrival() // the claim the production resolver takes under s.mu; the handler releases one unconditionally (#413)
 	dest.prepare(prepareMsg{snap: snap, room: "darkwood:room:grove", epoch: 4, token: "tok", reply: reply})
 	if err := <-reply; err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -1718,7 +1718,7 @@ func TestPendingMintFlagDoesNotLatchAcrossAWalk(t *testing.T) {
 		instanceMintPending: true, // asked to enter, then walked away before the build finished
 	}
 	dest.newPlayerEntity(s, "Hero")
-	dest.claimInboundTransfer()
+	dest.claimInboundArrival()
 	dest.transferIn(transferInMsg{s: s, room: "darkwood:room:grove"})
 
 	if s.instanceMintPending {
