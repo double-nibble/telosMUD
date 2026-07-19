@@ -384,7 +384,7 @@ func (sr *scopeReplication) seedZone(ctx context.Context, z *Zone) {
 	defer cancel()
 
 	// Region first: its staleness window is the one we can afford to widen.
-	regionID := sr.regionFor(z)
+	regionID := sr.resolveRegionOnce(z)
 	var regionSeed map[string]json.RawMessage
 	if regionID != "" {
 		if raw, err := sr.snapshot.SnapshotRegionState(ctx, regionID); err != nil {
@@ -422,7 +422,7 @@ func (sr *scopeReplication) registerZone(z *Zone) {
 	if sr == nil {
 		return
 	}
-	regionID := sr.regionFor(z)
+	regionID := sr.resolveRegionOnce(z)
 	if regionID == "" {
 		return // not a region member; world-scope deltas still reach it via zonesList
 	}
@@ -469,12 +469,45 @@ func (sr *scopeReplication) regionFor(z *Zone) string {
 	return sr.regionForZone(z.template)
 }
 
-// regionForZone returns the region id a zone belongs to per the shard's loaded region_defs, or "".
-func (sr *scopeReplication) regionForZone(zoneID string) string {
-	if sr.shard == nil || sr.shard.content == nil {
+// resolveRegionOnce answers "which region is this zone in" ONCE per zone build, caching the answer on the
+// zone, and it is the only thing seedZone and registerZone may ask.
+//
+// Both run on the same goroutine before the zone's actor starts — seedZone first, registerZone after — but
+// a full buildZone plus a store round trip sits between them. Since #418 the content snapshot they resolve
+// against can be SWAPPED in that gap, so two independent reads can return two different answers, and the
+// two answers are used for different things: seedZone picks which region's state to seed the replica from,
+// registerZone stamps which region's deltas the zone will receive. Disagreement is not a stale value, it is
+// a zone permanently holding one region's state while subscribed to another's — or, when the second read
+// returns "", holding a region's values while subscribed to nothing, which is exactly the sticky-stale
+// region gate (#44) seedZone exists to prevent, with no error anywhere to show for it.
+//
+// Caching on z.scopes.regionID is safe for the same reason registerZone's stamp is: strictly before z.Run.
+func (sr *scopeReplication) resolveRegionOnce(z *Zone) string {
+	if z == nil {
 		return ""
 	}
-	for _, rg := range sr.shard.content.Regions {
+	if z.scopes.regionID != "" {
+		return z.scopes.regionID
+	}
+	regionID := sr.regionFor(z)
+	z.scopes.regionID = regionID
+	return regionID
+}
+
+// regionForZone returns the region id a zone belongs to per the shard's loaded region_defs, or "".
+func (sr *scopeReplication) regionForZone(zoneID string) string {
+	if sr.shard == nil {
+		return ""
+	}
+	// The LIVE snapshot (#418), not a boot-time capture: region membership is read straight off the content
+	// here rather than registered into one of the atomic-swap def registries at construction, so a refreshed
+	// snapshot is simply the current answer. A zone's stamped regionID is still taken once at registerZone,
+	// so — as everywhere else the refresh reaches — the change lands on zones registered from here on.
+	lc := sr.shard.liveContent()
+	if lc == nil {
+		return ""
+	}
+	for _, rg := range lc.Regions {
 		for _, z := range rg.Zones {
 			if z == zoneID {
 				return rg.Ref

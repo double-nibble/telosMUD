@@ -90,7 +90,7 @@ func TestDrainStillAccountsForInstanceOccupants(t *testing.T) {
 	inst := newInstanceZone("darkwood#occupied", "darkwood")
 	inst.shard = sh
 	inst.protos = sh.protos
-	inst.buildZone(sh.content)
+	inst.buildZone(sh.liveContent())
 	sh.adopt(inst.id, inst)
 	sh.mu.Lock()
 	sh.instances[inst.id] = &instanceRecord{id: inst.id, template: "darkwood", account: "acct-1", minted: time.Now()}
@@ -221,7 +221,7 @@ func TestDrainDoesNotWaitOnAnOCCUPIEDInstance(t *testing.T) {
 	inst := newInstanceZone("darkwood#pinned", "darkwood")
 	inst.shard = sh
 	inst.protos = sh.protos
-	inst.buildZone(sh.content)
+	inst.buildZone(sh.liveContent())
 	sh.adopt(inst.id, inst)
 	sh.mu.Lock()
 	sh.instances[inst.id] = &instanceRecord{id: inst.id, template: "darkwood", account: "acct-1", minted: time.Now()}
@@ -386,7 +386,7 @@ func TestDrainDoesNotStallOnAZoneReapedMidDrain(t *testing.T) {
 	reaped := newInstanceZone("darkwood#reaped", "darkwood")
 	reaped.shard = sh
 	reaped.protos = sh.protos
-	reaped.buildZone(sh.content)
+	reaped.buildZone(sh.liveContent())
 	close(reaped.dead)
 	sh.adopt(reaped.id, reaped)
 

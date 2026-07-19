@@ -1,6 +1,8 @@
 package world
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
@@ -446,12 +448,42 @@ func parseAttributeBase(a content.AttributeDTO) (formulaNode, error) {
 	return nil, nil
 }
 
+// errNoZoneContent is returned when the snapshot has no definition for the zone's template, and
+// errIncompleteZoneBuild when it declares rooms whose prototypes are not in the cache. Both are ADVISORY to
+// a boot caller and FATAL to a runtime one — see buildZone's contract.
+var (
+	errNoZoneContent       = errors.New("no such zone in the content snapshot")
+	errIncompleteZoneBuild = errors.New("zone declares rooms with no prototype in the cache")
+)
+
 // buildZone constructs zone z (id == zoneRef) from its loaded definition: it spawns each room
 // as a singleton entity, records the start room, and runs the reset script. The prototype
-// cache must already be filled (defineContent). If the loaded content has no such zone, the
-// zone is left EMPTY (no rooms, no start room) — the bare-engine boot: a login to an empty
-// zone is rejected cleanly (Zone.join / resolveRoom guards), never a panic.
-func (z *Zone) buildZone(lc *content.LoadedContent) {
+// cache must already be filled (defineContent).
+//
+// # It reports whether the build was COMPLETE, and the caller decides what that is worth
+//
+// It returns an error when the snapshot has no such zone, or when it declares rooms whose prototypes are
+// missing from the cache. In both cases the zone is left partially built (possibly with no rooms at all).
+// The zone object is still usable — every read path guards nil — so the error is a REPORT, not a panic.
+//
+// The two classes of caller want opposite things from that report, which is why it is returned rather than
+// handled here:
+//
+//   - BOOT (NewShardFromContent) must tolerate it. "The engine boots with zero content" is a documented
+//     invariant: a bare deployment with no packs comes up, serves a clean rejection on login, and lets a
+//     builder connect and pull. Boot logs and continues.
+//   - RUNTIME (HostZone, MintInstance) must REFUSE it, and this is the half #418 added. A runtime build
+//     happens when a zone is already someone's destination — a drain handing players over, or a player
+//     walking through a dungeon door. Publishing a roomless zone there does not degrade, it DROPS them:
+//     transferIn's "destination has no rooms" branch disconnects every arriving session, and for HostZone
+//     the shard then holds a renewed lease on a black hole that nothing self-heals, because from the
+//     coordinator's view the zone is claimed and healthy. Refusing instead leaves the zone unowned, which
+//     is visible, alertable and retryable.
+//
+// Before #418 the runtime case could not arise: the snapshot was frozen at boot, so it always described a
+// zone whose prototypes defineContent had already loaded. Now the snapshot tracks reloads while the cache is
+// fed ref-by-ref off the bus, so a build can land in the window where the two disagree.
+func (z *Zone) buildZone(lc *content.LoadedContent) error {
 	// By TEMPLATE, not id: this is the one genuinely content-shaped question in the zone lifecycle, so it is
 	// the one place the two must differ for an instance (#72). They are equal for every zone that exists
 	// today, so this is inert until instances land.
@@ -466,10 +498,13 @@ func (z *Zone) buildZone(lc *content.LoadedContent) {
 	zd := lc.Zone(z.template)
 	if zd == nil {
 		z.log.Debug("zone has no loaded content; booting empty", "zone", z.id, "template", z.template)
-		return
+		return errNoZoneContent
 	}
+	missing := 0
 	for _, r := range zd.Rooms {
-		z.spawnRoom(ProtoRef(r.Ref))
+		if z.spawnRoom(ProtoRef(r.Ref)) == nil {
+			missing++
+		}
 	}
 	z.startRoom = ProtoRef(zd.StartRoom)
 	// Boot reset: run the script once to place the starting content. The SAME interpreter
@@ -481,6 +516,10 @@ func (z *Zone) buildZone(lc *content.LoadedContent) {
 	z.log.Debug("zone built from content", "zone", z.id,
 		"rooms", len(zd.Rooms), "start_room", z.startRoom, "resets", len(zd.Resets),
 		"reset_secs", zd.ResetSecs)
+	if missing > 0 {
+		return fmt.Errorf("%w: %q is missing %d of %d room prototypes", errIncompleteZoneBuild, z.template, missing, len(zd.Rooms))
+	}
+	return nil
 }
 
 // newDemoZone builds the named demo zone from the EMBEDDED demo pack (content.DemoPack),
@@ -508,6 +547,10 @@ func newDemoZone(id string, protos *protoCache) *Zone {
 	// strength/max_hp/hp standalone. The shard path (newShard) shares one bundle across zones;
 	// here each demo zone gets its own equivalent registration (same immutable defs).
 	defineGlobals(z.defs, lc)
-	z.buildZone(lc)
+	// The demo pack is embedded and defineContent ran over the same content two lines up, so an incomplete
+	// build here is a corrupt checked-in pack, not a runtime condition — panic, like the parse failure above.
+	if err := z.buildZone(lc); err != nil {
+		panic("world: build demo zone " + id + ": " + err.Error())
+	}
 	return z
 }

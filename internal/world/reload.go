@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"log/slog"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,23 @@ var (
 	// short-lived, briefly-sleeping goroutines cost is negligible, so the security-weighted path gets equal
 	// headroom rather than less.
 	maxCommsRepublishRetryGoroutines int64 = 128
+
+	// contentRefreshDebounce is how long a marked content-snapshot refresh WAITS before re-reading (#418).
+	// Package vars so a test can shrink them.
+	//
+	// It buys two things a bare single-flight cannot. First, ORDERING: the refresh reads Postgres directly
+	// while the prototype cache is fed ref-by-ref off the bus, and a pull's rows are all committed before its
+	// first invalidation is published — so a refresh that fires on zone #1's invalidation returns content
+	// describing zone #40's rooms whose prototypes are still in flight. Waiting for the fan-out to drain
+	// keeps the two halves of a zone from coming from different places. (It is not a correctness barrier —
+	// buildZone refuses an incomplete build either way — but without it, every deploy would produce a burst
+	// of refused mints.) Second, COALESCING: a 40-zone pack marks 40 times and re-reads once.
+	contentRefreshDebounce = 2 * time.Second
+	// contentRefreshJitter is spread added on top of the debounce. Every shard in the fleet receives the same
+	// broadcast within milliseconds, and the re-read is a full materialization of the deployed world: without
+	// jitter, N shards hit the content database simultaneously on every deploy, and again — all together —
+	// the instant a partition heals. Jitter turns a synchronized spike into a spread.
+	contentRefreshJitter = 3 * time.Second
 )
 
 // reload.go is the shard-side hot-reload applier (docs/PHASE4-PLAN.md §5). It subscribes to the
@@ -110,6 +128,22 @@ type reloader struct {
 	// single-flights concurrent reconnects.
 	appliedContentVersion atomic.Uint64
 	reconcileInFlight     atomic.Bool
+
+	// Live content snapshot refresh (#418). contentStale is set by any signal that the shard's boot-time
+	// content view may no longer match the deployed rows; contentRefreshInFlight single-flights the
+	// re-read the marker kicks off. See markContentStale / refreshContentSnapshot.
+	contentStale           atomic.Bool
+	contentRefreshInFlight atomic.Bool
+	// refreshDebounce/refreshJitter are captured from the package vars at CONSTRUCTION rather than read in
+	// the refresh loop. The loop runs on a goroutine that outlives the call that started it, so reading the
+	// package vars there races any test that restores them in a t.Cleanup while a previous test's worker is
+	// still sleeping — a real, -race-detectable data race between unrelated tests.
+	refreshDebounce time.Duration
+	refreshJitter   time.Duration
+	// snapshotContentVersion is the content version the CURRENT published snapshot was read at. It makes the
+	// refresh idempotent: a mark whose version the snapshot already reflects skips the whole-pack read, so a
+	// replayed or forged invalidation cannot be used as a read-amplification lever against Postgres.
+	snapshotContentVersion atomic.Uint64
 }
 
 // contentVersioner is the subset of the content source that reports the current Postgres content
@@ -167,11 +201,17 @@ func newReloader(src content.DefinitionSource, cache *protoCache, bus contentbus
 		shard:     shard,
 		log:       slog.With("component", "contentreload"),
 		retryDone: make(chan struct{}),
+		// Snapshot the refresh timing once, here — see the field comments.
+		refreshDebounce: contentRefreshDebounce,
+		refreshJitter:   contentRefreshJitter,
 	}
 	// Seed the applied version with the version the boot content was loaded at (read BEFORE the packs
 	// in loadContent, so it is never AHEAD of the loaded content — a pull racing boot fails safe to a
 	// redundant re-apply on the first reconnect, never a missed catch-up).
 	r.appliedContentVersion.Store(bootVersion)
+	// The boot snapshot was read at the same version, so the refresh's version gate starts calibrated: an
+	// invalidation replayed from before this process started re-reads nothing (#418).
+	r.snapshotContentVersion.Store(bootVersion)
 	for _, p := range enabledPacks {
 		r.packs[p] = true
 	}
@@ -235,6 +275,10 @@ func (r *reloader) reconcileOnJoin() {
 	// advanceApplied (not a raw Store): a wire delivery of a NEWER pull could land on the subscription
 	// goroutine during this reconcile and advance the cursor past `cur` — a hard Store would regress it.
 	r.advanceApplied(cur)
+	// The local re-apply above drove the per-ref swaps and the live-zone reconciles; the snapshot that
+	// runtime zone builds and instance mints read from needs the same catch-up (#418). Marked rather than
+	// refreshed inline so it coalesces with the marks the local PublishPack fan-out just produced.
+	r.markContentStale()
 	r.log.Info("reconcile-on-join: caught up after a content-bus gap",
 		"from_version", applied, "to_version", cur, "definitions_applied", total)
 }
@@ -251,6 +295,214 @@ func (r *reloader) advanceApplied(v uint64) {
 			return
 		}
 	}
+}
+
+// markContentStale records that the shard's live content snapshot (s.content) may be behind the deployed
+// rows and kicks a single-flighted background refresh (#418).
+//
+// # Why a marker plus a background re-read, rather than a direct patch
+//
+// The snapshot has to converge on every path that changes content, and the shard-side signals differ per
+// path. A coordinated pull ends in the version-complete SENTINEL; a shard-local staff `reload` emits NO
+// sentinel (only per-ref invalidations plus a trailing KindZone per zone); a reconcile-on-join has the
+// packs in hand already. Marking from all three and refreshing in one place means one mechanism instead of
+// three, and — the load-bearing part — it COALESCES: a pull of a 40-zone pack marks 40 times and re-reads
+// once, instead of 40 full pack reads against Postgres on the bus goroutine.
+//
+// Patching the snapshot per-invalidation was the alternative and it cannot work: the KindZone wire payload
+// carries only the room set and start room (contentbus.Invalidation), not resets, reset_secs, or
+// `instanceable` — and a zone DELETED from a pack emits no invalidation at all, so a patch could never
+// learn about the one case (#418's "a deleted template still mints") that most needs learning.
+//
+// # The refresh runs OFF the bus goroutine
+//
+// onInvalidation is serial per subscription: a full LoadPacks against Postgres there would head-of-line
+// stall every later invalidation behind it. Same reason bus.OnReconnect dispatches reconcileOnJoin to its
+// own goroutine.
+func (r *reloader) markContentStale() {
+	if r == nil || r.shard == nil {
+		return // a bare test reloader with no shard has no snapshot to refresh
+	}
+	// Order matters: publish the mark BEFORE claiming the in-flight slot. The refresher clears the mark
+	// before each pass, so a mark published after its clear is guaranteed either to win the CAS here or to
+	// be seen by the running refresher's re-check below — never dropped between the two.
+	r.contentStale.Store(true)
+	if !r.contentRefreshInFlight.CompareAndSwap(false, true) {
+		return // a refresh is already running; it will observe the mark we just set
+	}
+	go func() {
+		defer func() {
+			r.contentRefreshInFlight.Store(false)
+			// Close the lost-wakeup window: a mark that arrived after our last CompareAndSwap below but
+			// before the Store above found the slot taken and returned without kicking anything. Re-check
+			// once the slot is free. Bounded — the re-kick only happens when there is genuinely new work.
+			if r.contentStale.Load() {
+				r.markContentStale()
+			}
+		}()
+		for r.contentStale.CompareAndSwap(true, false) {
+			// Debounce + jitter BEFORE the read, so the marks still arriving from this same pull are
+			// absorbed into this pass rather than each buying their own. Aborts promptly on stop.
+			//nolint:gosec // G404: load-spreading jitter, not a secret. Predicting it buys an attacker
+			// nothing — the refresh is version-gated, so a forged invalidation re-reads nothing whatever
+			// its timing, and the only thing the jitter protects is the content database from a
+			// synchronized fleet-wide read.
+			if !r.sleepOrStop(r.refreshDebounce + time.Duration(rand.Int63n(int64(r.refreshJitter)+1))) {
+				return // the reloader stopped — refreshing a torn-down shard is pointless
+			}
+			r.refreshContentSnapshot()
+		}
+	}()
+}
+
+// sleepOrStop waits d, returning false if the reloader stopped first. It is how the refresh loop stays
+// promptly cancellable across a debounce that is deliberately longer than a shutdown should take.
+func (r *reloader) sleepOrStop(d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-r.retryDone:
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// refreshContentSnapshot re-reads the shard's enabled packs and publishes the result as the shard's live
+// content snapshot (#418). It is the ONLY writer of s.content after construction.
+//
+// It re-reads through content.LoadWithCore — the SAME call cmd/telos-world uses at boot — so the refreshed
+// snapshot has the identical shape and layering the process booted with: the embedded core bootstrap pack
+// merged UNDER the enabled packs, last-write-wins by ref. Assembling it any other way would make a
+// runtime-built zone differ from a boot-built one in ways nothing tests.
+//
+// Every failure is non-fatal: the previous snapshot stays published. Serving slightly stale content is the
+// bug this fixes, but serving NO content would break HostZone and every mint outright, so a Postgres blip
+// must not be allowed to escalate.
+func (r *reloader) refreshContentSnapshot() {
+	src, ok := r.src.(content.Source)
+	if !ok {
+		// An embedded/mem DefinitionSource that cannot re-read whole packs. Logged rather than silent: a
+		// production source is meant to be a *store.Pool, and a decorator that dropped LoadPacks would
+		// disable the refresh entirely with a green test suite — the same seam the contentVersionBumper
+		// SEAM WARNING above documents.
+		r.log.Debug("content snapshot refresh skipped: the source cannot re-read whole packs", "packs", r.enabled)
+		return
+	}
+	// The refresh outlives nothing: bound it by BOTH the read timeout and the reloader's stop signal, so a
+	// shutdown does not leave a full-content read against Postgres running for another 30 seconds.
+	ctx, cancel := context.WithTimeout(context.Background(), reloadRepublishTimeout)
+	defer cancel()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-r.retryDone:
+			cancel()
+		case <-stop:
+		}
+	}()
+
+	// VERSION GATE. Read the authority's version FIRST, and skip the whole-pack read when the published
+	// snapshot already reflects it. Two things depend on this:
+	//
+	//   - It makes a replayed or FORGED invalidation inert. The content bus carries unsigned JSON and its
+	//     pack filter accepts an empty pack from anybody, so without this gate an attacker who can publish
+	//     to the subject could drive every shard in the fleet into back-to-back full-content reads against
+	//     the content database, indefinitely, for the cost of one small message.
+	//   - It removes the redundant read a coalesced storm would otherwise still pay for.
+	//
+	// A source with no version authority (embedded/mem in dev) has no gate and always re-reads, which is
+	// correct there: no authority means no way to know, and the cost is a small in-memory pack.
+	before, versioned := r.currentContentVersion(ctx)
+	if versioned && before != 0 && before <= r.snapshotContentVersion.Load() {
+		r.log.Debug("content snapshot refresh skipped: already at the current content version",
+			"version", before, "packs", r.enabled)
+		return
+	}
+
+	lc, err := content.LoadWithCore(ctx, src, r.enabled)
+	if err != nil {
+		r.log.Warn("content snapshot refresh failed; runtime zone builds keep the previous content",
+			"packs", r.enabled, "err", err)
+		return
+	}
+	prev := r.shard.liveContent()
+	// An EMPTY result is not a refresh, it is a wipe. LoadPacks matches on `pack = ANY($1)` and returns no
+	// rows and NO ERROR for a pack that was pruned or renamed, so a bad deploy could otherwise replace a
+	// good snapshot with nothing — and an empty snapshot makes every runtime zone build refuse. Keeping the
+	// previous one is the recoverable direction; the loud log is the operator's signal.
+	//
+	// Counted OUTSIDE the core namespace, which is the whole reason this is not lc.Empty(). LoadWithCore
+	// always layers the embedded bootstrap pack, so a snapshot that lost every real zone still reports one
+	// and Empty() is never true here — the obvious guard would have been dead code in production while
+	// looking correct in a test that skipped the core layering.
+	if realZones(lc) == 0 && realZones(prev) > 0 {
+		r.log.Error("content snapshot refresh read ZERO non-core zones for packs that previously had them; "+
+			"keeping the previous snapshot (check that the enabled packs still exist in the content database)",
+			"packs", r.enabled, "previous_zones", realZones(prev))
+		return
+	}
+	r.shard.setContent(lc)
+	r.snapshotContentVersion.Store(before)
+	r.log.Info("content snapshot refreshed; new zone builds and instance mints use the current content",
+		"packs", r.enabled, "zones", len(lc.Zones), "previous_zones", zoneCountOf(prev), "version", before)
+
+	// TORN-READ DETECTION. LoadPacks issues independent statements per table with no enclosing
+	// transaction, so an import committing mid-read yields a snapshot mixing two versions. Re-read the
+	// version afterwards: if it moved, the snapshot we just published may be spliced, so mark stale again
+	// and let the loop re-read. Publishing first and repairing after is deliberate — a spliced snapshot is
+	// still strictly newer than the one it replaced, and buildZone refuses anything incoherent in the gap.
+	if after, ok := r.currentContentVersion(ctx); ok && after != before {
+		r.log.Warn("the content version moved during the snapshot read; the snapshot may mix two versions, "+
+			"re-reading", "read_at", before, "now", after)
+		r.contentStale.Store(true)
+	}
+}
+
+// currentContentVersion reads the content authority's current version. ok is false when the source has no
+// authority (the embedded/mem dev sources) or the read failed — callers treat that as "cannot tell" and
+// proceed, never as "unchanged", so a version-read blip degrades to a redundant refresh rather than a
+// silently skipped one.
+func (r *reloader) currentContentVersion(ctx context.Context) (uint64, bool) {
+	vs, ok := r.src.(contentVersioner)
+	if !ok {
+		return 0, false
+	}
+	v, err := vs.ContentVersion(ctx)
+	if err != nil {
+		r.log.Debug("content version read failed; refreshing without the version gate", "err", err)
+		return 0, false
+	}
+	return v, true
+}
+
+// zoneCountOf is a nil-safe zone count for the refresh log line (a shard can have no previous snapshot).
+func zoneCountOf(lc *content.LoadedContent) int {
+	if lc == nil {
+		return 0
+	}
+	return len(lc.Zones)
+}
+
+// realZones counts zones that are NOT part of the embedded core bootstrap pack.
+//
+// It is the count that answers "does this snapshot still describe a world", which is what the wipe guard
+// needs. The core pack is layered under every load, so a total zone count can never reach zero and would
+// make that guard unreachable.
+func realZones(lc *content.LoadedContent) int {
+	if lc == nil {
+		return 0
+	}
+	n := 0
+	for i := range lc.Zones {
+		ref := lc.Zones[i].Ref
+		if ref == content.CoreZone || strings.HasPrefix(ref, content.CoreRefPrefix) {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // onInvalidation is the bus handler: it runs OFF every zone goroutine (the bus's subscription
@@ -274,6 +526,10 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 	// cursor — only a real versioned pull advances it.)
 	if inv.Kind == content.KindVersionComplete {
 		r.advanceApplied(inv.Version)
+		// A completed pull is the ONE signal that covers a zone DELETION (#418): a zone dropped from a pack
+		// emits no KindZone invalidation of its own — PublishPack loops over the zones that are PRESENT — so
+		// the sentinel is the only edge on which a shard can learn the template is gone.
+		r.markContentStale()
 		return
 	}
 
@@ -293,6 +549,10 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 	// already-swapped cache with no source re-read. It forks off before the prototype path, like the
 	// channel case.
 	if inv.Kind == content.KindZone {
+		// The zone-shape edit converges the LIVE zone; the snapshot refresh converges what the NEXT
+		// runtime-built zone (a HostZone after a rebalance, every instance mint) is assembled from (#418).
+		// Marked here and not only on the sentinel because a shard-local staff `reload` never emits one.
+		r.markContentStale()
 		r.reconcileZone(inv)
 		return
 	}
@@ -690,15 +950,22 @@ func (r *reloader) notifyZones(kind, ref string) {
 // stop unsubscribes the reloader from the bus and cancels any in-flight reconcile-retry goroutines.
 // Idempotent (the retryDone close is once-guarded); safe on a nil reloader.
 func (r *reloader) stop() {
-	if r == nil || r.sub == nil {
+	if r == nil {
 		return
 	}
-	_ = r.sub.Unsubscribe()
+	// Close retryDone FIRST and unconditionally. It used to sit behind an `r.sub == nil` early return, so a
+	// reloader with no live subscription never signalled stop at all — and the content-snapshot refresh
+	// (#418) made that load-bearing: its debounce and its Postgres read are both cancelled by this channel,
+	// so a missed close means a full-content read outliving the shard by up to the read timeout.
 	r.stopOnce.Do(func() {
 		if r.retryDone != nil {
 			close(r.retryDone)
 		}
 	})
+	if r.sub == nil {
+		return
+	}
+	_ = r.sub.Unsubscribe()
 }
 
 // buildPrototype turns a single re-read Definition into a fresh *Prototype using the SAME
