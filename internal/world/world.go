@@ -243,6 +243,10 @@ type Shard struct {
 	// It is the primary in-flight-drain dedupe: a directive re-read on the next renewal tick refreshes the
 	// directive rather than launching a second drain of the same zone.
 	rebalancing map[string]bool
+	// anchorDeferSince records when a zone's rebalance was FIRST deferred because instance occupants are
+	// anchored to it (#421). It bounds the deferral: past anchorDeferBudget the occupants are ejected and the
+	// move proceeds, so a dungeon fed by a busy town cannot pin its entrance zone indefinitely. Guarded by mu.
+	anchorDeferSince map[string]time.Time
 	// rebalanceBackoff[zone] is the earliest time a failed rebalance of that zone may be retried, guarded by
 	// mu — so a persistently-unreachable target isn't re-dialed every renewal tick.
 	rebalanceBackoff map[string]time.Time
@@ -478,6 +482,7 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		actorDone:        map[string]chan struct{}{},
 		rebalancing:      map[string]bool{},
 		rebalanceBackoff: map[string]time.Time{},
+		anchorDeferSince: map[string]time.Time{},
 		// Instanced-zone bookkeeping (#411, instance.go). The limits default here rather than at first use so
 		// a shard built by ANY constructor is capped — a zero-valued cap would mean "unbounded", which for the
 		// per-shard bound is a resource-exhaustion hole rather than a permissive default.

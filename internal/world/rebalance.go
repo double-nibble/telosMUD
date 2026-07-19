@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -40,6 +41,17 @@ const (
 	// unreachable target would otherwise re-dial each tick until the directive TTL lapses).
 	rebalanceRetryBackoff = 30 * time.Second
 )
+
+// anchorDeferBudget caps how long a rebalance may be deferred because the zone is somebody's exit anchor
+// (#421). Past it, the anchored occupants are ejected and the move proceeds.
+//
+// A cap is not optional. A dungeon fed by a busy town would otherwise have SOMEBODY inside essentially
+// always, so a naive pin defers that town's rebalance indefinitely — and every deferred cycle burns a
+// coordinator cooldown, so the load imbalance the rebalance exists to fix just persists.
+//
+// Sized longer than an ordinary dungeon run (so the common case is never disturbed) and shorter than an
+// operator's patience with a shard that will not shed load. Var for tests.
+var anchorDeferBudget = 3 * time.Minute
 
 // maybeRebalance runs on the zone's lease-renewal goroutine (a confirmed-owned tick): it reads any pending
 // rebalance directive for the zone and, if this shard isn't already draining it, launches the single-zone
@@ -101,7 +113,16 @@ func (s *Shard) runRebalance(zoneID, toShard, toAddr string) {
 	res, err := s.RebalanceZone(ctx, zoneID, toShard, toAddr, rebalanceDrainDeadline)
 	if err != nil {
 		// Back off and leave the directive to expire / be re-issued — don't clear it (the move didn't happen).
-		slog.Warn("rebalance drain failed", "zone", zoneID, "to", toShard, "err", err)
+		// Clearing on a non-move would tell the coordinator the load had shifted when it had not, and it would
+		// re-plan against a wrong model.
+		//
+		// An anchor DEFERRAL (#421) is an expected outcome rather than a fault, so it is logged at Info by
+		// settleAnchorsBeforeRebalance and not repeated as a failure here. It takes the same backoff, which is
+		// what gives it its retry cadence, and the same do-not-clear treatment, which is what makes the
+		// coordinator keep asking.
+		if !errors.Is(err, errZoneAnchored) {
+			slog.Warn("rebalance drain failed", "zone", zoneID, "to", toShard, "err", err)
+		}
 		s.failRebalance(zoneID)
 		return
 	}
@@ -113,6 +134,105 @@ func (s *Shard) runRebalance(zoneID, toShard, toAddr string) {
 	_ = s.rebalancePort.ClearRebalance(cctx, zoneID, toShard)
 	ccancel()
 	s.succeedRebalance(zoneID)
+}
+
+// errZoneAnchored defers a rebalance because instance occupants are anchored to the zone (#421). It is a
+// DEFERRAL, not a failure: the caller must not clear the directive, so the coordinator keeps a true model of
+// where the load is and the natural retry cadence re-attempts the move.
+var errZoneAnchored = errors.New("zone is the exit anchor of a live instance occupant; deferring the rebalance")
+
+// settleAnchorsBeforeRebalance decides whether zoneID may be handed to a peer right now (#421).
+//
+// Three outcomes, in order of preference:
+//
+//   - Nobody is anchored here: proceed immediately. This is the overwhelmingly common case, and it costs one
+//     bounded query only when a rebalance directive actually lands.
+//   - Somebody is anchored and the defer budget is not spent: refuse with errZoneAnchored. A rebalance is a
+//     load-balancing optimization; deferring it for the length of a dungeon run is cheap, while moving the
+//     zone out from under a party costs them their run or their routing.
+//   - Somebody is anchored and the budget IS spent: eject them and proceed. Progress must be guaranteed —
+//     see anchorDeferBudget for why an uncapped defer is its own outage.
+//
+// The eject is the same walk-back-to-the-door the drain does, so the players land in the anchor room and are
+// then redirected with everybody else by the handover that follows. They lose the dungeon run; they do not
+// lose their session or their state.
+func (s *Shard) settleAnchorsBeforeRebalance(ctx context.Context, zoneID string) error {
+	if !s.zoneIsAnchored(ctx, zoneID) {
+		s.clearAnchorDefer(zoneID)
+		return nil
+	}
+	if since, expired := s.anchorDeferExpired(zoneID); !expired {
+		slog.Info("rebalance deferred: the zone is a live instance occupant's exit anchor; moving it now would "+
+			"route their reconnect to a shard that does not hold their session",
+			"zone", zoneID, "deferred_for", time.Since(since).Round(time.Second), "budget", anchorDeferBudget)
+		return errZoneAnchored
+	}
+	slog.Warn("rebalance defer budget exhausted: ejecting instance occupants anchored to this zone so the "+
+		"move can proceed", "zone", zoneID, "budget", anchorDeferBudget)
+	s.ejectOccupantsAnchoredTo(ctx, zoneID)
+	s.clearAnchorDefer(zoneID)
+	return nil
+}
+
+// ejectOccupantsAnchoredTo walks every instance occupant whose anchor is zoneID back out to it, so the zone
+// can then be handed over with them counted as ordinary residents of it.
+//
+// Whole-instance granularity: a party enters together through one door, so an instance's occupants
+// overwhelmingly share an anchor, and ejecting the few who do not costs them the same interrupted run rather
+// than anything worse. Precision here would buy nothing and would need a second round trip to get.
+func (s *Shard) ejectOccupantsAnchoredTo(ctx context.Context, zoneID string) {
+	var affected []*Zone
+	for _, z := range s.zonesList() {
+		if !z.isInstance() {
+			continue
+		}
+		ch := make(chan []string, 1)
+		select {
+		case z.inbox <- anchorsMsg{resp: ch}:
+		case <-z.dead:
+			continue
+		case <-ctx.Done():
+			return
+		case <-time.After(anchorQueryBarrier):
+			continue
+		}
+		select {
+		case anchors := <-ch:
+			for _, a := range anchors {
+				if a == zoneID {
+					affected = append(affected, z)
+					break
+				}
+			}
+		case <-ctx.Done():
+			return
+		case <-time.After(anchorQueryBarrier):
+		}
+	}
+	// Reuse the drain's own eject, which claims and releases the destination through the instance's OWN
+	// goroutine (never the caller's) and is bounded by its barrier.
+	s.ejectInstanceOccupants(ctx, affected)
+}
+
+// anchorDeferExpired reports how long zoneID's rebalance has been deferred for anchors, and whether the
+// budget is spent. The first call starts the clock.
+func (s *Shard) anchorDeferExpired(zoneID string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	since, ok := s.anchorDeferSince[zoneID]
+	if !ok {
+		since = time.Now()
+		s.anchorDeferSince[zoneID] = since
+	}
+	return since, time.Since(since) >= anchorDeferBudget
+}
+
+// clearAnchorDefer forgets a zone's defer clock, so a later unrelated deferral gets a full budget rather
+// than inheriting an old one.
+func (s *Shard) clearAnchorDefer(zoneID string) {
+	s.mu.Lock()
+	delete(s.anchorDeferSince, zoneID)
+	s.mu.Unlock()
 }
 
 // failRebalance clears the in-flight flag and arms a retry backoff so a persistently-failing move isn't
@@ -145,6 +265,16 @@ func (s *Shard) succeedRebalance(zoneID string) {
 // because the players and the lease have already moved — the residue is a leak, not a correctness break, and
 // failing the rebalance here would make the coordinator retry a move that has already happened.
 func (s *Shard) RebalanceZone(ctx context.Context, zoneID, toShard, toAddr string, deadline time.Duration) (res DrainResult, err error) {
+	// #421: settle the EXIT ANCHOR question BEFORE handoverZoneTo, because the flip is what breaks the
+	// invariant — ShardForZone follows the LEASE, not the hosting, so once ownership moves, the placement
+	// records of everyone anchored here route reconnects to a shard with no session for them.
+	//
+	// A guard placed later (on quiescence, or in UnhostZone) would be worse than none: the flip would land
+	// anyway, and this shard would be left hosting a zone it no longer owns, refused by every subsequent
+	// teardown, while runRebalance told the coordinator the move had completed.
+	if err := s.settleAnchorsBeforeRebalance(ctx, zoneID); err != nil {
+		return res, err
+	}
 	z := s.zoneByID(zoneID)
 	if z == nil {
 		return res, fmt.Errorf("rebalance %q: not hosted here", zoneID)
