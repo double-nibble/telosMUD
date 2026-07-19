@@ -44,16 +44,24 @@ const (
 	// version, rebases this snapshot onto it, and retries the CAS in place (bounded) rather than
 	// bouncing it back to a session that no longer exists.
 	//
-	// This force-rebase is authoritative ONLY for the clean-quit path, and only because its sole
-	// concurrent writer is this shard's STRICTLY-OLDER cadence flush (the logout state dominates a
-	// flush taken before it). It is NOT globally newest, and the saver cannot prove that off
-	// goroutine — so before each force-write finalizeFlush PROBES the zone (z.players, single-
-	// writer): if the character is truly gone the rebase is safe; if a live session re-appeared
-	// (a re-attach within the link-death grace, whose fresh state would otherwise be reverted) it
-	// hands off to the LIVE reconcile path (saveConflictMsg -> Zone.saveConflict re-dumps current)
-	// instead of clobbering. Cross-shard zombie fence (saver.handle) is intact regardless: a final
-	// flush only ever runs for a player leaving THIS shard via leave(); a handed-off character is
-	// removed by freezeExpire WITHOUT a save, never reaching this path.
+	// The rebase is bounded to CONTENTION, and only within one ownership epoch. That bound is the
+	// #432 fix, and it is worth stating what the code used to believe instead: the zone PROBE
+	// (finalizeFlush -> zonePresent, reading this process's z.players) was treated as the safety
+	// property — "if the character is gone here, the rebase is safe." It cannot be. It answers only
+	// for THIS process, so a live session on another shard was structurally invisible to it, and both
+	// shards independently concluded their own z.players was the authority. The rebase then made the
+	// state_version CAS succeed by construction, and a stale shard's 60-second-old logout snapshot
+	// force-wrote over the live owner's state — a rollback, and a duplication primitive built on it.
+	//
+	// The fence is now at the SINK: the save carries the session's owner_epoch and the store applies
+	// only `WHERE owner_epoch <= $k`. A rebase moves state_version and never the epoch, so it cannot
+	// reach around that conjunct. An epoch loss is DEFINITIVE — the writer is a zombie, its data is
+	// discarded, and the zone is told (saveNotOwnerMsg). The zone probe survives as an optimization
+	// for the same-shard re-attach case, nothing more.
+	//
+	// The pre-existing cross-shard zombie exclusion still holds independently: a final flush only ever
+	// runs for a player leaving THIS shard via leave(); a handed-off character is removed by
+	// freezeExpire WITHOUT a save, never reaching this path.
 	saveFinal
 )
 
@@ -267,7 +275,23 @@ func (sv *saver) handle(ctx context.Context, req saveRequest) {
 
 	// Redis tier (always): a cheap mirror keyed by name so any shard can rehydrate on login.
 	if sv.ckpt != nil {
-		if err := sv.ckpt.Checkpoint(ioCtx, req.snap); err != nil {
+		if err := sv.ckpt.Checkpoint(ioCtx, req.snap); errors.Is(err, ErrCheckpointNotOwner) {
+			// The EARLIEST double-own detector (#432). This tier pulses every ~10s while the Postgres
+			// fence only fires on the ~60s flush, so routing the refusal to the same eviction shrinks a
+			// zombie's window — the span in which it generates unsaveable play and can externalize wealth
+			// into another character's row — by roughly a factor of six. It is not a write failure and
+			// must not be logged as one.
+			//
+			// The checkpoint guard reports only THAT it refused, not which epoch beat us, so ownerEpoch
+			// is synthesized as "strictly above ours". That is exactly the predicate Zone.ownershipLost
+			// needs — it asks whether the session has since caught up to the winner — and it stays correct
+			// however far above us the real winner is: a session that has legitimately advanced past our
+			// epoch satisfies the guard and is spared, one that has not is the zombie.
+			sv.log.Warn("checkpoint refused: another session owns this character; this copy is a zombie",
+				"event", "checkpoint_not_owner", "player", req.id, "our_epoch", req.snap.OwnerEpoch)
+			req.zone.post(saveNotOwnerMsg{id: req.id, ourEpoch: req.snap.OwnerEpoch, ownerEpoch: req.snap.OwnerEpoch + 1})
+			return
+		} else if err != nil {
 			sv.log.Debug("checkpoint write failed (non-fatal)", "player", req.id, "err", err)
 		} else {
 			sv.log.Debug("checkpoint written", "player", req.id, "state_version", req.snap.StateVersion)
@@ -287,12 +311,43 @@ func (sv *saver) handle(ctx context.Context, req saveRequest) {
 		sv.log.Warn("durable character state exceeds soft cap; persisting anyway (investigate unbounded growth)",
 			"player", req.id, "bytes", len(b), "cap", maxDurableStateBytes)
 	}
-	newVersion, ok, err := sv.store.SaveCharacter(ioCtx, snap)
+	res, err := sv.store.SaveCharacter(ioCtx, snap)
 	if err != nil {
 		sv.log.Debug("postgres flush failed (non-fatal; next cadence retries)", "player", req.id, "err", err)
 		return
 	}
-	if !ok {
+	switch res.Outcome {
+	case SaveApplied:
+		sv.log.Debug("postgres flush ok", "player", req.id, "new_state_version", res.NewVersion)
+		req.zone.post(saveOkMsg{id: req.id, newVersion: res.NewVersion})
+		return
+
+	case SaveNotOwner:
+		// OWNERSHIP loss (#432) — definitive, and terminal on BOTH paths. Another session has claimed
+		// this character; this writer's state belongs to a zombie.
+		//
+		// The instinct to reconcile is what has to be resisted here, and on the live path it is not
+		// merely wrong but actively harmful: saveConflict re-reads, re-dumps and re-enqueues
+		// IMMEDIATELY (not on the cadence), so answering an epoch loss that way is an unbounded
+		// read-write loop on the drainer goroutine that every zone on this shard shares — one per
+		// double-owned character, and it can never succeed, because a rebase moves state_version and
+		// the predicate it is losing on is owner_epoch.
+		//
+		// So: log the alertable signal and hand the ZONE a verdict it can act on. Only the zone
+		// goroutine may touch the session, and only it knows whether this loss is stale (see
+		// Zone.ownershipLost).
+		sv.log.Warn("save refused: another session owns this character; this copy is a zombie",
+			"event", "save_not_owner", "player", req.id, "reason", req.reason,
+			"our_epoch", snap.OwnerEpoch, "owner_epoch", res.CurOwnerEpoch)
+		req.zone.post(saveNotOwnerMsg{id: req.id, ourEpoch: snap.OwnerEpoch, ownerEpoch: res.CurOwnerEpoch})
+		return
+
+	case SaveNoRow:
+		// No live row: soft-deleted, or a persist id that never existed. Retrying cannot create one.
+		sv.log.Warn("save refused: no live character row", "event", "save_no_row", "player", req.id)
+		return
+
+	case SaveStaleVersion:
 		if req.reason == saveFinal {
 			// Logout flush lost the CAS to a concurrent write. Reconcile under a tight wall-clock
 			// budget (off ioCtx so a wedged store can't head-of-line-block the drainer): rebase +
@@ -300,19 +355,26 @@ func (sv *saver) handle(ctx context.Context, req saveRequest) {
 			// re-appeared. ctx (the parent, drainer-lifetime) bounds the budget, not the already-spent
 			// ioCtx, so the reconcile gets its full budget even if the first CAS was slow.
 			finCtx, finCancel := context.WithTimeout(ctx, finalFlushBudget)
-			sv.finalizeFlush(finCtx, req, snap)
+			sv.finalizeFlush(finCtx, req, snap, res.CurVersion)
 			finCancel()
 			return
 		}
-		// A live player's flush lost the CAS: bounce a conflict back so the zone re-dumps current
-		// state at the fresh version (Zone.saveConflict). It never forces the write off-goroutine.
+		// A live player's flush lost the CAS *at an epoch it still owns* — its own cadence racing its
+		// own drain/logout flush. Bounce a conflict back so the zone re-dumps current state at the
+		// fresh version (Zone.saveConflict). It never forces the write off-goroutine.
 		sv.log.Debug("save conflict: stale state_version, requesting reconcile",
 			"player", req.id, "tried_version", snap.StateVersion)
 		req.zone.post(saveConflictMsg{id: req.id})
 		return
+
+	default:
+		// SaveOutcomeUnset. The zero value is not a legitimate verdict — it means a CharacterStore
+		// implementation (most likely a test double) returned a bare SaveResult{}. Treating it as
+		// success is how a silently-passing test ships a hole in the fence, so it is loud and terminal.
+		sv.log.Error("save returned no outcome; treating as failed (a CharacterStore is not setting SaveResult.Outcome)",
+			"player", req.id)
+		return
 	}
-	sv.log.Debug("postgres flush ok", "player", req.id, "new_state_version", newVersion)
-	req.zone.post(saveOkMsg{id: req.id, newVersion: newVersion})
 }
 
 // finalizeFlush drives a logout flush to durability after its first CAS lost to a concurrent write.
@@ -334,7 +396,7 @@ func (sv *saver) handle(ctx context.Context, req saveRequest) {
 // gets its own finalFlushIOTimeout so one hung call can't eat the whole budget. On budget/retry
 // exhaustion it logs at Warn (the observable durability gap; the next login's freshness check
 // recovers). On success it posts saveOkMsg for symmetry — a guarded no-op if the session is gone.
-func (sv *saver) finalizeFlush(ctx context.Context, req saveRequest, snap CharSnapshot) {
+func (sv *saver) finalizeFlush(ctx context.Context, req saveRequest, snap CharSnapshot, curVersion uint64) {
 	for attempt := 0; attempt < finalFlushRetries; attempt++ {
 		if ctx.Err() != nil {
 			sv.log.Warn("final flush abandoned: budget exhausted", "player", req.id, "attempt", attempt)
@@ -342,31 +404,72 @@ func (sv *saver) finalizeFlush(ctx context.Context, req saveRequest, snap CharSn
 		}
 		// A live session re-appeared (re-attach within the link-death grace): its state is newer than
 		// this logout snapshot. Hand off to the live reconcile path rather than reverting it.
+		//
+		// The probe reads this process's z.players, so it can only ever answer for THIS process. Treating
+		// its "absent" as "safe to force-write" globally is precisely how a stale shard rolled a live
+		// owner back (#432) — a live session on another shard is structurally invisible to it. The
+		// owner_epoch conjunct at the sink is what holds the line across processes.
+		//
+		// It is still load-bearing for what it can actually see: the SAME-shard re-attach. A reconnect
+		// that lands after this session was reaped seeds its epoch from the directory rather than a
+		// fresh mint (server.go skips the claim for a still-resident session, and the reap can race
+		// that check), so the two can hold the same epoch and the fence alone would not separate them.
+		// The probe does. Same-shard guard, not the cross-shard fence — that distinction is the fix.
 		if sv.zonePresent(ctx, req) {
 			sv.log.Debug("final flush yielding: live session re-appeared; routing to live reconcile",
 				"player", req.id)
 			req.zone.post(saveConflictMsg{id: req.id})
 			return
 		}
-		cur, found, err := sv.loadOnce(ctx, snap.Name)
-		if err != nil || !found {
-			sv.log.Warn("final flush reconcile read failed; logout state may be lost",
-				"player", req.id, "found", found, "err", err)
-			return
+		// Rebase onto the version the concurrent write advanced to. The FIRST pass uses the version the
+		// refused CAS already observed under its row lock (no extra round-trip inside the flush budget);
+		// later passes re-read.
+		if attempt > 0 {
+			cur, found, err := sv.loadOnce(ctx, snap.Name)
+			if err != nil || !found {
+				sv.log.Warn("final flush reconcile read failed; logout state may be lost",
+					"player", req.id, "found", found, "err", err)
+				return
+			}
+			curVersion = cur.StateVersion
 		}
-		snap.StateVersion = cur.StateVersion // rebase onto the version the cadence advanced to
-		newVersion, ok, err := sv.saveOnce(ctx, snap)
+		snap.StateVersion = curVersion
+		// The rebase moves state_version and NOTHING ELSE. snap.OwnerEpoch is deliberately never
+		// touched here: it is the claim this session was minted at, and a writer that could raise its
+		// own epoch on retry would be able to rebase straight through the ownership fence — which is
+		// the whole defect (#432). The retry loop is for contention among writers at one epoch.
+		res, err := sv.saveOnce(ctx, snap)
 		if err != nil {
 			sv.log.Warn("final flush retry write failed; logout state may be lost", "player", req.id, "err", err)
 			return
 		}
-		if ok {
+		switch res.Outcome {
+		case SaveApplied:
 			sv.log.Debug("final flush landed after reconcile", "player", req.id,
-				"new_state_version", newVersion, "attempts", attempt+1)
-			req.zone.post(saveOkMsg{id: req.id, newVersion: newVersion})
+				"new_state_version", res.NewVersion, "attempts", attempt+1)
+			req.zone.post(saveOkMsg{id: req.id, newVersion: res.NewVersion})
+			return
+		case SaveNotOwner:
+			// DEFINITIVE. Another session owns this character, so this logout snapshot is a zombie's and
+			// must be discarded — this is the exact write that used to roll a live owner back. Retrying
+			// is not merely futile but unsafe-looking: every pass would re-fail on the same conjunct.
+			//
+			// Warn, because "a double-own happened" is the alertable event this fence exists to surface.
+			// The lost data is the zombie's, and the legitimate owner's state is untouched.
+			sv.log.Warn("final flush refused: another session owns this character; discarding the zombie's logout state",
+				"event", "final_flush_not_owner", "player", req.id,
+				"our_epoch", snap.OwnerEpoch, "owner_epoch", res.CurOwnerEpoch)
+			req.zone.post(saveNotOwnerMsg{id: req.id, ourEpoch: snap.OwnerEpoch, ownerEpoch: res.CurOwnerEpoch})
+			return
+		case SaveNoRow:
+			sv.log.Warn("final flush refused: no live character row", "event", "final_flush_no_row", "player", req.id)
+			return
+		case SaveStaleVersion:
+			// Lost again to another concurrent write at our own epoch: re-probe + re-read + retry.
+		default:
+			sv.log.Error("final flush returned no outcome; abandoning", "player", req.id)
 			return
 		}
-		// Lost again to another concurrent write: re-probe + re-read + retry until the bound.
 	}
 	// The one durability gap worth alerting on. A structured "event" key makes it greppable/
 	// alertable until a real metrics tier lands (no counter framework exists yet — slog is the
@@ -385,7 +488,7 @@ func (sv *saver) loadOnce(ctx context.Context, name string) (CharSnapshot, bool,
 	return sv.store.LoadCharacter(c, name)
 }
 
-func (sv *saver) saveOnce(ctx context.Context, snap CharSnapshot) (uint64, bool, error) {
+func (sv *saver) saveOnce(ctx context.Context, snap CharSnapshot) (SaveResult, error) {
 	c, cancel := context.WithTimeout(ctx, finalFlushIOTimeout)
 	defer cancel()
 	return sv.store.SaveCharacter(c, snap)

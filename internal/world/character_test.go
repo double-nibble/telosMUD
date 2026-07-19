@@ -35,7 +35,7 @@ func login(t *testing.T, shard *Shard, z *Zone, name string) chan *playv1.Server
 	t.Helper()
 	out := make(chan *playv1.ServerFrame, 64)
 	var cz atomic.Pointer[Zone]
-	loaded, loadedOK := shard.loadCharacterSnapshot(context.Background(), name)
+	loaded, loadedOK, _ := shard.loadCharacterSnapshot(context.Background(), name)
 	z.post(attachMsg{character: name, out: out, curZone: &cz, loaded: loaded, loadedOK: loadedOK})
 	waitPlayer(t, z, name, true)
 	return out
@@ -194,20 +194,22 @@ func TestStateVersionCASRejectsStaleSave(t *testing.T) {
 	base := CharSnapshot{PID: pid, Name: "Bo", ZoneRef: "midgaard", RoomRef: "midgaard:room:temple", StateVersion: 0}
 
 	// Writer A wins, bumping the row to version 1.
-	newV, ok, err := mem.SaveCharacter(ctx, base)
-	if err != nil || !ok {
-		t.Fatalf("first save: ok=%v err=%v, want ok", ok, err)
+	res, err := mem.SaveCharacter(ctx, base)
+	if err != nil || res.Outcome != SaveApplied {
+		t.Fatalf("first save: outcome=%v err=%v, want applied", res.Outcome, err)
 	}
-	if newV != 1 {
-		t.Fatalf("first save new version = %d, want 1", newV)
+	if res.NewVersion != 1 {
+		t.Fatalf("first save new version = %d, want 1", res.NewVersion)
 	}
-	// Writer B (the zombie) still holds base version 0 -> must lose the CAS.
-	_, ok, err = mem.SaveCharacter(ctx, base)
+	// Writer B (the zombie) still holds base version 0 -> must lose the CAS. Both writers carry the
+	// same (zero) owner epoch, so the ownership fence is satisfied and the refusal is specifically
+	// the state_version contention miss, not SaveNotOwner.
+	res, err = mem.SaveCharacter(ctx, base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
-		t.Fatal("stale save at version 0 must lose the CAS once the row moved to version 1")
+	if res.Outcome != SaveStaleVersion {
+		t.Fatalf("stale save at version 0 must lose the CAS once the row moved to version 1: outcome=%v", res.Outcome)
 	}
 }
 
@@ -231,8 +233,8 @@ func TestSaveConflictPostsReconcile(t *testing.T) {
 	setupDeadline := time.Now().Add(3 * time.Second)
 	for advanced < 4 {
 		if cur, found, _ := mem.LoadCharacter(context.Background(), "Cy"); found {
-			if v, ok, _ := mem.SaveCharacter(context.Background(), cur); ok {
-				advanced = v
+			if res, _ := mem.SaveCharacter(context.Background(), cur); res.Outcome == SaveApplied {
+				advanced = res.NewVersion
 			}
 		}
 		if time.Now().After(setupDeadline) {
@@ -290,7 +292,7 @@ func TestLogoutFlushSurvivesCASConflict(t *testing.T) {
 	setupDeadline := time.Now().Add(3 * time.Second)
 	for {
 		if cur, found, _ := mem.LoadCharacter(context.Background(), "Quincy"); found {
-			if _, ok, _ := mem.SaveCharacter(context.Background(), cur); ok {
+			if res, _ := mem.SaveCharacter(context.Background(), cur); res.Outcome == SaveApplied {
 				break
 			}
 		}
@@ -346,7 +348,9 @@ func TestFinalFlushYieldsToReattachedSession(t *testing.T) {
 	req := saveRequest{snap: stale, zone: z, id: "Rex", reason: saveFinal}
 	ctx, cancel := context.WithTimeout(context.Background(), finalFlushBudget)
 	defer cancel()
-	z.saver.finalizeFlush(ctx, req, stale)
+	// curVersion is what the refused CAS observed under the row lock — here, the live session's own
+	// last flush. It goes unused on this path: the live-session probe yields before the rebase.
+	z.saver.finalizeFlush(ctx, req, stale, live.StateVersion)
 
 	// The durable row must NOT have been reverted to temple. The yield posts saveConflictMsg, whose
 	// reconcile re-dumps the LIVE session's current (market) state — so the row stays at market.
@@ -374,15 +378,15 @@ func TestCheckpointFreshnessWins(t *testing.T) {
 	pid, _ := mem.CreateCharacter(ctx, "Del", "midgaard", "midgaard:room:temple")
 	row := CharSnapshot{PID: pid, Name: "Del", ZoneRef: "midgaard", RoomRef: "midgaard:room:temple", StateVersion: 0}
 	for row.StateVersion < 2 {
-		v, _, _ := mem.SaveCharacter(ctx, row)
-		row.StateVersion = v
+		res, _ := mem.SaveCharacter(ctx, row)
+		row.StateVersion = res.NewVersion
 	}
 	// A FRESHER checkpoint at version 5 in a DIFFERENT room (a more recent ~10s mirror).
 	_ = mem.Checkpoint(ctx, CharSnapshot{
 		PID: pid, Name: "Del", ZoneRef: "midgaard", RoomRef: "midgaard:room:market", StateVersion: 5,
 	})
 
-	snap, ok := shard.loadCharacterSnapshot(ctx, "Del")
+	snap, ok, _ := shard.loadCharacterSnapshot(ctx, "Del")
 	if !ok {
 		t.Fatal("expected to load a snapshot")
 	}
@@ -395,7 +399,7 @@ func TestCheckpointFreshnessWins(t *testing.T) {
 	_ = mem.Checkpoint(ctx, CharSnapshot{
 		PID: pid, Name: "Del", ZoneRef: "midgaard", RoomRef: "midgaard:room:temple", StateVersion: 1,
 	})
-	snap2, ok := shard.loadCharacterSnapshot(ctx, "Del")
+	snap2, ok, _ := shard.loadCharacterSnapshot(ctx, "Del")
 	if !ok {
 		t.Fatal("expected to load a snapshot (inverse)")
 	}
@@ -421,8 +425,8 @@ func TestCheckpointWinsOnStateVersionTie(t *testing.T) {
 	pid, _ := mem.CreateCharacter(ctx, "Tie", "midgaard", "midgaard:room:temple")
 	row := CharSnapshot{PID: pid, Name: "Tie", ZoneRef: "midgaard", RoomRef: "midgaard:room:temple", StateVersion: 0}
 	for row.StateVersion < 2 {
-		v, _, _ := mem.SaveCharacter(ctx, row)
-		row.StateVersion = v
+		res, _ := mem.SaveCharacter(ctx, row)
+		row.StateVersion = res.NewVersion
 	}
 
 	// A checkpoint-only pulse fired AFTER the flush: the player walked to the market, but no Postgres flush
@@ -432,7 +436,7 @@ func TestCheckpointWinsOnStateVersionTie(t *testing.T) {
 		PID: pid, Name: "Tie", ZoneRef: "midgaard", RoomRef: "midgaard:room:market", StateVersion: 2,
 	})
 
-	snap, ok := shard.loadCharacterSnapshot(ctx, "Tie")
+	snap, ok, _ := shard.loadCharacterSnapshot(ctx, "Tie")
 	if !ok {
 		t.Fatal("expected to load a snapshot")
 	}
@@ -445,14 +449,14 @@ func TestCheckpointWinsOnStateVersionTie(t *testing.T) {
 	// lapsed while Postgres advanced) must still lose. Advance the row to version 3 (market via a flush),
 	// leaving the checkpoint at version 2 — the row is now strictly fresher and must win.
 	row = CharSnapshot{PID: pid, Name: "Tie", ZoneRef: "midgaard", RoomRef: "midgaard:room:square", StateVersion: 2}
-	v, ok2, _ := mem.SaveCharacter(ctx, row)
-	if !ok2 {
-		t.Fatalf("row flush to advance version failed")
+	advance, _ := mem.SaveCharacter(ctx, row)
+	if advance.Outcome != SaveApplied {
+		t.Fatalf("row flush to advance version failed: outcome=%v", advance.Outcome)
 	}
-	if v != 3 {
-		t.Fatalf("expected row to advance to version 3, got %d", v)
+	if advance.NewVersion != 3 {
+		t.Fatalf("expected row to advance to version 3, got %d", advance.NewVersion)
 	}
-	snap2, ok := shard.loadCharacterSnapshot(ctx, "Tie")
+	snap2, ok, _ := shard.loadCharacterSnapshot(ctx, "Tie")
 	if !ok {
 		t.Fatal("expected to load a snapshot (stale-checkpoint case)")
 	}
@@ -480,8 +484,8 @@ func TestCheckpointTieRecoversMigratedHandoffLocation(t *testing.T) {
 	pid, _ := mem.CreateCharacter(ctx, "Migrant", "midgaard", "midgaard:room:temple")
 	row := CharSnapshot{PID: pid, Name: "Migrant", ZoneRef: "midgaard", RoomRef: "midgaard:room:temple", StateVersion: 0}
 	for row.StateVersion < 3 {
-		v, _, _ := mem.SaveCharacter(ctx, row)
-		row.StateVersion = v
+		res, _ := mem.SaveCharacter(ctx, row)
+		row.StateVersion = res.NewVersion
 	}
 
 	// The destination rehydrated the carried player (session.stateVersion seeded to the SAME 3, no flush on
@@ -490,7 +494,7 @@ func TestCheckpointTieRecoversMigratedHandoffLocation(t *testing.T) {
 		PID: pid, Name: "Migrant", ZoneRef: "darkwood", RoomRef: "darkwood:room:entrance", StateVersion: 3,
 	})
 
-	snap, ok := shard.loadCharacterSnapshot(ctx, "Migrant")
+	snap, ok, _ := shard.loadCharacterSnapshot(ctx, "Migrant")
 	if !ok {
 		t.Fatal("expected to load a snapshot")
 	}

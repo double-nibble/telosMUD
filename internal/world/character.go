@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 )
 
@@ -32,6 +33,19 @@ type CharSnapshot struct {
 	RoomRef      string    // characters.room_ref: which room within it
 	StateVersion uint64    // characters.state_version: the value this snapshot was dumped AT
 	State        StateJSON // the characters.state JSONB content subtree
+
+	// OwnerEpoch is characters.owner_epoch: the OWNERSHIP generation the dumping session was minted at
+	// (#432). It is the fence that state_version never was. state_version is contention control — it says
+	// "somebody wrote since you read", and every caller answers that by rebasing and writing again, which
+	// is precisely how a stale shard's logout flush used to force its 60-second-old snapshot over the live
+	// owner's state. owner_epoch says "somebody else OWNS this character now", which no rebase can reach
+	// around: a rebase moves state_version, and the epoch predicate is an independent conjunct.
+	//
+	// Set by dumpCharacter from session.epoch, carried through EVERY durable tier (the Postgres column,
+	// the Redis checkpoint value, MemStore), and compared at each of them. A zero value means "unfenced" —
+	// a legacy row, a pre-#432 checkpoint, or an ephemeral character with no durable identity — which
+	// every comparison treats as "loses to any real claim", never as "wins".
+	OwnerEpoch uint64
 
 	// PendingChargen is the not-yet-applied character-generation RESULT (Phase 14.8, Model A): set by the
 	// store from the characters.chargen column when a freshly content-built character logs in for the FIRST
@@ -267,12 +281,105 @@ type CharacterStore interface {
 	// path; an existing name is a conflict the caller treats as "load instead".
 	CreateCharacter(ctx context.Context, name, zoneRef, roomRef string) (PersistID, error)
 
-	// SaveCharacter writes snap with optimistic concurrency: it applies only when the stored
-	// state_version equals snap.StateVersion (the value the snapshot was dumped at), then bumps
-	// it. It returns the NEW state_version on success; ok=false (no error) means a stale writer
-	// lost the CAS — the caller reconciles (re-dump at the current version), it never forces
-	// the write. This is the state_version backstop behind the directory epoch (§7).
-	SaveCharacter(ctx context.Context, snap CharSnapshot) (newVersion uint64, ok bool, err error)
+	// SaveCharacter writes snap under TWO independent predicates (#432):
+	//
+	//   - owner_epoch <= snap.OwnerEpoch — the OWNERSHIP fence. Losing it is DEFINITIVE: another
+	//     session has claimed this character and this writer is a zombie. It must never be retried,
+	//     rebased around, or reconciled — the whole dupe primitive was a caller answering an
+	//     ownership question with a contention answer.
+	//   - state_version = snap.StateVersion — CONTENTION control among writers at the SAME epoch
+	//     (this shard's own cadence racing its logout flush). Losing it is retryable: re-read,
+	//     rebase, write again.
+	//
+	// The two refusals demand opposite handling, so they are reported as distinct outcomes rather
+	// than one overloaded bool. See SaveOutcome.
+	SaveCharacter(ctx context.Context, snap CharSnapshot) (SaveResult, error)
+
+	// ClaimCharacter mints the NEXT ownership epoch for the character with this persist id and returns
+	// it: `owner_epoch = GREATEST(owner_epoch, floor) + 1`, atomically (#432). It is the ONLY way an
+	// epoch is minted, and every ownership claim — a fresh login, a cross-shard handoff — goes through
+	// it, which is what makes an epoch value name exactly one live copy of a character.
+	//
+	// Atomicity is the whole contract. A read-then-bump (read the current value, add one, write it)
+	// hands two concurrent claimants the SAME epoch and silently restores the bug: two copies that both
+	// satisfy `owner_epoch <= k` are back to fighting over state_version. One statement under the row
+	// lock is what prevents that; do not decompose it.
+	//
+	// floor raises the mint above a value the row does not know about — the directory's recorded
+	// placement epoch (which survives a row that was never saved after a handoff), or the claiming
+	// session's own epoch. It is a FLOOR, never an assignment: a stale/evicted directory can only fail
+	// to raise the mint, never lower it below the row's own high-water mark. That asymmetry is what
+	// keeps a Redis hiccup from wedging a legitimate player (see the claim call in server.go).
+	//
+	// ErrNoCharacterRow when no live row has that id. Blocking I/O; never call it on a zone goroutine.
+	ClaimCharacter(ctx context.Context, pid PersistID, floor uint64) (epoch uint64, err error)
+}
+
+// ErrNoCharacterRow reports that a claim/save targeted a persist id with no live (non-soft-deleted)
+// row. It is distinct from an infrastructure error: the caller degrades rather than retrying.
+var ErrNoCharacterRow = errors.New("world: no live character row")
+
+// ErrCheckpointNotOwner reports that a checkpoint write was refused because a NEWER owner holds the
+// slot (#432) — the Redis-tier twin of SaveNotOwner. A Checkpointer returns it instead of nil so the
+// refusal is not silent: this tier pulses every ~10s against Postgres's ~60s, which makes it the
+// EARLIEST detector of a double-own. Swallowing it would mean the alertable signal fired six times
+// per Postgres cycle and was thrown away each time, and a zombie would keep generating unsaveable
+// play (and externalizing wealth) for a full flush cadence instead of one pulse.
+var ErrCheckpointNotOwner = errors.New("world: checkpoint refused; another session owns this character")
+
+// SaveOutcome classifies one SaveCharacter attempt. It replaced an `ok bool` that already conflated
+// "state_version lost" with "row missing" — and the #432 fix needed to add a THIRD, oppositely-handled
+// refusal to it. A bool that means three things is how the force-write shipped in the first place, so
+// this is an enum whose ZERO VALUE is invalid: a store double that forgets to set it fails loudly
+// instead of silently reporting success.
+type SaveOutcome int
+
+const (
+	// SaveOutcomeUnset is the zero value and never a legitimate result. It exists so a hand-written
+	// CharacterStore fake that returns a bare SaveResult{} trips the caller's default branch rather
+	// than being read as "applied".
+	SaveOutcomeUnset SaveOutcome = iota
+	// SaveApplied means the write landed. NewVersion carries the bumped state_version.
+	SaveApplied
+	// SaveStaleVersion means the write lost on state_version at an epoch this writer STILL OWNS. Retryable —
+	// rebase onto CurVersion and CAS again, or bounce a conflict back to the live session.
+	SaveStaleVersion
+	// SaveNotOwner means the write lost on owner_epoch. DEFINITIVE. Another session owns this character; this
+	// writer's state is a zombie's and must be discarded, not reconciled. Retrying, rebasing, or
+	// re-dumping in response to this is the bug (#432) — the retry loop cannot raise its own epoch,
+	// so it would spin on the shared saver drainer forever while never being allowed to write.
+	SaveNotOwner
+	// SaveNoRow means there is no live row with this persist id (deleted, or never created).
+	SaveNoRow
+)
+
+func (o SaveOutcome) String() string {
+	switch o {
+	case SaveApplied:
+		return "applied"
+	case SaveStaleVersion:
+		return "stale_version"
+	case SaveNotOwner:
+		return "not_owner"
+	case SaveNoRow:
+		return "no_row"
+	default:
+		return "unset"
+	}
+}
+
+// SaveResult is one CAS attempt's verdict plus the row state the caller needs to act on it. The
+// observed columns come back on a REFUSAL so a reconcile does not need a second round-trip (it used
+// to re-read, which both cost a call inside the logout flush budget and left a window between the
+// read and the retry).
+type SaveResult struct {
+	Outcome SaveOutcome
+	// NewVersion is the bumped state_version. Valid only for SaveApplied.
+	NewVersion uint64
+	// CurVersion is the row's observed state_version — the rebase target on SaveStaleVersion.
+	CurVersion uint64
+	// CurOwnerEpoch is the row's observed owner_epoch — on SaveNotOwner, the epoch that beat us.
+	CurOwnerEpoch uint64
 }
 
 // Checkpointer is the optional Redis tier of the durability ladder (docs/PERSISTENCE.md §6): a
@@ -307,11 +414,15 @@ func dumpCharacter(s *session) CharSnapshot {
 	st.Comms = dumpCommsState(s) // Phase 8.6 — the receiver-side comms-state subtree (P8-D7)
 	zoneRef, room := durableLocation(s)
 	return CharSnapshot{
-		PID:          pid,
-		Name:         s.character,
-		ZoneRef:      zoneRef,
-		RoomRef:      room,
+		PID:     pid,
+		Name:    s.character,
+		ZoneRef: zoneRef,
+		RoomRef: room,
+		// The two axes travel together and mean different things (#432): StateVersion is the value this
+		// dump is rebasing on (contention), OwnerEpoch is the claim this session holds (ownership). Every
+		// durable tier compares BOTH, so a dump that carried only one would be unfenced at that tier.
 		StateVersion: s.stateVersion,
+		OwnerEpoch:   s.epoch,
 		State:        st,
 	}
 }
@@ -903,6 +1014,32 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 	return droppedItems
 }
 
+// fresherThan reports whether candidate should displace best as the snapshot to rehydrate from,
+// comparing (owner_epoch, state_version) LEXICOGRAPHICALLY (#432).
+//
+// The epoch axis comes first, and it is load-bearing rather than cosmetic. The Redis checkpoint is a
+// single key per character name; two live copies of one character both write it, so a stale copy's
+// ~10s pulse can be the last writer at any moment. Before the epoch axis existed, a stale copy that
+// wrote last while sitting at the SAME state_version as the live owner (which is the normal state for
+// the whole window between a login and its first Postgres flush — state_version only advances on a
+// durable CAS) won the `>=` tie and handed the next login the stale copy's content. That was a
+// complete bypass of the Postgres fence: the rollback simply happened one tier up.
+//
+// Within a single epoch the `>=` tie-break survives unchanged, because it is correct and load-bearing
+// there (#322): at equal state_version the checkpoint's content is by construction at least as recent
+// as the row's, and it is the only state in which the checkpoint tier can contribute to crash recovery
+// at all. What the epoch axis removes is that tie-break's reach ACROSS owners.
+//
+// A zero epoch on either side (a legacy row, a pre-#432 checkpoint) sorts lowest, so an unfenced
+// candidate never displaces a claimed one, and two unfenced snapshots fall back to exactly the
+// pre-#432 comparison.
+func fresherThan(candidate, best CharSnapshot) bool {
+	if candidate.OwnerEpoch != best.OwnerEpoch {
+		return candidate.OwnerEpoch > best.OwnerEpoch
+	}
+	return candidate.StateVersion >= best.StateVersion
+}
+
 // loadCharacterSnapshot reads the freshest durable snapshot for a character name, picking the
 // higher-state_version of {Postgres row, Redis checkpoint} — the durability-ladder freshness check
 // (docs/PHASE4-PLAN.md §4 read path). It runs OFF the zone goroutine (server.go Connect), so the
@@ -913,17 +1050,23 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 // is what lets ANY shard rehydrate a player it never saw — the checkpoint may have been written by
 // a now-dead original owner. Picking the higher state_version means a fresh ~10s Redis checkpoint
 // beats a stale ~60s Postgres flush, shrinking the crash data-loss window to the checkpoint cadence.
-func (s *Shard) loadCharacterSnapshot(ctx context.Context, name string) (CharSnapshot, bool) {
+// storeUnreadable reports that the durable tier is CONFIGURED but could not be read. It is distinct
+// from "no row" (#432): a login that cannot read the row cannot claim ownership and cannot save, and
+// the pre-#432 code funnelled both into the same found=false, sending a real character with a real
+// row down the BRAND-NEW-character branch — spawning a blank ephemeral copy in the start room whose
+// CreateCharacter then fails on the unique name. That is the failure the fail-closed rule exists to
+// prevent, and it must not be skipped in precisely the case where the store is most broken.
+func (s *Shard) loadCharacterSnapshot(ctx context.Context, name string) (snap CharSnapshot, found, storeUnreadable bool) {
 	sv := s.saver
 	if sv == nil || (sv.store == nil && sv.ckpt == nil) {
-		return CharSnapshot{}, false // ephemeral: no durable tier
+		return CharSnapshot{}, false, false // ephemeral: no durable tier, nothing to fail closed on
 	}
 	var best CharSnapshot
-	var found bool
 
 	if sv.store != nil {
 		if snap, ok, err := sv.store.LoadCharacter(ctx, name); err != nil {
 			s.saver.log.Debug("character load (postgres) failed; trying checkpoint", "name", name, "err", err)
+			storeUnreadable = true
 		} else if ok {
 			best, found = snap, true
 		}
@@ -931,7 +1074,7 @@ func (s *Shard) loadCharacterSnapshot(ctx context.Context, name string) (CharSna
 	if sv.ckpt != nil {
 		if snap, ok, err := sv.ckpt.LoadCheckpoint(ctx, name); err != nil {
 			s.saver.log.Debug("checkpoint load failed (non-fatal)", "name", name, "err", err)
-		} else if ok && (!found || snap.StateVersion >= best.StateVersion) {
+		} else if ok && (!found || fresherThan(snap, best)) {
 			// Prefer the checkpoint when it is fresher OR TIED, and when Postgres had no row (#322). The tie is
 			// the whole point of the fix — and, as it turns out, the ONLY state in which the checkpoint tier
 			// can ever contribute to crash recovery of a flushed player. state_version only advances on a
@@ -962,8 +1105,10 @@ func (s *Shard) loadCharacterSnapshot(ctx context.Context, name string) (CharSna
 	if found {
 		s.saver.log.Debug("character snapshot loaded", "name", name,
 			"state_version", best.StateVersion, "room", best.RoomRef)
+		// A row WAS read; whatever else failed, this is not the unreadable case.
+		storeUnreadable = false
 	}
-	return best, found
+	return best, found, storeUnreadable
 }
 
 // maxItemNestDepth bounds how deep a persisted/carried inventory tree is rehydrated. Container

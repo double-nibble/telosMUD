@@ -36,9 +36,9 @@ func TestCharacterItemDeltaRoundTrip(t *testing.T) {
 	delta := json.RawMessage(`{"quality":{"level":5,"affixes":{"fire":2,"keen":1}},"bound":true,"stack":7,"kept":true}`)
 	snap.State.Inventory = []world.ItemJSON{{ProtoRef: "midgaard:obj:sword", Delta: delta}}
 
-	_, ok, err := pool.SaveCharacter(ctx, snap)
+	res, err := pool.SaveCharacter(ctx, snap)
 	require.NoError(t, err)
-	require.True(t, ok, "CAS save at the matching version should apply")
+	require.Equal(t, world.SaveApplied, res.Outcome, "CAS save at the matching version should apply")
 
 	reloaded, found, err := pool.LoadCharacter(ctx, name)
 	require.NoError(t, err)

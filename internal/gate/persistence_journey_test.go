@@ -90,8 +90,8 @@ func TestReconnectResetsInputSeqFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	snap.State.AppliedSeq = 5
-	if _, ok, err := store.SaveCharacter(context.Background(), snap); err != nil || !ok {
-		t.Fatalf("seed appliedSeq: ok=%v err=%v", ok, err)
+	if res, err := store.SaveCharacter(context.Background(), snap); err != nil || res.Outcome != world.SaveApplied {
+		t.Fatalf("seed appliedSeq: outcome=%v err=%v", res.Outcome, err)
 	}
 
 	h := newHarness(t)

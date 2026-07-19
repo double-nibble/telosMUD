@@ -219,7 +219,7 @@ type saveCounter struct {
 	saves atomic.Int64
 }
 
-func (c *saveCounter) SaveCharacter(ctx context.Context, snap CharSnapshot) (uint64, bool, error) {
+func (c *saveCounter) SaveCharacter(ctx context.Context, snap CharSnapshot) (SaveResult, error) {
 	c.saves.Add(1)
 	return c.MemStore.SaveCharacter(ctx, snap)
 }

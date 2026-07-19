@@ -40,7 +40,13 @@ func fullSnapshot() world.CharSnapshot {
 		ZoneRef:      "darkwood",
 		RoomRef:      "darkwood:room:grove",
 		StateVersion: 42,
-		State:        world.StateJSON{AppliedSeq: 7, Attributes: map[string]float64{"strength": 14}},
+		// The ownership epoch (#432) must be non-zero here or the exhaustive check below cannot tell a
+		// dropped field from an unset one. This tier is the one that was completely unfenced before #432:
+		// a dropped OwnerEpoch reads back as 0, which the login comparator ranks lowest and the guard
+		// script compares against a value it never stored — an unfenced checkpoint next to a fenced row
+		// is exactly where a bypass lives.
+		OwnerEpoch: 9,
+		State:      world.StateJSON{AppliedSeq: 7, Attributes: map[string]float64{"strength": 14}},
 	}
 }
 

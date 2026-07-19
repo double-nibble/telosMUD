@@ -16,7 +16,7 @@ func TestAttachRecordsVerifiedTier(t *testing.T) {
 	shard, z, _ := persistShard(t)
 	out := make(chan *playv1.ServerFrame, 64)
 	var cz atomic.Pointer[Zone]
-	loaded, loadedOK := shard.loadCharacterSnapshot(context.Background(), "Buildy")
+	loaded, loadedOK, _ := shard.loadCharacterSnapshot(context.Background(), "Buildy")
 
 	z.post(attachMsg{character: "Buildy", out: out, curZone: &cz, loaded: loaded, loadedOK: loadedOK, tier: "admin"})
 	waitPlayer(t, z, "Buildy", true)
@@ -37,7 +37,7 @@ func TestAttachDefaultsTierToPlayer(t *testing.T) {
 	shard, z, _ := persistShard(t)
 	out := make(chan *playv1.ServerFrame, 64)
 	var cz atomic.Pointer[Zone]
-	loaded, loadedOK := shard.loadCharacterSnapshot(context.Background(), "Plain")
+	loaded, loadedOK, _ := shard.loadCharacterSnapshot(context.Background(), "Plain")
 
 	z.post(attachMsg{character: "Plain", out: out, curZone: &cz, loaded: loaded, loadedOK: loadedOK}) // no tier
 	waitPlayer(t, z, "Plain", true)
@@ -197,7 +197,7 @@ func TestAdminLoginAppliesTierFlags(t *testing.T) {
 	spawn := func(name, tier string) *Entity {
 		out := make(chan *playv1.ServerFrame, 64)
 		var cz atomic.Pointer[Zone]
-		loaded, loadedOK := shard.loadCharacterSnapshot(context.Background(), name)
+		loaded, loadedOK, _ := shard.loadCharacterSnapshot(context.Background(), name)
 		z.post(attachMsg{character: name, out: out, curZone: &cz, loaded: loaded, loadedOK: loadedOK, tier: tier})
 		waitPlayer(t, z, name, true)
 		return z.players[name].entity

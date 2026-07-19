@@ -101,19 +101,52 @@ func (m *MemStore) CreateCharacter(_ context.Context, name, zoneRef, roomRef str
 	return pid, nil
 }
 
-// SaveCharacter writes snap with the same optimistic-concurrency CAS as the pgx store: it applies
-// only when the stored state_version equals snap.StateVersion, then bumps it and returns the new
-// value. A version mismatch (a stale writer) returns ok=false with no error — the caller reconciles.
-func (m *MemStore) SaveCharacter(_ context.Context, snap CharSnapshot) (uint64, bool, error) {
+// ClaimCharacter mints the next ownership epoch, mirroring the pgx store's atomic UPDATE (#432).
+// The mutex here plays the part Postgres's row lock plays there: two concurrent claimants must
+// receive DISTINCT epochs, because the whole fence rests on an epoch value naming exactly one live
+// copy of a character. Keyed by name (the MemStore's row key) after resolving the pid.
+func (m *MemStore) ClaimCharacter(_ context.Context, pid PersistID, floor uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, row := range m.rows {
+		if row.PID != pid {
+			continue
+		}
+		next := row.OwnerEpoch
+		if floor > next {
+			next = floor
+		}
+		next++
+		row.OwnerEpoch = next
+		m.rows[k] = row
+		return next, nil
+	}
+	return 0, ErrNoCharacterRow
+}
+
+// SaveCharacter enforces the SAME two predicates as the pgx store — the owner_epoch ownership fence
+// and the state_version contention CAS — and reports them through the same tri-state outcome.
+//
+// PARITY IS THE POINT, not convenience. Every world-package test of the #432 fence runs against this
+// store; a MemStore that checked only state_version would make all of them vacuously green while the
+// real tier was the only thing actually holding the line. The parity test asserts the two agree.
+func (m *MemStore) SaveCharacter(_ context.Context, snap CharSnapshot) (SaveResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	k := memKey(snap.Name)
 	cur, ok := m.rows[k]
 	if !ok {
-		return 0, false, nil // no row to update (treated as a CAS loss)
+		return SaveResult{Outcome: SaveNoRow}, nil
+	}
+	res := SaveResult{CurVersion: cur.StateVersion, CurOwnerEpoch: cur.OwnerEpoch}
+	if cur.OwnerEpoch > snap.OwnerEpoch {
+		// Ownership loss dominates a concurrent version mismatch: the caller must stop, not rebase.
+		res.Outcome = SaveNotOwner
+		return res, nil
 	}
 	if cur.StateVersion != snap.StateVersion {
-		return 0, false, nil // stale writer lost the CAS
+		res.Outcome = SaveStaleVersion
+		return res, nil
 	}
 	snap.PID = cur.PID // identity is immutable; never let a save rewrite it
 	snap.StateVersion = cur.StateVersion + 1
@@ -126,15 +159,25 @@ func (m *MemStore) SaveCharacter(_ context.Context, snap CharSnapshot) (uint64, 
 		snap.ZoneRef = cur.ZoneRef
 	}
 	m.rows[k] = snap
-	return snap.StateVersion, true, nil
+	res.Outcome = SaveApplied
+	res.NewVersion = snap.StateVersion
+	return res, nil
 }
 
 // Checkpoint writes snap as the latest "Redis" checkpoint for snap.Name, overwriting the prior one. An empty
 // ZoneRef preserves the stored one, matching both durable tiers (see SaveCharacter).
+//
+// It also mirrors the real tier's OWNERSHIP guard (#432): a writer whose epoch is below the stored one is a
+// zombie and its write is dropped. The checkpoint is a single key per character name and two live copies both
+// pulse it every ~10s, so without this guard a stale copy is last-writer-wins roughly half the time — and the
+// login read would then rehydrate from it, bypassing the Postgres fence entirely one tier up.
 func (m *MemStore) Checkpoint(_ context.Context, snap CharSnapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	k := memKey(snap.Name)
+	if prev, ok := m.ckpt[k]; ok && prev.OwnerEpoch > snap.OwnerEpoch {
+		return ErrCheckpointNotOwner // parity with the Redis tier: the refusal must be observable
+	}
 	if snap.ZoneRef == "" {
 		if prev, ok := m.ckpt[k]; ok {
 			snap.ZoneRef = prev.ZoneRef
