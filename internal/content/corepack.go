@@ -51,8 +51,31 @@ func (c coreLayered) LoadPacks(ctx context.Context, enabled []string) ([]Pack, e
 // empty content on an empty enabled list, which would skip core) and core is always merged
 // FIRST — real packs from src override it by ref.
 func LoadWithCore(ctx context.Context, src Source, enabled []string) (*LoadedContent, error) {
+	packs, err := LoadPacksWithCore(ctx, src, enabled)
+	if err != nil {
+		return nil, err
+	}
+	LintPacks(packs)
+	return Merge(packs), nil
+}
+
+// LoadPacksWithCore returns the RAW core-layered pack slice LoadWithCore merges: the embedded core pack
+// FIRST, then src's packs for the enabled names, in that order. It is LoadWithCore stopped one step
+// early — same read, same layering, same order — so a caller can INSPECT the packs before deciding
+// whether to merge and publish them.
+//
+// That seam is what the shard's live content-snapshot refresh needs (#423): it validates the packs and
+// publishes content.Merge of the SAME slice, so the thing gated is byte-identically the thing deployed.
+// Doing it with two reads instead would reintroduce a TOCTOU — an import committing between them would
+// let unvalidated rows go live under a validated read's approval.
+//
+// It skips the boot content-lints (LintPacks) deliberately: those are logging, and a caller that
+// re-reads on every content event would emit them on a loop. LoadWithCore still runs them.
+func LoadPacksWithCore(ctx context.Context, src Source, enabled []string) ([]Pack, error) {
+	// CorePack is prepended for the same two reasons LoadWithCore has always prepended it: the list is
+	// then never empty, and core merges FIRST so real packs override it by ref.
 	full := append([]string{CorePack}, enabled...)
-	return Load(ctx, coreLayered{delegate: src}, full)
+	return coreLayered{delegate: src}.LoadPacks(ctx, full)
 }
 
 // LoadCorePack loads just the embedded core pack into a LoadedContent, for tests and the

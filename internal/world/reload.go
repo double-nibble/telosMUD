@@ -2,8 +2,11 @@ package world
 
 import (
 	"context"
+	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,6 +69,12 @@ var (
 	// jitter, N shards hit the content database simultaneously on every deploy, and again — all together —
 	// the instant a partition heals. Jitter turns a synchronized spike into a spread.
 	contentRefreshJitter = 3 * time.Second
+	// rejectedRereadCooldown is the minimum interval between whole-content re-reads of a version the publish
+	// gate already REJECTED (#423). See the cooldown note in refreshContentSnapshot: without it, broken rows
+	// leave the version gate permanently open and every content event costs every shard a full read. Short
+	// enough that an operator's in-place row fix converges on its own; long enough that a broken deploy is
+	// not a read multiplier against the content database.
+	rejectedRereadCooldown = 60 * time.Second
 )
 
 // reload.go is the shard-side hot-reload applier (docs/PHASE4-PLAN.md §5). It subscribes to the
@@ -144,6 +153,19 @@ type reloader struct {
 	// refresh idempotent: a mark whose version the snapshot already reflects skips the whole-pack read, so a
 	// replayed or forged invalidation cannot be used as a read-amplification lever against Postgres.
 	snapshotContentVersion atomic.Uint64
+	// rejectedContentVersion / rejectedAtNanos / rejectedProblemSet track the last REFUSED publish (#423).
+	//
+	// rejectedContentVersion + rejectedAtNanos drive the re-read COOLDOWN: a rejection must not advance
+	// snapshotContentVersion (that would make the shard treat refused rows as published and stop retrying),
+	// but re-reading the whole content database on every content event while rows stay broken is the exact
+	// amplification the version gate exists to prevent. The pair bounds it to one re-read per
+	// rejectedRereadCooldown while still converging on an in-place row fix.
+	//
+	// rejectedProblemSet is the LOG memo, keyed on the problem set rather than the version — see
+	// rejectionKey for why a version-keyed memo can be used to hide a second, different rejection.
+	rejectedContentVersion atomic.Uint64
+	rejectedAtNanos        atomic.Int64
+	rejectedProblemSet     atomic.Uint64
 }
 
 // contentVersioner is the subset of the content source that reports the current Postgres content
@@ -343,10 +365,12 @@ func (r *reloader) markContentStale() {
 		for r.contentStale.CompareAndSwap(true, false) {
 			// Debounce + jitter BEFORE the read, so the marks still arriving from this same pull are
 			// absorbed into this pass rather than each buying their own. Aborts promptly on stop.
-			//nolint:gosec // G404: load-spreading jitter, not a secret. Predicting it buys an attacker
-			// nothing — the refresh is version-gated, so a forged invalidation re-reads nothing whatever
-			// its timing, and the only thing the jitter protects is the content database from a
-			// synchronized fleet-wide read.
+			//nolint:gosec // G404: load-spreading jitter, not a secret. The only thing it protects is the
+			// content database from a synchronized fleet-wide read, and predicting it does not change that.
+			// NOTE (#423): this used to also claim "a forged invalidation re-reads nothing whatever its
+			// timing" because the refresh is version-gated. That is no longer unconditionally true — while
+			// deployed rows are REJECTED the version gate cannot close (a rejection must not advance
+			// snapshotContentVersion), so re-reads do happen. rejectedRereadCooldown is what bounds them now.
 			if !r.sleepOrStop(r.refreshDebounce + time.Duration(rand.Int63n(int64(r.refreshJitter)+1))) {
 				return // the reloader stopped — refreshing a torn-down shard is pointless
 			}
@@ -371,14 +395,47 @@ func (r *reloader) sleepOrStop(d time.Duration) bool {
 // refreshContentSnapshot re-reads the shard's enabled packs and publishes the result as the shard's live
 // content snapshot (#418). It is the ONLY writer of s.content after construction.
 //
-// It re-reads through content.LoadWithCore — the SAME call cmd/telos-world uses at boot — so the refreshed
-// snapshot has the identical shape and layering the process booted with: the embedded core bootstrap pack
-// merged UNDER the enabled packs, last-write-wins by ref. Assembling it any other way would make a
-// runtime-built zone differ from a boot-built one in ways nothing tests.
+// It re-reads through content.LoadPacksWithCore + content.Merge — the two halves of the SAME
+// content.LoadWithCore call cmd/telos-world uses at boot — so the refreshed snapshot has the identical
+// shape and layering the process booted with: the embedded core bootstrap pack merged UNDER the enabled
+// packs, last-write-wins by ref. Assembling it any other way would make a runtime-built zone differ from a
+// boot-built one in ways nothing tests. The split exists so the packs can be VALIDATED between the read and
+// the merge (#423) without reading twice.
 //
 // Every failure is non-fatal: the previous snapshot stays published. Serving slightly stale content is the
 // bug this fixes, but serving NO content would break HostZone and every mint outright, so a Postgres blip
 // must not be allowed to escalate.
+//
+// # What a rejected/failed refresh actually costs, and the divergence it accepts
+//
+// Three call sites read this snapshot: HostZone (a zone built fresh after a rebalance/standby adoption),
+// MintInstance, and regionForZone. The per-ref applier — what propagates a live content EDIT to a running
+// zone — re-reads per ref and never touches the snapshot.
+//
+// So state the freeze PRECISELY, because "it blocks every pack's deploy" is the wrong reading and it is the
+// one a reviewer reaches for. A staff `reload` of an unrelated pack still succeeds and still propagates
+// fleet-wide during a freeze: its per-ref invalidations swap the prototype cache, and the zone-shape
+// reconcile converges off the WIRE payload with no snapshot read. Room, item, mob and channel edits all go
+// live. What a freeze actually holds back is the zone-graph half: a NEW zone cannot be hosted, the
+// `instanceable` opt-in cannot take effect, start-room/reset changes do not reach zones built fresh after
+// the freeze, and region membership does not update for zones registered after it.
+//
+// A frozen snapshot can never LOSE a zone (setContent stores a whole new snapshot or nothing, and the
+// prototype cache has no delete), so no currently-hosted zone becomes unhostable and nobody playing is
+// disconnected. The one real player-facing edge is a stalled drain, and it needs the uptime split below to
+// exist at all: if a RESTARTED shard hosts a zone that only exists in the post-freeze rows, a frozen peer
+// refuses to adopt it (HostZone -> errNoZoneContent -> FailedPrecondition), so that zone cannot be
+// evacuated. Not a dupe and not a disconnect — a drain that cannot complete for one zone, which is one more
+// reason the boot-time Error is the alertable signal.
+//
+// The honest cost is a divergence that does NOT self-heal: boot reads rows raw and unvalidated, so a shard
+// restarted while bad rows are deployed serves them, while a long-running shard rejects and stays behind.
+// Pre-#423 the divergence was transient (everyone converged on newest); now it persists until a human fixes
+// the rows. That is accepted because the alternative is auto-deploying content the operator was told was
+// rejected — and it is made survivable by boot logging the same findings at Error (ReportBootContentProblems, in
+// bootvalidate.go), which is the alertable signal that says a fleet is now split by uptime. Boot logs and boots
+// anyway rather than refusing: it has no previous snapshot to fall back on, so refusing would turn a content
+// defect into an outage.
 func (r *reloader) refreshContentSnapshot() {
 	src, ok := r.src.(content.Source)
 	if !ok {
@@ -414,19 +471,68 @@ func (r *reloader) refreshContentSnapshot() {
 	//
 	// A source with no version authority (embedded/mem in dev) has no gate and always re-reads, which is
 	// correct there: no authority means no way to know, and the cost is a small in-memory pack.
+	// REJECTED-VERSION COOLDOWN (#423). A rejection deliberately does NOT advance snapshotContentVersion —
+	// it must not, or the gate above would treat the refused version as published and the shard would stop
+	// re-reading, so an operator's fix would never be picked up. But leaving it at that reopens exactly the
+	// amplification lever the gate exists to close: while broken rows are deployed, EVERY content event
+	// re-reads the whole content database on every shard, indefinitely, and the attacker can create that
+	// precondition with the same one-row write. The cooldown bounds it: a version already rejected is
+	// re-read at most once per rejectedRereadCooldown. An in-place row fix (which does not bump the version)
+	// still converges, just within the cooldown rather than instantly — the right trade, since the
+	// alternative is an unbounded read multiplier on the content database.
 	before, versioned := r.currentContentVersion(ctx)
 	if versioned && before != 0 && before <= r.snapshotContentVersion.Load() {
 		r.log.Debug("content snapshot refresh skipped: already at the current content version",
 			"version", before, "packs", r.enabled)
 		return
 	}
+	if versioned && before != 0 && before == r.rejectedContentVersion.Load() && !r.rejectedRereadDue() {
+		r.log.Debug("content snapshot refresh skipped: this version was already rejected and is in its "+
+			"re-read cooldown", "version", before, "packs", r.enabled)
+		return
+	}
 
-	lc, err := content.LoadWithCore(ctx, src, r.enabled)
+	// ONE read, then validate-then-merge over that same slice (#423). LoadPacksWithCore is LoadWithCore
+	// stopped one step early, so the packs gated below are byte-identically the packs published. Reading
+	// twice — once to validate, once to publish — would reintroduce the TOCTOU this gate exists to close.
+	packs, err := content.LoadPacksWithCore(ctx, src, r.enabled)
 	if err != nil {
 		r.log.Warn("content snapshot refresh failed; runtime zone builds keep the previous content",
 			"packs", r.enabled, "err", err)
 		return
 	}
+	// THE PUBLISH GATE (#423). Before #423 this function published raw Postgres rows as the shard's live
+	// content with nothing checking them, while the staff `reload` command's identical publish WAS gated by
+	// validatePacks. That asymmetry meant a reload the operator saw REJECTED ("nothing propagated") still
+	// went live on every shard at the next unrelated content event — rows are written by seed/import BEFORE
+	// any reload runs, so the refresh simply re-read and deployed them. Gating here makes "rejected" mean
+	// rejected on both publish paths.
+	//
+	// SCOPE = every enabled pack, core EXCLUDED — the same rule republish states for itself ("Core is
+	// context-only, never in scope", reloadcmd.go). Core is embedded and compiled in; a finding there is an
+	// engine bug, and letting one freeze every shard's snapshot fleet-wide is the opposite of the
+	// degraded-but-bootable posture the core pack exists to guarantee.
+	//
+	// ONE BROKEN PACK REJECTS THE WHOLE SNAPSHOT, and that is deliberate. The alternative — drop the
+	// offending pack and merge the rest — is mechanically easy and semantically wrong: it silently PROMOTES
+	// whatever definitions the dropped pack was overriding, and those are exactly the ones validatePacks
+	// skipped as inert (its provenance model is last-writer-wins). A partial merge would publish content the
+	// gate never looked at, and would build a graph no boot would ever produce — which this function's own
+	// contract forbids.
+	scope := r.snapshotScope()
+	reject, warn := validateSnapshotPacks(packs, scope)
+	for _, w := range warn {
+		// Detection is not reduced by the narrowing — these are still computed and still surfaced, they
+		// simply do not hold a veto over the zone graph. Boot reports the same findings at Error.
+		r.log.Warn("content snapshot: a shared-def problem in the deployed content (NOT blocking the "+
+			"snapshot — these kinds are registered at boot only, or hot-swap via their own path, so the "+
+			"snapshot cannot deploy them; a rolling reboot would)", "packs", r.enabled, "problem", w)
+	}
+	if len(reject) > 0 {
+		r.logSnapshotRejection(before, versioned, reject)
+		return
+	}
+	lc := content.Merge(packs)
 	prev := r.shard.liveContent()
 	// An EMPTY result is not a refresh, it is a wipe. LoadPacks matches on `pack = ANY($1)` and returns no
 	// rows and NO ERROR for a pack that was pruned or renamed, so a bad deploy could otherwise replace a
@@ -458,6 +564,71 @@ func (r *reloader) refreshContentSnapshot() {
 			"re-reading", "read_at", before, "now", after)
 		r.contentStale.Store(true)
 	}
+}
+
+// snapshotScope is the validatePacks provenance scope for a snapshot refresh: every pack this shard
+// enables, with the embedded CORE pack deliberately absent.
+//
+// A `reload <pack>` scopes narrowly so an unrelated broken pack cannot block it (#205). A refresh has no
+// such narrowing available — it publishes ONE merged snapshot assembled from every enabled pack, so every
+// non-core pack contributes to what goes live and every non-core finding is rejectable. Core is excluded
+// for the reason republish excludes it: it is compiled-in content the operator cannot fix by editing rows,
+// so a core finding must never be able to wedge the refresh permanently.
+func (r *reloader) snapshotScope() map[string]bool {
+	scoped := make(map[string]bool, len(r.enabled))
+	for _, p := range r.enabled {
+		if p != content.CorePack {
+			scoped[p] = true
+		}
+	}
+	return scoped
+}
+
+// logSnapshotRejection reports a refused snapshot ONCE PER CONTENT VERSION, at Error the first time and
+// at Debug for every later refresh that re-reads the same broken rows.
+//
+// The memo matters because the refresh is driven by content EVENTS, not by the broken pack: once bad rows
+// are in Postgres, every unrelated invalidation fleet-wide re-reads and re-rejects them. Without the memo
+// a single bad deploy turns into an Error per shard per content event, which is how a real signal gets
+// tuned out. Version 0 / an unversioned source has nothing to memo on, so it logs every time — correct
+// there, since those are dev sources with no fleet to spam.
+func (r *reloader) logSnapshotRejection(version uint64, versioned bool, problems []string) {
+	const msg = "content snapshot refresh REJECTED: the deployed content failed validation, so new zone " +
+		"builds and instance mints KEEP THE PREVIOUS SNAPSHOT (a shard restarted now would read these rows " +
+		"raw and serve different content — fix the rows, then re-deploy)"
+	r.rejectedContentVersion.Store(version)
+	r.rejectedAtNanos.Store(time.Now().UnixNano())
+	// Memoize on the PROBLEM SET, not on the version. A raw row edit does not bump content_version (only an
+	// import or a staff reload does), so a version-keyed memo would report the first breakage at Error and
+	// then silently downgrade every LATER, DIFFERENT breakage at that same version to Debug — an attacker
+	// could land a benign typo to burn the memo and follow it with a real one nobody is paged about.
+	if versioned && version != 0 && r.rejectedProblemSet.Swap(rejectionKey(version, problems)) == rejectionKey(version, problems) {
+		r.log.Debug(msg, "packs", r.enabled, "version", version, "problems", problems)
+		return
+	}
+	r.log.Error(msg, "packs", r.enabled, "version", version, "problems", problems)
+}
+
+// rejectionKey identifies a (version, problem-set) pair for the log memo. Order-independent so a map-
+// iteration reshuffle in a validator cannot masquerade as a new problem set and re-page the operator.
+func rejectionKey(version uint64, problems []string) uint64 {
+	sorted := append([]string(nil), problems...)
+	sort.Strings(sorted)
+	h := fnv.New64a()
+	_, _ = fmt.Fprintf(h, "%d\x00", version)
+	for _, p := range sorted {
+		_, _ = h.Write([]byte(p))
+		_, _ = h.Write([]byte{0})
+	}
+	return h.Sum64()
+}
+
+// rejectedRereadDue reports whether a version already rejected may be re-read again. See the cooldown note
+// in refreshContentSnapshot: it bounds the read amplification a broken deploy would otherwise hand an
+// attacker, while still letting an in-place row fix converge without a restart.
+func (r *reloader) rejectedRereadDue() bool {
+	last := r.rejectedAtNanos.Load()
+	return last == 0 || time.Since(time.Unix(0, last)) >= rejectedRereadCooldown
 }
 
 // currentContentVersion reads the content authority's current version. ok is false when the source has no
