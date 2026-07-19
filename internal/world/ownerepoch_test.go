@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1141,4 +1142,220 @@ func TestPreMintHandoffFailureAdoptsNothing(t *testing.T) {
 	require.Equal(t, SaveNotOwner, res.Outcome,
 		"premise check: the session is legitimately BELOW the row here (the row was pre-claimed by the fixture), "+
 			"so its save is refused — the point of this test is that the FAILED HANDOFF did not make that worse")
+}
+
+// loadFailStore wraps a MemStore and controls what a BY-NAME LoadCharacter reports for exactly one
+// character: a genuine MISS (found=false, nil error) or a read FAILURE. Every other operation —
+// crucially ClaimCharacter — is inherited from the embedded MemStore, so if the resolve ever does
+// hand back a PersistID the mint that follows runs against a real row and is fully observable.
+type loadFailStore struct {
+	*MemStore
+	name string
+	err  error // non-nil => the read FAILS; nil => the read reports a genuine MISS
+}
+
+func (s *loadFailStore) LoadCharacter(ctx context.Context, name string) (CharSnapshot, bool, error) {
+	if name == s.name {
+		if s.err != nil {
+			return CharSnapshot{}, false, s.err
+		}
+		return CharSnapshot{}, false, nil
+	}
+	return s.MemStore.LoadCharacter(ctx, name)
+}
+
+// countingPrepareClient rejects the Prepare like rejectingHandoffClient, but records that it was
+// CALLED and with which epoch. That call count is what separates "failed closed before contacting
+// the destination" from "proceeded on an unminted guess and was merely refused at the far end" —
+// two outcomes that both post a handoffFailMsg and are otherwise indistinguishable from the source.
+type countingPrepareClient struct {
+	rejectingHandoffClient
+	prepares  atomic.Int64
+	lastEpoch atomic.Uint64
+}
+
+func (c *countingPrepareClient) Prepare(ctx context.Context, req *handoffv1.PrepareRequest, opts ...grpc.CallOption) (*handoffv1.PrepareResponse, error) {
+	c.prepares.Add(1)
+	c.lastEpoch.Store(req.GetEpoch())
+	return c.rejectingHandoffClient.Prepare(ctx, req, opts...)
+}
+
+// TestHandoffFailsClosedWhenTheStoreCannotBeRead pins the hole the #432 security review found in
+// beginHandoff's mint block: a read FAILURE and a genuine MISS were conflated, and the failure
+// disarmed the fence silently.
+//
+// When the handoff snapshot carries no PersistId — the async-create window, where CreateCharacter has
+// not yet returned an id for a brand-new character — the mint resolves the row BY NAME. The original
+// form was `if row, found, lerr := LoadCharacter(...); lerr == nil && found { pid = row.PID }`, which
+// answers an ERROR exactly as it answers a miss: pid stays empty, cerr stays nil, the ClaimCharacter
+// call is skipped, and the handoff proceeds at an unminted `epoch+1` — with no log line and no
+// failure. That is the fence turning itself off precisely when the store is sick, which is when a
+// double-own is most likely and least detectable: `epoch+1` is computed from the SESSION, so it
+// collides with a concurrent login's row+1 whenever the row has not been saved since this session's
+// claim, and two live copies at one epoch both satisfy `owner_epoch <= k`.
+//
+// The two halves are asserted together in one table because the fix is a DISCRIMINATION, not a
+// tightening: making the error path fail closed is only correct if the miss path still proceeds. A
+// miss means there truly is no row to fence with (async-create, or an ephemeral/storeless shard), and
+// refusing that would break cross-shard movement for every character in its first seconds of life.
+//
+// The discriminating observable is the Prepare call count, not just adoptEpoch: both branches end in
+// a handoffFailMsg here (the destination rejects), so "failed closed before the destination was ever
+// contacted" and "proceeded on a guess and got refused at the far end" look identical without it.
+func TestHandoffFailsClosedWhenTheStoreCannotBeRead(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name         string
+		loadErr      error // non-nil => the by-name read FAILS; nil => a genuine miss
+		wantPrepares int64
+		wantMinted   bool // true => adoptEpoch is the unfenced session+1; false => adoptEpoch is 0
+		why          string
+	}{
+		{
+			name:         "a store READ FAILURE fails the handoff CLOSED",
+			loadErr:      errors.New("postgres unavailable (injected)"),
+			wantPrepares: 0,
+			wantMinted:   false,
+			why: "an unreadable store cannot tell us whether a row exists, so proceeding is a guess that the " +
+				"fence exists to forbid; the move must fail and the player thaw where they stand",
+		},
+		{
+			name:         "a genuine MISS is legitimately unfenceable and must still PROCEED at epoch+1",
+			loadErr:      nil,
+			wantPrepares: 1,
+			wantMinted:   true,
+			why: "there is no row to mint from inside the async-create window; refusing here would break the " +
+				"first cross-shard step of every brand-new character and of every storeless shard",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &countingPrepareClient{}
+			peers := func(string) (handoffv1.HandoffClient, error) { return client, nil }
+			sh, z, s, _, rowEpoch := handoffFixture(t, epochStubLocator{}, peers, 7)
+			mem, ok := sh.saver.store.(*MemStore)
+			require.True(t, ok, "premise: the fixture's store is a MemStore we can wrap")
+			sh.saver.store = &loadFailStore{MemStore: mem, name: "Mover", err: tc.loadErr}
+			startEpoch := s.epoch
+
+			// THE premise: the snapshot carries NO PersistId, so the mint must resolve by name.
+			sh.beginHandoff(z, &handoffv1.PlayerSnapshot{CharacterId: "Mover"}, "darkwood", "", s.epoch)
+			fail := awaitHandoffFail(t, z)
+
+			if got := client.prepares.Load(); got != tc.wantPrepares {
+				t.Fatalf("the destination's Prepare was called %d time(s), want %d (#432 review): %s", got, tc.wantPrepares, tc.why)
+			}
+			if tc.wantMinted {
+				require.EqualValues(t, startEpoch+1, fail.adoptEpoch,
+					"an unfenceable miss must fall back to session+1 (%d); anything else means the fallback was "+
+						"lost when the error path was split out", startEpoch+1)
+				require.EqualValues(t, startEpoch+1, client.lastEpoch.Load(),
+					"the epoch offered to the destination must be the same value the failure reports for adoption")
+			} else {
+				require.Zero(t, fail.adoptEpoch,
+					"a handoff that failed on an UNREADABLE store must adopt nothing: it never minted, so there is "+
+						"no exclusive epoch to take. A non-zero value here is the pre-fix behaviour — the read error "+
+						"was swallowed as a miss and the move proceeded at an unminted session+1, silently unfenced")
+			}
+
+			// Neither branch may touch the durable row: the failure never reached ClaimCharacter, and the
+			// miss has nothing to claim.
+			row, found, err := mem.LoadCharacter(ctx, "Mover")
+			require.NoError(t, err)
+			require.True(t, found)
+			require.EqualValues(t, rowEpoch, row.OwnerEpoch,
+				"the characters row must be untouched (epoch %d -> %d): no mint happened on either branch",
+				rowEpoch, row.OwnerEpoch)
+
+			// And the source session recovers on both branches — a movement hiccup, not a wedge.
+			z.handle(fail)
+			require.False(t, s.frozen, "the failed handoff must thaw the source session")
+			if tc.wantMinted {
+				require.EqualValues(t, startEpoch+1, s.epoch,
+					"the thaw adopts the fallback the handoff advertised; adoption is a max() and this value is "+
+						"strictly above the session's own")
+			} else {
+				require.Equal(t, startEpoch, s.epoch,
+					"a handoff that minted nothing must leave the session's epoch untouched")
+			}
+		})
+	}
+}
+
+// TestConcurrentHandoffsOfOneCharacterDeriveDistinctTokens closes #381 STRUCTURALLY, by making the
+// closure a property the suite defends rather than a claim in a closing comment.
+//
+// #381: handoffToken is deterministic — `sha256(character/epoch)`. Before #432 a handoff computed its
+// destination epoch as `M+1` off the base epoch M it read, so two concurrent handoffs of one character
+// in a split-brain race (two shards each believing they own the player) both read M, both computed
+// M+1, and derived the IDENTICAL token. Against the same destination, Prepare's token-keyed
+// idempotency then parked ONE SHARED pending for both. Both raced the directory epoch CAS; the loser
+// took the rollback path and issued a genuine, correctly-signed Abort — which discarded the very
+// pending the WINNER's redirect and gate re-dial needed to bind. Both handoffs failed. No attacker,
+// no forged message: two legitimate flows aliased onto one key.
+//
+// #432 removes the aliasing at its source. Every handoff now mints its epoch from the one atomic
+// `characters.owner_epoch` counter (the same counter a login mints from), so concurrent claimants get
+// DISTINCT epochs by construction — and since the token is a pure function of (character, epoch), they
+// derive DISTINCT tokens, land in DISTINCT pendings, and the loser's Abort can only ever discard its
+// own. The shared-pending race is unreachable rather than handled.
+//
+// TestClaimCharacterIsAtomic pins the epochs; this test carries that one hop further to the TOKEN,
+// which is the value #381 is actually about. Both are needed: distinct epochs that collapsed under
+// the token's hash (or a token that stopped depending on the epoch) would restore #381 while leaving
+// the epoch test green.
+//
+// HONEST RESIDUAL: a storeless/ephemeral shard (no CharacterStore configured) still falls back to
+// `epoch+1` in beginHandoff and can therefore still collide. That is a degraded configuration with no
+// durable characters in it at all, not the deployed one — but it is the reason this test asserts the
+// property at the MINT and not at beginHandoff.
+func TestConcurrentHandoffsOfOneCharacterDeriveDistinctTokens(t *testing.T) {
+	ctx := context.Background()
+	mem := NewMemStore()
+	const character = "Contested"
+	pid, err := mem.CreateCharacter(ctx, character, "midgaard", "midgaard:room:temple")
+	require.NoError(t, err)
+
+	// N shards all claiming the SAME character at once — the split-brain race of #381, modelled at the
+	// only seam that crosses the process boundary (the store), exactly as the exploit test does.
+	const n = 64
+	epochs := make([]uint64, n)
+	var start, done sync.WaitGroup
+	start.Add(1)
+	for i := range n {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			start.Wait()
+			ep, cerr := mem.ClaimCharacter(ctx, pid, 0)
+			if cerr == nil {
+				epochs[i] = ep
+			}
+		}()
+	}
+	start.Done()
+	done.Wait()
+
+	tokens := make(map[string]uint64, n)
+	for i, ep := range epochs {
+		require.NotZerof(t, ep, "claim %d failed or minted 0; every concurrent handoff must mint a real epoch", i)
+		tok := handoffToken(character, ep)
+		if prev, dup := tokens[tok]; dup {
+			t.Fatalf("two concurrent handoffs of %q derived the SAME handoff token %s (epochs %d and %d) — #381 "+
+				"is reachable again. A shared token means Prepare's token-keyed idempotency parks ONE pending for "+
+				"both flows at the destination; the loser of the directory CAS then aborts it out from under the "+
+				"winner, and BOTH handoffs fail. The mint is the fix: distinct epochs off the one atomic counter "+
+				"give distinct tokens, so a rollback can only ever discard its own registration",
+				character, tok, prev, ep)
+		}
+		tokens[tok] = ep
+	}
+	require.Len(t, tokens, n,
+		"%d concurrent claims must yield %d distinct handoff tokens", n, n)
+
+	// The token must actually DEPEND on the epoch — otherwise distinct epochs are irrelevant and the
+	// aliasing returns by a different route.
+	require.NotEqual(t, handoffToken(character, 1), handoffToken(character, 2),
+		"handoffToken must vary with the epoch, or #432's distinct mints cannot separate two flows at all")
 }

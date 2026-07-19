@@ -1321,11 +1321,24 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			pid := PersistID(snap.GetPersistId())
 			var cerr error
 			if pid == "" {
-				if row, found, lerr := s.saver.store.LoadCharacter(cctx, character); lerr == nil && found {
+				// Resolve BY NAME. A read FAILURE and a genuine miss must not be conflated: a miss means
+				// there is truly no row and nothing to fence (the character is still inside its async-create
+				// window, or the shard is ephemeral), which is legitimately unfenceable. A failure means the
+				// store is sick — exactly when the fence matters most — and silently falling back to an
+				// unminted epoch+1 would disarm it with no log line and no failure. Fail closed, the same
+				// way the login path refuses an unreadable store.
+				row, found, lerr := s.saver.store.LoadCharacter(cctx, character)
+				switch {
+				case lerr != nil:
+					cerr = lerr
+				case found:
 					pid = row.PID
+				default:
+					log.Debug("handoff epoch not minted: no durable row for this character (async-create window)",
+						"epoch", newEpoch)
 				}
 			}
-			if pid != "" {
+			if cerr == nil && pid != "" {
 				var ep uint64
 				ep, cerr = s.saver.store.ClaimCharacter(cctx, pid, epoch)
 				if cerr == nil {
