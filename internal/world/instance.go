@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -804,17 +805,78 @@ func (s *Shard) reapIdleInstances(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
-	sort.Strings(due) // deterministic sweep order (map iteration is randomized)
-	for _, id := range due {
-		if err := s.UnhostZone(ctx, id); err != nil {
-			// Ordinary: someone entered between the sample and the re-check, or the actor is busy. Give the
-			// instance a fresh idle budget so it is not retried on every single tick.
-			s.resetInstanceIdle(id)
-			slog.Debug("instance reap deferred", "zone", id, "err", err)
-			continue
-		}
-		slog.Info("reaped idle zone instance", "zone", id)
+	sort.Strings(due) // deterministic DISPATCH order (map iteration is randomized); completion order is not
+	s.reapConcurrently(ctx, due)
+}
+
+// instanceReapConcurrency bounds how many instances one sweep retires at a time (#419).
+//
+// The sweep used to be serial, and UnhostZone waits up to unhostActorGrace (10s) for a zone's actor to
+// return. So ONE wedged instance delayed every other reap behind it by 10 seconds, and k wedged instances
+// delayed the tail by 10k — while the ticker coalesced behind the whole thing. Nothing about the reaps is
+// ordered with respect to each other (each is an independent teardown of an independent zone), so the
+// serialization bought nothing and cost the worst case.
+//
+// Bounded rather than unbounded to control the goroutine burst and the burst of routing-mutex acquisitions
+// against live traffic. Note what the bound is NOT doing: each worker takes s.mu and releases it BEFORE it
+// blocks on the actor wait, so 256 workers would mostly queue on the mutex rather than hold it — the same
+// total mutex work, just burstier. Each hold is a scan of tokenIndex and residentZone, sub-millisecond at
+// MUD populations. So this is a smoothing bound, not a correctness one.
+const instanceReapConcurrency = 8
+
+// reapConcurrently retires the due instances with bounded parallelism, and waits for the batch.
+//
+// It WAITS deliberately. Fire-and-forget would let successive ticks pile unbounded goroutines onto the same
+// wedged instance — the ticker would keep re-dispatching a teardown that takes 10s to fail, forever. Waiting
+// means a slow sweep simply delays the next one, and time.Ticker DROPS ticks its receiver misses (its
+// channel holds one) rather than queuing them, so sweeps can never overlap or pile up.
+//
+// The cost of that is not only latency, and it is worth naming: rec.idle advances once per COMPLETED SWEEP,
+// not once per wall-clock tick. So on a shard where sweeps run long, retiring a newly-idle instance takes
+// instanceIdleTicks *sweeps* — and while dead instances sit in s.instances, reserveInstanceSlot counts them
+// against the per-shard cap and can refuse live mints. Wedged instances do not accumulate across sweeps
+// (UnhostZone deletes the record even on its timeout path, so a wedged one is reaped once and never
+// re-swept), which is what keeps this bounded rather than progressive.
+func (s *Shard) reapConcurrently(ctx context.Context, due []string) {
+	if len(due) == 0 {
+		return
 	}
+	sem := make(chan struct{}, instanceReapConcurrency)
+	var wg sync.WaitGroup
+	for _, id := range due {
+		// Checked BEFORE the select, deliberately. With ctx already done and sem free, a select on both
+		// would have two ready cases and Go picks between them uniformly at random — so roughly half the
+		// remaining ids would be dispatched anyway, and "stop dispatching" would be true only on average.
+		if ctx.Err() != nil {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// A DETACHED context per teardown, not the sweep's (#419). UnhostZone passes its ctx to the
+			// actor wait, so handing it the shard's ctx meant a shutdown cancelled every in-flight teardown
+			// mid-commit: each had already removed the zone and its record and cancelled the actor, then
+			// bailed out of the wait. `wg.Wait()` returned almost instantly and looked graceful while
+			// leaving up to instanceReapConcurrency zones half torn down.
+			//
+			// Bounded by the same grace the wait itself uses (plus slack, so the wait's own timeout is what
+			// fires and reports the wedged actor, rather than this one racing it to a less specific error).
+			// Modeled on unadoptZone, which detaches for the same reason.
+			tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unhostActorGrace+time.Second)
+			defer cancel()
+			if err := s.UnhostZone(tctx, id); err != nil {
+				// Ordinary: someone entered between the sample and the re-check, or the actor is busy. Give
+				// the instance a fresh idle budget so it is not retried on every single tick.
+				s.resetInstanceIdle(id)
+				slog.Debug("instance reap deferred", "zone", id, "err", err)
+				return
+			}
+			slog.Info("reaped idle zone instance", "zone", id)
+		}(id)
+	}
+	wg.Wait()
 }
 
 // abandonInstance marks a successfully-minted instance as one its entrant never entered (#72 M3). Called from
