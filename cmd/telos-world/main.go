@@ -530,6 +530,31 @@ const drainHandoffDeadline = 30 * time.Second
 // The ordering PresenceReflectWindow must respect — presence heartbeat (10s) < PresenceReflectWindow (12s) <
 // drainReservationTTL — is guaranteed structurally by this definition (the TTL is the window plus a positive
 // deadline) and asserted against the REAL exported constant in drain_ttl_test.go.
+//
+// WHY THE STEP-1 OFFSET IS NOT A LURKING BOUND (#384). It was proposed that reason (1) above only holds
+// while the step-1 loop's own duration D1 stays under PresenceReflectWindow, leaving a (D1 - 12s) window at
+// large zone counts. Two properties make that not so, and they are worth stating because the alternative is
+// to replace a structural constant with a measured one:
+//
+//   - The reservation is REBASED on every accumulate, not stamped once. reserveDrainTarget (internal/
+//     directory) packs count and expiry in one field and writes `now + ttl` on each reserve onto the same
+//     (target, drainer), so the exposure for a target is measured from its LAST reserve, not from the start
+//     of step 1. Only a target filled to the ceiling early and never revisited ages at all.
+//   - The hold is anchored to the same instant as the redirect it exists to cover. handoverZoneTo is
+//     immediately followed by the zone's drain post (internal/world drain.go), so that zone begins fanning
+//     players off within milliseconds of its reservation being stamped, and the bridge it needs runs from
+//     there to +PresenceReflectWindow. A 42s lifetime covers a ~12s bridge with 30s to spare regardless of
+//     D1. A long D1 delays OTHER zones' redirects, and each of those carries its own freshly-rebased hold.
+//
+// A zone still fanning off 30s+ after being told to drain is by construction one whose players are RECLAIMED
+// rather than redirected, so the headroom a lapsed hold stopped reserving was headroom for arrivals that do
+// not occur. And the reservation is only ever an admission hint against a SOFT ceiling that force-proceeds
+// when every candidate is full — there is no correctness invariant here to violate, only a transient
+// occupancy overshoot the rebalancer corrects. Making the margin D1-aware would trade this proof for a
+// measurement and buy nothing; refreshing mid-wait would need a directory "extend expiry" primitive that
+// inverts the monotonic-shortening invariant ExpireDrainTargetSoon depends on, handing a CRASHED drainer an
+// unbounded hold — a real regression for a hint. The observability line in retireDrainTargets is the check
+// on this reasoning: if a hold ever does lapse before its drain finished, it says so.
 const drainReservationTTL = drainHandoffDeadline + world.PresenceReflectWindow
 
 // drainFleet adapts the directory + presence roster to placement.DrainFleet (#41): the live drain-target
