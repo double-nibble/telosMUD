@@ -6,134 +6,23 @@ import (
 	"log/slog"
 )
 
-// Source is where content comes from. Two implementations exist:
+// loadoracle_test.go — the INDEPENDENT ORACLE for the #423 read/merge split.
 //
-//   - the embedded YAML demo pack (EmbeddedSource, demo.go) — used by unit tests and a
-//     bare dev run, so the test suite needs NO live Postgres;
-//   - Postgres (internal/store implements this) — the production path.
+// #423 cut content.Load into LoadPacks + LintPacks + Merge so the snapshot refresh could validate packs
+// between the read and the merge. The risk in that refactor is this repo's recurring failure mode: a
+// definition FIELD or a whole KIND silently dropping out of a merge/store path with a green suite.
 //
-// Both return the same neutral []Pack, filtered to the enabled pack names, so the loader
-// and the world-side mapper are source-agnostic.
-type Source interface {
-	// LoadPacks returns the definition data for exactly the named packs (each as one Pack).
-	// An enabled pack with no rows yields an empty/absent Pack; unknown names are skipped.
-	// A nil/empty enabled list means "load nothing" (bare-engine boot).
-	LoadPacks(ctx context.Context, enabled []string) ([]Pack, error)
-}
-
-// LoadedContent is the result of a load: the zones to build, keyed by zone ref, in a
-// neutral form the world package consumes (it builds prototypes and runs resets from this).
-// It carries no world types, so this package stays free of an import cycle.
-type LoadedContent struct {
-	// Zones is every loaded zone, in stable load order (pack order, then file order) so a
-	// build is deterministic.
-	Zones []ZoneDTO
-	// byRef indexes Zones by ref for O(1) lookup.
-	byRef map[string]*ZoneDTO
-
-	// Attributes/Resources/DamageTypes are the PACK-GLOBAL definition kinds (Phase 5.1): they
-	// are zone-independent, accumulated across every loaded pack in load order. A later pack
-	// shipping the same ref overrides the earlier one (last write wins), mirroring the zone
-	// override rule. The world side registers them into per-shard registries (build.go).
-	Attributes  []AttributeDTO
-	Resources   []ResourceDTO
-	DamageTypes []DamageTypeDTO
-	// Affects are the pack-global status-effect definitions (Phase 5.2), same last-write-wins
-	// override rule keyed by ref. The world side registers them into the per-shard affectRegistry.
-	Affects []AffectDTO
-	// Abilities are the pack-global ability definitions (Phase 5.3), same last-write-wins override
-	// rule keyed by ref. The world side registers them into the per-shard abilityRegistry and
-	// registers each command-invocation ability into the per-shard command table.
-	Abilities []AbilityDTO
-	// CombatProfiles are the pack-global combat profiles (Phase 6.3a), same last-write-wins override
-	// rule keyed by ref. The world side parses each into a runtime combatProfile (to-hit/avoidance/
-	// damage) and registers them into the per-shard combat-profile registry.
-	CombatProfiles []CombatProfileDTO
-	// DefaultCombat names the combat profile a player entity fights with when its own prototype
-	// declares none (the pack's player default). The LAST non-empty pack value wins. Empty => players
-	// have no combat profile (the degenerate auto-hit case).
-	DefaultCombat string
-	// Commands are the pack-global custom Lua verbs (Phase 7.4e), accumulated across packs (last-write
-	// -wins by verb). The world side registers them into the per-shard custom-command table.
-	Commands []CommandDTO
-	// DisplayDefs are the pack-global display templates (Lua render body per surface), accumulated across
-	// packs (last-write-wins by surface). The world side registers them into the per-shard display table.
-	DisplayDefs []DisplayDefDTO
-	// HelpDefs are the pack-global help topics (#64), same last-write-wins override rule keyed by ref. The
-	// world side registers them into the per-shard help registry; the `help` command reads them and layers
-	// the auto-included command set on top. An empty list => no topics (the command index still renders).
-	HelpDefs []HelpDTO
-	// Channels are the pack-global comms channel definitions (Phase 8.3), same last-write-wins
-	// override rule keyed by ref. The world side registers them into the per-shard channel registry
-	// and binds each channel's verb(s) into the per-shard channel-command table. An empty list => no
-	// channels => no channel verbs (the empty-boot invariant).
-	Channels []ChannelDTO
-	// ToggleDefs are the pack-global player toggles, same last-write-wins override rule keyed by ref.
-	// The world side registers them into the per-shard toggle registry and binds each toggle's verb(s)
-	// into the dispatch path. An empty list => no toggles => no toggle verbs (the empty-boot invariant).
-	ToggleDefs []ToggleDTO
-	// Regions are the pack-global region definitions (Phase 10.3), same last-write-wins override rule
-	// keyed by ref. A region groups member zones a director owns the supra-zone state of; an empty list
-	// => no regions (only the world scope). The director/zone wiring consumes these in 10.3b/c.
-	Regions []RegionDTO
-	// Tracks are the pack-global advancement tracks (Phase 11.2), same last-write-wins override rule keyed
-	// by ref. The world side parses each step's grant op-list and registers them into the per-shard track
-	// registry; an empty list => no tracks (the empty-boot invariant).
-	Tracks []TrackDTO
-	// Bundles are the pack-global class/race/feat/… bundles (Phase 11.4b), same last-write-wins override
-	// rule keyed by ref. The world side parses each bundle's grant op-list and registers them into the
-	// per-shard bundle registry; apply_bundle runs one's grants on an entity.
-	Bundles []BundleDTO
-	// RarityTiers + LootTables are the pack-global loot definitions (Phase 12.1), same last-write-wins
-	// override rule keyed by ref. The world side registers them into the per-shard loot registries; the
-	// resolver runs a loot table per eligible looter on death.
-	RarityTiers []RarityTierDTO
-	// Affixes are the pack-global named affixes (#37), accumulated last-write-wins by ref. The world builds a
-	// per-shard registry the loot-table builder resolves AffixRollDTO.Ref against. Empty => inline-only pools.
-	Affixes        []AffixDefDTO
-	LootTables     []LootTableDTO
-	SpawnSchedules []SpawnScheduleDTO
-	// Recipes are the pack-global crafting recipes (Phase 13.5), same last-write-wins by ref. The world side
-	// registers them into the per-shard recipe registry; the craft op reads one by ref.
-	Recipes []RecipeDTO
-	// WearSlots is the pack-global content-defined equipment vocabulary (#35), accumulated last-write-wins by
-	// slot ref. The world builds its runtime wear-slot vocab from it; an empty list => the engine default set.
-	WearSlots []WearSlotDTO
-	// Chargens are the pack-global character-generation flows (Phase 14.8), same last-write-wins by ref.
-	// telos-account reads them (not the world) to render + validate the signup form.
-	Chargens []ChargenDTO
-	// TrustTiers is the pack-global content-defined trust ladder (#27/#29, Round 9 Slice 0), accumulated
-	// last-write-wins by tier NAME. BOTH the world (rank + flag derivation, command gating) AND telos-account
-	// (tier validation + promote authz) read it. An empty list => the engine default ladder.
-	TrustTiers []TrustTierDTO
-	// PvpLua is the pack PvP-policy Lua hook (Phase 7.4f); the LAST non-empty pack value wins. Empty =>
-	// the engine's built-in pvp_allowed. Formulas are the Lua ruleset-formula overrides (last-write-wins
-	// by name).
-	PvpLua   string
-	Formulas map[string]string
-	// WorldScript is the pack-global world-director Lua script (#47); the LAST non-empty pack value wins
-	// (there is one world orchestrator). Empty => the director reacts to no signals. The telos-director
-	// service reads it (not the world/zone) to build its sandboxed Lua signal handler.
-	WorldScript string
-}
-
-// Zone returns the loaded zone with the given ref, or nil.
-func (lc *LoadedContent) Zone(ref string) *ZoneDTO {
-	if lc == nil {
-		return nil
-	}
-	return lc.byRef[ref]
-}
-
-// Empty reports whether nothing was loaded (the bare-engine boot case).
-func (lc *LoadedContent) Empty() bool { return lc == nil || len(lc.Zones) == 0 }
-
-// Load reads the enabled packs from src and returns the assembled LoadedContent. It is the
-// boot-time content read; it runs synchronously on the shard-construction goroutine (never
-// on a zone goroutine), so blocking I/O here is fine (docs/PHASE4-PLAN.md §3). With no
-// enabled packs or an unreachable source returning nothing, it returns an empty
-// LoadedContent — the bare-engine invariant: the engine boots with zero content.
-func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, error) {
+// The first attempt at guarding it compared Load against Merge. That test was TAUTOLOGICAL — after the
+// refactor Load *is* LintPacks+Merge, so both sides of the comparison ran the same code, and inserting
+// `packs = nil` at the top of Merge still passed. It is recorded here because the mistake is a subtle one
+// and the shape of the fix is the lesson: an equivalence test needs an oracle the change cannot move.
+//
+// loadOLD below is the pre-refactor content.Load, copied VERBATIM from the commit before the split
+// (`git show 409a1b9:internal/content/loader.go`). It is frozen: it must never be "kept in sync" with the
+// production loader, because being independent of it is the entire point. If a legitimate change to the
+// merge rules makes these tests fail, update loadOLD in the SAME commit as the behavior change and say so
+// in the message — that turns a silent field-drop into a deliberate, reviewed edit.
+func loadOLD(ctx context.Context, src Source, enabled []string) (*LoadedContent, error) {
 	lc := &LoadedContent{byRef: map[string]*ZoneDTO{}}
 	if src == nil || len(enabled) == 0 {
 		slog.Debug("content load: no source or no enabled packs; booting empty",
@@ -144,17 +33,6 @@ func Load(ctx context.Context, src Source, enabled []string) (*LoadedContent, er
 	if err != nil {
 		return nil, fmt.Errorf("content: load packs %v: %w", enabled, err)
 	}
-	LintPacks(packs)
-	lc = Merge(packs)
-	slog.Debug("content loaded", "packs", enabled, "zones", len(lc.Zones))
-	return lc, nil
-}
-
-// LintPacks runs the boot content-lints over already-read packs and LOGS the findings. Every lint here
-// is non-fatal by design: boot never refuses content (see the fail-safe posture in reloadvalidate.go's
-// header), so these are operator signal, not a gate. Exported alongside Merge so a caller that splits
-// the read from the merge (the #423 snapshot refresh) can still emit the same boot diagnostics.
-func LintPacks(packs []Pack) {
 	// Content-lint (#212): warn on any NON-core pack shipping a world-ref under the reserved core:
 	// namespace, which would clobber the embedded bootstrap room via the last-write-wins merge below.
 	// Non-fatal (the merge still runs), mirroring the world content-lints.
@@ -192,20 +70,6 @@ func LintPacks(packs []Pack) {
 			"the channel may be unintentionally open or unreachable",
 			"pack", v.Pack, "channel", v.Channel, "field", v.Field, "detail", v.Detail)
 	}
-}
-
-// Merge assembles already-read packs into a LoadedContent, applying the last-write-wins-by-ref
-// override rules. It is PURE — no I/O, no source, no linting — which is what makes it usable as the
-// second half of a read the caller wants to INSPECT before publishing.
-//
-// Load is `LoadPacks` + the boot content-lints + Merge; LoadWithCore is `LoadPacksWithCore` + the
-// same lints + Merge. Callers that need to gate on the pack contents (the shard's live content-
-// snapshot refresh, #423 — which runs validatePacks over the packs before publishing the merged
-// result) read once with LoadPacksWithCore and merge here, so the thing validated is byte-identically
-// the thing published. Splitting the read from the merge is the ONLY reason this is exported;
-// everything below is the merge loop Load has always run, moved verbatim.
-func Merge(packs []Pack) *LoadedContent {
-	lc := &LoadedContent{byRef: map[string]*ZoneDTO{}}
 	// Materialize the deduped zone set: a later pack shipping the same zone ref overrides the
 	// earlier one IN PLACE (last write wins; content-lint catches accidental collisions).
 	// Track positions by index, NOT by pointer — appending to lc.Zones reallocates the backing
@@ -432,10 +296,10 @@ func Merge(packs []Pack) *LoadedContent {
 		protos += len(z.Items) + len(z.Mobs)
 		resets += len(z.Resets)
 	}
-	slog.Debug("content merged", "zones", len(lc.Zones),
+	slog.Debug("content loaded", "packs", enabled, "zones", len(lc.Zones),
 		"rooms", rooms, "prototypes", protos, "resets", resets,
 		"attributes", len(lc.Attributes), "resources", len(lc.Resources),
 		"damage_types", len(lc.DamageTypes), "affects", len(lc.Affects),
 		"abilities", len(lc.Abilities))
-	return lc
+	return lc, nil
 }

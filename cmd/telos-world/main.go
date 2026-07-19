@@ -682,14 +682,20 @@ func loadContent(ctx context.Context, cfg config.Config) (*content.LoadedContent
 	}
 	enabledPacks := content.ResolveEnabledPacks(cfg.ContentPacks, registryPacks)
 
-	// LoadWithCore layers the minimal embedded core pack UNDER the real packs read from Postgres, so
-	// the bootstrap zone is ALWAYS present; real content overrides it by ref (#212).
-	lc, err := content.LoadWithCore(ctx, pool, enabledPacks)
+	// LoadPacksWithCore + Merge are the two halves of LoadWithCore: it layers the minimal embedded core pack
+	// UNDER the real packs read from Postgres, so the bootstrap zone is ALWAYS present and real content
+	// overrides it by ref (#212). Split here so the packs can be VALIDATED between the read and the merge —
+	// the same gate a running shard's snapshot refresh applies (#423). Boot LOGS the findings and boots
+	// anyway; see world.ReportBootContentProblems for why boot's posture differs from the runtime refresh's.
+	packs, err := content.LoadPacksWithCore(ctx, pool, enabledPacks)
 	if err != nil {
 		slog.Warn("content load failed; booting bootstrap-only world (embedded core pack)", "err", err)
 		core, _ := content.LoadWithCore(ctx, nil, nil)
 		return core, nil, 0
 	}
+	content.LintPacks(packs)
+	world.ReportBootContentProblems(packs, enabledPacks)
+	lc := content.Merge(packs)
 	// lc always carries the core zone now, so lc.Empty() is never true; report on the REAL content.
 	if realZones := len(lc.Zones) - 1; realZones <= 0 {
 		slog.Warn("no real content loaded (packs absent in DB?); booting bootstrap-only world (embedded core pack)", "packs", enabledPacks)

@@ -181,6 +181,84 @@ func (s *reloadScope) liveZones() []content.ZoneDTO {
 // scoped == all) every finding is rejectable, so behaviour is identical to the pre-#205 scoped-only pass.
 func validatePacks(full []content.Pack, scoped map[string]bool) []string {
 	s := newReloadScope(full, scoped)
+	return append(zoneGraphProblems(s), sharedDefProblems(s)...)
+}
+
+// validateSnapshotPacks is the #423 CONTENT-SNAPSHOT gate: the same checks, split by whether a finding can
+// make the published snapshot unsafe to BUILD A ZONE FROM. Rejectable findings block the publish; the rest
+// are returned as warnings and merely logged.
+//
+// # The rule that generated the split, so it is derivable rather than a preference
+//
+// A check is REJECTABLE here iff a finding in it can make the published snapshot unsafe to build a zone
+// from. That rule follows from what the snapshot is actually consumed as. It has exactly three readers —
+// HostZone, MintInstance and regionForZone — and between them they read zone existence, the room-ref set,
+// StartRoom, Resets/ResetSecs, Instanceable, and Regions. It is a ZONE GRAPH, and nothing else.
+//
+// # Why the demoted checks are not merely lower-priority — they protect NOTHING on this path
+//
+// This is the load-bearing half. Attributes, resources, abilities, formulas and the trust ladder are
+// registered by defineGlobals, which runs at BOOT ONLY; a snapshot refresh re-registers nothing (setContent
+// is a bare atomic store). Channels hot-swap through their own KindChannel path off the staff `reload`,
+// which has its own gate and its own narrow #205 scoping, and never consult the snapshot at all.
+//
+// So a trust-ladder finding here cannot prevent a single bad ladder from reaching a running world: the only
+// path a ladder takes is a RESTART, and boot deliberately does not gate (ReportBootContentProblems — see
+// bootvalidate.go for why refusing at boot would turn a content defect into an outage). Rejecting on it
+// would be pure veto surface: no protective value, and — because the snapshot scope is every enabled pack —
+// the power to freeze every pack's zone graph fleet-wide over a finding in one pack's rows.
+//
+// Detection is NOT reduced by any of this. The demoted findings are still computed and still logged, and
+// boot still runs the FULL validatePacks at Error. What changes is only which findings hold a veto.
+//
+// validatePacks itself is deliberately untouched: the staff `reload` gate and the boot report keep full
+// strictness. A `reload` is a human deliberately propagating an edit and can afford to be refused; the
+// refresh is an automatic background reaction to somebody else's content event and cannot.
+func validateSnapshotPacks(full []content.Pack, scoped map[string]bool) (reject, warn []string) {
+	s := newReloadScope(full, scoped)
+	return zoneGraphProblems(s), sharedDefProblems(s)
+}
+
+// zoneGraphProblems returns findings that make the merged content unsafe to BUILD A ZONE FROM — the subset
+// the snapshot gate rejects on. See validateSnapshotPacks for the rule.
+//
+//   - room exits: a proxy, honestly. buildZone reads only r.Ref out of the snapshot, so a dangling exit
+//     rides the prototype from the cache rather than the snapshot. It is kept rejectable anyway because a
+//     zone's room set and its exits are one authored unit, and a dangling exit is THE canonical signal of a
+//     broken zone-graph deploy.
+//   - resets: directly consumed — buildZone calls runResets/startRepop straight off the snapshot DTO.
+//   - proto-ref collisions: collapse a zone's room set in the shared cache, so the zone builds wrong.
+//   - reserved core namespace: a core-namespace zone ref in the merged snapshot IS a lc.Zone() clobber of
+//     the embedded bootstrap lobby.
+//   - ref charset: room/zone refs become ProtoRefs and GMCP keys via spawnRoom.
+func zoneGraphProblems(s *reloadScope) []string {
+	problems := validateRoomExits(s)
+	problems = append(problems, validateResets(s)...)
+	problems = append(problems, validateProtoRefs(s)...)
+	// Reserved core: namespace (#212): a real pack shipping a core-namespace world-ref would, on
+	// broadcast, drive a KindZone reconcile against the embedded bootstrap lobby (which reshapes/tears
+	// down rooms) on every shard. Hard REJECT — but only when the OFFENDING pack is in scope (a not-reloaded
+	// pack's pre-existing violation must not block this reload).
+	for _, v := range content.LintReservedCoreRefs(s.full) {
+		if s.inScope(v.Pack) {
+			problems = append(problems, fmt.Sprintf("pack %q ships %s %q under the reserved core: namespace (would clobber the embedded bootstrap pack)", v.Pack, v.Kind, v.Ref))
+		}
+	}
+	// Ref charset (#66, extended #234): an identity token with a character outside its safe charset can break
+	// a GMCP key, a comms subject, or the tokenizer. Hard REJECT for an in-scope pack only.
+	for _, v := range content.LintRefCharset(s.full) {
+		if s.inScope(v.Pack) {
+			problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside its safe charset %s (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value, v.Charset))
+		}
+	}
+	return problems
+}
+
+// sharedDefProblems returns findings in the pack-GLOBAL definition kinds — the ones registered only by
+// defineGlobals at boot, or hot-swapped by a path that never reads the snapshot. The `reload` gate and the
+// boot report reject/report on these; the snapshot gate only warns. See validateSnapshotPacks.
+func sharedDefProblems(s *reloadScope) []string {
+	full := s.full
 	var problems []string
 	// --- attributes: build the FULL merged def graph (last-write-wins by ref) exactly as boot does, then
 	// reject a parse error / cycle only when an IN-SCOPE attribute is the live cause. Building over the full
@@ -208,27 +286,8 @@ func validatePacks(full []content.Pack, scoped map[string]bool) []string {
 			problems = append(problems, fmt.Sprintf("attribute cycle: %v", cycle))
 		}
 	}
-	// Payload + pack-health checks, each resolving against the full graph and rejecting only in-scope findings.
+	// Channels hot-swap through their OWN KindChannel path, which never reads the content snapshot.
 	problems = append(problems, validateChannels(s)...)
-	problems = append(problems, validateRoomExits(s)...)
-	problems = append(problems, validateResets(s)...)
-	problems = append(problems, validateProtoRefs(s)...)
-	// Reserved core: namespace (#212): a real pack shipping a core-namespace world-ref would, on
-	// broadcast, drive a KindZone reconcile against the embedded bootstrap lobby (which reshapes/tears
-	// down rooms) on every shard. Hard REJECT — but only when the OFFENDING pack is in scope (a not-reloaded
-	// pack's pre-existing violation must not block this reload).
-	for _, v := range content.LintReservedCoreRefs(full) {
-		if s.inScope(v.Pack) {
-			problems = append(problems, fmt.Sprintf("pack %q ships %s %q under the reserved core: namespace (would clobber the embedded bootstrap pack)", v.Pack, v.Kind, v.Ref))
-		}
-	}
-	// Ref charset (#66, extended #234): an identity token with a character outside its safe charset can break
-	// a GMCP key, a comms subject, or the tokenizer. Hard REJECT for an in-scope pack only.
-	for _, v := range content.LintRefCharset(full) {
-		if s.inScope(v.Pack) {
-			problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside its safe charset %s (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value, v.Charset))
-		}
-	}
 	// Trust ladder (#111): a baseline tier granting a capability elevates every un-elevated account on next
 	// login. Reject-severity findings are a hard REJECT for an in-scope pack; warn-severity is authoring noise.
 	for _, v := range content.LintTrustLadder(full) {
