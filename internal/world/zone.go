@@ -1223,6 +1223,14 @@ func (z *Zone) transferIn(m transferInMsg) {
 	// underflow report lives in releaseInboundArrival, shared with the attach and prepare producers.
 	defer z.releaseInboundArrival("transfer")
 	s := m.s
+	// Release the mid-transfer residency mark the source took (#379), on the same paths and for the same
+	// reason the claim above is released: the session is ours now (or, on the no-rooms rejection, nobody's),
+	// so a reconnect must stop being refused. Deferred and unconditional — a mark that outlives its transfer
+	// makes the character permanently unable to reconnect. setPlayer below already clears it on the happy
+	// path; this covers the early return and a recovered panic. See markTransferInFlight.
+	if z.shard != nil {
+		defer z.shard.clearTransferInFlight(s.character)
+	}
 	r := z.resolveRoom(m.room)
 	if r == nil {
 		// The destination zone hosts no rooms (empty-world boot): it cannot place the
@@ -1364,6 +1372,48 @@ func (z *Zone) attach(m attachMsg) {
 		z.presenceLeave(character)
 		z.stopTellConsumer(character) // the handed-off orphan no longer lives here; the destination drains its tells (8.5)
 		s = nil
+	}
+	// DELIVERY-TIME RESIDENCY CHECK (#379), and the one that actually closes the double-own.
+	//
+	// server.go resolves the attach zone on the STREAM goroutine and then delivers the attachMsg through this
+	// zone's INBOX. Nothing re-reads residency in between, so the routing decision can be stale by the time it
+	// arrives — and not by a microsecond race. The reachable shape is ordinary inbox QUEUEING: a link death
+	// drops a stream whose last input was a cross-zone `north` still queued here, the gate reconnects, the
+	// routing read still (correctly) says this zone holds the session, and the attachMsg is posted BEHIND the
+	// queued move. This goroutine then runs the move — transferOut, delPlayer, hand off to the destination —
+	// and only then this attach, which finds s == nil and takes the fresh-login default: a SECOND live copy,
+	// while the first is landing in the destination zone.
+	//
+	// It is the worse half of the bug, not the milder one. Because the routing said "resident", server.go
+	// SKIPPED the #432 ownership claim, so the two copies hold the SAME epoch: the fence cannot separate them
+	// and they force-write over each other. That is the pre-#432 posture, reached from an ordinary reconnect.
+	//
+	// THE PREDICATE IS THE MISMATCH, and the in-flight mark is only the second arm. A destination that has
+	// already dequeued the handover has cleared the mark and re-indexed the character to itself, so a check
+	// for `inFlight` alone would miss exactly the interleaving that is easiest to hit. `resident != z` covers
+	// both: it is the same only-if-mine shape unindexResident uses, applied to attach. If this shard's index
+	// says the character lives in a DIFFERENT zone, a fresh login here is a second copy by definition,
+	// whatever the reason.
+	//
+	// It runs on the zone goroutine and so is serialized against this zone's own transferOut — which is what
+	// makes it a fix rather than a narrower race. Refusing (rather than forwarding to the right zone) is
+	// deliberate: forwarding would mean resolving another zone and posting to it from here, which is the
+	// resolve-then-deliver-async shape #413 exists to remove, and it would need an arrival claim taken outside
+	// s.mu. The gate re-dials, the reconnect then resolves the destination correctly, and this refusal
+	// disappears. Scoped to `s == nil` (the fresh-login default is the only branch that can create a copy) and
+	// to token == "" (a handoff bind is a different lane, keyed by a token this zone holds).
+	if s == nil && token == "" && z.shard != nil {
+		if resident, inFlight := z.shard.residencyFor(character); inFlight || (resident != nil && resident != z) {
+			residentZone := "none"
+			if resident != nil {
+				residentZone = resident.id
+			}
+			z.log.Warn("attach rejected: this shard holds the character's session in another zone, so a fresh "+
+				"login here would be a second live copy; the gate re-dials and resolves the right zone (#379)",
+				"player", character, "zone", z.id, "resident_zone", residentZone, "in_flight", inFlight)
+			out <- disconnectFrame("character is mid-transfer")
+			return
+		}
 	}
 	switch {
 	case s != nil && s.pending:

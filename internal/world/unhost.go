@@ -211,10 +211,18 @@ func (s *Shard) UnhostZone(ctx context.Context, id string) error {
 	// ever unhosts a non-quiescent zone can't leave the index pointing at a stopped actor — mirroring the
 	// tokenIndex sweep. residentZone has its own lock, taken briefly here under s.mu (leaf order preserved:
 	// residentMu never reaches back for s.mu).
+	//
+	// forgetResidencyLocked, not a bare delete, so an entry carrying an in-flight transfer mark (#379) would
+	// keep the mark and lose only the zone pointer. THAT ARM IS INERT TODAY and is kept as defense-in-depth
+	// only: the sole path that sets a mark nils the entry's zone one statement later (transferOut marks, then
+	// delPlayer), so by the time this loop could match `r.z == z` the entry no longer names a zone — and in the
+	// one instant where it would match, the character is still in z.players, so pop == 1 and the quiescence
+	// precondition above has already refused the unhost. It is here so that a future non-quiescent teardown
+	// cannot silently drop a mark and let a reconnect fresh-login into the window the mark exists to refuse.
 	s.residentMu.Lock()
-	for character, rz := range s.residentZone {
-		if rz == z {
-			delete(s.residentZone, character)
+	for character, r := range s.residentZone {
+		if r.z == z {
+			s.forgetResidencyLocked(character, r)
 		}
 	}
 	s.residentMu.Unlock()

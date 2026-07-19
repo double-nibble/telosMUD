@@ -633,10 +633,18 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, departMsg 
 	// leave without posting — a panic below is recovered by dispatchSafe/handle, which run no compensator. A
 	// leaked claim is permanent: dest can never be unhosted or rebalanced again, and every later BeginDrain on
 	// this process burns its whole deadline waiting for a quiescence that will never come.
+	//
+	// The SAME compensator releases the mid-transfer residency mark taken below (#379), because the mark's
+	// lifetime is deliberately this claim's: one lifetime, one audited pair of release sites (here and
+	// transferIn's defer), so a future path cannot leak the mark without also leaking `incoming` — which is
+	// loud (releaseInboundArrival's underflow report) and wedges the zone. See markTransferInFlight.
 	posted := false
 	defer func() {
 		if !posted {
 			dest.incoming.Add(-1)
+			if z.shard != nil {
+				z.shard.clearTransferInFlight(s.character)
+			}
 		}
 	}()
 	// Combat exclusion is ENFORCED in move() (refuses while posFighting), so a fighting player never
@@ -649,6 +657,22 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, departMsg 
 		z.actConceal(departMsg, s.entity, ToRoom) // #100: silent to those who can't see the mover
 	}
 	Move(s.entity, nil) // detach from the source room before handing off
+	// Mark the character mid-transfer BEFORE removing them from this zone (#379), so there is no instant in
+	// which the shard's residency index answers "nowhere" for a session that is very much alive. From here
+	// until transferIn (or the compensator above) a token=="" reconnect is REFUSED with Unavailable rather
+	// than falling through to the stale durable zone_ref and fresh-logging a second copy — see
+	// markTransferInFlight for the full lifetime argument.
+	//
+	// The mark is only-if-mine, so it can decline. That is unreachable today (we are on z's goroutine, for a
+	// session in z.players, which setPlayer indexed to z) and it is not fatal when it happens — Zone.attach's
+	// delivery-time residency check is the actual double-own net, and this refusal only buys the earlier,
+	// epoch-preserving refusal — but it means the index disagrees with z.players about who we hold, which
+	// nothing else would ever report.
+	if z.shard != nil && !z.shard.markTransferInFlight(s.character, z) {
+		z.log.Error("BUG: transferring a character this zone's residency index does not attribute to us; "+
+			"a reconnect racing this transfer loses its early refusal (#379)",
+			"player", s.character, "from_zone", z.id, "to_zone", dest.id)
+	}
 	z.delPlayer(s.character)
 	// Forward in-flight input to dest until the reader loop observes the new
 	// currentZone (which dest.transferIn Stores). dest dedups by appliedSeq.
