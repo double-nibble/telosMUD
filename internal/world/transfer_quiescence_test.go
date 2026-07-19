@@ -979,6 +979,24 @@ func TestUnhostSweepNeverOrphansATransferringSession(t *testing.T) {
 	if dst == nil {
 		t.Fatal("darkwood is not hosted at the end of the sweep")
 	}
+	// A BOUNDED SETTLE FIRST, because "the walking stopped" is NOT "the last transferIn returned".
+	//
+	// crossZone declares a crossing complete when the walker's currentZone flips, and transferIn Stores that
+	// pointer roughly two thirds of the way through its body — before registerPlacement, the arrival look
+	// (which can enter Lua), the aggro scan and the prompt, and therefore well before the deferred
+	// releaseInboundArrival that its RETURN runs. So the last crossing of the run is routinely still inside
+	// transferIn when this assertion is reached, with its claim legitimately still held. The counter reaching
+	// 0 here was relying on the sweeper's shutdown taking longer than that tail; under -race it does not
+	// always, and this failed ~1 run in 50 with the message that names the #409 wedge — the worst possible
+	// false positive, since it accuses the fix of the exact bug it prevents.
+	//
+	// The settle is a loop and NOT a waitCond, deliberately: a genuinely leaked claim never converges, and
+	// reporting that as "timed out waiting for ..." would bury the finding. The loop only gives the tail room;
+	// the assertions below still name what went wrong.
+	settle := time.Now().Add(5 * time.Second)
+	for time.Now().Before(settle) && (src.incoming.Load() != 0 || dst.incoming.Load() != 0) {
+		time.Sleep(2 * time.Millisecond)
+	}
 	if got := src.incoming.Load(); got != 0 {
 		t.Fatalf("midgaard incoming = %d after the walk settled, want 0 (a claim leaked)", got)
 	}

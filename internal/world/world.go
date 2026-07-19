@@ -143,8 +143,10 @@ type Shard struct {
 	//
 	// Its own mutex: setPlayer/delPlayer run on EVERY zone's goroutine and the reconnect read on a stream
 	// goroutine, so keeping it off s.mu avoids contending with zone-hosting/drain. Guarded by residentMu.
+	//
+	// The entry also carries the MID-TRANSFER state (#379) — see the residency type.
 	residentMu   sync.Mutex
-	residentZone map[string]*Zone
+	residentZone map[string]residency
 
 	// content is the shard's LIVE view of loaded content — every pack's prototypes are already in protos
 	// (defineContent fills from ALL loaded zones, not just the hosted set). Retained so HostZone (Phase
@@ -481,7 +483,7 @@ func newBareShard(home, addr string, dir Locator, peers HandoffDialer) *Shard {
 		dir:              dir,
 		peers:            peers,
 		tokenIndex:       map[string]*Zone{},
-		residentZone:     map[string]*Zone{},
+		residentZone:     map[string]residency{},
 		handedOff:        map[string]bool{},
 		leaseStop:        map[string]context.CancelFunc{},
 		actorStop:        map[string]context.CancelFunc{},
@@ -1032,12 +1034,69 @@ func (s *Shard) dropToken(token string) {
 	s.mu.Unlock()
 }
 
+// residency is one character's entry in the shard-level index: WHERE their session is, and whether it is
+// currently in flight between two of this shard's zones (#379).
+//
+// The two facts live in ONE entry rather than in two maps because they are one fact — "who holds this
+// session right now" — with an in-flight state, and two maps could disagree. During an intra-shard transfer
+// the session is genuinely held by NEITHER zone: transferOut removes it from the source and hands it to the
+// destination through the destination's INBOX, so from the source's delPlayer until the destination's
+// setPlayer it is in no zone's players map. That is not a gap the index can name a zone for; it is a
+// distinct state, and the reconnect path must answer differently in it (server.go refuses, the same answer
+// Zone.attach already gives a re-dial to a frozen mid-CROSS-SHARD-handoff session).
+//
+//	z == nil && !inFlight  never stored (the entry is deleted instead)
+//	z != nil && !inFlight  the ordinary case: zone z holds the session
+//	z != nil &&  inFlight  transferOut has taken the mark but has not yet removed the session from z
+//	z == nil &&  inFlight  the window: the source has removed them, the destination has not received them
+type residency struct {
+	z        *Zone
+	inFlight bool
+	// markedAt is when inFlight was set, for the TTL below. Zero when !inFlight.
+	markedAt time.Time
+}
+
+// transferMarkTTL is the AGE at which an in-flight mark becomes eligible to be written off as broken (#379).
+// It is one of TWO conditions, and on its own it clears nothing — see expireStaleTransferMark.
+//
+// WHY AGE ALONE IS NOT ENOUGH, stated here because the obvious design is a plain TTL and it is wrong. In the
+// window before the destination dequeues the handover, NOTHING holds the character: the mark is the only
+// refusal available, because Zone.attach's residency-mismatch arm has no resident to mismatch against. So
+// expiring a mark that is still live does not merely cost the early refusal — it re-opens the double-own for
+// exactly the interleaving the mark exists to cover. A timer cannot tell a leaked mark from a destination
+// whose actor is briefly stalled, and under load the second is not exotic. (This is not theory: a mutation
+// setting this to 0 turns the queued-attach test red with two live copies.)
+//
+// So the age is paired with a positive liveness proof — no zone on this shard holding an inbound arrival
+// claim — and that pairing is what keeps the TTL genuinely insurance rather than load-bearing.
+//
+// THE VALUE. 750ms, bounded on both sides:
+//
+//   - Far ABOVE the honest window, which is one inbox hop between two goroutines in one process —
+//     microseconds. Three orders of magnitude of headroom.
+//   - Comfortably INSIDE the gate's reconnect budget: the gate retries an Unavailable attach 5 times at a
+//     fixed 250ms (~1.25s). Becoming eligible at 750ms leaves at least one and typically two whole retries
+//     within the same reconnect, so a broken mark costs the player a hiccup rather than a failed login. A
+//     value at or above the budget would downgrade the lockout from permanent to per-login, which is not
+//     enough.
+//
+// The failure mode this exists for is the one the mark's own balance argument cannot cover: a leaked
+// `incoming` claim wedges a zone against unhost, which is operator-visible and eventually paged, while a
+// leaked MARK silently bricks exactly one player's ability to reconnect and shows up nowhere. Hence a
+// deadline AND an ERROR — the log line is the alertable signal that the invariant broke.
+const transferMarkTTL = 750 * time.Millisecond
+
 // indexResident records that zone z now holds character's session (#321). Called from setPlayer, so it
 // mirrors z.players exactly. An unconditional set is correct: a character is resident in at most one zone on
 // a shard at a time, and during an intra-shard transfer the destination's setPlayer is the newest truth.
+//
+// It also CLEARS any in-flight mark, and truthfully so: the destination's setPlayer is the instant the
+// transfer stops being in flight. That is not the mark's release — transferIn's deferred release is (see
+// markTransferInFlight), and it runs after this and finds nothing to do — it is what keeps the two fields
+// consistent if the two ever run in the other order.
 func (s *Shard) indexResident(character string, z *Zone) {
 	s.residentMu.Lock()
-	s.residentZone[character] = z
+	s.residentZone[character] = residency{z: z}
 	s.residentMu.Unlock()
 }
 
@@ -1047,22 +1106,187 @@ func (s *Shard) indexResident(character string, z *Zone) {
 // be correct there. The only-if-mine guard is defense-in-depth: it makes the index robust to ANY future call
 // site (or a re-ordering) where a source delete could otherwise erase a destination's fresh entry, matching
 // the only-if-mine discipline the placement tombstone fence uses. Cheap, and it removes a latent footgun.
+//
+// An in-flight entry SURVIVES as a zone-less mark rather than being deleted (#379): transferOut sets the
+// mark before its delPlayer precisely so this call cannot open an uncovered instant.
 func (s *Shard) unindexResident(character string, z *Zone) {
 	s.residentMu.Lock()
-	if s.residentZone[character] == z {
-		delete(s.residentZone, character)
+	if r, ok := s.residentZone[character]; ok && r.z == z {
+		s.forgetResidencyLocked(character, r)
 	}
 	s.residentMu.Unlock()
+}
+
+// forgetResidencyLocked drops the ZONE half of an entry: the whole entry when nothing else is riding on it,
+// or just the zone pointer when a transfer is in flight for the character (the mark must outlive the source's
+// delPlayer — it is released by transferIn/transferOut, never by a zone leaving the index). Caller holds
+// residentMu.
+func (s *Shard) forgetResidencyLocked(character string, r residency) {
+	if !r.inFlight {
+		delete(s.residentZone, character)
+		return
+	}
+	r.z = nil
+	s.residentZone[character] = r
+}
+
+// markTransferInFlight records that character is mid-INTRA-SHARD-transfer out of zone z (#379), and
+// clearTransferInFlight releases that mark.
+//
+// WHY THE MARK EXISTS. Between transferOut's delPlayer and transferIn's setPlayer the session is in NO
+// zone's players map, so zoneForResidentCharacter answers nil. A token=="" reconnect landing there falls
+// through to the durable zone_ref — which by construction is STALE, since transferIn never flushes — and
+// takes the fresh-login branch: a second copy of the character, built from a snapshot up to a full save
+// interval old. Since #432 that fresh copy also mints a strictly greater epoch, so it wins and the in-flight
+// copy is evicted by ownershipLost (leaveNoSave, no save by design): everything since the last flush is
+// silently discarded and the player eats an unexplained displaced kick. It also fires #432's
+// `event=ownership_lost` WARN, which is positioned as an alertable "a double-own is not supposed to be
+// reachable" signal — making it reachable from a benign reconnect race erodes the alert it was built for.
+//
+// Pointing the residency at the DESTINATION instead was considered and is worse: the attachMsg and the
+// transferInMsg are posted by DIFFERENT goroutines into the same inbox with no ordering between them, so an
+// attach that lands first sees no session, fresh-logins, and is then OVERWRITTEN by transferIn's setPlayer —
+// an orphaned entity in the room with no z.players reference. No index ordering closes that. So the answer
+// is the one Zone.attach already gives a re-dial to a frozen mid-CROSS-SHARD-handoff session: refuse, and
+// let the gate re-resolve (#324 retries Unavailable; the window is a two-goroutine inbox hop).
+//
+// THE LIFETIME IS THE `incoming` CLAIM'S, AND THEY BALANCE. A mark that is never cleared makes the character
+// permanently unable to reconnect, so it does not get a lifecycle of its own — it rides the one that is
+// already audited and already reports its own underflow. Every set and every clear:
+//
+//	SET   transferOut, immediately before z.delPlayer — while the character is still resident, so there is
+//	      no uncovered instant on either side of the removal. transferOut registers the `posted` compensator
+//	      as its FIRST statement, so the set is covered by it from the moment it happens.
+//	CLEAR transferOut's !posted compensator — every exit that does NOT reach the send, including a panic
+//	      recovered by dispatchSafe/handle, which run no compensator of their own.
+//	CLEAR transferIn's unconditional defer — every exit once the send DID happen, including the no-rooms
+//	      rejection and a recovered panic.
+//
+// Those are the same two sites that release the arrival claim, so the two cannot drift: a future path that
+// leaked the mark would have to leak `incoming` too, and that has a loud report (releaseInboundArrival) and
+// wedges the zone against every teardown. There is no post-to-a-dead-zone leak either — claimTransferTarget
+// resolves and claims the destination in ONE hold of s.mu, so dest cannot be unhosted while incoming > 0, so
+// transferIn runs for as long as the process lives. (A shard whose runCtx is cancelled can stop its actors
+// with a handover still queued; the mark leaks then, harmlessly, at process exit — the same exposure the
+// `incoming` claim has.) transferMarkTTL is the backstop for everything this argument does not cover.
+//
+// The mark is keyed on the CHARACTER, not the zone, because that is what the reconnect asks about; z is
+// recorded only so the entry stays truthful for the instant before delPlayer.
+//
+// ONLY-IF-MINE, like every sibling in this index. It returns false without touching anything when the index
+// does not attribute the character to z. That cannot happen today — transferOut runs on z's goroutine for a
+// session in z.players, which setPlayer indexed to z — but an unconditional overwrite would let a future
+// caller silently hijack another zone's entry and then DELETE it on release, and this index is what the
+// reconnect path trusts. The caller reports the refusal (it has the zone logger); a missing mark only costs
+// the early refusal, since Zone.attach's delivery-time check is the correctness net.
+func (s *Shard) markTransferInFlight(character string, z *Zone) bool {
+	s.residentMu.Lock()
+	defer s.residentMu.Unlock()
+	r, ok := s.residentZone[character]
+	if !ok || r.z != z {
+		return false
+	}
+	r.inFlight = true
+	r.markedAt = time.Now()
+	s.residentZone[character] = r
+	return true
+}
+
+// clearTransferInFlight releases the mark set by markTransferInFlight. It is idempotent and safe on a
+// character with no mark (the compensator may run on a path that never reached the set).
+//
+// It drops the WHOLE entry only when the mark was the only thing left in it (z == nil, the ordinary
+// mid-flight shape after the source's delPlayer). An entry that still names a zone keeps naming it and loses
+// only the mark: that zone's players map holds the session, and deleting the entry there would punch a #321
+// index hole for a live player — a reconnect would stop finding them and route by the stale durable
+// zone_ref, which is the very bug this file exists to close.
+func (s *Shard) clearTransferInFlight(character string) {
+	s.residentMu.Lock()
+	if r, ok := s.residentZone[character]; ok && r.inFlight {
+		r.inFlight = false
+		r.markedAt = time.Time{}
+		if r.z == nil {
+			delete(s.residentZone, character)
+		} else {
+			s.residentZone[character] = r
+		}
+	}
+	s.residentMu.Unlock()
+}
+
+// expireStaleTransferMark drops an in-flight mark that is provably broken and reports whether it did (#379).
+// The caller LOGS that at ERROR: an unreleased mark is a per-player lockout with no other symptom, and
+// clearing it here is what makes the report fire ONCE for the incident rather than on every one of the gate's
+// five retries.
+//
+// TWO CONDITIONS, BOTH REQUIRED, because clearing a mark that is still live re-opens the very double-own the
+// mark exists to refuse (see transferMarkTTL):
+//
+//   - AGE. The mark is older than transferMarkTTL.
+//   - LIVENESS. No zone on this shard holds an inbound arrival claim. `incoming` is taken atomically with
+//     resolving a transfer destination and released by transferIn on every path, so a genuinely in-flight
+//     handover ALWAYS has one outstanding — including, and especially, while the destination's actor is
+//     stalled, which is the case a bare timer gets wrong. Zero claims anywhere is therefore a positive proof
+//     that no transfer is in flight on this shard, and hence that this mark corresponds to nothing.
+//
+// The liveness half is conservative in the safe direction: an unrelated concurrent transfer defers the
+// cleanup to a later login attempt, which costs nothing (the mark is already broken and the player is already
+// retrying), while a false clear would cost a duplicate character.
+//
+// Called on the stream goroutine at the top of a token=="" login — the only place a lockout is observable,
+// and off the zone goroutines. Lock order is the established one: residentMu is dropped before zonesList
+// takes s.mu, so this never holds a leaf lock while reaching for the shard mutex.
+func (s *Shard) expireStaleTransferMark(character string) bool {
+	s.residentMu.Lock()
+	r, ok := s.residentZone[character]
+	aged := ok && r.inFlight && time.Since(r.markedAt) > transferMarkTTL
+	s.residentMu.Unlock()
+	if !aged || s.anyInboundArrivalOutstanding() {
+		return false
+	}
+	s.clearTransferInFlight(character)
+	return true
+}
+
+// anyInboundArrivalOutstanding reports whether ANY zone on this shard has an arrival claimed but not yet
+// handled. It is the liveness half of expireStaleTransferMark's staleness proof; see there for why a plain
+// age test is not sufficient on its own.
+func (s *Shard) anyInboundArrivalOutstanding() bool {
+	for _, z := range s.zonesList() {
+		if z.incoming.Load() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // zoneForResidentCharacter returns the zone on THIS shard currently holding character's session, or nil.
 // Consulted by the Play attach BEFORE the durable zone_ref so a link-dead resume routes to the zone that
 // actually holds the detached session, never the zone the durable record has gone stale naming (#321). Read
 // on the stream goroutine; safe against the zone-goroutine writers via residentMu.
+//
+// nil while a transfer is in flight, because no zone holds them then — callers that must tell "gone" from
+// "in flight" apart use residencyFor (#379).
 func (s *Shard) zoneForResidentCharacter(character string) *Zone {
+	z, _ := s.residencyFor(character)
+	return z
+}
+
+// residencyFor is zoneForResidentCharacter plus the in-flight answer, read in ONE hold so the two cannot
+// disagree. Its two callers each need both: the attach ROUTING (resolveAttachZoneLocked, on the stream
+// goroutine) and the attach DELIVERY check (Zone.attach, on the target zone's goroutine).
+//
+// IT DOES NOT APPLY THE TTL, deliberately. A reader that aged the mark out on its own would be GUESSING that
+// the transfer is dead, and in the pre-arrival window that guess is the difference between a refusal and a
+// duplicate character — nothing else can refuse there, because there is no resident to mismatch against.
+// Writing a mark off is a decision with one owner (expireStaleTransferMark, which pairs the age with a proof
+// that no arrival is outstanding anywhere), taken on the login path, and it is expressed by REMOVING the
+// mark — so every reader here sees the same thing, and sees it only once someone has proven it.
+func (s *Shard) residencyFor(character string) (z *Zone, inFlight bool) {
 	s.residentMu.Lock()
 	defer s.residentMu.Unlock()
-	return s.residentZone[character]
+	r := s.residentZone[character]
+	return r.z, r.inFlight
 }
 
 // GRPCDialer dials peer shards over plaintext gRPC, caching one connection per

@@ -47,12 +47,17 @@ const (
 	// so the caller can report WHY the player's saved location was not honored.
 	attachRouteDurableUnhosted // the durable zone_ref names a zone this shard does not host (#320)
 	attachRouteDurableInstance // the durable zone_ref is instance-shaped and refused by shape (#411)
+	// attachRouteMidTransfer is the only route that resolves NO zone on a shard that hosts one: an
+	// intra-shard transfer is in flight for this character, so no zone holds them and none may be handed
+	// this connection. The caller turns it into an Unavailable (#379).
+	attachRouteMidTransfer
 )
 
 // resolveAttachZoneLocked decides which hosted zone an attaching connection is handed to, in priority order:
 // a pending handoff token, then a session this shard still HOLDS (the #321 residency index), then the
-// character's durable zone_ref, then the home zone as the fallback. It returns nil only when this shard hosts
-// no home zone at all, plus the route taken so the caller can log it.
+// character's durable zone_ref, then the home zone as the fallback. It returns nil when this shard hosts no
+// home zone at all, and when the character is mid-intra-shard-transfer (#379, refused rather than routed),
+// plus the route taken so the caller can log it.
 //
 // THE CALLER MUST HOLD s.mu. It takes s.residentMu inside, which is the established order (UnhostZone does
 // exactly this; residentMu is a leaf and never reaches back for s.mu). Running the WHOLE four-branch decision
@@ -67,10 +72,9 @@ const (
 func (s *Shard) resolveAttachZoneLocked(character, token string, loaded CharSnapshot, loadedOK bool) (*Zone, attachRoute) {
 	zone := s.zones[s.home]
 	var resident *Zone
+	var inTransfer bool
 	if token == "" {
-		s.residentMu.Lock()
-		resident = s.residentZone[character]
-		s.residentMu.Unlock()
+		resident, inTransfer = s.residencyFor(character)
 	}
 	switch {
 	case token != "":
@@ -79,6 +83,25 @@ func (s *Shard) resolveAttachZoneLocked(character, token string, loaded CharSnap
 		}
 		// If no zone holds the token, fall through with the home zone; the zone's attach
 		// rejects the unknown token rather than spawning a fresh character.
+	case inTransfer:
+		// An intra-shard transfer is in flight for this character (#379). The source zone has taken the mark
+		// and is at or past its delPlayer, so the session is on its way to a destination that has not yet
+		// received it: for the width of that inbox hop it is held by NEITHER zone, and no zone here can be
+		// handed this connection. REFUSE, which is the same answer Zone.attach gives a re-dial to a frozen
+		// mid-CROSS-SHARD-handoff session — the same fact, one hop in.
+		//
+		// The alternative is what this replaces: fall through to the durable zone_ref, which transferIn
+		// never flushes and which is therefore stale by up to a save interval, and fresh-login a SECOND copy
+		// from it. Since #432 that copy wins the ownership claim, so the in-flight one is evicted without a
+		// save and the player silently loses everything since their last flush — plus a displaced kick they
+		// cannot explain and an `ownership_lost` WARN on a page-worthy alert, fired by a benign race.
+		//
+		// Returning nil is what keeps the refusal free of side effects: claimAttachTarget takes no arrival
+		// claim, and Connect returns before ClaimCharacter, so no spurious epoch is minted either. That is
+		// this branch's whole remaining job — the DOUBLE-OWN itself is closed one layer down, by Zone.attach's
+		// delivery-time residency check, because the decision made here is asynchronous with the delivery and
+		// can be stale by the time the attachMsg is dequeued.
+		return nil, attachRouteMidTransfer
 	case resident != nil:
 		// A session for this character is still held on this shard: route to its actual zone so attach
 		// re-binds it. This is authoritative over the (possibly stale) durable zone_ref (#321).
@@ -237,6 +260,26 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		return status.Error(codes.Unavailable, "shard draining; reconnect")
 	}
 
+	// SELF-HEAL A STUCK MID-TRANSFER MARK (#379), before the routing below can be refused by one.
+	//
+	// The mark is a "refuse this login until someone clears it" state, and its release sites are balanced
+	// against the destination's `incoming` claim — but the two failure modes are not equally visible. A leaked
+	// claim wedges a zone against unhost, which an operator sees and a drain deadline eventually pages on. A
+	// leaked mark brick-walls exactly ONE player's reconnect, silently, for the life of the process: the only
+	// trace would be the benign Info line below, repeated on each of the gate's retries and indistinguishable
+	// from the ordinary race it is named for.
+	//
+	// So the mark carries a deadline (transferMarkTTL), and outliving it is reported at ERROR — the signal
+	// that the balance argument broke somewhere — and then DROPPED, so the very next routing decision treats
+	// the character normally. Clearing it here rather than merely ignoring it is what makes the report fire
+	// once per incident instead of once per retry. This is insurance only: the double-own itself is closed by
+	// Zone.attach's delivery-time check, which does not depend on the mark at all.
+	if token == "" && s.shard.expireStaleTransferMark(character) {
+		s.log.Error("a mid-transfer mark outlived its transfer and was dropped; some path took the "+
+			"intra-shard transfer mark without releasing it, which had made this character unable to "+
+			"reconnect (#379)", "character", character, "ttl", transferMarkTTL)
+	}
+
 	// Resume the player's ownership epoch from the directory BEFORE handing the stream to
 	// the zone. Only for a fresh/link-dead login (token == ""), never a handoff re-dial
 	// (that carries its own epoch through the pending session). The directory's placement
@@ -311,10 +354,9 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	//
 	// The REPORTED #321 case — link death AFTER the walk lands — is fully closed: detach forwards the detach
 	// to the destination via z.forwarding, so the session is always held on (and indexed to) the zone it
-	// walked to. A residual micro-window remains only for a reconnect landing DURING an in-flight intra-shard
-	// transfer (between the source's delPlayer and the destination's setPlayer the session is in no zone's
-	// players map), where the index misses and we fall back to the stale durable zone. That is intrinsic to
-	// the message-passing handoff and strictly narrower than the pre-fix window; tracked as a follow-up.
+	// walked to. A reconnect landing DURING an in-flight intra-shard transfer (between the source's delPlayer
+	// and the destination's setPlayer the session is in no zone's players map) is not a routing question at
+	// all — it is held by neither zone — so it is REFUSED rather than routed (#379, attachRouteMidTransfer).
 	//
 	// RESOLVE THE ATTACH ZONE AND CLAIM THE ARRIVAL, atomically under s.mu (#413). See claimAttachTarget:
 	// resolving here and posting the attachMsg below is a resolve-then-deliver-async window, and a concurrent
@@ -346,8 +388,18 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// 2s, which is a refusal (retryable, self-clearing) and not a wedge.
 	zone, route := s.shard.claimAttachTarget(character, token, loaded, loadedOK)
 	if zone == nil {
-		// Decided BEFORE any epoch is minted, deliberately: a shard with no hosted zone would otherwise burn
-		// a ClaimCharacter — and thus an ownership generation — on every retry of a login it always refuses.
+		// Both no-zone routes are decided BEFORE any epoch is minted, deliberately: a login that is always
+		// refused (no hosted zone) would otherwise burn a ClaimCharacter — and thus an ownership generation —
+		// on every retry, and a login refused for being mid-transfer would mint an epoch STRICTLY GREATER
+		// than the one the in-flight copy is carrying, which is the whole harm #379 is about (the in-flight
+		// copy would then lose the fence to a copy that never even attached).
+		if route == attachRouteMidTransfer {
+			// Info, not Warn: this is a benign, self-clearing race (a reconnect arriving inside a
+			// two-goroutine inbox hop), and the gate re-resolves on Unavailable (#324) so the retry lands.
+			s.log.Info("refusing a reconnect landing inside an in-flight intra-shard transfer; the gate will "+
+				"re-resolve", "character", character)
+			return status.Error(codes.Unavailable, "character is mid-transfer; reconnect")
+		}
 		s.log.Error("no zone to attach to", "character", character, "home", s.shard.home)
 		return status.Error(codes.Unavailable, "no hosted zone; reconnect")
 	}
@@ -378,8 +430,10 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	case attachRouteDurableUnhosted:
 		s.log.Warn("durable zone not hosted on this shard; falling back to the home zone (the player's saved location is lost)",
 			"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
-	case attachRouteHome, attachRouteToken, attachRouteResident, attachRouteDurable:
+	case attachRouteHome, attachRouteToken, attachRouteResident, attachRouteDurable, attachRouteMidTransfer:
 		// Nothing to report: the route either honored the player's location or is the ordinary fallback.
+		// (attachRouteMidTransfer never reaches here — it resolves no zone and returned above — but it is
+		// listed so this switch stays exhaustive over the route set.)
 	}
 
 	// CLAIM OWNERSHIP (#432). A login is an ownership assertion, and until this existed it was not
