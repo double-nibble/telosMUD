@@ -681,10 +681,8 @@ func realZones(lc *content.LoadedContent) int {
 // rebuilds the prototype, and swaps it into the cache. Every failure is non-fatal (logged):
 // hot reload is best-effort and never disturbs the running world beyond the one ref it targets.
 func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
-	// Ignore an edit to a pack this shard does not load (an empty pack matches nothing). A shard
-	// only caches prototypes from its enabled packs, so a foreign-pack invalidation is a no-op.
-	if inv.Pack != "" && !r.packs[inv.Pack] {
-		r.log.Debug("invalidation ignored: pack not loaded here", "kind", inv.Kind, "ref", inv.Ref, "pack", inv.Pack)
+	if !r.accepts(inv) {
+		r.log.Debug("invalidation ignored", "kind", inv.Kind, "ref", inv.Ref, "pack", inv.Pack)
 		return
 	}
 	r.log.Debug("invalidation received", "kind", inv.Kind, "ref", inv.Ref, "pack", inv.Pack)
@@ -766,6 +764,77 @@ func (r *reloader) onInvalidation(inv contentbus.Invalidation) {
 	// reset the breaker. The shared-cache swap above is the cross-goroutine-safe publish; the
 	// per-zone Lua state is updated single-writer via the inbox post.
 	r.notifyZones(inv.Kind, inv.Ref)
+}
+
+// accepts is the content-bus admission decision: does this shard act on inv at all? It is a PURE
+// predicate, split out from onInvalidation so the decision is table-testable over every kind — the
+// re-widening regression this guards against is one line, and one line is exactly what slips back in.
+//
+// # Fail CLOSED on an empty pack (#424)
+//
+// The rule was `inv.Pack != "" && !r.packs[inv.Pack]` — i.e. an invalidation naming NO pack was accepted
+// by EVERY shard regardless of which packs it loads. The bus is unsigned JSON on one NATS subject with no
+// publisher identity, so that handed anyone who could publish a KNOWLEDGE-FREE, FLEET-WIDE primitive: no
+// need to know a single pack name.
+//
+// It was also DESTRUCTIVE, which is the part that makes this more than tidying. The applier resolves a
+// definition with `WHERE ref = $1 AND pack = $2`, so an empty pack never matches a row — the re-read comes
+// back Found:false, and Found:false is the DELETION path: the prototype is evicted from the shard's cache
+// (no further spawns, live scripted instances go scriptless) or the channel is dropped from the registry
+// (its verb stops resolving, live subscribers lose it). Fleet-wide, per ref, freely repeatable, with no
+// version guard anywhere on that path.
+//
+// It is TEMPTING to add "and naming a real pack does the opposite, since the re-read succeeds and the swap
+// is an idempotent no-op". That is FALSE, and the false version was in this comment until a review probed
+// it. The re-read dispatches on KIND as well as (ref, pack), and returns Found:false for a kind that does
+// not match the target's actual kind — so `{kind:"item", ref:"<a room ref>", pack:"<a loaded pack>"}` still
+// evicts that room, fleet-wide, for the cost of one public pack name. The kind whitelist in accepts closes
+// the unknown-kind half of that; the kind-MISMATCH half is not closable here (an item invalidation for an
+// item ref is exactly what a legitimate publish looks like) and is closed only by authenticating the bus.
+//
+// # What this does NOT buy
+//
+// Not authentication. An attacker who names a pack the shard actually loads — and pack names are hardly
+// secret; they are in the content repo, the reload readout, and the logs — still reaches the zone-shape
+// reconcile, the channel registry swap, and the per-ref re-read. Authenticating the bus is NATS subject
+// permissions (deployment-side) and, if that proves insufficient, signing. This is blast-radius reduction:
+// it removes the primitive that needs no knowledge at all.
+//
+// # The one legitimate pack-less publisher
+//
+// PublishVersionComplete emits a content-LESS sentinel (kind + version only), and every shard must process
+// it — it is what advances the applied-version cursor and is the only signal covering a zone DELETION. So
+// it is exempted, but STRUCTURALLY: a sentinel carries no ref, no room set and no start room by
+// construction, and one that does is not a sentinel. Requiring that here costs nothing and stops the
+// exemption from being usable as a carrier for content a future refactor might start reading off it.
+//
+// RESIDUAL, stated plainly: the sentinel exemption is still forgeable, and advanceApplied is monotone with
+// no upper bound. A forged sentinel carrying a max version wedges appliedContentVersion, which makes
+// reconcile-on-join's `cur <= applied` gate permanently true — the shard then silently never catches up
+// after a bus gap. The snapshot refresh is NOT affected (it gates on the source's own version, #418). That
+// residual is bounded by subject permissions, not by anything expressible here.
+func (r *reloader) accepts(inv contentbus.Invalidation) bool {
+	// A kind outside the closed wire vocabulary is REJECTED rather than passed through. An unknown kind
+	// reaches LoadDefinition, whose store dispatch returns Found:false for anything it does not recognise,
+	// and Found:false is the DELETION path — so `{kind:"made-up", ref:"<real ref>", pack:"<loaded pack>"}`
+	// evicted that prototype from every shard. Whitelisting the vocabulary closes that without needing to
+	// know anything about the ref.
+	if !content.KnownKind(inv.Kind) {
+		return false
+	}
+	if inv.Kind == content.KindVersionComplete {
+		return inv.Pack == "" && inv.Ref == "" && len(inv.Rooms) == 0 && inv.StartRoom == ""
+	}
+	// Everything else MUST name a pack this shard loads. The explicit `inv.Pack != ""` is NOT redundant
+	// with the map lookup, and removing it would silently undo this whole change: r.packs is built by
+	// ranging the configured enabled-pack list, and an empty string in that list (reachable — a YAML
+	// `content_packs: [reference, '']` survives config load, unlike the env path which drops empties) would
+	// put a "" key in the map and make every pack-less invalidation acceptable again, with nothing logged.
+	// The property should not depend on the contents of a config-derived map.
+	//
+	// Two rejections fold together here: an empty pack (fail closed) and a pack another shard loads but
+	// this one does not (a real no-op — a shard only caches prototypes from its enabled packs).
+	return inv.Pack != "" && r.packs[inv.Pack]
 }
 
 // reloadChannel applies a `channel` content hot reload (Phase 8.3): it re-reads the single edited
