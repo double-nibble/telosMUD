@@ -564,7 +564,20 @@ func (s *Shard) retireDrainTargets(sentPlayers map[string]bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), drainReleaseTimeout)
 		var err error
 		if sent {
-			_, err = s.drainReleaser.ExpireDrainTargetSoon(ctx, target, s.shardID, PresenceReflectWindow)
+			var held bool
+			held, err = s.drainReleaser.ExpireDrainTargetSoon(ctx, target, s.shardID, PresenceReflectWindow)
+			if err == nil && !held {
+				// The hold we are retiring was ALREADY GONE while this drain was still sending players to
+				// this target. That is the precise signature of "our reservation lapsed before we finished"
+				// — the concern raised in #384, which was closed on the argument that the 42s TTL exceeds
+				// the ~12s presence-reflection bridge it covers by 30s regardless of how long the step-1
+				// selection loop ran. This line is the check on that argument: it converts an unfalsifiable
+				// theory into an operational fact. If it never fires, the reasoning held; if it does, #384
+				// reopens with a measured duration attached rather than a hypothesis.
+				slog.Warn("drain: the reservation on a target had already lapsed while we were still sending to it; "+
+					"the drain outran its hold (see #384 — report this with the drain's duration)",
+					"event", "drain_reservation_lapsed", "target", target, "drainer", s.shardID)
+			}
 		} else {
 			err = s.drainReleaser.ReleaseDrainTarget(ctx, target, s.shardID)
 		}
