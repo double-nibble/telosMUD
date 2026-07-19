@@ -33,6 +33,30 @@ const (
 	KindVersionComplete = "version_complete"
 )
 
+// AllKinds is the CLOSED set of definition kinds the content bus carries — the wire vocabulary, in one
+// place, so a consumer can enumerate it instead of hand-copying a list that then silently goes stale.
+//
+// It exists because #424 needed the shard-side admission filter to whitelist kinds rather than pass
+// anything through: an unrecognised kind reaches the applier's single-ref re-read, whose store dispatch
+// returns Found:false for a kind it does not know, and Found:false is the DELETION path — so a made-up
+// kind naming a real ref evicts that prototype fleet-wide. Enumerating the closed set turns that into a
+// rejection.
+//
+// ADDING A KIND: append it here, and expect internal/world's admission test to fail until you have said
+// explicitly what the bus should do with it. That failure is the point — the previous version of that test
+// asserted the length of its own hand-written literal, so it could never fire.
+var AllKinds = []string{KindRoom, KindItem, KindMob, KindZone, KindChannel, KindVersionComplete}
+
+// KnownKind reports whether kind is part of the closed wire vocabulary above.
+func KnownKind(kind string) bool {
+	for _, k := range AllKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
 // Definition is the result of a single-ref re-read: exactly one of Room/Proto is set (per Kind),
 // or Found=false when the ref no longer exists (the row was deleted — the caller removes the
 // prototype rather than serving stale data). It is intentionally a thin union so the world mapper

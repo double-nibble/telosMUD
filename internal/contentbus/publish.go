@@ -2,6 +2,7 @@ package contentbus
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/double-nibble/telosmud/internal/content"
 )
@@ -35,6 +36,16 @@ import (
 func PublishPack(ctx context.Context, bus Bus, pk content.Pack, version uint64) (int, error) {
 	if bus == nil {
 		return 0, nil
+	}
+	// A pack-LESS invalidation is now dropped by every subscriber (#424 made the shard-side filter fail
+	// closed, since an empty pack was a knowledge-free fleet-wide primitive on an unsigned bus). So an
+	// unnamed pack here would publish a whole pack's worth of messages that silently reach nobody — a
+	// fleet-wide no-op reported as success. Refuse it loudly instead. No production path can hit this
+	// (packtree defaults the name to the directory, and the store import rejects an empty one), which is
+	// exactly why it needs saying: the fail-closed filter must never be able to quietly kill a real path.
+	if pk.Pack == "" {
+		return 0, fmt.Errorf("contentbus: refusing to publish invalidations for a pack with no name "+
+			"(every subscriber fails closed on an empty pack, so this would reach nobody): %d zone(s)", len(pk.Zones))
 	}
 	n := 0
 	pub := func(kind, ref string) error {
