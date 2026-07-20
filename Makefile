@@ -45,6 +45,7 @@ verify: ## Run the hermetic CI matrix locally (gofmt + buf + vet + build + race 
 	@echo ">> gofmt (CI-strict: no file may be unformatted)"
 	@test -z "$$(gofmt -l . 2>/dev/null)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
 	@command -v buf >/dev/null 2>&1 && { echo ">> buf lint + format (the CI proto job)"; buf lint && buf format --exit-code; } || echo ">> buf not installed — skipping proto checks (CI still runs them)"
+	@echo ">> log-key guard (#454: no sensitive value as a structured-log key)" && ./scripts/check-log-keys.sh
 	@echo ">> go vet" && $(GO) vet ./...
 	@echo ">> go build" && $(GO) build ./...
 	@echo ">> go build (release gate: NO dev-autoauth bypass — #96)" && $(GO) build -o /dev/null ./cmd/telos-gate

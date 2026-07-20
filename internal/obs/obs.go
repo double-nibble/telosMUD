@@ -84,7 +84,21 @@ func initMetrics(service string) ShutdownFunc {
 // calls can rely on the level filter instead; use this only to guard debug-only
 // work that is itself expensive (e.g. serializing a large value just to log it).
 func DebugEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEBUG"))) {
+	return truthyEnv("DEBUG")
+}
+
+// LogRawInput reports whether the TELOS_LOG_RAW_INPUT env flag is truthy. It gates
+// logging of verbatim player input lines (tells, chat, mistyped link codes) — a
+// separate, explicit opt-in from DEBUG, deliberately: turning on debug logging must
+// never silently start recording player chat into a durable log store (#454). Off by
+// default; callers on hot paths cache the result rather than re-reading env per line.
+func LogRawInput() bool {
+	return truthyEnv("TELOS_LOG_RAW_INPUT")
+}
+
+// truthyEnv reports whether the named env var is set to a truthy value (1/true/yes/on).
+func truthyEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
 	case "1", "true", "yes", "on":
 		return true
 	}

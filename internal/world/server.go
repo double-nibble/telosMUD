@@ -16,6 +16,7 @@ import (
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/assertion"
 	"github.com/double-nibble/telosmud/internal/metrics"
+	"github.com/double-nibble/telosmud/internal/obs"
 	"github.com/double-nibble/telosmud/internal/sessionlock"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
@@ -621,6 +622,10 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 
 	cleanQuit := false
 	reclaimed := false // the watchdog tore this stream down; the peer gets a distinct status, not a clean EOF
+	// Read the raw-input opt-in once per stream (not per line): whether verbatim input may be logged.
+	// OFF unless TELOS_LOG_RAW_INPUT is set — a deliberate, separate opt-in from DEBUG so debug logging
+	// never silently records player input at the world ingress (#454).
+	logRawInput := obs.LogRawInput()
 	for {
 		var f *playv1.ClientFrame
 		select {
@@ -655,7 +660,13 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			// world's own ingress, before it reaches a zone inbox and fans out to other
 			// players' terminals. CleanLine is a no-op for legitimate, already-clean input.
 			line := textsan.CleanLine(in.GetText())
-			s.log.Debug("input received", "character", character, "seq", in.GetSeq(), "text", line)
+			// The raw line is verbatim player input (a tell/say body, a mistyped link code); attach it only
+			// under the explicit opt-in. character+seq is enough to trace ingress by default (#454).
+			if logRawInput {
+				s.log.Debug("input received", "character", character, "seq", in.GetSeq(), "text", line) // logkey-ok: gated by TELOS_LOG_RAW_INPUT (#454)
+			} else {
+				s.log.Debug("input received", "character", character, "seq", in.GetSeq())
+			}
 			currentZone.Load().post(inputMsg{id: character, seq: in.GetSeq(), line: line})
 		case *playv1.ClientFrame_Gmcp:
 			// Inbound GMCP request (#92): a rich client ASKS the world for data (Char.Items.Contents).

@@ -16,6 +16,7 @@ import (
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/metrics"
+	"github.com/double-nibble/telosmud/internal/obs"
 	roster "github.com/double-nibble/telosmud/internal/presence"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
@@ -55,12 +56,15 @@ type Zone struct {
 	// the locality decision in ownsZoneRef. Reach for `id` by default; use `template` only where the question
 	// is genuinely about content, because an instance's rooms carry their AUTHORED refs (that is what lets
 	// every instance share the immutable per-shard protoCache) and so name the template, never the instance.
-	template  string
-	rooms     map[ProtoRef]*Entity // room entities, keyed by their ProtoRef (MUDLIB §4)
-	players   map[string]*session  // connection state, keyed by character id
-	startRoom ProtoRef             // ProtoRef of the room a fresh login spawns in
-	rids      ridAllocator         // per-zone RuntimeID source for entities (identity.go)
-	inbox     chan msg             // message queue; the only ingress to zone state
+	template string
+	// logRawInput gates logging of verbatim player input lines (see newZone + #454). Cached from
+	// obs.LogRawInput() at construction so the per-line dispatch path never reads env.
+	logRawInput bool
+	rooms       map[ProtoRef]*Entity // room entities, keyed by their ProtoRef (MUDLIB §4)
+	players     map[string]*session  // connection state, keyed by character id
+	startRoom   ProtoRef             // ProtoRef of the room a fresh login spawns in
+	rids        ridAllocator         // per-zone RuntimeID source for entities (identity.go)
+	inbox       chan msg             // message queue; the only ingress to zone state
 	// dead is closed by UnhostZone once this zone's actor has returned for good (#288). `post` selects on it,
 	// so a sender that arrives after the teardown returns immediately instead of filling — and eventually
 	// blocking on — an inbox nobody will ever drain again. That matters because some senders are NOT
@@ -723,6 +727,11 @@ func newZone(id string) *Zone {
 		// Scoped logger so every line this zone emits is tagged with its id; all
 		// the verbose control-flow tracing below goes through z.log at Debug.
 		log: slog.With("component", "zone", "zone", id),
+		// Cached once at construction (never re-read per input line): whether verbatim player
+		// input lines may be logged. OFF unless TELOS_LOG_RAW_INPUT is truthy — a deliberate,
+		// separate opt-in from DEBUG so "turn on debug logging" can never mean "start recording
+		// player tells/chat/link-codes into a durable log store" (#454).
+		logRawInput: obs.LogRawInput(),
 	}
 	// The per-zone Lua runtime (luart.go): the VM + the restricted-globals sandbox, built at
 	// zone construction so it is live before Run starts, and torn down when Run returns. Built
@@ -1011,7 +1020,15 @@ func (z *Zone) handleInput(v inputMsg) {
 	if v.seq != 0 {
 		s.appliedSeq = v.seq
 	}
-	z.log.Debug("inbox: input", "player", v.id, "seq", v.seq, "line", v.line)
+	// Never log the raw input line by default: it is verbatim player text (tells, chat, a
+	// mistyped link code) and this fires BEFORE dispatch, so it captures the line whether or
+	// not the verb resolves. player+seq is enough to trace flow. The line is only attached
+	// under the explicit TELOS_LOG_RAW_INPUT opt-in (distinct from DEBUG) — see #454.
+	if z.logRawInput {
+		z.log.Debug("inbox: input", "player", v.id, "seq", v.seq, "line", v.line) // logkey-ok: gated by TELOS_LOG_RAW_INPUT (#454)
+	} else {
+		z.log.Debug("inbox: input", "player", v.id, "seq", v.seq)
+	}
 	z.dispatchSafe(s, v.line)
 }
 
@@ -1023,8 +1040,16 @@ func (z *Zone) handleInput(v inputMsg) {
 func (z *Zone) dispatchSafe(s *session, line string) {
 	defer func() {
 		if r := recover(); r != nil {
-			z.log.Error("command handler panicked; zone survived",
-				"player", s.character, "line", line, "panic", r, "stack", string(debug.Stack()))
+			// The stack + player + panic value are the real diagnostic for a crash; the raw input
+			// line is verbatim player text (a tell/say body, a mistyped link code) and fires at
+			// Error — always on, unlike the Debug sites — so it is attached only under the explicit
+			// TELOS_LOG_RAW_INPUT opt-in (#454). Without it, the panic is still fully actionable.
+			if z.logRawInput {
+				z.log.Error("command handler panicked; zone survived", "player", s.character, "line", line, "panic", r, "stack", string(debug.Stack())) // logkey-ok: gated by TELOS_LOG_RAW_INPUT (#454)
+			} else {
+				z.log.Error("command handler panicked; zone survived",
+					"player", s.character, "panic", r, "stack", string(debug.Stack()))
+			}
 			s.send(textFrame("Something went wrong with that command."))
 			z.sendPrompt(s)
 		}

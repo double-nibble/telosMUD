@@ -275,7 +275,14 @@ func (z *Zone) dispatch(s *session, line string) {
 		z.sendPrompt(s)
 		return
 	}
-	z.log.Debug("dispatch", "player", s.character, "verb", lower, "cmd", cmd.Name, "line", line)
+	// verb+cmd is enough to trace dispatch, matching the neighbouring sites above which log verb
+	// only. The raw `line` is verbatim player input (it carries a tell/say/channel body) and is
+	// attached only under the explicit TELOS_LOG_RAW_INPUT opt-in (distinct from DEBUG) — see #454.
+	if z.logRawInput {
+		z.log.Debug("dispatch", "player", s.character, "verb", lower, "cmd", cmd.Name, "line", line) // logkey-ok: gated by TELOS_LOG_RAW_INPUT (#454)
+	} else {
+		z.log.Debug("dispatch", "player", s.character, "verb", lower, "cmd", cmd.Name)
+	}
 
 	ctx := &Context{z: z, s: s, Actor: s.entity, arg: rest}
 	_ = cmd.Run(ctx)
