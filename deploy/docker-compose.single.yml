@@ -36,7 +36,10 @@ services:
     # pinned so it survives an image or config change.
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports:
-      - "6380:6379"
+      # Publish to HOST LOOPBACK only — no-auth Redis holding coordination state (see docker-compose.yml). The
+      # world reaches it by service name (redis:6379) over the compose network; the host publish (6380) is only
+      # for host-side inspection. Matches the two-shard file's loopback hardening. (#455)
+      - "127.0.0.1:6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -119,7 +122,10 @@ services:
       TELOS_ZONES: midgaard # players spawn in midgaard
       DEBUG: true
     ports:
-      - "4000:4000" # telnet: connect with `telnet localhost 4000`
+      # Publish to HOST LOOPBACK only, matching the two-shard gate's precedent. This is a passwordless bare-name
+      # dev login (TELOS_ALLOW_INSECURE, no OAuth) on a plaintext telnet listener, so it must not be reachable
+      # off-host. Manual connect (`telnet localhost 4000`) is host-side, so unaffected. (#455)
+      - "127.0.0.1:4000:4000" # telnet: connect with `telnet localhost 4000`
     depends_on:
       world:
         condition: service_started
