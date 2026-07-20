@@ -50,7 +50,7 @@ type hookedSnapshot struct {
 	onWorldRead func()
 }
 
-func (h hookedSnapshot) SnapshotWorldState(ctx context.Context) (map[string][]byte, error) {
+func (h hookedSnapshot) SnapshotWorldState(ctx context.Context) (map[string]ScopeValue, error) {
 	if h.onWorldRead != nil {
 		h.onWorldRead()
 	}
@@ -256,7 +256,7 @@ type regionCountingSnapshot struct {
 	onRegionRead func()
 }
 
-func (r regionCountingSnapshot) SnapshotRegionState(ctx context.Context, regionID string) (map[string][]byte, error) {
+func (r regionCountingSnapshot) SnapshotRegionState(ctx context.Context, regionID string) (map[string]ScopeValue, error) {
 	if r.onRegionRead != nil {
 		r.onRegionRead()
 	}
@@ -271,7 +271,7 @@ type slowSnapshot struct {
 	once    sync.Once
 }
 
-func (s *slowSnapshot) SnapshotWorldState(ctx context.Context) (map[string][]byte, error) {
+func (s *slowSnapshot) SnapshotWorldState(ctx context.Context) (map[string]ScopeValue, error) {
 	s.once.Do(func() { close(s.entered) })
 	<-ctx.Done()
 	return nil, ctx.Err()

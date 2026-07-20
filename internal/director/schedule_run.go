@@ -146,7 +146,7 @@ func (d *Director) saveScheduleState(ctx context.Context, ref string, st Schedul
 		d.log.Warn("scheduler: marshal schedule state", "schedule", ref, "err", err)
 		return false
 	}
-	if err := d.set(ctx, scheduleKey(ref), body); err != nil {
+	if _, err := d.set(ctx, scheduleKey(ref), body); err != nil {
 		d.log.Warn("scheduler: persist schedule state failed", "schedule", ref, "err", err)
 		return false
 	}

@@ -46,10 +46,11 @@ func (a *API) Get(key string) (json.RawMessage, bool) {
 // region:get). A nil value deletes the key. A CAS loss surfaces as an error (a failover race); the
 // handler may retry. This is the single sanctioned write path — the director is the only writer.
 func (a *API) Set(key string, value json.RawMessage) error {
-	if err := a.d.set(a.ctx, key, value); err != nil {
+	ver, err := a.d.set(a.ctx, key, value)
+	if err != nil {
 		return err
 	}
-	a.d.broadcastStateDown(a.ctx, key, value)
+	a.d.broadcastStateDown(a.ctx, key, value, ver)
 	return nil
 }
 
@@ -417,11 +418,14 @@ func (d *Director) broadcastPullResult(parent context.Context, version, actor st
 // broadcastStateDown publishes a state delta DOWN on this director's scope (the EventStateSet contract the
 // zone read-replica consumes). Transient: a live push to member zones. Runs on the actor goroutine; the
 // transient publish is fast and fire-and-forget.
-func (d *Director) broadcastStateDown(ctx context.Context, key string, value json.RawMessage) {
+func (d *Director) broadcastStateDown(ctx context.Context, key string, value json.RawMessage, version uint64) {
 	if d.bus == nil {
 		return
 	}
-	body, err := json.Marshal(scopebus.StatePayload{Key: key, Value: value})
+	// version is the STORE-assigned version d.set returned for THIS write — passed in rather than read
+	// back out of d.versions, so the stamp cannot describe a different write than the value does (#355).
+	// See StatePayload.Version for why it must be the store's counter and never a publisher-side one.
+	body, err := json.Marshal(scopebus.StatePayload{Key: key, Value: value, Version: version})
 	if err != nil {
 		d.log.Warn("director: marshal state broadcast", "key", key, "err", err)
 		return

@@ -288,14 +288,14 @@ func (b *blockingSnapshot) wait(ctx context.Context) {
 	}
 }
 
-func (b *blockingSnapshot) SnapshotWorldState(ctx context.Context) (map[string][]byte, error) {
+func (b *blockingSnapshot) SnapshotWorldState(ctx context.Context) (map[string]ScopeValue, error) {
 	b.wait(ctx)
-	return map[string][]byte{}, nil
+	return map[string]ScopeValue{}, nil
 }
 
-func (b *blockingSnapshot) SnapshotRegionState(ctx context.Context, _ string) (map[string][]byte, error) {
+func (b *blockingSnapshot) SnapshotRegionState(ctx context.Context, _ string) (map[string]ScopeValue, error) {
 	b.wait(ctx)
-	return map[string][]byte{}, nil
+	return map[string]ScopeValue{}, nil
 }
 
 // TestMintRefusedWhenTheDrainStartsMidBuild closes the race the reserve-time refusal alone does not cover.

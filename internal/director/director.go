@@ -353,7 +353,8 @@ func (d *Director) handle(ctx context.Context, m msg) {
 	case getMsg:
 		v.reply <- d.get(ctx, v.key)
 	case setMsg:
-		v.reply <- d.set(ctx, v.key, v.value)
+		_, err := d.set(ctx, v.key, v.value)
+		v.reply <- err
 	case signalMsg:
 		d.handleSignal(ctx, v)
 	default:

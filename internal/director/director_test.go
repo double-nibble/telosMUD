@@ -3,6 +3,7 @@ package director
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -28,6 +29,13 @@ type memEntry struct {
 func newMemStore() *memScopeStore {
 	return &memScopeStore{world: map[string]memEntry{}, region: map[string]map[string]memEntry{}}
 }
+
+// errNullScopeValue mirrors the real schema. world_state.value / region_state.value are JSONB NOT NULL,
+// so Postgres rejects a nil value with a 23502 constraint violation. This double used to accept it and
+// store empty bytes — a fake that was MORE permissive than the thing it stands in for, which is the one
+// direction a test double must never diverge, because it hides the bug instead of surfacing it. A delete
+// is written as the JSON `null` literal, not as a SQL NULL.
+var errNullScopeValue = errors.New("memScopeStore: null value violates the value NOT NULL constraint (mirrors Postgres 23502)")
 
 func casSave(tbl map[string]memEntry, key string, value []byte, expected uint64) (uint64, bool) {
 	e, ok := tbl[key]
@@ -57,6 +65,9 @@ func (m *memScopeStore) LoadWorldState(_ context.Context, key string) ([]byte, u
 }
 
 func (m *memScopeStore) SaveWorldState(_ context.Context, key string, value []byte, expected uint64) (uint64, bool, error) {
+	if value == nil {
+		return 0, false, errNullScopeValue
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	nv, ok := casSave(m.world, key, value, expected)
@@ -78,6 +89,9 @@ func (m *memScopeStore) LoadRegionState(_ context.Context, regionID, key string)
 }
 
 func (m *memScopeStore) SaveRegionState(_ context.Context, regionID, key string, value []byte, expected uint64) (uint64, bool, error) {
+	if value == nil {
+		return 0, false, errNullScopeValue
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.region[regionID] == nil {
