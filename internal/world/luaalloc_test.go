@@ -86,20 +86,21 @@ for i = 1, 64 do t[i] = string.reverse(s) end`},
 local t = {}
 for i = 1, 64 do t[i] = string.upper(s) end`},
 		// gsub's FUNCTION-replacement path, whose per-match output guard is a separate call site from the
-		// others. Sized for FEW, LARGE matches (128 x 8 KiB = 1 MiB per gsub, just under the per-op cap) so
-		// that ~1000 Lua re-entries carry 8 MiB of charge. The obvious shape — many small matches — charges
-		// the same and costs 16x the VM work, which under `-race` runs out the wall clock before the budget.
-		{"string.gsub", `local subject = string.rep("a", 128)
-local chunk = string.rep("x", 8192)
+		// others. Sized for the FEWEST possible Lua re-entries (16 matches x 32 KiB = 512 KiB per gsub, half
+		// the per-op cap; 20 calls carry 10 MiB of charge in 320 callbacks). The obvious shape — many small
+		// matches — charges the same and costs an order of magnitude more VM work, which under `-race` on CI
+		// hardware runs the wall clock out before the budget and fails for the wrong reason.
+		{"string.gsub", `local subject = string.rep("a", 16)
+local chunk = string.rep("x", 32768)
 local t = {}
-for i = 1, 10 do t[i] = string.gsub(subject, "a", function(m) return chunk end) end`},
+for i = 1, 20 do t[i] = string.gsub(subject, "a", function(m) return chunk end) end`},
 	}
 	// A PATIENT deadline for the duration, so that what stops these programs is the allocation budget and not
 	// the wall clock. The wall clock is what stopped every one of them BEFORE #438 — at gigabytes of
 	// allocation, and classified as transient host load — so at the default 5ms several of these cases pass
 	// with the whole change reverted.
 	saved := luaCallDeadline
-	luaCallDeadline = time.Second
+	luaCallDeadline = 5 * time.Second
 	t.Cleanup(func() { luaCallDeadline = saved })
 
 	for _, tc := range cases {

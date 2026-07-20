@@ -100,7 +100,12 @@ for i = 1, 40 do s = s .. s end`
 		if !arm {
 			L.SetStringByteBudget(0)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		// SHORT, and that is about the rest of the suite rather than about this test. The disarmed half
+		// allocates for the entire deadline at multiple GB/s, and leaving that much garbage behind makes the
+		// next test that races the wall clock against an instruction count lose it — which is exactly how
+		// TestABudgetAbortStillFiresUnderTheDefaults started failing on CI. 50ms is still ~100x the armed
+		// figure, so the oracle holds with room to spare.
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
 		L.SetContext(ctx)
 		L.ResetInstructionCount()
@@ -110,6 +115,8 @@ for i = 1, 40 do s = s .. s end`
 		runtime.ReadMemStats(&m0)
 		_ = L.DoString(bomb)
 		runtime.ReadMemStats(&m1)
+		// Hand the garbage back before the next test runs, for the same reason.
+		t.Cleanup(runtime.GC)
 		return float64(m1.TotalAlloc-m0.TotalAlloc) / (1 << 20)
 	}
 
