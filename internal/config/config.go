@@ -121,9 +121,45 @@ type PostgresConfig struct {
 	DSN string `yaml:"dsn"`
 }
 
-// RedisConfig configures the Redis connection (the directory).
+// RedisConfig configures the Redis connection(s).
+//
+// Two addresses, because the engine puts two DIFFERENT KINDS OF STATE in Redis and they want opposite
+// eviction policies (#429):
+//
+//   - COORDINATION state (the directory): zone lease owners and generations, placement epochs, the
+//     director's leader-election lease, shard registrations, instance-template claims. The fleet cannot
+//     re-derive any of it, so losing a key is a WRONG answer rather than a slow one. It wants `noeviction`.
+//     It is also small and bounded — O(zones + shards + online players) of small hashes.
+//   - CACHE state: the checkpoint tier (full character JSON on a 1h TTL — the dominant consumer by volume),
+//     the presence roster, telos-account's device-auth codes. This wants an evicting policy and a ceiling.
+//
+// `maxmemory-policy` is server-wide, so one instance cannot satisfy both, and the policy ends up chosen by
+// whichever tier is loudest. Worse, the safe-for-coordination answer is actively dangerous on a cache-sized
+// instance: `noeviction` with no ceiling never returns OOM to clients, so Redis grows until the container
+// limit and is OOM-KILLED — wiping every lease, generation and epoch at once, which is the very failure the
+// policy was set to prevent.
 type RedisConfig struct {
+	// Addr is the Redis every tier uses unless DirectoryAddr overrides the coordination half.
 	Addr string `yaml:"addr"`
+
+	// DirectoryAddr, when set, points the COORDINATION keyspace at its own instance. Empty means "use Addr",
+	// so an untouched deployment is unchanged.
+	//
+	// Setting it is what lets the eviction check become FATAL rather than advisory: on a shared instance an
+	// operator running `allkeys-lru` may be doing the right thing for the Redis they actually have, and
+	// refusing to boot would order them into the OOM-kill described above. On a dedicated coordination
+	// instance there is no such tradeoff — an evicting policy there is simply wrong — so the host refuses to
+	// start instead of logging and continuing. See directory.CheckEvictionPolicy.
+	DirectoryAddr string `yaml:"directory_addr"`
+}
+
+// DirectoryAddress returns the address the COORDINATION keyspace should use, and whether it is DEDICATED
+// (that is, separate from the cache tiers). The dedicated bit is what the eviction gate keys off.
+func (r RedisConfig) DirectoryAddress() (addr string, dedicated bool) {
+	if r.DirectoryAddr != "" && r.DirectoryAddr != r.Addr {
+		return r.DirectoryAddr, true
+	}
+	return r.Addr, false
 }
 
 // NATSConfig configures the NATS connection (the comms/events bus).
@@ -267,6 +303,9 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_REDIS_ADDR"); ok {
 		c.Redis.Addr = v
+	}
+	if v, ok := os.LookupEnv("TELOS_REDIS_DIRECTORY_ADDR"); ok { // #429 — the coordination keyspace
+		c.Redis.DirectoryAddr = v
 	}
 	if v, ok := os.LookupEnv("TELOS_NATS_URL"); ok {
 		c.NATS.URL = v

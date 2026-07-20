@@ -421,13 +421,44 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			WithAudit(auditSink). // #350: durable audit trail (nil pool => auditing disabled)
 			WithTells(tellJS), nil
 	}
-	dir := directory.NewRedis(rdb, "telos")
-	// #340: the directory is COORDINATION STATE, not cache — report (loudly) if this Redis is configured to
-	// evict it. Deliberately NOT a boot refusal: this same client also serves the checkpoint tier, so
-	// mandating noeviction on it is not unambiguously safe until the two are split. See CheckEvictionPolicy.
+	// #429: the COORDINATION keyspace may live on its own Redis. Empty directory_addr keeps the historical
+	// single-instance shape, so an untouched deployment is unchanged.
+	//
+	// The coordination client is separate from `rdb` ONLY when dedicated — deliberately, rather than always
+	// dialing twice: two clients at the same address would double the connection pool against one server and
+	// make the "is this dedicated?" question a matter of comparing strings later instead of a fact about
+	// which client exists.
+	dirAddr, dirDedicated := cfg.Redis.DirectoryAddress()
+	dirRDB := rdb
+	if dirDedicated {
+		dirRDB = redis.NewClient(&redis.Options{Addr: dirAddr})
+		if err := dirRDB.Ping(ctx).Err(); err != nil {
+			// FATAL, unlike the cache Redis above, which degrades to single-shard mode. A configured-but-
+			// unreachable coordination Redis is not a degraded mode: silently falling back to the cache
+			// instance would put coordination state on an instance the operator has policied for eviction,
+			// which is the exact hazard this split exists to remove.
+			slog.Error("refusing to start: the configured coordination redis is unreachable",
+				"directory_addr", dirAddr, "err", err)
+			os.Exit(1)
+		}
+		defer func() { _ = dirRDB.Close() }()
+		slog.Info("coordination redis is dedicated", "directory_addr", dirAddr, "cache_addr", cfg.Redis.Addr)
+	}
+	dir := directory.NewRedis(dirRDB, "telos")
+	// #340/#429: the directory is COORDINATION STATE, not cache — an eviction policy turns a lost key into a
+	// WRONG answer. Whether this refuses the boot tracks whether the coordination Redis is dedicated: on a
+	// shared instance an evicting policy may be the right call for the Redis the operator actually has, and
+	// refusing would order them into an OOM-kill that wipes the whole directory at once. See EvictionGate.
 	evCtx, evCancel := context.WithTimeout(ctx, 3*time.Second)
-	dir.CheckEvictionPolicy(evCtx)
+	evFinding := dir.CheckEvictionPolicy(evCtx)
 	evCancel()
+	if fatal := directory.EvictionGate(evFinding, dirDedicated); fatal != nil {
+		slog.Error("refusing to start", "err", fatal)
+		os.Exit(1)
+	}
+	// A boot-only check cannot see a later `CONFIG SET`, which is how this misconfiguration is actually
+	// introduced. Warn-only for the life of the process — never a fence; see WatchEvictionPolicy.
+	go dir.WatchEvictionPolicy(ctx)
 	ckpt := checkpoint.NewRedis(rdb, "telos") // ~10s Redis checkpoint tier of the ladder
 	// Cross-shard `who` roster (Phase 8.4): the same Redis the directory uses, namespaced "<ns>:presence:*"
 	// so it never collides with the directory's "<ns>:dir:*". Each shard writes ONLY its own residents

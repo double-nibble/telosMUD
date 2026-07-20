@@ -7,7 +7,33 @@ log_level: info
 postgres:
   dsn: postgres://telos:telos@localhost:5432/telosmud?sslmode=disable
 redis:
+  # The CACHE tier: the checkpoint rung of the durability ladder (full character JSON on a 1h TTL — by far
+  # the largest consumer), the presence roster, and telos-account's device-auth codes. This one wants an
+  # evicting policy AND a `maxmemory` ceiling, sized to the box.
   addr: localhost:6379
+
+  # The COORDINATION tier (#429). Commented out on purpose: leaving it unset keeps the historical single-
+  # instance shape, which is fine for a dev box or a small deployment.
+  #
+  # Setting it points the DIRECTORY keyspace at its own Redis — zone lease owners and generations, placement
+  # epochs, the director's leader-election lease, shard registrations, instance-template claims. None of that
+  # can be re-derived by the fleet, so losing a key is a WRONG answer rather than a slow one. It is also small
+  # and bounded: O(zones + shards + online players) of small hashes.
+  #
+  # Why it is a SEPARATE INSTANCE and not just a DB index: `maxmemory-policy` is server-wide, so one instance
+  # cannot be `noeviction` for coordination and evicting for cache at the same time.
+  #
+  # Set this and telos-world/telos-director REFUSE TO START if that instance has an evicting policy — where
+  # on a shared instance they only warn, because there the safe-looking remedy can be worse than the problem.
+  # On the dedicated instance, set BOTH:
+  #     maxmemory-policy noeviction
+  #     maxmemory <a ceiling with headroom under the container limit>
+  # The ceiling matters: `noeviction` with no ceiling never returns OOM to clients, so Redis grows until the
+  # container kills it — wiping every lease, generation and epoch at once, which is the failure the policy was
+  # set to prevent. Alert on used_memory / maxmemory.
+  #
+  # Env: TELOS_REDIS_DIRECTORY_ADDR
+  # directory_addr: localhost:6380
 nats:
   url: nats://localhost:4222
 
