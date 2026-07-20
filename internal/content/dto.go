@@ -931,6 +931,25 @@ type RoomDTO struct {
 	// the dedicated rooms.coord JSONB column.
 	Coord []int             `json:"coord" yaml:"coord"`
 	Exits map[string]string `json:"exits" yaml:"exits"`
+	// InstanceEntrances are DUNGEON DOORS: direction -> the template ZONE ref a player minting an instance
+	// of it steps into (#435, #72). Separate from Exits, and that separation is the security design rather
+	// than tidiness.
+	//
+	// Making the crossing an ordinary MOVEMENT means the player is the one acting, so mud.send_to_instance's
+	// self-only rule is satisfied structurally — target == the mover, with no third party in the call frame —
+	// and the instance is billed to the mover's own account. The alternative (letting a room's `enter` trigger
+	// send the entrant) would hand content the power to decide WHO gets sent, which is a forced relocation
+	// into unobservable space charged to the victim's cap.
+	//
+	// It is a SEPARATE MAP because every other reader of Exits must not see these: the exit rows carry a
+	// `to_room` foreign key that a zone ref cannot satisfy, and room-and-adjacent AoE, directional flee, GMCP
+	// Room.Info and the Lua handle surface all walk exits and would each acquire a door they must not
+	// traverse. A separate key space also cannot collide with an authored room ref, whereas a sentinel value
+	// inside Exits could be forged (the ref charset permits ':', so a pack can author a zone named
+	// "instance").
+	//
+	// The value is a ZONE ref, never a room ref — the target zone's own start_room decides where you land.
+	InstanceEntrances map[string]string `json:"instance_entrances" yaml:"instance_entrances"`
 	// Flags are open-set named room booleans (docs/ABILITIES.md §1): "safe" (no PvP harm lands here),
 	// "arena" (PvP forced on), etc. The PvP gate (world/pvp.go) reads them; the engine never invents a
 	// flag name. Empty for an unflagged room. Mapped onto Room.namedFlags (world/content_map.go).

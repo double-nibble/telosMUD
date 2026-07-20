@@ -181,12 +181,12 @@ func (p *Pool) LoadDefinition(ctx context.Context, kind, ref, pack string) (cont
 // Definition. The exits are a small second query keyed by the room ref.
 func (p *Pool) loadRoomDefinition(ctx context.Context, ref, pack string) (content.Definition, error) {
 	var r content.RoomDTO
-	var flags []byte
+	var flags, entrances []byte
 	err := p.pool.QueryRow(ctx,
 		`SELECT ref, name, COALESCE(sector, ''), COALESCE(body->>'long', ''),
-		        COALESCE(body->'flags', '[]'::jsonb)
+		        COALESCE(body->'flags', '[]'::jsonb), COALESCE(body->'instance_entrances', '{}'::jsonb)
 		   FROM rooms WHERE ref = $1 AND pack = $2`, ref, pack).
-		Scan(&r.Ref, &r.Name, &r.Sector, &r.Long, &flags)
+		Scan(&r.Ref, &r.Name, &r.Sector, &r.Long, &flags, &entrances)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return content.Definition{Kind: content.KindRoom, Ref: ref, Found: false}, nil
 	}
@@ -196,6 +196,19 @@ func (p *Pool) loadRoomDefinition(ctx context.Context, ref, pack string) (conten
 	if len(flags) > 0 {
 		if err := json.Unmarshal(flags, &r.Flags); err != nil {
 			return content.Definition{}, fmt.Errorf("store: room %s flags: %w", ref, err)
+		}
+	}
+	if len(entrances) > 0 { // #435
+		if err := json.Unmarshal(entrances, &r.InstanceEntrances); err != nil {
+			return content.Definition{}, fmt.Errorf("store: room %s instance entrances: %w", ref, err)
+		}
+		// A room with no doors must come back NIL, not an empty map. The COALESCE above yields '{}', which
+		// unmarshals into a non-nil empty map, and the YAML loader leaves the field nil — so without this the
+		// two load paths represent "no doors" differently and every round-trip parity check fails on a Go
+		// nil-vs-empty distinction that is not a content difference. Same equivalence normalizeContent
+		// documents for room Flags; fixed here so the two paths simply agree.
+		if len(r.InstanceEntrances) == 0 {
+			r.InstanceEntrances = nil
 		}
 	}
 	r.Exits = map[string]string{}
@@ -276,7 +289,8 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 	rooms := map[string]*content.RoomDTO{}
 	rows, err := p.pool.Query(ctx,
 		`SELECT ref, zone_ref, name, COALESCE(sector, ''), COALESCE(body->>'long', ''),
-		        COALESCE(body->'flags', '[]'::jsonb), coord
+		        COALESCE(body->'flags', '[]'::jsonb), coord,
+		        COALESCE(body->'instance_entrances', '{}'::jsonb)
 		   FROM rooms WHERE pack = ANY($1) ORDER BY zone_ref, ref`, enabled)
 	if err != nil {
 		return fmt.Errorf("store: query rooms: %w", err)
@@ -284,8 +298,8 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 	for rows.Next() {
 		var r content.RoomDTO
 		var zoneRef string
-		var flags, coord []byte
-		if err := rows.Scan(&r.Ref, &zoneRef, &r.Name, &r.Sector, &r.Long, &flags, &coord); err != nil {
+		var flags, coord, entrances []byte
+		if err := rows.Scan(&r.Ref, &zoneRef, &r.Name, &r.Sector, &r.Long, &flags, &coord, &entrances); err != nil {
 			rows.Close()
 			return fmt.Errorf("store: scan room: %w", err)
 		}
@@ -299,6 +313,15 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 			if err := json.Unmarshal(coord, &r.Coord); err != nil {
 				rows.Close()
 				return fmt.Errorf("store: room %s coord: %w", r.Ref, err)
+			}
+		}
+		if len(entrances) > 0 { // #435
+			if err := json.Unmarshal(entrances, &r.InstanceEntrances); err != nil {
+				rows.Close()
+				return fmt.Errorf("store: room %s instance entrances: %w", r.Ref, err)
+			}
+			if len(r.InstanceEntrances) == 0 {
+				r.InstanceEntrances = nil // "no doors" is nil on the YAML path; see loadRoomDefinition
 			}
 		}
 		r.Exits = map[string]string{}

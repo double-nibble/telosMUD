@@ -227,6 +227,34 @@ func TestStorePackRoundTrip(t *testing.T) {
 			"true re-opens the uncapped item faucet (a mint runs the zone's boot resets into a private copy) "+
 			"for every zone in content")
 
+	// Room-level MAP (#435): instance_entrances rides the rooms.body JSONB, because an exit row's `to_room`
+	// carries a foreign key into rooms(ref) and an entrance names a ZONE, which could never satisfy it.
+	//
+	// The same field-drop trap as `instanceable` above, and the reason it is asserted BY NAME rather than left
+	// to the whole-struct DeepEqual: this field is written in insertRooms and must be read back in TWO
+	// separate places (loadRoomDefinition for a single ref, loadRooms for a whole pack), and a field missing
+	// from either survives every world test — those load from the YAML tree, not from Postgres. RoomDTO.Lua is
+	// dropped by this very path today, which is what the trap looks like when nobody asserts.
+	//
+	// A dropped entrance is silent and total: the door simply is not there, on any deployment served from the
+	// store rather than the embed, and the player is told "You can't go that way."
+	var dbGuildhall *content.RoomDTO
+	for zi := range fromDB.Zones {
+		for ri := range fromDB.Zones[zi].Rooms {
+			if fromDB.Zones[zi].Rooms[ri].Ref == "midgaard:room:guildhall" {
+				dbGuildhall = &fromDB.Zones[zi].Rooms[ri]
+			}
+		}
+	}
+	require.NotNil(t, dbGuildhall, "the guild hall survived the round trip")
+	assert.Equal(t, "crypt", dbGuildhall.InstanceEntrances["enter"],
+		"round-trip DROPPED rooms.instance_entrances: the door parses from YAML and comes back missing from "+
+			"Postgres, so the dungeon door silently does not exist wherever content is served from the store")
+	assert.NotContains(t, dbGuildhall.Exits, "enter",
+		"the entrance came back as an ordinary EXIT. That is not a cosmetic difference: every mover — hMove "+
+			"from a trigger, directional flee, room-and-adjacent AoE — resolves through exits, so a door in "+
+			"that map can be traversed on another party's initiative")
+
 	// Pack-level scalar (persistence review): DefaultCombat rides pack_meta.default_combat — it is
 	// NEITHER zone content nor one of the six def slices, so neither DeepEqual reaches it. A drop on its
 	// store import/load path is the same top-level-field-drop class this test closes, so pin it directly.

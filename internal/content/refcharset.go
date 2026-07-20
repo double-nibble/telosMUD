@@ -68,6 +68,10 @@ var refNameFields = map[string]bool{
 // movement-match token (#234).
 var refKeyFields = map[string]bool{
 	"RoomDTO.Exits": true, // exit-direction keys (dirCharset)
+	// #435: the same movement-match token and GMCP-adjacent key space as Exits, so it needs the same charset
+	// check — this is precisely the "a future feature routes a map key RAW into a subject or GMCP key" case
+	// this table's doc anticipates.
+	"RoomDTO.InstanceEntrances": true, // entrance-direction keys (dirCharset)
 }
 
 // refListFields are the <StructType>.<Field> []string fields that carry a SET of single-token, EXACT-DISPATCH

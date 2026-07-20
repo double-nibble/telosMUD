@@ -28,6 +28,12 @@ func roomComponents(r content.RoomDTO) componentSet {
 		exits[dir] = ProtoRef(to)
 	}
 	room := &Room{exits: exits, sector: r.Sector, coord: r.Coord}
+	if len(r.InstanceEntrances) > 0 { // #435 — dungeon doors, deliberately NOT merged into exits
+		room.entrances = make(map[string]string, len(r.InstanceEntrances))
+		for dir, tmpl := range r.InstanceEntrances {
+			room.entrances[dir] = tmpl
+		}
+	}
 	if len(r.Flags) > 0 {
 		room.namedFlags = make(map[string]bool, len(r.Flags))
 		for _, f := range r.Flags {

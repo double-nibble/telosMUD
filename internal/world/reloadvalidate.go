@@ -492,6 +492,54 @@ func validateRoomExits(s *reloadScope) []string {
 					problems = append(problems, fmt.Sprintf("room %q: exit %q points to unknown room %q", r.Ref, dir, target))
 				}
 			}
+			problems = append(problems, validateEntrances(r)...)
+		}
+	}
+	return problems
+}
+
+// validateEntrances reports the STRUCTURAL problems with a room's instance entrances (#435) — the ones that
+// are wrong under any combination of packs, so they are the builder's mistake rather than a missing dependency.
+//
+// Deliberately NOT checked here: whether the target zone exists, is `instanceable`, or has a usable start
+// room. Those are real problems, but they are cross-pack: a pack declaring a door into a dungeon shipped by
+// another pack would be unloadable without it, which is the dangling-ref tolerance the loader already extends
+// to exits. MintInstance refuses all three at entry time and the player is told the way fails to open.
+func validateEntrances(r content.RoomDTO) []string {
+	if len(r.InstanceEntrances) == 0 {
+		return nil
+	}
+	dirs := make([]string, 0, len(r.InstanceEntrances))
+	for dir := range r.InstanceEntrances {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs) // map order is random; the readout must be deterministic
+	var problems []string
+	for _, dir := range dirs {
+		target := strings.TrimSpace(r.InstanceEntrances[dir])
+		switch {
+		case target == "":
+			problems = append(problems, fmt.Sprintf("room %q: instance entrance %q has an empty target", r.Ref, dir))
+		case strings.Contains(target, ":"):
+			// A ROOM ref where a ZONE ref belongs. This must be rejected rather than tolerated: parseRef would
+			// silently keep only the leading segment, so `crypt:room:altar` would mint the `crypt` zone and
+			// appear to work — landing the player at the zone's own start room rather than the room named.
+			problems = append(problems, fmt.Sprintf("room %q: instance entrance %q targets %q, which is a ROOM "+
+				"ref; an entrance names a ZONE, and the target zone's own start_room decides where you land",
+				r.Ref, dir, target))
+		case strings.Contains(target, instanceSep):
+			// The instance-id separator. Mirrors validateMintTemplate's check, but at load time and in front
+			// of the builder rather than as a runtime refusal a player sees.
+			problems = append(problems, fmt.Sprintf("room %q: instance entrance %q targets %q, which contains "+
+				"%q — that is the engine's instance-id separator and never appears in an authored ref",
+				r.Ref, dir, target, instanceSep))
+		}
+		if _, clash := r.Exits[dir]; clash {
+			// The two maps share the direction namespace, so an overlap is ambiguous. The move path resolves
+			// exits first, which makes this fail SAFE (toward the ordinary exit) rather than toward minting —
+			// but ambiguous content must not load in the first place.
+			problems = append(problems, fmt.Sprintf("room %q: %q is both an exit and an instance entrance; "+
+				"one direction cannot be both", r.Ref, dir))
 		}
 	}
 	return problems

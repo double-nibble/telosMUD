@@ -515,6 +515,33 @@ func (z *Zone) move(s *session, dir string) bool {
 	from := s.entity.location // the current room entity
 	ref, ok := from.room.exits[dir]
 	if !ok {
+		// An INSTANCE ENTRANCE — a dungeon door (#435). Checked only after the ordinary exits miss, so that
+		// content which somehow declared a direction as both (the loader rejects it) fails toward the exit
+		// rather than toward minting.
+		//
+		// THIS IS THE WHOLE SECURITY DESIGN OF THE FEATURE, so it is worth being explicit about why it is
+		// here and not in a trigger. The crossing is a MOVEMENT the player typed, so the player is the actor:
+		// requestInstanceEntry is reached with the mover as both the invoker and the target, which satisfies
+		// mud.send_to_instance's self-only rule STRUCTURALLY — there is no third party in the call frame to
+		// exclude, and no new gate that could be got wrong. The mint is billed to the mover's own account
+		// rather than to a victim's, which the trigger-based alternative could not have guaranteed.
+		//
+		// It also means no path that moves a player on ANOTHER party's initiative can reach a dungeon door:
+		// hMove, directional flee, and every other mover resolve a direction through `exits`, which does not
+		// contain entrances. IF A FOLLOW MECHANIC IS EVER ADDED it becomes the first path that moves a player
+		// through a direction on someone else's initiative, and it MUST refuse an entrance direction or this
+		// property collapses silently.
+		if tmpl, isDoor := from.room.entrances[dir]; isDoor {
+			// Every refusal — not instanceable, caps, rate limit, no nesting, no verified account, a mint
+			// already pending, a draining shard — is requestInstanceEntry's or the async mint's, and each
+			// already speaks to the player. `true` is the gate decision: the mover IS the invoking actor.
+			z.requestInstanceEntry(s, tmpl, true)
+			// FALSE, deliberately: `move` returns true only when it RELEASED OWNERSHIP of the session. This
+			// released nothing. The player is still standing in this room and stays fully live — the actual
+			// transferOut happens hops later, from instanceReady, on this same goroutine. Returning true
+			// would mark the command as having moved and suppress their prompt until then.
+			return false
+		}
 		z.log.Debug("move blocked: no exit", "player", s.character, "room", from.proto, "dir", dir)
 		s.send(textFrame("You can't go that way."))
 		return false
