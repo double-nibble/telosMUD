@@ -3,6 +3,7 @@ package world
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/double-nibble/telosmud/internal/luasandbox"
 )
@@ -55,21 +56,92 @@ for i = 1, 40 do s = s .. s end`)
 	}
 }
 
-// TestZoneAllocBudgetChargesTheZoneStringBuiltins. The zone has its own copies of the capped amplifier
-// wrappers, so it needs its own charge — the parity test compares constants, not call sites.
+// TestZoneAllocBudgetChargesTheZoneStringBuiltins. The zone has its own copies of every capped wrapper, so it
+// needs its own charge at every one — the parity test compares CONSTANTS, not call sites, so a zone wrapper
+// that forgets to charge is invisible to it.
+//
+// Every case here was a surviving mutation: review deleted each charge in turn and the world suite stayed
+// green, because only string.rep was covered.
 func TestZoneAllocBudgetChargesTheZoneStringBuiltins(t *testing.T) {
-	z := newDemoZone("midgaard", newProtoCache())
-	defer z.lua.close()
-
-	// 4096 x 16 KiB = 64 MiB of individually-legal reps, each 1/64th of the per-op cap.
-	err := z.lua.runChunk("reps", `local t = {}
-for i = 1, 4096 do t[i] = string.rep("x", 16384) end`)
-	if err == nil {
-		t.Fatal("64 MiB of individually-legal string.rep calls completed on a zone runtime; the zone's " +
-			"wrappers do not charge, so a loop of legal operations bypasses the per-call bound")
+	cases := []struct {
+		name string
+		src  string
+	}{
+		// 4096 x 16 KiB = 64 MiB of individually-legal calls, each 1/64th of the per-op cap.
+		{"string.rep", `local t = {}
+for i = 1, 4096 do t[i] = string.rep("x", 16384) end`},
+		{"string.format", `local chunk = string.rep("y", 16384)
+local t = {}
+for i = 1, 4096 do t[i] = string.format("%s", chunk) end`},
+		// The field WIDTH, which was validated against the per-op cap but never charged: a megabyte of
+		// padding from an eleven-byte format string and no string arguments.
+		{"string.format field width", `local t = {}
+for i = 1, 64 do t[i] = string.format("%1000000d", i) end`},
+		// The 1:1 transforms, which sat in the "no amplification" passthrough list and allocated 2 GB in one
+		// call while charging nothing.
+		{"string.reverse", `local s = string.rep("x", 1048576)
+local t = {}
+for i = 1, 64 do t[i] = string.reverse(s) end`},
+		{"string.upper", `local s = string.rep("x", 1048576)
+local t = {}
+for i = 1, 64 do t[i] = string.upper(s) end`},
+		// gsub's FUNCTION-replacement path, whose per-match output guard is a separate call site from the
+		// others. Sized for FEW, LARGE matches (128 x 8 KiB = 1 MiB per gsub, just under the per-op cap) so
+		// that ~1000 Lua re-entries carry 8 MiB of charge. The obvious shape — many small matches — charges
+		// the same and costs 16x the VM work, which under `-race` runs out the wall clock before the budget.
+		{"string.gsub", `local subject = string.rep("a", 128)
+local chunk = string.rep("x", 8192)
+local t = {}
+for i = 1, 10 do t[i] = string.gsub(subject, "a", function(m) return chunk end) end`},
 	}
-	if !strings.Contains(err.Error(), "string allocation budget exceeded") {
-		t.Fatalf("stopped for the wrong reason: %v", err)
+	// A PATIENT deadline for the duration, so that what stops these programs is the allocation budget and not
+	// the wall clock. The wall clock is what stopped every one of them BEFORE #438 — at gigabytes of
+	// allocation, and classified as transient host load — so at the default 5ms several of these cases pass
+	// with the whole change reverted.
+	saved := luaCallDeadline
+	luaCallDeadline = time.Second
+	t.Cleanup(func() { luaCallDeadline = saved })
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			z := newDemoZone("midgaard", newProtoCache())
+			defer z.lua.close()
+
+			err := z.lua.runChunk("bomb", tc.src)
+			if err == nil {
+				t.Fatalf("64 MiB of individually-legal %s calls completed on a zone runtime; this wrapper "+
+					"does not charge, so a loop of legal operations bypasses the per-call bound", tc.name)
+			}
+			if !strings.Contains(err.Error(), "string allocation budget exceeded") {
+				t.Fatalf("stopped for the wrong reason: %v", err)
+			}
+		})
+	}
+}
+
+// TestZoneAllocAbortCostsTheZoneBreaker is the world's twin of the luasandbox breaker test, and it closes a
+// mutation that survived: deleting luaAlloc from luabreaker's weight switch left the ENTIRE world suite green.
+//
+// The switch has no default arm, so an unwired kind adds ZERO to the budget while still incrementing the
+// failure count — and the trip test reads the budget. A script that bombs memory on every single call would
+// therefore never be quarantined. This is the production path; internal/luasandbox's breaker is the
+// director's.
+func TestZoneAllocAbortCostsTheZoneBreaker(t *testing.T) {
+	// A bare runtime is enough: breakerRecord only touches rt.breakers.
+	alloc := &luaRuntime{breakers: map[string]*breakerState{}}
+	budget := &luaRuntime{breakers: map[string]*breakerState{}}
+	for i := 0; i < 4; i++ {
+		alloc.breakerRecord("s", "origin", luaAlloc)
+		budget.breakerRecord("s", "origin", luaBudget)
+	}
+	got, want := alloc.breakers["s"].budget, budget.breakers["s"].budget
+	if got == 0 {
+		t.Fatal("four allocation aborts cost the ZONE breaker nothing. luabreaker's switch has no default " +
+			"arm, so an unwired kind is free: a script bombing memory on every call is never quarantined")
+	}
+	if got != want {
+		t.Fatalf("an allocation abort costs %v where an instruction abort costs %v; both are deterministic "+
+			"and content-pathological and must weigh the same", got, want)
 	}
 }
 

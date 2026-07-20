@@ -22,6 +22,11 @@ func (b *builder) buildCappedStringTable(raw *lua.LTable) *lua.LTable {
 			t.RawSetString(name, fn)
 		}
 	}
+	for _, name := range stringTransforms {
+		if fn := raw.RawGetString(name); fn != lua.LNil {
+			t.RawSetString(name, b.wrapTransform(fn, "string."+name))
+		}
+	}
 	rawFormat := raw.RawGetString("format")
 	rawGsub := raw.RawGetString("gsub")
 	rawFind := raw.RawGetString("find")
@@ -53,8 +58,30 @@ func chargeStrAlloc(l *lua.LState, n int, what string) bool {
 	if l.ChargeStringBytes(int64(n)) {
 		return true
 	}
-	l.RaiseError("%s: string allocation budget exceeded (cap %d bytes per call)", what, StrAllocCap)
+	l.RaiseError("%s: string allocation budget exceeded (cap %d bytes per call). Note that building a string with repeated `..` costs O(n^2) — a 700-line report assembled that way charges megabytes; use table.concat",
+		what, StrAllocCap)
 	return false
+}
+
+// wrapTransform charges the per-call allocation budget for a 1:1 string builtin (lower/upper/reverse/char)
+// and delegates. There is NO per-operation cap, deliberately: the result is the size of the input, which is
+// already bounded by whatever built it, so one call can never be a bomb. The loop is the bomb — the same
+// distinction chargeStrAlloc exists for.
+//
+// The charge is the INPUT length, which for these four equals the output length (`char`'s output is one byte
+// per argument, hence the argument-count fallback). Approximating rather than computing the exact result is
+// fine here and not fine for an amplifier: these cannot be off by more than a constant factor.
+func (b *builder) wrapTransform(raw lua.LValue, what string) *lua.LFunction {
+	return b.L.NewFunction(func(l *lua.LState) int {
+		n := l.GetTop() // string.char: one output byte per argument
+		if s, ok := l.Get(1).(lua.LString); ok {
+			n = len(string(s))
+		}
+		if !chargeStrAlloc(l, n, what) {
+			return 0
+		}
+		return b.callDelegate(l, raw)
+	})
 }
 
 // cappedRep is string.rep with the output-size guard: it rejects an n*#s result over StrByteCap BEFORE the
@@ -88,11 +115,16 @@ func (b *builder) wrapFormat(raw lua.LValue) *lua.LFunction {
 			l.RaiseError("string.format format too large (cap %d bytes)", StrByteCap)
 			return 0
 		}
-		if w := maxFormatWidth(format); w > StrByteCap {
+		width := maxFormatWidth(format)
+		if width > StrByteCap {
 			l.RaiseError("string.format field width too large (cap %d bytes)", StrByteCap)
 			return 0
 		}
-		total := len(format)
+		// The field WIDTH counts toward the charge, not just toward the per-op cap (#438). "%1000000d"
+		// allocates a megabyte from an eleven-byte format string and no arguments, so charging only
+		// len(format) plus the %s argument lengths undercharges it by ~100,000x — enough to make the loop
+		// version a gigabyte-per-call bomb that bills almost nothing.
+		total := len(format) + width
 		for i := 2; i <= l.GetTop(); i++ {
 			if s, ok := l.Get(i).(lua.LString); ok {
 				total += len(string(s))
@@ -279,9 +311,12 @@ func (b *builder) wrapConcat(raw lua.LValue) *lua.LFunction {
 				return 0
 			}
 		}
-		if !chargeStrAlloc(l, total, "table.concat") {
-			return 0
-		}
+		// NOT charged here, deliberately (#438). gopher-lua's tableConcat is implemented ON TOP of the concat
+		// opcode's helper, which the fork already charges — so billing it again here charged table.concat
+		// exactly 2x (measured), halving the effective budget for the very idiom the docs recommend INSTEAD of
+		// the quadratic accumulator. The coupling to the delegate's internals is invisible, so a test asserts
+		// table.concat is charged approximately once; if the delegate ever stops routing through the opcode,
+		// that test fails rather than the bound silently disappearing.
 		return b.callDelegate(l, raw)
 	})
 }

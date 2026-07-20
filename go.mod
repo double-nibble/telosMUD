@@ -28,7 +28,7 @@ require (
 // github.com/double-nibble/gopher-lua — adding a per-call VM instruction-count abort
 // (mainLoopWithContext); upstream has no SetHook/MaskCount. The fork KEEPS the module path
 // `github.com/yuin/gopher-lua`, so imports are unchanged and this is a pure source swap via replace.
-replace github.com/yuin/gopher-lua => github.com/double-nibble/gopher-lua v0.0.0-20260720034816-c697b8073ad4
+replace github.com/yuin/gopher-lua => github.com/double-nibble/gopher-lua v0.0.0-20260720042941-f1c6e7bea870
 
 require (
 	dario.cat/mergo v1.0.0 // indirect

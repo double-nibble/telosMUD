@@ -159,6 +159,176 @@ for i = 1, 4096 do t[i] = table.concat(parts) end`},
 	}
 }
 
+// TestAllocChargeIsLeviedBeforeTheAllocation. The single load-bearing decision in the whole change, and it
+// was UNTESTED until review moved the charge below strings.Join and every test still passed.
+//
+// The doubling bomb cannot detect the ordering: charging after only permits one extra allocation of roughly
+// the size already reached, so 7 MB becomes 7 MB and no ratio gate trips. What detects it is a single CONCAT
+// OPCODE with many operands — Lua compiles `a .. a .. a .. ...` into ONE instruction, so one uninterruptible
+// Join builds the whole result. Charge first and it never runs; charge after and the full result is built and
+// then complained about. Measured: 1.3 MB versus 129 MB for 128 operands.
+func TestAllocChargeIsLeviedBeforeTheAllocation(t *testing.T) {
+	// 128 operands of 1 MiB in ONE expression: 128 MiB from a single opcode, against an 8 MiB budget.
+	var b strings.Builder
+	b.WriteString("local c = string.rep(\"x\", 1048576)\nlocal s = c")
+	for i := 0; i < 127; i++ {
+		b.WriteString(" .. c")
+	}
+
+	L := New(Opts{})
+	defer L.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	L.SetContext(ctx)
+	L.ResetInstructionCount()
+
+	var m0, m1 runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m0)
+	err := L.DoString(b.String())
+	runtime.ReadMemStats(&m1)
+	allocMB := float64(m1.TotalAlloc-m0.TotalAlloc) / (1 << 20)
+
+	if err == nil {
+		t.Fatal("a 128 MiB single-opcode concat completed under an 8 MiB budget")
+	}
+	if got := ClassifyError(err); got != AbortAlloc {
+		t.Fatalf("stopped by %v, not the allocation budget: %v", got, err)
+	}
+	t.Logf("single-opcode concat of 128 x 1 MiB: allocated %.1f MB", allocMB)
+	// The 1 MiB seed itself is charged and allocated, so allow generous headroom above it — but nothing like
+	// the 128 MiB the result would take.
+	if allocMB > 32 {
+		t.Fatalf("the refused concat still allocated %.1f MB. The charge is being levied AFTER strings.Join, "+
+			"so the full result is built and only then complained about — which is the entire failure this "+
+			"budget exists to prevent, since one Join is uninterruptible", allocMB)
+	}
+}
+
+// TestAllocBudgetChargesTheOneToOneTransforms. string.lower/upper/reverse/char amplify nothing but each
+// allocates a whole new string of script-controlled size, and they sat in the "no amplification" passthrough
+// list uncharged until review measured 2 GB in a single call through string.reverse.
+//
+// "Does not multiply its input" and "does not allocate" are different questions; only the second bounds
+// memory. The one that got away also aborted on the DEADLINE, i.e. in the 0.1-weight bucket this change
+// exists to move memory bombs out of.
+func TestAllocBudgetChargesTheOneToOneTransforms(t *testing.T) {
+	for _, name := range stringTransforms {
+		if name == "char" {
+			continue // charges per ARGUMENT; reaching 8 MiB that way is 8M VM ops. See the test below.
+		}
+		t.Run(name, func(t *testing.T) {
+			// 64 iterations over a 1 MiB string = 64 MiB of 1:1 transforms, each single call entirely legal.
+			src := `local s = string.rep("x", 1048576)
+local t = {}
+for i = 1, 64 do t[i] = string.` + name + `(s) end`
+			err := runPatient(t, src)
+			if err == nil {
+				t.Fatalf("64 MiB of string.%s calls completed under an %d-byte per-call budget: this builtin "+
+					"allocates proportional to script-controlled input and charges nothing, so a loop through "+
+					"it is an uncharged memory bomb", name, StrAllocCap)
+			}
+			if got := ClassifyError(err); got != AbortAlloc {
+				t.Fatalf("stopped by %v, not the allocation budget: %v", got, err)
+			}
+		})
+	}
+}
+
+// TestAllocBudgetChargesFormatFieldWidth. `string.format("%1000000d", 1)` allocates a megabyte from an
+// eleven-byte format string and NO string arguments, so a charge summing only len(format) and the %s
+// arguments undercharged it ~100,000x — measured 1.7 GB allocated against 15 KB charged.
+func TestAllocBudgetChargesFormatFieldWidth(t *testing.T) {
+	err := runPatient(t, `local t = {}
+for i = 1, 64 do t[i] = string.format("%1000000d", i) end`)
+	if err == nil {
+		t.Fatalf("64 MiB of field-width padding completed under an %d-byte budget; the width is validated "+
+			"against the per-op cap but never charged, so it is free", StrAllocCap)
+	}
+	if got := ClassifyError(err); got != AbortAlloc {
+		t.Fatalf("stopped by %v, not the allocation budget: %v", got, err)
+	}
+}
+
+// TestTableConcatIsChargedExactlyOnce. table.concat delegates to gopher-lua's tableConcat, which is built on
+// the concat opcode's helper — so the FORK already charges it, and the engine wrapper charging it too billed
+// exactly 2x (measured), halving the effective budget for the idiom the docs recommend INSTEAD of the
+// quadratic accumulator.
+//
+// The engine wrapper's charge was therefore removed, which leaves an invisible coupling to the delegate's
+// internals. This test is what makes it visible: if gopher-lua ever stops routing table.concat through the
+// opcode, the charge silently disappears and this fails rather than the bound quietly going away.
+func TestTableConcatIsChargedExactlyOnce(t *testing.T) {
+	L := New(Opts{})
+	defer L.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	L.SetContext(ctx)
+	L.ResetInstructionCount()
+
+	// Build the parts with string.rep (charged), note the tally, then concat and look at the delta only.
+	if err := L.DoString(`parts = {}
+for i = 1, 64 do parts[i] = string.rep("x", 1024) end`); err != nil {
+		t.Fatal(err)
+	}
+	before := L.StringBytesCharged()
+	if err := L.DoString(`joined = table.concat(parts)`); err != nil {
+		t.Fatal(err)
+	}
+	const result = 64 * 1024
+	charged := L.StringBytesCharged() - before
+
+	if charged == 0 {
+		t.Fatalf("table.concat charged NOTHING for a %d-byte result. The engine wrapper does not charge (by "+
+			"design — the fork's concat opcode does), so if the delegate stopped routing through that opcode "+
+			"the bound has silently disappeared", result)
+	}
+	if charged > 1.5*result {
+		t.Fatalf("table.concat charged %d bytes for a %d-byte result (%.1fx). It is being charged twice — "+
+			"once by the fork's opcode and once by the engine wrapper — which halves the effective budget for "+
+			"the idiom recommended over the quadratic accumulator", charged, result, float64(charged)/result)
+	}
+}
+
+// TestAllocAbortMessageExplainsTheQuadratic. The budget's most surprising property is that `s = s .. chunk`
+// charges O(n^2), so an author refused after building a 34 KB string sees a cap quoted in megabytes and has
+// no way to connect the two. The remedy has to be in the message: they will not read this file.
+func TestAllocAbortMessageExplainsTheQuadratic(t *testing.T) {
+	err := runPatient(t, `local chunk = string.rep("x", 4096)
+local s = ""
+for i = 1, 4096 do s = s .. chunk end`)
+	if err == nil {
+		t.Fatal("the accumulator completed")
+	}
+	if !strings.Contains(err.Error(), "table.concat") {
+		t.Fatalf("the refusal does not name the remedy, so an author who built a 34 KB string and was told "+
+			"about an 8 MB cap has nothing to act on: %v", err)
+	}
+}
+
+// TestAllocBudgetChargesStringChar covers the fourth 1:1 transform, whose charge is its ARGUMENT COUNT rather
+// than an input length — reaching the cap through it would take ~8M VM operations, so this asserts the charge
+// DIRECTLY instead. That is the sharper assertion anyway: it pins the amount billed, not merely that
+// something eventually refused.
+func TestAllocBudgetChargesStringChar(t *testing.T) {
+	rt := NewRuntime(nil, Opts{Rng: rand.New(rand.NewSource(1)), CallDeadlineMS: 1000})
+	t.Cleanup(rt.Close)
+	if err := rt.Compile("t", `local a = {}
+for i = 1, 512 do a[i] = 65 end
+local s = string.char(unpack(a))
+if #s ~= 512 then error("wrong length: " .. #s) end`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.LoadGlobals("t"); err != nil {
+		t.Fatal(err)
+	}
+	// The 512-argument call must have billed ~512 bytes; nothing else in the chunk charges.
+	if got := rt.L.StringBytesCharged(); got < 512 {
+		t.Fatalf("string.char(512 args) charged %d bytes total; it allocates one byte per argument and must "+
+			"charge for them, or a loop through it is an uncharged allocator", got)
+	}
+}
+
 // TestAllocAbortClassifiedAsItsOwnKind. Before #438 the memory bomb allocated for the whole deadline and then
 // tripped it, so it was classified AbortDeadline — weight 0.1, the "probably transient host load, do not
 // punish the script" bucket. It is neither transient nor the host's fault: it reproduces exactly, every run,

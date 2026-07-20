@@ -101,7 +101,26 @@ const (
 	//
 	// Note the charge is against the RESULT size, so the `s = s .. chunk` accumulator idiom is charged O(n^2)
 	// — which is what it genuinely allocates. See the fork's telosmud_strbudget_test.go, which pins that
-	// coefficient because this constant was chosen against it.
+	// coefficient because this constant was chosen against it. In practice that means a naive accumulator can
+	// reach sqrt(2 * cap * chunk): ~600 lines of a typical formatted report before it is refused. The abort
+	// message names table.concat for exactly this reason — the author sees a cap in megabytes after building
+	// tens of kilobytes, and the two only connect if something says so.
+	//
+	// Measured against SHIPPED content rather than assumed: the largest string-builder in the tree is the
+	// overworld minimap display template, which charges ~7 KB — a margin over 1000x.
+	//
+	// WHAT THIS DOES NOT BOUND, stated plainly because the gaps are the interesting part:
+	//   - Table growth. Genuinely O(instructions) at ~140 B/instr, so MaxInstrBudget bounds it (see there).
+	//   - Retention ACROSS calls. This is a per-CALL budget and it resets per call, so a script that stores
+	//     8 MiB into a mob's or room's self.state on every tick is unbounded by anything here. Player state
+	//     is capped at save time (marshalLuaState); mob and room state is not marshalled and so is not.
+	//   - A charge inflated by ANOTHER party's input. The charge depends only on the calling script's own
+	//     operands, which is why this design was chosen over sampling the process heap — but content that
+	//     accumulates a player-supplied string once per observer is quadratic in something a player controls,
+	//     so a long message in a crowded room can push a script over the line. The consequence is bounded:
+	//     the breaker may quarantine that script, and every security-relevant hook fails CLOSED when
+	//     quarantined (the PvP policy returns false, the safe-room veto runs before Lua at all), so this is
+	//     an availability concern and not a gate bypass.
 	StrAllocCap = 8 << 20
 )
 
@@ -113,8 +132,22 @@ var BaseAllowlist = []string{
 	"type", "tostring", "tonumber", "pairs", "ipairs", "unpack",
 }
 
-// stringPassthrough are the string functions with no amplification — copied verbatim from the genuine lib.
-var stringPassthrough = []string{"byte", "char", "len", "lower", "upper", "sub", "reverse"}
+// stringPassthrough are the string functions copied verbatim: they neither amplify NOR allocate a new string
+// proportional to their input. `byte` returns numbers, `len` returns a number, and `sub` shares Go's backing
+// array rather than copying (measured: no allocation).
+//
+// The distinction is deliberately allocation, not amplification (#438). This list previously also held
+// `lower`, `upper`, `reverse` and `char`, justified as "no amplification" — true, and irrelevant: each
+// allocates a whole new string of script-controlled size on every call, so a loop over a legally-built 1 MiB
+// string reached 2 GB in one call while charging nothing. "Does not multiply its input" and "does not
+// allocate" are different questions, and only the second one bounds memory. They are wrapped in
+// stringTransforms below.
+var stringPassthrough = []string{"byte", "len", "sub"}
+
+// stringTransforms are the 1:1 string builtins: they allocate a new string the size of their input (or, for
+// `char`, of its argument count) without amplifying it. Safe per call and unbounded in a loop, so they are
+// copied verbatim except for charging the per-call allocation budget.
+var stringTransforms = []string{"lower", "upper", "reverse", "char"}
 
 // tablePassthrough are the table functions with no amplification (concat is capped separately).
 var tablePassthrough = []string{"insert", "remove", "sort", "getn", "maxn"}
@@ -432,6 +465,7 @@ func GlobalNames() []string {
 // StringNames / TableNames return the members the capped string/table namespaces expose, for the parity test.
 func StringNames() []string {
 	names := append([]string(nil), stringPassthrough...)
+	names = append(names, stringTransforms...)
 	return append(names, "rep", "format", "gsub", "find", "match", "gmatch")
 }
 
