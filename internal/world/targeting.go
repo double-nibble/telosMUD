@@ -196,8 +196,15 @@ func (z *Zone) Resolve(actor *Entity, spec TargetSpec, scopes ...Scope) []*Entit
 		}
 	}
 
-	z.log.Debug("targeting: resolve", "actor", actor.short, "keywords", spec.keywords,
-		"all", spec.all, "index", spec.index, "candidates", len(hits))
+	// spec.keywords is the player-typed target tokens (verbatim input); attach it only under the
+	// opt-in. By default the token COUNT is enough to debug a resolve; the words themselves are not
+	// logged (#454).
+	if z.logRawInput {
+		z.log.Debug("targeting: resolve", "actor", actor.short, "keywords", spec.keywords, "all", spec.all, "index", spec.index, "candidates", len(hits)) // logkey-ok: gated by TELOS_LOG_RAW_INPUT (#454)
+	} else {
+		z.log.Debug("targeting: resolve", "actor", actor.short, "keyword_count", len(spec.keywords),
+			"all", spec.all, "index", spec.index, "candidates", len(hits))
+	}
 	return selectMatches(spec, hits)
 }
 

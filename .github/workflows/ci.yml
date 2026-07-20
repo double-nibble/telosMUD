@@ -28,6 +28,9 @@ jobs:
         with:
           go-version: "1.25"
           cache: true
+      # #454: fail if a sensitive value (raw player input, a credential) is used as a structured-log
+      # key. Cheap, no build needed; runs early so a logging leak fails fast.
+      - run: ./scripts/check-log-keys.sh
       - run: go vet ./...
       # gofmt is not enforced by `go vet`; a dirty file slipped in unnoticed before this check.
       - run: test -z "$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }

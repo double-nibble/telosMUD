@@ -270,12 +270,28 @@ func (z *Zone) dispatch(s *session, line string) {
 			z.sendPrompt(s)
 			return
 		}
-		z.log.Debug("unknown verb", "player", s.character, "verb", lower)
+		// An unknown verb is verbatim player input: when the line is a single token (no whitespace),
+		// `lower` IS that whole token — e.g. a link code or a /login URL pasted one beat late into the
+		// game prompt. This is the exact credential-leak the issue names, so the typed token is attached
+		// only under the opt-in; by default we log its LENGTH, which distinguishes a real typo (short)
+		// from a pasted credential (long) without disclosing it (#454).
+		if z.logRawInput {
+			z.log.Debug("unknown verb", "player", s.character, "verb", lower) // logkey-ok: gated by TELOS_LOG_RAW_INPUT (#454)
+		} else {
+			z.log.Debug("unknown verb", "player", s.character, "verb_len", len(lower))
+		}
 		s.send(textFrame("Huh?"))
 		z.sendPrompt(s)
 		return
 	}
-	z.log.Debug("dispatch", "player", s.character, "verb", lower, "cmd", cmd.Name, "line", line)
+	// verb+cmd is enough to trace dispatch, matching the neighbouring sites above which log verb
+	// only. The raw `line` is verbatim player input (it carries a tell/say/channel body) and is
+	// attached only under the explicit TELOS_LOG_RAW_INPUT opt-in (distinct from DEBUG) — see #454.
+	if z.logRawInput {
+		z.log.Debug("dispatch", "player", s.character, "verb", lower, "cmd", cmd.Name, "line", line) // logkey-ok: gated by TELOS_LOG_RAW_INPUT (#454)
+	} else {
+		z.log.Debug("dispatch", "player", s.character, "verb", lower, "cmd", cmd.Name)
+	}
 
 	ctx := &Context{z: z, s: s, Actor: s.entity, arg: rest}
 	_ = cmd.Run(ctx)
