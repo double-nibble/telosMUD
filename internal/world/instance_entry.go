@@ -539,7 +539,14 @@ func (z *Zone) ejectAllToAnchors(resp chan int) {
 // warning and must not read like one.
 const drainEjectNotice = "The way behind you closes, and you find yourself back where you entered."
 
-// drainEjectBarrier bounds how long BeginDrain waits for ONE instance to finish ejecting its occupants.
+// drainEjectBarrier bounds how long BeginDrain waits for EVERY instance to finish ejecting its occupants. It
+// is ONE SHARED deadline for the whole phase, not a per-instance one — armed once before the collect loop
+// below, which every response selects against.
+//
+// That makes it a real ordering relation with the perShard cap (instance.go's maxInstancesPerShard, which
+// cites this constant): the budget was sized against the default 256, and raising the cap gives the same
+// budget proportionally more work. This comment previously said "ONE instance", which is why that is spelled
+// out here — read the per-instance way, the cap's ceiling looks unjustified and invites someone to raise it.
 //
 // The wait is what makes the eject safe (see claimEjectTarget): the eject window is open only while BeginDrain
 // is blocked here, so a claim can never be taken at an unbounded later time — after step 3 has flushed and
