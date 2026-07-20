@@ -44,6 +44,22 @@ const EventStateSet = "scope.state.set"
 type StatePayload struct {
 	Key   string          `json:"key"`
 	Value json.RawMessage `json:"value,omitempty"`
+	// Version is the STORE-ASSIGNED version this delta was written at — the value the scope-state CAS
+	// returned, not a publisher-side counter (#355). A read-replica keeps the highest version it has
+	// applied per key and drops anything at or below it, so a duplicated or reordered push cannot leave
+	// the replica holding a superseded value.
+	//
+	// It MUST be the store's version. That counter lives in the row and is incremented by the CAS itself,
+	// so it is monotonic per key across a director failover: a promoted leader loads the row and its next
+	// write continues the sequence. A per-director counter would reset to 0 on every failover, and the
+	// fence would then drop every push until it climbed back past what each replica had already seen —
+	// permanently, for a rarely-written key. A fence that drops GOOD pushes is worse than no fence.
+	//
+	// Version == 0 means UNVERSIONED — a publisher that predates this field, as during a rolling deploy.
+	// A consumer must APPLY it and not record a version, exactly as the durable tier treats SeqOK=false
+	// ("cannot dedup" => apply-and-do-not-advance, see DurableEvent). Reading 0 as "oldest" would make a
+	// replica holding any version reject every push from an un-upgraded director.
+	Version uint64 `json:"ver,omitempty"`
 }
 
 // Scope is an addressable event scope. Kind is "world", "region", or "zone"; ID is the region/zone ref

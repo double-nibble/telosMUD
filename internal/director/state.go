@@ -99,7 +99,18 @@ func (d *Director) get(ctx context.Context, key string) getResult {
 // reaches the same end state by a far more common route: the write does not land, handleSignal acks
 // anyway, and the consequence is consumed off the SHARED durable consumer and lost fleet-wide. An ack
 // predicate that only knew about CAS losses would have fixed the rare half of its own defect.
-func (d *Director) set(ctx context.Context, key string, value json.RawMessage) (err error) {
+// It returns the version the store assigned to THIS write, so a caller that broadcasts the change stamps
+// the version of the write it just made rather than re-reading d.versions and trusting a comment to keep
+// the two in step (#355). The map read happened to be correct, but correctness that depends on nobody
+// introducing an intervening write is the kind that quietly stops holding.
+func (d *Director) set(ctx context.Context, key string, value json.RawMessage) (version uint64, err error) {
+	// A nil/empty value means DELETE, and the value column is NOT NULL — Postgres rejects a literal nil
+	// with a 23502 constraint violation, while the in-memory test double happily stored it. That
+	// divergence hid the bug in exactly the direction a fake should never hide one. Normalise to the JSON
+	// null literal, which is what the Lua path already produces and what every reader treats as a delete.
+	if len(value) == 0 {
+		value = json.RawMessage("null")
+	}
 	// Any unsuccessful return records the failure for handleSignal's ack decision. A deferred check keeps
 	// that guarantee STRUCTURAL: a future early-return added to this function inherits it automatically,
 	// rather than depending on whoever adds it remembering to set the flag.
@@ -120,7 +131,7 @@ func (d *Director) set(ctx context.Context, key string, value json.RawMessage) (
 	// on the row, the way characters.owner_epoch fences character ownership — because a version CAS is a
 	// lost-update DETECTOR, not an ownership fence. That is a schema change and its own piece of work.
 	if !d.leader.Load() {
-		return ErrNotLeader
+		return 0, ErrNotLeader
 	}
 	// Seed the version on a CACHE MISS before CASing (#354). d.versions[key] is 0 for any key this process
 	// has never read, and the store's CAS predicate (`WHERE version = $expected`) REJECTS 0 against an
@@ -135,7 +146,7 @@ func (d *Director) set(ctx context.Context, key string, value json.RawMessage) (
 	if _, cached := d.versions[key]; !cached {
 		val, ver, found, lerr := d.load(ctx, key)
 		if lerr != nil {
-			return lerr
+			return 0, lerr
 		}
 		if found {
 			d.state[key] = val
@@ -144,24 +155,24 @@ func (d *Director) set(ctx context.Context, key string, value json.RawMessage) (
 	}
 	newVer, ok, err := d.save(ctx, key, value, d.versions[key])
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !ok {
 		// Lost the CAS — another writer moved the version. Reload so the cache is correct, then surface
 		// the conflict; the single-writer invariant means this only happens during a failover race.
 		val, ver, found, lerr := d.load(ctx, key)
 		if lerr != nil {
-			return lerr
+			return 0, lerr
 		}
 		if found {
 			d.state[key] = val
 			d.versions[key] = ver
 		}
-		return errCASLost
+		return 0, errCASLost
 	}
 	d.state[key] = value
 	d.versions[key] = newVer
-	return nil
+	return newVer, nil
 }
 
 // load / save dispatch to the world- or region-scoped store methods by this director's scope.

@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"testing"
 
 	"github.com/double-nibble/telosmud/internal/commbus"
@@ -16,12 +17,12 @@ type fakeScopeSnapshot struct {
 	region map[string]map[string][]byte
 }
 
-func (f fakeScopeSnapshot) SnapshotWorldState(context.Context) (map[string][]byte, error) {
-	return f.world, nil
+func (f fakeScopeSnapshot) SnapshotWorldState(context.Context) (map[string]ScopeValue, error) {
+	return asScopeValues(f.world), nil
 }
 
-func (f fakeScopeSnapshot) SnapshotRegionState(_ context.Context, regionID string) (map[string][]byte, error) {
-	return f.region[regionID], nil
+func (f fakeScopeSnapshot) SnapshotRegionState(_ context.Context, regionID string) (map[string]ScopeValue, error) {
+	return asScopeValues(f.region[regionID]), nil
 }
 
 // TestApplyScopeSeed pins the seed apply: a full snapshot replaces the zone's replica for its scope (dropping
@@ -102,4 +103,20 @@ func TestSeedFromSnapshotSeedsHostedZone(t *testing.T) {
 	if string(z.scopes.region["mood"]) != `"tense"` {
 		t.Fatalf("region state not seeded on join: %v", z.scopes.region)
 	}
+}
+
+// asScopeValues wraps a plain key->bytes fixture as the versioned snapshot shape the store returns
+// (#355). Versions start at 1 and ascend by insertion-independent key order, which is enough for the
+// seed-fence tests: what matters is that the versions are non-zero and distinct, not their exact values.
+func asScopeValues(in map[string][]byte) map[string]ScopeValue {
+	out := make(map[string]ScopeValue, len(in))
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i, k := range keys {
+		out[k] = ScopeValue{Value: in[k], Version: uint64(i + 1)}
+	}
+	return out
 }

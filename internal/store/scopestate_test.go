@@ -132,13 +132,19 @@ func TestSnapshotScopeState(t *testing.T) {
 	// The value column is JSONB, so Postgres re-serializes ({"a":1} -> {"a": 1}); compare as JSON.
 	require.Contains(t, world, wk1)
 	require.Contains(t, world, wk2)
-	assert.JSONEq(t, `{"a":1}`, string(world[wk1]))
-	assert.JSONEq(t, `true`, string(world[wk2]))
+	assert.JSONEq(t, `{"a":1}`, string(world[wk1].Value))
+	assert.JSONEq(t, `true`, string(world[wk2].Value))
+	// The snapshot must carry the row VERSION, not just the value (#355): it is what lets a seeding zone
+	// replica keep its delta fence across the seed instead of resetting it at exactly the boot /
+	// drain-adoption moment the fence exists to cover.
+	assert.NotZero(t, world[wk1].Version, "a snapshot row must carry its CAS version")
+	assert.NotZero(t, world[wk2].Version)
 
 	reg, err := p.SnapshotRegionState(ctx, region)
 	if err != nil {
 		t.Fatal(err)
 	}
 	require.Len(t, reg, 1)
-	assert.JSONEq(t, `"tense"`, string(reg[rk]))
+	assert.JSONEq(t, `"tense"`, string(reg[rk].Value))
+	assert.NotZero(t, reg[rk].Version, "a region snapshot row must carry its CAS version too")
 }

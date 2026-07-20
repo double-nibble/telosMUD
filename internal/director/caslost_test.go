@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/contentbus"
+	"github.com/double-nibble/telosmud/internal/scopebus"
 )
 
 // caslost_test.go — #354: a signal whose scope-state write LOST the optimistic CAS must NAK for
@@ -58,7 +61,7 @@ func TestSetSeedsVersionOnCacheMiss(t *testing.T) {
 
 	// A fresh director — a restart — blind-writes the key without ever reading it.
 	d := leaderDirector(st)
-	require.NoError(t, d.set(ctx, "last_boss", json.RawMessage(`"vexis"`)),
+	requireSetOK(ctx, t, d, "last_boss", json.RawMessage(`"vexis"`),
 		"a blind write from a restarted director must not report a CAS loss: there is no other writer")
 
 	got, ver, found, err := st.LoadWorldState(ctx, "last_boss")
@@ -79,7 +82,7 @@ func TestHandleSignalNAKsOnCASLoss(t *testing.T) {
 	})
 
 	// Prime this director's cache at version 1, then let a CONCURRENT writer move the row to version 2.
-	require.NoError(t, d.set(ctx, "phase", json.RawMessage(`1`)))
+	requireSetOK(ctx, t, d, "phase", json.RawMessage(`1`))
 	_, ok, err := st.SaveWorldState(ctx, "phase", []byte(`99`), 1)
 	require.NoError(t, err)
 	require.True(t, ok, "the concurrent write must land, or there is no CAS loss to observe")
@@ -111,7 +114,7 @@ func TestNAKedSignalConvergesOnRedelivery(t *testing.T) {
 		_ = api.Set("kills", json.RawMessage(strconv.Itoa(n+1)))
 	})
 
-	require.NoError(t, d.set(ctx, "kills", json.RawMessage(`0`)))
+	requireSetOK(ctx, t, d, "kills", json.RawMessage(`0`))
 	// A concurrent writer jumps the count to 10 and the version to 2.
 	_, ok, err := st.SaveWorldState(ctx, "kills", []byte(`10`), 1)
 	require.NoError(t, err)
@@ -150,7 +153,7 @@ func TestPcallCannotHideCASLoss(t *testing.T) {
 	`)
 	require.NotNil(t, d.handler, "the world script must have compiled and wired a handler")
 
-	require.NoError(t, d.set(ctx, "phase", json.RawMessage(`1`)))
+	requireSetOK(ctx, t, d, "phase", json.RawMessage(`1`))
 	_, ok, err := st.SaveWorldState(ctx, "phase", []byte(`99`), 1)
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -175,7 +178,7 @@ func TestCASLossThroughComposedScheduleHandler(t *testing.T) {
 	// Compose the scheduler OUTERMOST, as production does. A non-boss.died event falls through to prev.
 	d.WithSchedules([]Schedule{{Ref: "gorlak", Proto: "p", Zone: "z", Interval: time.Hour}})
 
-	require.NoError(t, d.set(ctx, "phase", json.RawMessage(`1`)))
+	requireSetOK(ctx, t, d, "phase", json.RawMessage(`1`))
 	_, ok, err := st.SaveWorldState(ctx, "phase", []byte(`99`), 1)
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -198,7 +201,7 @@ func TestCASLossFlagDoesNotLeakAcrossSignals(t *testing.T) {
 		}
 	})
 
-	require.NoError(t, d.set(ctx, "phase", json.RawMessage(`1`)))
+	requireSetOK(ctx, t, d, "phase", json.RawMessage(`1`))
 	_, ok, err := st.SaveWorldState(ctx, "phase", []byte(`99`), 1)
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -283,7 +286,7 @@ func TestBossDeathRescheduleDoesNotClaimAFailedWrite(t *testing.T) {
 	d.WithSchedules([]Schedule{{Ref: "gorlak", Proto: "p", Zone: "z", Interval: time.Hour}})
 
 	// Prime the key in the director's cache, then move it underneath so the reschedule write loses.
-	require.NoError(t, d.set(ctx, scheduleKey("gorlak"), json.RawMessage(`{"active":true}`)))
+	requireSetOK(ctx, t, d, scheduleKey("gorlak"), json.RawMessage(`{"active":true}`))
 	_, ver, _, err := st.LoadWorldState(ctx, scheduleKey("gorlak"))
 	require.NoError(t, err)
 	_, ok, err := st.SaveWorldState(ctx, scheduleKey("gorlak"), []byte(`{"active":true}`), ver)
@@ -316,7 +319,7 @@ func TestBossDeathRescheduleLogsTheFailureNotSuccess(t *testing.T) {
 	d.WithSchedules([]Schedule{{Ref: "gorlak", Proto: "p", Zone: "z", Interval: time.Hour}})
 
 	// Prime the key in the director's cache, then move it underneath so the reschedule write loses.
-	require.NoError(t, d.set(ctx, scheduleKey("gorlak"), json.RawMessage(`{"active":true}`)))
+	requireSetOK(ctx, t, d, scheduleKey("gorlak"), json.RawMessage(`{"active":true}`))
 	_, ver, _, err := st.LoadWorldState(ctx, scheduleKey("gorlak"))
 	require.NoError(t, err)
 	_, moved, err := st.SaveWorldState(ctx, scheduleKey("gorlak"), []byte(`{"active":true}`), ver)
@@ -437,10 +440,10 @@ func TestSetRefusesAWriteFromANonLeader(t *testing.T) {
 	ctx := context.Background()
 	st := newMemStore()
 	d := leaderDirector(st)
-	require.NoError(t, d.set(ctx, "phase", json.RawMessage(`1`)), "a leader's write must land")
+	requireSetOK(ctx, t, d, "phase", json.RawMessage(`1`), "a leader's write must land")
 
 	d.leader.Store(false) // the lease lapsed
-	err := d.set(ctx, "phase", json.RawMessage(`2`))
+	err := setErr(ctx, d, "phase", json.RawMessage(`2`))
 	assert.ErrorIs(t, err, ErrNotLeader, "a non-leader must be refused at the write path")
 
 	got, _, _, lerr := st.LoadWorldState(ctx, "phase")
@@ -467,4 +470,108 @@ func TestMidHandlerDemotionNAKsRatherThanWriting(t *testing.T) {
 	_, _, found, err := st.LoadWorldState(ctx, "phase")
 	require.NoError(t, err)
 	assert.False(t, found, "and the demoted director's write must never have landed")
+}
+
+// --- #355 Part B: the DOWN broadcast carries the STORE-assigned version ---------------------------
+
+// TestBroadcastStateDownCarriesTheStoreVersion pins producer/fence agreement. The version is asserted
+// against what the STORE's CAS actually returned, never a literal — if the two could drift, the replica
+// fence would be silently fencing on the wrong number.
+func TestBroadcastStateDownCarriesTheStoreVersion(t *testing.T) {
+	ctx := context.Background()
+	mb := commbus.NewMemBus()
+	st := newMemStore()
+	dirBus := scopebus.New(mb)
+
+	var mu sync.Mutex
+	var got []scopebus.StatePayload
+	sub, err := dirBus.Subscribe(scopebus.World(), func(event string, payload json.RawMessage, _ string) {
+		if event != scopebus.EventStateSet {
+			return
+		}
+		var p scopebus.StatePayload
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return
+		}
+		mu.Lock()
+		got = append(got, p)
+		mu.Unlock()
+	})
+	require.NoError(t, err)
+	defer func() { _ = sub.Unsubscribe() }()
+
+	d := leaderDirector(st).WithScopeBus(dirBus, "world-director-1")
+	api := &API{d: d, ctx: ctx}
+	require.NoError(t, api.Set("war", json.RawMessage(`"active"`)))
+	require.NoError(t, api.Set("war", json.RawMessage(`"ended"`)))
+
+	_, storeVer, found, err := st.LoadWorldState(ctx, "war")
+	require.NoError(t, err)
+	require.True(t, found)
+
+	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == 2 },
+		time.Second, 5*time.Millisecond, "both state deltas must be broadcast down")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, storeVer, got[1].Version,
+		"the broadcast version must be the version the store's CAS assigned, not a publisher-side counter")
+	assert.Greater(t, got[1].Version, got[0].Version, "successive writes must carry increasing versions")
+}
+
+// TestBroadcastVersionContinuesAcrossARestart is the failover-monotonicity guard, and it is the test that
+// fails loudly if anyone ever swaps the store version for a per-director counter. A promoted leader (here,
+// a fresh Director over the same store) must CONTINUE the sequence — a counter restarting at 1 would be
+// fenced out by every replica holding a higher version, permanently for a rarely-written key.
+func TestBroadcastVersionContinuesAcrossARestart(t *testing.T) {
+	ctx := context.Background()
+	mb := commbus.NewMemBus()
+	st := newMemStore()
+
+	var mu sync.Mutex
+	var versions []uint64
+	sub, err := scopebus.New(mb).Subscribe(scopebus.World(), func(event string, payload json.RawMessage, _ string) {
+		if event != scopebus.EventStateSet {
+			return
+		}
+		var p scopebus.StatePayload
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return
+		}
+		mu.Lock()
+		versions = append(versions, p.Version)
+		mu.Unlock()
+	})
+	require.NoError(t, err)
+	defer func() { _ = sub.Unsubscribe() }()
+
+	// The original leader writes the key twice.
+	d1 := leaderDirector(st).WithScopeBus(scopebus.New(mb), "world-director-1")
+	api1 := &API{d: d1, ctx: ctx}
+	require.NoError(t, api1.Set("war", json.RawMessage(`"a"`)))
+	require.NoError(t, api1.Set("war", json.RawMessage(`"b"`)))
+
+	// The promoted leader: a FRESH director over the same store, with an empty version cache.
+	d2 := leaderDirector(st).WithScopeBus(scopebus.New(mb), "world-director-2")
+	api2 := &API{d: d2, ctx: ctx}
+	require.NoError(t, api2.Set("war", json.RawMessage(`"c"`)))
+
+	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(versions) == 3 },
+		time.Second, 5*time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []uint64{1, 2, 3}, versions,
+		"the promoted leader must continue the store's sequence, not restart its own counter")
+}
+
+// requireSetOK / setErr adapt d.set's two-value form (it returns the store version since #355) for tests
+// that only care whether the write landed.
+func requireSetOK(ctx context.Context, t *testing.T, d *Director, key string, value json.RawMessage, msgAndArgs ...any) {
+	t.Helper()
+	_, err := d.set(ctx, key, value)
+	require.NoError(t, err, msgAndArgs...)
+}
+
+func setErr(ctx context.Context, d *Director, key string, value json.RawMessage) error {
+	_, err := d.set(ctx, key, value)
+	return err
 }

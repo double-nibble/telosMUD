@@ -36,14 +36,23 @@ type scopeReplica struct {
 	world    map[string]json.RawMessage
 	region   map[string]json.RawMessage
 	regionID string
+	// worldVer / regionVer are the highest STORE version applied per key (#355), the fence that makes a
+	// duplicated or reordered delta harmless. A key absent here has no recorded version and the next
+	// delta for it is applied unconditionally — which is required, not merely permissive: a seeded
+	// replica has values but no versions, and rejecting the unknown case would freeze every zone at its
+	// seed forever.
+	worldVer  map[string]uint64
+	regionVer map[string]uint64
 }
 
 // newScopeReplica builds an empty replica (no region). A shard adopting the zone into a region sets
 // regionID via WithScopeBus; until a director broadcasts, both maps are empty (every read returns nil).
 func newScopeReplica() *scopeReplica {
 	return &scopeReplica{
-		world:  map[string]json.RawMessage{},
-		region: map[string]json.RawMessage{},
+		world:     map[string]json.RawMessage{},
+		region:    map[string]json.RawMessage{},
+		worldVer:  map[string]uint64{},
+		regionVer: map[string]uint64{},
 	}
 }
 
@@ -54,6 +63,8 @@ type scopeDeltaMsg struct {
 	kind  string
 	key   string
 	value json.RawMessage // nil => delete the key
+	// version is the store version this delta was written at; 0 means an unversioned publisher (#355).
+	version uint64
 }
 
 func (scopeDeltaMsg) zoneMsg() {}
@@ -65,6 +76,11 @@ func (scopeDeltaMsg) zoneMsg() {}
 type scopeSeedMsg struct {
 	kind  string // "world" or "region"
 	state map[string]json.RawMessage
+	// versions are the store row versions for the seeded keys, so the replica's delta fence survives the
+	// seed instead of resetting to empty (#355). A seed built without them (a test double, or a store
+	// that could not supply them) leaves the fence unset for those keys, which is the SAFE direction:
+	// unfenced means "apply the next delta", never "freeze this key".
+	versions map[string]uint64
 }
 
 func (scopeSeedMsg) zoneMsg() {}
@@ -72,6 +88,12 @@ func (scopeSeedMsg) zoneMsg() {}
 // applyScopeSeed replaces this zone's replica for the seed's scope with the authoritative store snapshot.
 // Runs on the zone goroutine, BEFORE any live delta (the seed is posted before the subscription activates),
 // so it is the base state subsequent deltas build on. A region seed for a region-less zone is ignored.
+//
+// It RESETS the delta version fence (#355) along with the values it replaces. The snapshot carries no
+// versions, so any version this replica had recorded describes a value the seed has just overwritten —
+// keeping it would fence out valid subsequent pushes at lower versions and freeze those keys until they
+// happened to exceed a version from the replica's previous life. The map must be replaced, not merged,
+// for the same reason the value map is.
 func (z *Zone) applyScopeSeed(m scopeSeedMsg) {
 	ns := make(map[string]json.RawMessage, len(m.state))
 	for k, v := range m.state {
@@ -79,14 +101,20 @@ func (z *Zone) applyScopeSeed(m scopeSeedMsg) {
 			ns[k] = v
 		}
 	}
+	nv := make(map[string]uint64, len(m.versions))
+	for k, v := range m.versions {
+		if v > 0 {
+			nv[k] = v
+		}
+	}
 	switch m.kind {
 	case "world":
-		z.scopes.world = ns
+		z.scopes.world, z.scopes.worldVer = ns, nv
 	case "region":
 		if z.scopes.regionID == "" {
 			return
 		}
-		z.scopes.region = ns
+		z.scopes.region, z.scopes.regionVer = ns, nv
 	}
 }
 
@@ -114,18 +142,36 @@ func (z *Zone) fireScopeEvent(m scopeEventMsg) {
 // applyScopeDelta updates this zone's replica from a director broadcast. Runs on the zone goroutine. A
 // delta for a scope this zone does not track (a region delta on a region-less zone) is ignored — the
 // shard subscription only routes a region's deltas to its member zones, but this is a defensive backstop.
+// It also FENCES a stale delta (#355): a duplicated or reordered push at a version at or below the one
+// already applied for that key is dropped, so the replica can never end up holding a superseded value.
+// This matters more than it looks: world.flag / region:get read the LOCAL replica only — there is no
+// read-through to the director anywhere — so a replica left holding the wrong value stays wrong until the
+// next write of that key or a full reseed. A sticky "war active" is exactly that failure.
 func (z *Zone) applyScopeDelta(m scopeDeltaMsg) {
 	var tgt map[string]json.RawMessage
+	var vers map[string]uint64
 	switch m.kind {
 	case "world":
-		tgt = z.scopes.world
+		tgt, vers = z.scopes.world, z.scopes.worldVer
 	case "region":
 		if z.scopes.regionID == "" {
 			return
 		}
-		tgt = z.scopes.region
+		tgt, vers = z.scopes.region, z.scopes.regionVer
 	default:
 		return
+	}
+	// An UNVERSIONED delta (version 0 — a publisher predating the field, e.g. mid-rolling-deploy) is
+	// applied and records nothing. Treating 0 as "oldest" would make a replica that has recorded any
+	// version reject every push from an un-upgraded director. Same rule the durable tier applies to
+	// SeqOK=false: cannot fence => apply, do not advance.
+	if m.version > 0 {
+		if applied, seen := vers[m.key]; seen && m.version <= applied {
+			return
+		}
+		// Recorded for BOTH a set and a delete. A delete that did not record its version would let a
+		// reordered older set resurrect the deleted key.
+		vers[m.key] = m.version
 	}
 	if len(m.value) == 0 || string(m.value) == "null" {
 		delete(tgt, m.key)
@@ -157,13 +203,25 @@ type scopeReplication struct {
 	snapshot ScopeSnapshotSource
 }
 
+// ScopeValue is one scope-state row as a snapshot returns it: the stored bytes plus the row's CAS
+// version. The version is what carries a seeding replica's delta fence ACROSS the seed (#355) — without
+// it a seeded replica has values but no versions, so every key is unfenced until its next delta, which is
+// precisely the boot / drain-adoption window the fence exists to cover.
+//
+// It lives in this package, not in the store, for the same reason ScopeSnapshotSource does: the
+// dependency runs store -> world, so the consumer owns the shape and the store implements it.
+type ScopeValue struct {
+	Value   []byte
+	Version uint64
+}
+
 // ScopeSnapshotSource reads the full current world/region scope state, so a joining zone can seed its
 // read-replica rather than start empty and miss a delta broadcast while it was down (#44). Satisfied by
 // *store.Pool; nil disables snapshot-on-join. It lives here as an interface so the world package stays free
 // of the store dependency, mirroring MailReaper / ContentPuller in the director.
 type ScopeSnapshotSource interface {
-	SnapshotWorldState(ctx context.Context) (map[string][]byte, error)
-	SnapshotRegionState(ctx context.Context, regionID string) (map[string][]byte, error)
+	SnapshotWorldState(ctx context.Context) (map[string]ScopeValue, error)
+	SnapshotRegionState(ctx context.Context, regionID string) (map[string]ScopeValue, error)
 }
 
 // scopeSignalJob is one queued signal-UP (a zone commanding its region/world director). The event name +
@@ -252,9 +310,9 @@ func (sr *scopeReplication) seedFromSnapshot() {
 	if raw, err := sr.snapshot.SnapshotWorldState(ctx); err != nil {
 		sr.log.Warn("world state snapshot failed; zones start without seeded world state", "err", err)
 	} else {
-		seed := toRawMap(raw)
+		seed, seedVer := toRawMap(raw), toVerMap(raw)
 		for _, z := range sr.shard.zonesList() {
-			z.post(scopeSeedMsg{kind: "world", state: seed})
+			z.post(scopeSeedMsg{kind: "world", state: seed, versions: seedVer})
 		}
 	}
 
@@ -276,23 +334,33 @@ func (sr *scopeReplication) seedFromSnapshot() {
 			sr.log.Warn("region state snapshot failed; zones start without seeded region state", "region", regionID, "err", err)
 			continue
 		}
-		seed := toRawMap(raw)
+		seed, seedVer := toRawMap(raw), toVerMap(raw)
 		for zoneID, rID := range zoneRegion {
 			if rID != regionID {
 				continue
 			}
 			if z := sr.shard.zoneByID(zoneID); z != nil {
-				z.post(scopeSeedMsg{kind: "region", state: seed})
+				z.post(scopeSeedMsg{kind: "region", state: seed, versions: seedVer})
 			}
 		}
 	}
 }
 
-// toRawMap converts a store snapshot ([]byte values) to the replica's json.RawMessage form.
-func toRawMap(in map[string][]byte) map[string]json.RawMessage {
+// toVerMap extracts the row versions from a store snapshot, so the seed carries the replica's delta
+// fence (#355) rather than clearing it at exactly the boot/adoption moment the fence is for.
+func toVerMap(in map[string]ScopeValue) map[string]uint64 {
+	out := make(map[string]uint64, len(in))
+	for k, v := range in {
+		out[k] = v.Version
+	}
+	return out
+}
+
+// toRawMap converts a store snapshot to the replica's json.RawMessage form.
+func toRawMap(in map[string]ScopeValue) map[string]json.RawMessage {
 	out := make(map[string]json.RawMessage, len(in))
 	for k, v := range in {
-		out[k] = json.RawMessage(v)
+		out[k] = json.RawMessage(v.Value)
 	}
 	return out
 }
@@ -386,12 +454,13 @@ func (sr *scopeReplication) seedZone(ctx context.Context, z *Zone) {
 	// Region first: its staleness window is the one we can afford to widen.
 	regionID := sr.resolveRegionOnce(z)
 	var regionSeed map[string]json.RawMessage
+	var regionSeedVer map[string]uint64
 	if regionID != "" {
 		if raw, err := sr.snapshot.SnapshotRegionState(ctx, regionID); err != nil {
 			sr.log.Warn("region state snapshot failed; adopted zone starts without seeded region state",
 				"zone", z.id, "region", regionID, "err", err)
 		} else {
-			regionSeed = toRawMap(raw)
+			regionSeed, regionSeedVer = toRawMap(raw), toVerMap(raw)
 		}
 	}
 
@@ -401,10 +470,10 @@ func (sr *scopeReplication) seedZone(ctx context.Context, z *Zone) {
 		sr.log.Warn("world state snapshot failed; adopted zone starts without seeded world state",
 			"zone", z.id, "err", err)
 	} else {
-		z.post(scopeSeedMsg{kind: "world", state: toRawMap(raw)})
+		z.post(scopeSeedMsg{kind: "world", state: toRawMap(raw), versions: toVerMap(raw)})
 	}
 	if regionSeed != nil {
-		z.post(scopeSeedMsg{kind: "region", state: regionSeed})
+		z.post(scopeSeedMsg{kind: "region", state: regionSeed, versions: regionSeedVer})
 	}
 }
 
@@ -530,7 +599,7 @@ func (sr *scopeReplication) onScopeEvent(kind, regionID, event string, payload j
 			sr.log.Debug("dropping malformed scope state delta", "kind", kind, "event", event)
 			return
 		}
-		m = scopeDeltaMsg{kind: kind, key: p.Key, value: p.Value}
+		m = scopeDeltaMsg{kind: kind, key: p.Key, value: p.Value, version: p.Version}
 		// A STATE delta reaches EVERY zone including instances: an instance reads world/region state exactly
 		// like its template (regionFor resolves its region by template for the same reason). Pass "" so the
 		// instance filter below never withholds one — state is the read direction, and reads are allowed.
