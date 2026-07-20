@@ -166,6 +166,12 @@ type luaRuntime struct {
 	// goroutine only.
 	spawnThisCall int
 
+	// logsThisCall is the per-CALL builder-log line count (#456): print + mud.log lines emitted in the
+	// CURRENT entry-point call, reset at the chokepoint alongside spawnThisCall. Over
+	// luasandbox.MaxLogsPerCall the next log call raises a flood error, aborting the invocation and
+	// feeding the breaker so a script that floods every call is quarantined. Zone goroutine only.
+	logsThisCall int
+
 	// chunkGen is the runtime's current chunk generation — the hot-reload drop seam a mud.after
 	// timer captures at scheduling time so a callback bound to a swapped chunk is dropped on
 	// fire (mirrors the zone-gen handle guard). Wired but NEVER bumped until slice 7.7. Zone
@@ -891,12 +897,15 @@ func (rt *luaRuntime) luaMathRandom(L *lua.LState) int {
 // space (Lua print semantics) and logs at info. The full mud.log with levels lands in 7.3b;
 // here it proves the redirect and the bare-engine log path.
 func (rt *luaRuntime) luaPrint(L *lua.LState) int {
+	rt.noteLuaLog(L) // length/rate bound (#456) — may abort the invocation over the per-call cap
 	n := L.GetTop()
 	parts := make([]string, 0, n)
 	for i := 1; i <= n; i++ {
 		parts = append(parts, L.ToStringMeta(L.Get(i)).String())
 	}
-	rt.log.Info("lua print", "msg", strings.Join(parts, " "))
+	// source=builder_lua labels content-authored output so ops can route/filter it separately from
+	// engine logs (short retention) rather than have it crowd the engine stream; msg is length-capped (#456).
+	rt.log.Info("lua print", "source", "builder_lua", "msg", luasandbox.CapLogMsg(strings.Join(parts, " ")))
 	return 0
 }
 

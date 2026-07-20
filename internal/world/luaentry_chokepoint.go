@@ -85,6 +85,7 @@ func (rt *luaRuntime) pcallGuarded(scriptKey, origin string, nargs, nret int) er
 		L.SetContext(ctx)
 		L.ResetInstructionCount()
 		rt.resetSpawnBudget()
+		rt.logsThisCall = 0 // reset the per-call builder-log budget alongside the instruction/spawn budgets (#456)
 		defer L.RemoveContext()
 	}
 

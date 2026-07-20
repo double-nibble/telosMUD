@@ -33,6 +33,11 @@ type Runtime struct {
 	// Per-runtime rather than package-global so a host can tune it without changing it for every other
 	// sandbox in the process.
 	callDeadline time.Duration
+
+	// logsThisCall counts builder log lines (print / director.log) emitted in the CURRENT top-level
+	// invocation. Reset at the chokepoint (call), incremented by noteLogLine; over MaxLogsPerCall the
+	// next log call raises LogFloodError, aborting the invocation and feeding the breaker (#456).
+	logsThisCall int
 }
 
 // NewRuntime builds a Runtime over a fresh sandboxed LState. printTarget, if non-empty, routes the script's
@@ -55,15 +60,30 @@ func NewRuntime(log *slog.Logger, opts Opts) *Runtime {
 	// built before the state exists); override it now with a structured-log redirect. The globals table
 	// itself is not read-only (only the string/table/math proxies are), so SetGlobal is permitted.
 	rt.L.SetGlobal("print", rt.L.NewFunction(func(l *lua.LState) int {
+		rt.NoteLogLine(l) // length/rate bound (#456) — may abort the invocation over the per-call cap
 		n := l.GetTop()
 		parts := make([]string, 0, n)
 		for i := 1; i <= n; i++ {
 			parts = append(parts, l.ToStringMeta(l.Get(i)).String())
 		}
-		rt.log.Info("lua print", "msg", strings.Join(parts, " "))
+		// source=builder_lua labels content-authored output so ops can route/filter it independently
+		// of engine logs (short retention), rather than have it crowd the engine's stream (#456).
+		rt.log.Info("lua print", "source", "builder_lua", "msg", CapLogMsg(strings.Join(parts, " ")))
 		return 0
 	}))
 	return rt
+}
+
+// NoteLogLine accounts one builder log line against the per-call budget and, over MaxLogsPerCall,
+// raises LogFloodError — which unwinds through PCall and is classified/weighted by the breaker (a
+// script that floods every call is quarantined). Call it BEFORE emitting, so the (cap+1)th line
+// aborts rather than being written. Exported so a host that registers its OWN log builtin into this
+// runtime (the director's director.log) shares the same per-call budget as the built-in print (#456).
+func (rt *Runtime) NoteLogLine(L *lua.LState) {
+	rt.logsThisCall++
+	if rt.logsThisCall > MaxLogsPerCall {
+		L.RaiseError("%s", LogFloodError().Error())
+	}
 }
 
 // Close tears down the VM.
@@ -165,6 +185,7 @@ func (rt *Runtime) call(breakerKey, origin string, nargs, nret int) error {
 	defer cancel()
 	L.SetContext(ctx)
 	L.ResetInstructionCount()
+	rt.logsThisCall = 0 // reset the per-call builder-log budget alongside the instruction budget (#456)
 	// Deferred disarm (matches the zone chokepoint): if a Go panic escapes PCall, the context is still
 	// cleared so a since-cancelled context is never left armed on the shared LState.
 	defer L.RemoveContext()

@@ -354,9 +354,15 @@ func (ld *luaDirector) luaBroadcast(L *lua.LState) int {
 	return 0
 }
 
-// luaLog: director.log(msg) — a structured info log (the director's print-with-context).
+// luaLog: director.log(msg) — a structured info log (the director's print-with-context). Length- and
+// rate-bounded (#456): the message is clamped to MaxLogMsgBytes, the call is accounted against the
+// runtime's per-call log budget (over the cap it aborts + feeds the breaker), and it is labelled
+// source=builder_lua so ops can route content output separately from engine logs. The director is a
+// single process with a wider blast radius than a per-zone VM, so bounding it matters as much here.
 func (ld *luaDirector) luaLog(L *lua.LState) int {
-	ld.log.Info("director script", "msg", L.CheckString(1))
+	msg := luasandbox.CapLogMsg(L.CheckString(1))
+	ld.rt.NoteLogLine(L) // may abort over the per-call cap
+	ld.log.Info("director script", "source", "builder_lua", "msg", msg)
 	return 0
 }
 
