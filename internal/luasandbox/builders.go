@@ -39,6 +39,24 @@ func (b *builder) buildCappedStringTable(raw *lua.LTable) *lua.LTable {
 	return t
 }
 
+// chargeStrAlloc bills n bytes of about-to-be-built string against the CALL's cumulative allocation budget
+// (#438), raising the same error the fork's concat charge raises when the call has spent it.
+//
+// The per-operation StrByteCap checks each wrapper already performs are a different bound and both are
+// needed. StrByteCap stops ONE operation being a bomb; it says nothing about ten thousand legal ones, so
+// `for i=1,10000 do t[i] = string.rep("x", 1048576) end` is 10 GB of individually-permitted allocations. This
+// is what makes the budget a per-CALL bound rather than a per-op one.
+//
+// Charged BEFORE the allocation, like every other guard here — charging after would bill for memory already
+// taken.
+func chargeStrAlloc(l *lua.LState, n int, what string) bool {
+	if l.ChargeStringBytes(int64(n)) {
+		return true
+	}
+	l.RaiseError("%s: string allocation budget exceeded (cap %d bytes per call)", what, StrAllocCap)
+	return false
+}
+
 // cappedRep is string.rep with the output-size guard: it rejects an n*#s result over StrByteCap BEFORE the
 // underlying allocation, so string.rep("A", 2e9) is a clean error, not a multi-GB allocation.
 func (b *builder) cappedRep(L *lua.LState) int {
@@ -50,6 +68,9 @@ func (b *builder) cappedRep(L *lua.LState) int {
 	}
 	if n > StrByteCap/len(s) { // len(s)*n can overflow int; check via division
 		L.RaiseError("string.rep result too large (cap %d bytes)", StrByteCap)
+		return 0
+	}
+	if !chargeStrAlloc(L, len(s)*n, "string.rep") {
 		return 0
 	}
 	L.Push(lua.LString(strings.Repeat(s, n)))
@@ -80,6 +101,9 @@ func (b *builder) wrapFormat(raw lua.LValue) *lua.LFunction {
 					return 0
 				}
 			}
+		}
+		if !chargeStrAlloc(l, total, "string.format") {
+			return 0
 		}
 		return b.callDelegate(l, raw)
 	})
@@ -148,6 +172,11 @@ func (b *builder) outputGuardedFunc(produce func(l *lua.LState) lua.LValue) *lua
 		}
 		if total > StrByteCap {
 			l.RaiseError("string.gsub result too large (cap %d bytes)", StrByteCap)
+			return 0
+		}
+		// Charged per MATCH rather than per gsub call: `total` above is this gsub's running sum, so billing it
+		// would re-charge every earlier match on each new one.
+		if s, ok := v.(lua.LString); ok && !chargeStrAlloc(l, len(string(s)), "string.gsub") {
 			return 0
 		}
 		l.Push(v)
@@ -249,6 +278,9 @@ func (b *builder) wrapConcat(raw lua.LValue) *lua.LFunction {
 				l.RaiseError("table.concat result too large (cap %d bytes)", StrByteCap)
 				return 0
 			}
+		}
+		if !chargeStrAlloc(l, total, "table.concat") {
+			return 0
 		}
 		return b.callDelegate(l, raw)
 	})

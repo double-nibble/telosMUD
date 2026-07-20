@@ -114,7 +114,12 @@ func (rt *luaRuntime) breakerRecord(key, origin string, kind luaAbortKind) {
 		return
 	case luaLogicErr:
 		b.budget += breakerWeightLogic
-	case luaBudget:
+	case luaBudget, luaAlloc:
+		// The allocation abort shares the instruction abort's weight, and it is grouped here rather than
+		// given a case of its own to make that deliberate: both are deterministic and content-pathological —
+		// they reproduce every run from the script's own operands. It must NOT get the deadline's 0.1: a
+		// memory bomb allocates for the whole deadline and then trips it, so before #438 the most dangerous
+		// thing a script could do was weighted as "probably the host was busy".
 		b.budget += breakerWeightBudget
 	case luaDeadline:
 		b.budget += breakerWeightDeadline

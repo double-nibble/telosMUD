@@ -36,6 +36,7 @@ const (
 	luaRegistryMaxSize = luasandbox.RegistryMaxSize // T4 — value-stack ceiling
 	luaStrByteCap      = luasandbox.StrByteCap      // T13 — amplifier OUTPUT byte cap
 	luaPatternInputCap = luasandbox.PatternInputCap // T13 — pattern INPUT byte cap
+	luaStrAllocCap     = luasandbox.StrAllocCap     // #438 — per-call cumulative string-allocation budget
 )
 
 // The two OPERATOR-TUNABLE Lua caps (#368). Defaults are the shared luasandbox values, so an untouched
@@ -88,6 +89,20 @@ func SetLuaCaps(instrBudget, callDeadlineMS int) error {
 	luaCallDeadline = time.Duration(luasandbox.ClampCallDeadlineMS(callDeadlineMS)) * time.Millisecond
 	slog.Info("lua sandbox caps", "instr_budget", luaInstrBudget, "call_deadline", luaCallDeadline)
 	return nil
+}
+
+// chargeLuaStrAlloc bills n bytes of about-to-be-built string against the CALL's cumulative string-allocation
+// budget (#438). The zone's twin of luasandbox.chargeStrAlloc; the parity test cross-checks the behavior.
+//
+// The per-operation luaStrByteCap checks the wrappers already perform are a DIFFERENT bound, and both are
+// needed: StrByteCap stops one operation being a bomb and says nothing about ten thousand legal ones, so
+// `for i=1,10000 do t[i] = string.rep("x", 1048576) end` is 10 GB of individually-permitted allocations.
+func chargeLuaStrAlloc(L *lua.LState, n int, what string) bool {
+	if L.ChargeStringBytes(int64(n)) {
+		return true
+	}
+	L.RaiseError("%s: string allocation budget exceeded (cap %d bytes per call)", what, luaStrAllocCap)
+	return false
 }
 
 // luaRuntime is a zone's Lua VM plus the engine-owned state the sandbox depends on. It is
@@ -431,6 +446,10 @@ func (rt *luaRuntime) installSandbox() {
 	// Arm the default per-call budgets (T3/T4). The per-call re-arm chokepoint is slice 7.5;
 	// arming once here makes the abort path live and testable now.
 	L.SetInstructionBudget(luaInstrBudget)
+	// The MEMORY half of the same layer (#438) — the zone's twin of the luasandbox arming site. The
+	// instruction budget above does not bound it: `..` is one VM opcode, so a doubling concat reaches
+	// gigabytes inside any instruction budget.
+	L.SetStringByteBudget(luaStrAllocCap)
 	L.ResetInstructionCount()
 }
 
@@ -528,6 +547,9 @@ func (rt *luaRuntime) cappedRep(L *lua.LState) int {
 		L.RaiseError("string.rep result too large (cap %d bytes)", luaStrByteCap)
 		return 0
 	}
+	if !chargeLuaStrAlloc(L, len(s)*n, "string.rep") {
+		return 0
+	}
 	L.Push(lua.LString(strings.Repeat(s, n)))
 	return 1
 }
@@ -565,6 +587,9 @@ func (rt *luaRuntime) wrapFormat(raw lua.LValue) *lua.LFunction {
 					return 0
 				}
 			}
+		}
+		if !chargeLuaStrAlloc(l, total, "string.format") {
+			return 0
 		}
 		return rt.callDelegate(l, raw)
 	})
@@ -653,6 +678,11 @@ func (rt *luaRuntime) outputGuardedFunc(produce func(l *lua.LState) lua.LValue) 
 		}
 		if total > luaStrByteCap {
 			l.RaiseError("string.gsub result too large (cap %d bytes)", luaStrByteCap)
+			return 0
+		}
+		// Charged per MATCH: `total` is this gsub's running sum, so billing it would re-charge every
+		// earlier match on each new one.
+		if sv, ok := v.(lua.LString); ok && !chargeLuaStrAlloc(l, len(string(sv)), "string.gsub") {
 			return 0
 		}
 		l.Push(v)
@@ -766,6 +796,9 @@ func (rt *luaRuntime) wrapConcat(raw lua.LValue) *lua.LFunction {
 				l.RaiseError("table.concat result too large (cap %d bytes)", luaStrByteCap)
 				return 0
 			}
+		}
+		if !chargeLuaStrAlloc(l, total, "table.concat") {
+			return 0
 		}
 		return rt.callDelegate(l, raw)
 	})

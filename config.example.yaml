@@ -41,7 +41,9 @@ tunables:
   # Raising the budget therefore costs wall clock, and wall clock is the real budget: the deadline must stay
   # under the 250ms zone pulse (telos-world refuses otherwise), because a call that outlives a pulse stops
   # combat rounds and affect ticks landing for every player in that zone. Consider also that instructions
-  # allocate — a table-building loop reaches hundreds of MB per call at the top of the range.
+  # allocate: with the string amplifiers separately capped (#438), a call's table growth is roughly linear in
+  # instructions at ~140 bytes each, so this ceiling buys ~1.4 GB of table growth per concurrent call and the
+  # 100000 default buys ~14 MB. Raising the budget is therefore buying memory as well as time.
   #
   # Raise it if legitimate content is aborting with "instruction budget exceeded"; that message names the
   # script, so check the script is not accidentally unbounded before raising the ceiling for everyone.

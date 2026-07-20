@@ -162,6 +162,7 @@ func TestSandboxCapConstantsShared(t *testing.T) {
 	}{
 		{"StrByteCap", luaStrByteCap, luasandbox.StrByteCap},
 		{"PatternInputCap", luaPatternInputCap, luasandbox.PatternInputCap},
+		{"StrAllocCap", luaStrAllocCap, luasandbox.StrAllocCap},
 		{"InstrBudget", luaInstrBudget, luasandbox.InstrBudget},
 		{"CallStackSize", luaCallStackSize, luasandbox.CallStackSize},
 		{"RegistrySize", luaRegistrySize, luasandbox.RegistrySize},

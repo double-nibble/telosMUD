@@ -63,7 +63,12 @@ func (br *breaker) record(log *slog.Logger, key, origin string, kind AbortKind) 
 		return
 	case AbortLogic:
 		s.budget += breakerWeightLogic
-	case AbortBudget:
+	case AbortBudget, AbortAlloc:
+		// Grouped, not given a case of its own, so the shared weight is visibly deliberate: both are
+		// deterministic and content-pathological, reproducing every run from the script's own operands. The
+		// allocation abort must NOT inherit the deadline's 0.1 — a memory bomb allocates for the whole
+		// deadline and then trips it, so before #438 the most dangerous thing a script could do was weighted
+		// as "probably the host was busy" (see ClassifyError's ordering).
 		s.budget += breakerWeightBudget
 	case AbortDeadline:
 		s.budget += breakerWeightDeadline

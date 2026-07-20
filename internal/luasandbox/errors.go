@@ -16,6 +16,7 @@ const (
 	AbortOK       AbortKind = iota // no error
 	AbortLogic                     // a deterministic Lua error (a content bug)
 	AbortBudget                    // the instruction-count abort (deterministic, content-pathological)
+	AbortAlloc                     // the string-allocation abort (deterministic, content-pathological)
 	AbortDeadline                  // the wall-clock deadline (transient — weighted lightly)
 )
 
@@ -30,6 +31,13 @@ func ClassifyError(err error) AbortKind {
 	switch {
 	case strings.Contains(msg, "instruction budget exceeded"):
 		return AbortBudget
+	// Checked BEFORE the deadline case, and that ordering is the whole point of having a separate kind
+	// (#438). A memory bomb allocates for the entire deadline and then trips it, so before this existed the
+	// single most dangerous thing a script could do was classified AbortDeadline and weighted 0.1 — the
+	// "probably transient host load, do not punish the script" bucket. It is neither transient nor the
+	// host's fault: it reproduces exactly, every run, from the script's own operands.
+	case strings.Contains(msg, "string allocation budget exceeded"):
+		return AbortAlloc
 	case strings.Contains(msg, context.DeadlineExceeded.Error()):
 		return AbortDeadline
 	default:

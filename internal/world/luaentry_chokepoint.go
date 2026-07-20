@@ -30,6 +30,7 @@ const (
 	luaOK       luaAbortKind = iota // no error
 	luaLogicErr                     // a deterministic Lua error (a content bug)
 	luaBudget                       // the instruction-count abort (deterministic, content-pathological)
+	luaAlloc                        // the string-allocation abort (deterministic, content-pathological)
 	luaDeadline                     // the wall-clock deadline (transient — weighted lightly)
 )
 
@@ -42,6 +43,8 @@ func classifyLuaError(err error) luaAbortKind {
 		return luaOK
 	case luasandbox.AbortBudget:
 		return luaBudget
+	case luasandbox.AbortAlloc:
+		return luaAlloc
 	case luasandbox.AbortDeadline:
 		return luaDeadline
 	default:
