@@ -74,6 +74,21 @@ type Director struct {
 	applied  map[string]uint64
 	consumer commbus.Consumer
 
+	// writeFailed records that a d.set did NOT land during the CURRENT handleSignal apply window (#354) —
+	// a lost CAS, a store error, or a write refused because this director no longer leads the scope.
+	// handleSignal arms it before dispatch and inspects it after, NAKing the signal rather than acking a
+	// consequence that never happened. Actor-goroutine only (like state/versions), so no lock.
+	//
+	// It is a DIRECTOR field rather than a SignalHandler return value or an *API flag, for three reasons
+	// no return-value design can match:
+	//   - a script's `pcall(function() director.set(k,v) end)` SWALLOWS the Lua error luaSet raises, so
+	//     any outcome derived from error propagation is invisible through content;
+	//   - WithSchedules composes handlers as closures that discard returns, so every present and future
+	//     wrapper would have to remember to propagate it;
+	//   - the only production Go writer, saveScheduleState, calls d.set DIRECTLY and never holds an *API
+	//     at all — an API-scoped flag would miss the one path that wedges a boss permanently.
+	writeFailed bool
+
 	// Scheduled spawns (Phase 12.4). schedules are the loaded boss schedules this director owns; the tick
 	// drives them (spawn-when-due, broadcast DOWN) and the boss.died signal reschedules. now is the clock
 	// seam (time.Now in prod; a test injects a fixed/advancing clock to drive the schedule deterministically).

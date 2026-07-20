@@ -93,7 +93,18 @@ func (d *Director) onBossDied(api *API, payload json.RawMessage) {
 	}
 	for _, s := range d.schedules {
 		if s.Ref == bd.Ref {
-			d.saveScheduleState(api.ctx, s.Ref, AfterDeath(s, d.now()))
+			if !d.saveScheduleState(api.ctx, s.Ref, AfterDeath(s, d.now())) {
+				// Do NOT claim a reschedule that did not persist. A failed write leaves the row Active,
+				// which makes IsDue false forever and ApplyMissed skip it on restart — the boss never
+				// respawns again. The old unconditional Info line reported success for exactly that
+				// permanent wedge, making the only operator-visible artifact of the bug a lie.
+				//
+				// On a CAS loss the write is also recoverable now: d.set recorded it, so handleSignal
+				// NAKs this signal and the redelivery re-runs the reschedule against fresh state (#354).
+				d.log.Warn("scheduler: boss death reschedule did NOT persist; the schedule stays active "+
+					"until a redelivery or the next tick reconciles it", "schedule", s.Ref)
+				return
+			}
 			d.log.Info("scheduler: scheduled boss died; rescheduled", "schedule", s.Ref, "next_in", s.Interval)
 			return
 		}
@@ -114,17 +125,32 @@ func (d *Director) loadScheduleState(ctx context.Context, ref string) ScheduleSt
 	return st
 }
 
-// saveScheduleState persists a schedule's ScheduleState to scope state (versioned CAS via d.set). A CAS
-// loss is logged and dropped — the next tick re-reads + retries. Actor goroutine.
-func (d *Director) saveScheduleState(ctx context.Context, ref string, st ScheduleState) {
+// saveScheduleState persists a schedule's ScheduleState to scope state (versioned CAS via d.set) and
+// reports whether the write LANDED. Actor goroutine.
+//
+// The bool is not decoration: the caller cannot infer success from anything else, and a dropped write here
+// is not the benign "retry next tick" the old comment claimed. AfterSpawn persists Active:true, and an
+// active schedule is skipped by IsDue AND left alone by ApplyMissed on restart — so a lost write there
+// wedges that boss's respawn permanently, across restarts.
+//
+// Only onBossDied consumes the result today, because only it can act on the answer: its caller is a
+// SIGNAL, so a failure NAKs and the redelivery re-runs the reschedule (#354). The two runSchedules call
+// sites deliberately do NOT branch on it — they run on the TICK, which has no redelivery to fall back on,
+// and the pre-existing broadcast-then-persist ordering there means a lost persist re-broadcasts a spawn
+// next tick (a double spawn) rather than losing one. Correcting that needs a spawn-ordering change with
+// its own failure analysis, not a bool check; the failure is at least no longer silent, since this logs
+// a Warn on every dropped write.
+func (d *Director) saveScheduleState(ctx context.Context, ref string, st ScheduleState) bool {
 	body, err := json.Marshal(st)
 	if err != nil {
 		d.log.Warn("scheduler: marshal schedule state", "schedule", ref, "err", err)
-		return
+		return false
 	}
 	if err := d.set(ctx, scheduleKey(ref), body); err != nil {
-		d.log.Debug("scheduler: persist schedule state failed (will retry next tick)", "schedule", ref, "err", err)
+		d.log.Warn("scheduler: persist schedule state failed", "schedule", ref, "err", err)
+		return false
 	}
+	return true
 }
 
 func scheduleKey(ref string) string { return "schedule:" + ref }
