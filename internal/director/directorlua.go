@@ -247,7 +247,9 @@ func (d *Director) withScript(key, script string) *Director {
 	}
 	ld, err := newLuaDirector(d.log, key, script)
 	if err != nil {
-		d.log.Error("director script compile failed; this scope runs without orchestration", "script", key, "err", err)
+		// #456: cap the builder-controlled parser error (a huge string-literal / identifier makes the fork
+		// echo the token verbatim) so a compile failure can't write a source-size line to the ops log.
+		d.log.Error("director script compile failed; this scope runs without orchestration", "script", key, "err", luasandbox.CapLogMsg(err.Error()))
 		return d
 	}
 	d.log.Info("director script loaded; orchestration active", "script", key)

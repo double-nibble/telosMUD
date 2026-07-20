@@ -71,6 +71,24 @@ func TestLuaErrorMessageCapped(t *testing.T) {
 	}
 }
 
+// TestLuaCompileErrorCapped: a COMPILE error is builder-controllable to source size (gopher-lua echoes
+// the offending token — here two adjacent huge identifiers). The compile-failure ops log must be
+// length-capped too, not just the runtime-error path (#456 review follow-up).
+func TestLuaCompileErrorCapped(t *testing.T) {
+	z := newZone("compilecap")
+	rt := z.lua
+	buf := captureRuntimeLog(rt)
+	// Two adjacent huge identifiers => a syntax error whose message echoes the token verbatim.
+	bad := strings.Repeat("z", 150000) + " " + strings.Repeat("z", 150000)
+	_, err := rt.compileChunk("formula:badcompile", bad)
+	if err == nil {
+		t.Fatal("precondition: the source must fail to compile")
+	}
+	if n := strings.Count(buf.String(), "z"); n > luasandbox.MaxLogMsgBytes+64 {
+		t.Fatalf("compile error not capped: %d 'z's reached the log (cap %d)", n, luasandbox.MaxLogMsgBytes)
+	}
+}
+
 // lualog_bound_test.go — #456. Builder-authored Lua logging (print / mud.log) is LENGTH-capped,
 // RATE-limited per call (over the cap the invocation aborts and feeds the breaker), and LABELLED
 // source=builder_lua so ops can route it apart from engine logs.
