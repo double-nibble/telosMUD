@@ -203,9 +203,15 @@ func TestDirectorSignalIdempotent(t *testing.T) {
 
 // captureDirector builds a director whose logger writes into buf (Info+), so a test can assert what the
 // director recorded. No scope bus / Run needed — handleSignal is driven directly.
+//
+// It is already the LEADER: Run is what stores leader=true for a claimer-less director (director.go), and
+// these tests bypass Run — so without the explicit store every one of them would trip the #354 non-leader
+// NAK gate and assert against a requeue instead of the behavior it means to pin.
 func captureDirector(buf *bytes.Buffer) *Director {
 	log := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	return New("", newMemStore(), log)
+	d := New("", newMemStore(), log)
+	d.leader.Store(true)
+	return d
 }
 
 func auditSignal(t *testing.T, key string, a contentbus.ReloadAudit) signalMsg {
@@ -272,6 +278,7 @@ func TestDirectorSeqlessSignalAppliesUnconditionally(t *testing.T) {
 				calls++
 			}
 		})
+	d.leader.Store(true) // handleSignal is driven directly, bypassing Run's leader store (#354)
 
 	mk := func() signalMsg {
 		return signalMsg{event: "boss_slain", seq: 0, seqOK: false, source: "shard-1", ack: make(chan bool, 1)}

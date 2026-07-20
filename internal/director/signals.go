@@ -164,6 +164,20 @@ func (d *Director) handleSignal(ctx context.Context, m signalMsg) {
 		m.ack <- true // already applied this session — idempotently suppressed
 		return
 	}
+	// LEADER GATE (#354), and the ordering against the dedup check above is deliberate: dedup FIRST. An
+	// event this director already applied must ack even after demotion — NAKing it would hand the promoted
+	// leader work that is already done, re-running the handler and re-firing its down-broadcasts.
+	//
+	// Past that, a non-leader must not apply. syncScopeSubscription only re-evaluates leadership after a
+	// campaign (every leaseTTL/3), and a signalMsg already sitting in the inbox is drained AFTER demotion
+	// either way — so a consume-then-demote handoff is reachable, exactly the boundary handlePullRequest
+	// already defends below. NAK so the durable stream redelivers to the live leader, and leave the
+	// high-water alone: the event is unhandled here, not applied-once.
+	if !d.leader.Load() {
+		d.log.Info("director: not leader; requeueing signal for the live leader", "event", m.event, "source", m.source)
+		m.ack <- false
+		return
+	}
 	// Native content-reload AUDIT (#192 S3): record who/what/when for every fleet content change, deduped
 	// apply-once by the high-water above. Independent of the content SignalHandler — audit is an operational
 	// concern the director owns, so it holds even when no director-script is wired. A content handler (if
@@ -182,8 +196,46 @@ func (d *Director) handleSignal(ctx context.Context, m signalMsg) {
 			return
 		}
 	}
+	// Arm the failed-write record for this apply window (#354). Cleared here rather than after the check so
+	// a failure from the TICK path (runSchedules -> saveScheduleState) can never leak into the next
+	// signal's ack decision — the flag means "THIS signal's application lost a write", nothing broader.
+	d.writeFailed = false
 	if d.handler != nil {
 		d.handler(&API{d: d, ctx: ctx}, m.event, m.payload)
+	}
+	if d.writeFailed {
+		// A scope-state write this signal caused did not land. Acking here would consume the event off the
+		// SHARED durable consumer, so the consequence is lost FLEET-WIDE — the live leader never re-sees
+		// it. NAK instead, and do not advance the high-water.
+		//
+		// WHAT A REDELIVERY ACTUALLY BUYS, stated precisely, because the obvious claim is wrong. It is
+		// tempting to say the retry "re-reads and recomputes" and therefore always converges. That holds
+		// only for a handler that READS. The world_script contract (directorlua.go) tells authors to write
+		// DERIVED values and avoid read-modify-write, and a blind derived write re-pushes byte-identically
+		// what the CAS just rejected — so for the contract's own recommended shape, the retry is a retry of
+		// the WRITE, not of the computation.
+		//
+		// That is safe only because of what bounds it, so the bound is the load-bearing part:
+		//   - the leader gate above refuses a redelivery to a director that has observed its demotion, and
+		//   - d.set refuses a write from a non-leader outright.
+		// What neither closes is the lag in OBSERVING demotion: d.leader only refreshes on a campaign
+		// (leaseTTL/3), so for that window a just-demoted director still believes it leads and its retry
+		// can beat the promoted leader's value. Fully closing it needs an ownership fence carried into the
+		// CAS predicate (a lease epoch on the row, as characters.owner_epoch does for characters); a
+		// version CAS detects a lost update but cannot tell WHO was entitled to win.
+		//
+		// Bounded by transport at the far end: MaxDeliver=10 over NakBackoff (~164s), so a genuine failover
+		// has ample room to complete and a persistent dual-writer PARKS the message — visible via the #311
+		// advisory — rather than spinning or vanishing silently. Parking is strictly better than the
+		// ack-and-drop this replaces: the event stays in the stream and an operator is told.
+		//
+		// COST, stated plainly: a handler that did several sets and failed on a later one REPLAYS the
+		// earlier ones on redelivery, and a director.broadcast re-fires. That is the same at-least-once
+		// replay a crash-before-ack already produces, but this path makes it more frequent than a crash.
+		d.log.Warn("director: scope-state write failed applying signal; NAK for redelivery to the live leader",
+			"event", m.event, "source", m.source)
+		m.ack <- false
+		return
 	}
 	if hasSeq && seq > d.applied[m.source] {
 		d.applied[m.source] = seq
@@ -232,6 +284,11 @@ func (d *Director) handlePullRequest(ctx context.Context, payload json.RawMessag
 		return true // no puller wired (a state-only / region director) — drop-and-ack; coordinated pulls disabled
 	}
 	if !d.leader.Load() {
+		// Belt and braces since #354 added the leader gate at the top of handleSignal, which strictly
+		// dominates this check — so in production this branch is now unreachable. It is kept because
+		// handlePullRequest's contract is stated in terms of its OWN leader check (see the doc comment),
+		// and a caller reaching it by another route must still be refused.
+		//
 		// A standby must not import. NAK so the durable stream redelivers to the newly-promoted leader,
 		// rather than the request being consumed here and silently lost on a failover boundary. No result
 		// is broadcast: the promoted leader owns the request now and will report its outcome.

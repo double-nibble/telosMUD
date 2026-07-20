@@ -14,6 +14,11 @@ var ErrCASLost = errors.New("director: scope-state CAS lost (concurrent writer)"
 // errCASLost is the internal alias the actor returns; exported as ErrCASLost.
 var errCASLost = ErrCASLost
 
+// ErrNotLeader is returned by set when this director does not hold its scope's lease. Scope state has a
+// single owning writer, and a director that lost the lease is not it — so the write path refuses rather
+// than relying on every caller to have gated first (#354).
+var ErrNotLeader = errors.New("director: not the scope leader (scope state has a single writer)")
+
 // state.go is the director's authoritative scope-state read/write, run on the actor goroutine (single
 // writer). Get reads the in-memory cache, lazily loading a key from the store on first miss. Set writes
 // through the optimistic-concurrency CAS to the store, then updates the cache + version — so the
@@ -88,7 +93,55 @@ func (d *Director) get(ctx context.Context, key string) getResult {
 // set (actor goroutine) CASes value to the store on the key's known version, then updates the cache.
 // On a CAS loss it reloads the key (so the cache reflects the winning writer) and returns an error so
 // the caller can retry against the fresh value.
-func (d *Director) set(ctx context.Context, key string, value json.RawMessage) error {
+//
+// EVERY failure path here records d.writeFailed, not just the CAS branch (#354). The issue framed the
+// lost-write defect around ErrCASLost, but a plain store error — a Postgres blip, a reset connection —
+// reaches the same end state by a far more common route: the write does not land, handleSignal acks
+// anyway, and the consequence is consumed off the SHARED durable consumer and lost fleet-wide. An ack
+// predicate that only knew about CAS losses would have fixed the rare half of its own defect.
+func (d *Director) set(ctx context.Context, key string, value json.RawMessage) (err error) {
+	// Any unsuccessful return records the failure for handleSignal's ack decision. A deferred check keeps
+	// that guarantee STRUCTURAL: a future early-return added to this function inherits it automatically,
+	// rather than depending on whoever adds it remembering to set the flag.
+	defer func() {
+		if err != nil {
+			d.writeFailed = true
+		}
+	}()
+	// A director that does not hold its scope's lease must not write scope state, full stop (#354). The
+	// leader gate in handleSignal and the one in onTick both already check this, but they check it BEFORE
+	// dispatch — leadership can lapse DURING a handler, and the write path itself was happy to persist
+	// afterwards. Enforcing it here makes the single-writer invariant structural at the point of the write
+	// instead of assumed by every caller.
+	//
+	// This does NOT close the window completely, and the comment should not pretend otherwise: d.leader is
+	// only refreshed on a campaign (every leaseTTL/3), so a director whose lease expired seconds ago still
+	// reads true. Closing it fully needs an ownership fence carried INTO the CAS predicate — a lease epoch
+	// on the row, the way characters.owner_epoch fences character ownership — because a version CAS is a
+	// lost-update DETECTOR, not an ownership fence. That is a schema change and its own piece of work.
+	if !d.leader.Load() {
+		return ErrNotLeader
+	}
+	// Seed the version on a CACHE MISS before CASing (#354). d.versions[key] is 0 for any key this process
+	// has never read, and the store's CAS predicate (`WHERE version = $expected`) REJECTS 0 against an
+	// existing row — so a director that RESTARTED and blind-writes a pre-existing key would lose the CAS
+	// with no concurrent writer anywhere. That is not hypothetical: it is exactly the derived-write pattern
+	// the world_script idempotency contract recommends (directorlua.go: `director.set("last_boss", ...)`
+	// with no prior get), so every restart silently dropped the first write to each key.
+	//
+	// This is load-bearing for the NAK-on-CAS-loss decision in handleSignal: an ack predicate is only as
+	// good as the signal under it, and until this seed existed ErrCASLost meant "cold cache" far more often
+	// than it meant "concurrent writer".
+	if _, cached := d.versions[key]; !cached {
+		val, ver, found, lerr := d.load(ctx, key)
+		if lerr != nil {
+			return lerr
+		}
+		if found {
+			d.state[key] = val
+			d.versions[key] = ver
+		}
+	}
 	newVer, ok, err := d.save(ctx, key, value, d.versions[key])
 	if err != nil {
 		return err
