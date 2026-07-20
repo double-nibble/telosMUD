@@ -74,6 +74,54 @@ const (
 	// PatternInputCap bounds the INPUT length of the pattern builtins (find/match/gsub — pathological
 	// backtracking). Lua patterns can backtrack super-linearly; capping input length bounds the worst case.
 	PatternInputCap = 1 << 16
+
+	// StrAllocCap is the per-CALL cumulative string-allocation budget: the MEMORY dimension of the abort
+	// layer, and the answer to #438's "the sandbox has no allocation bound".
+	//
+	// The instruction budget bounds CPU and does not bound memory, and the two are not proportional. Measured
+	// across the programs a script can actually write, bytes-per-instruction spans five orders of magnitude,
+	// and the top of that range is not table growth (which is genuinely O(instructions), ~140 B/instr worst
+	// case) — it is `..`. Concatenation is a single VM OPCODE, so it allocates a string of script-controlled
+	// size in one instruction: `s = s .. s` from a 1 MiB seed reaches 64 GB in ~25 instructions, AT THESE
+	// SHIPPING DEFAULTS, aborting only on the wall clock — which the breaker weights most leniently of all,
+	// because that weight exists to mean "the host was busy".
+	//
+	// So this is the cap the amplifier wrappers below could not provide: every string BUILTIN is capped by a
+	// wrapper (StrByteCap), but an opcode has no wrapper, which is why the charge lives in the fork.
+	//
+	// It is CUMULATIVE PER CALL, not per operation, which also closes the retention hole the per-op caps
+	// leave open: a loop of individually-legal 1 MiB rep() calls is bounded now, where before only each
+	// single call was.
+	//
+	// 8 MiB, chosen against measurement rather than assumed: 8x StrByteCap so any single legal string
+	// operation can complete, ~22x the largest legitimate string-building I could construct, and — the part
+	// that matters most — well BELOW what the default 5ms deadline already permits, because a cap above the
+	// reachable ceiling is inert. That is exactly how #368's instruction budget went dead above ~850k, and it
+	// is the failure this constant is most likely to repeat.
+	//
+	// Note the charge is against the RESULT size, so the `s = s .. chunk` accumulator idiom is charged O(n^2)
+	// — which is what it genuinely allocates. See the fork's telosmud_strbudget_test.go, which pins that
+	// coefficient because this constant was chosen against it. In practice that means a naive accumulator can
+	// reach sqrt(2 * cap * chunk): ~600 lines of a typical formatted report before it is refused. The abort
+	// message names table.concat for exactly this reason — the author sees a cap in megabytes after building
+	// tens of kilobytes, and the two only connect if something says so.
+	//
+	// Measured against SHIPPED content rather than assumed: the largest string-builder in the tree is the
+	// overworld minimap display template, which charges ~7 KB — a margin over 1000x.
+	//
+	// WHAT THIS DOES NOT BOUND, stated plainly because the gaps are the interesting part:
+	//   - Table growth. Genuinely O(instructions) at ~140 B/instr, so MaxInstrBudget bounds it (see there).
+	//   - Retention ACROSS calls. This is a per-CALL budget and it resets per call, so a script that stores
+	//     8 MiB into a mob's or room's self.state on every tick is unbounded by anything here. Player state
+	//     is capped at save time (marshalLuaState); mob and room state is not marshalled and so is not.
+	//   - A charge inflated by ANOTHER party's input. The charge depends only on the calling script's own
+	//     operands, which is why this design was chosen over sampling the process heap — but content that
+	//     accumulates a player-supplied string once per observer is quadratic in something a player controls,
+	//     so a long message in a crowded room can push a script over the line. The consequence is bounded:
+	//     the breaker may quarantine that script, and every security-relevant hook fails CLOSED when
+	//     quarantined (the PvP policy returns false, the safe-room veto runs before Lua at all), so this is
+	//     an availability concern and not a gate bypass.
+	StrAllocCap = 8 << 20
 )
 
 // BaseAllowlist is the exact set of base (global) functions the sandbox keeps — registered INDIVIDUALLY,
@@ -84,8 +132,22 @@ var BaseAllowlist = []string{
 	"type", "tostring", "tonumber", "pairs", "ipairs", "unpack",
 }
 
-// stringPassthrough are the string functions with no amplification — copied verbatim from the genuine lib.
-var stringPassthrough = []string{"byte", "char", "len", "lower", "upper", "sub", "reverse"}
+// stringPassthrough are the string functions copied verbatim: they neither amplify NOR allocate a new string
+// proportional to their input. `byte` returns numbers, `len` returns a number, and `sub` shares Go's backing
+// array rather than copying (measured: no allocation).
+//
+// The distinction is deliberately allocation, not amplification (#438). This list previously also held
+// `lower`, `upper`, `reverse` and `char`, justified as "no amplification" — true, and irrelevant: each
+// allocates a whole new string of script-controlled size on every call, so a loop over a legally-built 1 MiB
+// string reached 2 GB in one call while charging nothing. "Does not multiply its input" and "does not
+// allocate" are different questions, and only the second one bounds memory. They are wrapped in
+// stringTransforms below.
+var stringPassthrough = []string{"byte", "len", "sub"}
+
+// stringTransforms are the 1:1 string builtins: they allocate a new string the size of their input (or, for
+// `char`, of its argument count) without amplifying it. Safe per call and unbounded in a loop, so they are
+// copied verbatim except for charging the per-call allocation budget.
+var stringTransforms = []string{"lower", "upper", "reverse", "char"}
 
 // tablePassthrough are the table functions with no amplification (concat is capped separately).
 var tablePassthrough = []string{"insert", "remove", "sort", "getn", "maxn"}
@@ -147,6 +209,11 @@ func New(opts Opts) *lua.LState {
 	b := &builder{L: L, rng: rng}
 	b.strip(opts.Print)
 	L.SetInstructionBudget(ClampInstrBudget(opts.InstrBudget))
+	// The MEMORY half of the same layer (#438). Not operator-tunable, unlike the instruction budget: it has
+	// two couplings (it must stay at or above StrByteCap, or a single legal string builtin could never
+	// complete, and it interacts with the deadline through allocation bandwidth), and there is no content
+	// pressure for a knob — the measured margin over legitimate use is ~22x.
+	L.SetStringByteBudget(StrAllocCap)
 	return L
 }
 
@@ -162,12 +229,22 @@ const (
 	// MaxInstrBudget bounds the stall an operator can configure. Reaching anywhere near it also requires
 	// raising the DEADLINE; see ValidateCaps, which is the check that actually matters.
 	//
-	// THE OTHER DIMENSION IS MEMORY, and it is the one with no cap at all. RegistryMaxSize bounds the value
-	// stack and StrByteCap bounds amplifier OUTPUT, but nothing bounds table growth. Measured allocation for
-	// a single call of `t[i]={i,i,i}`: ~3MB at the 100k default, ~355MB at this ceiling — and the abort does
-	// not release it until GC. So a shard configured near the top trades a bounded stall for an OOM-kill,
-	// which is the harder failure. Treat this as a wall-clock bound that also happens to be a memory bound
-	// nobody has measured for their content.
+	// THE OTHER DIMENSION IS MEMORY, and as of #438 it has its own cap (StrAllocCap) rather than riding on
+	// this one. That separation is the point, because the two are NOT proportional and this comment used to
+	// imply they were: measured across the programs a script can write, bytes-per-instruction spans five
+	// orders of magnitude, and the top of that range was `..`, a single opcode — 64 GB in ~25 instructions,
+	// which NO instruction budget bounds. Deriving a memory ceiling from this constant was therefore not
+	// conservative, it was impossible.
+	//
+	// What remains true, and is now the whole of this constant's memory story: with the string amplifiers
+	// capped, the residual allocation a call can reach IS roughly linear in instructions, at a measured worst
+	// case of ~140 bytes/instruction (`t[i]={a=1}`, growing a table's hash part). So this ceiling is ~1.4 GB
+	// of table growth per call, and the 100k default is ~14 MB. An operator raising it should read it as
+	// buying that much memory per concurrent call, not merely that much time — and should note the abort does
+	// not release it until GC.
+	//
+	// Note this bounds a SINGLE call. Nothing here bounds what a script RETAINS across calls in a mob's or
+	// room's `self.state`, which is a different hole.
 	MaxInstrBudget = 10_000_000
 
 	// InstrPerMS is the engine's calibrated Lua instruction rate: how many VM instructions a call may be
@@ -388,6 +465,7 @@ func GlobalNames() []string {
 // StringNames / TableNames return the members the capped string/table namespaces expose, for the parity test.
 func StringNames() []string {
 	names := append([]string(nil), stringPassthrough...)
+	names = append(names, stringTransforms...)
 	return append(names, "rep", "format", "gsub", "find", "match", "gmatch")
 }
 
