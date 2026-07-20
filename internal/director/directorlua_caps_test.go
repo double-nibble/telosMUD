@@ -14,13 +14,12 @@ import (
 // TestDirectorLuaCapsReachTheRuntime pins the injection behaviorally: a configured floor budget must abort a
 // script the default budget runs comfortably.
 func TestDirectorLuaCapsReachTheRuntime(t *testing.T) {
-	budget, deadline := directorLuaInstrBudget, directorLuaCallDeadlineMS
-	t.Cleanup(func() { directorLuaInstrBudget, directorLuaCallDeadlineMS = budget, deadline })
+	restoreLuaCaps(t)
 
 	if err := SetLuaCaps(luasandbox.MinInstrBudget, 0); err != nil {
 		t.Fatalf("SetLuaCaps: %v", err)
 	}
-	_, err := newLuaDirector(nil, "for i = 1, 1000000 do end\nfunction on_signal() end")
+	_, err := newLuaDirector(nil, worldScriptKey, "for i = 1, 1000000 do end\nfunction on_signal() end")
 	if err == nil {
 		t.Fatal("a million-iteration top level ran under a 1000-instruction budget; the configured cap never " +
 			"reached the director's runtime")
@@ -34,8 +33,7 @@ func TestDirectorLuaCapsReachTheRuntime(t *testing.T) {
 // cannot apply caps without validating them — so the director's setter must refuse the same pairs the world's
 // does, and refuse without changing anything.
 func TestDirectorSetLuaCapsRefusesAnUnhonorablePair(t *testing.T) {
-	budget, deadline := directorLuaInstrBudget, directorLuaCallDeadlineMS
-	t.Cleanup(func() { directorLuaInstrBudget, directorLuaCallDeadlineMS = budget, deadline })
+	restoreLuaCaps(t)
 
 	directorLuaInstrBudget = 0
 	if err := SetLuaCaps(luasandbox.MaxInstrBudget, 0); err == nil {
@@ -45,4 +43,18 @@ func TestDirectorSetLuaCapsRefusesAnUnhonorablePair(t *testing.T) {
 	if directorLuaInstrBudget != 0 {
 		t.Fatalf("a refused SetLuaCaps still applied (%d)", directorLuaInstrBudget)
 	}
+}
+
+// restoreLuaCaps saves and restores the package-level Lua caps AND the capsFrozen latch (#356) around a
+// test. The latch is what makes SetLuaCaps refuse to run after a VM exists, so any earlier test in the
+// package that compiled a script would otherwise make these tests fail purely on ordering. Unlatching here
+// is a test-only affordance; production has exactly one boot-time caller.
+func restoreLuaCaps(t *testing.T) {
+	t.Helper()
+	budget, deadline, frozen := directorLuaInstrBudget, directorLuaCallDeadlineMS, capsFrozen.Load()
+	capsFrozen.Store(false)
+	t.Cleanup(func() {
+		directorLuaInstrBudget, directorLuaCallDeadlineMS = budget, deadline
+		capsFrozen.Store(frozen)
+	})
 }

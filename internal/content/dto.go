@@ -208,10 +208,30 @@ type DisplayDefDTO struct {
 // telos.scope.region.<ref> — validated before a subject is built); Name is the display name; Zones are
 // the member zone refs (a zone's membership in at most one region drives which region state it
 // replicates). The director/zone wiring (read replica + signal-up) is 10.3b/c.
+// Script, if set, is this region's DIRECTOR script (#356): the Lua source defining `on_signal(event,
+// payload)`, run in a sandboxed VM on the region director's actor goroutine once per signal-up event from
+// a member zone. It is the region-scoped sibling of Pack.WorldScript, and it lives on the keyed def
+// rather than as a pack-level scalar because the scopes are asymmetric — one singleton world, N keyed
+// regions. That also gives it better merge semantics for free: the pack tree merges regions by Ref, so a
+// later pack overriding a region carries its script with it, where WorldScript needs a
+// last-non-empty-pack-wins special case.
+//
+// IDEMPOTENCY, the same contract world_script carries: signal-up is durable and at-least-once, and a
+// failed write NAKs and REPLAYS the handler (#354), so `on_signal` must be idempotent — write DERIVED
+// values (director.set("last_raid", p.raid)), never a blind read-modify-write.
+//
+// The script is compiled at director construction, so a content pull that adds or changes a region script
+// takes effect on the next telos-director restart — the same boot-only contract world_script has. Note the
+// region case is strictly weaker than the world one, and an operator needs to know it: a pull that adds a
+// BRAND-NEW region leaves that region with no director at all until the tier restarts, while zones
+// hot-reload immediately and begin publishing durable signal-up events to a subject nobody consumes (they
+// age out of WORLD_EVENTS). world_script never has this shape, because the world director always exists.
+// Adding a region is a pull AND a director restart.
 type RegionDTO struct {
-	Ref   string   `json:"ref" yaml:"ref"`
-	Name  string   `json:"name" yaml:"name"`
-	Zones []string `json:"zones" yaml:"zones"`
+	Ref    string   `json:"ref" yaml:"ref"`
+	Name   string   `json:"name" yaml:"name"`
+	Zones  []string `json:"zones" yaml:"zones"`
+	Script string   `json:"script" yaml:"script"`
 }
 
 // TrackDTO is one content-defined advancement track (Phase 11.2, gap [G6a], docs/PHASE11-PLAN.md §11.2).

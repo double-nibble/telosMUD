@@ -4,9 +4,9 @@
 // so orchestration never competes with zone ticks for CPU.
 //
 // Startup: load config -> obs.Init -> open the scope-state store (Postgres) -> open the directory
-// (Redis) for LEADER ELECTION -> build + run the world director under leader election. SIGINT/SIGTERM
-// cancels ctx, which stops the director loop and RESIGNS its scope lease so a standby takes over
-// immediately. Region directors (one per region_defs) join here once region content exists (10.3+).
+// (Redis) for LEADER ELECTION -> build + run the world director, then ONE REGION DIRECTOR per region_defs
+// entry (#356, buildRegionDirectors), each under its own scope lease. SIGINT/SIGTERM cancels ctx, which
+// stops every director loop and RESIGNS its scope lease so a standby takes over immediately.
 package main
 
 import (
@@ -144,10 +144,29 @@ func main() {
 	// zoneRegion maps each pool zone to its region (#42 locality): the placement coordinator prefers to
 	// colocate a region's zones on one shard. Empty when content has no regions (locality then no-ops).
 	zoneRegion := map[string]string{}
+	var regions []content.RegionDTO
 	// worldScript is the content-defined world-director Lua signal handler (#47), read from pack_meta. Empty
 	// => the director drains+acks signals with no orchestration reaction.
 	var worldScript string
-	if lc, err := content.Load(ctx, pool, []string{content.DemoPack}); err == nil {
+	// Resolve the pack set the SAME way telos-world does (#356): an explicit TELOS_CONTENT_PACKS pin,
+	// else the published registry, else the demo default. This tier hardcoded the demo pack, which was
+	// harmless while it only read spawn schedules and the world script — both demo-only concerns in
+	// practice — and stops being harmless now that region directors are built from this content. On a
+	// deployment serving the `reference` pack, a hardcoded demo load returns ZERO regions, so the feature
+	// would be silently inert; worse, if a demo row co-exists, the director tier would own the DEMO's
+	// regions while the shards derive their zone→region membership from the operator's packs, leaving
+	// directors owning regions no shard belongs to and shards signalling to regions no director consumes.
+	//
+	// This is the same divergence #246 closed for telos-account; the director tier still had it.
+	var registryPacks []string
+	if info, verr := pool.CurrentContentVersion(ctx); verr == nil {
+		registryPacks = info.Packs
+	} else {
+		slog.Debug("content version registry unavailable; using configured/default packs", "err", verr)
+	}
+	enabledPacks := content.ResolveEnabledPacks(cfg.ContentPacks, registryPacks)
+	slog.Info("director content packs resolved", "packs", enabledPacks)
+	if lc, err := content.Load(ctx, pool, enabledPacks); err == nil {
 		for _, sc := range lc.SpawnSchedules {
 			schedules = append(schedules, director.BuildSchedule(sc))
 		}
@@ -160,12 +179,12 @@ func main() {
 			}
 		}
 		worldScript = lc.WorldScript
+		regions = lc.Regions
 	} else {
 		slog.Warn("could not load director content (no schedules / world script)", "err", err)
 	}
 
-	// Build + run the WORLD director. Region directors (one per region_defs) join here once region
-	// content lands (10.3+); for now the world scope is the deployable. The signal HANDLER (the
+	// Build + run the WORLD director. Region directors (one per region_defs) are built below (#356). The signal HANDLER (the
 	// orchestration "director script") is content-defined — not yet authored — so the director currently
 	// drains + acks signals (the write/broadcast machinery is live via the API; the built-in logic plugs
 	// in here when director-script content lands). WithSchedules wires the Phase-12.4 boss scheduler.
@@ -205,6 +224,29 @@ func main() {
 		defer wg.Done()
 		world.Run(ctx) // returns on ctx cancel, resigning its lease
 	}()
+
+	// Build + run one REGION director per region_defs (#356). Until this existed the region scope was
+	// WRITE-DEAD in a way the zone side did not reflect: content's scope.signal_region already publishes
+	// DURABLE signal-up events to telos.scope.region.<ref>, and zones already subscribe their region and
+	// apply its state deltas — but nothing consumed the region subject and nothing ever wrote region state,
+	// so those events sat in WORLD_EVENTS until they aged out and region:get could only ever read rows no
+	// code path wrote. These directors are the missing half.
+	//
+	// Every scope-dependent seam was already region-generic (the lease id, the durable consumer name, the
+	// scope subject, the state load/save dispatch), so this is wiring, not new machinery.
+	//
+	// Deliberately NOT wired here: schedules, the mail reaper, the roster aggregator and the content puller
+	// are all world SINGLETONS by design, and their nil defaults already disable them.
+	//
+	// A region with an EMPTY script still gets a director: it owns that region's state and drains its
+	// signal-up stream. Skipping it would leave the same write-dead scope this exists to fix.
+	for _, rd := range buildRegionDirectors(regions, pool, scopeBus, claimer, instanceID, slog.Default()) {
+		wg.Add(1)
+		go func(rd *director.Director) {
+			defer wg.Done()
+			rd.Run(ctx)
+		}(rd)
+	}
 
 	// Zone-placement COORDINATOR (docs/PLACEMENT.md §2/§4, Phase 10.6b): while this director is the leader,
 	// observe the live fleet + the zone assignment and compute the desired rebalancing PLAN. The coordinator
@@ -457,4 +499,42 @@ func (z zoneLocator) ZoneHosted(ctx context.Context, zone string) (bool, error) 
 			"copies of it right now); the pull is refused until they leave", "zone", zone)
 	}
 	return inUse, nil
+}
+
+// buildRegionDirectors constructs one region director per region_defs entry (#356). Split out of main so
+// the wiring itself is testable: every field here is load-bearing and none of it was reachable from a test
+// while it lived inline in main — the scope each director owns, the bus it broadcasts on, the script it
+// runs, and the lease it campaigns for.
+//
+// A region with an EMPTY ref is SKIPPED, loudly. That is not defensive tidying, it is a real hazard the
+// region loop introduced: director.New("") IS the world director, so an unref'd region entry would put a
+// SECOND world director in this process — sharing the world's lease id ("director:world"), its instance id
+// and its durable consumer name ("director-world"). ClaimLease succeeds for an owner that already holds the
+// lease, so the CAS cannot arbitrate two claimants with the same instance id and BOTH would believe they
+// lead: two writers on world scope with independent in-memory version caches, two subscriptions to one
+// durable consumer name splitting the world's signal-up stream between them, and the region's script
+// running against WORLD state. The ref-charset lint does not catch this (it skips empty tokens by design),
+// so the guard belongs at the sink that gives an empty ref meaning.
+func buildRegionDirectors(regions []content.RegionDTO, st director.ScopeStore, bus *scopebus.Bus,
+	claimer director.LeaseClaimer, instanceID string, log *slog.Logger,
+) []*director.Director {
+	out := make([]*director.Director, 0, len(regions))
+	for _, r := range regions {
+		if r.Ref == "" {
+			log.Error("region_def has no ref; refusing to build its director (an empty ref would collide with "+
+				"the WORLD director's lease and durable consumer)", "region_name", r.Name)
+			continue
+		}
+		rd := director.New(r.Ref, st, log).
+			WithScopeBus(bus, instanceID).
+			WithRegionScript(r.Script)
+		if claimer != nil {
+			rd.WithElection(claimer, instanceID)
+		}
+		out = append(out, rd)
+	}
+	if len(out) > 0 {
+		log.Info("region directors started", "count", len(out))
+	}
+	return out
 }

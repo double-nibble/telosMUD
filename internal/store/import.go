@@ -718,7 +718,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	// ref is the PK (GLOBAL across packs — see foreignrefs.go). The loader reads it back into the same RegionDTO the embedded YAML
 	// produces, so YAML and Postgres packs define regions identically.
 	for _, rg := range pk.Regions {
-		body, err := json.Marshal(regionBody{Name: rg.Name, Zones: rg.Zones})
+		body, err := marshalRegionBody(rg)
 		if err != nil {
 			return fmt.Errorf("store: marshal region %s body: %w", rg.Ref, err)
 		}

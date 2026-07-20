@@ -503,9 +503,35 @@ type channelBody struct {
 // regionBody is the JSONB-tail shape for a region_defs row (Phase 10.3): everything that is not the
 // relational ref/pack PK. It mirrors content.RegionDTO minus its Ref, so the whole region SHAPE (its
 // display name + member zone refs) is content carried in the body — the engine names no region.
+//
+// EVERY field of RegionDTO except Ref must appear here AND in both the marshal (import.go) and the
+// unmarshal below. A field added to the DTO but not to this struct round-trips fine through a YAML pack
+// and silently vanishes through a Postgres one — so unit tests and the embedded fixture pass while
+// staging and prod load the region with the field empty and no error anywhere. That failure has landed in
+// this repo three times; TestRegionScriptSurvivesPostgresRoundTrip is the net.
 type regionBody struct {
-	Name  string   `json:"name,omitempty"`
-	Zones []string `json:"zones,omitempty"`
+	Name   string   `json:"name,omitempty"`
+	Zones  []string `json:"zones,omitempty"`
+	Script string   `json:"script,omitempty"`
+}
+
+// marshalRegionBody / applyRegionBody are the ONE place the region field list is written down for
+// persistence. The import and load sites call these rather than each spelling the fields out, so adding a
+// field to RegionDTO is a single edit here instead of three edits that must agree — and a test can
+// exercise the real encode/decode instead of restating it, which would make the test pass by construction
+// no matter what the store actually did.
+func marshalRegionBody(rg content.RegionDTO) ([]byte, error) {
+	return json.Marshal(regionBody{Name: rg.Name, Zones: rg.Zones, Script: rg.Script})
+}
+
+// applyRegionBody decodes a region_defs body onto rg, leaving rg.Ref (the relational PK) untouched.
+func applyRegionBody(rg *content.RegionDTO, body []byte) error {
+	var b regionBody
+	if err := json.Unmarshal(body, &b); err != nil {
+		return err
+	}
+	rg.Name, rg.Zones, rg.Script = b.Name, b.Zones, b.Script
+	return nil
 }
 
 // trackBody is the JSONB-tail shape for a track_defs row (Phase 11.2): everything that is not the ref/pack
@@ -935,12 +961,10 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 			return fmt.Errorf("store: scan region_def: %w", err)
 		}
 		if len(body) > 0 {
-			var b regionBody
-			if err := json.Unmarshal(body, &b); err != nil {
+			if err := applyRegionBody(&rg, body); err != nil {
 				rgRows.Close()
 				return fmt.Errorf("store: region_def %s body: %w", rg.Ref, err)
 			}
-			rg.Name, rg.Zones = b.Name, b.Zones
 		}
 		pp := pack(pk)
 		pp.Regions = append(pp.Regions, rg)
