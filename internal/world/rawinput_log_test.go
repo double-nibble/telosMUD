@@ -14,10 +14,10 @@ import (
 // is deliberately separate from DEBUG. These tests drive the real dispatch path and assert the
 // secret is absent by default and present under the opt-in.
 
-// rawSecret stands in for a tell body / a mistyped credential. Deliberately lowercase: the unknown-verb
+// rawInput stands in for a tell body / a mistyped credential. Deliberately lowercase: the unknown-verb
 // and targeting paths lower-case player input, so a lowercase token survives those transforms and a leak
 // there is still caught by a substring check (a mixed-case token would be mangled and hide the leak).
-const rawSecret = "my-link-code-8f3k2"
+const rawInput = "my-link-code-8f3k2"
 
 // captureZoneLog swaps z.log for a Debug-level text handler writing to buf, so every line the zone
 // emits is observable. It returns buf for inspection.
@@ -32,10 +32,10 @@ func captureZoneLog(z *Zone) *bytes.Buffer {
 // pre-dispatch site fires) or a RESOLVED verb (both fire).
 func TestRawInputRedactedByDefault(t *testing.T) {
 	for _, line := range []string{
-		"frobnicate " + rawSecret, // unknown verb (multi-token) -> pre-dispatch + unknown-verb sites
-		rawSecret,                 // single-token paste (a link code) -> the unknown-verb `verb` IS the token
-		"look " + rawSecret,       // resolved verb -> pre-dispatch + dispatch + targeting sites
-		"say " + rawSecret,        // resolved verb with a body (the tell/chat case)
+		"frobnicate " + rawInput, // unknown verb (multi-token) -> pre-dispatch + unknown-verb sites
+		rawInput,                 // single-token paste (a link code) -> the unknown-verb `verb` IS the token
+		"look " + rawInput,       // resolved verb -> pre-dispatch + dispatch + targeting sites
+		"say " + rawInput,        // resolved verb with a body (the tell/chat case)
 	} {
 		z, _, room := harmZone(t)
 		z.logRawInput = false
@@ -44,7 +44,7 @@ func TestRawInputRedactedByDefault(t *testing.T) {
 
 		z.handleInput(inputMsg{id: "Alice", line: line})
 
-		if got := buf.String(); strings.Contains(got, rawSecret) {
+		if got := buf.String(); strings.Contains(got, rawInput) {
 			t.Errorf("raw input leaked into logs for %q (opt-in OFF):\n%s", line, got)
 		}
 		// The flow markers must still be present — redaction keeps the diagnostic, drops the body.
@@ -62,8 +62,8 @@ func TestRawInputLoggedUnderOptIn(t *testing.T) {
 	z.logRawInput = true
 	buf := captureZoneLog(z)
 	harmPlayer(z, room, "Alice")
-	z.handleInput(inputMsg{id: "Alice", line: "frobnicate " + rawSecret})
-	if got := buf.String(); !strings.Contains(got, rawSecret) {
+	z.handleInput(inputMsg{id: "Alice", line: "frobnicate " + rawInput})
+	if got := buf.String(); !strings.Contains(got, rawInput) {
 		t.Errorf("opt-in ON: pre-dispatch site should log the raw line, got:\n%s", got)
 	}
 
@@ -72,8 +72,8 @@ func TestRawInputLoggedUnderOptIn(t *testing.T) {
 	z2.logRawInput = true
 	buf2 := captureZoneLog(z2)
 	harmPlayer(z2, room2, "Bob")
-	z2.handleInput(inputMsg{id: "Bob", line: "look " + rawSecret})
-	if got := buf2.String(); !strings.Contains(got, rawSecret) {
+	z2.handleInput(inputMsg{id: "Bob", line: "look " + rawInput})
+	if got := buf2.String(); !strings.Contains(got, rawInput) {
 		t.Errorf("opt-in ON: dispatch site should log the raw line, got:\n%s", got)
 	}
 
@@ -83,8 +83,8 @@ func TestRawInputLoggedUnderOptIn(t *testing.T) {
 	z3.logRawInput = true
 	buf3 := captureZoneLog(z3)
 	harmPlayer(z3, room3, "Cara")
-	z3.handleInput(inputMsg{id: "Cara", line: rawSecret})
-	if got := buf3.String(); !strings.Contains(got, rawSecret) {
+	z3.handleInput(inputMsg{id: "Cara", line: rawInput})
+	if got := buf3.String(); !strings.Contains(got, rawInput) {
 		t.Errorf("opt-in ON: unknown-verb site should log the pasted token, got:\n%s", got)
 	}
 }
@@ -111,8 +111,8 @@ func TestAbilityCastArgRedaction(t *testing.T) {
 	z, caster := abilityTestZone(t)
 	z.logRawInput = false
 	buf := captureZoneLog(z)
-	z.castAbility(caster, z.defs.ability.get("fireball"), rawSecret, z.combatRng())
-	if got := buf.String(); strings.Contains(got, rawSecret) {
+	z.castAbility(caster, z.defs.ability.get("fireball"), rawInput, z.combatRng())
+	if got := buf.String(); strings.Contains(got, rawInput) {
 		t.Errorf("ability cast leaked the raw arg (opt-in OFF):\n%s", got)
 	}
 	if got := buf.String(); !strings.Contains(got, "ability lifecycle: invoke") {
@@ -123,8 +123,8 @@ func TestAbilityCastArgRedaction(t *testing.T) {
 	z2, caster2 := abilityTestZone(t)
 	z2.logRawInput = true
 	buf2 := captureZoneLog(z2)
-	z2.castAbility(caster2, z2.defs.ability.get("fireball"), rawSecret, z2.combatRng())
-	if got := buf2.String(); !strings.Contains(got, rawSecret) {
+	z2.castAbility(caster2, z2.defs.ability.get("fireball"), rawInput, z2.combatRng())
+	if got := buf2.String(); !strings.Contains(got, rawInput) {
 		t.Errorf("opt-in ON: ability cast should log the raw arg:\n%s", got)
 	}
 }
@@ -138,7 +138,7 @@ func init() {
 		baseTable.register(&Command{
 			Name:  panicVerb454,
 			Flags: CmdHidden,
-			Run:   func(*Context) error { panic("boom-" + rawSecret) },
+			Run:   func(*Context) error { panic("boom-" + rawInput) },
 		})
 	}
 }
@@ -147,18 +147,18 @@ func init() {
 // Error. The raw input line (verbatim player text) must be gated behind the opt-in, but the panic
 // must remain fully diagnosable (player + panic value + stack) regardless.
 func TestPanicPathRedactsRawInput(t *testing.T) {
-	// The panic value itself embeds rawSecret so we can prove the *line* redaction independently:
+	// The panic value itself embeds rawInput so we can prove the *line* redaction independently:
 	// we search for the input-line marker, not the panic string. Use a distinct token for the line.
-	const lineSecret = "line-body-QQ9"
+	const lineBody = "line-body-QQ9"
 
 	// Opt-in OFF: the line must not appear, but the stack/player must.
 	z, _, room := harmZone(t)
 	z.logRawInput = false
 	buf := captureZoneLog(z)
 	harmPlayer(z, room, "Alice")
-	z.dispatchSafe(z.players["Alice"], panicVerb454+" "+lineSecret)
+	z.dispatchSafe(z.players["Alice"], panicVerb454+" "+lineBody)
 	off := buf.String()
-	if strings.Contains(off, lineSecret) {
+	if strings.Contains(off, lineBody) {
 		t.Errorf("panic path leaked the raw input line (opt-in OFF):\n%s", off)
 	}
 	if !strings.Contains(off, "panicked") || !strings.Contains(off, "stack") {
@@ -170,8 +170,8 @@ func TestPanicPathRedactsRawInput(t *testing.T) {
 	z2.logRawInput = true
 	buf2 := captureZoneLog(z2)
 	harmPlayer(z2, room2, "Bob")
-	z2.dispatchSafe(z2.players["Bob"], panicVerb454+" "+lineSecret)
-	if on := buf2.String(); !strings.Contains(on, lineSecret) {
+	z2.dispatchSafe(z2.players["Bob"], panicVerb454+" "+lineBody)
+	if on := buf2.String(); !strings.Contains(on, lineBody) {
 		t.Errorf("panic path should log the raw line under the opt-in:\n%s", on)
 	}
 }
