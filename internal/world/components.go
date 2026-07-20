@@ -22,6 +22,17 @@ type Room struct {
 	// old Room.exits string map; routing splits the ProtoRef via parseRef.
 	exits map[string]ProtoRef
 
+	// entrances maps a direction to the TEMPLATE ZONE ref of an instanced dungeon reached by moving that
+	// way (#435). A door, not an exit: there is no destination room, because the target zone's own start
+	// room decides where the player lands, and the zone does not exist until they walk through.
+	//
+	// SEPARATE FROM exits, and every reader of exits must stay unaware of it — that separation is what makes
+	// the security property structural rather than enforced. hMove, directional flee, room-and-adjacent AoE
+	// and the cross-shard router all resolve a direction through exits; none of them can traverse a door
+	// they cannot see, so no path that moves a player on ANOTHER party's initiative can push them into a
+	// private instance. See Zone.move, which is the only reader.
+	entrances map[string]string
+
 	// sector classifies the terrain/environment (city, forest, water…) for movement
 	// cost and look flavour. Stub: unused in slice 1.
 	sector string
@@ -63,10 +74,19 @@ func (r *Room) sortedExits() []string {
 // displayExits returns the room's WALKABLE exits in "Exits:" display order — the cardinals plus the
 // exit/enter/out movement verbs (displayDirOrder). This is what the built-in look line shows, so a gate
 // like `exit` appears; a non-walkable data-only direction is omitted.
+//
+// INSTANCE ENTRANCES ARE INCLUDED (#435). They are walkable — that is the entire point — and an invisible
+// door is a worse defect than any of the leaks the separation elsewhere guards against: a player cannot type
+// a direction they were never shown. Only the DIRECTION appears; the template ref never does, here or on any
+// other player-facing surface.
 func (r *Room) displayExits() []string {
 	var out []string
 	for _, d := range displayDirOrder {
 		if _, ok := r.exits[d]; ok {
+			out = append(out, d)
+			continue
+		}
+		if _, ok := r.entrances[d]; ok {
 			out = append(out, d)
 		}
 	}
@@ -89,9 +109,26 @@ func isCanonicalDir(d string) bool {
 // direction the movement registry never binds) is a real edge of the room graph and a room display template
 // must be able to see it. sortedExits stays the canonical-only accessor (GMCP/targeting); displayExits is the built-in look line.
 func (r *Room) allExits() []string {
-	out := r.sortedExits()
+	// The canonical head walks dirOrder over BOTH maps — an instance entrance (#435) is a real edge of the
+	// room graph, and a room display template (the overworld minimap is one) would otherwise silently lose a
+	// door the built-in look line shows. Not built on sortedExits, which stays exit-only for GMCP/targeting.
+	var out []string
+	for _, d := range dirOrder {
+		if _, isExit := r.exits[d]; isExit {
+			out = append(out, d)
+			continue
+		}
+		if _, isDoor := r.entrances[d]; isDoor {
+			out = append(out, d)
+		}
+	}
 	var extra []string
 	for d := range r.exits {
+		if !isCanonicalDir(d) {
+			extra = append(extra, d)
+		}
+	}
+	for d := range r.entrances {
 		if !isCanonicalDir(d) {
 			extra = append(extra, d)
 		}

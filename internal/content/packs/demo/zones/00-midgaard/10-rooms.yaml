@@ -35,6 +35,19 @@ zones:
           east: midgaard:room:temple
           north: midgaard:room:smithy
           down: crypt:room:entrance     # cross-zone stair (intra-shard transfer when co-hosted)
+        # The DUNGEON DOOR (#435): walking `enter` mints a PRIVATE copy of the crypt for the mover and steps
+        # them into it, where `down` above walks into the SHARED one everybody else is also in. Both lead to
+        # the same authored content; only the second is yours alone.
+        #
+        # It is a declared exit rather than an `on("enter")` room trigger calling mud.send_to_instance, and
+        # that is the whole design: the crossing is then a MOVEMENT the player typed, so the player is the
+        # actor, the instance is billed to THEIR account, and content never gets to decide who gets sent into
+        # a private zone nobody can see them in.
+        #
+        # The value is a ZONE ref — the target zone's own start_room decides where you land — and the crypt
+        # sets `instanceable: true`, without which this refuses at entry time.
+        instance_entrances:
+          enter: crypt
       - ref: midgaard:room:smithy
         name: The Smithy
         coord: [-1, 1, 0]  # north of the guild hall

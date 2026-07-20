@@ -490,6 +490,14 @@ func insertRooms(ctx context.Context, tx pgx.Tx, pack string, z content.ZoneDTO)
 		if len(r.Flags) > 0 {
 			rb["flags"] = r.Flags
 		}
+		// #435 instance entrances ride the body JSONB, NOT the exits table: an exit row's to_room carries a
+		// foreign key into rooms(ref), and an entrance names a ZONE, so it could never satisfy it. Anything
+		// added here must also be read back in BOTH loadRoomDefinition and loadRooms — a field written and
+		// not read survives the YAML tree loader and dies only on the store round trip, which is why every
+		// world test would still pass. RoomDTO.Lua is dropped by this path today for exactly that reason.
+		if len(r.InstanceEntrances) > 0 {
+			rb["instance_entrances"] = r.InstanceEntrances
+		}
 		body, _ := json.Marshal(rb)
 		var coord []byte // the [x,y,z] minimap position rides the dedicated coord JSONB column (Phase 9.3b)
 		if len(r.Coord) > 0 {

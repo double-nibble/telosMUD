@@ -160,6 +160,21 @@ func cloneComponent(c Component) Component {
 		for k, dst := range v.exits {
 			cp.exits[k] = dst
 		}
+		// entrances (#435) and namedFlags are maps too, and the contract above is that EVERY reference-typed
+		// field is reallocated — not just the ones something mutates today. namedFlags was already being
+		// aliased; rooms happen to be immutable at runtime, so it was latent rather than harmless.
+		if v.entrances != nil {
+			cp.entrances = make(map[string]string, len(v.entrances))
+			for k, tmpl := range v.entrances {
+				cp.entrances[k] = tmpl
+			}
+		}
+		if v.namedFlags != nil {
+			cp.namedFlags = make(map[string]bool, len(v.namedFlags))
+			for k, on := range v.namedFlags {
+				cp.namedFlags[k] = on
+			}
+		}
 		return &cp
 	case *Living:
 		// Living gained reference-typed instance state in Phase 5.1 (attrBase/resCur maps + the
