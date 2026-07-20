@@ -135,3 +135,66 @@ func TestTunablesReportsEveryMalformedValue(t *testing.T) {
 		t.Fatalf("a malformed value was coerced rather than left alone: %+v", c.Tunables)
 	}
 }
+
+// TestDirectoryAddressResolution — #429. The bool this returns decides whether an evicting policy on the
+// coordination Redis REFUSES THE BOOT, so getting it wrong is either a fleet that will not start or a
+// silently un-enforced gate.
+func TestDirectoryAddressResolution(t *testing.T) {
+	cases := []struct {
+		name          string
+		cfg           RedisConfig
+		wantAddr      string
+		wantDedicated bool
+		why           string
+	}{
+		{
+			name:     "unset falls back to the shared addr",
+			cfg:      RedisConfig{Addr: "cache:6379"},
+			wantAddr: "cache:6379", wantDedicated: false,
+			why: "an untouched deployment must be unchanged, and must stay on the WARN-only side of the gate",
+		},
+		{
+			name:     "a distinct directory addr is dedicated",
+			cfg:      RedisConfig{Addr: "cache:6379", DirectoryAddr: "coord:6379"},
+			wantAddr: "coord:6379", wantDedicated: true,
+		},
+		{
+			name:     "the SAME address spelled twice is NOT dedicated",
+			cfg:      RedisConfig{Addr: "cache:6379", DirectoryAddr: "cache:6379"},
+			wantAddr: "cache:6379", wantDedicated: false,
+			why: "this is one instance however it is spelled. Reporting it as dedicated would make the boot " +
+				"gate fatal on a SHARED Redis — refusing to start a fleet whose operator changed nothing but " +
+				"a config line, and ordering them into noeviction on a cache-sized instance",
+		},
+		{
+			name:     "a directory addr with no cache addr still counts",
+			cfg:      RedisConfig{DirectoryAddr: "coord:6379"},
+			wantAddr: "coord:6379", wantDedicated: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, dedicated := tc.cfg.DirectoryAddress()
+			if addr != tc.wantAddr {
+				t.Fatalf("addr = %q, want %q", addr, tc.wantAddr)
+			}
+			if dedicated != tc.wantDedicated {
+				t.Fatalf("dedicated = %v, want %v. %s", dedicated, tc.wantDedicated, tc.why)
+			}
+		})
+	}
+}
+
+// TestDirectoryAddrFromEnv pins the env name alongside the yaml tag.
+func TestDirectoryAddrFromEnv(t *testing.T) {
+	t.Setenv("TELOS_REDIS_DIRECTORY_ADDR", "coord:6379")
+	c := Default()
+	c.applyEnv()
+	if c.Redis.DirectoryAddr != "coord:6379" {
+		t.Fatalf("DirectoryAddr = %q; TELOS_REDIS_DIRECTORY_ADDR did not reach it", c.Redis.DirectoryAddr)
+	}
+	if c.Redis.Addr == "coord:6379" {
+		t.Fatal("the directory address also overwrote the CACHE address, which would put the checkpoint " +
+			"tier on the coordination instance — the opposite of the split")
+	}
+}

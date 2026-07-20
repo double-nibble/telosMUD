@@ -85,13 +85,33 @@ func main() {
 	if cfg.Redis.Addr != "" {
 		rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 		defer func() { _ = rdb.Close() }()
-		dir = directory.NewRedis(rdb, "telos")
-		// #340: report an evicting directory Redis. The director has the most to lose here — its own
-		// LEADER-ELECTION lease is a TTL'd key, and evicting it lets two directors both believe they lead —
-		// so it is the tier most worth telling. Warn-only; see CheckEvictionPolicy for why not fatal.
+		// #429: the coordination keyspace may be on its own instance. The director reads the SAME split as
+		// the world — a fleet where only one tier honors directory_addr would put the leader-election lease
+		// and the zone leases it arbitrates on two different servers.
+		dirAddr, dirDedicated := cfg.Redis.DirectoryAddress()
+		dirRDB := rdb
+		if dirDedicated {
+			dirRDB = redis.NewClient(&redis.Options{Addr: dirAddr})
+			if err := dirRDB.Ping(ctx).Err(); err != nil {
+				slog.Error("refusing to start: the configured coordination redis is unreachable",
+					"directory_addr", dirAddr, "err", err)
+				os.Exit(1)
+			}
+			defer func() { _ = dirRDB.Close() }()
+			slog.Info("coordination redis is dedicated", "directory_addr", dirAddr)
+		}
+		dir = directory.NewRedis(dirRDB, "telos")
+		// #340/#429: report an evicting directory Redis, and REFUSE when it is dedicated. The director has the
+		// most to lose — its own LEADER-ELECTION lease is a TTL'd key, and evicting it lets two directors both
+		// believe they lead, which is the worst outcome in the whole coordination keyspace.
 		evCtx, evCancel := context.WithTimeout(ctx, 3*time.Second)
-		dir.CheckEvictionPolicy(evCtx)
+		evFinding := dir.CheckEvictionPolicy(evCtx)
 		evCancel()
+		if fatal := directory.EvictionGate(evFinding, dirDedicated); fatal != nil {
+			slog.Error("refusing to start", "err", fatal)
+			os.Exit(1)
+		}
+		go dir.WatchEvictionPolicy(ctx)             // warn-only for the life of the process; never a fence
 		rosterSrc = presence.NewRedis(rdb, "telos") // #90: same Redis + namespace as the who roster
 		claimer = dir
 		slog.Info("leader election enabled", "instance", instanceID)

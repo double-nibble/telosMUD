@@ -2,9 +2,11 @@ package directory
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // eviction.go — the startup check that tells an operator their directory Redis is configured to evict
@@ -62,7 +64,7 @@ import (
 // `volatile-*` eviction candidates, and the leader-election lease and the shard registration are each a
 // single-writer guard that eviction turns off.
 //
-// # This WARNS. It does not refuse to start, and that is deliberate
+// # Whether this REFUSES THE BOOT depends on whether the coordination Redis is DEDICATED (#429)
 //
 // A boot refusal was the obvious shape and it is the wrong one today, for a reason that is about this
 // deployment rather than about the check: telos-world points ONE Redis client at four tiers — the directory,
@@ -77,10 +79,31 @@ import (
 // ceiling set, every write at the ceiling errors, including lease renewal — which fences shards fleet-wide,
 // simultaneously, since they share the instance.
 //
-// So an operator running `allkeys-lru` here may be doing the correct thing for the Redis they actually have.
-// Refusing to boot would order them into a worse configuration. The honest sequence is: split the
-// coordination Redis from the cache Redis first, then make this fatal. Until then it is a loud, specific,
-// actionable Error line, and never a reason a shard fails to start.
+// So an operator running `allkeys-lru` on a SHARED instance may be doing the correct thing for the Redis
+// they actually have, and refusing to boot would order them into a worse configuration.
+//
+// #429 supplied the missing prerequisite: `redis.directory_addr` points the coordination keyspace at its own
+// instance. That splits the population in two and the gate follows it exactly —
+//
+//   - SHARED (no directory_addr): warn-only, as before. The tradeoff above is real and the operator may have
+//     resolved it correctly for their deployment; a loud, specific, actionable Error line is the honest
+//     ceiling on what this can claim to know.
+//   - DEDICATED (directory_addr set): FATAL. The tradeoff has been dissolved — nothing on that instance wants
+//     eviction, it is small and bounded, and an evicting policy there is simply a misconfiguration. There is
+//     no worse configuration to be ordered into, so refusing to start is now the safe direction rather than
+//     the reckless one.
+//
+// A gate whose severity tracks whether its own prerequisite is met, rather than being flipped by hand later
+// and forgotten.
+//
+// # The check also RE-RUNS periodically, and that half must never fence
+//
+// A boot-only check cannot see `CONFIG SET maxmemory-policy allkeys-lru` on a live fleet — which is exactly
+// how this misconfiguration gets introduced, by an operator responding to a memory alert — and shards run for
+// weeks. So the shard re-checks on a slow tick and WARNS. That half is warn-only on BOTH shapes, dedicated or
+// not, and deliberately so: a live shard owns zone leases and player sockets, and exiting under it would turn
+// a configuration mistake into a player-visible outage plus an unplanned lease handover. Boot is the only
+// place refusing is cheap.
 //
 // # What the loss of `gen` would actually do
 //
@@ -101,9 +124,31 @@ type EvictionFinding struct {
 	Unknown   bool   // the config could not be read (managed Redis commonly disables CONFIG GET)
 }
 
+// EvictionGate is the BOOT decision derived from a finding (#429), factored out of the hosts so the
+// fail-closed behavior is unit-testable — the same shape handoffAuthGate uses in cmd/telos-world.
+//
+// dedicated says the coordination keyspace has its own Redis instance (redis.directory_addr). It is the only
+// input beyond the finding, and it is what decides whether an evicting policy is a refusal or a warning; see
+// the file header.
+//
+// A non-nil fatal means "do not start". Everything else has already been logged by CheckEvictionPolicy.
+func EvictionGate(f EvictionFinding, dedicated bool) (fatal error) {
+	if !f.Unsafe || !dedicated {
+		return nil
+	}
+	return fmt.Errorf("the DEDICATED coordination redis has maxmemory-policy %q with a %d-byte ceiling, so "+
+		"it will discard coordination state under memory pressure: a lost zone lease generation, placement "+
+		"epoch, leader-election lease or instance-template claim is a WRONG answer, not a slow one. Nothing "+
+		"on this instance wants eviction — it holds only the directory, and it is small and bounded — so set "+
+		"`maxmemory-policy noeviction` on it. (Set a `maxmemory` ceiling too, with headroom, so noeviction "+
+		"returns OOM to clients rather than growing until the container OOM-kills it and wipes everything at "+
+		"once.)", f.Policy, f.MaxMemory)
+}
+
 // CheckEvictionPolicy reads the directory Redis's eviction configuration and LOGS what it finds. It never
-// returns an error and never prevents startup — see the file header for why that is deliberate rather than
-// timid. The finding is returned so a caller (or a test) can assert on it.
+// returns an error and never prevents startup by itself — the boot decision is EvictionGate's, and whether it
+// refuses depends on the coordination Redis being dedicated (see the file header). The finding is returned so
+// a caller (or a test) can make that decision and assert on it.
 //
 // It reads BOTH the policy and the ceiling, because the policy alone cannot answer the question. With
 // `maxmemory 0` — the default — eviction cannot occur at all, no matter what the policy says, so an
@@ -134,9 +179,10 @@ func (r *Redis) CheckEvictionPolicy(ctx context.Context) EvictionFinding {
 			"an evicting policy and a maxmemory ceiling is set, so it WILL discard directory keys under "+
 			"memory pressure — losing a zone lease generation, a placement epoch, a drain reservation or an "+
 			"instance-template claim produces a WRONG answer, not a slow one (#340). Set `maxmemory-policy "+
-			"noeviction`. If this Redis is also serving the checkpoint/presence tiers, give the directory its "+
-			"own instance first — noeviction on a cache-sized instance risks an OOM-kill that wipes the whole "+
-			"directory, which is worse than the problem",
+			"noeviction`. If this Redis is ALSO serving the checkpoint/presence tiers, split them first "+
+			"(`redis.directory_addr`, #429) — noeviction on a cache-sized instance risks an OOM-kill that "+
+			"wipes the whole directory, which is worse than the problem. If it is ALREADY dedicated, the boot "+
+			"gate that follows this line refuses the start outright",
 			"maxmemory_policy", f.Policy, "maxmemory_bytes", f.MaxMemory)
 	case f.Policy != "" && isEvictingPolicy(f.Policy):
 		slog.Warn("the directory redis has an evicting maxmemory-policy, but no maxmemory ceiling, so nothing "+
@@ -147,6 +193,40 @@ func (r *Redis) CheckEvictionPolicy(ctx context.Context) EvictionFinding {
 		slog.Debug("directory redis eviction policy verified", "maxmemory_policy", f.Policy)
 	}
 	return f
+}
+
+// evictionRecheckInterval is how often a running process re-reads the policy (#429).
+//
+// Slow on purpose. This is watching for an OPERATOR ACTION (`CONFIG SET` in response to a memory alert), not
+// for a fast-moving signal, so minutes of detection lag costs nothing and a tight loop would add a CONFIG
+// round trip to a coordination Redis for no benefit.
+const evictionRecheckInterval = 5 * time.Minute
+
+// WatchEvictionPolicy re-checks the policy on a slow tick until ctx is done, logging through
+// CheckEvictionPolicy exactly as the boot check does. Intended to run in its own goroutine for the life of
+// the process.
+//
+// IT NEVER FENCES, NEVER EXITS AND NEVER RETURNS AN ERROR, on either the shared or the dedicated shape, and
+// that asymmetry with the boot gate is the design rather than an oversight. A live shard owns zone leases and
+// player sockets; a running process that killed itself over a configuration change would convert an operator
+// mistake into a player-visible outage plus an unplanned lease handover — strictly worse than the eviction
+// risk it is reacting to, and self-inflicted at the worst moment (the fleet is already under memory
+// pressure, which is why someone reached for CONFIG SET). Boot is the only place where refusing is cheap,
+// because nothing is depending on the process yet.
+func (r *Redis) WatchEvictionPolicy(ctx context.Context) {
+	t := time.NewTicker(evictionRecheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// Bounded, so a hung Redis cannot wedge this goroutine; the next tick simply tries again.
+			c, cancel := context.WithTimeout(ctx, 3*time.Second)
+			r.CheckEvictionPolicy(c)
+			cancel()
+		}
+	}
 }
 
 // evictionPolicy reads the server's maxmemory-policy, trying CONFIG GET first and falling back to
