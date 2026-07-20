@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/double-nibble/telosmud/internal/luasandbox"
 )
 
 // luaentry.go — the entry-point INVOCATION CORE (docs/PHASE7-PLAN.md slice 7.4, §1.1, §4): the
@@ -48,11 +50,15 @@ func (rt *luaRuntime) compileChunk(origin, src string) (*compiledChunk, error) {
 	fn, err := rt.L.Load(strings.NewReader(src), origin)
 	if err != nil {
 		// Fail-closed: a syntactically-broken body compiles to nothing; the def stays inert.
-		rt.log.Warn("lua compile failed; def left inert", "origin", origin, "err", err.Error())
+		// Cap the builder-controlled parser error: a bare huge string-literal / adjacent huge identifiers
+		// make gopher-lua echo the offending token verbatim, so an uncapped log/echo here is a source-size
+		// (MB) write to the log store and to staff terminals on every recompile — the same class #456 bounds
+		// for the runtime sinks, via the compile channel (#456 review follow-up).
+		rt.log.Warn("lua compile failed; def left inert", "origin", origin, "err", luasandbox.CapLogMsg(err.Error()))
 		// #116: a compile error is the highest-value builder signal — the script never runs, so no RUNTIME
 		// error site would ever fire; without this the broken def is silently inert. Echo it to watching staff.
 		if rt.zone != nil {
-			rt.zone.echoDebug(fmt.Sprintf("lua compile error [%s]: %v", origin, err))
+			rt.zone.echoDebug(fmt.Sprintf("lua compile error [%s]: %s", origin, luasandbox.CapLogMsg(err.Error())))
 		}
 		return nil, fmt.Errorf("lua compile %s: %w", origin, err)
 	}
@@ -84,7 +90,7 @@ func (rt *luaRuntime) chunkFor(key, src string) *compiledChunk {
 		// def on a broken edit). Record the new (bad) src so we don't re-attempt every call, but
 		// leave prev.chunk in place so the old behavior persists until the edit is fixed.
 		rt.log.Warn("lua recompile failed; keeping last-good chunk (broken edit ignored)",
-			"key", key, "err", err.Error())
+			"key", key, "err", luasandbox.CapLogMsg(err.Error())) // #456: builder-controlled parser error, capped
 		prev.src = src // remember the bad source so a re-call with the same bad src doesn't recompile
 		return prev.chunk
 	}

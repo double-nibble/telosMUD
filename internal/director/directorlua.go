@@ -247,7 +247,9 @@ func (d *Director) withScript(key, script string) *Director {
 	}
 	ld, err := newLuaDirector(d.log, key, script)
 	if err != nil {
-		d.log.Error("director script compile failed; this scope runs without orchestration", "script", key, "err", err)
+		// #456: cap the builder-controlled parser error (a huge string-literal / identifier makes the fork
+		// echo the token verbatim) so a compile failure can't write a source-size line to the ops log.
+		d.log.Error("director script compile failed; this scope runs without orchestration", "script", key, "err", luasandbox.CapLogMsg(err.Error()))
 		return d
 	}
 	d.log.Info("director script loaded; orchestration active", "script", key)
@@ -354,9 +356,18 @@ func (ld *luaDirector) luaBroadcast(L *lua.LState) int {
 	return 0
 }
 
-// luaLog: director.log(msg) — a structured info log (the director's print-with-context).
+// luaLog: director.log(msg) — a structured info log (the director's print-with-context). Length- and
+// rate-bounded (#456): the message is clamped to MaxLogMsgBytes, the call is accounted against the
+// runtime's per-call log budget (over the cap it aborts + feeds the breaker), and it is labelled
+// source=builder_lua so ops can route content output separately from engine logs. The director is a
+// single process with a wider blast radius than a per-zone VM, so bounding it matters as much here.
 func (ld *luaDirector) luaLog(L *lua.LState) int {
-	ld.log.Info("director script", "msg", L.CheckString(1))
+	msg := luasandbox.CapLogMsg(L.CheckString(1))
+	ld.rt.NoteLogLine(L) // per-call cap — may abort over the per-call cap
+	if !ld.rt.AllowLogLine() {
+		return 0 // sustained-rate bound (#456): drop this line
+	}
+	ld.log.Info("director script", "source", "builder_lua", "msg", msg)
 	return 0
 }
 

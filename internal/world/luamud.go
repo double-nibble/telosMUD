@@ -1,6 +1,7 @@
 package world
 
 import (
+	"github.com/double-nibble/telosmud/internal/luasandbox"
 	"github.com/double-nibble/telosmud/internal/textsan"
 	lua "github.com/yuin/gopher-lua"
 )
@@ -107,6 +108,19 @@ func (rt *luaRuntime) installMudTable() {
 // entry-point call gets the full per-call spawn cap (mirrors ResetInstructionCount).
 func (rt *luaRuntime) resetSpawnBudget() { rt.spawnThisCall = 0 }
 
+// noteLuaLog accounts one builder log line against the per-call budget (#456). Over
+// luasandbox.MaxLogsPerCall it raises a flood error, which unwinds through pcallGuarded and is
+// classified as a logic abort (the heaviest breaker weight) — a script that floods every call is
+// quarantined, not merely throttled. Call it BEFORE emitting so the (cap+1)th line aborts rather
+// than being written. The budget resets at the chokepoint; nested calls share it (a script cannot
+// re-nest to reset its log tally — the same discipline as the instruction/spawn budgets).
+func (rt *luaRuntime) noteLuaLog(l *lua.LState) {
+	rt.logsThisCall++
+	if rt.logsThisCall > luasandbox.MaxLogsPerCall {
+		l.RaiseError("%s", luasandbox.LogFloodError().Error())
+	}
+}
+
 // --- RNG + clock (T9 / T2) ----------------------------------------------------------------
 
 // mudRandom mirrors mud.random()/(n)/(m,n) drawing the per-zone seeded RNG (T9). Same
@@ -183,16 +197,21 @@ func (rt *luaRuntime) mudZone(l *lua.LState) int {
 // mud.log(level, msg) with level one of "debug"/"info"/"warn"/"error" (default info).
 func (rt *luaRuntime) mudLog(l *lua.LState) int {
 	level := l.OptString(1, "info")
-	msg := l.CheckString(2)
+	msg := luasandbox.CapLogMsg(l.CheckString(2)) // length bound (#456)
+	rt.noteLuaLog(l)                              // per-call cap (#456) — may abort over the per-call cap
+	if !rt.logLimiter.Allow() {
+		return 0 // sustained-rate bound (#456): drop this line
+	}
+	// source=builder_lua so ops can route/filter content output independently of engine logs (#456).
 	switch level {
 	case "debug":
-		rt.log.Debug("lua log", "msg", msg)
+		rt.log.Debug("lua log", "source", "builder_lua", "msg", msg)
 	case "warn":
-		rt.log.Warn("lua log", "msg", msg)
+		rt.log.Warn("lua log", "source", "builder_lua", "msg", msg)
 	case "error":
-		rt.log.Error("lua log", "msg", msg)
+		rt.log.Error("lua log", "source", "builder_lua", "msg", msg)
 	default:
-		rt.log.Info("lua log", "msg", msg)
+		rt.log.Info("lua log", "source", "builder_lua", "msg", msg)
 	}
 	return 0
 }

@@ -33,6 +33,15 @@ type Runtime struct {
 	// Per-runtime rather than package-global so a host can tune it without changing it for every other
 	// sandbox in the process.
 	callDeadline time.Duration
+
+	// logsThisCall counts builder log lines (print / director.log) emitted in the CURRENT top-level
+	// invocation. Reset at the chokepoint (call), incremented by noteLogLine; over MaxLogsPerCall the
+	// next log call raises LogFloodError, aborting the invocation and feeding the breaker (#456).
+	logsThisCall int
+
+	// logLimiter bounds SUSTAINED builder-log volume (across calls/timers) — the per-call cap only
+	// bounds one frame. Excess lines are dropped (#456).
+	logLimiter *LogRateLimiter
 }
 
 // NewRuntime builds a Runtime over a fresh sandboxed LState. printTarget, if non-empty, routes the script's
@@ -49,22 +58,49 @@ func NewRuntime(log *slog.Logger, opts Opts) *Runtime {
 		// Resolved once here rather than read per call: the deadline is a property of how this runtime was
 		// configured, and re-deriving it on the hot path would invite a future reader to make it mutable.
 		callDeadline: time.Duration(ClampCallDeadlineMS(opts.CallDeadlineMS)) * time.Millisecond,
+		logLimiter:   NewLogRateLimiter(nil),
 	}
 	rt.L = New(opts)
 	// Route the script's `print` to the runtime logger. New installed a no-op print (the LFunction can't be
 	// built before the state exists); override it now with a structured-log redirect. The globals table
 	// itself is not read-only (only the string/table/math proxies are), so SetGlobal is permitted.
 	rt.L.SetGlobal("print", rt.L.NewFunction(func(l *lua.LState) int {
+		rt.NoteLogLine(l) // per-call cap (#456) — may abort the invocation over the per-call cap
+		if !rt.logLimiter.Allow() {
+			return 0 // sustained-rate bound (#456): drop this line
+		}
 		n := l.GetTop()
 		parts := make([]string, 0, n)
 		for i := 1; i <= n; i++ {
 			parts = append(parts, l.ToStringMeta(l.Get(i)).String())
 		}
-		rt.log.Info("lua print", "msg", strings.Join(parts, " "))
+		// source=builder_lua labels content-authored output so ops can route/filter it independently
+		// of engine logs (short retention), rather than have it crowd the engine's stream (#456).
+		rt.log.Info("lua print", "source", "builder_lua", "msg", CapLogMsg(strings.Join(parts, " ")))
 		return 0
 	}))
 	return rt
 }
+
+// NoteLogLine accounts one builder log line against the per-call budget and, over MaxLogsPerCall,
+// raises LogFloodError — which unwinds through PCall and is classified/weighted by the breaker (a
+// script that floods every call is quarantined). Call it BEFORE emitting, so the (cap+1)th line
+// aborts rather than being written. Exported so a host that registers its OWN log builtin into this
+// runtime (the director's director.log) shares the same per-call budget as the built-in print (#456).
+func (rt *Runtime) NoteLogLine(L *lua.LState) {
+	rt.logsThisCall++
+	if rt.logsThisCall > MaxLogsPerCall {
+		L.RaiseError("%s", LogFloodError().Error())
+	}
+}
+
+// AllowLogLine consumes one token from the sustained-rate limiter, returning false when a host log
+// builtin (the director's director.log) should DROP its line. Exported so a host that registers its
+// own log sink into this runtime shares the same per-runtime rate bound as the built-in print (#456).
+func (rt *Runtime) AllowLogLine() bool { return rt.logLimiter.Allow() }
+
+// LogLinesDropped is the cumulative count of builder log lines dropped by the rate limit (a metric).
+func (rt *Runtime) LogLinesDropped() int64 { return rt.logLimiter.Dropped() }
 
 // Close tears down the VM.
 func (rt *Runtime) Close() {
@@ -165,6 +201,7 @@ func (rt *Runtime) call(breakerKey, origin string, nargs, nret int) error {
 	defer cancel()
 	L.SetContext(ctx)
 	L.ResetInstructionCount()
+	rt.logsThisCall = 0 // reset the per-call builder-log budget alongside the instruction budget (#456)
 	// Deferred disarm (matches the zone chokepoint): if a Go panic escapes PCall, the context is still
 	// cleared so a since-cancelled context is never left armed on the shared LState.
 	defer L.RemoveContext()
@@ -174,7 +211,11 @@ func (rt *Runtime) call(breakerKey, origin string, nargs, nret int) error {
 		rt.breaker.record(rt.log, breakerKey, origin, kind)
 	}
 	if err != nil {
-		return fmt.Errorf("lua run %s: %w", origin, err)
+		// Cap the rendered error at the source (#456): a builder controls the Lua error message via
+		// error(msg), and OnSignal logs this err.Error() to the ops log. Without the cap a director
+		// script could error() a multi-megabyte string into the log store every signal. %w is dropped
+		// deliberately (nothing unwraps these; callers only log/nil-check).
+		return fmt.Errorf("lua run %s: %s", origin, CapLogMsg(err.Error()))
 	}
 	return nil
 }
