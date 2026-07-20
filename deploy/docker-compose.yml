@@ -18,7 +18,12 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-telos}
       POSTGRES_DB: ${POSTGRES_DB:-telosmud}
     ports:
-      - "5432:5432"
+      # Publish to HOST LOOPBACK only — this dev DB ships with the well-known default creds (telos:telos)
+      # and holds accounts + world state, so an off-host bind is a trivial credentialed read/write. Containers
+      # reach it by service name (postgres:5432) over the compose network, so this only removes off-host reach;
+      # host-side tooling still works — the Makefile's gated tests use TELOS_TEST_DSN=...@localhost:5432. Matches
+      # the gate's loopback precedent below. (#455)
+      - "127.0.0.1:5432:5432"
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
@@ -41,7 +46,11 @@ services:
     # "Read this before setting noeviction".
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports:
-      - "6379:6379"
+      # Publish to HOST LOOPBACK only — this Redis runs with NO auth and holds the coordination state above
+      # (lease generations, the director's leader lease, shard registrations). Off-host that is an unauthenticated
+      # read/write/FLUSHALL: forging or evicting any of those keys corrupts the cluster, not just a cache. Containers
+      # reach it by service name (redis:6379), so this only removes off-host reach. Matches the loopback precedent. (#455)
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -242,7 +251,11 @@ services:
       TELOS_WEB_SECURE_COOKIES: "0" # dev serves over plain http://localhost; prod (TLS) keeps the secure-by-default
       DEBUG: true
     ports:
-      - "8080:8080" # website: open http://localhost:8080 to sign in
+      # Publish to HOST LOOPBACK only. The website is the GitHub sign-in + dashboard + link-code bridge; off-host
+      # it exposes the auth surface (device-auth flow, the "Play" link-code mint) and, with dev secure-cookies
+      # disabled, session cookies over plain http. The gate reaches the account gRPC API by service name
+      # (account:9100, expose-only), not this port; browser sign-in is host-local (http://localhost:8080). (#455)
+      - "127.0.0.1:8080:8080" # website: open http://localhost:8080 to sign in
     expose:
       - "9100"
     depends_on:
@@ -317,7 +330,11 @@ services:
       TELOS_ZONES: midgaard
       DEBUG: true
     ports:
-      - "4001:4001" # telnet: connect with `telnet localhost 4001`, then enter your link code
+      # Publish to HOST LOOPBACK only, matching the plain gate's :4000 precedent above. This is an unencrypted
+      # plaintext telnet listener (TELOS_GATE_ALLOW_PLAINTEXT=1) carrying link codes / passphrases in the clear,
+      # so an off-host bind would leak credentials on the wire. The smoke harness connects host-side
+      # (GATE_HOST=localhost:4001), so this is unaffected. (#455)
+      - "127.0.0.1:4001:4001" # telnet: connect with `telnet localhost 4001`, then enter your link code
     depends_on:
       world:
         condition: service_started
