@@ -166,11 +166,18 @@ type luaRuntime struct {
 	// goroutine only.
 	spawnThisCall int
 
-	// logsThisCall is the per-CALL builder-log line count (#456): print + mud.log lines emitted in the
-	// CURRENT entry-point call, reset at the chokepoint alongside spawnThisCall. Over
+	// logsThisCall is the per-FRAME builder-log line count (#456): print + mud.log lines emitted in the
+	// CURRENT invocation frame, reset at the chokepoint (every frame, nested included — so a flood abort
+	// is charged to the flooding script's own breaker key, not a co-firing sibling's). Over
 	// luasandbox.MaxLogsPerCall the next log call raises a flood error, aborting the invocation and
-	// feeding the breaker so a script that floods every call is quarantined. Zone goroutine only.
+	// feeding the breaker so a script that floods a single call is quarantined. The cross-call/nested
+	// volume bound is logLimiter, which nesting cannot reset. Zone goroutine only.
 	logsThisCall int
+
+	// logLimiter bounds SUSTAINED builder-log volume for this zone (across calls, nested frames, and
+	// mud.after timers) in wall-clock time — the per-frame cap alone does not bound the call RATE.
+	// Excess builder log lines are dropped (#456). Zone goroutine only.
+	logLimiter *luasandbox.LogRateLimiter
 
 	// chunkGen is the runtime's current chunk generation — the hot-reload drop seam a mud.after
 	// timer captures at scheduling time so a callback bound to a swapped chunk is dropped on
@@ -322,6 +329,7 @@ func newLuaRuntime(zoneID string, log *slog.Logger) *luaRuntime {
 		chunks:        map[string]*chunkCacheEntry{},
 		entityScripts: map[RuntimeID]*entityScript{},
 		breakers:      map[string]*breakerState{},
+		logLimiter:    luasandbox.NewLogRateLimiter(nil),
 	}
 
 	rt.installSandbox()
@@ -897,7 +905,10 @@ func (rt *luaRuntime) luaMathRandom(L *lua.LState) int {
 // space (Lua print semantics) and logs at info. The full mud.log with levels lands in 7.3b;
 // here it proves the redirect and the bare-engine log path.
 func (rt *luaRuntime) luaPrint(L *lua.LState) int {
-	rt.noteLuaLog(L) // length/rate bound (#456) — may abort the invocation over the per-call cap
+	rt.noteLuaLog(L) // per-call cap (#456) — may abort the invocation over the per-call cap
+	if !rt.logLimiter.Allow() {
+		return 0 // sustained-rate bound (#456): drop this line
+	}
 	n := L.GetTop()
 	parts := make([]string, 0, n)
 	for i := 1; i <= n; i++ {

@@ -198,7 +198,10 @@ func (rt *luaRuntime) mudZone(l *lua.LState) int {
 func (rt *luaRuntime) mudLog(l *lua.LState) int {
 	level := l.OptString(1, "info")
 	msg := luasandbox.CapLogMsg(l.CheckString(2)) // length bound (#456)
-	rt.noteLuaLog(l)                              // rate bound (#456) — may abort over the per-call cap
+	rt.noteLuaLog(l)                              // per-call cap (#456) — may abort over the per-call cap
+	if !rt.logLimiter.Allow() {
+		return 0 // sustained-rate bound (#456): drop this line
+	}
 	// source=builder_lua so ops can route/filter content output independently of engine logs (#456).
 	switch level {
 	case "debug":

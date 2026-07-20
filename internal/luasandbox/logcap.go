@@ -2,6 +2,7 @@ package luasandbox
 
 import (
 	"fmt"
+	"time"
 	"unicode/utf8"
 )
 
@@ -26,11 +27,72 @@ const (
 	// diagnostic; anything larger is a report the log is the wrong channel for.
 	MaxLogMsgBytes = 1024
 
-	// MaxLogsPerCall caps builder log lines emitted within one top-level invocation (a hook/event/
-	// tick call). Generous — legitimate content rarely logs more than a handful per call — so
-	// crossing it is a clear flood signal. The (cap+1)th call aborts the invocation.
+	// MaxLogsPerCall caps builder log lines emitted within one FRAME (a hook/event/tick call).
+	// Generous — legitimate content rarely logs more than a handful per call — so crossing it is a
+	// clear flood signal. The (cap+1)th call aborts the invocation and feeds the breaker.
 	MaxLogsPerCall = 200
+
+	// MaxLogLinesPerSec bounds SUSTAINED builder-log volume per runtime (per zone / per director) in
+	// wall-clock time. The per-call cap bounds a single frame; it does NOT bound the call RATE — a
+	// self-rescheduling mud.after timer (≈4 fires/sec) or many co-firing timers can emit a per-call
+	// burst every tick forever, which is a disk-fill / ingest-flood DoS against the whole node (the
+	// game shares it; k3s local-path PVCs don't enforce size). This token-bucket DROPS builder log
+	// lines past the rate so sustained volume is hard-bounded (~50 lines × ~1KB = ~50KB/s/runtime)
+	// regardless of how many calls or nested frames produce them (#456).
+	MaxLogLinesPerSec = 50
 )
+
+// LogRateLimiter is a wall-clock token bucket bounding sustained builder-log volume per runtime. Burst
+// is MaxLogsPerCall (a single legitimate call may emit up to a full per-call burst); it refills at
+// MaxLogLinesPerSec. Not goroutine-safe: a runtime is driven from one serialized goroutine. The clock
+// is injectable for deterministic tests (nil => time.Now). Log volume is not gameplay state, so using
+// wall-clock here — as the sandbox deadline already does — does not affect replay determinism.
+type LogRateLimiter struct {
+	now     func() time.Time
+	tokens  float64
+	last    time.Time
+	dropped int64
+}
+
+// NewLogRateLimiter builds a full bucket. now may be nil (=> time.Now); tests inject a fake clock.
+func NewLogRateLimiter(now func() time.Time) *LogRateLimiter {
+	if now == nil {
+		now = time.Now
+	}
+	return &LogRateLimiter{now: now, tokens: MaxLogsPerCall, last: now()}
+}
+
+// Allow refills by elapsed wall time (capped at the burst) and takes one token. It returns true if a
+// token was available (log the line) or false if the bucket is empty (DROP the line); a drop is
+// counted. A nil limiter allows everything (a runtime built without one is unbounded — never in prod).
+func (l *LogRateLimiter) Allow() bool {
+	if l == nil {
+		return true
+	}
+	t := l.now()
+	if elapsed := t.Sub(l.last).Seconds(); elapsed > 0 {
+		l.tokens += elapsed * MaxLogLinesPerSec
+		if l.tokens > MaxLogsPerCall {
+			l.tokens = MaxLogsPerCall
+		}
+		l.last = t
+	}
+	if l.tokens >= 1 {
+		l.tokens--
+		return true
+	}
+	l.dropped++
+	return false
+}
+
+// Dropped is the cumulative count of builder log lines dropped by the rate limit — surfaced as a
+// metric so an operator can see a script being throttled.
+func (l *LogRateLimiter) Dropped() int64 {
+	if l == nil {
+		return 0
+	}
+	return l.dropped
+}
 
 // logTruncationMarker is appended to a message clipped by CapLogMsg so a reader can tell the line
 // was cut rather than genuinely ending there.

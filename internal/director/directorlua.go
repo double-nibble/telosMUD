@@ -361,7 +361,10 @@ func (ld *luaDirector) luaBroadcast(L *lua.LState) int {
 // single process with a wider blast radius than a per-zone VM, so bounding it matters as much here.
 func (ld *luaDirector) luaLog(L *lua.LState) int {
 	msg := luasandbox.CapLogMsg(L.CheckString(1))
-	ld.rt.NoteLogLine(L) // may abort over the per-call cap
+	ld.rt.NoteLogLine(L) // per-call cap — may abort over the per-call cap
+	if !ld.rt.AllowLogLine() {
+		return 0 // sustained-rate bound (#456): drop this line
+	}
 	ld.log.Info("director script", "source", "builder_lua", "msg", msg)
 	return 0
 }

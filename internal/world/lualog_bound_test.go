@@ -5,9 +5,71 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/double-nibble/telosmud/internal/luasandbox"
 )
+
+// TestLuaLogSustainedRateLimited: the per-call cap bounds one call, but SUSTAINED logging across many
+// calls (the mud.after-timer disk-fill vector) is bounded by the wall-clock rate limiter — excess
+// lines are dropped, not emitted. Uses an injected frozen clock so the bound is deterministic.
+func TestLuaLogSustainedRateLimited(t *testing.T) {
+	z := newZone("lograte")
+	rt := z.lua
+	buf := captureRuntimeLog(rt)
+
+	base := time.Unix(1000, 0)
+	now := base
+	rt.logLimiter = luasandbox.NewLogRateLimiter(func() time.Time { return now })
+
+	// Each call logs 100 lines — UNDER the per-call cap (200), so no call aborts; only the sustained
+	// rate limit can bound this. 10 calls = 1000 attempts with the clock frozen.
+	ch, err := rt.compileChunk("formula:rate", `for i = 1, 100 do mud.log("info", "x") end`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv := &luaInvocation{}
+	for i := 0; i < 10; i++ {
+		if err := rt.invoke(ch, inv, nil); err != nil {
+			t.Fatalf("under-per-call-cap logging must not abort (call %d): %v", i, err)
+		}
+	}
+	emitted := strings.Count(buf.String(), `msg="lua log"`)
+	if emitted > luasandbox.MaxLogsPerCall+1 {
+		t.Errorf("sustained logging not bounded: emitted %d lines, burst is %d", emitted, luasandbox.MaxLogsPerCall)
+	}
+	if rt.logLimiter.Dropped() == 0 {
+		t.Error("expected the rate limiter to have dropped lines")
+	}
+
+	// Advance the clock 1s: ~MaxLogLinesPerSec tokens refill, so ~that many more lines pass.
+	prev := emitted
+	now = base.Add(time.Second)
+	if err := rt.invoke(ch, inv, nil); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Count(buf.String(), `msg="lua log"`) - prev
+	if got == 0 || got > luasandbox.MaxLogLinesPerSec+1 {
+		t.Errorf("after a 1s refill expected ~%d more lines, got %d", luasandbox.MaxLogLinesPerSec, got)
+	}
+}
+
+// TestLuaErrorMessageCapped: a builder controls the Lua error message via error(msg); every isolated-
+// callback path logs err.Error() to the ops log. That message must be length-capped at the source so a
+// script cannot stream a multi-megabyte line into the log store through the error channel (#456).
+func TestLuaErrorMessageCapped(t *testing.T) {
+	z := newZone("errcap")
+	rt := z.lua
+	buf := captureRuntimeLog(rt)
+	ch, err := rt.compileChunk("trigger:#1", `error(string.rep("E", 500000))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rt.invoke(ch, &luaInvocation{}, nil) // errors; the isolated path logs err.Error() at Warn
+	if n := strings.Count(buf.String(), "E"); n > luasandbox.MaxLogMsgBytes+64 {
+		t.Fatalf("err.Error() not capped: %d 'E's reached the log (cap %d)", n, luasandbox.MaxLogMsgBytes)
+	}
+}
 
 // lualog_bound_test.go — #456. Builder-authored Lua logging (print / mud.log) is LENGTH-capped,
 // RATE-limited per call (over the cap the invocation aborts and feeds the breaker), and LABELLED

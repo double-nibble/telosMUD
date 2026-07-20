@@ -85,9 +85,18 @@ func (rt *luaRuntime) pcallGuarded(scriptKey, origin string, nargs, nret int) er
 		L.SetContext(ctx)
 		L.ResetInstructionCount()
 		rt.resetSpawnBudget()
-		rt.logsThisCall = 0 // reset the per-call builder-log budget alongside the instruction/spawn budgets (#456)
 		defer L.RemoveContext()
 	}
+	// The per-FRAME builder-log line cap resets EVERY frame (nested included), UNLIKE the instruction/
+	// spawn budgets which are per-cascade. A flood abort must be charged to the script that actually
+	// flooded — a per-cascade shared counter would let an earlier sibling log up to the cap, then the
+	// (cap+1)th call in a co-firing VICTIM's frame would abort and be recorded against the victim's
+	// breaker key. Resetting per frame charges each script for its own logging. The cross-call/nested
+	// VOLUME bound is logLimiter (wall-clock), which nesting cannot reset — so per-frame reset here does
+	// not reopen the disk-fill vector (#456, review finding).
+	prevLogs := rt.logsThisCall
+	rt.logsThisCall = 0
+	defer func() { rt.logsThisCall = prevLogs }()
 
 	err := L.PCall(nargs, nret, nil)
 	kind := classifyLuaError(err)
@@ -95,7 +104,13 @@ func (rt *luaRuntime) pcallGuarded(scriptKey, origin string, nargs, nret int) er
 		rt.breakerRecord(scriptKey, origin, kind)
 	}
 	if err != nil {
-		return fmt.Errorf("lua run %s: %w", origin, err)
+		// Cap the rendered error at the source: a builder controls the Lua error message via
+		// error(msg), and every isolated-callback path logs this err.Error() to the ops log. Without
+		// this a script could error(string.rep(..., 8MB)) and stream an uncapped line into the log
+		// store on every call — the same disk-fill/poisoning vector #456 bounds for the log sinks, via
+		// the error channel. %w is dropped deliberately (nothing unwraps these; callers only log or
+		// nil-check), so the capped string is what any downstream err.Error() renders (#456).
+		return fmt.Errorf("lua run %s: %s", origin, luasandbox.CapLogMsg(err.Error()))
 	}
 	return nil
 }
@@ -152,6 +167,7 @@ func (rt *luaRuntime) reportMemoryMetric() int {
 		"breakers_tripped", tripped, // quarantined scripts
 		"timers_live", rt.luaTimersLive, // live mud.after wheel entries
 		"spawns_live", rt.luaSpawnsLive, // live Lua-spawned population
+		"builder_logs_dropped", rt.logLimiter.Dropped(), // #456: builder log lines dropped by the sustained-rate limit
 	)
 	return regCap
 }
