@@ -4,8 +4,14 @@
 # Fails if a sensitive key name is used as a structured-log key in a logging call. The VALUES behind
 # these keys are verbatim player text (a tell/say body, a mistyped link code) or credentials, and
 # once container stdout is shipped into Loki (Observability 2) a log line is a durable, indexed,
-# queryable archive. This guard makes "no raw input / secret in the logs" an enforced invariant, not
-# a convention that erodes.
+# queryable archive.
+#
+# This is a DEFENSE-IN-DEPTH BACKSTOP, not a complete invariant. It catches the common regression —
+# a listed key reintroduced on a single-line log call — but it is deliberately NOT exhaustive: it
+# does not know a value's provenance, so a sensitive value logged under an unlisted key (e.g. "msg",
+# "name", "code"), built into the message string via fmt.Sprintf, or split onto its own line will
+# pass. The real invariant is the reviewed gating of raw-input sites behind TELOS_LOG_RAW_INPUT; this
+# guard just makes the cheap, mechanical class fail fast.
 #
 # The only legitimate sites log the raw input line, and do so ONLY behind the explicit
 # TELOS_LOG_RAW_INPUT opt-in (separate from DEBUG). Those lines are annotated with `logkey-ok` and a
@@ -17,7 +23,7 @@ set -euo pipefail
 
 # Sensitive slog KEYS. Anchored to the double-quoted key form so struct tags (`json:"body"`) and map
 # literals (`"text":`) do not match — only a positional slog arg `"key", value` / `"key")` does.
-keys='line|body|text|token|secret|assertion'
+keys='line|body|text|token|secret|assertion|keywords'
 
 # A structured-log call on the line.
 logcall='\.(Debug|Info|Warn|Error|Debugf|Infof|Warnf|Errorf|DebugContext|InfoContext|WarnContext|ErrorContext)\('

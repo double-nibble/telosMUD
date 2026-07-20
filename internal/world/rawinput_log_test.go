@@ -14,7 +14,10 @@ import (
 // is deliberately separate from DEBUG. These tests drive the real dispatch path and assert the
 // secret is absent by default and present under the opt-in.
 
-const rawSecret = "my-link-code-8F3K2" // stands in for a tell body / a mistyped credential
+// rawSecret stands in for a tell body / a mistyped credential. Deliberately lowercase: the unknown-verb
+// and targeting paths lower-case player input, so a lowercase token survives those transforms and a leak
+// there is still caught by a substring check (a mixed-case token would be mangled and hide the leak).
+const rawSecret = "my-link-code-8f3k2"
 
 // captureZoneLog swaps z.log for a Debug-level text handler writing to buf, so every line the zone
 // emits is observable. It returns buf for inspection.
@@ -29,8 +32,9 @@ func captureZoneLog(z *Zone) *bytes.Buffer {
 // pre-dispatch site fires) or a RESOLVED verb (both fire).
 func TestRawInputRedactedByDefault(t *testing.T) {
 	for _, line := range []string{
-		"frobnicate " + rawSecret, // unknown verb -> pre-dispatch site only
-		"look " + rawSecret,       // resolved verb -> pre-dispatch + dispatch sites
+		"frobnicate " + rawSecret, // unknown verb (multi-token) -> pre-dispatch + unknown-verb sites
+		rawSecret,                 // single-token paste (a link code) -> the unknown-verb `verb` IS the token
+		"look " + rawSecret,       // resolved verb -> pre-dispatch + dispatch + targeting sites
 		"say " + rawSecret,        // resolved verb with a body (the tell/chat case)
 	} {
 		z, _, room := harmZone(t)
@@ -72,6 +76,17 @@ func TestRawInputLoggedUnderOptIn(t *testing.T) {
 	if got := buf2.String(); !strings.Contains(got, rawSecret) {
 		t.Errorf("opt-in ON: dispatch site should log the raw line, got:\n%s", got)
 	}
+
+	// Single-token paste: under the opt-in the unknown-verb site logs the token itself (the escape
+	// hatch for a bug hunt); by default (tested above) it logs only verb_len.
+	z3, _, room3 := harmZone(t)
+	z3.logRawInput = true
+	buf3 := captureZoneLog(z3)
+	harmPlayer(z3, room3, "Cara")
+	z3.handleInput(inputMsg{id: "Cara", line: rawSecret})
+	if got := buf3.String(); !strings.Contains(got, rawSecret) {
+		t.Errorf("opt-in ON: unknown-verb site should log the pasted token, got:\n%s", got)
+	}
 }
 
 // TestNewZoneWiresRawInputFromEnv: construction reads the opt-in from TELOS_LOG_RAW_INPUT (and
@@ -86,6 +101,31 @@ func TestNewZoneWiresRawInputFromEnv(t *testing.T) {
 	t.Setenv("TELOS_LOG_RAW_INPUT", "1")
 	if z := newZone("wire-on"); !z.logRawInput {
 		t.Error("TELOS_LOG_RAW_INPUT=1 should enable logRawInput at construction")
+	}
+}
+
+// TestAbilityCastArgRedaction: the ability-invoke log carries the cast line's verbatim tail (`arg`),
+// which is player input. It must be redacted by default and present under the opt-in.
+func TestAbilityCastArgRedaction(t *testing.T) {
+	// Default OFF: the arg must not appear.
+	z, caster := abilityTestZone(t)
+	z.logRawInput = false
+	buf := captureZoneLog(z)
+	z.castAbility(caster, z.defs.ability.get("fireball"), rawSecret, z.combatRng())
+	if got := buf.String(); strings.Contains(got, rawSecret) {
+		t.Errorf("ability cast leaked the raw arg (opt-in OFF):\n%s", got)
+	}
+	if got := buf.String(); !strings.Contains(got, "ability lifecycle: invoke") {
+		t.Errorf("ability invoke flow log missing; redaction dropped too much:\n%s", got)
+	}
+
+	// Opt-in ON: the arg reappears.
+	z2, caster2 := abilityTestZone(t)
+	z2.logRawInput = true
+	buf2 := captureZoneLog(z2)
+	z2.castAbility(caster2, z2.defs.ability.get("fireball"), rawSecret, z2.combatRng())
+	if got := buf2.String(); !strings.Contains(got, rawSecret) {
+		t.Errorf("opt-in ON: ability cast should log the raw arg:\n%s", got)
 	}
 }
 
