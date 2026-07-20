@@ -94,10 +94,16 @@ func TestAllocBudgetBoundsActualAllocation(t *testing.T) {
 	const bomb = `local s = string.rep("x", 1048576)
 for i = 1, 40 do s = s .. s end`
 
+	// A TIGHT armed budget (1 MiB, not the 8 MiB default) so the armed figure is bounded by the CAP and stays
+	// small and machine-independent, while the disarmed figure is bounded by the DEADLINE and therefore scales
+	// with how fast the box is. Comparing a cap-bound number against a time-bound one is what made the first
+	// version of this test flaky: it passed locally at 8 GB vs 7 MB and failed on CI at 31 MB vs 7 MB.
 	measure := func(arm bool) float64 {
 		L := New(Opts{})
 		defer L.Close()
-		if !arm {
+		if arm {
+			L.SetStringByteBudget(1 << 20)
+		} else {
 			L.SetStringByteBudget(0)
 		}
 		// SHORT, and that is about the rest of the suite rather than about this test. The disarmed half
@@ -122,7 +128,10 @@ for i = 1, 40 do s = s .. s end`
 
 	armed, disarmed := measure(true), measure(false)
 	t.Logf("armed=%.1f MB disarmed=%.1f MB", armed, disarmed)
-	if disarmed < 10*armed {
+	// 4x, not 10x. The discriminating power is at ratio ~1: a charge that is a no-op, or one levied after the
+	// allocation, makes the two runs allocate the SAME amount. A large multiple buys no extra detection and
+	// only couples the test to how fast the machine is.
+	if disarmed < 4*armed {
 		t.Fatalf("the budget did not meaningfully bound allocation: armed %.1f MB vs disarmed %.1f MB. A "+
 			"charge that is a no-op — or one levied after the allocation — produces exactly this", armed, disarmed)
 	}
