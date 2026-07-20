@@ -267,6 +267,28 @@ func (b *NATSJetStream) handleParkAdvisory(data []byte) {
 	notifyParkObserver(b.name, adv.Consumer, adv.StreamSeq)
 }
 
+// noteStallIfCrossed records the stall early-warning when this delivery is the one that crosses the
+// threshold (#390). A METHOD on the handle, for the same reason handleParkAdvisory is one: the production
+// emitter is then reachable from a hermetic test. Wiring it only as an inline block in the consume
+// callback left the whole production path unpinned — the block could be deleted and every test stayed
+// green, because the hermetic tier drives the in-memory stand-in's separate copy of the logic.
+//
+// It matters most for WORLD_EVENTS, and the reason is MaxAckPending=1: a stalled message blocks EVERY
+// later message on its consumer for the whole window, and WORLD_EVENTS has one consumer per SCOPE for the
+// entire fleet. So the real incident is not "a message is being retried" — it is "this scope's
+// orchestration has applied nothing for N seconds", which is why the log carries the subject and the
+// counter does not.
+func (b *NATSJetStream) noteStallIfCrossed(subject, consumerID string, msg Message, attempt int) {
+	if !stalled(attempt) {
+		return
+	}
+	noteStall(b.name, subject, attempt)
+	b.log.Warn("durable message STALLED — it is being redelivered and, under MaxAckPending=1, is blocking "+
+		"every later message on this consumer until it lands or parks",
+		"subject", subject, "consumer", consumerID, "author", msg.AuthorID, "seq", msg.Seq,
+		"attempt", attempt, "parks_after", DefaultMaxDeliver, "window", totalNakWindow())
+}
+
 // notifyParkObserver invokes the test seam if one is set (see parkAdvisoryObserver).
 func notifyParkObserver(streamName, consumer string, streamSeq uint64) {
 	if obs := parkAdvisoryObserver.Load(); obs != nil {
@@ -348,6 +370,20 @@ func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, b
 			}
 			attempt = int(nd) //nolint:gosec // clamped to maxAttemptClamp (< MaxInt32) on the line above
 		}
+		// The EARLY WARNING (#390) fires HERE — on the crossing DELIVERY, before the handler runs — not
+		// inside the RetryTransient arm below. Two reasons, both found by review:
+		//
+		//   - Arm-conditioning made the equality predicate skippable. attempt crosses the threshold exactly
+		//     once, so if that particular delivery was resolved by any OTHER arm (a poison drop, or an ack
+		//     whose delivery the broker then re-tried anyway), the crossing was consumed and the stall was
+		//     never counted — while the message went on to park. A message could be reported as PARKED with
+		//     no stall warning ever emitted.
+		//   - It also makes the code mean what the metric's docstring says: "a 4th delivery occurred",
+		//     rather than "a 4th delivery occurred AND that delivery also transient-failed".
+		//
+		// Firing before the handler also warns at the START of the crossing attempt rather than after it,
+		// which under a slow handler is the difference between warning now and warning up to AckWait later.
+		b.noteStallIfCrossed(m.Subject(), consumerID, msg, attempt)
 		switch handler(msg, backlog) {
 		case AckDelivered:
 			_ = m.Ack()

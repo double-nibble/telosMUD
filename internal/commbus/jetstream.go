@@ -4,8 +4,15 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/double-nibble/telosmud/internal/metrics"
 )
+
+// memStreamName labels the stall counter for the in-memory stand-in. It is deliberately distinct from the
+// real stream names so a metric scraped from a test harness can never be mistaken for production traffic.
+const memStreamName = "MEM"
 
 // jetstream.go is the DURABLE comms transport for Phase-8 slice 8.5 (docs/PHASE8-PLAN.md, OQ-1 =
 // DURABLE-ALWAYS): every tell is a JetStream message, and "online delivery" is just a fast durable
@@ -104,6 +111,50 @@ const (
 	// redelivers and spends no budget.
 	DropPoison
 )
+
+// stallAttempt is the delivery attempt at which a message is considered STUCK rather than merely retrying
+// (#390). A park is permanent loss that has ALREADY happened; the actionable window is the ~164s before
+// it, and this is where that window is announced.
+//
+// 5 is chosen against NakBackoff's own documented schedule, not picked round: "a cross-shard handoff
+// (sub-second) clears by attempt 2; a NATS/gate bus blip (seconds) by attempt 4". So attempt 5 is the
+// first delivery that is NOT explained by a transient the redelivery budget exists to absorb. Firing
+// earlier would alert on the design working as intended.
+//
+// The threshold is read against DELIVERIES, not failures — the hook fires on the crossing delivery before
+// the handler runs (see the placement comment in jetstream_nats.go), so a message that needed a 5th
+// delivery is reported even if that delivery then succeeds. That is the honest reading: under
+// MaxAckPending=1 the consumer was head-of-line blocked for those 14.2s whether or not the last try
+// worked, and for WORLD_EVENTS that is 14.2s in which a scope applied nothing.
+//
+// 14.2s is 8.6% of the 164s redelivery window, so there is still ample room to act before the park.
+const stallAttempt = 5
+
+// stalled reports whether this attempt is the one that crosses the stall threshold. EQUALITY, not >=, and
+// that is the whole design: attempt is monotonic per message, so equality fires exactly ONCE per stalled
+// message. With >= it would fire on every attempt from 4 to 10, and the counter would conflate "one
+// message stuck badly" with "seven messages each hiccuping" — which call for opposite responses.
+func stalled(attempt int) bool { return attempt == stallAttempt }
+
+// stallObserver is the stall test-seam signature, mirroring parkObserver.
+type stallObserver func(streamName, subject string, attempt int)
+
+// stallObserverPtr, when set, is invoked for every stall crossing — a TEST SEAM, since the OTel counter is
+// not readily observable in a test. An atomic.Pointer for the same reason parkAdvisoryObserver is one: it
+// is read on a delivery goroutine while a test writes it from setup/cleanup.
+var stallObserverPtr atomic.Pointer[stallObserver]
+
+// noteStall records one message crossing the stall threshold: the counter (the alert trigger, labeled by
+// stream only) and the test seam. The paired WARN log lives at each call site, because only the call site
+// has the subject/consumer/seq context that says WHICH message on WHICH scope is wedged — and for
+// WORLD_EVENTS that is the difference between "something is blocked" and "this region's orchestration is
+// blocked". Same counter-vs-log split durable_parked_total already uses.
+func noteStall(streamName, subject string, attempt int) {
+	metrics.DurableStalled(context.Background(), streamName)
+	if obs := stallObserverPtr.Load(); obs != nil {
+		(*obs)(streamName, subject, attempt)
+	}
+}
 
 // DefaultMaxDeliver bounds redelivery of a single durable message (P8-A5): a message RetryTransient'd this
 // many times is PARKED (permanent loss — see the terminal note above), so a stuck message cannot redeliver
@@ -392,6 +443,12 @@ func (c *memConsumer) run() {
 // advancing the delivered-cursor past a pending, delay-NAK'd message.
 func (c *memConsumer) deliverBounded(msg Message, backlog bool) {
 	for attempt := 1; attempt <= DefaultMaxDeliver; attempt++ {
+		// Same placement as the real consumer: on the crossing DELIVERY, before the handler, so the
+		// crossing cannot be consumed by a non-retry arm. Wiring the hook here as well as in
+		// jetstream_nats.go is what makes the feature hermetically testable at all.
+		if stalled(attempt) {
+			noteStall(memStreamName, msg.Subject, attempt)
+		}
 		switch c.handler(msg, backlog) {
 		case AckDelivered:
 			return
