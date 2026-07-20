@@ -2,6 +2,24 @@ regions:
   - ref: heartlands
     name: The Heartlands
     zones: [midgaard, darkwood]
+    # script: this region's DIRECTOR script (#356) — the region-scoped sibling of world_script. It runs in
+    # a sandboxed Lua VM on the region director's actor goroutine, once per signal-up event a member zone
+    # sends with scope.signal_region(...). director.set writes THIS region's state (member zones see it via
+    # region:get); director.broadcast reaches only this region's zones.
+    #
+    # on_signal must be IDEMPOTENT: signal-up is at-least-once and a failed write NAKs and replays the
+    # handler, so write DERIVED values (as below) rather than a blind read-modify-write.
+    # The type check is not ceremony: payload comes from a member ZONE over an at-least-once stream, so it
+    # is caller-supplied input. Without it, a signal missing `boss` reaches director.set(key, nil), which
+    # DELETES the key — the happy path would double as a delete primitive — and a table-valued `boss` would
+    # make region:get("last_boss") return an object that breaks any content concatenating it.
+    script: |
+      function on_signal(event, payload)
+        if event == "region_boss_slain" and type(payload) == "table"
+          and type(payload.boss) == "string" then
+          director.set("last_boss", payload.boss)
+        end
+      end
 
 # tracks: content-defined advancement tracks (Phase 11.2). hero_advancement is an XP→level track: as a
 # character's xp crosses each threshold, the matching step's grant op-list runs once — bumping level + a

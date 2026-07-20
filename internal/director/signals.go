@@ -2,6 +2,8 @@ package director
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"time"
@@ -87,12 +89,26 @@ func (d *Director) scope() scopebus.Scope {
 
 // consumerID is this director's STABLE durable-consumer name (dot- and colon-free — real JetStream
 // rejects a "." in a consumer name, and we avoid ":" too). Stable per scope so a restart RESUMES from the
-// last ack rather than replaying every event (the cross-restart dedup that makes apply-once hold).
+// last ack rather than replaying every event (the cross-restart dedup that makes apply-once hold), and
+// INJECTIVE over scopes so two regions can never share one consumer.
 func (d *Director) consumerID() string {
 	if d.regionID == "" {
 		return "director-world"
 	}
-	return "director-region-" + strings.NewReplacer(".", "-", ":", "-").Replace(d.regionID)
+	// The name must be INJECTIVE over region refs, and character substitution is not (#356). Both "." and
+	// ":" are legal in a region ref, and the old rewrite mapped them both to "-" — so "heart:lands" and
+	// "heart-lands" are two distinct regions, with distinct subjects and distinct leases, that collapsed to
+	// one consumer name. Consume calls CreateOrUpdateConsumer, so the second director would UPDATE the
+	// shared consumer's filter subject to its own and both would pull from it: one region's director,
+	// running one region's script against one region's state, receiving the other's signals — and every
+	// leadership flip re-subscribes and flips the filter back, intermittently blackholing a region's stream
+	// entirely. Latent before this change, because nothing consumed region subjects at all.
+	//
+	// Hashing is injective for any ref and is inherently dot- and colon-free, which is what the substitution
+	// was there for (real JetStream rejects a "." in a consumer name). The ref is logged at subscribe time,
+	// so an operator can still map a consumer back to its region.
+	sum := sha256.Sum256([]byte(d.regionID))
+	return "director-region-" + hex.EncodeToString(sum[:8])
 }
 
 // syncScopeSubscription binds the durable signal-up consumer to LEADERSHIP: subscribe when this director
@@ -132,7 +148,7 @@ func (d *Director) subscribeSignals(ctx context.Context) {
 		return
 	}
 	d.consumer = cons
-	d.log.Debug("director: signal-up consumer started", "scope", d.scope().Label(), "consumer", d.consumerID())
+	d.log.Info("director: signal-up consumer started", "scope", d.scope().Label(), "consumer", d.consumerID())
 }
 
 // unsubscribeSignals stops the durable consumer (on losing leadership or at loop exit). Idempotent.

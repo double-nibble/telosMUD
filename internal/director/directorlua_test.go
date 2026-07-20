@@ -304,7 +304,7 @@ func TestEmptyWorldScriptIsNoop(t *testing.T) {
 
 // TestNewLuaDirectorCompileError: the constructor surfaces a compile error (used by WithWorldScript).
 func TestNewLuaDirectorCompileError(t *testing.T) {
-	ld, err := newLuaDirector(slog.Default(), "function on_signal( -- unclosed")
+	ld, err := newLuaDirector(slog.Default(), worldScriptKey, "function on_signal( -- unclosed")
 	if err == nil {
 		ld.close()
 		t.Fatal("expected a compile error")

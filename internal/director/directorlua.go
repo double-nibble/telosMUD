@@ -2,10 +2,12 @@ package director
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	lua "github.com/yuin/gopher-lua"
 
@@ -22,10 +24,33 @@ const maxScopeValueBytes = 64 * 1024
 // cannot spoof it. This is the fail-closed guard closing the trust-boundary widening (#47 security F3): the
 // director signal handler is now CONTENT, so a script must not be able to forge a reserved down-event —
 // especially scope.state.set (which a zone read-replica applies as a state delta, BYPASSING the director's
-// single-writer CAS) or a content.* pull/reload status line. Reserved:
-//   - scopebus.EventStateSet — the authoritative-state-set channel (single-writer bypass);
-//   - the content.* namespace — contentbus pull/reload result + audit events;
-//   - the director's own boss schedule signals.
+// single-writer CAS) or a content.* pull/reload status line.
+//
+// NOT A CHOKEPOINT — this is the important caveat, and it was verified against a real broker rather than
+// assumed. This guard covers the DIRECTOR-script surface only. Zone Lua's scope.signal_world /
+// signal_region (world/luascope.go enqueueScopeSignal) takes its event name straight off the Lua stack
+// with NO reserved-name check, and publishes to the SAME subjects every shard core-subscribes for
+// down-broadcasts — so a zone script can emit a reserved name directly and reach every replica without
+// passing through here at all. That is a separate, pre-existing hole in the broader and less-trusted of
+// the two content surfaces; the structural fix is to split the up/down subjects so a zone physically
+// cannot publish on the down channel. Do not read this guard as the boundary it is not.
+//
+// It is SCOPE-AGNOSTIC and must stay that way: a region script (#356) runs through this same guard, and the
+// two reservations that matter are if anything MORE important at region scope, because the zone-side
+// dispatch (world/scope.go onScopeEvent) switches on the event NAME with no scope-kind check —
+//   - scopebus.EventStateSet — reaches the zone's REGION replica and applies as a state delta, bypassing
+//     the region director's single-writer CAS exactly as it would the world's;
+//   - the content.* namespace — `content.pull.result` reaches deliverPullResult and prints an operator
+//     advisory to a named builder. A region script forging "pull v1.2.3 succeeded" at an operator is a live
+//     path, not a theoretical one.
+//
+// The other two are currently VACUOUS at region scope and are kept for uniformity, not for protection:
+//   - spawn.boss / boss.died — the spawn scheduler runs only on the world director, and a region broadcast
+//     fires on_region handlers while the spawn machinery subscribes on_world. They protect nothing today.
+//     They are reserved anyway because reservation ASYMMETRY is the worse trap: an author who learns
+//     "spawn.boss is engine-reserved" must not later find it free at region scope and build on it. This is
+//     not the Round 17 too-broad failure — that was a security subset wide enough to be unusable; this is
+//     two event names no content has reason to want.
 func reservedDownEvent(event string) bool {
 	switch event {
 	case scopebus.EventStateSet, SpawnBossEvent, BossDiedEvent:
@@ -34,11 +59,16 @@ func reservedDownEvent(event string) bool {
 	return strings.HasPrefix(event, "content.")
 }
 
-// reservedScopeKeyPrefixes are the world-scope-state key prefixes the ENGINE owns (the Go director's own
+// reservedScopeKeyPrefixes are the scope-state key prefixes the ENGINE owns (the Go director's own
 // persisted state — e.g. the spawn scheduler's per-boss next-spawn record, schedule_run.go scheduleKey).
-// A content world_script may use any OTHER key freely, but director.set REFUSES a reserved-prefixed key so a
-// script cannot corrupt engine state (integrity, defense-in-depth even for trusted content). Reads are
+// A content director script may use any OTHER key freely, but director.set REFUSES a reserved-prefixed key
+// so a script cannot corrupt engine state (integrity, defense-in-depth even for trusted content). Reads are
 // allowed (harmless). Extend this list when a new engine feature persists director scope state under a prefix.
+//
+// Scope-agnostic, like reservedDownEvent: a region script (#356) is held to the same list. `schedule:` is
+// currently vacuous at region scope — no region director runs schedules, since SpawnScheduleDTO has no
+// region field — but region-scoped schedules are the plausible next feature and the uniformity argument
+// above applies. Do NOT add region-only prefixes speculatively.
 var reservedScopeKeyPrefixes = []string{"schedule:"}
 
 // reservedScopeKey reports whether key is owned by the engine (director.set must refuse it).
@@ -66,7 +96,14 @@ func reservedScopeKey(key string) bool {
 // never a blind read-modify-write. This is a content contract (see the WorldScript DTO doc); the runtime does
 // not add a dedup layer in v1.
 
+// worldScriptKey / regionScriptKey build the script's identity: the compiled chunk name, the circuit
+// breaker's key, and the log key. It is per-luaDirector rather than a package const (#356) because with
+// N region directors in one process every region's failure would otherwise be logged as "world_script",
+// leaving an operator unable to tell which region tripped. Breaker keys never collided — each Runtime has
+// its own chunk map — but the logs did.
 const worldScriptKey = "world_script"
+
+func regionScriptKey(regionID string) string { return "region_script:" + regionID }
 
 // luaJSONMaxDepth bounds the recursion of the JSON<->Lua bridge. The instruction budget does NOT cover the
 // Go-side encode/decode, so a deeply-nested or CYCLIC Lua table (director.set) is bounded HERE — past the cap
@@ -78,6 +115,9 @@ const luaJSONMaxDepth = 16
 type luaDirector struct {
 	rt  *luasandbox.Runtime
 	log *slog.Logger
+	// key names this script for the chunk, the breaker, and the log — "world_script" for the world
+	// director, "region_script:<ref>" for a region's.
+	key string
 	// api is the director-API handle valid ONLY during an OnSignal call — the `director` table's functions
 	// read it. nil outside a call (the host functions guard against a stray call).
 	api *API
@@ -89,6 +129,12 @@ type luaDirector struct {
 var (
 	directorLuaInstrBudget    int
 	directorLuaCallDeadlineMS int
+	// capsFrozen goes true the moment the first VM reads the caps. With ONE world script the
+	// "call SetLuaCaps before compiling" rule was enforced by a doc comment and one obvious call site;
+	// with N region VMs built across a loop it is a rule someone can break silently, and the symptom
+	// would be some scopes honouring the operator's caps and others running the defaults. Freezing turns
+	// that silent split into a boot error (#356).
+	capsFrozen atomic.Bool
 )
 
 // SetLuaCaps validates and applies the operator's Lua sandbox tunables to the director tier (#368). It
@@ -101,6 +147,11 @@ func SetLuaCaps(instrBudget, callDeadlineMS int) error {
 	if err := luasandbox.ValidateCaps(instrBudget, callDeadlineMS); err != nil {
 		return err
 	}
+	if capsFrozen.Load() {
+		return errors.New("director: SetLuaCaps called after a script VM was already built — the caps are " +
+			"read at VM construction, so this would leave some scopes on the operator's caps and others on " +
+			"the engine defaults; call it before wiring any director script")
+	}
 	directorLuaInstrBudget, directorLuaCallDeadlineMS = instrBudget, callDeadlineMS
 	return nil
 }
@@ -108,11 +159,12 @@ func SetLuaCaps(instrBudget, callDeadlineMS int) error {
 // newLuaDirector compiles the world script, installs the `director` host table, and runs the script's top
 // level so its `on_signal` definition lands in the sandbox globals. A compile/load error is returned so the
 // caller can decide (the director logs it and runs without orchestration rather than crashing the tier).
-func newLuaDirector(log *slog.Logger, script string) (*luaDirector, error) {
+func newLuaDirector(log *slog.Logger, key, script string) (*luaDirector, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	ld := &luaDirector{log: log.With("subsystem", "director-lua")}
+	capsFrozen.Store(true) // the caps are read just below; refuse a later SetLuaCaps rather than split them
+	ld := &luaDirector{log: log.With("subsystem", "director-lua", "script", key), key: key}
 	// #368: the operator's Lua caps, injected the same way the world injects them into its own sandbox.
 	// Zero fields mean "engine default", so an untouched deployment is unchanged.
 	ld.rt = luasandbox.NewRuntime(ld.log, luasandbox.Opts{
@@ -120,13 +172,13 @@ func newLuaDirector(log *slog.Logger, script string) (*luaDirector, error) {
 		CallDeadlineMS: directorLuaCallDeadlineMS,
 	})
 	ld.installDirectorTable()
-	if err := ld.rt.Compile(worldScriptKey, script); err != nil {
+	if err := ld.rt.Compile(key, script); err != nil {
 		ld.rt.Close()
 		return nil, err
 	}
-	if err := ld.rt.LoadGlobals(worldScriptKey); err != nil {
+	if err := ld.rt.LoadGlobals(key); err != nil {
 		ld.rt.Close()
-		return nil, fmt.Errorf("world_script load: %w", err)
+		return nil, fmt.Errorf("%s load: %w", key, err)
 	}
 	return ld, nil
 }
@@ -145,15 +197,52 @@ func (ld *luaDirector) close() {
 // ERROR is logged and the director runs WITHOUT orchestration (a broken script must never prevent the tier
 // from booting). Not safe to call after Run.
 func (d *Director) WithWorldScript(script string) *Director {
+	return d.withScript(worldScriptKey, script)
+}
+
+// WithRegionScript wires a REGION's content-defined director script (#356, RegionDTO.Script) — the
+// region-scoped sibling of WithWorldScript. The `director` host table, the reserved-event and
+// reserved-key guards, and the sandbox caps are all identical; only the scope differs, and that is
+// carried by the Director itself (its regionID routes get/set to region_state and its broadcasts to
+// telos.scope.region.<ref>). Not safe to call after Run.
+//
+// It is deliberately NOT paired with a teardown hook. #356 proposed one on the belief that a director
+// losing leadership is destroyed and recreated, leaking its VM. It is not: the same long-lived Director
+// campaigns, loses, and campaigns again — losing the lease only flips an atomic bool and tears down the
+// durable consumer. The VM is built once per process per scope and is fully reclaimable if dropped (no
+// goroutine, no OS handle, no timer). Adding the hook would have been actively harmful: Runtime.Close
+// nils the LState while CallGlobal dereferences it unguarded and OnSignal has no recover, so a late
+// signal would crash the director process. See TestDirectorVMsAreReclaimedWithoutClose.
+func (d *Director) WithRegionScript(script string) *Director {
+	// A director with an empty regionID IS the world director — that is what New("") builds. So a "region
+	// script" wired onto one is definitionally a mistake, and a silent one: the script would run with the
+	// world's state, the world's lease and the world's durable consumer, and every reserved-name guard in
+	// this file would be beside the point because the script simply IS the world script. The reachable
+	// cause is mundane — one region_defs entry with `ref` omitted, which the ref-charset lint skips by
+	// design ("an omitempty ref means not set") — so refusing HERE closes it for every caller rather than
+	// only for the one construction site that remembers to check.
+	if d.regionID == "" {
+		d.log.Error("refusing to wire a REGION script onto the world director: a region with an empty ref " +
+			"would run its script against world state under the world's lease and durable consumer (#356)")
+		return d
+	}
+	return d.withScript(regionScriptKey(d.regionID), script)
+}
+
+// withScript compiles script under key and installs its on_signal as this director's signal handler. An
+// empty script is a no-op; a COMPILE ERROR is logged and the director runs WITHOUT orchestration — a
+// broken script must never prevent the tier from booting, and that matters more with N region scripts
+// than it did with one world script, since one bad region would otherwise take the whole tier down.
+func (d *Director) withScript(key, script string) *Director {
 	if script == "" {
 		return d
 	}
-	ld, err := newLuaDirector(d.log, script)
+	ld, err := newLuaDirector(d.log, key, script)
 	if err != nil {
-		d.log.Error("world_script compile failed; director runs without orchestration (#47)", "err", err)
+		d.log.Error("director script compile failed; this scope runs without orchestration", "script", key, "err", err)
 		return d
 	}
-	d.log.Info("world_script loaded; director orchestration active (#47)")
+	d.log.Info("director script loaded; orchestration active", "script", key)
 	return d.WithSignalHandler(ld.OnSignal)
 }
 
@@ -164,13 +253,13 @@ func (d *Director) WithWorldScript(script string) *Director {
 func (ld *luaDirector) OnSignal(api *API, event string, payload json.RawMessage) {
 	ld.api = api
 	defer func() { ld.api = nil }()
-	_, err := ld.rt.CallGlobal(worldScriptKey, "on_signal", 0, func(L *lua.LState) int {
+	_, err := ld.rt.CallGlobal(ld.key, "on_signal", 0, func(L *lua.LState) int {
 		L.Push(lua.LString(event))
 		L.Push(jsonToLua(L, payload))
 		return 2
 	})
 	if err != nil {
-		ld.log.Warn("world_script on_signal failed", "event", event, "err", err)
+		ld.log.Warn("director script on_signal failed", "event", event, "err", err)
 	}
 }
 
@@ -259,7 +348,7 @@ func (ld *luaDirector) luaBroadcast(L *lua.LState) int {
 
 // luaLog: director.log(msg) — a structured info log (the director's print-with-context).
 func (ld *luaDirector) luaLog(L *lua.LState) int {
-	ld.log.Info("world_script", "msg", L.CheckString(1))
+	ld.log.Info("director script", "msg", L.CheckString(1))
 	return 0
 }
 
