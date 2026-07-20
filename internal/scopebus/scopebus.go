@@ -38,6 +38,23 @@ const SubjectRoot = commbus.ScopeSubjectPrefix
 // string. A script's own signal-up events (a content-named "boss_slain") use any OTHER name.
 const EventStateSet = "scope.state.set"
 
+// ReservedDownEvent reports whether an event name may ONLY be emitted DOWNWARD, by a director. These
+// names are meaningful to the zone-side dispatch, which switches on the event NAME alone — so a name
+// emitted in the wrong direction is not merely odd, it is acted on.
+//
+// This matters because signal-UP and broadcast-DOWN share ONE subject per scope. A durable signal-up
+// publish is an ordinary NATS publish to telos.scope.<kind>.<id>, and every shard CORE-subscribes that
+// same subject for down-broadcasts — so a zone that publishes a reserved name upward has it delivered to
+// every replica as though a director had sent it. Confirmed against a real broker, not inferred.
+//
+// It lives here, not in the director, because both ends of the bus must agree on the list and the world
+// package cannot import the director. The director additionally reserves its own scheduler event names on
+// the DOWN path; those are legitimate UP names (a dying boss signals boss.died), so listing them here
+// would break the shipped spawn feature — a guard too broad is as bad as one too narrow.
+func ReservedDownEvent(event string) bool {
+	return event == EventStateSet || strings.HasPrefix(event, "content.")
+}
+
 // StatePayload is one region/world state delta on the wire (Phase 10.4): a key and its new value
 // (data-only JSON — numbers/strings/bools/nested objects). A nil/JSON-null Value DELETES the key. The
 // director is the single writer of the authoritative state; this is the broadcast of one applied change.

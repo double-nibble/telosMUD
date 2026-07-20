@@ -56,6 +56,12 @@ func newScopeReplica() *scopeReplica {
 	}
 }
 
+// scopeVersionGapWarn is how far ahead of the applied version an incoming delta may be before the replica
+// says something. The director's CAS increments by one per write, so a legitimate gap is bounded by how
+// many writes to ONE key a replica missed while disconnected — generous at a million, and still many
+// orders of magnitude below what a forged or corrupt version looks like.
+const scopeVersionGapWarn = 1 << 20
+
 // scopeDeltaMsg is a director's region/world state broadcast, posted to the zone inbox by the shard's
 // scoped-bus subscription so it is applied on the zone goroutine (the golden rule: a message, applied
 // locally — never a cross-goroutine write into zone state). kind is "world" or "region".
@@ -168,6 +174,18 @@ func (z *Zone) applyScopeDelta(m scopeDeltaMsg) {
 	if m.version > 0 {
 		if applied, seen := vers[m.key]; seen && m.version <= applied {
 			return
+		}
+		// A version far AHEAD of what this replica has applied is worth saying out loud. The director
+		// increments by exactly one per write, so a jump of millions is not a replica that fell behind —
+		// it is a corrupt or forged delta, and because the fence is a high-water it would then drop every
+		// legitimate director write for that key until a reseed. Logged rather than rejected: a genuine
+		// large gap (a long transient outage) must still apply, and silently freezing a key would be worse
+		// than the gap itself. The forged-delta path is closed at its source instead (a zone can no longer
+		// emit a reserved DOWN name), and this is how an operator sees it if one ever arrives anyway.
+		if applied, seen := vers[m.key]; seen && m.version-applied > scopeVersionGapWarn {
+			z.log.Warn("scope delta version jumped implausibly far ahead; the replica's fence for this key "+
+				"will reject anything below it until a reseed",
+				"kind", m.kind, "key", m.key, "applied", applied, "incoming", m.version)
 		}
 		// Recorded for BOTH a set and a delete. A delete that did not record its version would let a
 		// reordered older set resurrect the deleted key.

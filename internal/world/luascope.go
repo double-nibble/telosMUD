@@ -188,6 +188,26 @@ func (rt *luaRuntime) enqueueScopeSignal(l *lua.LState, scope scopebus.Scope) {
 	if event == "" {
 		return
 	}
+	// A zone script must not emit a DIRECTOR-only event name (scope.state.set, content.*). Signal-UP and
+	// broadcast-DOWN share one subject per scope, and every shard core-subscribes it — so a zone that
+	// signals `scope.state.set` upward has it delivered to every replica as though a director had written
+	// it, bypassing the director entirely along with its lease and its CAS.
+	//
+	// Since the delta now carries a fence version, that is worse than a wrong value: a forged version far
+	// ahead of the real one makes every subsequent LEGITIMATE director write drop as stale, and there is no
+	// read-through to recover the key. The zone Lua surface is the broader and less-trusted of the two
+	// content surfaces, and it was the only one with no guard.
+	//
+	// This closes the CONTENT path, which is the trust boundary this guard is for. It does not stop a
+	// process that already holds NATS credentials from publishing the same frame directly — that needs the
+	// up/down subjects split apart so a publisher physically cannot reach the down channel, which is a wire
+	// change and its own piece of work.
+	if scopebus.ReservedDownEvent(event) {
+		rt.log.Warn("refusing a scope signal on an engine-reserved DOWN event name: a zone must not emit "+
+			"what only a director may broadcast (it would be applied by every replica as authoritative)",
+			"event", event, "scope", scope.Label())
+		return
+	}
 	var payload json.RawMessage
 	if tbl, ok := l.Get(2).(*lua.LTable); ok {
 		if raw, err := marshalLuaState(tbl); err != nil {

@@ -52,11 +52,19 @@ const maxScopeValueBytes = 64 * 1024
 //     not the Round 17 too-broad failure — that was a security subset wide enough to be unusable; this is
 //     two event names no content has reason to want.
 func reservedDownEvent(event string) bool {
-	switch event {
-	case scopebus.EventStateSet, SpawnBossEvent, BossDiedEvent:
+	// The shared list (scope.state.set, content.*) lives on the bus, because BOTH ends must agree on it —
+	// the zone Lua surface enforces the same names on the signal-UP side, since up and down share one
+	// subject. Restating it here would let the two drift.
+	if scopebus.ReservedDownEvent(event) {
 		return true
 	}
-	return strings.HasPrefix(event, "content.")
+	// The director's own scheduler names are reserved on the DOWN path only. They are legitimate UP names
+	// (a zone's dying boss signals boss.died), so they are deliberately NOT in the shared list.
+	switch event {
+	case SpawnBossEvent, BossDiedEvent:
+		return true
+	}
+	return false
 }
 
 // reservedScopeKeyPrefixes are the scope-state key prefixes the ENGINE owns (the Go director's own
