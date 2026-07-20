@@ -197,12 +197,19 @@ func defaultInstanceLimits() instanceLimits {
 // unlocked is a data race the moment anything calls this after Run — which tests already did before this was
 // fixed. Taking the lock costs nothing on a construction-time path and removes the trap entirely.
 //
-// RAISING perAccount ALONE IS NOT ENOUGH. The mint rate limit is a FIXED window, not a token bucket, so its
-// real worst case is 2*mintBurst mints across a window boundary. That is only harmless because perAccount
-// (3 by default) bounds how many of those can be LIVE at once, which in turn bounds how fast the churn can
-// repeat. Raise perAccount without also reconsidering mintBurst/mintWindow and the coupling that made the
-// fixed window acceptable is gone: mint churn — full zone builds and boot resets, the expensive part — stops
-// being bounded by anything.
+// THIS IS THE EMBEDDER/TEST SEAM AND IT DOES NOT VALIDATE. Operators reach the same fields through
+// SetInstanceLimits, which bounds-checks them and refuses a configuration the shard cannot honor. This one is
+// deliberately permissive because tests need the extreme values a validator must refuse (a perAccount of 1
+// against a mintBurst of 100, say, to exercise one bound without tripping the other).
+//
+// THE MINT RATE LIMIT IS THE ONLY PER-ACCOUNT BOUND ON MINT CHURN. It is a FIXED window, not a token bucket,
+// so its real worst case is 2*mintBurst mints across a window boundary — and perAccount does NOT contain that,
+// contrary to what this comment claimed before #436. reserveInstanceSlot excludes ABANDONED records from the
+// per-account count (see the comment there), and mint-abandon-mint is precisely the churn loop: each iteration
+// is a full zone build plus its boot resets, the expensive part, and none of it is charged to perAccount.
+// (perShard still counts abandoned records, so it does bound concurrent churn shard-wide — but that is a
+// backstop shared with every other account, not a bound on the account doing the churning.) So
+// mintBurst/mintWindow are load-bearing on their own rather than a second line behind the concurrent cap.
 func (s *Shard) WithInstanceLimits(perAccount, perShard, mintBurst int, mintWindow time.Duration) *Shard {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -219,6 +226,181 @@ func (s *Shard) WithInstanceLimits(perAccount, perShard, mintBurst int, mintWind
 		s.instanceLimits.mintWindow = mintWindow
 	}
 	return s
+}
+
+// Bounds for the operator-facing SetInstanceLimits (#436). Unexported: nothing outside this package needs
+// them, and internal/config must not import internal/world — that leaf property is why validation lives at
+// the injection point rather than in the config package.
+const (
+	// maxInstancesPerAccount. Past this the per-account cap has stopped being a fairness bound and is just a
+	// second copy of the shard cap. It is also multiplied by the shard count fleet-wide.
+	maxInstancesPerAccount = 64
+
+	// maxInstancesPerShard is the tightest ceiling of the four because this is the only cap whose failure mode
+	// is an OOM-killed shard rather than a refusal. Three independent arguments land in the same place:
+	//
+	//  1. Memory. Each live instance is a zone object, an actor goroutine and a Lua VM whose registry grows to
+	//     luasandbox.RegistryMaxSize and never shrinks, plus every entity the template's boot resets spawn —
+	//     which the engine does not bound at all.
+	//  2. Mutex hold time on the ROUTING path. reserveInstanceSlot scans all of s.instances under s.mu, and
+	//     s.mu is the same mutex zoneByID and claimTransferTarget take. perShard directly sizes a stall on
+	//     every routing read.
+	//  3. drainEjectBarrier. BeginDrain's step 0 ejects EVERY instance's occupants under ONE shared 5s
+	//     deadline, a budget sized against 256. That is a real ordering relation between this value and a
+	//     constant in instance_entry.go — the issue that asked for these knobs asserted there was none — and
+	//     overshooting it does not crash: the tail instances miss the barrier and their occupants are dropped
+	//     to straggler reclaim on every rolling deploy, warned about and otherwise silent.
+	maxInstancesPerShard = 1024
+
+	// warnInstancesPerShard is where (3) above starts being a real risk rather than a theoretical one.
+	warnInstancesPerShard = 512
+
+	// maxInstanceMintBurst bounds the instantaneous spike (2*burst across a window boundary); the sustained
+	// rate is bounded separately by maxInstanceMintsPerMinute, since a burst ceiling alone means nothing
+	// without the window it is measured over.
+	maxInstanceMintBurst = 60
+
+	// The mint window's floor and ceiling. FLOOR: a window shorter than a mint's own build latency means
+	// essentially every mint opens a fresh bucket, so the limiter is configured but inert. CEILING:
+	// pruneMintRateLocked only drops a bucket once its window has FULLY elapsed, so the window is exactly how
+	// long s.mintRate retains an entry per minting account — an hours-long window turns a rate limit into a
+	// durable per-account quota with an unbounded-in-accounts map behind it. Note that the ceiling guards the
+	// direction an operator reaches for when they want to be STRICTER.
+	minInstanceMintWindow = time.Second
+	maxInstanceMintWindow = time.Hour
+
+	// maxInstanceMintsPerMinute is the sustained mint rate ceiling, per account. A mint is a full buildZone —
+	// every room spawned, every boot reset run — plus a seedZone store round trip. This is what bounds that
+	// work per unit time, and it is expressed as a RATE because validating burst and window separately lets
+	// burst=60/window=1s through, which is 3600 zone builds a minute. Conservative by choice, not derived.
+	maxInstanceMintsPerMinute = 120
+)
+
+// SetInstanceLimits is the OPERATOR-facing injection point for the four instance caps (#436) — the validated
+// twin of WithInstanceLimits, and #368 slice 2. A zero field means "use the compiled-in default", NEVER
+// "unlimited": for the counts unlimited is resource exhaustion, and for the window zero is worse still, since
+// `now.Sub(windowStart) >= 0` is true on every mint, so the bucket resets every time and the rate limit
+// disappears silently while the boot log shows a plausible configuration.
+//
+// It validates the EFFECTIVE values — after the zero-means-default substitution — which is the difference
+// between working and inert. An operator who sets instances_per_account: 300 and leaves instances_per_shard
+// unset presents (300, 0): validating the raw pair sees "perShard unset, no cross-field check to do" and ships
+// exactly the per-account-above-shard-cap configuration the cross-field rule exists to refuse.
+//
+// It is also all-or-nothing. The whole limit set is built and checked locally and assigned in one write under
+// mu, so a refused configuration changes NOTHING — rather than leaving the shard running two of the operator's
+// four values after being told the set was rejected.
+//
+// A method on the constructed *Shard rather than a builder option, deliberately: cmd/telos-world builds a
+// shard on two different paths (with and without Redis), and a builder-option wiring added to one of them is
+// silently inert on the other — which would be the local/dev path, where a mistake goes unnoticed longest.
+func (s *Shard) SetInstanceLimits(perAccount, perShard, mintBurst, mintWindowSec int) error {
+	for _, f := range []struct {
+		name string
+		v    int
+	}{
+		{"instances_per_account", perAccount},
+		{"instances_per_shard", perShard},
+		{"instance_mint_burst", mintBurst},
+		{"instance_mint_window_sec", mintWindowSec},
+	} {
+		if f.v < 0 {
+			return fmt.Errorf("%s=%d: there is no unlimited — every instance cap bounds a real resource "+
+				"(a zone, a goroutine and a Lua VM each). Use 0 for the engine default", f.name, f.v)
+		}
+	}
+
+	// The window's ceiling is checked on the RAW SECONDS, before the multiply below, and that ordering is the
+	// whole point: time.Duration(mintWindowSec) * time.Second scales by 1e9, so a large int64 wraps — and it
+	// can wrap to a value INSIDE the accepted range. 2^55+60 seconds arrives as a perfectly legal 1m0s, so
+	// checking only the product turns the ceiling into a silent reinterpretation of the operator's number,
+	// which is the "parses, logs plausibly, means something else" failure this whole feature exists to end.
+	if maxSec := int(maxInstanceMintWindow.Seconds()); mintWindowSec > maxSec {
+		return fmt.Errorf("instance_mint_window_sec=%d exceeds the maximum %d: buckets are only pruned once "+
+			"their window has fully elapsed, so a longer window is not stricter — it is a durable per-account "+
+			"quota with one retained map entry per account that ever minted", mintWindowSec, maxSec)
+	}
+
+	want := defaultInstanceLimits()
+	if perAccount > 0 {
+		want.perAccount = perAccount
+	}
+	if perShard > 0 {
+		want.perShard = perShard
+	}
+	if mintBurst > 0 {
+		want.mintBurst = mintBurst
+	}
+	if mintWindowSec > 0 {
+		want.mintWindow = time.Duration(mintWindowSec) * time.Second
+	}
+
+	switch {
+	case want.perAccount > maxInstancesPerAccount:
+		return fmt.Errorf("instances_per_account=%d exceeds the maximum %d: past that it is no longer a "+
+			"fairness bound, and it is multiplied by the shard count fleet-wide",
+			want.perAccount, maxInstancesPerAccount)
+	case want.perShard > maxInstancesPerShard:
+		return fmt.Errorf("instances_per_shard=%d exceeds the maximum %d: each instance is a zone, an actor "+
+			"goroutine and a Lua VM, this is the one cap whose failure is an OOM-killed shard rather than a "+
+			"refusal, and the drain's eject barrier is sized against a value in this range",
+			want.perShard, maxInstancesPerShard)
+	case want.perAccount > want.perShard:
+		return fmt.Errorf("instances_per_account=%d exceeds instances_per_shard=%d, so the per-account cap can "+
+			"never fire: the only cap left is the global one, which is first-come-first-served, and one account "+
+			"filling the shard denies every other player entry", want.perAccount, want.perShard)
+	case want.mintBurst > maxInstanceMintBurst:
+		return fmt.Errorf("instance_mint_burst=%d exceeds the maximum %d: the fixed window's real worst case "+
+			"is twice this across a window boundary, each mint being a full zone build",
+			want.mintBurst, maxInstanceMintBurst)
+	case want.mintWindow < minInstanceMintWindow:
+		return fmt.Errorf("instance_mint_window_sec=%v is below the minimum %v: a window shorter than a mint's "+
+			"own build latency opens a fresh bucket for essentially every mint, so the limit is configured and "+
+			"inert", want.mintWindow, minInstanceMintWindow)
+	}
+	// The two are only meaningful together: burst alone permits 60-per-second, and a window alone bounds
+	// nothing. Checked in per-minute terms so the number in the message is the one an operator reasons in.
+	if rate := float64(want.mintBurst) / want.mintWindow.Minutes(); rate > maxInstanceMintsPerMinute {
+		return fmt.Errorf("instance_mint_burst=%d per instance_mint_window_sec=%v is %.0f mints per minute, "+
+			"above the maximum %d: a mint is a full zone build (every room spawned, every boot reset run) plus "+
+			"a store round trip, and this rate is the only thing bounding that work — the concurrent caps do "+
+			"not see mint-abandon-mint churn at all",
+			want.mintBurst, want.mintWindow, rate, maxInstanceMintsPerMinute)
+	}
+
+	s.mu.Lock()
+	s.instanceLimits = want
+	s.mu.Unlock()
+
+	if want.perShard > warnInstancesPerShard {
+		slog.Warn("instances_per_shard is high: the drain's instance eject runs every instance under one "+
+			"shared barrier, so occupants of the tail instances may be dropped to straggler reclaim on a "+
+			"rolling deploy", "per_shard", want.perShard, "warn_above", warnInstancesPerShard)
+	}
+	// Refused only when it can NEVER fire (perAccount > perShard); warned when it barely fires. At equality
+	// the per-account cap trips at the exact point the global cap already would, so it reads as a fairness
+	// bound and delivers none — but it is a coherent thing for an operator to choose, and refusing it would
+	// also refuse the legitimate degenerate case of a one-instance shard, where the two are equal by
+	// necessity. Hence the perShard > 1 guard.
+	if want.perShard > 1 && want.perAccount*2 > want.perShard {
+		slog.Warn("instances_per_account is close to instances_per_shard, so it provides little fairness: one "+
+			"account can take most or all of the shard's capacity and deny every other player entry",
+			"per_account", want.perAccount, "per_shard", want.perShard)
+	}
+	// Fires on an explicitly-configured 6 as well as an unset one. The zero sentinel deliberately carries no
+	// "was it set" signal, and warning about a deliberate choice is the cheaper error of the two here.
+	if want.perAccount > defaultInstancesPerAccount && want.mintBurst == defaultInstanceMintBurst {
+		slog.Warn("instances_per_account was raised while the mint rate limit was left at its default: the "+
+			"rate limit is the only bound on mint-abandon-mint churn, so consider it alongside the "+
+			"concurrent cap", "per_account", want.perAccount, "mint_burst", want.mintBurst)
+	}
+	// The EFFECTIVE values, logged from the site that installs them, so an operator can confirm their setting
+	// took rather than inferring it. The caveat rides along because "3" reads as a fleet-wide guarantee and is
+	// not one.
+	slog.Info("instance caps", "per_account", want.perAccount, "per_shard", want.perShard,
+		"mint_burst", want.mintBurst, "mint_window", want.mintWindow,
+		"note", "per shard PROCESS; an account's fleet-wide ceiling is per_account x the shard count")
+	return nil
 }
 
 // instanceRecord is the shard's bookkeeping for one live instance. Guarded by Shard.mu (the same mutex that

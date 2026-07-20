@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -185,6 +186,40 @@ type TunablesConfig struct {
 	// validator has a floor.
 	LuaCallDeadlineMS int `yaml:"lua_call_deadline_ms"`
 
+	// The four instance caps (#436). All four are PER SHARD PROCESS: there is no cross-shard instance
+	// accounting, so an account's real fleet-wide ceiling is InstancesPerAccount x (the number of world shards
+	// it can reach). Sizing InstancesPerAccount against abuse without multiplying by the shard count gets the
+	// wrong answer, which is why world.SetInstanceLimits repeats the caveat in its boot log.
+	//
+	// InstancesPerAccount is the max LIVE instances charged to one account — the FAIRNESS bound, stopping one
+	// principal from consuming the whole shard cap and denying every other player entry.
+	// TELOS_INSTANCES_PER_ACCOUNT. 0 => the engine default (3).
+	InstancesPerAccount int `yaml:"instances_per_account"`
+
+	// InstancesPerShard is the max LIVE instances on this process across all accounts — the RESOURCE bound,
+	// and the load-bearing one: each instance is a zone object, an actor goroutine and a Lua VM, plus whatever
+	// the template's boot resets spawn. It is the only one of the four whose failure mode is an OOM-killed
+	// shard rather than a bounded refusal, which is why its ceiling is the tightest.
+	// TELOS_INSTANCES_PER_SHARD. 0 => the engine default (256).
+	InstancesPerShard int `yaml:"instances_per_shard"`
+
+	// InstanceMintBurst is the max mints per account per window — the CHURN bound, and the only bound on
+	// mint-abandon-mint, which the concurrent caps deliberately do not see (an abandoned instance is excluded
+	// from its account's count). Each mint is a full zone build plus a store round trip.
+	// TELOS_INSTANCE_MINT_BURST. 0 => the engine default (6).
+	InstanceMintBurst int `yaml:"instance_mint_burst"`
+
+	// InstanceMintWindowSec is the mint rate-limit window in seconds. Seconds as an int, with the unit in the
+	// name, deliberately: an env value crosses as a string, and Atoi("60") cast straight to a time.Duration is
+	// 60 NANOSECONDS — which makes every mint open a fresh window, so the burst check never fires and the rate
+	// limit silently disappears while the boot log shows a plausible number.
+	//
+	// Note that RAISING this is the leaky direction, counter to intuition: a cautious operator reads a longer
+	// window as stricter, but a bucket is only pruned once its window has fully elapsed, so a very long window
+	// turns the limiter into a durable per-account quota whose map retains an entry per account that ever
+	// minted. TELOS_INSTANCE_MINT_WINDOW_SEC. 0 => the engine default (60).
+	InstanceMintWindowSec int `yaml:"instance_mint_window_sec"`
+
 	// err carries a malformed TELOS_* value forward so the host refuses the boot rather than silently
 	// running the default. Unexported: it is not configuration, it is a parse outcome.
 	err error
@@ -340,27 +375,38 @@ func (c *Config) applyEnv() {
 	if v, ok := os.LookupEnv("TELOS_CONTENT_PACKS"); ok {
 		c.ContentPacks = splitCSV(v)
 	}
-	// Tunables (#368). A malformed value is IGNORED here rather than silently coerced to 0 — 0 means "use
-	// the default", so parsing "abc" as 0 would quietly hand back the default while the operator believed
-	// their setting had taken. Validate() then reports anything out of range.
-	// A malformed value is RECORDED as an error rather than ignored. Atoi("abc") yields 0, and 0 means "use
-	// the default" — so coercing would hand back the default while the operator believed their setting had
-	// taken, which is the silent misconfiguration this whole feature exists to end. The host reads Err() and
-	// refuses the boot. Only the LAST malformed value is reported; the boot stops either way.
-	if v, ok := os.LookupEnv("TELOS_LUA_INSTR_BUDGET"); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Tunables.LuaInstrBudget = n
-		} else {
-			c.Tunables.err = fmt.Errorf("TELOS_LUA_INSTR_BUDGET=%q is not a number", v)
-		}
+	// Tunables (#368, #436). A malformed value is RECORDED as an error rather than ignored. Atoi("abc") yields
+	// 0, and 0 means "use the default" — so coercing would hand back the default while the operator believed
+	// their setting had taken, which is the silent misconfiguration this whole feature exists to end. The host
+	// reads Err() and refuses the boot.
+	//
+	// EVERY malformed value is reported, not just the last one (#436). With six knobs in one ConfigMap, a
+	// last-write-wins error hands the operator one typo, they fix it, and the boot fails again on the next —
+	// so the number of deploy cycles to a clean boot scales with the number of mistakes.
+	c.Tunables.intFromEnv("TELOS_LUA_INSTR_BUDGET", &c.Tunables.LuaInstrBudget)
+	c.Tunables.intFromEnv("TELOS_LUA_CALL_DEADLINE_MS", &c.Tunables.LuaCallDeadlineMS)
+	c.Tunables.intFromEnv("TELOS_INSTANCES_PER_ACCOUNT", &c.Tunables.InstancesPerAccount)
+	c.Tunables.intFromEnv("TELOS_INSTANCES_PER_SHARD", &c.Tunables.InstancesPerShard)
+	c.Tunables.intFromEnv("TELOS_INSTANCE_MINT_BURST", &c.Tunables.InstanceMintBurst)
+	c.Tunables.intFromEnv("TELOS_INSTANCE_MINT_WINDOW_SEC", &c.Tunables.InstanceMintWindowSec)
+}
+
+// intFromEnv reads one integer tunable from the environment into dst, leaving dst untouched (so the YAML or
+// default value stands) and recording an error when the value is present but malformed.
+//
+// A helper rather than six copy-pasted blocks: the blocks differ only in an env name and a field pointer, and
+// that is exactly the shape where a paste assigns the wrong field and every single-knob test still passes.
+func (t *TunablesConfig) intFromEnv(name string, dst *int) {
+	v, ok := os.LookupEnv(name)
+	if !ok {
+		return
 	}
-	if v, ok := os.LookupEnv("TELOS_LUA_CALL_DEADLINE_MS"); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Tunables.LuaCallDeadlineMS = n
-		} else {
-			c.Tunables.err = fmt.Errorf("TELOS_LUA_CALL_DEADLINE_MS=%q is not a number", v)
-		}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		t.err = errors.Join(t.err, fmt.Errorf("%s=%q is not a number", name, v))
+		return
 	}
+	*dst = n
 }
 
 // splitCSV parses a comma-separated env value into a trimmed, non-empty list.

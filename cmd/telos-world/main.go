@@ -72,6 +72,24 @@ func scopeSnap(p *store.Pool) world.ScopeSnapshotSource {
 // into — so a discoverable production shard that forgot the handoff keypair refuses to boot. A non-empty warn
 // string means "running with unauthenticated handoffs under an explicit TELOS_ALLOW_INSECURE opt-in". Both
 // empty => the shard is either single-shard (never receives a handoff) or properly keyed.
+// applyInstanceTunables carries the four configured instance caps (#436) to the shard that enforces them,
+// factored out of main so the MAPPING is unit-testable — the same reason handoffAuthGate below is.
+//
+// The mapping is the whole risk here, and it is invisible to every other test in the tree. SetInstanceLimits
+// is thoroughly tested and takes four bare ints in a fixed order, so a config field read into the wrong
+// parameter produces a shard that boots happily, logs a plausible line and enforces limits the operator never
+// wrote. Deleting the call site entirely used to leave the full suite green.
+func applyInstanceTunables(shard *world.Shard, t config.TunablesConfig) error {
+	return shard.SetInstanceLimits(t.InstancesPerAccount, t.InstancesPerShard,
+		t.InstanceMintBurst, t.InstanceMintWindowSec)
+}
+
+// handoffAuthGate is the FAIL-CLOSED boot decision for the keyless-handoff guard (#251), factored out of main
+// so it is unit-testable. shardErr is Shard.CheckHandoffAuth()'s result (non-nil = this shard can receive
+// handoffs but has no verify key). It returns that error as fatal when insecure mode was NOT explicitly opted
+// into — so a discoverable production shard that forgot the handoff keypair refuses to boot. A non-empty warn
+// string means "running with unauthenticated handoffs under an explicit TELOS_ALLOW_INSECURE opt-in". Both
+// empty => the shard is either single-shard (never receives a handoff) or properly keyed.
 func handoffAuthGate(shardErr error, allowInsecure bool) (warn string, fatal error) {
 	if shardErr == nil {
 		return "", nil
@@ -149,6 +167,15 @@ func main() {
 		os.Exit(1)
 	} else if warn != "" {
 		slog.Warn(warn)
+	}
+	// #436: the operator-tunable instance caps, slice 2 of the #368 tunables. Same fail-closed posture as
+	// SetLuaCaps — a configuration the shard cannot honor names the constraint and refuses the boot rather
+	// than being silently clamped. HERE rather than in buildShard's chain because buildShard has two return
+	// paths (Redis-backed and bare), and a builder-option wiring added to one is inert on the other; and
+	// BEFORE shard.Run, because the limits are read on the mint path from the moment the shard is running.
+	if err := applyInstanceTunables(shard, cfg.Tunables); err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
 	}
 	go shard.Run(worldCtx) // each zone actor loop owns its world state from here on
 

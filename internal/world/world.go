@@ -271,7 +271,9 @@ type Shard struct {
 	// instance.go): instance zone id -> the record its cap slot is charged against, and per-account mint-rate
 	// buckets. Both guarded by mu — the SAME mutex that guards s.zones — so a mint's cap check and its
 	// publish into s.zones are one atomic decision, and so UnhostZone can drop a zone and free its cap slot
-	// in one hold. instanceLimits is set at construction and read-only after (WithInstanceLimits, before Run).
+	// in one hold. instanceLimits is written by WithInstanceLimits and SetInstanceLimits and read on the mint
+	// path, ALL under mu — it is not a read-only-after-construction field, so do not "optimize" a read of it
+	// out of the lock on the strength of when it happens to be written today.
 	//
 	// An instance is hosted UNLEASED, like a local bootstrap zone, so it appears in s.zones but in none of the
 	// lease/placement/handoff maps. It is also the only zone class this shard creates on its own initiative

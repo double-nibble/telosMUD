@@ -20,8 +20,12 @@ nats:
 # Not every timeout in the engine is here, deliberately. Several have ordering invariants — the adopt-confirm
 # deadline must cover the handoff pending TTL, the drain-reservation TTL is derived from the drain deadline —
 # and a plausible-looking value for one of those would break an invariant a test exists to pin. What is
-# exposed are bounds whose only relationship is to the workload.
-# Both lines below are COMMENTED OUT on purpose. Setting a value here PINS it: future default changes stop
+# exposed are bounds whose relationships are documented AND enforced by the boot-time validator — the two
+# that exist here (instances_per_account vs instances_per_shard, and the mint burst/window pair, which is
+# meaningful only as a rate) are checked as a set, and instances_per_shard's ceiling is set by the drain's
+# instance-eject barrier rather than by anything about the workload.
+#
+# Every line below is COMMENTED OUT on purpose. Setting a value here PINS it: future default changes stop
 # reaching you, and an explicit lua_call_deadline_ms defeats the automatic `-race` scaling described below,
 # because it is the unset-means-default sentinel that routes to it.
 tunables:
@@ -55,3 +59,43 @@ tunables:
   # Raising this is the usual need on a busy or noisy host. LOWERING it below what a legitimate builtin needs
   # spuriously aborts correct scripts, which is why there is a floor.
   # lua_call_deadline_ms: 5
+
+  # ---------------------------------------------------------------------------------------------------
+  # Instanced-zone caps (#436). ALL FOUR ARE PER SHARD PROCESS. There is no cross-shard instance accounting,
+  # so an account's real fleet-wide ceiling is instances_per_account x the number of world shards it can
+  # reach. Size against abuse WITH that multiplication, not without it.
+  # ---------------------------------------------------------------------------------------------------
+
+  # Max live instances charged to one account: the FAIRNESS bound, stopping one principal from consuming the
+  # whole shard cap and denying every other player entry. Default 3. Range 1..64, and it must not exceed
+  # instances_per_shard (above that it can never fire, leaving only the first-come-first-served global cap).
+  # Env: TELOS_INSTANCES_PER_ACCOUNT
+  #
+  # Note that it does NOT bound mint churn: an instance its entrant never entered is deliberately excluded
+  # from the account's count, so raising this without also considering the mint rate below leaves nothing
+  # bounding mint-abandon-mint. telos-world warns at boot if you raise one and not the other.
+  # instances_per_account: 3
+
+  # Max live instances on this process across all accounts: the RESOURCE bound, and the load-bearing one.
+  # Default 256. Range 1..1024, warned above 512. Env: TELOS_INSTANCES_PER_SHARD
+  #
+  # This is the only one of the four whose failure mode is an OOM-killed shard rather than a refusal — each
+  # instance is a zone object, an actor goroutine and a Lua VM, plus everything the template's boot resets
+  # spawn. It also sizes an O(n) scan taken under the shard's ROUTING mutex on every mint.
+  #
+  # The ceiling comes from the drain: SIGTERM ejects every instance's occupants back to their entrances under
+  # one shared 5s barrier, a budget sized against the default. Overshoot and nothing crashes — the tail
+  # instances miss the barrier and their occupants are dropped to straggler reclaim on every rolling deploy.
+  # instances_per_shard: 256
+
+  # Max mints per account per window, and the window in seconds: together the CHURN bound, and the only thing
+  # bounding mint-abandon-mint. Each mint is a full zone build (every room spawned, every boot reset run)
+  # plus a store round trip. Defaults 6 per 60s. Burst 1..60, window 1..3600s, and the pair must not exceed
+  # 120 mints/minute — burst alone would permit 60-per-second.
+  # Env: TELOS_INSTANCE_MINT_BURST, TELOS_INSTANCE_MINT_WINDOW_SEC
+  #
+  # The window has a CEILING because raising it is the leaky direction, counter to intuition: a bucket is
+  # only pruned once its window has fully elapsed, so a very long window is not stricter — it is a durable
+  # per-account quota whose map retains an entry for every account that ever minted on the process.
+  # instance_mint_burst: 6
+  # instance_mint_window_sec: 60
