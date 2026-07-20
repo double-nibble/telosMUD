@@ -4,8 +4,15 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/double-nibble/telosmud/internal/metrics"
 )
+
+// memStreamName labels the stall counter for the in-memory stand-in. It is deliberately distinct from the
+// real stream names so a metric scraped from a test harness can never be mistaken for production traffic.
+const memStreamName = "MEM"
 
 // jetstream.go is the DURABLE comms transport for Phase-8 slice 8.5 (docs/PHASE8-PLAN.md, OQ-1 =
 // DURABLE-ALWAYS): every tell is a JetStream message, and "online delivery" is just a fast durable
@@ -104,6 +111,42 @@ const (
 	// redelivers and spends no budget.
 	DropPoison
 )
+
+// stallAttempt is the delivery attempt at which a message is considered STUCK rather than merely retrying
+// (#390). A park is permanent loss that has ALREADY happened; the actionable window is the ~164s before
+// it, and this is where that window is announced.
+//
+// 4 is chosen against NakBackoff's own schedule, not picked round. Attempts 2 and 3 land at 200ms and
+// 1.2s, which is exactly where that schedule's doc says routine transients clear — a cross-shard handoff
+// by attempt 2, a bus blip by attempt 4. Firing at 2 would alert on the design working as intended.
+// Attempt 4 lands at 4.2s with 97% of the redelivery window still remaining.
+const stallAttempt = 4
+
+// stalled reports whether this attempt is the one that crosses the stall threshold. EQUALITY, not >=, and
+// that is the whole design: attempt is monotonic per message, so equality fires exactly ONCE per stalled
+// message. With >= it would fire on every attempt from 4 to 10, and the counter would conflate "one
+// message stuck badly" with "seven messages each hiccuping" — which call for opposite responses.
+func stalled(attempt int) bool { return attempt == stallAttempt }
+
+// stallObserver is the stall test-seam signature, mirroring parkObserver.
+type stallObserver func(streamName, subject string, attempt int)
+
+// stallObserverPtr, when set, is invoked for every stall crossing — a TEST SEAM, since the OTel counter is
+// not readily observable in a test. An atomic.Pointer for the same reason parkAdvisoryObserver is one: it
+// is read on a delivery goroutine while a test writes it from setup/cleanup.
+var stallObserverPtr atomic.Pointer[stallObserver]
+
+// noteStall records one message crossing the stall threshold: the counter (the alert trigger, labeled by
+// stream only) and the test seam. The paired WARN log lives at each call site, because only the call site
+// has the subject/consumer/seq context that says WHICH message on WHICH scope is wedged — and for
+// WORLD_EVENTS that is the difference between "something is blocked" and "this region's orchestration is
+// blocked". Same counter-vs-log split durable_parked_total already uses.
+func noteStall(streamName, subject string, attempt int) {
+	metrics.DurableStalled(context.Background(), streamName)
+	if obs := stallObserverPtr.Load(); obs != nil {
+		(*obs)(streamName, subject, attempt)
+	}
+}
 
 // DefaultMaxDeliver bounds redelivery of a single durable message (P8-A5): a message RetryTransient'd this
 // many times is PARKED (permanent loss — see the terminal note above), so a stuck message cannot redeliver
@@ -399,6 +442,12 @@ func (c *memConsumer) deliverBounded(msg Message, backlog bool) {
 			c.js.notePoison(c.id, msg)
 			return // exactly one handler call; no delay, no budget spent
 		default: // RetryTransient
+			// Same hook the real consumer uses. Wiring it ONLY in jetstream_nats.go would make the sole
+			// possible test broker-gated, which is how a threshold quietly rots — and would leave the
+			// stand-in behaving differently from the thing it stands in for.
+			if stalled(attempt) {
+				noteStall(memStreamName, msg.Subject, attempt)
+			}
 			c.js.noteNak(c.id, nakBackoff(attempt))
 		}
 		select {

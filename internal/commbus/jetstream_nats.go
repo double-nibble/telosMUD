@@ -364,6 +364,28 @@ func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, b
 			// (subscribeParkAdvisory, #311), NOT incremented here — this path is best-effort (it misses an
 			// AckWait-expiry or across-restart park), and double-counting the advisory-visible in-process
 			// park would corrupt the count. So: rich log here, authoritative count there.
+			// The EARLY WARNING (#390), fired once as this message crosses the stall threshold. The park
+			// above is permanent loss reported after the fact; this is the ~164s window before it, while
+			// the message is still recoverable.
+			//
+			// It matters most for WORLD_EVENTS, and the reason is MaxAckPending=1: a stalled message
+			// blocks EVERY subsequent event on that consumer for the whole window, and WORLD_EVENTS has
+			// one consumer per SCOPE for the entire fleet. So the real incident is not "a message is being
+			// retried" — it is "this scope's orchestration has applied nothing for N seconds", which is why
+			// the log carries the subject (the scope) rather than the counter carrying it as a label.
+			//
+			// Unlike the park, this is read from the IN-HANDLER attempt rather than a broker advisory, and
+			// the #311 reasoning inverts here: a park is never delivered again, so only the broker sees it;
+			// a stall IS an in-process delivery, so the handler sees every one by construction. The NAK
+			// advisory would be strictly less complete (it misses AckWait-expiry redelivery) and strictly
+			// more expensive.
+			if stalled(attempt) {
+				noteStall(b.name, m.Subject(), attempt)
+				b.log.Warn("durable message STALLED — it is being redelivered and, under MaxAckPending=1, "+
+					"is blocking every later message on this consumer until it lands or parks",
+					"subject", m.Subject(), "consumer", consumerID, "author", msg.AuthorID, "seq", msg.Seq,
+					"attempt", attempt, "parks_after", DefaultMaxDeliver, "window", totalNakWindow())
+			}
 			if attempt >= DefaultMaxDeliver {
 				b.log.Error("durable message PARKED after exhausting the redelivery budget — it is LOST",
 					"subject", m.Subject(), "author", msg.AuthorID, "seq", msg.Seq,

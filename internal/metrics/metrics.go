@@ -31,6 +31,7 @@ var (
 	drainRedirected  metric.Int64Counter
 	drainReclaimed   metric.Int64Counter
 	durableParked    metric.Int64Counter
+	durableStalled   metric.Int64Counter
 	durablePoisoned  metric.Int64Counter
 )
 
@@ -76,6 +77,8 @@ func init() {
 		metric.WithDescription("Players still resident at the drain deadline, dropped to reconnect from durable state; "+
 			"labeled fault=infra (a connected in-world player the drain could not hand off in time) vs "+
 			"fault=client (link-dead, or never finished connecting)"))
+	durableStalled, _ = meter.Int64Counter("telos.commbus.durable_stalled_total",
+		metric.WithDescription("durable messages that needed redelivery past the stall threshold (early warning, once per message)"))
 	durableParked, _ = meter.Int64Counter("telos.commbus.durable_parked_total",
 		metric.WithDescription("Durable messages PARKED after exhausting the redelivery budget — permanent LOSS "+
 			"(the never-lost invariant only covers transients shorter than the backoff window). Labeled by stream. "+
@@ -189,6 +192,29 @@ func DrainReclaimed(ctx context.Context, n int, fault string) {
 func DurableParked(ctx context.Context, stream string) {
 	if durableParked != nil {
 		durableParked.Add(ctx, 1, metric.WithAttributes(attribute.String("stream", stream)))
+	}
+}
+
+// DurableStalled counts a durable message that needed enough redeliveries to be considered STUCK, fired
+// ONCE per message rather than once per attempt (#390). It is the EARLY WARNING that durable_parked_total
+// is not: a park is permanent loss that has already happened, whereas a stall is the ~164s window before
+// it, during which the message is still recoverable.
+//
+// Once per message is the load-bearing part. Counting every redelivery would make "one message retried
+// nine times" indistinguishable from "nine messages retried once", and those call for opposite responses.
+// The caller fires on equality with the stall threshold, not >=, so the monotonic per-message attempt
+// counter crosses it exactly once.
+//
+// `stream` is low-cardinality (COMMS_TELL | WORLD_EVENTS) — never a per-player subject. The SCOPE identity
+// (which region is wedged) rides the paired WARN log instead, because that is diagnosis, not an alert
+// trigger, and it is where the cardinality lives. Same split durable_parked_total already uses.
+//
+// Known under-count, stated for the same reason DurableParked states its miss window: a redelivery whose
+// first delivery in THIS process is already past the threshold (a restart mid-stall) never crosses it and
+// is not counted. It is an alert counter, not an exact one.
+func DurableStalled(ctx context.Context, stream string) {
+	if durableStalled != nil {
+		durableStalled.Add(ctx, 1, metric.WithAttributes(attribute.String("stream", stream)))
 	}
 }
 
