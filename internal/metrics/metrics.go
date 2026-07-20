@@ -209,9 +209,24 @@ func DurableParked(ctx context.Context, stream string) {
 // (which region is wedged) rides the paired WARN log instead, because that is diagnosis, not an alert
 // trigger, and it is where the cardinality lives. Same split durable_parked_total already uses.
 //
-// Known under-count, stated for the same reason DurableParked states its miss window: a redelivery whose
-// first delivery in THIS process is already past the threshold (a restart mid-stall) never crosses it and
-// is not counted. It is an alert counter, not an exact one.
+// KNOWN MISSES, stated for the same reason DurableParked states its own. It is an alert counter, not an
+// exact one:
+//
+//   - a redelivery whose first delivery in THIS process is already past the threshold (a restart
+//     mid-stall) never crosses it and is not counted;
+//   - a WEDGED handler is invisible to it, and this is the important one because a wedged single-writer
+//     actor is a prime stall cause. The consume callback is invoked inline on the client's dispatch
+//     goroutine, so a handler that blocks forever blocks that consumer's dispatch entirely: AckWait
+//     expiries queue in the client buffer and the callback is never re-entered, so the crossing delivery
+//     never reaches this counter. The broker still parks the message and durable_parked_total still
+//     fires — so the operator gets the permanent-loss alarm without the early warning, exactly inverting
+//     what this instrument is for. Closing it needs a signal that does not depend on the handler
+//     RETURNING: an in-flight watchdog (stamp delivery entry, report anything in flight past the
+//     threshold from a background ticker) or a periodic consumer-info poll on NumRedelivered.
+//
+// COMMS_TELL is not exposed to the wedge case today, by a bound elsewhere: routeTellDeliver caps at
+// tellAckTimeout (5s) < jsAckWait (30s). WORLD_EVENTS is, because the director's consume callback can
+// block in d.post when the actor inbox fills, before its own signalAckTimeout guard is ever reached.
 func DurableStalled(ctx context.Context, stream string) {
 	if durableStalled != nil {
 		durableStalled.Add(ctx, 1, metric.WithAttributes(attribute.String("stream", stream)))

@@ -116,11 +116,19 @@ const (
 // (#390). A park is permanent loss that has ALREADY happened; the actionable window is the ~164s before
 // it, and this is where that window is announced.
 //
-// 4 is chosen against NakBackoff's own schedule, not picked round. Attempts 2 and 3 land at 200ms and
-// 1.2s, which is exactly where that schedule's doc says routine transients clear — a cross-shard handoff
-// by attempt 2, a bus blip by attempt 4. Firing at 2 would alert on the design working as intended.
-// Attempt 4 lands at 4.2s with 97% of the redelivery window still remaining.
-const stallAttempt = 4
+// 5 is chosen against NakBackoff's own documented schedule, not picked round: "a cross-shard handoff
+// (sub-second) clears by attempt 2; a NATS/gate bus blip (seconds) by attempt 4". So attempt 5 is the
+// first delivery that is NOT explained by a transient the redelivery budget exists to absorb. Firing
+// earlier would alert on the design working as intended.
+//
+// The threshold is read against DELIVERIES, not failures — the hook fires on the crossing delivery before
+// the handler runs (see the placement comment in jetstream_nats.go), so a message that needed a 5th
+// delivery is reported even if that delivery then succeeds. That is the honest reading: under
+// MaxAckPending=1 the consumer was head-of-line blocked for those 14.2s whether or not the last try
+// worked, and for WORLD_EVENTS that is 14.2s in which a scope applied nothing.
+//
+// 14.2s is 8.6% of the 164s redelivery window, so there is still ample room to act before the park.
+const stallAttempt = 5
 
 // stalled reports whether this attempt is the one that crosses the stall threshold. EQUALITY, not >=, and
 // that is the whole design: attempt is monotonic per message, so equality fires exactly ONCE per stalled
@@ -435,6 +443,12 @@ func (c *memConsumer) run() {
 // advancing the delivered-cursor past a pending, delay-NAK'd message.
 func (c *memConsumer) deliverBounded(msg Message, backlog bool) {
 	for attempt := 1; attempt <= DefaultMaxDeliver; attempt++ {
+		// Same placement as the real consumer: on the crossing DELIVERY, before the handler, so the
+		// crossing cannot be consumed by a non-retry arm. Wiring the hook here as well as in
+		// jetstream_nats.go is what makes the feature hermetically testable at all.
+		if stalled(attempt) {
+			noteStall(memStreamName, msg.Subject, attempt)
+		}
 		switch c.handler(msg, backlog) {
 		case AckDelivered:
 			return
@@ -442,12 +456,6 @@ func (c *memConsumer) deliverBounded(msg Message, backlog bool) {
 			c.js.notePoison(c.id, msg)
 			return // exactly one handler call; no delay, no budget spent
 		default: // RetryTransient
-			// Same hook the real consumer uses. Wiring it ONLY in jetstream_nats.go would make the sole
-			// possible test broker-gated, which is how a threshold quietly rots — and would leave the
-			// stand-in behaving differently from the thing it stands in for.
-			if stalled(attempt) {
-				noteStall(memStreamName, msg.Subject, attempt)
-			}
 			c.js.noteNak(c.id, nakBackoff(attempt))
 		}
 		select {
