@@ -56,8 +56,14 @@ services:
     # cluster for HA). Fine for the single-box demo.
     command: ["-js", "-m", "8222"]
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      # Publish BOTH NATS ports to HOST LOOPBACK only — this server runs with no auth (dev stack). Off-host
+      # the client port (4222) is a full unauthenticated data-plane: subscribe to telos.comms.tell.<playerId>
+      # to read every tell, publish forged comms/events, or DoS JetStream. The monitoring port (8222) leaks
+      # the online-player roster + tell topology (/connz, /subsz) and server config (/varz). Containers reach
+      # NATS by service name (nats:4222) over the compose network, so this only removes off-host reach; host
+      # tooling (`curl localhost:8222/...`) still works. Matches the gate's loopback precedent below. (#455)
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
       interval: 5s
@@ -73,8 +79,12 @@ services:
     volumes:
       - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
     ports:
-      - "4317:4317" # OTLP gRPC ingest
-      - "8889:8889" # Prometheus scrape endpoint
+      # Publish to HOST LOOPBACK only, matching the gate's precedent. Both endpoints are unauthenticated:
+      # :4317 is an OTLP ingest (anyone on the host's network could WRITE arbitrary telemetry — and, once the
+      # LGTM logs pipeline lands, forge log lines / fill disk) and :8889 is a plaintext metrics scrape (READ).
+      # The smoke/e2e harness and `curl localhost:8889/metrics` during load runs are host-local, so unaffected.
+      - "127.0.0.1:4317:4317" # OTLP gRPC ingest
+      - "127.0.0.1:8889:8889" # Prometheus scrape endpoint
     restart: unless-stopped
 
   # One-shot: apply the embedded goose migrations (the schema), then exit. Runs before any
