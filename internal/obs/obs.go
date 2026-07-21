@@ -56,13 +56,18 @@ func Init(service, level string) ShutdownFunc {
 	// which already collects logs via filelog, does not double-ship.
 	var handler slog.Handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
 	logShutdown := noopShutdown
-	if LogOTLP() && otlpConfigured() {
+	switch {
+	case LogOTLP() && otlpConfigured():
 		if lp, bridge, err := initLogs(service, lvl); err != nil {
 			slog.Warn("otlp log bridge init failed; logs stay stdout-only", "err", err)
 		} else {
 			handler = newMultiHandler(handler, bridge) // stdout AND OTLP
 			logShutdown = lp.Shutdown
 		}
+	case LogOTLP():
+		// The flag is set but no OTLP endpoint is configured, so the bridge can't be built — surface it
+		// rather than silently ship no logs (this is exactly how the account-service endpoint gap hid).
+		slog.Warn("TELOS_OTEL_LOGS is set but no OTLP endpoint is configured; log bridge disabled (logs stay stdout-only)")
 	}
 	slog.SetDefault(slog.New(handler).With("service", service))
 
