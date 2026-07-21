@@ -2570,8 +2570,8 @@ func (z *Zone) quiescent() bool {
 // real id, each minted instance would create a fresh Prometheus label value, i.e. a fresh, never-resampled
 // time series. On the 12 GB single-node backend this stack targets that is a player-triggerable cardinality
 // bomb — a monitoring outage a player can cause on demand, and plausibly a game outage on that box too. The
-// TelosMUDInstanceReportsTemplate regression test is the actual guard; this comment alone will not survive a
-// refactor, so the test asserts a minted instance reports its template, not its id.
+// TestMetricZoneReportsTemplateForMintedInstance regression test is the actual guard; this comment alone
+// will not survive a refactor, so the test asserts a minted instance reports its template, not its id.
 //
 // Logs and metrics deliberately want OPPOSITE answers here. The zone LOGGER keeps the instance id (and adds
 // `template=`; see newInstanceZone), because an operator reading a log needs to know which copy misbehaved —
