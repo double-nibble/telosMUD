@@ -449,7 +449,12 @@ func (c *memConsumer) deliverBounded(msg Message, backlog bool) {
 		if stalled(attempt) {
 			noteStall(memStreamName, msg.Subject, attempt)
 		}
-		switch c.handler(msg, backlog) {
+		// Consumer span LINKED to the producer, carrying backlog + attempt (#467) — so each redelivery is a
+		// fresh span linked to the SAME producer, visibly the Nth attempt, mirroring the NATS consumer.
+		_, cspan := startConsumer(msg.Subject, msg, backlog, attempt)
+		ack := c.handler(msg, backlog)
+		cspan.End()
+		switch ack {
 		case AckDelivered:
 			return
 		case DropPoison:

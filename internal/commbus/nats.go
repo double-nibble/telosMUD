@@ -136,7 +136,7 @@ func (b *NATSBus) Available() bool { return b.nc != nil && b.nc.IsConnected() }
 // NOTHING reaches the broker — the impersonation gate holds even though NATS has no role concept.
 // msg.Subject is stamped to subj so a wildcard subscriber can dispatch on the concrete subject. A
 // closed connection returns ErrBusClosed. Off any zone goroutine (the source world's publish path).
-func (b *NATSBus) Publish(_ context.Context, subj string, msg Message) error {
+func (b *NATSBus) Publish(ctx context.Context, subj string, msg Message) error {
 	if b.role == RoleGate && isACLGuarded(subj) {
 		return ErrPublishForbidden
 	}
@@ -144,6 +144,11 @@ func (b *NATSBus) Publish(_ context.Context, subj string, msg Message) error {
 		return ErrBusClosed
 	}
 	msg.Subject = subj
+	// Producer span + traceparent injected into the envelope (#467). The traceparent rides Data (Message
+	// JSON), so a raw nc.Publish still carries it — no need for nc.PublishMsg headers, which the mem
+	// transport could not mirror.
+	msg, span := startProducer(ctx, subj, msg)
+	defer span.End()
 	data, err := msg.marshal()
 	if err != nil {
 		return fmt.Errorf("commbus: marshal message: %w", err)
@@ -175,7 +180,11 @@ func (b *NATSBus) Subscribe(subj string, handler func(Message)) (Subscription, e
 		// Trust the broker's delivery subject over a (possibly absent) payload field so a wildcard
 		// subscriber dispatches on the concrete subject it was delivered.
 		msg.Subject = m.Subject
+		// Consumer span LINKED to the producer (#467). Transient delivery is always live (not backlog) and
+		// single-attempt — there is no redelivery on the fire-and-forget path.
+		_, span := startConsumer(m.Subject, msg, false, 1)
 		handler(msg)
+		span.End()
 	})
 	if err != nil {
 		return nil, fmt.Errorf("commbus: subscribe %s: %w", subj, err)
