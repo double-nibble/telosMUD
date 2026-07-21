@@ -147,7 +147,7 @@ func (b *NATSBus) Publish(ctx context.Context, subj string, msg Message) error {
 	// Producer span + traceparent injected into the envelope (#467). The traceparent rides Data (Message
 	// JSON), so a raw nc.Publish still carries it — no need for nc.PublishMsg headers, which the mem
 	// transport could not mirror.
-	msg, span := startProducer(ctx, subj, msg)
+	pubCtx, msg, span := startProducer(ctx, subj, msg)
 	defer span.End()
 	data, err := msg.marshal()
 	if err != nil {
@@ -159,7 +159,7 @@ func (b *NATSBus) Publish(ctx context.Context, subj string, msg Message) error {
 	if err := b.nc.Flush(); err != nil {
 		return fmt.Errorf("commbus: flush: %w", err)
 	}
-	b.log.Debug("comms message published", "subject", subj, "author", msg.AuthorID, "seq", msg.Seq)
+	b.log.DebugContext(pubCtx, "comms message published", "subject", subj, "author", msg.AuthorID, "seq", msg.Seq)
 	return nil
 }
 

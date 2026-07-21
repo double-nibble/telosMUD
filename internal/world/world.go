@@ -1571,21 +1571,21 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 		// the binding survives the owning shard moving hosts.
 		destShardID, err := s.dir.ShardForZone(ctx, destZone)
 		if err != nil {
-			log.Warn("destination zone not in directory", "err", err)
+			log.WarnContext(spanCtx, "destination zone not in directory", "err", err)
 			fail("destination unreachable")
 			return
 		}
 		span.SetAttributes(attribute.String("telos.shard.dest", destShardID))
 		addr, err := s.dir.EndpointForShard(ctx, destShardID)
 		if err != nil {
-			log.Warn("owning shard has no live endpoint", "dest_shard", destShardID, "err", err)
+			log.WarnContext(spanCtx, "owning shard has no live endpoint", "dest_shard", destShardID, "err", err)
 			fail("destination unreachable")
 			return
 		}
-		log.Debug("resolved destination", "dest_shard", destShardID, "endpoint", addr)
+		log.DebugContext(spanCtx, "resolved destination", "dest_shard", destShardID, "endpoint", addr)
 		client, err := s.peers(addr)
 		if err != nil {
-			log.Warn("cannot reach destination shard", "dest_shard", destShardID, "addr", addr, "err", err)
+			log.WarnContext(spanCtx, "cannot reach destination shard", "dest_shard", destShardID, "addr", addr, "err", err)
 			fail("destination unreachable")
 			return
 		}
@@ -1636,7 +1636,7 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 				case found:
 					pid = row.PID
 				default:
-					log.Debug("handoff epoch not minted: no durable row for this character (async-create window)",
+					log.DebugContext(spanCtx, "handoff epoch not minted: no durable row for this character (async-create window)",
 						"epoch", newEpoch)
 				}
 			}
@@ -1657,7 +1657,7 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 				// player where they stand, which is a movement hiccup, not data loss. newEpoch is still
 				// 0 here (the assignment above only runs on success), so `fail` adopts nothing.
 				newEpoch = 0
-				log.Warn("ownership claim for the handoff failed; aborting the move", "err", cerr)
+				log.WarnContext(spanCtx, "ownership claim for the handoff failed; aborting the move", "err", cerr)
 				fail("destination unreachable")
 				return
 			}
@@ -1685,7 +1685,7 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			prepSpan.RecordError(err)
 			prepSpan.SetStatus(otelcodes.Error, "prepare rejected")
 			prepSpan.End()
-			log.Warn("prepare rejected by destination", "err", err)
+			log.WarnContext(spanCtx, "prepare rejected by destination", "err", err)
 			fail("destination rejected the handoff")
 			return
 		}
@@ -1703,7 +1703,7 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 		claimSpan.SetAttributes(attribute.Bool("telos.handoff.claimed", err == nil && ok))
 		claimSpan.End()
 		if err != nil || !ok {
-			log.Warn("directory claim failed after prepare", "ok", ok, "err", err)
+			log.WarnContext(spanCtx, "directory claim failed after prepare", "ok", ok, "err", err)
 			// The rollback Abort needs a FRESH context: ctx may already be at/past its
 			// deadline (e.g. SetPlayerShard was what timed out), which would cancel the
 			// Abort before it could discard the destination's pending entity. It stays under the
@@ -1727,10 +1727,10 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 				// skew (#314): a new keyed destination rejected an unsigned rollback from an old-code source
 				// mid-rolling-upgrade. That is an actionable operator signal, not the usual network/deadline miss.
 				if status.Code(aerr) == codes.PermissionDenied {
-					log.Warn("rollback Abort rejected by destination (auth) — pending will self-heal via pendingTTL; "+
+					log.WarnContext(spanCtx, "rollback Abort rejected by destination (auth) — pending will self-heal via pendingTTL; "+
 						"check handoff key/version skew during a rolling upgrade", "err", aerr)
 				} else {
-					log.Debug("rollback Abort did not reach destination; pending self-heals via pendingTTL", "err", aerr)
+					log.DebugContext(spanCtx, "rollback Abort did not reach destination; pending self-heals via pendingTTL", "err", aerr)
 				}
 			}
 			abortSpan.End()
@@ -1752,7 +1752,7 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 		// correctness no longer depends on freezeTTL >> handoffRPCTimeout.
 		src.post(handedOffMsg{id: character})
 
-		log.Debug("prepared + ownership claimed; redirecting", "dest_addr", resp.GetTargetShardAddr(), "epoch", newEpoch)
+		log.DebugContext(spanCtx, "prepared + ownership claimed; redirecting", "dest_addr", resp.GetTargetShardAddr(), "epoch", newEpoch)
 		src.post(redirectMsg{
 			id:         character,
 			targetAddr: resp.GetTargetShardAddr(),

@@ -244,7 +244,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		character = "Wanderer-" + uuid.NewString()[:8]
 	}
 	token := attach.GetHandoffToken()
-	s.log.Debug("attach parsed", "character", character)
+	s.log.DebugContext(attachCtx, "attach parsed", "character", character)
 
 	// Phase 14.3: on a FRESH login (no handoff token) verify the gate's signed session assertion against
 	// account's public key — OFFLINE, no per-connect RPC. A handoff re-dial is trusted via its handoff token
@@ -265,13 +265,13 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	if token == "" && s.shard.verifyKey != nil {
 		claims, err := assertion.Verify(s.shard.verifyKey, attach.GetSessionAssertion(), time.Now())
 		if err != nil {
-			s.log.Warn("session assertion rejected", "err", err, "character", character)
+			s.log.WarnContext(attachCtx, "session assertion rejected", "err", err, "character", character)
 			return status.Error(codes.Unauthenticated, "invalid session assertion")
 		}
 		// The token must match THIS connection: the session it was issued for + the character it names. This
 		// is what stops a compromised gate replaying one account's assertion to attach as a different identity.
 		if claims.Session != attach.GetSessionId() || claims.Character != attach.GetCharacterId() {
-			s.log.Warn("session assertion identity mismatch",
+			s.log.WarnContext(attachCtx, "session assertion identity mismatch",
 				"claim_session", claims.Session, "claim_character", claims.Character)
 			return status.Error(codes.Unauthenticated, "session assertion mismatch")
 		}
@@ -287,7 +287,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// via the directory (whose zone leases have flipped to the peer) and dials there. A handoff BIND
 	// (token != "") is still accepted so an in-flight cross-shard move completes.
 	if token == "" && s.shard.isDraining() {
-		s.log.Info("refusing fresh login: shard draining", "character", character)
+		s.log.InfoContext(attachCtx, "refusing fresh login: shard draining", "character", character)
 		return status.Error(codes.Unavailable, "shard draining; reconnect")
 	}
 
@@ -306,7 +306,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// once per incident instead of once per retry. This is insurance only: the double-own itself is closed by
 	// Zone.attach's delivery-time check, which does not depend on the mark at all.
 	if token == "" && s.shard.expireStaleTransferMark(character) {
-		s.log.Error("a mid-transfer mark outlived its transfer and was dropped; some path took the "+
+		s.log.ErrorContext(attachCtx, "a mid-transfer mark outlived its transfer and was dropped; some path took the "+
 			"intra-shard transfer mark without releasing it, which had made this character unable to "+
 			"reconnect (#379)", "character", character, "ttl", transferMarkTTL)
 	}
@@ -327,10 +327,10 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		ectx, ecancel := context.WithTimeout(epCtx, 2*time.Second)
 		if ep, found, err := s.shard.dir.PlayerEpoch(ectx, character); err != nil {
 			epSpan.RecordError(err)
-			s.log.Debug("epoch resume read failed; treating as fresh", "character", character, "err", err)
+			s.log.DebugContext(attachCtx, "epoch resume read failed; treating as fresh", "character", character, "err", err)
 		} else if found {
 			resumeEpoch = ep
-			s.log.Debug("epoch resumed from directory", "character", character, "epoch", ep)
+			s.log.DebugContext(attachCtx, "epoch resumed from directory", "character", character, "epoch", ep)
 		}
 		ecancel()
 		epSpan.End()
@@ -360,7 +360,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			// copy in the start room, whose create then collides on the unique name, leaving the player
 			// with an ephemeral session that persists nothing (#432). Refusing is both honest and the
 			// same fail-closed rule the ownership claim below applies.
-			s.log.Error("durable character read failed; refusing the login rather than spawning a blank copy",
+			s.log.ErrorContext(attachCtx, "durable character read failed; refusing the login rather than spawning a blank copy",
 				"character", character)
 			endAttach(otelcodes.Error, "durable character read failed", nil)
 			return status.Error(codes.Unavailable, "character store unavailable; reconnect")
@@ -436,11 +436,11 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		if route == attachRouteMidTransfer {
 			// Info, not Warn: this is a benign, self-clearing race (a reconnect arriving inside a
 			// two-goroutine inbox hop), and the gate re-resolves on Unavailable (#324) so the retry lands.
-			s.log.Info("refusing a reconnect landing inside an in-flight intra-shard transfer; the gate will "+
+			s.log.InfoContext(attachCtx, "refusing a reconnect landing inside an in-flight intra-shard transfer; the gate will "+
 				"re-resolve", "character", character)
 			return status.Error(codes.Unavailable, "character is mid-transfer; reconnect")
 		}
-		s.log.Error("no zone to attach to", "character", character, "home", s.shard.home)
+		s.log.ErrorContext(attachCtx, "no zone to attach to", "character", character, "home", s.shard.home)
 		return status.Error(codes.Unavailable, "no hosted zone; reconnect")
 	}
 	// LIVE INSURANCE, registered before anything that can return or panic while the claim is held.
@@ -472,10 +472,10 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// behind it). Both routes end at the home zone with the player's saved location not honored.
 	switch route {
 	case attachRouteDurableInstance:
-		s.log.Warn("durable zone_ref names a zone INSTANCE; refusing it and falling back to the home zone",
+		s.log.WarnContext(attachCtx, "durable zone_ref names a zone INSTANCE; refusing it and falling back to the home zone",
 			"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
 	case attachRouteDurableUnhosted:
-		s.log.Warn("durable zone not hosted on this shard; falling back to the home zone (the player's saved location is lost)",
+		s.log.WarnContext(attachCtx, "durable zone not hosted on this shard; falling back to the home zone (the player's saved location is lost)",
 			"character", character, "zone_ref", loaded.ZoneRef, "home", s.shard.home)
 	case attachRouteHome, attachRouteToken, attachRouteResident, attachRouteDurable, attachRouteMidTransfer:
 		// Nothing to report: the route either honored the player's location or is the ordinary fallback.
@@ -522,13 +522,13 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		case cerr == nil:
 			claimed = ep
 			claimSpan.End()
-			s.log.Debug("ownership claimed", "character", character, "epoch", ep, "floor", floor)
+			s.log.DebugContext(attachCtx, "ownership claimed", "character", character, "epoch", ep, "floor", floor)
 		case errors.Is(cerr, ErrNoCharacterRow):
 			// The row vanished between the load and the claim (a soft delete). Nothing to fence; fall
 			// through unclaimed and let the ordinary login path handle the missing row.
 			claimSpan.AddEvent("no_row_unfenced")
 			claimSpan.End()
-			s.log.Warn("ownership claim found no row; continuing unfenced", "character", character)
+			s.log.WarnContext(attachCtx, "ownership claim found no row; continuing unfenced", "character", character)
 		default:
 			claimSpan.RecordError(cerr)
 			claimSpan.SetStatus(otelcodes.Error, "ownership claim failed")
@@ -541,7 +541,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			//
 			// This return runs with the arrival claim HELD: the deferred release above is what keeps a
 			// store outage from converting every refused login into a permanently un-unhostable zone.
-			s.log.Error("ownership claim failed; refusing the login", "character", character, "err", cerr)
+			s.log.ErrorContext(attachCtx, "ownership claim failed; refusing the login", "character", character, "err", cerr)
 			endAttach(otelcodes.Error, "ownership claim failed", cerr)
 			return status.Error(codes.Unavailable, "could not claim character ownership; reconnect")
 		}
@@ -634,7 +634,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		account:     loginAccount,
 	})
 	posted = true // the arrival claim is now Zone.attach's to release (#413)
-	s.log.Debug("player stream ready", "character", character, "zone", zone.id)
+	s.log.DebugContext(attachCtx, "player stream ready", "character", character, "zone", zone.id)
 
 	// Phase 14.4 single-session lock: on a FRESH login (a handoff re-dial already holds the lock under the
 	// same character), ACQUIRE the cross-shard lock (takeover) and start a renewer. A session displaced by a
@@ -652,7 +652,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			// degradation on the login path even though it does not refuse the login.
 			lockSpan.RecordError(lerr)
 			lockSpan.AddEvent("lock_acquire_failed_continuing_unlocked")
-			s.log.Warn("session lock acquire failed (continuing unlocked)", "character", character, "err", lerr)
+			s.log.WarnContext(attachCtx, "session lock acquire failed (continuing unlocked)", "character", character, "err", lerr)
 		} else {
 			go s.runSessionLockRenewer(ctx, character, lockToken, out)
 			defer func() {

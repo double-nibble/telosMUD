@@ -305,7 +305,7 @@ func (b *NATSJetStream) PublishDurable(ctx context.Context, subj string, msg Mes
 	msg.Subject = subj
 	// Producer span + traceparent injected into the envelope (#467), riding Data alongside the idempotency
 	// key so the durable consumer can LINK its (possibly redelivered) delivery span to this producer.
-	msg, span := startProducer(ctx, subj, msg)
+	pubCtx, msg, span := startProducer(ctx, subj, msg)
 	defer span.End()
 	data, err := msg.marshal()
 	if err != nil {
@@ -318,7 +318,7 @@ func (b *NATSJetStream) PublishDurable(ctx context.Context, subj string, msg Mes
 	if _, err := b.js.PublishMsg(ctx, m); err != nil {
 		return fmt.Errorf("commbus: durable publish %s: %w", subj, err)
 	}
-	b.log.Debug("durable tell published", "subject", subj, "author", msg.AuthorID, "seq", msg.Seq)
+	b.log.DebugContext(pubCtx, "durable tell published", "subject", subj, "author", msg.AuthorID, "seq", msg.Seq)
 	return nil
 }
 
@@ -391,14 +391,14 @@ func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, b
 		// Consumer span LINKED to the producer (#467), carrying backlog + the delivery attempt so a
 		// redelivery is visibly a redelivery (a fresh span linked to the SAME producer, attempt=N) rather
 		// than a second child of one parent — the correct model for at-least-once JetStream.
-		_, cspan := startConsumer(m.Subject(), msg, backlog, attempt)
+		cctx, cspan := startConsumer(m.Subject(), msg, backlog, attempt)
 		ack := handler(msg, backlog)
 		cspan.End()
 		switch ack {
 		case AckDelivered:
 			_ = m.Ack()
 		case DropPoison:
-			b.log.Warn("dropping undeliverable durable message (poison)",
+			b.log.WarnContext(cctx, "dropping undeliverable durable message (poison)",
 				"subject", m.Subject(), "author", msg.AuthorID, "seq", msg.Seq)
 			metrics.DurablePoisoned(context.Background(), b.name)
 			_ = m.Ack()
@@ -411,7 +411,7 @@ func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, b
 			// AckWait-expiry or across-restart park), and double-counting the advisory-visible in-process
 			// park would corrupt the count. So: rich log here, authoritative count there.
 			if attempt >= DefaultMaxDeliver {
-				b.log.Error("durable message PARKED after exhausting the redelivery budget — it is LOST",
+				b.log.ErrorContext(cctx, "durable message PARKED after exhausting the redelivery budget — it is LOST",
 					"subject", m.Subject(), "author", msg.AuthorID, "seq", msg.Seq,
 					"attempts", attempt, "window", totalNakWindow())
 			}

@@ -101,7 +101,7 @@ func (b *MemBus) Publish(ctx context.Context, subj string, msg Message) error {
 	msg.Subject = subj
 	// Producer span + traceparent into the envelope (#467), so an in-proc subscriber links its delivery span
 	// to this producer exactly as a NATS one does.
-	msg, span := startProducer(ctx, subj, msg)
+	_, msg, span := startProducer(ctx, subj, msg)
 	defer span.End()
 	c := b.core
 	c.mu.Lock()

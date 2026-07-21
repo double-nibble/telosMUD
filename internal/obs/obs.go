@@ -60,7 +60,10 @@ func Init(service, level string) ShutdownFunc {
 	// scraping. That is the Docker-Desktop answer: filelog cannot read the VM's container logs, but the
 	// OTLP path already works (it carries metrics), so logs ride it too. It is OFF by default so k8s,
 	// which already collects logs via filelog, does not double-ship.
-	var handler slog.Handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
+	// traceHandler wraps the stdout JSON handler so a log line emitted with a ctx carrying a live span gains
+	// trace_id/span_id (#468) — the Tempo→Loki pivot. The otelslog OTLP bridge does its own correlation, so
+	// only the stdout sink needs the wrapper.
+	var handler slog.Handler = traceHandler{next: slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})}
 	logShutdown := noopShutdown
 	switch {
 	case LogOTLP() && otlpConfigured():
@@ -325,6 +328,37 @@ func truthyEnv(name string) bool {
 		return true
 	}
 	return false
+}
+
+// traceHandler adds trace_id/span_id attributes lifted off the ctx when a valid span context is present, so
+// clicking a slow span in Tempo lands on that request's Loki log lines (#468, the metric→trace→log pivot).
+//
+// It only helps the *Context slog methods (InfoContext/WarnContext/…): the ctx-less forms pass
+// context.Background(), whose span context is invalid, so they get nothing — which is why #468 also converts
+// the span-carrying log sites to the *Context forms. Zero cost when tracing is off: an unconfigured process
+// never has a valid span context, so Handle adds no attributes and allocates nothing. The stdout JSON sink is
+// the only one wrapped; the otelslog OTLP bridge does its own ctx correlation.
+type traceHandler struct{ next slog.Handler }
+
+func (h traceHandler) Enabled(ctx context.Context, l slog.Level) bool { return h.next.Enabled(ctx, l) }
+
+func (h traceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		r = r.Clone() // never mutate the caller's record in place (multiHandler shares it across sinks)
+		r.AddAttrs(
+			slog.String("trace_id", sc.TraceID().String()),
+			slog.String("span_id", sc.SpanID().String()),
+		)
+	}
+	return h.next.Handle(ctx, r)
+}
+
+func (h traceHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	return traceHandler{next: h.next.WithAttrs(as)}
+}
+
+func (h traceHandler) WithGroup(name string) slog.Handler {
+	return traceHandler{next: h.next.WithGroup(name)}
 }
 
 // multiHandler fans one slog record out to several handlers (here: stdout JSON + the OTLP bridge), so a

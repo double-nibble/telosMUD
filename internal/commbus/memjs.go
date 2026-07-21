@@ -186,7 +186,7 @@ func (js *MemJetStream) PublishDurable(ctx context.Context, subj string, msg Mes
 		return ErrJetStreamClosed
 	}
 	// Producer span + traceparent into the envelope (#467), so a durable consumer links to it.
-	msg, span := startProducer(ctx, subj, msg)
+	_, msg, span := startProducer(ctx, subj, msg)
 	defer span.End()
 	js.Append(subj, msg)
 	return nil

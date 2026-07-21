@@ -1,8 +1,10 @@
 package obs
 
 import (
+	"bytes"
 	"context"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -342,5 +344,39 @@ func TestTraceSampleRatio(t *testing.T) {
 		if got := traceSampleRatio(); got != c.want {
 			t.Errorf("traceSampleRatio() with OTEL_TRACES_SAMPLER_ARG=%q = %v, want %v", c.val, got, c.want)
 		}
+	}
+}
+
+// TestTraceHandlerAddsIDsWhenSpanPresent pins #468: the stdout handler adds trace_id/span_id when a log is
+// emitted with a ctx carrying a valid span, and adds nothing otherwise — the Tempo→Loki correlation, and
+// zero cost when there is no span.
+func TestTraceHandlerAddsIDsWhenSpanPresent(t *testing.T) {
+	var buf bytes.Buffer
+	h := traceHandler{next: slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})}
+	log := slog.New(h)
+
+	// A real recording span installed in the ctx.
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	ctx, span := tp.Tracer("t").Start(context.Background(), "op")
+	wantTrace := span.SpanContext().TraceID().String()
+	wantSpan := span.SpanContext().SpanID().String()
+
+	log.InfoContext(ctx, "with span")
+	span.End()
+	out := buf.String()
+	if !strings.Contains(out, `"trace_id":"`+wantTrace+`"`) {
+		t.Errorf("log with a span-carrying ctx is missing the correct trace_id; got %q", out)
+	}
+	if !strings.Contains(out, `"span_id":"`+wantSpan+`"`) {
+		t.Errorf("log with a span-carrying ctx is missing the correct span_id; got %q", out)
+	}
+
+	// A log with NO span (ctx-less form / Background) gets neither id.
+	buf.Reset()
+	log.Info("no span")
+	if got := buf.String(); strings.Contains(got, "trace_id") || strings.Contains(got, "span_id") {
+		t.Errorf("a log with no span must carry no trace_id/span_id; got %q", got)
 	}
 }
