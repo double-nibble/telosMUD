@@ -389,7 +389,7 @@ func TestAFKAutoReply(t *testing.T) {
 	commsOf(target).afkMsg = "zzz"
 
 	// Deliver a LIVE tell from Caller to Sleeper directly via the drain path.
-	ack := z.deliverDrainedTell(tellDeliverMsg{
+	ack := z.deliverDrainedTell(context.Background(), tellDeliverMsg{
 		target:  "Sleeper",
 		msg:     commbus.Message{AuthorID: "Caller", AuthorName: "Caller", Seq: 1, Body: "wake up"},
 		backlog: false,
@@ -410,7 +410,7 @@ func TestAFKAutoReply(t *testing.T) {
 	// A BACKLOG (offline catch-up) drain must NOT auto-reply: those are old tells whose senders
 	// should not get a stale "is AFK" now (the header's second claim, previously unasserted —
 	// ai-finding #13). Seq 2 > the cursor the live tell advanced, so it genuinely delivers.
-	ack = z.deliverDrainedTell(tellDeliverMsg{
+	ack = z.deliverDrainedTell(context.Background(), tellDeliverMsg{
 		target:  "Sleeper",
 		msg:     commbus.Message{AuthorID: "Caller", AuthorName: "Caller", Seq: 2, Body: "still there?"},
 		backlog: true,

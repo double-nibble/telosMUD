@@ -95,6 +95,19 @@ const (
 	maxTraceValueLen = 512
 )
 
+// ProducerLink returns a span link to the producer that published msg, for a consumer OUTSIDE commbus (the
+// zone actor, #467 zone-mailbox half) that wants to link its own span to the message's origin. It reuses the
+// same security boundary as startConsumer: a bounded extract, and it returns ONLY the producer's span
+// context (via the link) — attacker-controllable baggage in msg.Trace never crosses. Returns a zero (dropped
+// by the SDK) link when there is no valid, in-bounds producer context.
+func ProducerLink(msg Message) trace.Link {
+	if !carrierWithinBounds(msg.Trace) {
+		return trace.Link{}
+	}
+	producerCtx := otel.GetTextMapPropagator().Extract(context.Background(), msgCarrier(msg.Trace))
+	return trace.LinkFromContext(producerCtx)
+}
+
 func carrierWithinBounds(t map[string]string) bool {
 	if len(t) > maxTraceKeys {
 		return false

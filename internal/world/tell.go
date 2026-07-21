@@ -5,6 +5,9 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/textsan"
 )
@@ -69,9 +72,14 @@ var loginDrainPace = 50 * time.Millisecond
 // both ack) or could not be (no such resident right now — NAK so it redelivers, bounded by maxDeliver).
 type tellDeliverMsg struct {
 	target  string          // the resident player id this tell is for
-	msg     commbus.Message // the durable tell (engine-set author, seq, body)
+	msg     commbus.Message // the durable tell (engine-set author, seq, body); msg.Trace carries the producer link
 	backlog bool            // true => an OFFLINE catch-up tell (rendered "while you were away…")
 	ack     chan bool       // the zone replies true=ack (handled/suppressed), false=nak (retry)
+	// enqueued is when the off-zone consumer POSTED this to the inbox (#467). The zone reads it at DEQUEUE to
+	// record inbox queue-wait — precisely the saturation signal at the hot-zone one-core ceiling. It carries
+	// an immutable timestamp + msg.Trace (a serialized SpanContext), NEVER a cancellable context, so a message
+	// handled after its originating stream was cancelled cannot outlive a dead parent.
+	enqueued time.Time
 }
 
 func (tellDeliverMsg) zoneMsg() {}
@@ -253,7 +261,30 @@ func (z *Zone) stopTellConsumer(playerID string) {
 //     re-render-once-on-crash exception.
 //   - otherwise: render + emit to the gate via the transient bus, advance the cursor, set lastTellFrom
 //     for `reply`, and ACK.
-func (z *Zone) deliverDrainedTell(m tellDeliverMsg) bool {
+//
+// deliverTellTraced wraps deliverDrainedTell in the zone-side tell-delivery span (#467, zone-mailbox half).
+// The span STARTS HERE — on the zone goroutine at DEQUEUE, not when the message was enqueued — so a message
+// DROPPED before it is dequeued (postOrDrop under load) never starts a span at all: there is no orphan by
+// construction, and this is why a started-never-ended span cannot happen on the shed path. It LINKS to the
+// producer that published the tell (bounded, baggage-free via commbus.ProducerLink) rather than parenting to
+// it, and records inbox queue-wait (now − enqueued) — the hot-zone saturation signal. The span's ctx is
+// threaded into the render+emit so the gate-delivery publish continues this trace instead of rooting anew.
+func (z *Zone) deliverTellTraced(m tellDeliverMsg) bool {
+	ctx, span := tracer().Start(context.Background(), "zone.deliver_tell",
+		trace.WithLinks(commbus.ProducerLink(m.msg)),
+		trace.WithAttributes(
+			attribute.String("telos.zone", z.metricZone()), // template, never the player-mintable instance id (#470)
+			attribute.Bool("telos.bus.backlog", m.backlog),
+		),
+	)
+	if !m.enqueued.IsZero() {
+		span.SetAttributes(attribute.Int64("telos.zone.queue_wait_ms", time.Since(m.enqueued).Milliseconds()))
+	}
+	defer span.End()
+	return z.deliverDrainedTell(ctx, m)
+}
+
+func (z *Zone) deliverDrainedTell(ctx context.Context, m tellDeliverMsg) bool {
 	s := z.players[m.target]
 	if s == nil {
 		return false // not ours right now: NAK -> redeliver (bounded); the player's real host drains it
@@ -279,7 +310,7 @@ func (z *Zone) deliverDrainedTell(m tellDeliverMsg) bool {
 	} else {
 		line = m.msg.AuthorName + " tells you, '" + m.msg.Body + "'"
 	}
-	if err := z.commsBus().Publish(context.Background(), commbus.TellSubject(m.target), commbus.Message{
+	if err := z.commsBus().Publish(ctx, commbus.TellSubject(m.target), commbus.Message{
 		AuthorID:   m.msg.AuthorID,
 		AuthorName: m.msg.AuthorName,
 		Seq:        m.msg.Seq,

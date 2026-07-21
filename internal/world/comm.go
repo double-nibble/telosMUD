@@ -334,7 +334,7 @@ func routeTellDeliver(route func() *Zone, playerID string, msg commbus.Message, 
 		return commbus.RetryTransient // unknown current zone: redeliver on the schedule; the message stays durable
 	}
 	ack := make(chan bool, 1)
-	z.post(tellDeliverMsg{target: playerID, msg: msg, backlog: backlog, ack: ack})
+	z.post(tellDeliverMsg{target: playerID, msg: msg, backlog: backlog, ack: ack, enqueued: time.Now()})
 	select {
 	case ok := <-ack:
 		if ok {
