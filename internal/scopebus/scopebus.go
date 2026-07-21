@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/metrics"
 )
@@ -157,7 +159,7 @@ type scopeMsg struct {
 // CLAMPED at 0: cross-host wall-clock skew can make now-PubMillis negative, and a negative sample would drag
 // down the histogram's SUM (poisoning any avg=sum/count dashboard panel) while telling us nothing about
 // delivery latency — clock-skew monitoring is a separate concern, not this metric's job.
-func recordBusDeliverLag(pubMillis int64) {
+func recordBusDeliverLag(ctx context.Context, pubMillis int64) {
 	if pubMillis <= 0 {
 		return
 	}
@@ -165,7 +167,17 @@ func recordBusDeliverLag(pubMillis int64) {
 	if lag < 0 {
 		lag = 0
 	}
-	metrics.RecordBusLag(context.Background(), float64(lag))
+	metrics.RecordBusLag(ctx, float64(lag))
+}
+
+// busExemplarCtx returns a ctx carrying the span context of the PRODUCER that published m — extracted from
+// m's trace envelope (#467) via commbus.ProducerLink's bounded, baggage-free extract (only the span-context
+// id crosses). Recording busLag on it attaches a trace EXEMPLAR, so a spike in the delivery-latency histogram
+// becomes a click through to the trace of the request that produced it (#469, the metric→trace pivot — and
+// busLag is its flagship). A message with no/unsampled producer trace yields an invalid span context and thus
+// NO exemplar, which is exactly right: an exemplar exists only for a sampled trace.
+func busExemplarCtx(m commbus.Message) context.Context {
+	return trace.ContextWithSpanContext(context.Background(), commbus.ProducerLink(m).SpanContext)
 }
 
 // recordBusCatchup records one durable BACKLOG delivery: its count and its age (#276).
@@ -244,7 +256,7 @@ func (b *Bus) Subscribe(scope Scope, handler Handler) (commbus.Subscription, err
 		if err := json.Unmarshal([]byte(m.Body), &sm); err != nil || sm.Event == "" {
 			return // a malformed scoped message is dropped, never delivered as a bogus event
 		}
-		recordBusDeliverLag(sm.PubMillis) // #44: publish->deliver latency (transient tier)
+		recordBusDeliverLag(busExemplarCtx(m), sm.PubMillis) // #44 latency + #469 exemplar
 		handler(sm.Event, sm.Payload, m.AuthorID)
 	})
 }
@@ -351,7 +363,7 @@ func (b *Bus) SubscribeDurable(scope Scope, consumerID string, handler DurableHa
 				// #276: a resuming consumer's catch-up depth + age, kept OUT of the live-latency histogram.
 				recordBusCatchup(subj, sm.PubMillis)
 			} else {
-				recordBusDeliverLag(sm.PubMillis)
+				recordBusDeliverLag(busExemplarCtx(m), sm.PubMillis)
 			}
 		}
 		if ack {

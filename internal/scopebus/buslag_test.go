@@ -84,7 +84,7 @@ func TestScopeBusDeliverLag(t *testing.T) {
 	}
 
 	// (2) a skewed (future) stamp → still records, clamped so the Sum does not drop.
-	recordBusDeliverLag(time.Now().UnixMilli() + 10_000)
+	recordBusDeliverLag(context.Background(), time.Now().UnixMilli()+10_000)
 	c2, s2 := busLagHistogram(t, rdr)
 	if c2 != c1+1 {
 		t.Fatalf("skewed sample: count %d -> %d, want +1 (still recorded, clamped)", c1, c2)
@@ -94,8 +94,8 @@ func TestScopeBusDeliverLag(t *testing.T) {
 	}
 
 	// (3) an unstamped/foreign message → nothing recorded.
-	recordBusDeliverLag(0)
-	recordBusDeliverLag(-5)
+	recordBusDeliverLag(context.Background(), 0)
+	recordBusDeliverLag(context.Background(), -5)
 	c3, _ := busLagHistogram(t, rdr)
 	if c3 != c2 {
 		t.Fatalf("an unstamped message recorded a sample: count %d -> %d", c2, c3)
@@ -132,4 +132,11 @@ func TestScopeBusDeliverLag(t *testing.T) {
 	if sum6 < catchSum {
 		t.Fatalf("a skewed backlog stamp dragged the Sum down (%.0f -> %.0f); it must clamp at 0", catchSum, sum6)
 	}
+
+	// (6) #469 — the metric→trace EXEMPLAR pivot on busLag. Recording on a ctx carrying a SAMPLED producer
+	// span context (off the #467 trace envelope, via busExemplarCtx) attaches a trace exemplar whose trace_id
+	// is the producer's; an unsampled/absent producer trace attaches none (an exemplar exists only for a
+	// sampled trace). Kept in THIS test because the busLag reader is bound to this test's provider (the
+	// global-delegation trap the header documents) — a sibling test with its own reader would see nothing.
+	assertBusLagExemplarPivot(t, rdr)
 }
