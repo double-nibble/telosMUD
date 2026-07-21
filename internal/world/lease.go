@@ -6,8 +6,13 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	handoffv1 "github.com/double-nibble/telosmud/api/gen/telosmud/handoff/v1"
 	"github.com/double-nibble/telosmud/internal/directory"
+	"github.com/double-nibble/telosmud/internal/obs"
 )
 
 // ZoneLeaser is the slice of the directory the shard needs to OWN its hosted zones' leases at RUNTIME
@@ -332,7 +337,33 @@ func (s *Shard) retireZoneRenewal(zoneID string) {
 //
 // Returns an error (leaving the zone owned by us) if the target can't host it or the fenced flip is refused
 // (we are no longer the live owner). Requires leasing to be wired (WithZoneLeasing).
-func (s *Shard) handoverZoneTo(ctx context.Context, zoneID, targetShardID, targetAddr string) error {
+func (s *Shard) handoverZoneTo(ctx context.Context, zoneID, targetShardID, targetAddr string) (err error) {
+	// The AdoptZone / lease-handover trace (#465), 100% sampled via obs.AlwaysSample(). A ROOT span for the
+	// same reason the handoff span is (decision B, #471): the drain that triggers it is not itself traced, and
+	// each zone's handover is a distinct, rare, high-value multi-hop worth its own trace. zoneID is safe as an
+	// attribute — a leased AUTHORED zone, never a player-mintable instance (instances are shard-local and
+	// unleased; AdoptZone refuses instance-shaped ids). The deferred close records the outcome, so every one
+	// of the many error exits below is visible + distinguishable on the trace.
+	ctx, span := tracer().Start(ctx, "world.adopt_zone",
+		trace.WithNewRoot(),
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			obs.AlwaysSample(),
+			attribute.String("telos.zone", zoneID),
+			attribute.String("telos.shard.src", s.shardID),
+			attribute.String("telos.shard.dest", targetShardID),
+		),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, err.Error())
+		} else {
+			span.SetStatus(otelcodes.Ok, "")
+		}
+		span.End()
+	}()
+
 	if s.leaser == nil {
 		return fmt.Errorf("handover %q: zone leasing not configured", zoneID)
 	}
@@ -373,18 +404,33 @@ func (s *Shard) handoverZoneTo(ctx context.Context, zoneID, targetShardID, targe
 		LeaseGen:    leaseGen,
 	}
 	adopt.ZoneSig = signAdoptZone(s.handoffSignKey, adopt)
-	if _, err := client.AdoptZone(ctx, adopt); err != nil {
-		return fmt.Errorf("handover %q: target %s adopt failed: %w", zoneID, targetShardID, err)
+	span.SetAttributes(attribute.Int64("telos.lease.gen", clampInt64(leaseGen)))
+	// Child span per hop so an operator sees WHETHER the peer's build (AdoptZone RPC) or our own fenced flip
+	// (HandoverZone CAS) was the slow/failing step.
+	rpcCtx, rpcSpan := tracer().Start(ctx, "world.adopt_zone.rpc")
+	_, aerr := client.AdoptZone(rpcCtx, adopt)
+	if aerr != nil {
+		rpcSpan.RecordError(aerr)
+		rpcSpan.SetStatus(otelcodes.Error, "adopt rejected")
+		rpcSpan.End()
+		return fmt.Errorf("handover %q: target %s adopt failed: %w", zoneID, targetShardID, aerr)
 	}
+	rpcSpan.End()
 
 	// Suppress our own fence/renewal for this zone BEFORE the flip, so our renewal can never mistake the
 	// deliberate flip for a lost lease.
 	s.markZoneHandedOff(zoneID)
 
 	ttl, _ := s.leaseParams()
-	ok, err := s.leaser.HandoverZone(ctx, zoneID, s.shardID, targetShardID, ttl)
-	if err != nil {
-		return fmt.Errorf("handover %q: lease flip: %w", zoneID, err)
+	flipCtx, flipSpan := tracer().Start(ctx, "world.adopt_zone.lease_flip")
+	ok, ferr := s.leaser.HandoverZone(flipCtx, zoneID, s.shardID, targetShardID, ttl)
+	flipSpan.SetAttributes(attribute.Bool("telos.lease.flipped", ferr == nil && ok))
+	if ferr != nil {
+		flipSpan.RecordError(ferr)
+	}
+	flipSpan.End()
+	if ferr != nil {
+		return fmt.Errorf("handover %q: lease flip: %w", zoneID, ferr)
 	}
 	if !ok {
 		return fmt.Errorf("handover %q: fenced flip refused (no longer the live owner)", zoneID)

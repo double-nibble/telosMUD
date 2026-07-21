@@ -29,6 +29,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -38,6 +41,7 @@ import (
 	"github.com/double-nibble/telosmud/internal/commbus"
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
+	"github.com/double-nibble/telosmud/internal/obs"
 	roster "github.com/double-nibble/telosmud/internal/presence"
 	"github.com/double-nibble/telosmud/internal/sessionlock"
 )
@@ -1512,12 +1516,35 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			s.handoffSem <- struct{}{}
 			defer func() { <-s.handoffSem }()
 		}
+		character := snap.GetCharacterId()
+
+		// The cross-shard-handoff trace (#465) — the highest-value trace in the architecture, sampled at 100%
+		// via obs.AlwaysSample(). It is a ROOT span (WithNewRoot): under decision B (#471) the triggering move
+		// command is not traced, so there is no parent/link to attach; the handoff outlives and is causally
+		// distinct from the keystroke that provoked it, and parenting a multi-second cross-shard operation to a
+		// player's `north` would be a lie about lifetime anyway. Attributes are bounded-cardinality only — zone
+		// template/shard ids/epoch — NEVER the zone INSTANCE id (player-mintable, unbounded; #470). Rounds
+		// 27/31/38 all found real bugs in this neither-owns/both-own window, so a trace that makes the hop
+		// ordering (Prepare→claim→Commit vs Abort) directly visible is a standing regression net.
+		spanCtx, span := tracer().Start(context.Background(), "world.handoff",
+			trace.WithNewRoot(),
+			trace.WithSpanKind(trace.SpanKindInternal),
+			trace.WithAttributes(
+				obs.AlwaysSample(),
+				attribute.String("telos.zone.dest", destZone),
+				// s.addr, not s.shardID: a shard is addressed by addr here, addr IS the FromShardId this handoff
+				// sends on the wire, and shardID is only populated when leasing is configured. Both are
+				// fleet-bounded. destShardID (a logical shard id from the directory) is added once resolved.
+				attribute.String("telos.shard.src", s.addr),
+			),
+		)
+		defer span.End()
+
 		// Bound the whole conversation: a hung Prepare to a restarting/draining destination
 		// must not strand the frozen player forever. On deadline the fail(...) path below
 		// thaws + restores them. Runs off the zone goroutine, so blocking here is safe.
-		ctx, cancel := context.WithTimeout(context.Background(), handoffRPCTimeout)
+		ctx, cancel := context.WithTimeout(spanCtx, handoffRPCTimeout)
 		defer cancel()
-		character := snap.GetCharacterId()
 		log := slog.With("component", "handoff", "player", character, "dest_zone", destZone)
 
 		// newEpoch is minted LATER, immediately before Prepare (see the mint block below). It is declared
@@ -1529,6 +1556,12 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 		// a max(), so a pre-mint failure adopts nothing.
 		var newEpoch uint64
 		fail := func(reason string) {
+			// Make every failure exit visible AND distinguishable on the trace (#465): the reason string is
+			// what separates "destination unreachable" from "destination rejected the handoff" from "ownership
+			// conflict", and the per-hop child spans below localize WHERE it failed. Bounded-cardinality: the
+			// reason is one of a small fixed set, never free text.
+			span.SetStatus(otelcodes.Error, reason)
+			span.AddEvent("handoff_failed", trace.WithAttributes(attribute.String("telos.handoff.reason", reason)))
 			src.post(handoffFailMsg{id: character, reason: reason, adoptEpoch: newEpoch})
 		}
 
@@ -1542,6 +1575,7 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			fail("destination unreachable")
 			return
 		}
+		span.SetAttributes(attribute.String("telos.shard.dest", destShardID))
 		addr, err := s.dir.EndpointForShard(ctx, destShardID)
 		if err != nil {
 			log.Warn("owning shard has no live endpoint", "dest_shard", destShardID, "err", err)
@@ -1577,6 +1611,12 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 		// the row BY NAME instead — the row may already exist even though this snapshot has no id, and
 		// treating that case as "nothing to fence" would leave the one exclusivity hole the shared
 		// counter is meant to close.
+		// The epoch-mint hop (a characters-row read + ClaimCharacter): a Postgres round trip inside the
+		// both-own window, so it too gets a child span — otherwise it is the one in-window hop that can be slow
+		// (a sick store) and yet never show up as "the slow hop" in the trace. The store I/O keeps its own
+		// context.Background()-derived deadline (below) so a handoff-RPC timeout cannot cancel the mint; the
+		// span is for timing only.
+		_, mintSpan := tracer().Start(spanCtx, "world.handoff.mint_epoch")
 		newEpoch = epoch + 1
 		if s.saver != nil && s.saver.store != nil {
 			cctx, ccancel := context.WithTimeout(context.Background(), handoffClaimTimeout)
@@ -1609,6 +1649,9 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			}
 			ccancel()
 			if cerr != nil {
+				mintSpan.RecordError(cerr)
+				mintSpan.SetStatus(otelcodes.Error, "epoch mint failed")
+				mintSpan.End()
 				// The claim is what makes the destination's epoch exclusive; proceeding on an unminted
 				// guess is the collision this exists to prevent. Fail instead — the source thaws the
 				// player where they stand, which is a movement hiccup, not data loss. newEpoch is still
@@ -1619,6 +1662,7 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 				return
 			}
 		}
+		mintSpan.End()
 
 		// Prepare the destination: it rehydrates the player as a pending entity. Sign the request so a
 		// key-enforcing destination accepts it (docs/REMAINING.md §1); an unconfigured source signs nil,
@@ -1632,23 +1676,40 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			FromShardId:  s.addr,
 		}
 		prepReq.SnapshotSig = signSnapshot(s.handoffSignKey, prepReq)
-		resp, err := client.Prepare(ctx, prepReq)
+		span.SetAttributes(attribute.Int64("telos.handoff.epoch", clampInt64(newEpoch)))
+		// Child span per network hop, so an operator sees WHICH hop was slow (issue #465: "whether Prepare
+		// succeeded and Commit timed out"). The hop's duration is the span; its error is recorded on it.
+		prepCtx, prepSpan := tracer().Start(ctx, "world.handoff.prepare")
+		resp, err := client.Prepare(prepCtx, prepReq)
 		if err != nil {
+			prepSpan.RecordError(err)
+			prepSpan.SetStatus(otelcodes.Error, "prepare rejected")
+			prepSpan.End()
 			log.Warn("prepare rejected by destination", "err", err)
 			fail("destination rejected the handoff")
 			return
 		}
+		prepSpan.End()
 
 		// Prepare succeeded: claim ownership in the directory (epoch CAS), recording the
 		// destination SHARD ID (not its address) AND the destination ZONE (#320 — the zone is what a
 		// later reconnect routes by, because a shard id goes stale the moment that zone is rebalanced).
 		// On conflict, roll back the destination's pending entity.
-		if ok, err := s.dir.SetPlayerShard(ctx, character, destShardID, destZone, newEpoch); err != nil || !ok {
+		claimCtx, claimSpan := tracer().Start(ctx, "world.handoff.directory_claim")
+		ok, err := s.dir.SetPlayerShard(claimCtx, character, destShardID, destZone, newEpoch)
+		if err != nil {
+			claimSpan.RecordError(err)
+		}
+		claimSpan.SetAttributes(attribute.Bool("telos.handoff.claimed", err == nil && ok))
+		claimSpan.End()
+		if err != nil || !ok {
 			log.Warn("directory claim failed after prepare", "ok", ok, "err", err)
 			// The rollback Abort needs a FRESH context: ctx may already be at/past its
 			// deadline (e.g. SetPlayerShard was what timed out), which would cancel the
-			// Abort before it could discard the destination's pending entity.
-			abortCtx, ac := context.WithTimeout(context.Background(), 2*time.Second)
+			// Abort before it could discard the destination's pending entity. It stays under the
+			// handoff span (spanCtx, not Background) so the Abort hop remains part of this trace.
+			abortCtx, ac := context.WithTimeout(spanCtx, 2*time.Second)
+			abortCtx, abortSpan := tracer().Start(abortCtx, "world.handoff.abort")
 			// Sign the rollback so a key-enforcing destination accepts it (#314); an unconfigured source signs
 			// nil, which only a keyless destination accepts — the same seam as the Prepare signature above.
 			// Bind the rollback to the destination SHARD it is addressed to (#314) so a signature captured off
@@ -1660,6 +1721,7 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 			}
 			abortReq.Sig = signHandoffToken(s.handoffSignKey, handoffAbortDomain, abortReq.GetHandoffToken(), destShardID)
 			if _, aerr := client.Abort(abortCtx, abortReq); aerr != nil {
+				abortSpan.RecordError(aerr)
 				// Best-effort: the destination's pending self-heals via pendingTTL (60s) regardless. But log the
 				// error so the rejection is not silent — in particular a PermissionDenied here means a version/key
 				// skew (#314): a new keyed destination rejected an unsigned rollback from an old-code source
@@ -1671,10 +1733,16 @@ func (s *Shard) beginHandoff(src *Zone, snap *handoffv1.PlayerSnapshot, destZone
 					log.Debug("rollback Abort did not reach destination; pending self-heals via pendingTTL", "err", aerr)
 				}
 			}
+			abortSpan.End()
 			ac()
 			fail("ownership conflict")
 			return
 		}
+
+		// The claim committed: the handoff succeeded. Mark the trace OK so the abort/failure paths above are
+		// distinguishable from the happy path at a glance.
+		span.SetStatus(otelcodes.Ok, "")
+		span.AddEvent("committed")
 
 		// Commit-marker FIRST: the directory CAS just committed, so the both-own truth has
 		// flipped. Post handedOffMsg ahead of redirectMsg (and ahead of the log line below) so
