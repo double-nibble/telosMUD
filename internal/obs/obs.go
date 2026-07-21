@@ -25,16 +25,22 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ShutdownFunc flushes any observability exporters on process exit.
@@ -79,8 +85,9 @@ func Init(service, level string) ShutdownFunc {
 	}
 
 	metricsShutdown := initMetrics(service)
+	tracingShutdown := initTracing(service)
 	return func(ctx context.Context) error {
-		return errors.Join(metricsShutdown(ctx), logShutdown(ctx))
+		return errors.Join(metricsShutdown(ctx), tracingShutdown(ctx), logShutdown(ctx))
 	}
 }
 
@@ -140,6 +147,151 @@ func initMetrics(service string) ShutdownFunc {
 	mp := sdkmetric.NewMeterProvider(opts...)
 	otel.SetMeterProvider(mp)
 	return mp.Shutdown
+}
+
+// alwaysSampleKey marks a root span that must be recorded at 100% regardless of the head-sampling ratio —
+// the handoff / AdoptZone carve-out (#465). It is passed as a span-START attribute (trace.WithAttributes at
+// Start), which OTel surfaces to the sampler's ShouldSample BEFORE the sampling decision, so a span that
+// carries it is kept even under an aggressive ratio.
+const alwaysSampleKey = attribute.Key("telos.trace.always_sample")
+
+// AlwaysSample returns the span-start attribute that forces a span to be sampled at 100%, bypassing the head
+// ratio sampler. Use it ONLY for rare, bounded, high-value traces — the cross-shard handoff and the AdoptZone
+// lease (#465) — never on a hot path: it defeats the volume protection the ratio sampler exists to provide.
+//
+//	ctx, span := tracer.Start(ctx, "handoff", trace.WithNewRoot(),
+//	    trace.WithLinks(trace.Link{SpanContext: cause}), trace.WithAttributes(obs.AlwaysSample()))
+func AlwaysSample() attribute.KeyValue { return alwaysSampleKey.Bool(true) }
+
+// initTracing installs the global W3C propagator (always) and — gated on the SAME OTLP env as metrics — a
+// TracerProvider exporting spans over OTLP/gRPC. Returns its Shutdown so buffered spans flush on exit; a
+// no-op when no endpoint is configured.
+//
+// # Zero cost when unconfigured
+//
+// With no OTLP endpoint the global no-op TracerProvider is left in place, so otel.Tracer(...).Start returns a
+// non-recording span: no span record is allocated and nothing is exported. An unconfigured process pays only
+// the one-time global propagator assignment, exactly as an unconfigured metrics process pays nothing.
+//
+// # Sampler policy
+//
+// Head sampling, decided at the trace ROOT and inherited by children (sdktrace.ParentBased): a child created
+// from an incoming sampled traceparent is always kept, so a sampled trace is whole rather than a scatter of
+// fragments. The root decision is TraceIDRatioBased — deterministic on the trace id, so every service makes
+// the same keep/drop choice for a given trace with no coordination. The ratio defaults to 1.0 and is
+// overridden by the standard OTEL_TRACES_SAMPLER_ARG.
+//
+// The one carve-out: a span started with obs.AlwaysSample() is recorded at 100% no matter the ratio (see
+// carveOutSampler). That exists for the cross-shard handoff + AdoptZone lease (#465) — the single
+// highest-value, and rarest, trace in the architecture; sampling it away to respect a hot-path budget it
+// never contributes to would be exactly backwards.
+//
+// # No per-command tracing (#471, decision B)
+//
+// There is deliberately no per-command trace root. Play is ONE bidi gRPC stream for the whole session
+// (internal/world/server.go), so gRPC metadata carries a traceparent once per session, not once per command;
+// rooting a span at each keystroke would need a field on the hottest message in the protocol to enable traces
+// the ratio sampler mostly discards. The load-bearing traces — handoff (#465), session attach (#466), bus
+// delivery (#467) — are all session- or infrastructure-scoped and need no per-command root. A player's
+// `north` that provokes a handoff is still traced, as a handoff, linked from the session — just not rooted at
+// the keystroke. Relatedly, no otelgrpc STREAM interceptor is installed on Play: it would produce one
+// multi-hour span per player, emitted only at logout. Any interceptor added later must exclude Play (#464).
+func initTracing(service string) ShutdownFunc {
+	// Global W3C propagation, set unconditionally: an incoming traceparent must be understood even by a hop
+	// that does not itself export, so trace context survives an unconfigured link in the chain. Cheap — one
+	// global assignment — and with no TracerProvider installed a started span is still non-recording.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{}))
+
+	if !otlpTracesConfigured() {
+		return noopShutdown
+	}
+
+	ctx := context.Background()
+	res, err := resource.New(ctx, resource.WithAttributes(semconv.ServiceName(service)))
+	if err != nil {
+		res = resource.Default()
+	}
+	exp, err := otlptracegrpc.New(ctx) // endpoint + insecure flag from the standard OTEL_* env, like metrics
+	if err != nil {
+		slog.Warn("otlp span exporter init failed; tracing disabled", "err", err)
+		return noopShutdown
+	}
+	return installTracerProvider(res, exp)
+}
+
+// installTracerProvider assembles the process TracerProvider from a resource + span exporter, installs it
+// globally, and returns its Shutdown. Split out from initTracing so a test can drive the EXACT production
+// assembly (BatchSpanProcessor + telosSampler + the returned Shutdown) through an in-memory exporter, rather
+// than a hand-rebuilt provider that could drift from what actually runs.
+func installTracerProvider(res *resource.Resource, exp sdktrace.SpanExporter) ShutdownFunc {
+	sampler := telosSampler()
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithResource(res),
+		sdktrace.WithBatcher(exp), // BatchSpanProcessor flushes on tp.Shutdown — the flush this returns
+		sdktrace.WithSampler(sampler),
+	)
+	otel.SetTracerProvider(tp)
+	slog.Info("otel traces exporting via OTLP", "sampler", sampler.Description())
+	return tp.Shutdown
+}
+
+// otlpTracesConfigured reports whether an OTLP endpoint is set for traces, gating tracing on the SAME env as
+// metrics (the generic endpoint or the signal-specific one), so tracing is opt-in exactly as metrics are.
+func otlpTracesConfigured() bool {
+	return os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" ||
+		os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") != ""
+}
+
+// telosSampler is the process sampler: the handoff / AdoptZone 100% carve-out wrapping a ParentBased ratio
+// head sampler.
+func telosSampler() sdktrace.Sampler {
+	return carveOutSampler{base: sdktrace.ParentBased(sdktrace.TraceIDRatioBased(traceSampleRatio()))}
+}
+
+// traceSampleRatio reads the standard OTEL_TRACES_SAMPLER_ARG as the root head-sampling probability, default
+// 1.0, clamped to [0,1]. A malformed value degrades to 1.0 with a warning rather than silently sampling
+// nothing.
+func traceSampleRatio() float64 {
+	s := strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER_ARG"))
+	if s == "" {
+		return 1.0
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		slog.Warn("OTEL_TRACES_SAMPLER_ARG is not a number; defaulting to 1.0", "value", s, "err", err)
+		return 1.0
+	}
+	switch {
+	case f < 0:
+		return 0
+	case f > 1:
+		return 1
+	default:
+		return f
+	}
+}
+
+// carveOutSampler forces a span carrying obs.AlwaysSample() to RecordAndSample regardless of the base
+// sampler's decision, and delegates every other span to base. It is how the rare, high-value handoff /
+// AdoptZone traces (#465) are guaranteed 100% even under an aggressive head ratio.
+type carveOutSampler struct{ base sdktrace.Sampler }
+
+func (s carveOutSampler) ShouldSample(p sdktrace.SamplingParameters) sdktrace.SamplingResult {
+	for _, a := range p.Attributes {
+		if a.Key == alwaysSampleKey && a.Value.AsBool() {
+			// Preserve any inbound tracestate, mirroring what the SDK's own samplers return.
+			return sdktrace.SamplingResult{
+				Decision:   sdktrace.RecordAndSample,
+				Tracestate: trace.SpanContextFromContext(p.ParentContext).TraceState(),
+			}
+		}
+	}
+	return s.base.ShouldSample(p)
+}
+
+func (s carveOutSampler) Description() string {
+	return "TelosCarveOut{always_sample->100%,base=" + s.base.Description() + "}"
 }
 
 // DebugEnabled reports whether the DEBUG env flag is truthy. Cheap slog.Debug
