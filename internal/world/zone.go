@@ -2560,17 +2560,27 @@ func (z *Zone) quiescent() bool {
 	return z.pop.Load() == 0 && z.stashed.Load() == 0 && z.incoming.Load() == 0
 }
 
-// metricZone is the zone label for an OTel attribute — the TEMPLATE, never the id (#411).
+// metricZone is the zone label for an OTel attribute — the TEMPLATE, never the id (#411, #470).
+//
+// THIS IS A SECURITY BOUNDARY, NOT A FORMATTING CHOICE. Do not "simplify" it to return z.id.
+//
+// Instance minting (#72) is player-driven: an instance id is `<template>#<128 random bits>` (mintInstanceID),
+// and a player able to enter dungeons can mint unbounded distinct ids. Every zone-labelled metric routes
+// through here — RecordTickLag and SetOccupancy at zone.go:808, :1101, :1187, :2381. If this returned the
+// real id, each minted instance would create a fresh Prometheus label value, i.e. a fresh, never-resampled
+// time series. On the 12 GB single-node backend this stack targets that is a player-triggerable cardinality
+// bomb — a monitoring outage a player can cause on demand, and plausibly a game outage on that box too. The
+// TelosMUDInstanceReportsTemplate regression test is the actual guard; this comment alone will not survive a
+// refactor, so the test asserts a minted instance reports its template, not its id.
 //
 // Logs and metrics deliberately want OPPOSITE answers here. The zone LOGGER keeps the instance id (and adds
-// `template=`; see newInstanceZone), because an operator reading a log needs to know which copy misbehaved.
-// A metric must not: an instance id is minted per dungeon run, so as an attribute it is unbounded,
-// player-driven cardinality — thousands of dead time series that never get another sample.
+// `template=`; see newInstanceZone), because an operator reading a log needs to know which copy misbehaved —
+// there the id is a bounded structured field on a line, not an unbounded metric label.
 //
 // The cost is that every live copy of a template reports occupancy onto ONE series, so the gauge reads as
 // "the last copy that reported" rather than a sum. That is accepted: per-instance occupancy is not a signal
 // anyone alerts on, and the aggregate that IS a signal — how many instances exist — has its own gauge
-// (metrics.SetInstances), which is where instance load is visible.
+// (metrics.SetInstances / telos.zone.instances), which is the deliberate place instanced load is visible.
 func (z *Zone) metricZone() string { return z.template }
 
 // reseedCombat mixes salt into the zone's combat RNG. Construction-time only, before the actor starts —
