@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
@@ -193,6 +195,33 @@ func registerPlay(gs *grpc.Server, s *Shard) {
 // the stream context is done.
 func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	s.log.Debug("play stream connect")
+
+	// The session-ATTACH span (#466): the login-latency decomposition, first Recv → session lock, and NO
+	// further. Play is one bidi stream for the WHOLE session, so this span is deliberately NOT the session —
+	// it ends the instant the player is in-world (the session-lock block below), and everything after is a
+	// separate trace. NOT 100%-sampled: unlike the handoff (#465) a login happens on every connect, so it
+	// rides the ordinary head ratio. Rooted at stream.Context() (under decision B #471 the gate sends no
+	// per-command traceparent, so there is nothing to be a child of). NO player-identifying attributes —
+	// account uuid / character name belong in structured log fields, not span attributes (#466/#470).
+	attachCtx, attachSpan := tracer().Start(stream.Context(), "world.session_attach")
+	attachEnded := false
+	endAttach := func(code otelcodes.Code, desc string, err error) {
+		if attachEnded {
+			return
+		}
+		attachEnded = true
+		if err != nil {
+			attachSpan.RecordError(err)
+		}
+		attachSpan.SetStatus(code, desc)
+		attachSpan.End()
+	}
+	// Safety net: the span MUST end at attach, not at logout. The success path calls endAttach explicitly at
+	// the session lock (making this a no-op); any early return in the handshake region instead ends the span
+	// HERE, at that return — which is still inside the handshake, so the timing stays correct. A plain
+	// `defer attachSpan.End()` would wrongly hold the span open for the whole multi-hour session.
+	defer endAttach(otelcodes.Error, "attach did not complete", nil)
+
 	first, err := stream.Recv()
 	if err != nil {
 		return err
@@ -294,14 +323,17 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// there is no both-own risk.
 	var resumeEpoch uint64
 	if token == "" && s.shard.dir != nil {
-		ectx, ecancel := context.WithTimeout(stream.Context(), 2*time.Second)
+		epCtx, epSpan := tracer().Start(attachCtx, "session_attach.epoch_resume") // the Redis/directory hop
+		ectx, ecancel := context.WithTimeout(epCtx, 2*time.Second)
 		if ep, found, err := s.shard.dir.PlayerEpoch(ectx, character); err != nil {
+			epSpan.RecordError(err)
 			s.log.Debug("epoch resume read failed; treating as fresh", "character", character, "err", err)
 		} else if found {
 			resumeEpoch = ep
 			s.log.Debug("epoch resumed from directory", "character", character, "epoch", ep)
 		}
 		ecancel()
+		epSpan.End()
 	}
 
 	// Load the character's durable snapshot, sibling to the epoch read above and on the SAME
@@ -314,11 +346,15 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	var loaded CharSnapshot
 	var loadedOK bool
 	if token == "" {
-		lctx, lcancel := context.WithTimeout(stream.Context(), 2*time.Second)
+		loadCtx, loadSpan := tracer().Start(attachCtx, "session_attach.load_snapshot") // the Postgres/Redis hop
+		lctx, lcancel := context.WithTimeout(loadCtx, 2*time.Second)
 		var unreadable bool
 		loaded, loadedOK, unreadable = s.shard.loadCharacterSnapshot(lctx, character)
 		lcancel()
+		loadSpan.SetAttributes(attribute.Bool("telos.attach.rehydrated", loadedOK))
 		if unreadable {
+			loadSpan.SetStatus(otelcodes.Error, "durable read failed")
+			loadSpan.End()
 			// The durable tier is configured but could not be read. Falling through would take the
 			// BRAND-NEW-character branch for a character that very likely has a row — spawning a blank
 			// copy in the start room, whose create then collides on the unique name, leaving the player
@@ -326,8 +362,10 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			// same fail-closed rule the ownership claim below applies.
 			s.log.Error("durable character read failed; refusing the login rather than spawning a blank copy",
 				"character", character)
+			endAttach(otelcodes.Error, "durable character read failed", nil)
 			return status.Error(codes.Unavailable, "character store unavailable; reconnect")
 		}
+		loadSpan.End()
 	}
 
 	// Decide which hosted zone this connection starts in. This runs AFTER the snapshot load because the
@@ -422,6 +460,13 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			zone.releaseInboundArrival("attach-not-posted")
 		}
 	}()
+	// Bounded-cardinality attach attributes only: the zone by TEMPLATE (never the player-mintable instance id
+	// — same #470 boundary as metrics), and the shard. NO character name or account id — those are structured
+	// log fields, not span attributes (#466).
+	attachSpan.SetAttributes(
+		attribute.String("telos.zone", zone.metricZone()),
+		attribute.String("telos.shard.src", s.shard.addr),
+	)
 	// The routing decision's operator-facing WARNs, emitted OUT from under s.mu (the shard's hot routing
 	// mutex: a log handler is arbitrary code that may do I/O, and every zone resolve on this shard queues
 	// behind it). Both routes end at the home zone with the player's saved location not honored.
@@ -469,18 +514,25 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 		if loaded.OwnerEpoch > floor {
 			floor = loaded.OwnerEpoch
 		}
-		cctx, ccancel := context.WithTimeout(stream.Context(), 2*time.Second)
+		claimCtx, claimSpan := tracer().Start(attachCtx, "session_attach.claim") // the Postgres ownership-claim hop
+		cctx, ccancel := context.WithTimeout(claimCtx, 2*time.Second)
 		ep, cerr := s.shard.saver.store.ClaimCharacter(cctx, loaded.PID, floor)
 		ccancel()
 		switch {
 		case cerr == nil:
 			claimed = ep
+			claimSpan.End()
 			s.log.Debug("ownership claimed", "character", character, "epoch", ep, "floor", floor)
 		case errors.Is(cerr, ErrNoCharacterRow):
 			// The row vanished between the load and the claim (a soft delete). Nothing to fence; fall
 			// through unclaimed and let the ordinary login path handle the missing row.
+			claimSpan.AddEvent("no_row_unfenced")
+			claimSpan.End()
 			s.log.Warn("ownership claim found no row; continuing unfenced", "character", character)
 		default:
+			claimSpan.RecordError(cerr)
+			claimSpan.SetStatus(otelcodes.Error, "ownership claim failed")
+			claimSpan.End()
 			// FAIL CLOSED. We could admit this login at the resumed epoch, as the code did before — but
 			// a session that could not claim cannot be proven to be the owner, and the same store outage
 			// that refused the claim will refuse its saves. Admitting it means hours of play that is
@@ -490,6 +542,7 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 			// This return runs with the arrival claim HELD: the deferred release above is what keeps a
 			// store outage from converting every refused login into a permanently un-unhostable zone.
 			s.log.Error("ownership claim failed; refusing the login", "character", character, "err", cerr)
+			endAttach(otelcodes.Error, "ownership claim failed", cerr)
 			return status.Error(codes.Unavailable, "could not claim character ownership; reconnect")
 		}
 	}
@@ -590,10 +643,15 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	if token == "" && s.shard.sessionLock != nil {
 		lockToken := uuid.NewString()
 		key := sessionlock.Key(character)
-		actx, acancel := context.WithTimeout(ctx, 2*time.Second)
+		lockCtx, lockSpan := tracer().Start(attachCtx, "session_attach.session_lock") // the Redis session-lock hop
+		actx, acancel := context.WithTimeout(lockCtx, 2*time.Second)
 		_, lerr := s.shard.sessionLock.Acquire(actx, key, lockToken, s.shard.lockTTL)
 		acancel()
 		if lerr != nil {
+			// Non-fatal (login continues unlocked), but record it: a Redis hiccup here is a real, visible
+			// degradation on the login path even though it does not refuse the login.
+			lockSpan.RecordError(lerr)
+			lockSpan.AddEvent("lock_acquire_failed_continuing_unlocked")
 			s.log.Warn("session lock acquire failed (continuing unlocked)", "character", character, "err", lerr)
 		} else {
 			go s.runSessionLockRenewer(ctx, character, lockToken, out)
@@ -603,7 +661,13 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 				rcancel()
 			}()
 		}
+		lockSpan.End()
 	}
+
+	// The player is in-world: the login handshake is complete. END the session-attach span HERE — everything
+	// after this point (the reader/writer loop, the entire multi-hour session) is deliberately OUT of its
+	// scope (#466). The safety-net defer registered at the top is now a no-op.
+	endAttach(otelcodes.Ok, "", nil)
 
 	// Reader loop: translate client frames into zone inbox messages, posting each to
 	// the player's CURRENT zone (which can change as they walk between this shard's
