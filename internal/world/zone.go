@@ -968,7 +968,7 @@ func (z *Zone) handle(m msg) {
 		}
 		z.promptAfterAsync(v.s) // #371: the async command owns its trailing prompt, emitted AFTER its output
 	case tellDeliverMsg:
-		v.ack <- z.deliverDrainedTell(v) // drained durable tell: dedup-via-cursor, render+emit, ack/nak
+		v.ack <- z.deliverTellTraced(v) // drained durable tell: dedup-via-cursor, render+emit, ack/nak (#467 span)
 	case tellCursorProbeMsg:
 		z.probeTellCursor(v)
 	case lastTellProbeMsg:

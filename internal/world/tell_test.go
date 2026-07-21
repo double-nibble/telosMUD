@@ -442,7 +442,7 @@ func TestTellCursorRoundTripSuppressesRedeliveryAfterRestart(t *testing.T) {
 	z.shard = &Shard{comms: &commSource{bus: bus, js: commbus.DisabledJetStream(), seq: map[string]uint64{}, rl: map[string]*tokenBucket{}, consumers: map[string]commbus.Consumer{}}}
 
 	// A REDELIVERY of Alice:5 (<= the restored cursor) is suppressed but ACKed (render-once across restart).
-	if ok := z.deliverDrainedTell(tellDeliverMsg{target: "Bob", msg: commbus.Message{AuthorID: "Alice", AuthorName: "Alice", Seq: 5, Body: "old"}}); !ok {
+	if ok := z.deliverDrainedTell(context.Background(), tellDeliverMsg{target: "Bob", msg: commbus.Message{AuthorID: "Alice", AuthorName: "Alice", Seq: 5, Body: "old"}}); !ok {
 		t.Fatal("a redelivered (already-delivered) tell must ACK, not NAK")
 	}
 	if dst.lastTellFrom == "Alice" {
@@ -450,7 +450,7 @@ func TestTellCursorRoundTripSuppressesRedeliveryAfterRestart(t *testing.T) {
 	}
 
 	// A NEW Alice:6 (> cursor) renders and advances the cursor.
-	if ok := z.deliverDrainedTell(tellDeliverMsg{target: "Bob", msg: commbus.Message{AuthorID: "Alice", AuthorName: "Alice", Seq: 6, Body: "new"}}); !ok {
+	if ok := z.deliverDrainedTell(context.Background(), tellDeliverMsg{target: "Bob", msg: commbus.Message{AuthorID: "Alice", AuthorName: "Alice", Seq: 6, Body: "new"}}); !ok {
 		t.Fatal("a new tell must ACK")
 	}
 	if dst.tellCursor["Alice"] != 6 || dst.lastTellFrom != "Alice" {
