@@ -55,6 +55,29 @@ func TestScopeSubject(t *testing.T) {
 	}
 }
 
+// TestScopeSubjectRejectsInstanceIDs guards the BusCatchup cardinality boundary from #470. BusCatchup
+// (metrics.go) labels a time series by the raw subject string, and its ONLY caller is recordBusCatchup(subj),
+// where subj comes from Scope.Subject() on a durable subscription (scopebus.go). So the question "can a
+// per-player / player-mintable subject ever reach that metric label?" reduces to "can such an id form a
+// scope subject?" — and the answer must stay no.
+//
+// A minted zone-instance id (#72) is `<template>#<128 random bits>` — player-driven and unbounded. The `#`
+// separator is not in validScopeID's charset, so an instance-scoped subject cannot be formed at all: the
+// durable subscription errors before any subject reaches the bus, and BusCatchup can never be handed one.
+// This test pins that so a charset "cleanup" that admitted `#` would fail loudly here rather than silently
+// opening a player-triggerable cardinality bomb.
+func TestScopeSubjectRejectsInstanceIDs(t *testing.T) {
+	// The `#`-bearing instance shape (world.mintInstanceID); hardcoded because scopebus must not import world.
+	for _, id := range []string{"darkwood#deadbeefdeadbeef", "crypt#0123456789abcdef", "a#b"} {
+		_, err := ZoneScope(id).Subject()
+		assert.Error(t, err, "instance-shaped zone id %q must not form a scope subject (#470)", id)
+	}
+	// Sanity: the plain template it was minted from is a perfectly valid, bounded subject.
+	subj, err := ZoneScope("darkwood").Subject()
+	require.NoError(t, err)
+	assert.Equal(t, "telos.scope.zone.darkwood", subj)
+}
+
 func TestScopeBusSignalAndSubscribe(t *testing.T) {
 	core := commbus.NewMemBus()
 	t.Cleanup(func() { _ = core.Close() })

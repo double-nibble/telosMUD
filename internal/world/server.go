@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"sync/atomic"
 	"time"
 
@@ -540,16 +541,26 @@ func (s *playServer) Connect(stream playv1.Play_ConnectServer) error {
 	// The peer address labels the metric and the log. A wedged gate stalls EVERY player it serves — the
 	// HTTP/2 connection-level window is shared across their streams — so an unlabeled counter would show a
 	// burst of increments with nothing to attribute them to. `gate` is the actionable dimension (which gate
-	// to restart) and has fleet-bounded cardinality; character and zone would not.
-	gateAddr := "unknown"
+	// to restart); character and zone would not be.
+	//
+	// The METRIC label is the gate HOST only, never the full peer address. p.Addr.String() is `host:port`
+	// where the port is the gate's EPHEMERAL source port — a fresh value on every gate reconnect. As a
+	// Prometheus label that is unbounded, ops-driven cardinality: a flapping/restarting gate mints a new
+	// series per dial (the same class of monitoring-outage boundary as metricZone(), #470). Stripping the
+	// port keeps the label fleet-bounded — one series per gate host, which is what "which gate to restart"
+	// actually needs. The LOG keeps the full address (a structured field is not a cardinality axis, and the
+	// exact connection is useful there). See gateMetricHost + TestGateMetricHostStripsEphemeralPort.
+	gateAddr := "unknown" // full peer addr (host:port) for the log
+	gateHost := "unknown" // host only, for the metric label — fleet-bounded
 	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
 		gateAddr = p.Addr.String()
+		gateHost = gateMetricHost(p.Addr)
 	}
 	go watchSendStall(ctx, &sendStarted, stalled, streamSendStallTimeout, streamStallCheckInterval, func(blocked time.Duration) {
 		s.log.Warn("play stream reclaimed: a frame has been blocked in Send past the stall bound; "+
 			"the gate is answering keepalives but is not reading this stream",
 			"character", character, "gate", gateAddr, "blocked", blocked)
-		metrics.StreamStalled(context.Background(), gateAddr)
+		metrics.StreamStalled(context.Background(), gateHost)
 	})
 
 	// Hand the stream to the chosen zone: it creates a new player, re-binds an existing
@@ -771,4 +782,22 @@ func watchSendStall(ctx context.Context, started *atomic.Pointer[time.Time], sta
 			}
 		}
 	}
+}
+
+// gateMetricHost is the fleet-bounded `gate` label for the stream-stall metric (#470-adjacent cardinality
+// discipline). A gRPC peer address is `host:port`, and the port is the gate's ephemeral SOURCE port — a new
+// value every reconnect. Labeling a metric by it would grow one dead Prometheus series per gate dial. This
+// strips the port to the host, so a flapping gate reports onto ONE series (which is all "which gate to
+// restart" needs); the full address stays on the log line, where cardinality is free.
+//
+// SplitHostPort failure (an addr with no port, e.g. a unix socket) falls back to the raw string rather than
+// dropping the label — a bounded already-portless value is fine as-is.
+func gateMetricHost(addr net.Addr) string {
+	if addr == nil {
+		return "unknown"
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
 }
