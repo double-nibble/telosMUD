@@ -19,11 +19,27 @@ exporters:
   debug:
     verbosity: normal
   # Kept so the existing `curl localhost:8889/metrics` load-run workflow keeps working with the overlay on.
+  #
+  # NOTE (#469): the `prometheus` exporter DROPS exemplars (it needs enable_open_metrics + an OpenMetrics-
+  # negotiating scraper, which `curl` is not). That is fine here — this endpoint exists only for the ad-hoc
+  # load-run scrape, and the metric→trace pivot does NOT run through it. Exemplars reach Grafana via the
+  # `otlp/lgtm` exporter below instead (OTLP carries them natively), so there is deliberately no
+  # `prometheusremotewrite` exporter: OTLP-straight-to-the-backend is the simpler of the two options the
+  # issue named, and the overlay already had it.
   prometheus:
     endpoint: 0.0.0.0:8889
   # Fan out to the otel-lgtm container's embedded collector (4317), which routes to its bundled
   # Prometheus (metrics) and Tempo (traces). lgtm's OTLP ports are NOT published to the host (the
   # collector reaches it over the compose network), avoiding a 4317 collision with our collector.
+  #
+  # EXEMPLARS (#469): OTLP carries exemplars natively, so a histogram bucket recorded on a sampled span's ctx
+  # arrives at lgtm's Prometheus WITH its trace_id exemplar. otel-go's default exemplar filter is trace-based
+  # (sample-and-hold on a sampled span ctx). The flagship pivot is busLag (telos.bus.deliver_lag_ms), which
+  # #469 records on the producer's span context (scopebus.busExemplarCtx, off the #467 trace envelope) — so a
+  # delivery-latency spike clicks through to the producing trace. With the aggressive head sampling #464 uses,
+  # most buckets have NO exemplar; that is the correct tradeoff, not a misconfiguration (an exemplar exists
+  # only for a sampled trace). lgtm's Prometheus is started with exemplar-storage on and its Grafana provisions
+  # the Prometheus→Tempo exemplar link — see docker-compose.obs.yml.
   otlp/lgtm:
     endpoint: lgtm:4317
     tls:

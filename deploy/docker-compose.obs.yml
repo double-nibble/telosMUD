@@ -22,11 +22,17 @@ services:
       # 4317 would collide with our collector's published 4317.
       - "127.0.0.1:3000:3000" # Grafana UI — open http://localhost:3000 (default admin/admin, dev-only)
     environment:
-      # Each backend takes a *_EXTRA_ARGS knob. Nothing pinned here yet (a dev box has no retention
+      # Each backend takes a *_EXTRA_ARGS knob. Nothing pinned for retention yet (a dev box has no retention
       # pressure); the seam is documented so retention can be set without rebuilding the image.
       - LOKI_EXTRA_ARGS=
       - TEMPO_EXTRA_ARGS=
-      - PROMETHEUS_EXTRA_ARGS=
+      # exemplar-storage makes the metric→trace pivot (#469) work: our collector ships exemplars to lgtm over
+      # OTLP (otel-collector.obs.yaml), and Prometheus only KEEPS them with this feature flag. grafana/otel-lgtm
+      # enables it by default; pinning it here makes the pivot robust against an image-default change and
+      # documents the dependency. The Grafana side (the Prometheus datasource's exemplarTraceIdDestinations →
+      # Tempo, on the trace_id exemplar label) is provisioned by the otel-lgtm image, which exists for exactly
+      # this metric→trace→log correlation demo.
+      - PROMETHEUS_EXTRA_ARGS=--enable-feature=exemplar-storage
     volumes:
       - ./data/lgtm:/data # persist dashboards + TSDB/blocks across `make down-obs` (deploy/data is gitignored)
     healthcheck:

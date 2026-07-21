@@ -95,6 +95,19 @@ func zoneAttr(zone string) metric.RecordOption {
 }
 
 // RecordTickLag records a zone heartbeat's overrun (ms past the pulse budget) for the named zone.
+//
+// tickLag deliberately has NO exemplars (#469), and that is correct, not a gap. OTel's default exemplar
+// filter is trace-based: an instrument only attaches an exemplar when it records on a ctx carrying a SAMPLED
+// span. RecordTickLag is called from the zone's heartbeat on the ZONE-LIFETIME ctx (internal/world/zone.go
+// Run), which never carries a request span — and it must not. Spanning the tick to give it exemplars is an
+// explicit anti-goal: 250ms × N zones of pure timer noise, and it would reparent all timer-driven game logic
+// under a synthetic root. So the flagship SCALE metric has no trace pivot — accepted.
+//
+// The metric that DOES pivot is busLag (telos.bus.deliver_lag_ms): #469 records it on a ctx carrying the
+// producer's span context (scopebus.busExemplarCtx, off the #467 trace envelope), so a spike in delivery
+// latency clicks through to the producing trace. Most other counters (DurableParked/Poisoned, StreamStalled,
+// busCatchup) still record on context.Background() today and so carry no exemplar — threading a span ctx into
+// those is future work, not implied here.
 func RecordTickLag(ctx context.Context, zone string, ms float64) {
 	if tickLag != nil {
 		tickLag.Record(ctx, ms, zoneAttr(zone))
