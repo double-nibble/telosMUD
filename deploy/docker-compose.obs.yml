@@ -36,6 +36,24 @@ services:
       retries: 12 # otel-lgtm boots four backends + Grafana; give it generous startup room
     restart: unless-stopped
 
+  # Turn ON the OTLP log bridge (#459) for every long-running service, OVERLAY-ONLY so base `make up`
+  # never ships logs to a collector that has no logs pipeline. With this set, the engine also bridges
+  # slog over the existing OTLP connection (internal/obs) → our collector → otel-lgtm's Loki, so logs
+  # show up in Grafana with NO per-developer setup (no Loki docker-driver plugin) — the Docker-Desktop
+  # filelog problem is sidestepped entirely by reusing the OTLP path.
+  world:
+    environment: { TELOS_OTEL_LOGS: "1" }
+  world-darkwood:
+    environment: { TELOS_OTEL_LOGS: "1" }
+  world-crypt:
+    environment: { TELOS_OTEL_LOGS: "1" }
+  account:
+    environment: { TELOS_OTEL_LOGS: "1" }
+  gate:
+    environment: { TELOS_OTEL_LOGS: "1" }
+  gate-auth:
+    environment: { TELOS_OTEL_LOGS: "1" }
+
   # Point OUR collector at the overlay config (base config untouched → no lgtm-exporter retry noise when
   # the overlay is off). The base mount stays (unused); `command` selects the obs config. depends_on lgtm
   # so the collector's otlp/lgtm exporter has a target on first start.

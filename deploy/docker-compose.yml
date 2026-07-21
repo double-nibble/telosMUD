@@ -245,6 +245,10 @@ services:
       - path: ./auth.local.env
         required: false
     environment:
+      # account exports OTLP too (it serves the OAuth site — its latency is player-visible). This was a
+      # pre-existing gap: account alone never merged the anchor, so it shipped no metrics AND (with the
+      # #459 log bridge) no logs. Matches the k8s side, where #7 wires OTLP for account as well.
+      <<: *otel-env
       TELOS_SERVICE: telos-account
       TELOS_ENV: dev
       TELOS_ALLOW_INSECURE: "1" # dev account API runs tokenless (#247); prod sets TELOS_ACCOUNT_CALLER_TOKEN instead

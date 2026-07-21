@@ -22,12 +22,16 @@ package obs
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"strings"
 
+	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
@@ -44,13 +48,71 @@ func Init(service, level string) ShutdownFunc {
 	if DebugEnabled() {
 		lvl = slog.LevelDebug
 	}
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
+	// stdout JSON stays the primary sink everywhere (k8s ships it to Loki via the collector's filelog
+	// receiver). When TELOS_OTEL_LOGS is set (the docker-compose observability overlay does — #459),
+	// ALSO bridge slog records onto the existing OTLP connection so logs reach Loki without file
+	// scraping. That is the Docker-Desktop answer: filelog cannot read the VM's container logs, but the
+	// OTLP path already works (it carries metrics), so logs ride it too. It is OFF by default so k8s,
+	// which already collects logs via filelog, does not double-ship.
+	var handler slog.Handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
+	logShutdown := noopShutdown
+	switch {
+	case LogOTLP() && otlpConfigured():
+		if lp, bridge, err := initLogs(service, lvl); err != nil {
+			slog.Warn("otlp log bridge init failed; logs stay stdout-only", "err", err)
+		} else {
+			handler = newMultiHandler(handler, bridge) // stdout AND OTLP
+			logShutdown = lp.Shutdown
+		}
+	case LogOTLP():
+		// The flag is set but no OTLP endpoint is configured, so the bridge can't be built — surface it
+		// rather than silently ship no logs (this is exactly how the account-service endpoint gap hid).
+		slog.Warn("TELOS_OTEL_LOGS is set but no OTLP endpoint is configured; log bridge disabled (logs stay stdout-only)")
+	}
 	slog.SetDefault(slog.New(handler).With("service", service))
 
 	if DebugEnabled() {
 		slog.Debug("debug logging enabled (DEBUG env set)")
 	}
-	return initMetrics(service)
+	if LogOTLP() && otlpConfigured() {
+		slog.Info("otel logs bridging via OTLP")
+	}
+
+	metricsShutdown := initMetrics(service)
+	return func(ctx context.Context) error {
+		return errors.Join(metricsShutdown(ctx), logShutdown(ctx))
+	}
+}
+
+func noopShutdown(context.Context) error { return nil }
+
+// otlpConfigured reports whether an OTLP endpoint is set via the standard env, so an exporter has
+// somewhere to send. Shared by the metric and log setup.
+func otlpConfigured() bool {
+	return os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" ||
+		os.Getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") != "" ||
+		os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") != ""
+}
+
+// initLogs builds an OTLP LoggerProvider (endpoint from the standard OTEL_* env) and an slog bridge
+// handler over it, filtered to the same level as stdout. Returns the provider (for Shutdown) and the
+// handler. Callers multiplex it alongside the stdout handler so logs go to both places.
+func initLogs(service string, lvl slog.Level) (*sdklog.LoggerProvider, slog.Handler, error) {
+	ctx := context.Background()
+	res, err := resource.New(ctx, resource.WithAttributes(semconv.ServiceName(service)))
+	if err != nil {
+		res = resource.Default()
+	}
+	exp, err := otlploggrpc.New(ctx) // endpoint + insecure flag come from the standard OTEL_* env
+	if err != nil {
+		return nil, nil, err
+	}
+	lp := sdklog.NewLoggerProvider(
+		sdklog.WithResource(res),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)),
+	)
+	bridge := otelslog.NewHandler(service, otelslog.WithLoggerProvider(lp))
+	return lp, &levelHandler{level: lvl, next: bridge}, nil
 }
 
 // initMetrics installs the global OpenTelemetry MeterProvider (Phase 16.1). It exports over OTLP/gRPC when
@@ -96,6 +158,14 @@ func LogRawInput() bool {
 	return truthyEnv("TELOS_LOG_RAW_INPUT")
 }
 
+// LogOTLP reports whether the TELOS_OTEL_LOGS env flag is truthy — the opt-in that ALSO bridges slog
+// records over OTLP to the collector (#459). Off by default: k8s collects container logs via the
+// collector's filelog receiver, so shipping them over OTLP there would double them. The docker-compose
+// observability overlay sets it because filelog cannot read Docker Desktop's in-VM container logs.
+func LogOTLP() bool {
+	return truthyEnv("TELOS_OTEL_LOGS")
+}
+
 // truthyEnv reports whether the named env var is set to a truthy value (1/true/yes/on).
 func truthyEnv(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
@@ -103,6 +173,70 @@ func truthyEnv(name string) bool {
 		return true
 	}
 	return false
+}
+
+// multiHandler fans one slog record out to several handlers (here: stdout JSON + the OTLP bridge), so a
+// log line is both human-readable on stdout and shipped to Loki. slog has no built-in fan-out.
+type multiHandler struct{ hs []slog.Handler }
+
+func newMultiHandler(hs ...slog.Handler) *multiHandler { return &multiHandler{hs: hs} }
+
+func (m *multiHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	for _, h := range m.hs {
+		if h.Enabled(ctx, l) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	var errs []error
+	for _, h := range m.hs {
+		if h.Enabled(ctx, r.Level) {
+			// Clone per handler: a Record must not be shared across handlers that may add attrs.
+			if err := h.Handle(ctx, r.Clone()); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (m *multiHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	next := make([]slog.Handler, len(m.hs))
+	for i, h := range m.hs {
+		next[i] = h.WithAttrs(as)
+	}
+	return &multiHandler{hs: next}
+}
+
+func (m *multiHandler) WithGroup(name string) slog.Handler {
+	next := make([]slog.Handler, len(m.hs))
+	for i, h := range m.hs {
+		next[i] = h.WithGroup(name)
+	}
+	return &multiHandler{hs: next}
+}
+
+// levelHandler wraps a handler with a minimum level, so the OTLP bridge honors the same level filter as
+// stdout (the otelslog bridge otherwise emits at every level).
+type levelHandler struct {
+	level slog.Level
+	next  slog.Handler
+}
+
+func (h *levelHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.level }
+func (h *levelHandler) Handle(ctx context.Context, r slog.Record) error {
+	return h.next.Handle(ctx, r)
+}
+
+func (h *levelHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	return &levelHandler{level: h.level, next: h.next.WithAttrs(as)}
+}
+
+func (h *levelHandler) WithGroup(name string) slog.Handler {
+	return &levelHandler{level: h.level, next: h.next.WithGroup(name)}
 }
 
 func parseLevel(s string) slog.Level {
