@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/double-nibble/telosmud/internal/logcap"
 )
 
 // dice.go is the CONTENT dice-notation parser + roller for the check primitive (docs/PHASE6-PLAN.md
@@ -104,7 +106,7 @@ func parseKeep(left, keepStr string, kind diceKind, raw string) (diceSpec, error
 	if strings.TrimSpace(keepStr) != "" {
 		k, err := strconv.Atoi(strings.TrimSpace(keepStr))
 		if err != nil || k < 1 {
-			return diceSpec{}, fmt.Errorf("dice %q: bad keep count", raw)
+			return diceSpec{}, fmt.Errorf("dice %q: bad keep count", logcap.Value(raw))
 		}
 		keep = k
 	}
@@ -128,7 +130,7 @@ func splitPool(left, cmp, raw string) (diceSpec, bool, int, error) {
 	}
 	thr, err := strconv.Atoi(strings.TrimSpace(rhs))
 	if err != nil {
-		return diceSpec{}, false, 0, fmt.Errorf("dice %q: bad pool threshold", raw)
+		return diceSpec{}, false, 0, fmt.Errorf("dice %q: bad pool threshold", logcap.Value(raw))
 	}
 	return diceSpec{num: num, size: size}, gte, thr, nil
 }
@@ -137,7 +139,7 @@ func splitPool(left, cmp, raw string) (diceSpec, bool, int, error) {
 func parseNdS(s, raw string) (int, int, error) {
 	parts := strings.SplitN(strings.TrimSpace(s), "d", 2)
 	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("dice %q: want <N>d<S>", raw)
+		return 0, 0, fmt.Errorf("dice %q: want <N>d<S>", logcap.Value(raw))
 	}
 	num, err := parseDiceCount(parts[0], raw)
 	if err != nil {
@@ -145,7 +147,7 @@ func parseNdS(s, raw string) (int, int, error) {
 	}
 	size, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 	if err != nil || size <= 0 {
-		return 0, 0, fmt.Errorf("dice %q: bad size", raw)
+		return 0, 0, fmt.Errorf("dice %q: bad size", logcap.Value(raw))
 	}
 	return capDice(num), capDice(size), nil
 }
@@ -158,7 +160,7 @@ func parseDiceCount(s, raw string) (int, error) {
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 0 {
-		return 0, fmt.Errorf("dice %q: bad count", raw)
+		return 0, fmt.Errorf("dice %q: bad count", logcap.Value(raw))
 	}
 	return n, nil
 }

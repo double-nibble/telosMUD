@@ -3,6 +3,8 @@ package world
 import (
 	"fmt"
 	"math"
+
+	"github.com/double-nibble/telosmud/internal/logcap"
 )
 
 // formula.go is the prefix-AST expression evaluator for derived attributes (docs/PHASE5-PLAN.md
@@ -189,7 +191,7 @@ func (n opNode) eval(r *formulaResolver) (float64, error) {
 		}
 		return math.Mod(vals[0], vals[1]), nil
 	default:
-		return 0, fmt.Errorf("formula: unknown op %q", n.op)
+		return 0, fmt.Errorf("formula: unknown op %q", logcap.Value(n.op))
 	}
 }
 
@@ -233,7 +235,9 @@ func parseFormula(v any) (formulaNode, error) {
 	case []any:
 		return parseArrayNode(t)
 	default:
-		return nil, fmt.Errorf("formula: unexpected node %T (%v)", v, v)
+		// %v on a decoded value can itself be a huge builder-controlled string; cap it (#481). The type
+		// is the primary diagnostic — the value is a bounded hint.
+		return nil, fmt.Errorf("formula: unexpected node %T (%v)", v, logcap.Value(fmt.Sprintf("%v", v)))
 	}
 }
 
@@ -276,7 +280,7 @@ func parseArrayNode(arr []any) (formulaNode, error) {
 		}
 		return opNode{op: head, args: args}, nil
 	default:
-		return nil, fmt.Errorf("formula: unknown head %q", head)
+		return nil, fmt.Errorf("formula: unknown head %q", logcap.Value(head))
 	}
 }
 

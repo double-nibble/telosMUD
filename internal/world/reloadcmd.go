@@ -10,6 +10,7 @@ import (
 
 	"github.com/double-nibble/telosmud/internal/content"
 	"github.com/double-nibble/telosmud/internal/contentbus"
+	"github.com/double-nibble/telosmud/internal/logcap"
 	"github.com/double-nibble/telosmud/internal/scopebus"
 )
 
@@ -245,7 +246,7 @@ func (r *reloader) republish(ctx context.Context, packs []string, checkOnly bool
 	// it is also wired. WARN not reject — a too-open channel is authoring noise, not fleet-state corruption.
 	for _, v := range content.LintChannelAccess(loaded) {
 		r.log.Warn("reload: channel access-condition lint (present-but-empty/partial condition; likely a typo)",
-			"pack", v.Pack, "channel", v.Channel, "field", v.Field, "detail", v.Detail)
+			"pack", v.Pack, "channel", logcap.Value(v.Channel), "field", v.Field, "detail", logcap.Value(v.Detail))
 	}
 	// #56: the pack-global shared defs (abilities/formulas/pvp policy/…) have no hot-reload loop; they take
 	// effect only after a rolling reboot. Surface which are present so the readout reminds the operator (a
