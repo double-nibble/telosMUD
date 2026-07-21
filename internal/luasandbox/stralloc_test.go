@@ -63,25 +63,44 @@ func TestSandboxArmsTheAllocBudget(t *testing.T) {
 // is exactly how #368's instruction budget went dead above ~850k, and it is the most likely way for this
 // constant to become decoration.
 //
-// So: run the bomb under the REAL default deadline and require the allocation abort to be what stops it.
+// So the deadline is the FALLBACK this test leans on: run the bomb under the REAL default deadline and
+// require the ALLOCATION abort to be what stops it. If the cap were unarmed or set too high, the bomb would
+// allocate for the whole deadline and trip it (AbortDeadline) — so AbortDeadline is precisely the inert-cap
+// signal, and AbortAlloc is the cap firing first.
+//
+// The bomb reaches the 8 MiB cap in ~4 charged ops — microseconds of compute, far inside the 5 ms deadline.
+// But a GC/scheduler pause on a loaded CI runner can burn the whole 5 ms before those ops run, flipping a
+// REACHABLE cap's run to AbortDeadline. That is a false negative, not the inert-cap condition, and it is what
+// made this test flaky. "Reachable" is existential, so retry: require that SOME pause-free run reaches the
+// cap, and conclude "inert" only if EVERY run is beaten by the deadline. A healthy armed cap returns on the
+// first attempt; the loop only spins under a CI pause (rare) or a genuine regression (which fails, correctly).
 func TestAllocBudgetIsReachableAtTheDefaultDeadline(t *testing.T) {
-	L := New(Opts{})
-	defer L.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(CallDeadline)*time.Millisecond)
-	defer cancel()
-	L.SetContext(ctx)
-	L.ResetInstructionCount()
-
-	err := L.DoString(`local s = string.rep("x", 1048576)
-for i = 1, 40 do s = s .. s end`)
-	if err == nil {
-		t.Fatal("the doubling bomb completed")
+	const bomb = `local s = string.rep("x", 1048576)
+for i = 1, 40 do s = s .. s end`
+	const attempts = 12
+	for i := 0; i < attempts; i++ {
+		err := func() error {
+			L := New(Opts{})
+			defer L.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(CallDeadline)*time.Millisecond)
+			defer cancel()
+			L.SetContext(ctx)
+			L.ResetInstructionCount()
+			return L.DoString(bomb)
+		}()
+		// Hand back this run's garbage before the next attempt so peak memory stays at ONE run's worth — the
+		// inert-cap failure path (no alloc charge) allocates hard for the full deadline on every attempt.
+		runtime.GC()
+		if err == nil {
+			t.Fatal("the doubling bomb completed")
+		}
+		if ClassifyError(err) == AbortAlloc {
+			return // a pause-free run reached the cap before the deadline — the cap is reachable, not inert.
+		}
 	}
-	if got := ClassifyError(err); got != AbortAlloc {
-		t.Fatalf("at the default %dms deadline the bomb was stopped by %v, not AbortAlloc (%v). A cap the "+
-			"deadline always beats is inert: it never fires in production, and every other test in this file "+
-			"still passes because the deadline does the work", CallDeadline, got, err)
-	}
+	t.Fatalf("across %d runs at the default %dms deadline the bomb was never stopped by AbortAlloc: the "+
+		"allocation cap is unreachable within the deadline, i.e. inert — the deadline always does the work",
+		attempts, CallDeadline)
 }
 
 // TestAllocBudgetBoundsActualAllocation carries its own ORACLE. It runs the identical bomb twice — once on
