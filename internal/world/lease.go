@@ -435,6 +435,6 @@ func (s *Shard) handoverZoneTo(ctx context.Context, zoneID, targetShardID, targe
 	if !ok {
 		return fmt.Errorf("handover %q: fenced flip refused (no longer the live owner)", zoneID)
 	}
-	slog.Info("handed zone lease to peer", "zone", zoneID, "from", s.shardID, "to", targetShardID)
+	slog.InfoContext(ctx, "handed zone lease to peer", "zone", zoneID, "from", s.shardID, "to", targetShardID)
 	return nil
 }

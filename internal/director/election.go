@@ -57,12 +57,12 @@ func (d *Director) IsLeader() bool { return d.leader.Load() }
 func (d *Director) campaign(ctx context.Context) {
 	held, err := d.claimer.ClaimLease(ctx, d.leaseID, d.instanceID, d.leaseTTL)
 	if err != nil {
-		d.log.Warn("director lease campaign failed; stepping down", "err", err)
+		d.log.WarnContext(ctx, "director lease campaign failed; stepping down", "err", err)
 		d.leader.Store(false)
 		return
 	}
 	if was := d.leader.Swap(held); was != held {
-		d.log.Info("director leadership changed", "leader", held, "instance", d.instanceID, "scope", scopeLabel(d.regionID))
+		d.log.InfoContext(ctx, "director leadership changed", "leader", held, "instance", d.instanceID, "scope", scopeLabel(d.regionID))
 	}
 }
 

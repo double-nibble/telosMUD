@@ -54,7 +54,7 @@ func subjectKind(subj string) string {
 // msg.Trace, so a consumer can LINK to it. Returns the updated message + the span to End once the publish
 // returns. When no TracerProvider is installed the span is non-recording and Inject writes a not-sampled
 // context, so this is a cheap no-op — a message published with tracing off carries an empty/omitted Trace.
-func startProducer(ctx context.Context, subj string, msg Message) (Message, trace.Span) {
+func startProducer(ctx context.Context, subj string, msg Message) (context.Context, Message, trace.Span) {
 	ctx, span := tracer().Start(ctx, "commbus.publish "+subjectKind(subj),
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(
@@ -80,7 +80,8 @@ func startProducer(ctx context.Context, subj string, msg Message) (Message, trac
 			msg.Trace = nil // propagator wrote nothing (e.g. not sampled) — omit the field entirely
 		}
 	}
-	return msg, span
+	// Return the producer-span ctx so a publish-side log correlates to the producer span (#468).
+	return ctx, msg, span
 }
 
 // maxTraceCarrier bounds the incoming Trace map a consumer will feed to the propagator: a bound on the
