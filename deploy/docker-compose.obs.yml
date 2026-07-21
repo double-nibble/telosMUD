@@ -1,0 +1,48 @@
+# Observability overlay (#458) — OPT-IN. Adds the Grafana LGTM stack behind the existing collector.
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.obs.yml up   (or: make up-obs)
+#
+# Deliberately NOT part of deploy/docker-compose.yml: tests/smoke/smoke.sh runs the base file for every
+# service, twice via `make smoke-twice` plus once more for e2e, all on a 2-core runner — CI must not pay
+# for four observability containers it never reads (same rationale that keeps otel-collector out of the
+# smoke gate). With the overlay OFF, the base stack is byte-for-byte unchanged.
+#
+# Scope: metrics + traces only. Container logs into Loki are #459 (an unresolved Docker Desktop problem).
+name: telosmud-dev # match the base project name so the overlay merges onto the SAME stack, not a new one
+
+services:
+  # The all-in-one Grafana + Prometheus + Tempo + Loki backend. Grafana Labs scopes this image to
+  # "development, demo, and testing" — which is exactly this. The k8s deployment uses discrete
+  # components instead (see the infra repo's Observability 2 issues).
+  lgtm:
+    image: grafana/otel-lgtm:0.29.1 # arm64-native (verified on Apple Silicon); bundles Prometheus, NOT Mimir
+    ports:
+      # ONLY Grafana is published, to HOST LOOPBACK per #455. lgtm's own OTLP receivers (4317/4318) are
+      # deliberately NOT published: our collector reaches them over the compose network, and publishing
+      # 4317 would collide with our collector's published 4317.
+      - "127.0.0.1:3000:3000" # Grafana UI — open http://localhost:3000 (default admin/admin, dev-only)
+    environment:
+      # Each backend takes a *_EXTRA_ARGS knob. Nothing pinned here yet (a dev box has no retention
+      # pressure); the seam is documented so retention can be set without rebuilding the image.
+      - LOKI_EXTRA_ARGS=
+      - TEMPO_EXTRA_ARGS=
+      - PROMETHEUS_EXTRA_ARGS=
+    volumes:
+      - ./data/lgtm:/data # persist dashboards + TSDB/blocks across `make down-obs` (deploy/data is gitignored)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12 # otel-lgtm boots four backends + Grafana; give it generous startup room
+    restart: unless-stopped
+
+  # Point OUR collector at the overlay config (base config untouched → no lgtm-exporter retry noise when
+  # the overlay is off). The base mount stays (unused); `command` selects the obs config. depends_on lgtm
+  # so the collector's otlp/lgtm exporter has a target on first start.
+  otel-collector:
+    volumes:
+      - ./otel-collector.obs.yaml:/etc/otel-collector.obs.yaml:ro
+    command: ["--config=/etc/otel-collector.obs.yaml"]
+    depends_on:
+      lgtm:
+        condition: service_started

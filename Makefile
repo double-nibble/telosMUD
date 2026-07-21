@@ -1,5 +1,8 @@
 GO ?= go
 COMPOSE ?= docker compose -f deploy/docker-compose.yml
+# The observability overlay (#458): the base stack PLUS the grafana/otel-lgtm backend. Opt-in only —
+# CI never uses it (see deploy/docker-compose.obs.yml for why it is not in the base file).
+COMPOSE_OBS ?= docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.obs.yml
 
 # DSN for the gated Postgres integration tests (tests/integration + the co-located
 # internal/store/*_test.go). It is the same address `make deps` exposes; export
@@ -18,7 +21,7 @@ BOTS ?= 500
 LOADTEST_DURATION ?= 30s
 
 .DEFAULT_GOAL := help
-.PHONY: help up deps down logs test test-race test-integration test-e2e smoke smoke-twice vet lint build tidy proto migrate migrate-status seed verify verify-full loadtest
+.PHONY: help up deps down logs up-obs down-obs test test-race test-integration test-e2e smoke smoke-twice vet lint build tidy proto migrate migrate-status seed verify verify-full loadtest
 
 help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | \
@@ -32,6 +35,12 @@ deps: ## Start only the backing services (Postgres, Redis, NATS)
 
 down: ## Stop dev dependencies
 	$(COMPOSE) down
+
+up-obs: ## Build & start the full stack + the Grafana LGTM observability backend (Grafana on http://localhost:3000)
+	$(COMPOSE_OBS) up -d --build
+
+down-obs: ## Stop the stack including the observability overlay
+	$(COMPOSE_OBS) down
 
 logs: ## Tail dev dependency logs
 	$(COMPOSE) logs -f

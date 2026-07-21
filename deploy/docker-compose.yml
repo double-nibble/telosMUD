@@ -6,7 +6,12 @@ name: telosmud-dev
 # Phase 16: services export OTLP metrics to the otel-collector (merge *otel into a service's environment).
 # The 5s export interval (default is 60s) keeps the :8889 scrape fresh during sub-minute load runs.
 x-otel-env: &otel-env
-  OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+  # The endpoint MUST carry a URL scheme: the OTel Go SDK parses OTEL_EXPORTER_OTLP_ENDPOINT as a URL,
+  # and a bare "host:port" is read as scheme="host" with an EMPTY address, so the gRPC dial fails with
+  # "invalid target address" and metrics silently never leave the process. http:// = plaintext gRPC
+  # (INSECURE below is redundant with it but kept explicit). This was previously scheme-less and the
+  # metrics pipeline never actually worked (#458).
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
   OTEL_EXPORTER_OTLP_INSECURE: "true"
   OTEL_METRIC_EXPORT_INTERVAL: "5000"
 
