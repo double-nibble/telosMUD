@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+
+	"github.com/double-nibble/telosmud/internal/logcap"
 )
 
 // Source is where content comes from. Two implementations exist:
@@ -161,7 +163,7 @@ func LintPacks(packs []Pack) {
 	for _, v := range LintReservedCoreRefs(packs) {
 		slog.Warn("content: pack ships a ref under the reserved core: namespace; it will clobber the "+
 			"embedded bootstrap pack — rename it out of the core: prefix",
-			"pack", v.Pack, "kind", v.Kind, "ref", v.Ref)
+			"pack", v.Pack, "kind", logcap.Value(v.Kind), "ref", logcap.Value(v.Ref))
 	}
 	// Content-lint (#66): warn on any identity token (ref/verb/surface) with a character outside the safe
 	// charset — the GMCP strip, comms-subject routing, and targeting tokenizer all assume refs can't carry
@@ -169,14 +171,14 @@ func LintPacks(packs []Pack) {
 	for _, v := range LintRefCharset(packs) {
 		slog.Warn("content: identity token has characters outside its safe charset; "+
 			"it can break GMCP keys / comms subjects / the tokenizer — rename it",
-			"pack", v.Pack, "field", v.Field, "value", v.Value, "allowed", v.Charset)
+			"pack", v.Pack, "field", v.Field, "value", logcap.Value(v.Value), "allowed", v.Charset)
 	}
 	// Content-lint (#111): trust-ladder footguns — a baseline tier granting a capability (elevates the whole
 	// playerbase), duplicate/nameless rungs, un-grantable flags. Non-fatal at boot (the reload gate hard-rejects
 	// the Reject-severity ones), but logged at Error so a REJECT can never scroll past as routine noise.
 	for _, v := range LintTrustLadder(packs) {
 		msg := "content: trust-ladder lint"
-		attrs := []any{"pack", v.Pack, "tier", v.Tier, "severity", v.Severity.String(), "detail", v.Detail}
+		attrs := []any{"pack", v.Pack, "tier", logcap.Value(v.Tier), "severity", v.Severity.String(), "detail", logcap.Value(v.Detail)}
 		if v.Severity == TrustLadderReject {
 			slog.Error(msg+" REJECT — this ladder will be refused by a fleet reload; fix it before it elevates the wrong accounts", attrs...)
 			continue
@@ -190,7 +192,7 @@ func LintPacks(packs []Pack) {
 	for _, v := range LintChannelAccess(packs) {
 		slog.Warn("content: channel access-condition lint — a present-but-empty/partial condition (likely a typo); "+
 			"the channel may be unintentionally open or unreachable",
-			"pack", v.Pack, "channel", v.Channel, "field", v.Field, "detail", v.Detail)
+			"pack", v.Pack, "channel", logcap.Value(v.Channel), "field", v.Field, "detail", logcap.Value(v.Detail))
 	}
 }
 

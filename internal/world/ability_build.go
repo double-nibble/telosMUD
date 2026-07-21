@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/logcap"
 )
 
 // buildAbilityDef maps an AbilityDTO onto the runtime abilityDef. It parses the target mode +
@@ -96,7 +97,7 @@ func normalizeArea(s string) string {
 	case "", "self", "target":
 		return ""
 	default:
-		slog.Error("content: unknown targeting.area (treated as single-target)", "area", s)
+		slog.Error("content: unknown targeting.area (treated as single-target)", "area", logcap.Value(s))
 		return ""
 	}
 }
@@ -119,12 +120,12 @@ func parseEventMap(v any, owner string) map[eventKind][]effectOp {
 	for key, raw := range m {
 		kind := eventKind(key)
 		if !knownEventKinds[kind] {
-			slog.Error("content: on_event references unknown engine event (dropped)", "def", owner, "event", key)
+			slog.Error("content: on_event references unknown engine event (dropped)", "def", owner, "event", logcap.Value(key))
 			continue
 		}
 		ops, err := parseOpList(raw)
 		if err != nil {
-			slog.Error("content: on_event op-list parse failed", "def", owner, "event", key, "err", err)
+			slog.Error("content: on_event op-list parse failed", "def", owner, "event", logcap.Value(key), "err", err)
 		}
 		if len(ops) == 0 {
 			continue
@@ -151,7 +152,7 @@ func parseLuaEventMap(m map[string]string, owner string) map[eventKind]string {
 		}
 		kind := eventKind(key)
 		if !knownEventKinds[kind] {
-			slog.Error("content: on_event_lua references unknown engine event (dropped)", "def", owner, "event", key)
+			slog.Error("content: on_event_lua references unknown engine event (dropped)", "def", owner, "event", logcap.Value(key))
 			continue
 		}
 		if out == nil {
@@ -437,21 +438,25 @@ const maxDice = 500
 // parseDice parses a "<N>d<S>" dice string into (num, size). "8d6" -> (8,6). "d6" -> (1,6). Both the
 // count and the size are capped at maxDice so a runaway spec can't spin the zone goroutine.
 func parseDice(s string) (int, int, error) {
+	// The raw builder value is only ever echoed back in an error message; cap it once at the source so a
+	// huge `dice` field cannot produce a giant parse-error log line downstream (#481). Splitting still
+	// uses the full string so parsing is unaffected — only the diagnostic is bounded.
+	sLog := logcap.Value(s)
 	parts := strings.SplitN(strings.ToLower(strings.TrimSpace(s)), "d", 2)
 	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("dice %q: want <N>d<S>", s)
+		return 0, 0, fmt.Errorf("dice %q: want <N>d<S>", sLog)
 	}
 	num := 1
 	if parts[0] != "" {
 		n, err := strconv.Atoi(parts[0])
 		if err != nil || n < 0 {
-			return 0, 0, fmt.Errorf("dice %q: bad count", s)
+			return 0, 0, fmt.Errorf("dice %q: bad count", sLog)
 		}
 		num = n
 	}
 	size, err := strconv.Atoi(parts[1])
 	if err != nil || size <= 0 {
-		return 0, 0, fmt.Errorf("dice %q: bad size", s)
+		return 0, 0, fmt.Errorf("dice %q: bad size", sLog)
 	}
 	if num > maxDice {
 		num = maxDice
@@ -552,7 +557,7 @@ func lintAbilityOps(ref string, ops []effectOp) int {
 		for i := range list {
 			op := &list[i]
 			if _, ok := effectOpHandlers[op.kind]; !ok {
-				slog.Error("content: ability references unknown effect op", "ability", ref, "op", op.kind)
+				slog.Error("content: ability references unknown effect op", "ability", ref, "op", logcap.Value(op.kind))
 				unknown++
 			}
 			walk(op.then)

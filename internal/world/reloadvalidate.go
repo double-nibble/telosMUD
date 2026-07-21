@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/logcap"
 )
 
 // reloadvalidate.go — pre-publish content PACK-HEALTH gate for `reload` (#192, Option B: shard-local
@@ -251,6 +252,22 @@ func zoneGraphProblems(s *reloadScope) []string {
 			problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside its safe charset %s (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value, v.Charset))
 		}
 	}
+	return capProblems(problems)
+}
+
+// capProblems bounds each validation problem string to the shared logcap length (#481). Every problem
+// composed above embeds builder-controlled content — an identity token, a reference-valued exit/reset
+// target, a trust-ladder detail — verbatim; a 200KB field would otherwise ride the whole slice into the
+// reject/boot/snapshot log sinks (r.log.Error "problems", bootvalidate) AND into the returned reject
+// list (reloadOutcome.rejected). Capping HERE, at the two leaf aggregators every caller funnels through,
+// bounds the value regardless of which sub-check produced it or how the caller consumes it — one funnel
+// instead of a per-Sprintf hand-list (which the codebase's own ref-charset scope comment warns rots).
+// The rejection DECISION is unaffected: the sub-checks test the raw values; only the operator-facing
+// string is clipped. Per-element (not whole-slice) so a multi-problem reject still lists every finding.
+func capProblems(problems []string) []string {
+	for i, p := range problems {
+		problems[i] = logcap.Value(p)
+	}
 	return problems
 }
 
@@ -300,7 +317,7 @@ func sharedDefProblems(s *reloadScope) []string {
 		}
 		problems = append(problems, fmt.Sprintf("%s trust ladder: %s", where, v.Detail))
 	}
-	return problems
+	return capProblems(problems)
 }
 
 // anyAttrInScope reports whether any attribute on a cycle is owned (last-writer) by an in-scope pack — the
@@ -738,7 +755,9 @@ func advisoryReloadRemovals(s *reloadScope, wasLive func(ref string) bool) []str
 		}
 	}
 	sort.Strings(advisories)
-	return dedupeSorted(advisories)
+	// Advisories embed builder-controlled refs (exit/start-room/reset targets) verbatim and ride the same
+	// log + operator-readout sinks as the reject problems, so they get the same length bound (#481).
+	return capProblems(dedupeSorted(advisories))
 }
 
 // pinnedInstanceAdvisories surfaces (NON-BLOCKING, #411) every zone in this reload's scope that has live
@@ -768,7 +787,7 @@ func pinnedInstanceAdvisories(s *Shard, scope *reloadScope) []string {
 				"are reaped and the next one is minted", template, n))
 	}
 	sort.Strings(advisories)
-	return advisories
+	return capProblems(advisories)
 }
 
 // dedupeSorted collapses adjacent duplicates in a sorted slice (two resets in one zone spawning the same
