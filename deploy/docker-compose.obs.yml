@@ -1,6 +1,6 @@
 # Observability overlay (#458) — OPT-IN. Adds the Grafana LGTM stack behind the existing collector.
 #
-#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.obs.yml up   (or: make up-obs)
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.obs.yml up   (or just: make up)
 #
 # Deliberately NOT part of deploy/docker-compose.yml: tests/smoke/smoke.sh runs the base file for every
 # service, twice via `make smoke-twice` plus once more for e2e, all on a 2-core runner — CI must not pay
@@ -34,7 +34,7 @@ services:
       # this metric→trace→log correlation demo.
       - PROMETHEUS_EXTRA_ARGS=--enable-feature=exemplar-storage
     volumes:
-      - ./data/lgtm:/data # persist dashboards + TSDB/blocks across `make down-obs` (deploy/data is gitignored)
+      - ./data/lgtm:/data # persist dashboards + TSDB/blocks across `make down` (deploy/data is gitignored)
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
       interval: 10s
