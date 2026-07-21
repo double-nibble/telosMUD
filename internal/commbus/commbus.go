@@ -167,6 +167,12 @@ type Message struct {
 	IdempotencyKey string `json:"idempotency_key"` // "<AuthorID>:<Seq>" — the 8.5 dedup key, carried now
 	Body           string `json:"body"`            // the FULLY-RENDERED line the source world produced (format+color+$t); the gate writes it VERBATIM
 	Text           string `json:"text,omitempty"`  // the RAW sanitized player message ($t DATA), carried so a rich sink can render its own per-channel line (#49); empty for a config/system message
+	// Trace is the W3C trace-context carrier (#467): the producer injects its span context here at publish,
+	// the consumer extracts it and LINKS its delivery span to the producer. It rides the message ENVELOPE
+	// rather than NATS headers so the same field propagates uniformly across the NATS and in-proc mem
+	// transports (a NATS-header approach cannot carry across MemBus). omitempty + an unknown-field-tolerant
+	// decode make it rolling-deploy-safe: an old peer that neither sets nor reads it simply gets no link.
+	Trace map[string]string `json:"trace,omitempty"`
 }
 
 // ConfigPayload is the per-player comms-config the SOURCE world publishes to ConfigSubject(player)

@@ -94,11 +94,15 @@ func (b *MemBus) Available() bool { return true }
 // PUBLISH ORDER per subscriber. The ACL check is FIRST (P8-A2): a RoleGate handle publishing a
 // chan/tell subject returns ErrPublishForbidden and NOTHING is enqueued — the impersonation gate.
 // msg.Subject is stamped to subj so the sink can dispatch on it regardless of a wildcard subscription.
-func (b *MemBus) Publish(_ context.Context, subj string, msg Message) error {
+func (b *MemBus) Publish(ctx context.Context, subj string, msg Message) error {
 	if b.role == RoleGate && isACLGuarded(subj) {
 		return ErrPublishForbidden
 	}
 	msg.Subject = subj
+	// Producer span + traceparent into the envelope (#467), so an in-proc subscriber links its delivery span
+	// to this producer exactly as a NATS one does.
+	msg, span := startProducer(ctx, subj, msg)
+	defer span.End()
 	c := b.core
 	c.mu.Lock()
 	if c.closed {
@@ -144,7 +148,10 @@ func (b *MemBus) Subscribe(subj string, handler func(Message)) (Subscription, er
 	c.subs[s] = struct{}{}
 	go func() {
 		for msg := range s.ch {
+			// Consumer span LINKED to the producer (#467). The in-proc transient path is live, single-attempt.
+			_, span := startConsumer(msg.Subject, msg, false, 1)
 			s.handler(msg)
+			span.End()
 		}
 		close(s.done)
 	}()

@@ -178,13 +178,16 @@ func (js *MemJetStream) Pending(subj, consumerID string) int {
 // publish-side idempotency dedup (Append) and discards the newly-stored bool — the durable-tell path
 // cares only that the message is now in the log (a duplicate is harmlessly absorbed). A closed
 // stand-in refuses, mirroring a closed broker.
-func (js *MemJetStream) PublishDurable(_ context.Context, subj string, msg Message) error {
+func (js *MemJetStream) PublishDurable(ctx context.Context, subj string, msg Message) error {
 	js.mu.Lock()
 	closed := js.closed
 	js.mu.Unlock()
 	if closed {
 		return ErrJetStreamClosed
 	}
+	// Producer span + traceparent into the envelope (#467), so a durable consumer links to it.
+	msg, span := startProducer(ctx, subj, msg)
+	defer span.End()
 	js.Append(subj, msg)
 	return nil
 }

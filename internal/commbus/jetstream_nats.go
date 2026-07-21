@@ -303,6 +303,10 @@ func notifyParkObserver(streamName, consumer string, streamSeq uint64) {
 // it on next login.
 func (b *NATSJetStream) PublishDurable(ctx context.Context, subj string, msg Message) error {
 	msg.Subject = subj
+	// Producer span + traceparent injected into the envelope (#467), riding Data alongside the idempotency
+	// key so the durable consumer can LINK its (possibly redelivered) delivery span to this producer.
+	msg, span := startProducer(ctx, subj, msg)
+	defer span.End()
 	data, err := msg.marshal()
 	if err != nil {
 		return fmt.Errorf("commbus: marshal durable message: %w", err)
@@ -384,7 +388,13 @@ func (b *NATSJetStream) Consume(subj, consumerID string, handler func(Message, b
 		// Firing before the handler also warns at the START of the crossing attempt rather than after it,
 		// which under a slow handler is the difference between warning now and warning up to AckWait later.
 		b.noteStallIfCrossed(m.Subject(), consumerID, msg, attempt)
-		switch handler(msg, backlog) {
+		// Consumer span LINKED to the producer (#467), carrying backlog + the delivery attempt so a
+		// redelivery is visibly a redelivery (a fresh span linked to the SAME producer, attempt=N) rather
+		// than a second child of one parent — the correct model for at-least-once JetStream.
+		_, cspan := startConsumer(m.Subject(), msg, backlog, attempt)
+		ack := handler(msg, backlog)
+		cspan.End()
+		switch ack {
 		case AckDelivered:
 			_ = m.Ack()
 		case DropPoison:
