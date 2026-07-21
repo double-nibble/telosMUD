@@ -1,0 +1,46 @@
+# OpenTelemetry Collector config for the OBSERVABILITY OVERLAY (#458), selected by
+# deploy/docker-compose.obs.yml — NOT the base stack. It is the base deploy/otel-collector.yaml plus
+# a fan-out to the grafana/otel-lgtm backend so Grafana can render what the services emit.
+#
+# Kept SEPARATE from the base config on purpose: the base config has no lgtm exporter, so the base
+# `make up` produces zero exporter-retry log noise when the overlay is off. Our collector stays the
+# single ingest point (x-otel-env still points every service at otel-collector:4317, unchanged) and
+# otel-lgtm is treated purely as a backend behind it — the base six service definitions never change.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: normal
+  # Kept so the existing `curl localhost:8889/metrics` load-run workflow keeps working with the overlay on.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  # Fan out to the otel-lgtm container's embedded collector (4317), which routes to its bundled
+  # Prometheus (metrics) and Tempo (traces). lgtm's OTLP ports are NOT published to the host (the
+  # collector reaches it over the compose network), avoiding a 4317 collision with our collector.
+  otlp/lgtm:
+    endpoint: lgtm:4317
+    tls:
+      insecure: true
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, prometheus, otlp/lgtm]
+    # Traces ride the same OTLP ingest into Tempo. Empty until Observability 3 wires a TracerProvider
+    # (#464); shipping the pipeline now makes that round's local dev loop instant and costs nothing.
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, otlp/lgtm]
