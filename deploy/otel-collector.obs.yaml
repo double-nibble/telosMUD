@@ -44,3 +44,11 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [debug, otlp/lgtm]
+    # Logs (#459): the services bridge slog over OTLP (TELOS_OTEL_LOGS, set in the overlay) → here →
+    # otel-lgtm's Loki. This is the Docker-Desktop answer — filelog can't read the VM's container logs,
+    # so logs ride the OTLP path that already works. k8s uses filelog instead (the engine flag is off
+    # there), so there is no double-shipping.
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, otlp/lgtm]
