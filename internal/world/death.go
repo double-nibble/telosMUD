@@ -41,15 +41,17 @@ func (co *CorpseOwner) looterIsOwner(s *session) bool {
 // goroutine (single-writer) — it is triggered BY harm that already gated, drops combat pointers, removes
 // the dead mob, and builds a corpse, all in-zone.
 //
-// # The seam (6.5 uniform death)
+// # The seam (6.5 uniform death, generalized to any pool by #406)
 //
-// onVitalDepleted is invoked from the ONE shared dealDamage funnel (effect_op.go) whenever applied
-// damage empties a target's vital pool — a melee swing, an offensive spell, an AoE, a DoT tick, and an
-// opportunity attack ALL kill through this one seam (a pure-caster build can land a killing blow). It
-// runs the content on_depleted op-list (if authored), RE-CHECKS the vital (a hook that revived the
-// victim CANCELS the death), then die(). Death is the consequence of harm that brings hp to 0; the harm
-// path owns the swing/spell, this file owns the consequence. No damage-pipeline shape changed — death is
-// the depletion branch of the shared funnel, gated by the posDead idempotency latch.
+// onPoolDepleted is invoked from the ONE shared dealDamage funnel (effect_op.go) whenever applied
+// damage empties a target's resource pool — a melee swing, an offensive spell, an AoE, a DoT tick, and an
+// opportunity attack ALL reach it through this one seam (a pure-caster build can land a killing blow). It
+// runs the content on_depleted op-list (if authored), then — for a VITAL pool only — RE-CHECKS the vital
+// (a hook that revived the victim CANCELS the death) and calls die(). Death is the consequence of harm
+// that brings a VITAL pool to 0; emptying a non-vital pool (Sanity, Stress, a Stun track) runs that
+// pool's hook and stops there. The harm path owns the swing/spell, this file owns the consequence. No
+// damage-pipeline shape changed — depletion is a branch of the shared funnel, and the death half of it is
+// gated by the posDead idempotency latch.
 //
 // # The no-stale-pointer invariant (the death twin of disengage)
 //
@@ -65,14 +67,25 @@ func (co *CorpseOwner) looterIsOwner(s *session) bool {
 // ops/handlers — a harmful op in either still funnels the SAME guardHarmful (effect_op.go). Corpse
 // creation is pure containment (Move), no harm. So the gate's can't-bypass property holds unchanged.
 
-// onVitalDepleted is the UNIFORM death entry (6.5) the shared dealDamage funnel calls when `victim`'s
-// vital pool hits 0 — a melee swing, a spell, an AoE, a DoT tick, and an opportunity attack ALL reach it
-// through the one harm path (effect_op.go), not just the swing pipeline. `killer` is the entity the
-// emptying damage is attributed to (the swing attacker / a DoT's applier; nil for a sourceless
-// environmental hit / a self-DoT). It runs the content on_depleted hook (a last-gasp narration / effect
-// on the dying entity), RE-CHECKS the vital, then die(). Idempotent: a victim already dead (posDead) is a
-// no-op, so a second swing in the same round or a DoT tick racing the killing blow can't double-kill.
-// Single-writer: zone goroutine.
+// onPoolDepleted is the UNIFORM depletion entry (6.5 + #406) the shared dealDamage funnel calls when
+// damage empties one of `victim`'s resource pools — a melee swing, a spell, an AoE, a DoT tick, and an
+// opportunity attack ALL reach it through the one harm path (effect_op.go), not just the swing pipeline.
+// `killer` is the entity the emptying damage is attributed to (the swing attacker / a DoT's applier; nil
+// for a sourceless environmental hit / a self-DoT). It runs the depleted pool's on_depleted hook, then —
+// ONLY for a vital pool — RE-CHECKS the vital and calls die(). Idempotent for death: a victim already
+// dead (posDead) is a no-op, so a second swing in the same round or a DoT tick racing the killing blow
+// can't double-kill. Single-writer: zone goroutine.
+//
+// NON-VITAL DEPLETION (#406): `vital` now means only "the default consequence of emptying this pool is
+// DEATH", not "this pool is the only one with consequences". A non-vital pool (Sanity, Stress, a Stun
+// track) that bottoms out runs its own on_depleted — an 'insane'/'shaken' affect, an incapacitation, a
+// narration — and then falls out at the vitalDepleted re-check below WITHOUT reaching die(). That
+// re-check is the ONE gate between a depletion and death, and it reads def.vital from the immutable
+// registry (swapped only at reload, between zone messages), so no hook can flip it. die() has exactly one
+// call site in the tree — here — which makes "a non-vital depletion can never kill" structural rather
+// than a promise every call site has to keep. A hook that WANTS a non-vital break to be lethal says so
+// out loud by dealing damage to a vital pool, which kills through the ordinary funnel (and exactly once —
+// the deathGen guard below stops this outer frame from re-running death on the way out).
 //
 // CANCELLABLE DEATH CHECKPOINT (6.5, user-mandated): the on_depleted hook IS the declarative cancel.
 // After it runs we re-read the vital; if the hook revived the victim above 0 (a death-ward that did
@@ -85,38 +98,38 @@ func (co *CorpseOwner) looterIsOwner(s *session) bool {
 // RECURSION BOUND (security M1, the stack-overflow guard): the death hook is NOT reached through
 // fireEvent, so it does NOT get the bus's depth/width bounding for free — yet it can recurse, because an
 // on_depleted op-list may re-deal LETHAL damage (`deal_damage self`, or a `tgt: other` ping-pong between
-// two entities), and dealDamage's depletion checkpoint calls back into onVitalDepleted. Left unbounded
-// that is `dealDamage -> onVitalDepleted -> runOps -> opDealDamage -> dealDamage -> …` forever -> a
+// two entities), and dealDamage's depletion checkpoint calls back into onPoolDepleted. Left unbounded
+// that is `dealDamage -> onPoolDepleted -> runOps -> opDealDamage -> dealDamage -> …` forever -> a
 // process-fatal `fatal error: stack overflow` that takes down every zone, not just the fight. So we
 // bound the hook EXACTLY as fireEvent bounds a handler (event.go is the template):
-//   - The deathCtx inherits parent.depth. Refuse to run the hook once depth >= maxEventDepth (Warn, then
+//   - The depletionCtx inherits parent.depth. Refuse to run the hook once depth >= maxEventDepth (Warn, then
 //     fall through to die() WITHOUT the hook) — this is the critical cap that terminates the recursion at
 //     maxEventDepth=8. depth ALONE bounds it: a command-issued cast reaches here with a nil eventBudget,
 //     so we must not rely on the budget pointer being non-nil.
 //   - When a shared eventBudget exists, the hook is one unit of work: skip it (truncate) if the budget is
 //     spent, else decrement it — so a wide cascade of death hooks can't starve the goroutine either.
-//   - Run the ops at depth+1 (dc.depth++), so the nested dealDamage->onVitalDepleted sees an incremented
+//   - Run the ops at depth+1 (dc.depth++), so the nested dealDamage->onPoolDepleted sees an incremented
 //     depth and the recursion provably terminates at the cap.
 //
 // nil/empty op-list => nothing runs (engine default death). A hook that exhausts the depth/width budget
 // simply does not run — the victim then dies the engine-default way (no revive, since the cancel can only
 // happen if the hook actually ran and raised the vital).
-func (z *Zone) onVitalDepleted(victim, killer *Entity, pool string, parent *effectCtx) {
+func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, parent *effectCtx) {
 	if victim == nil || victim.living == nil || position(victim) == posDead {
 		return
 	}
 	gen := deathGen(victim)
-	// Run the on_depleted hook of the pool that ACTUALLY depleted (#71) — with multiple vitals each carries
-	// its own hook, so a sanity-death must run sanity's last-gasp, not hp's. pool is the routed pool from
-	// the dealDamage checkpoint (never "" — the checkpoint only fires for a vital pool it just emptied).
+	// Run the on_depleted hook of the pool that ACTUALLY depleted (#71/#406) — each pool carries its own
+	// hook, so a sanity break must run sanity's, not hp's. pool is the routed pool from the dealDamage
+	// checkpoint (never "" — the checkpoint only fires for a pool it just emptied).
 	if pool != "" {
 		if def := z.resourceDefs().get(pool); def != nil && len(def.onDepleted) > 0 {
-			dc := z.deathCtx(victim, killer, parent)
-			z.runDeathHook(dc, def.onDepleted, victim)
+			dc := z.depletionCtx(victim, killer, parent)
+			z.runDepletionHook(dc, def.onDepleted, victim, pool)
 		}
 	}
 	// THE RE-ENTRY GUARD (#69). The posDead check at entry only screens frames that have not started yet.
-	// An on_depleted hook that re-deals lethal damage re-enters onVitalDepleted recursively; the INNERMOST
+	// An on_depleted hook that re-deals lethal damage re-enters onPoolDepleted recursively; the INNERMOST
 	// frame (the one that hits the depth cap and runs no hook) reaches die() and buries the victim. As the
 	// stack unwinds, every outer frame is still holding a victim whose vital reads 0 — a corpsed mob's
 	// resCur is never restored — and would call die() AGAIN: a second corpse, a second OnKill, and a second
@@ -130,49 +143,63 @@ func (z *Zone) onVitalDepleted(victim, killer *Entity, pool string, parent *effe
 	if deathGen(victim) != gen {
 		return
 	}
-	// THE CANCEL RE-CHECK: after any on_depleted hook ran, re-read THE POOL THAT DEPLETED. A hook that
-	// revived the victim above 0 in that pool (death-ward / second wind) cancels the death declaratively —
-	// abort cleanly with no die/corpse/respawn and the posDead latch left unset (the victim fights on at
-	// its revived level). The check is POOL-LOCAL (#71): with multiple vitals, a sanity-death is cancelled
-	// by reviving sanity, not by hp being full. vitalDepleted also re-asserts the pool is vital with max >
-	// 0, so a 0-max pool can never fall through to die() even if this seam were reached with one.
+	// THE VITAL GATE + CANCEL RE-CHECK, in one predicate. Two jobs:
+	//   1. THE NON-VITAL STOP (#406): a pool that is not `vital` never gets past here, no matter what its
+	//      hook did. This is the single edge into die() in the whole tree, so "a Sanity break is not a
+	//      death" is a structural property, not a call-site convention.
+	//   2. THE CANCEL (6.5): after any on_depleted hook ran, re-read THE POOL THAT DEPLETED. A hook that
+	//      revived the victim above 0 in that pool (death-ward / second wind) cancels the death
+	//      declaratively — abort cleanly with no die/corpse/respawn and the posDead latch left unset (the
+	//      victim fights on at its revived level). POOL-LOCAL (#71): a sanity-death is cancelled by
+	//      reviving sanity, not by hp being full.
+	// vitalDepleted also re-asserts max > 0, so a 0-max pool can never fall through to die() either.
 	if !vitalDepleted(victim, pool) {
 		return
 	}
 	z.die(victim, killer, parent)
 }
 
-// runDeathHook runs an on_depleted op-list under the SAME depth/width bound fireEvent applies to an event
-// handler (event.go), so a hook that re-deals lethal damage recurses at most maxEventDepth deep instead
-// of overflowing the stack (security M1). dc inherits parent.depth/eventBudget (deathCtx); this is the
-// one place the death seam decrements the budget and increments the depth. A refusal (depth cap hit, or
-// budget spent) runs NO ops — the caller then proceeds to the engine-default death. Single-writer.
-func (z *Zone) runDeathHook(dc *effectCtx, ops []effectOp, victim *Entity) {
+// runDepletionHook runs an on_depleted op-list under the SAME depth/width bound fireEvent applies to an
+// event handler (event.go), so a hook that re-deals damage recurses at most maxEventDepth deep instead of
+// overflowing the stack (security M1). dc inherits parent.depth/eventBudget (depletionCtx); this is the
+// one place the depletion seam decrements the budget and increments the depth. A refusal (depth cap hit,
+// or budget spent) runs NO ops. Single-writer.
+//
+// WHAT A REFUSAL MEANS differs by pool kind, and both directions are deliberate: for a VITAL pool the
+// caller proceeds to the engine-default death (fail-CLOSED — a death-ward that could not run does not
+// save you); for a NON-VITAL pool the depletion simply has no consequence this blow (fail-OPEN — a silent
+// no-op beats an unbounded loop). `pool` rides the log so an operator can tell WHICH hook was dropped.
+//
+// #406 note: non-vital hooks now draw on the SAME shared eventBudget. A wide cascade of Sanity breaks
+// (an AoE horror) can therefore spend budget a later death hook in the same cascade would have used,
+// which drops that hook and lets the victim die the default way. That is the fail-closed direction for
+// death and is preferable to letting content buy unbounded work by splitting it across pools.
+func (z *Zone) runDepletionHook(dc *effectCtx, ops []effectOp, victim *Entity, pool string) {
 	if dc.depth >= maxEventDepth {
-		// The stack-overflow guard: a runaway on_depleted (re-deals lethal damage) is capped here exactly
-		// like a runaway event cascade. The victim falls through to die() with the hook UNrun.
-		z.log.Warn("on_depleted depth budget exhausted; death hook dropped",
-			"victim", targetShort(victim), "depth", dc.depth)
+		// The stack-overflow guard: a runaway on_depleted (re-deals damage that re-empties a pool) is capped
+		// here exactly like a runaway event cascade.
+		z.log.Warn("on_depleted depth budget exhausted; hook dropped",
+			"victim", targetShort(victim), "pool", pool, "depth", dc.depth)
 		return
 	}
 	if dc.eventBudget != nil {
 		if *dc.eventBudget <= 0 {
-			z.log.Warn("on_depleted handler budget exhausted; death hook dropped",
-				"victim", targetShort(victim))
+			z.log.Warn("on_depleted handler budget exhausted; hook dropped",
+				"victim", targetShort(victim), "pool", pool)
 			return
 		}
 		*dc.eventBudget--
 	}
-	dc.depth++ // the nested dealDamage->onVitalDepleted->runDeathHook sees +1, so recursion terminates at the cap
+	dc.depth++ // the nested dealDamage->onPoolDepleted->runDepletionHook sees +1, so recursion terminates at the cap
 	runOps(dc, ops)
 }
 
-// deathCtx builds the effectCtx the on_depleted / death-adjacent ops run under: the victim is the
-// actor/source/target (a self-effect on the dying entity), the killer is `other` (so a hook op can
-// reference $other = the slayer). It inherits the parent's depth/rng/event-budget so the death hook is
-// bounded by the SAME round budget as the swing that triggered it (no fresh 256). disp neutral — a
-// harmful op inside re-decides its own disposition and re-gates.
-func (z *Zone) deathCtx(victim, killer *Entity, parent *effectCtx) *effectCtx {
+// depletionCtx builds the effectCtx the on_depleted / death-adjacent ops run under: the depleted entity
+// is the actor/source/target (a self-effect on the subject), the damage source is `other` (so a hook op
+// can reference $other = the slayer / the horror that broke you). It inherits the parent's depth/rng/
+// event-budget so the hook is bounded by the SAME round budget as the swing that triggered it (no fresh
+// 256). disp neutral — a harmful op inside re-decides its own disposition and re-gates.
+func (z *Zone) depletionCtx(victim, killer *Entity, parent *effectCtx) *effectCtx {
 	c := &effectCtx{
 		z: z, actor: victim, source: victim, target: victim, other: killer,
 		mag: 1, disp: dispNeutral,
@@ -282,7 +309,7 @@ func (z *Zone) die(victim, killer *Entity, parent *effectCtx) {
 	z.disengage(victim)
 	z.scrubThreat(victim)
 
-	// Latch posDead — the REAL idempotency guard onVitalDepleted checks (disengage reset position to
+	// Latch posDead — the REAL idempotency guard onPoolDepleted checks (disengage reset position to
 	// standing just above, so set it here). As of 6.5 death is reached from ANY deal_damage (swing, spell,
 	// AoE, DoT tick, opportunity attack), so a second depletion on an already-dying entity is a live race —
 	// a DoT tick landing the same round as the killing swing, or an OnDamageTaken handler's deal_damage

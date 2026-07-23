@@ -301,7 +301,7 @@ func TestDeathGenerationIsInstanceOwnedNotProtoShared(t *testing.T) {
 }
 
 // TestOnVitalDepletedDoesNotDieTwice is a real dupe bug the death generation exposed and fixes. An
-// on_depleted hook that re-deals lethal damage re-enters onVitalDepleted recursively. The INNERMOST frame
+// on_depleted hook that re-deals lethal damage re-enters onPoolDepleted recursively. The INNERMOST frame
 // (the one the depth cap stops from running a hook) reaches die() and corpses the mob. As the stack
 // unwound, every outer frame still saw the vital at 0 — a corpsed mob's resCur is never restored — and
 // called die() AGAIN: a second corpse, a second OnKill, and a second resolveLoot. That last one is an item
@@ -355,7 +355,7 @@ func TestOnVitalDepletedDoesNotDieTwice(t *testing.T) {
 	}
 }
 
-// TestDieIsIdempotentUnderOnKillReentry covers the OTHER re-entry window, the one the onVitalDepleted
+// TestDieIsIdempotentUnderOnKillReentry covers the OTHER re-entry window, the one the onPoolDepleted
 // guard cannot see. die() deliberately fires OnKill and resolves loot BEFORE it latches posDead, so the
 // XP/quest handler sees the kill in context. An OnKill handler that damages the victim — a cleave, an
 // "execute" rider — therefore re-enters the funnel through a 0-hp entity with posDead unset and used to

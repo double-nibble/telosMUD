@@ -561,11 +561,16 @@ func guardCrossPlayerWrite(c *effectCtx, target *Entity) bool {
 //
 // 6.5 — UNIFORM DEATH: the depletion->death seam lives HERE, not in the swing path, so EVERY content
 // damage source kills through one path (a pure-caster's fireball/DoT can now land a killing blow). When
-// the applied damage empties the target's vital pool, onVitalDepleted runs the content on_depleted hook
+// the applied damage empties the target's vital pool, onPoolDepleted runs the content on_depleted hook
 // (which can CANCEL the death by reviving the victim — death.go) then die().
 //
+// #406 — ANY POOL HAS CONSEQUENCES: the same checkpoint also runs on_depleted for a NON-vital pool that
+// this blow emptied, and stops there (no die()). `vital` therefore means only "the default consequence of
+// emptying this pool is death" — a Sanity/Stress/Stun track can bottom out into an 'insane'/'shaken'
+// affect instead. See the checkpoint below for why the two triggers are deliberately asymmetric.
+//
 // BOUNDING (security M1): the death seam is NOT reached through fireEvent, so it does not inherit the
-// bus's depth/width guard for free. onVitalDepleted->runDeathHook (death.go) does the bounding EXPLICITLY
+// bus's depth/width guard for free. onPoolDepleted->runDepletionHook (death.go) does the bounding EXPLICITLY
 // at the seam: it INCREMENTS c.depth per hook level and DECREMENTS the shared eventBudget when present,
 // refusing the hook past maxEventDepth. So a recursive on_depleted (`deal_damage self`, or a `tgt: other`
 // ping-pong) that loops back through this checkpoint terminates at maxEventDepth instead of overflowing
@@ -590,7 +595,8 @@ func guardCrossPlayerWrite(c *effectCtx, target *Entity) bool {
 // resource selects WHICH pool the blow lands on (#71 multi-vital): an explicit resource ref routes the
 // damage to that pool; "" routes to the target's primary vital (a swing / untyped damage — the legacy
 // behavior). A depletion drives death only when the hit pool is VITAL (vitalDepleted), so a blow to a
-// non-vital pool (a stagger/mana bar) subtracts without killing.
+// non-vital pool (a stagger/mana bar) subtracts, may run that pool's on_depleted hook (#406), and never
+// kills.
 func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource string) int {
 	c.lastDamage = 0
 	if target == nil || target.living == nil {
@@ -642,7 +648,8 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 		return dmg
 	}
 	// Apply to the resolved pool. The pool clamps its current at 0 (resources.go); the depletion
-	// checkpoint below turns a 0-crossing into death when (and only when) the pool is a VITAL resource.
+	// checkpoint below turns an emptied pool into that pool's on_depleted hook, and into death when (and
+	// only when) the pool is a VITAL resource.
 	cur := resourceCurrent(target, pool)
 	setResourceCurrent(target, pool, cur-dmg)
 	c.lastDamage = dmg
@@ -673,14 +680,32 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 		c.z.fireEvent(c, evOnHit, src, target, float64(dmg))
 	}
 
-	// --- Depletion checkpoint (6.5, the uniform death seam): the applied damage emptied a VITAL pool ->
-	// run that pool's on_depleted hook (which may CANCEL death by reviving the victim) then die(). Death
-	// keys on vitalDepleted (the pool must be vital AND have max > 0), so damage to a non-vital pool is
-	// never lethal and a 0-max pool can never trigger a corpse. source is the killer attribution (nil for
-	// a sourceless death — no OnKill subject). Idempotent via the posDead latch (onVitalDepleted/die).
-	// Shares this ctx's budget/depth so a death inside an event cascade stays bounded.
-	if vitalDepleted(target, pool) {
-		c.z.onVitalDepleted(target, src, pool, c)
+	// --- Depletion checkpoint (6.5, the uniform death seam + #406): the applied damage emptied the pool ->
+	// run THAT pool's on_depleted hook, then — only for a VITAL pool — die(). source is the killer/source
+	// attribution (nil for a sourceless hit — no OnKill subject). Idempotent for death via the posDead latch
+	// (onPoolDepleted/die). Shares this ctx's budget/depth so the hook stays bounded inside a cascade.
+	//
+	// #406 widened the trigger from `vitalDepleted` to `poolDepleted` — the SAME predicate minus the `vital`
+	// clause — so a non-vital pool bottoming out runs its hook too. `vital` is now only what decides whether
+	// death FOLLOWS the hook, and that decision lives inside onPoolDepleted (which re-reads vitalDepleted),
+	// not here: keeping the one edge into die() behind one predicate is what makes "a Sanity break is not a
+	// death" structural.
+	//
+	// LEVEL-TRIGGERED, not edge-triggered — the same rule the vital path has always had. The hook fires on
+	// every blow that leaves the pool at 0, INCLUDING a blow onto an already-empty pool. Two reasons, and
+	// they point the same way:
+	//   - A two-track system (a stun/stagger track that carries its excess into a lethal pool) REQUIRES it.
+	//     Under an edge rule an already-empty track would swallow every subsequent blow whole and the
+	//     target would be immune to that damage kind forever — the carry-over is exactly what has to keep
+	//     happening after the first crossing.
+	//   - A vital pool can also reach 0 off the damage path (modify_resource, an ability cost, a max drop);
+	//     the next blow onto that already-empty vital must still kill. An edge rule would leave an
+	//     unkillable 0-hp victim.
+	// The cost is that a non-vital hook can re-run while the pool stays empty (a vital one is latched by
+	// posDead). That is a CONTENT concern, called out in ResourceDTO.OnDepleted: make the hook idempotent
+	// (`if has_affect` / `stacking: ignore`) and never put a rewarding op in one.
+	if poolDepleted(target, pool) {
+		c.z.onPoolDepleted(target, src, pool, c)
 	}
 	return dmg
 }
@@ -772,19 +797,35 @@ func vitalResource(e *Entity) string {
 	return lowest
 }
 
+// poolDepleted reports whether `pool` is a content-defined resource on `e` that has bottomed out — the
+// VITAL-free half of the depletion predicate (#406). TRUE only when the resource is registered, its
+// derived max is > 0, and its current is <= 0.
+//
+// The max > 0 clause is load-bearing twice over: it is the structural guard that a capacity-less pool
+// can never read as "depleted" (a mindless construct with max_sanity 0 must not fire sanity's "you go
+// insane" hook, exactly as it must not die of it), and it keeps this predicate consistent with the
+// immunity discard the routing path applies (dealDamage above). Zone-goroutine read.
+func poolDepleted(e *Entity, pool string) bool {
+	if e == nil || e.zone == nil || pool == "" {
+		return false
+	}
+	return e.zone.resourceDefs().get(pool) != nil &&
+		resourceMax(e, pool) > 0 && resourceCurrent(e, pool) <= 0
+}
+
 // vitalDepleted reports whether `pool` is a VITAL resource on `e` that has bottomed out — the exact
-// predicate the death seam keys on (#71). It is TRUE only when the pool's def is `vital`, its derived
-// max is > 0 (a 0-max pool is natural immunity, NOT a corpse-in-waiting — this is the structural guard
-// that a mislabeled or capacity-less pool can never trigger death), and its current is <= 0. Used at
-// BOTH the dealDamage depletion checkpoint and onVitalDepleted's cancel re-check so the two can never
-// disagree about "is this death real?" A non-vital pool (mana, a stagger bar) can be damaged to 0 but
-// is never lethal here. Zone-goroutine read (registry atomic.Load + resource reads).
+// predicate the DEATH seam keys on (#71). It is poolDepleted PLUS `def.vital`, defined in terms of it so
+// the two can never drift apart. Used at BOTH the dealDamage depletion checkpoint and onPoolDepleted's
+// cancel re-check so those two can never disagree about "is this death real?" A non-vital pool (mana, a
+// stagger bar, a Sanity track) can be damaged to 0 — and since #406 can run its own on_depleted hook —
+// but is NEVER lethal: this is the one predicate standing between a depletion and die(), which is why the
+// `vital` clause lives here and not at a call site. Zone-goroutine read.
 func vitalDepleted(e *Entity, pool string) bool {
 	if e == nil || e.zone == nil || pool == "" {
 		return false
 	}
 	def := e.zone.resourceDefs().get(pool)
-	return def != nil && def.vital && resourceMax(e, pool) > 0 && resourceCurrent(e, pool) <= 0
+	return def != nil && def.vital && poolDepleted(e, pool)
 }
 
 // isPlayer reports whether e is a player-controlled entity (the gate's "is this a PvP target?"
