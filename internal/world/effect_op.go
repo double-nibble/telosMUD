@@ -86,6 +86,15 @@ type effectCtx struct {
 	// A content formula reads it as `$depletion.overflow` / `.applied` / `.amount` (check.go); the zero
 	// value everywhere else makes a stray reference read 0 rather than an entity attribute.
 	depletion depletion
+	// sourcelessAmbient marks a ctx whose actor==target is an ARTIFACT of a sourceless ambient room field
+	// (landRoomAffectOn sets effSrc = occ when the field has no applier), NOT a genuine self-directed op.
+	// guardHarmful treats actor==target as self-harm (exempt from the spawn-protection window, #394) — the
+	// right rule for a player's own self-effect, but wrong for an ambient lava/gas field that should still
+	// honor a just-respawned occupant's window (#397 item 1). This flag lets the ENFORCEMENT side of the
+	// window fire even when actor==target, while the CANCELLATION side stays actor!=target-gated (an
+	// ambient field the victim did not summon must never drop the victim's own shield). false everywhere
+	// except the sourceless branch of landRoomAffectOn, so a real self-directed op is unaffected.
+	sourcelessAmbient bool
 	// reactACBonus is a TRANSIENT, swing-scoped defender-AC bump recorded by a to-hit REACTION (7.9,
 	// Shield: rx:modify("ac", +delta)). The swing pipeline (combat.go) sets it on this per-swing ctx
 	// from the reaction's "ac" delta BEFORE the to-hit check; resolveCheck (check.go) adds it to the
@@ -511,8 +520,12 @@ func guardHarmful(c *effectCtx, target *Entity) bool {
 	// refused cleanly (no partial effect). ACTOR-AGNOSTIC — a MOB attacker short-circuits pvpAllowed
 	// (pvp.go: mob->player is always allowed) BEFORE the safe-room veto, so this cannot live in the PvP
 	// policy; it sits here in the one in-op funnel, ahead of the mob-target no-op below. spawnProtected is
-	// false for a mob target, so mob targets still fall through to the PvE no-op. Self-harm is exempt.
-	if c.actor != target && c.z.spawnProtected(target) {
+	// false for a mob target, so mob targets still fall through to the PvE no-op. Self-harm is exempt —
+	// EXCEPT a sourceless ambient room field (#397 item 1), whose actor==target is only a gating artifact
+	// (landRoomAffectOn's effSrc=occ fallback): it still honors the target's window so a lava/gas field
+	// cannot damage a just-respawned occupant. The cancellation above stays actor!=target-gated, so an
+	// ambient field never drops the victim's own shield.
+	if (c.actor != target || c.sourcelessAmbient) && c.z.spawnProtected(target) {
 		c.z.log.Debug("spawn-protection: harmful op refused (respawn window)",
 			"actor", c.actor.short, "target", target.short, "until", target.living.protectedUntil)
 		if s, has := sessionOf(c.actor); has {
@@ -547,6 +560,14 @@ func guardHarmful(c *effectCtx, target *Entity) bool {
 func guardCrossPlayerWrite(c *effectCtx, target *Entity) bool {
 	if target == nil {
 		return false
+	}
+	// A sourceless ambient field (#397 item 1): actor==target is an ARTIFACT (effSrc=occ), not a genuine
+	// self-write, so it must NOT take the self-write exemption below — route it through guardHarmful so a
+	// modify_resource/dispel/remove_affect ambient tick honors a just-respawned occupant's spawn-protection
+	// window UNIFORMLY with a deal_damage field. guardHarmful returns true for an unprotected occupant
+	// (self/mob pass-through) and refuses only inside the window, without dropping the occupant's own shield.
+	if c.sourcelessAmbient {
+		return guardHarmful(c, target)
 	}
 	if target == c.actor || !isPlayer(target) {
 		// A self-write or a mob/ally write is not a cross-player harm vector — it proceeds ungated.
