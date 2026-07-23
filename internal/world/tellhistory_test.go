@@ -253,6 +253,43 @@ func TestTellHistoryBounded(t *testing.T) {
 	}
 }
 
+// TestTellHistoryOmitsRefusedSend is the #401 confirmed-echo fix: a tell to a NON-EXISTENT player is
+// refused by the publisher (resolve-miss) and never echoed, so it must NOT appear in the sender's ring
+// ("history == what the player saw"). Pre-fix the entry was captured optimistically at enqueue time and a
+// phantom "You told Ghost" line surfaced. A subsequent SUCCESSFUL tell is the sync barrier: its confirmed
+// record posts on the same FIFO publisher AFTER the refused one, so once it lands we know a record for the
+// refused tell would have landed too if the code ever emitted one.
+func TestTellHistoryOmitsRefusedSend(t *testing.T) {
+	core := commbus.NewMemBus()
+	t.Cleanup(func() { _ = core.Close() })
+	js := commbus.NewMemJetStream()
+	t.Cleanup(func() { _ = js.Close() })
+	dir := newFakeLocator("Alice", "Bob") // the directory does NOT know "Ghost"
+
+	z := tellShard(t, core.WorldHandle(), js, dir)
+	alice := joinTellPlayer(t, z, "Alice")
+	joinTellPlayer(t, z, "Bob")
+
+	// Alice tells a name the directory does not know -> resolve-miss, error to the sender, no echo/record.
+	z.post(inputMsg{id: "Alice", line: "tell Ghost boo"})
+	if !drainContains(t, alice, "There is no player by that name") {
+		t.Fatal("expected a resolve-miss error for an unknown target")
+	}
+	// A successful tell after it -> its confirmed record is the ordering barrier for the read below.
+	z.post(inputMsg{id: "Alice", line: "tell Bob hi"})
+	if !drainContains(t, alice, "You tell Bob, 'hi'") {
+		t.Fatal("sender was not echoed the successful tell")
+	}
+
+	out := runTells(t, z, alice)
+	if strings.Contains(out, "Ghost") {
+		t.Fatalf("a refused (resolve-miss) tell must NOT appear in history: %q", out)
+	}
+	if !strings.Contains(out, "You told Bob, 'hi'") {
+		t.Fatalf("the successful tell should be in history: %q", out)
+	}
+}
+
 // TestTellHistoryEmpty: `tells` with no history renders the friendly notice.
 func TestTellHistoryEmpty(t *testing.T) {
 	core := commbus.NewMemBus()

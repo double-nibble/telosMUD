@@ -84,6 +84,20 @@ type tellDeliverMsg struct {
 
 func (tellDeliverMsg) zoneMsg() {}
 
+// recordSentTellMsg carries a CONFIRMED sent tell from the off-zone publisher (publishOne) back TO the
+// sender's zone, which owns the sender's in-session tell ring (single-writer, #401 #349 follow-up). The
+// publisher posts it only past both failure returns, so it records exactly what the sender saw ("You tell
+// X" echoed). The handler drops it silently if the sender is no longer a resident here (walked/relogged —
+// the ring is transient and reset on relog anyway).
+type recordSentTellMsg struct {
+	playerID string    // the SENDER's player id (this zone's z.players key)
+	target   string    // the tell target's id/display name (the sender lacks its live entity)
+	body     string    // the sanitized tell body actually put on the wire
+	at       time.Time // confirmed-echo time
+}
+
+func (recordSentTellMsg) zoneMsg() {}
+
 // --- The sender side: the tell / reply commands -----------------------------------------------
 
 // cmdTell is the `tell <name> <msg>` source path. It resolves the target via the directory, sanitizes,
@@ -164,6 +178,18 @@ func (z *Zone) sendTell(s *session, targetName, body string) {
 	// sanitizer the channel + input paths use. The Seq is assigned LATER, in the FIFO publisher, so it
 	// is monotonic in publish order (the order the stream is appended).
 	clean := textsan.CleanLine(strings.TrimSpace(body))
+	// route follows the SENDER's current zone (the currentZone atomic pointer, else this zone for a bare
+	// test session) so the async publisher can post the CONFIRMED sent-tell back to the sender's ring —
+	// exactly the consumer-side route pattern (startTellConsumer). Captured on the zone goroutine.
+	curZone, startZone := s.currentZone, z
+	route := func() *Zone {
+		if curZone != nil {
+			if z := curZone.Load(); z != nil {
+				return z
+			}
+		}
+		return startZone
+	}
 	cs.enqueueTell(tellJob{
 		authorID:   s.character,
 		authorName: actor.Name(),
@@ -172,20 +198,15 @@ func (z *Zone) sendTell(s *session, targetName, body string) {
 		out:        s.out,
 		dir:        z.dir(),
 		log:        z.log,
+		route:      route,
 	})
 
-	// Capture the SENT side into the in-session tell ring (#349, tellhistory.go). This is OPTIMISTIC and
-	// captures at enqueue time, on the zone goroutine, BEFORE the async publisher (publishOne, comm.go) runs
-	// its directory existence check + echo. KNOWN DIVERGENCE (accepted for slice 1): on a resolve-miss
-	// ("no player by that name") or a publish failure ("tells temporarily offline"), publishOne shows the
-	// sender an ERROR and never emits the "You tell X" echo — yet this entry is already in the ring, so
-	// `tells` then shows a "You told X" line the sender never actually saw. It is the sender's OWN ring
-	// (no privacy leak), and the resolve-miss already reveals non-existence via the error, so the wart is
-	// cosmetic. The clean fix — record at publishOne's confirmed-echo point — needs the session/ring threaded
-	// onto tellJob and a post back to the zone goroutine (session state is zone-owned); deferred as a
-	// follow-up. The sender lacks the target's live *Entity, so the display name falls back to the
-	// (sanitized) target id, which is also what a successful live echo shows. Zone goroutine, single-writer.
-	s.recordTell(tellLogEntry{outbound: true, other: target, otherName: target, body: clean, at: time.Now()})
+	// The SENT side is captured into the in-session tell ring at publishOne's CONFIRMED-ECHO point (#401,
+	// comm.go), NOT here at enqueue time. Recording here would be OPTIMISTIC: on a resolve-miss ("no player
+	// by that name") or a publish failure the publisher shows the sender an ERROR and never emits the "You
+	// tell X" echo, yet an enqueue-time entry would already sit in the ring — a "You told X" line the sender
+	// never saw, violating "history == what the player saw". publishOne posts the record back to this zone
+	// (session state is zone-owned) only past both failure returns. Zone goroutine, single-writer.
 }
 
 // safeTellTarget sanitizes a player-supplied tell target into a token safe to use as BOTH a directory

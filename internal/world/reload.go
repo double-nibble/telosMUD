@@ -938,6 +938,13 @@ func (r *reloader) reloadChannel(inv contentbus.Invalidation) {
 	if !def.Found {
 		// The channel was deleted/renamed: remove it so its verb stops resolving.
 		reg.reload(inv.Ref, nil, true)
+		// Reap the channel's history ring (#401): the ring set is keyed by ref INDEPENDENTLY of the def
+		// registry, so a removed channel would otherwise leave an orphaned ring — unreachable (the history
+		// verb refuses a channel with no def) but pinning its buffered lines until shard restart. Off-zone,
+		// under chanHistory's own lock; a no-op when the channel had no ring.
+		if r.shard.chanHistory != nil {
+			r.shard.chanHistory.drop(inv.Ref)
+		}
 		r.log.Debug("hot reload: channel removed (definition deleted)", "ref", inv.Ref)
 		r.republishCommsToZones(inv.Ref) // a removed channel must drop live subscribers' subscriptions (#75)
 		return

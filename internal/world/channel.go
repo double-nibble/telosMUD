@@ -52,9 +52,14 @@ type channelDef struct {
 	words  []string // command verbs that emit on this channel (lower-cased, registered exact-only)
 	color  string   // color/markup token prepended to the rendered line (content; empty => none)
 	format string   // listener-perspective template ("[$channel] $name: $t"); empty => defaultChannelFormat
-	// history is the recent-lines buffer size (carried; retrieval deferred — P8-D3). When retrieval
-	// lands it MUST gate fetches on canHear (the split hear predicate) AT FETCH TIME — a player who
-	// lost hear access must not replay lines from when they had it.
+	// history is the recent-lines buffer size (carried; retrieval deferred — P8-D3). The history verb
+	// gates fetches on canHear (the split hear predicate) AT FETCH TIME — a player who lost hear access
+	// must not replay lines from when they had it (P8-D3, TIGHTENING is protected). CONTENT FOOTGUN (#401):
+	// because the gate reflects CURRENT policy, a hot reload that LOOSENS hear_access (restricted -> open)
+	// retroactively exposes previously-restricted buffered lines to newly-qualifying readers. This is
+	// consistent with the "live canHear at fetch time" model, but an author loosening a channel's hearing
+	// should treat the existing scrollback as now-visible. A reload that REMOVES the channel reaps its ring
+	// (reload.go), so only a loosening EDIT carries this exposure.
 	history   int
 	defaultOn bool // is a fresh character subscribed by default (drives the hear-set vs a toggle, 8.6)
 

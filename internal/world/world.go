@@ -622,6 +622,15 @@ func (s *Shard) CheckHandoffAuth() error {
 	return nil
 }
 
+// isMultiShard reports whether this shard is part of a multi-shard fleet — i.e. it can discover other
+// shards (a directory) or dial them (a peer handoff dialer). It is the SAME signal CheckHandoffAuth keys
+// off: s.dir is primary (directory discoverability = another shard can route to us), s.peers is belt-and-
+// suspenders (we can dial out). A single-shard/bare run (both nil) returns false. Used to decide whether a
+// shard-local read (e.g. channel history, #401) is potentially partial and should carry an in-band caveat.
+func (s *Shard) isMultiShard() bool {
+	return s != nil && (s.dir != nil || s.peers != nil)
+}
+
 // Default single-session lock timing (Phase 14.4): the key lives DefaultLockTTL (a crash self-clears after
 // it) and is heartbeated every DefaultLockRenew (also the takeover-detection latency).
 const (

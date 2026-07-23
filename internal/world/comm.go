@@ -85,6 +85,11 @@ type tellJob struct {
 	out        chan *playv1.ServerFrame
 	dir        Locator
 	log        *slog.Logger
+	// route resolves the zone CURRENTLY hosting the SENDER (via the session's currentZone atomic pointer),
+	// so publishOne can post the confirmed sent-tell back to the sender's zone for the in-session ring
+	// (#401 #349 follow-up). nil for a bare/legacy job; the record is skipped when nil or when the sender
+	// has since left (the zone no longer has them in z.players). Mirrors the consumer-side route func.
+	route func() *Zone
 }
 
 // newCommSource builds a disabled comms source (a no-op RoleWorld bus). WithComms swaps in a live bus.
@@ -316,6 +321,13 @@ func (z *Zone) dir() Locator {
 	return z.shard.dir
 }
 
+// isMultiShard reports whether this zone's shard is part of a multi-shard fleet (Shard.isMultiShard). A
+// bare/storeless zone (no shard) is single-shard by definition. Used by cmdHistory to decide whether the
+// shard-local channel-history ring is potentially partial and should carry the in-band footer (#401).
+func (z *Zone) isMultiShard() bool {
+	return z.shard != nil && z.shard.isMultiShard()
+}
+
 // routeTellDeliver posts one drained durable tell to the resident's CURRENT zone (resolved via the
 // route func, which Loads the session's currentZone atomic pointer) and blocks for the ack result. It
 // runs on a bus consumer goroutine (NOT a zone goroutine), so it reaches the zone only via the inbox —
@@ -420,6 +432,19 @@ func (c *commSource) publishOne(ctx context.Context, j tellJob) {
 		}
 		writeFrameTo(j.out, textFrame("Tells are temporarily offline."))
 		return
+	}
+	// CONFIRMED-ECHO capture of the SENT side into the sender's in-session ring (#401 #349 follow-up). This
+	// is the point past BOTH failure returns (resolve-miss, publish-failure), so the history now records
+	// exactly what the sender saw — "history == what the player saw". The ring is zone-owned session state,
+	// and we are off the zone goroutine here, so we POST it back to the sender's current zone (never touch
+	// the session directly). Posted BEFORE the echo write so the record is enqueued ahead of any command the
+	// sender issues in reaction to the echo (FIFO inbox) — no lost-update race on the sender's own `tells`.
+	// Best-effort (postOrDrop): a wedged/gone sender zone drops the cosmetic entry rather than stalling the
+	// FIFO publisher for every other sender — the transient-ring posture (it does not survive relog anyway).
+	if j.route != nil {
+		if z := j.route(); z != nil {
+			z.postOrDrop(recordSentTellMsg{playerID: j.authorID, target: j.target, body: j.body, at: time.Now()})
+		}
 	}
 	writeFrameTo(j.out, textFrame("You tell "+j.target+", '"+j.body+"'"))
 	if j.log != nil {
