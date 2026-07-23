@@ -35,3 +35,32 @@ resources:
             - {op: act, to: actor, target: other, text: "$N tries to flee — you lunge with an opportunity attack!"}
             - {op: deal_damage, target: other, type: slash, dice_num: 1, dice_size: 6, bonus: ["attr", "$actor.strength_bonus"]}
 
+  # --- sanity: the #408 exemplar. A NON-VITAL secondary pool, and non-vital is the whole point (#406):
+  # at 0 the character is PERMANENTLY BROKEN, not dead. Marking it `vital` would make it lethal under
+  # #71's any-vital-lethal policy, which is the wrong outcome for every system that models a mind.
+  #
+  # It is INERT for the existing world: max_sanity derives from `pow`, whose default base is 0, so every
+  # pre-existing player and mob has no capacity here and is immune to horror damage by construction.
+  #
+  # regen 0: sanity does NOT come back on its own — recovery is an authored act, which is the d100-family
+  # rule and also keeps the pool from silently healing out of the `insane` state.
+  - ref: sanity
+    display_name: Sanity
+    max_attr: max_sanity
+    vital: false
+    regen: 0
+    gauge: true
+    # THE #406 SURFACE: a non-vital pool bottoming out runs its OWN op-list and never reaches die().
+    # The hook is LEVEL-triggered — every blow that leaves the pool at 0 runs it — so the first op is the
+    # content-side idempotency guard the DTO doc prescribes: narrate and apply once, then stay quiet.
+    # Note what is NOT here: any rewarding op. A pool held at 0 can be hit on purpose, so a grant in this
+    # list would be farmable (lintDepletionHookGrants warns if you try).
+    on_depleted:
+      - op: if
+        has_affect: insane
+        then:
+          - {op: send, text: "The dark tide closes over what is left of you."}
+        else:
+          - {op: act, to: room, text: "$n's eyes go flat and empty. Something behind them has stopped."}
+          - {op: send, text: "You can no longer hold the shape of the world in your head."}
+          - {op: apply_affect, affect: insane, harmful: true}

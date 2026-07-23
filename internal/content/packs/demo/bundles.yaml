@@ -22,6 +22,20 @@ bundles:
     grants:
       - {op: modify_attribute_base, attr: intellect, amount: 3}
       - {op: set_flag, flag: arcane}
+  # investigator: the OPT-IN into the #408 Sanity subsystem — the other half of the isolation lever.
+  # `pow` defaults to 0, so nothing in the world has a mind to lose until content raises it; this is that
+  # content. modify_attribute_base is a PERSISTED grant (Phase 11.1), so taking it durably lifts pow 0 -> 4,
+  # which derives max_sanity 20 and moves the character out of the natural-immunity discard. It also grants
+  # `steady`, because a pool with regen 0 needs an authored way back.
+  #
+  # kind `path`, NOT `class`: the chargen picker selects by kind, and this is an opt-in a character acquires
+  # in play (a quest, a threshold room, a trainer), not a third starting class next to fighter and mage.
+  - ref: investigator
+    kind: path
+    grants:
+      - {op: modify_attribute_base, attr: pow, amount: 4}
+      - {op: grant_ability, ability: steady}
+      - {op: set_flag, flag: sanity_bearer}
       - {op: grant_track, track: hero_advancement}
   # leatherworking: a PROFESSION bundle (Phase 13.3, fork #2 — a profession is just a bundle, not a new def
   # table). Learning it grants the craft verb (grant_ability), the use-based skill track (grant_track), and

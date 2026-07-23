@@ -140,6 +140,41 @@ affects:
       duration: 16
       prevents: [verbal]
 
+  # insane: what a SANITY break leaves behind (#408). It is the consequence of a NON-vital pool bottoming
+  # out (#406) — the whole point being that the character is broken, not dead.
+  #
+  # stacking `ignore` is load-bearing, not taste: the depletion hook is LEVEL-triggered, so every further
+  # blow to a pool sitting at 0 re-enters the hook. `ignore` (first wins) means re-application is a no-op
+  # rather than an endlessly refreshed duration; the hook's own `if has_affect` guard stops the narration
+  # repeating. Those two together are what make a level-triggered hook safe to author.
+  #
+  # stack_scope: target is equally load-bearing, and for a reason worth internalising: an affect instance is
+  # keyed by (ref, SOURCE) by default, but a CONDITION belongs to the sufferer, not to whoever caused it.
+  # Without `target` this affect would (a) stack once per distinct source rather than once per victim,
+  # (b) be uncurable by anyone except the entity that caused it — a cleric's `remove_affect: insane` looks
+  # up (insane, cleric) and silently misses — and (c) become uncurable by ANYONE after a relog, because a
+  # persisted affect re-attaches with no source at all.
+  #
+  # prevents [verbal]: a broken mind cannot form a spell. Movement and melee are deliberately left alone,
+  # so a companion can still drag the character to safety — incapacitated, not paralysed.
+  #
+  # DURATION is a real 400 pulses, not "permanent": the engine has no permanent affect (remaining decrements
+  # every tick), and a player respawn STRIPS this one anyway — it fails the benign-affect whitelist (#318)
+  # on both its negative modifier and its `prevents`, and respawn refills sanity besides. So death is a
+  # complete cure, deliberately: the alternative would be a condition a player cannot escape at all. The
+  # name says Shaken rather than anything permanent so the fiction matches the mechanics.
+  - ref: insane
+    name: Shaken to the Core
+    category: madness
+    stacking: ignore
+    stack_scope: target
+    dispellable: false
+    body:
+      duration: 400
+      prevents: [verbal]
+      modifiers:
+        - {attr: accuracy, op: add, value: -4}
+
 # Abilities (skills/spells, docs/ABILITIES.md §2). The engine provides the lifecycle + the effect-op
 # vocabulary; THIS data is the whole skill — the engine has never heard of "fireball". Adding one is a
 # content write, zero engine changes.

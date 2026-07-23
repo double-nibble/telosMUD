@@ -483,9 +483,20 @@ func (z *Zone) respawnPlayer(victim *Entity) {
 	// trap in it: a player who wants a condition to survive death gets it from an affect, not from a pool
 	// the engine silently refuses to refill. Content that wants a pool to persist through death can re-empty
 	// it from the death hook, which is explicit and visible.
+	//
+	// The max > 0 guard is NOT cosmetic (the same guard topUpReactions uses, combat.go). Without it, a
+	// player with no capacity in a pool gets a stored 0 written on every death — and a STORED 0 is not the
+	// same as an absent key: resourceCurrent reads an absent pool as FULL and a stored 0 as empty. So a
+	// character who died before their content granted them capacity in an opt-in pool (a `sanity` track
+	// whose cap derives from an attribute defaulting to 0) would come back holding a durable, persisted 0,
+	// and the moment that capacity arrived they would read permanently empty on it — broken by the first
+	// point of damage instead of starting full. Writing nothing keeps the absent-reads-as-full path intact.
 	for ref, def := range z.resourceDefs().table() {
-		if def != nil {
-			setResourceCurrent(victim, ref, resourceMax(victim, ref))
+		if def == nil {
+			continue
+		}
+		if m := resourceMax(victim, ref); m > 0 {
+			setResourceCurrent(victim, ref, m)
 		}
 	}
 	setPosition(victim, posStanding)

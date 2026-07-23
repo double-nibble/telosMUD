@@ -123,11 +123,13 @@ func TestEmbeddedDemoPackLoads(t *testing.T) {
 		t.Fatalf("hero_advancement steps = %d, want 3 (one grant op-list per threshold)", len(tr.Steps))
 	}
 
-	// Bundles (Phase 11.4b): classes fighter+mage, races elf+dwarf, the leatherworking profession, and the
-	// uncapped foraging gathering profession (#55) — each a kind + a grant op-list. Pack globals, loaded onto
-	// lc.Bundles. (mage+dwarf were added in 14.8 to give the chargen picker a real choice.)
-	if len(lc.Bundles) != 6 {
-		t.Fatalf("bundles = %d, want 6 (fighter + mage + elf + dwarf + leatherworking + foraging)", len(lc.Bundles))
+	// Bundles (Phase 11.4b): classes fighter+mage, races elf+dwarf, the leatherworking profession, the
+	// uncapped foraging gathering profession (#55), and the `investigator` PATH (#408 — the opt-in that
+	// raises `pow` and so gives a character a sanity pool at all) — each a kind + a grant op-list. Pack
+	// globals, loaded onto lc.Bundles. (mage+dwarf were added in 14.8 to give the chargen picker a real
+	// choice; investigator is deliberately kind `path`, not `class`, so it does NOT join that picker.)
+	if len(lc.Bundles) != 7 {
+		t.Fatalf("bundles = %d, want 7 (fighter + mage + elf + dwarf + leatherworking + foraging + investigator)", len(lc.Bundles))
 	}
 	var fighter, foraging *BundleDTO
 	for i := range lc.Bundles {

@@ -90,7 +90,35 @@ zones:
             soak_slash: 3
             aggressive: 1
             max_reactions: 1
+      # a whispering shade — the #408 exemplar's horror source, and the in-world proof that #405 routing
+      # holds for a SWING. Its natural weapon's damage_type is `horror`, and `horror` declares
+      # target_resource: sanity (damage_types.yaml) — so its blows land on a victim's SANITY without the
+      # weapon, the mob or the swing pipeline naming a resource anywhere. That is the whole point of routing
+      # by type: a swing carries a damage type and never a resource, so before #405 this mob was unbuildable.
+      #
+      # Against anything with no mind (pow 0 — every other creature and every un-granted player) the engine
+      # DISCARDS its blows entirely as natural immunity, so adding it to the crypt cannot hurt existing
+      # content. The shade itself has pow 0: it has no mind of its own to lose.
+      - ref: crypt:mob:shade
+        keywords: [shade, whispering, whisper]
+        short: a whispering shade
+        long: A shade coils in the dark, whispering things you will not be able to unhear.
+        weapon: {dice_num: 1, dice_size: 4, damage_type: horror, class: unarmed, attack_verb: whisper}
+        living:
+          combat_profile: melee
+          attributes:
+            strength: 8
+            constitution: 3
+            level: 1
+            accuracy: 4
+            damroll: 0
+            attacks: 1
+            evasion: 10
+            dodge: 10
+            parry: 0
+            block: 0
     resets:
       - {op: spawn_mob, proto: crypt:mob:skeleton, room: crypt:room:ossuary, count: 1}
       - {op: spawn_item, proto: crypt:obj:bone-blade, into: crypt:mob:skeleton, room: crypt:room:ossuary, count: 1}
       - {op: spawn_mob, proto: crypt:mob:tomb-guardian, room: crypt:room:tomb, count: 1}
+      - {op: spawn_mob, proto: crypt:mob:shade, room: crypt:room:ossuary, count: 1}
