@@ -122,11 +122,88 @@ func TestRoutedTypeIsSafeForExistingContent(t *testing.T) {
 	before := resourceCurrent(rat, "hp")
 
 	for i := 0; i < 5; i++ {
-		dealTo(z, s.entity, rat, 100, "psychic", "")
+		// Assert the RETURN, not just the aftermath. Under the naive discard (`resource != ""`) the blow is
+		// not discarded at all: it reports its full damage and writes a phantom current — the hp and
+		// not-dead assertions below both still hold, so without this line the test is false-green and passes
+		// the very implementation it exists to reject.
+		require.Zero(t, dealTo(z, s.entity, rat, 100, "psychic", ""),
+			"blow %d must be DISCARDED, not merely harmless", i)
 	}
 
 	require.Equal(t, before, resourceCurrent(rat, "hp"), "a pre-existing mob must be untouched by a routed damage kind")
 	require.NotEqual(t, posDead, position(rat), "and certainly must not die of it")
+	_, stored := rat.living.resCur["sanity"]
+	require.False(t, stored, "a phantom current was written on a mob that has no such track")
+	require.False(t, entityHasResource(rat, "sanity"), "the mob was silently subscribed to that resource's handlers")
+}
+
+// TestCapacityLostMidBlowIsStillDiscarded closes the TOCTOU the security review found. The discard reads
+// the pool's max BEFORE applyDamageReaction and the write happens AFTER, so a reaction that drops the routed
+// pool's derived max to 0 mid-blow ("shatter its mind, then the psychic hit has nothing to land on" — a
+// perfectly natural thing to author) leaves the earlier check stale.
+//
+// Without the re-check the blow stores a current on a pool with NO capacity, and that is worse than it
+// sounds: setResourceCurrent only clamps the TOP end when max > 0, so the pool stores and reads back a
+// POSITIVE value at max 0 — and once anything is stored, resourceCurrent's "absent reads as full" is gone
+// for good. When capacity returns the entity reads permanently empty, and on a VITAL pool the next point of
+// damage kills. The TOCTOU predates #405 (an op-level route reaches it identically), but #405 takes the
+// exposed traffic from "ops an author deliberately wrote" to every blow carrying a routed type.
+func TestCapacityLostMidBlowIsStillDiscarded(t *testing.T) {
+	z, s := combatZone(t)
+	registerPool(z, "sanity", "max_sanity", 100, nil, false)
+	registerRoutedType(z, "psychic", "sanity")
+	// An affect that zeroes the pool's derived max, applied by an OnDamageTaken reaction — i.e. AFTER the
+	// discard check and BEFORE the write.
+	z.defs.affect.register("mindless", &affectDef{
+		ref: "mindless", stacking: stackIgnore, maxStacks: 1, duration: 100,
+		modifiers: []affectModifier{{attr: "max_sanity", add: true, value: -100}},
+	})
+	z.defs.res.register("shell", &resourceDef{
+		ref: "shell", maxAttr: "max_hp",
+		onEvent: map[eventKind][]effectOp{
+			evOnDamageTaken: {{kind: "apply_affect", affect: "mindless", tgt: "self"}},
+		},
+	})
+
+	mob := combatMob(z, s.entity, "brittle", "", 100)
+	setResourceCurrent(mob, "sanity", 100)
+
+	dealTo(z, s.entity, mob, 30, "psychic", "")
+
+	require.Zero(t, resourceMax(mob, "sanity"), "precondition: the handler must actually have zeroed the max")
+	// The property asserted is the READ, not the store, and that is deliberate: the handler can zero the max
+	// EITHER side of the write (a reaction runs before it, an event handler after), so no pre-write check
+	// can cover both. What must hold either way is that a pool with no capacity reads as holding nothing.
+	require.Zero(t, resourceCurrent(mob, "sanity"),
+		"a pool with NO capacity read back a positive current — the invariant the routing/immunity story rests on")
+	require.False(t, poolDepleted(mob, "sanity"), "and it is not 'depleted' either — it simply has no track")
+}
+
+// TestCapacityRestoredAfterAMaxDropKeepsWhatItHeld is the other half of the accessor rule, and the reason
+// the fix is a read-time floor rather than deleting the stored value. A TEMPORARY max-0 debuff must not be a
+// free refill: when capacity comes back the pool holds what it held before, not full. (Deleting on write
+// would have made every such debuff a full restore, which is a neat exploit: drop your own max to 0, let it
+// lapse, come back topped up.)
+func TestCapacityRestoredAfterAMaxDropKeepsWhatItHeld(t *testing.T) {
+	z, s := combatZone(t)
+	z.defs.attr.register("max_sanity", &attributeDef{ref: "max_sanity", base: litNode{v: 100}})
+	z.defs.res.register("sanity", &resourceDef{ref: "sanity", maxAttr: "max_sanity"})
+	z.defs.affect.register("mindless", &affectDef{
+		ref: "mindless", stacking: stackIgnore, maxStacks: 1, duration: 100,
+		modifiers: []affectModifier{{attr: "max_sanity", add: true, value: -100}},
+	})
+
+	mob := combatMob(z, s.entity, "scholar", "", 100)
+	setResourceCurrent(mob, "sanity", 60)
+
+	inst := applyAffect(mob, "mindless", attachOpts{}, nil)
+	require.NotNil(t, inst, "precondition: the debuff attached")
+	require.Zero(t, resourceCurrent(mob, "sanity"), "while capacity is 0 the pool reads as holding nothing")
+
+	affectedComponent(mob).expire(mob, inst, nil)
+	require.Equal(t, 100, resourceMax(mob, "sanity"), "precondition: capacity is back")
+	require.Equal(t, 60, resourceCurrent(mob, "sanity"),
+		"the pool must hold what it held — a temporary max-0 debuff is not a free refill")
 }
 
 // --- The routing reaches damage the PACK DID NOT AUTHOR ------------------------------------------
@@ -242,6 +319,59 @@ func TestLintDealDamageTypes(t *testing.T) {
 
 	require.Len(t, got, 1, "expected exactly the typo'd type: %+v", got)
 	require.Equal(t, "psychick", got[0].dmgType)
+}
+
+// --- A broken route is REJECTED by reload, not merely logged -------------------------------------
+
+// TestReloadRejectsAnUnusableRoute pins the finding as a CONTROL rather than a log line. The route lint is
+// ERROR severity because of blast radius — a target_resource naming a pool that cannot receive damage sends
+// every blow of that kind into the immunity discard, so the whole damage kind silently does nothing against
+// every target, including damage authored by other packs. A boot-time slog.Error does not stop anything: a
+// staff `reload` would happily install it. Both ways to be unusable are covered, because they have the
+// identical effect at runtime.
+func TestReloadRejectsAnUnusableRoute(t *testing.T) {
+	tests := []struct {
+		name     string
+		resource content.ResourceDTO
+		route    string
+		reject   bool
+		why      string
+	}{
+		{
+			"unregistered pool",
+			content.ResourceDTO{Ref: "sanity", MaxAttr: "max_sanity"},
+			"santiy", true,
+			"the obvious typo: the ref resolves to nothing",
+		},
+		{
+			"pool with no max_attr",
+			content.ResourceDTO{Ref: "sanity"},
+			"sanity", true,
+			"the silent twin: a registered pool with no cap has max 0 forever, so every blow is discarded",
+		},
+		{
+			"usable pool",
+			content.ResourceDTO{Ref: "sanity", MaxAttr: "max_sanity"},
+			"sanity", false,
+			"a correct route must not be rejected — a lint that cries wolf is worse than none",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pk := content.Pack{
+				Pack:        "horror",
+				Resources:   []content.ResourceDTO{tc.resource},
+				DamageTypes: []content.DamageTypeDTO{{Ref: "psychic", TargetResource: tc.route}},
+			}
+			problems := validatePacks([]content.Pack{pk}, map[string]bool{"horror": true})
+			if tc.reject {
+				require.NotEmpty(t, problems, "reload must REJECT this pack: %s", tc.why)
+				require.Contains(t, problems[0], "psychic", "the problem must name the offending damage type")
+			} else {
+				require.Empty(t, problems, "%s", tc.why)
+			}
+		})
+	}
 }
 
 // --- The content pipeline: target_resource survives the DTO -> runtime trip -----------------------

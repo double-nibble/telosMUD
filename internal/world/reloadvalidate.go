@@ -303,6 +303,42 @@ func sharedDefProblems(s *reloadScope) []string {
 			problems = append(problems, fmt.Sprintf("attribute cycle: %v", cycle))
 		}
 	}
+	// Damage-type ROUTES (#405). A `target_resource` naming a pool that cannot receive damage (unregistered,
+	// or registered with no max_attr so its cap is always 0) sends EVERY blow of that damage kind into the
+	// immunity discard — the whole kind silently does nothing, against every target, including damage
+	// authored by other packs. That is reject-severity by blast radius, and a boot-time slog.Error alone is
+	// not a control: without this a staff `reload` would happily install it. Same last-writer discipline as
+	// attributes (an overridden earlier copy is inert), and rejectable only when an IN-SCOPE pack is the
+	// live writer; the RESOURCE side is read from the full merged set, because the pool a route needs may
+	// legitimately be declared by a pack that is not being reloaded.
+	resolvable := map[string]bool{}
+	for i := range full {
+		for _, r := range full[i].Resources {
+			resolvable[r.Ref] = strings.TrimSpace(r.MaxAttr) != ""
+		}
+	}
+	dmgOwner := map[string]string{}
+	for i := range full {
+		for _, dt := range full[i].DamageTypes {
+			dmgOwner[dt.Ref] = full[i].Pack
+		}
+	}
+	for i := range full {
+		pk := &full[i]
+		if !s.inScope(pk.Pack) {
+			continue
+		}
+		for _, dt := range pk.DamageTypes {
+			if dt.TargetResource == "" || dmgOwner[dt.Ref] != pk.Pack {
+				continue
+			}
+			if !resolvable[dt.TargetResource] {
+				problems = append(problems, fmt.Sprintf(
+					"damage type %q routes to resource %q, which is not usable as a damage pool (unregistered, or no max_attr): every blow of this damage kind would be discarded",
+					dt.Ref, dt.TargetResource))
+			}
+		}
+	}
 	// Channels hot-swap through their OWN KindChannel path, which never reads the content snapshot.
 	problems = append(problems, validateChannels(s)...)
 	// Trust ladder (#111): a baseline tier granting a capability elevates every un-elevated account on next

@@ -280,6 +280,19 @@ func Merge(packs []Pack) *LoadedContent {
 		}
 		for _, d := range p.DamageTypes {
 			if idx, ok := dmgIdx[d.Ref]; ok {
+				// A later pack RE-AIMING an existing damage type is the loudest thing that can happen in this
+				// merge (#405). Damage types are a global last-write-wins namespace and the swing path carries a
+				// weapon's TYPE but never a resource, so one line restating a common type — `{ref: slash,
+				// target_resource: <pool>}` — silently re-aims every melee blow in the world, at a pool most
+				// creatures have no capacity in (which makes them immune) or at an engine-economy pool. The
+				// route CHANGE is the dangerous edit; adding a route to a type nobody else defined is normal
+				// authoring, and a same-route restatement (a pack re-declaring a type to tweak its color) is
+				// noise. WARN only on a genuine re-aim, naming both packs so an operator can tell who did it.
+				if prev := lc.DamageTypes[idx]; prev.TargetResource != d.TargetResource {
+					slog.Warn("content load: a later pack RE-AIMED an existing damage type's target_resource — every blow of this kind now lands on a different pool, including damage authored by other packs",
+						"damage_type", d.Ref, "pack", p.Pack,
+						"was", prev.TargetResource, "now", d.TargetResource)
+				}
 				lc.DamageTypes[idx] = d
 			} else {
 				dmgIdx[d.Ref] = len(lc.DamageTypes)

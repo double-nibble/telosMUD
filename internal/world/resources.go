@@ -37,6 +37,18 @@ func resourceCurrent(e *Entity, name string) int {
 		// No explicit current yet: full when a max is known, else 0 (contentless).
 		return maxV
 	}
+	// NO CAPACITY READS AS NOTHING. A pool whose def declares a cap (max_attr) that currently derives to
+	// <= 0 holds nothing, whatever happens to be stored. Without this the top-end clamp below is skipped
+	// for max <= 0 and the pool reads back a POSITIVE current at max 0 — which quietly falsifies the
+	// invariant the whole routing/immunity story rests on ("max <= 0 means the entity has no such track").
+	// It is reachable without any routing: a legitimate write lands while the pool has capacity, then an
+	// OnDamageTaken/OnHit handler or an expiring buff drops the derived max to 0 underneath it.
+	//
+	// Deliberately gated on maxAttr != "": a pool that declares NO cap is unbounded by design (resourceMax
+	// reports 0 for it), and must keep reporting whatever it holds.
+	if maxV <= 0 && declaresCap(e, name) {
+		return 0
+	}
 	if maxV > 0 && cur > maxV {
 		return maxV
 	}
@@ -44,6 +56,17 @@ func resourceCurrent(e *Entity, name string) int {
 		return 0
 	}
 	return cur
+}
+
+// declaresCap reports whether resource `name` is content-defined WITH a cap (a max_attr). It separates
+// "capped, and the cap currently derives to 0" (no capacity — reads as empty) from "declares no cap at
+// all" (unbounded — reads whatever it holds). Zone-goroutine read.
+func declaresCap(e *Entity, name string) bool {
+	if e == nil || e.zone == nil {
+		return false
+	}
+	def := e.zone.resourceDefs().get(name)
+	return def != nil && def.maxAttr != ""
 }
 
 // setResourceCurrent stores a resource's current, clamped into [0, max]. The CANONICAL stored value

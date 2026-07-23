@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/double-nibble/telosmud/internal/content"
+	"github.com/double-nibble/telosmud/internal/logcap"
 )
 
 // build.go is the content loader's world-side half (docs/PHASE4-PLAN.md §3): it takes the
@@ -305,8 +306,8 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	// max<=0 immunity discard, so the whole damage kind quietly does nothing, everywhere, forever. ERROR,
 	// not WARN, for that reason.
 	for _, m := range lintDamageTypeResources(d) {
-		slog.Error("content: damage_type.target_resource does not name a registered resource — EVERY blow of this damage kind will be discarded",
-			"damage_type", m.dmgType, "resource", m.resource)
+		slog.Error("content: damage_type.target_resource does not name a usable resource (unregistered, or no max_attr so its cap is always 0) — EVERY blow of this damage kind will be discarded",
+			"damage_type", logcap.Value(m.dmgType), "resource", logcap.Value(m.resource))
 	}
 	// Load-time content-lint (#405 companion): a deal_damage op's `type` must name a registered damage type.
 	// Nothing validated it before, because the only consumer (mitigate) no-ops silently on an unknown type.
@@ -315,7 +316,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	// mode the routing feature creates, so it gets its own lint.
 	for _, m := range lintDealDamageTypes(d) {
 		slog.Warn("content: deal_damage.type does not name a registered damage_type (no resist matrix, and no #405 pool routing)",
-			"owner", m.owner, "type", m.dmgType)
+			"owner", m.owner, "type", logcap.Value(m.dmgType))
 	}
 	// Load-time content-lint (#406): a NON-VITAL resource's on_depleted is FARMABLE if it rewards. Unlike the
 	// vital/death hook — latched to an actual kill by posDead, and for a mob followed by extraction — a
@@ -456,7 +457,10 @@ func lintDamageTypeResources(d *defRegistries) []damageTypeResourceMiss {
 		if def == nil || def.targetResource == "" {
 			continue
 		}
-		if d.res.get(def.targetResource) == nil {
+		// BOTH ways to get the blast radius, not just one. An UNREGISTERED resource is the obvious typo; a
+		// registered resource with NO max_attr is the silent twin — resourceMax is then always 0, so every
+		// blow of this kind is discarded against every target, everywhere, exactly as if the ref were wrong.
+		if rd := d.res.get(def.targetResource); rd == nil || rd.maxAttr == "" {
 			misses = append(misses, damageTypeResourceMiss{dmgType: ref, resource: def.targetResource})
 		}
 	}
