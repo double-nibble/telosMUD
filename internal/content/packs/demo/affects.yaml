@@ -140,6 +140,27 @@ affects:
       duration: 16
       prevents: [verbal]
 
+  # insane: what a SANITY break leaves behind (#408). It is the consequence of a NON-vital pool bottoming
+  # out (#406) — the whole point being that the character is broken, not dead.
+  #
+  # stacking `ignore` is load-bearing, not taste: the depletion hook is LEVEL-triggered, so every further
+  # blow to a pool sitting at 0 re-enters the hook. `ignore` (first wins) means re-application is a no-op
+  # rather than an endlessly refreshed duration; the hook's own `if has_affect` guard stops the narration
+  # repeating. Those two together are what make a level-triggered hook safe to author.
+  #
+  # prevents [verbal]: a broken mind cannot form a spell. Movement and melee are deliberately left alone,
+  # so a companion can still drag the character to safety — incapacitated, not paralysed.
+  - ref: insane
+    name: Irretrievably Mad
+    category: madness
+    stacking: ignore
+    dispellable: false
+    body:
+      duration: 200
+      prevents: [verbal]
+      modifiers:
+        - {attr: accuracy, op: add, value: -4}
+
 # Abilities (skills/spells, docs/ABILITIES.md §2). The engine provides the lifecycle + the effect-op
 # vocabulary; THIS data is the whole skill — the engine has never heard of "fireball". Adding one is a
 # content write, zero engine changes.

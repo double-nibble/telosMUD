@@ -76,6 +76,22 @@ attributes:
   # creature whose content grants reactions gets the OnLeaveRoom opportunity attack. The engine names no
   # "reactions"; it reads this attribute as the resource cap, exactly like max_hp caps hp.
   - {ref: max_reactions, display_name: Max Reactions, value_kind: int, default_base: {lit: 0}}
+  # --- The SANITY exemplar (#408): a secondary, NON-VITAL pool proving the multi-vital family end to end.
+  #
+  # pow is the isolation lever, and it is the SAME pattern max_reactions above uses: default 0, so every
+  # pre-existing player and mob derives max_sanity 0 and therefore has NO capacity in the sanity pool. The
+  # engine reads that as natural immunity — a horror-typed blow at a creature with no mind is DISCARDED
+  # before mitigation and threat (#405) — so adding this pool to a shared pack cannot touch anything that
+  # was already here. Only content that explicitly raises pow has a mind to lose.
+  - {ref: pow, display_name: Resolve, value_kind: int, default_base: {lit: 0}, min: 0, stat: true}
+  # max_sanity = pow * 5, the d100-family convention. Derived, so anything that raises pow — a bundle
+  # grant, a blessing affect — lifts the cap through the ordinary derivation stack.
+  - ref: max_sanity
+    display_name: Maximum Sanity
+    value_kind: derived
+    default_base:
+      expr: ["*", ["attr", pow], 5]
+    min: 0
   # Saving-throw attributes ([G2]/[G12]): a target's DEX save bonus and a caster's spell save DC. These
   # are what a per-target `check` save (a fireball's save-for-half) reads — `$target.dex_save` vs
   # `$source.spell_dc`. The engine names neither; the check spec authored on the spell reads them.

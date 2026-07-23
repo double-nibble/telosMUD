@@ -16,6 +16,13 @@ damage_types:
   # def rather than a free-form string: since #405 a type can carry a `target_resource`, so an op naming an
   # unregistered type silently loses any routing as well as its matrix, and lintDealDamageTypes flags it.
   - {ref: poison, display_name: Poison, color: green}
+  # horror: the #405 exemplar. Damage of THIS KIND routes to the sanity pool automatically, so every
+  # source of it — a mob's gaze, a DoT tick, a cursed item, another pack's psychic spell — lands on
+  # sanity without repeating `resource: sanity` on every op, and CANNOT silently land on hp.
+  #
+  # A NEW type, never a retrofit: adding target_resource to an EXISTING type would re-aim every already
+  # authored blow of that kind away from the pool it has always hit.
+  - {ref: horror, display_name: Horror, color: magenta, target_resource: sanity, resist: {horror: 1.0}}
 
 # Affects (status effects, docs/ABILITIES.md §5). The engine's Affected runtime (Phase 5.2) owns their
 # duration/stacking/tick/expire and feeds modifiers into derivation + prevents into the tag-CC gate.

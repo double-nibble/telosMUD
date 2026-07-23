@@ -59,6 +59,16 @@ func gmcpFrame(pkg string, payload []byte) *playv1.ServerFrame {
 func (z *Zone) charVitalsJSON(e *Entity) []byte {
 	m := make(map[string]int)
 	for _, ref := range z.hudResourceRefs() {
+		// Skip a pool this entity has NO capacity in, exactly as vitalsPrompt does (vitals.go). The two
+		// surfaces are the same question asked twice — "what is player-visible" — and they disagreed: the
+		// prompt filtered, this did not. That was invisible while every pack's gauged pools had a positive
+		// cap for everyone, and stops being invisible the moment a pack ships an OPT-IN pool (a `sanity`
+		// track whose cap derives from an attribute defaulting to 0, so only some characters have one).
+		// Without this, every client on the shard receives `"sanity":0,"maxsanity":0` for a pool its
+		// character does not have and the prompt correctly refuses to show.
+		if resourceMax(e, ref) <= 0 {
+			continue
+		}
 		m[ref] = resourceCurrent(e, ref)
 		m["max"+ref] = resourceMax(e, ref)
 	}
