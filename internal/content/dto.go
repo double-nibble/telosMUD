@@ -700,7 +700,8 @@ type FormulaNodeDTO = any
 
 // ResourceDTO is one content-defined resource pool (docs/ABILITIES.md §1, §1.2). max_attr names the
 // DERIVED attribute that caps the pool (so gear/affects that raise max_hp flow through derivation);
-// the engine holds `current`. vital + on_depleted is how "hp at 0 = death" is content (5.2/combat).
+// the engine holds `current`. `vital` is how "hp at 0 = death" is content (5.2/combat); on_depleted is the
+// consequence of emptying ANY pool and is independent of it (#406).
 type ResourceDTO struct {
 	Ref         string `json:"ref" yaml:"ref"`
 	DisplayName string `json:"display_name" yaml:"display_name"`
@@ -764,6 +765,12 @@ type ResourceDTO struct {
 	//     `stacking: ignore`, or the narration re-prints and the duration re-refreshes on every blow.
 	//   - NEVER put a REWARDING op in one (produce_item, advance_track, grant_ability, a currency grant).
 	//     A pool held at 0 can be hit repeatedly on purpose, which would make the reward farmable.
+	//     lintDepletionHookGrants warns at load when a non-vital hook contains one.
+	//   - Beware WIDTH. An `area:` op in a hook re-empties every entity in the room, each of which fires its
+	//     own hook. The engine caps the total work per blow, but the content is still a room-wide cascade.
+	//
+	// NOT YET AVAILABLE: the hook cannot see HOW FAR past 0 the blow went, so a "carry the excess into the
+	// lethal pool" two-track system can be authored in shape but not in magnitude. That primitive is #407.
 	OnDepleted []any `json:"on_depleted" yaml:"on_depleted"`
 }
 

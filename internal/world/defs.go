@@ -334,7 +334,7 @@ type resourceDef struct {
 	ref         string
 	displayName string
 	maxAttr     string // derived-attr ref capping the pool; "" => no cap (unbounded)
-	vital       bool   // depletion drives death (on_depleted) — wired in 5.2/combat
+	vital       bool   // depletion drives DEATH. Since #406 that is all it means: on_depleted runs for any pool
 	// primary designates the DEFAULT-damage vital (#71 multi-vital): unrouted damage (a swing, a
 	// deal_damage with no `resource`) hits this pool. Only consulted when >1 vital exists — vitalResource
 	// prefers the primary-flagged vital, else falls back to the lowest-ref one. Immutable after build.

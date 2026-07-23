@@ -80,12 +80,18 @@ func (co *CorpseOwner) looterIsOwner(s *session) bool {
 // DEATH", not "this pool is the only one with consequences". A non-vital pool (Sanity, Stress, a Stun
 // track) that bottoms out runs its own on_depleted — an 'insane'/'shaken' affect, an incapacitation, a
 // narration — and then falls out at the vitalDepleted re-check below WITHOUT reaching die(). That
-// re-check is the ONE gate between a depletion and death, and it reads def.vital from the immutable
-// registry (swapped only at reload, between zone messages), so no hook can flip it. die() has exactly one
-// call site in the tree — here — which makes "a non-vital depletion can never kill" structural rather
-// than a promise every call site has to keep. A hook that WANTS a non-vital break to be lethal says so
-// out loud by dealing damage to a vital pool, which kills through the ordinary funnel (and exactly once —
-// the deathGen guard below stops this outer frame from re-running death on the way out).
+// re-check is the ONE gate between a depletion and death, and die() has exactly one call site in the tree
+// — here — which makes "a non-vital depletion can never kill" structural rather than a promise every call
+// site has to keep. A hook that WANTS a non-vital break to be lethal says so out loud by dealing damage to
+// a vital pool, which kills through the ordinary funnel (and exactly once — the deathGen guard below stops
+// this outer frame from re-running death on the way out).
+//
+// WHY NO HOOK CAN FLIP `vital` UNDER US: not because the registry is immutable — defRegistry.reload runs at
+// RUNTIME off the content-bus goroutine (defs.go) — but because RESOURCE defs are only ever built at boot
+// (defineGlobals; today only `channel` goes through reg.reload). If resource hot-reload is ever wired, this
+// seam straddles it: the checkpoint's poolDepleted and this gate's vitalDepleted are separate reads with a
+// content hook (arbitrarily long) in between, so a `vital` flip landing in that window would let a Sanity
+// break reach die(). Whoever wires it must snapshot the def once at the checkpoint and pass it down.
 //
 // CANCELLABLE DEATH CHECKPOINT (6.5, user-mandated): the on_depleted hook IS the declarative cancel.
 // After it runs we re-read the vital; if the hook revived the victim above 0 (a death-ward that did
@@ -104,10 +110,13 @@ func (co *CorpseOwner) looterIsOwner(s *session) bool {
 // bound the hook EXACTLY as fireEvent bounds a handler (event.go is the template):
 //   - The depletionCtx inherits parent.depth. Refuse to run the hook once depth >= maxEventDepth (Warn, then
 //     fall through to die() WITHOUT the hook) — this is the critical cap that terminates the recursion at
-//     maxEventDepth=8. depth ALONE bounds it: a command-issued cast reaches here with a nil eventBudget,
-//     so we must not rely on the budget pointer being non-nil.
-//   - When a shared eventBudget exists, the hook is one unit of work: skip it (truncate) if the budget is
-//     spent, else decrement it — so a wide cascade of death hooks can't starve the goroutine either.
+//     maxEventDepth=8. Depth bounds recursion LENGTH.
+//   - The hook is one unit of work against the shared eventBudget: skip it (truncate) if the budget is
+//     spent, else decrement it. Depth alone does NOT bound total work — a hook containing an `area:` op
+//     fans out across the room at every level, which is (targets^depth) work from one blow — so
+//     runDepletionHook ROOTS a budget when it inherits none, exactly as fireEvent does. Before #406 that
+//     was survivable without rooting only because posDead collapsed the fan-out after the first wave; a
+//     non-vital pool has no such latch. This is the WIDTH bound.
 //   - Run the ops at depth+1 (dc.depth++), so the nested dealDamage->onPoolDepleted sees an incremented
 //     depth and the recursion provably terminates at the cap.
 //
@@ -182,14 +191,30 @@ func (z *Zone) runDepletionHook(dc *effectCtx, ops []effectOp, victim *Entity, p
 			"victim", targetShort(victim), "pool", pool, "depth", dc.depth)
 		return
 	}
-	if dc.eventBudget != nil {
-		if *dc.eventBudget <= 0 {
-			z.log.Warn("on_depleted handler budget exhausted; hook dropped",
-				"victim", targetShort(victim), "pool", pool)
-			return
-		}
-		*dc.eventBudget--
+	// ROOT the shared work budget when the caller had none — exactly what fireEvent does at the root of an
+	// event cascade (event.go). This seam is NOT reached through fireEvent, so before #406 it only ever
+	// DECREMENTED a budget somebody else happened to allocate; with a nil one (a command-issued cast, an
+	// affect on_tick, a Lua trigger) TOTAL work was unbounded and only chain LENGTH was capped.
+	//
+	// That was survivable while the hook was death-only, because the posDead latch collapsed the fan-out: a
+	// killed entity's second depletion early-returns. #406 deliberately removes that latch for non-vital
+	// pools, and a hook containing an AREA op then re-empties every entity in the room, each of which fires
+	// its own hook, at every level down to the depth cap — (N^maxEventDepth) work from ONE blow. Measured on
+	// this seam before the fix: 6 entities in a room = 335,923 hook runs and 7.5 seconds ON THE ZONE
+	// GOROUTINE, which is the heartbeat for every player in the zone; 10 entities extrapolates to minutes.
+	// It is also invisible to the Lua sandbox's per-instruction budget and wall-clock deadline, because one
+	// `h:damage` instruction buys all of it inside a single Go call (luasandbox/builders.go names exactly
+	// this hazard). Rooting the budget here caps the same scenario at maxEventHandlers runs / milliseconds.
+	if dc.eventBudget == nil {
+		b := maxEventHandlers
+		dc.eventBudget = &b
 	}
+	if *dc.eventBudget <= 0 {
+		z.log.Warn("on_depleted handler budget exhausted; hook dropped",
+			"victim", targetShort(victim), "pool", pool)
+		return
+	}
+	*dc.eventBudget--
 	dc.depth++ // the nested dealDamage->onPoolDepleted->runDepletionHook sees +1, so recursion terminates at the cap
 	runOps(dc, ops)
 }
@@ -422,11 +447,20 @@ func (z *Zone) respawnPlayer(victim *Entity) {
 	// circuits pvpAllowed (mob->player is always allowed) BEFORE the safe-room veto, so a mob's post-respawn
 	// apply lands even in a safe temple — closing it needs the actor-agnostic protection window, tracked separately.
 	stripHostileAffects(victim)
-	// Restore vitals to full (re-set each vital resource current to its derived max) so the player is
-	// alive again. resourceCurrent already clamps; setting to the max is the "fully healed on respawn"
-	// minimal rule.
+	// Restore EVERY pool to full (each resource's current re-set to its derived max) so the player comes
+	// back whole. resourceCurrent already clamps; setting to the max is the "fully healed on respawn" rule.
+	//
+	// #406 WIDENED THIS FROM VITALS-ONLY, and it is a correctness fix, not generosity. Once a non-vital pool
+	// bottoming out has a CONSEQUENCE, leaving it at 0 through respawn makes that consequence inescapable:
+	// stripHostileAffects above clears the 'insane'/'shaken' the pool's hook applied, then the very next
+	// point of damage to that still-empty pool re-fires the hook and re-applies it — so the #318 strip
+	// becomes a no-op and the player is stuck in the condition across logout, login and handoff (pool
+	// currents are persisted, character.go dumpResources). Restoring every pool is the uniform rule with no
+	// trap in it: a player who wants a condition to survive death gets it from an affect, not from a pool
+	// the engine silently refuses to refill. Content that wants a pool to persist through death can re-empty
+	// it from the death hook, which is explicit and visible.
 	for ref, def := range z.resourceDefs().table() {
-		if def != nil && def.vital {
+		if def != nil {
 			setResourceCurrent(victim, ref, resourceMax(victim, ref))
 		}
 	}

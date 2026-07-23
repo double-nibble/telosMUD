@@ -3,8 +3,9 @@ package world
 // resources.go is the content-defined resource model (docs/ABILITIES.md §1, docs/PHASE5-PLAN.md
 // §1.2). A resource is a named pool whose MAX is a derived attribute (resourceDef.maxAttr) and whose
 // CURRENT the engine holds per entity (Living.resCur). So gear/affects that raise max_hp flow through
-// derivation (§1.1) to the cap automatically. Slice 5.1 builds the read/clamp; regen ticks and the
-// vital on_depleted hook ride the pulse in 5.2/combat (the shape is reserved on resourceDef).
+// derivation (§1.1) to the cap automatically. Slice 5.1 builds the read/clamp; regen ticks ride the pulse
+// in 5.2/combat. A pool's on_depleted hook fires from the dealDamage checkpoint (effect_op.go), for any
+// pool — vital only decides whether DEATH follows it (#406).
 //
 // Single-writer: resource currents are zone-goroutine-owned instance state on Living.
 

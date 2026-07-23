@@ -359,6 +359,222 @@ func TestNonVitalOnDepletedSurvivesTheContentPipeline(t *testing.T) {
 
 func floatPtr(v float64) *float64 { return &v }
 
+// --- TOTAL WORK is bounded, not just chain length (the security-review blocker) ------------------
+
+// TestAreaDepletionHookIsWorkBounded is the regression test for the amplification the security review
+// measured. A non-vital hook containing an AREA op — "a Sanity break panics the room", the headline use
+// case — re-empties every entity in the room, each of which fires its own hook, at every level down to the
+// depth cap: (N^maxEventDepth) work from ONE blow. Before the fix this seam only ever DECREMENTED a work
+// budget somebody else had allocated; with a nil budget (a command-issued cast, an affect on_tick, a Lua
+// trigger) nothing bounded the TOTAL, and 6 entities in a room measured 335,923 hook runs / 7.5s ON THE
+// ZONE GOROUTINE — the heartbeat for every player in the zone. The depth cap alone does NOT catch this:
+// each level is short, there are just exponentially many of them.
+//
+// The fix roots a budget at the seam exactly as fireEvent does at the root of an event cascade. The
+// assertion is deliberately on TOTAL RUNS, not on wall-clock (which would be a flaky oracle).
+func TestAreaDepletionHookIsWorkBounded(t *testing.T) {
+	z, s := depletionZone(t)
+	// The hook re-empties EVERY living entity in the room, including the one that just fired it.
+	registerPool(z, "panic", "max_panic", 100, countingHook(
+		effectOp{kind: "deal_damage", area: "room", resource: "panic", amount: 500},
+	), false)
+
+	victims := make([]*Entity, 0, 5)
+	for i, name := range []string{"one", "two", "three", "four", "five"} {
+		m := combatMob(z, s.entity, name, "", 100)
+		setResourceCurrent(m, "panic", 5)
+		setResourceCurrent(m, "fired", 0)
+		victims = append(victims, m)
+		require.Equal(t, i+1, len(victims))
+	}
+
+	c := &effectCtx{
+		z: z, actor: s.entity, source: s.entity, target: victims[0],
+		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1)),
+	}
+	require.Nil(t, c.eventBudget,
+		"precondition: a NIL budget — this is the entry shape (cast / on_tick / Lua trigger) that was unbounded")
+
+	dealDamage(c, victims[0], 50, "slash", "panic")
+
+	total := 0
+	for _, v := range victims {
+		total += firedCount(v)
+	}
+	require.Positive(t, total, "the cascade must actually have run (else this test proves nothing)")
+	require.LessOrEqual(t, total, maxEventHandlers,
+		"an area on_depleted ran %d hooks off ONE blow with a nil budget — total work is unbounded at this seam", total)
+}
+
+// --- A blow whose victim died mid-flight does not fire that blow's depletion ---------------------
+
+// TestDepletionIsVoidedWhenTheVictimDiesMidBlow is the second security-review blocker. The checkpoint runs
+// AFTER OnDamageTaken/OnHit, and a handler there can kill the victim (an execute rider, a thorns reflect).
+// respawnPlayer then puts a PLAYER back at the start room. Firing this blow's depletion hook afterwards
+// aims a consequence at someone who has left the fight — in another room, with $other bound to a killer who
+// is elsewhere: the "your harm follows you to the temple" class (#318).
+//
+// Before #406 this was fail-safe only by ACCIDENT (respawn refilled the vital, so vitalDepleted went false).
+// It is closed by TWO independent mechanisms, and this test asserts the OBSERVABLE property both serve:
+//  1. respawn now refills every pool, so the outer checkpoint finds the pool full — this is the load-bearing
+//     one, and mutation-reverting it turns TestRespawnRestoresNonVitalPoolsToo red;
+//  2. the deathGen re-read at the checkpoint (effect_op.go), deliberate defense-in-depth. Every path I can
+//     enumerate is covered by (1) or by onPoolDepleted's posDead entry check for a mob, so reverting (2)
+//     alone leaves this test green — it is belt-and-braces at a security seam, in the same spirit as
+//     vitalDepleted re-asserting max > 0, NOT the primary guard. Said plainly here so nobody reads this test
+//     as evidence for it.
+func TestDepletionIsVoidedWhenTheVictimDiesMidBlow(t *testing.T) {
+	z, s := depletionZone(t)
+	// The tripwire is an AFFECT, not the usual counter pool: respawn now restores every pool, so a resource
+	// counter reads its max after a respawn whether the hook ran or not. A benign affect applied by the hook
+	// lands AFTER stripHostileAffects, so its presence means — unambiguously — the hook ran post-respawn.
+	z.defs.affect.register("marked", &affectDef{ref: "marked", name: "Marked", stacking: stackIgnore, maxStacks: 1, duration: 50})
+	registerPool(z, "sanity", "max_sanity", 100, []effectOp{
+		{kind: "apply_affect", affect: "marked", tgt: "self"},
+	}, false)
+	// hp subscribes an execute: any damage taken finishes the victim off. It fires from OnDamageTaken — i.e.
+	// INSIDE this blow, after the pool write and before the depletion checkpoint. For a PLAYER that means
+	// die() -> respawnPlayer, which relocates them to the start room.
+	z.defs.res.register("hp", &resourceDef{
+		ref: "hp", maxAttr: "max_hp", vital: true,
+		onEvent: map[eventKind][]effectOp{
+			evOnDamageTaken: {{kind: "deal_damage", tgt: "self", resource: "hp", amount: 9999}},
+		},
+	})
+
+	victim := s.entity // a PLAYER: death respawns rather than corpses, which is the dangerous shape
+	setResourceCurrent(victim, "sanity", 5)
+	attacker := combatMob(z, victim, "horror", "", 100)
+
+	c := &effectCtx{
+		z: z, actor: attacker, source: attacker, target: victim,
+		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1)),
+	}
+	dealDamage(c, victim, 50, "slash", "sanity")
+
+	require.Positive(t, deathGen(victim), "precondition: the OnDamageTaken execute must actually have killed the victim")
+	require.False(t, hasAffect(victim, "marked"),
+		"the depletion hook fired on a victim who had already died and respawned during this blow")
+}
+
+// --- Respawn restores every pool, not just the vitals -------------------------------------------
+
+// TestRespawnRestoresNonVitalPoolsToo pins the third security-review finding. Once a non-vital pool
+// bottoming out has a CONSEQUENCE, leaving it at 0 through respawn makes that consequence inescapable:
+// stripHostileAffects clears the 'insane' the hook applied, then the next single point of damage to the
+// still-empty pool re-fires the hook and re-applies it — so the #318 strip is a no-op and the player is
+// stuck across logout/login/handoff (pool currents are persisted). Respawn therefore restores EVERY pool.
+func TestRespawnRestoresNonVitalPoolsToo(t *testing.T) {
+	z, s := depletionZone(t)
+	registerPool(z, "sanity", "max_sanity", 60, nil, false)
+
+	setResourceCurrent(s.entity, "hp", 0)
+	setResourceCurrent(s.entity, "sanity", 0)
+	setResourceCurrent(s.entity, "fired", 3)
+
+	z.respawnPlayer(s.entity)
+
+	require.Equal(t, resourceMax(s.entity, "hp"), resourceCurrent(s.entity, "hp"), "vitals restore as before")
+	require.Equal(t, 60, resourceCurrent(s.entity, "sanity"),
+		"a NON-VITAL pool left at 0 through respawn is an inescapable condition — respawn must restore it")
+}
+
+// --- The rewarding-op lint ----------------------------------------------------------------------
+
+// TestLintDepletionHookGrants pins the engine-side guard behind the "never put a rewarding op in a
+// non-vital on_depleted" authoring rule. Prose in a Go doc comment is not a control; the build-time lint
+// is. The vital/death hook is exempt (latched to a real kill), and a narration/affect/damage hook — the
+// normal case — must stay lint-clean or the warning becomes noise everyone ignores.
+func TestLintDepletionHookGrants(t *testing.T) {
+	z, _ := combatZone(t)
+	reward := effectOp{kind: "produce_item", tgt: "self"}
+
+	// A reward buried inside a flow branch must still be found.
+	registerPool(z, "greed", "max_greed", 10, []effectOp{
+		{kind: "if", then: []effectOp{reward}},
+	}, false)
+	// A vital pool's hook is exempt.
+	registerPool(z, "blood", "max_blood", 10, []effectOp{reward}, true)
+	// The normal case: narrate + affect + damage. Must NOT be flagged.
+	registerPool(z, "sanity", "max_sanity", 10, []effectOp{
+		{kind: "act", tgt: "self"},
+		{kind: "apply_affect", affect: "insane", tgt: "self"},
+		{kind: "deal_damage", tgt: "self", resource: "hp", amount: 5},
+	}, false)
+
+	got := lintDepletionHookGrants(z.defs)
+
+	require.Len(t, got, 1, "expected exactly one finding: %+v", got)
+	require.Equal(t, "greed", got[0].resource, "the NON-VITAL pool with the buried reward is the finding")
+	require.Equal(t, "produce_item", got[0].op)
+}
+
+// --- The hook's ctx bindings ---------------------------------------------------------------------
+
+// TestNonVitalHookBindsSourceAsOther pins the ctx binding the DTO now documents ($actor = the depleted
+// entity, $other = the damage source). Nothing else in this file exercises `target: other` from a
+// non-vital hook, so the documented contract was unpinned — a builder writing "lash back at whatever broke
+// you" would be the one to discover it.
+func TestNonVitalHookBindsSourceAsOther(t *testing.T) {
+	z, s := depletionZone(t)
+	registerPool(z, "sanity", "max_sanity", 100, []effectOp{
+		{kind: "deal_damage", tgt: "other", resource: "hp", amount: 25},
+	}, false)
+
+	attacker := combatMob(z, s.entity, "horror", "", 100)
+	victim := combatMob(z, s.entity, "seer", "", 100)
+	setResourceCurrent(victim, "sanity", 5)
+
+	c := &effectCtx{
+		z: z, actor: attacker, source: attacker, target: victim,
+		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1)),
+	}
+	dealDamage(c, victim, 50, "slash", "sanity")
+
+	require.Equal(t, 75, resourceCurrent(attacker, "hp"),
+		"$other in a non-vital hook must bind the DAMAGE SOURCE — the hook's lash-back missed its attacker")
+	require.Equal(t, 100, resourceCurrent(victim, "hp"), "the depleted entity is $actor, not $other")
+}
+
+// TestNonVitalHookRefusalIsFailOpen pins the refusal semantics documented on runDepletionHook: when the
+// budget/depth is exhausted, a VITAL pool still dies the engine-default way (fail-CLOSED — a death-ward
+// that could not run does not save you) while a NON-VITAL pool's depletion simply has no consequence
+// (fail-OPEN). Those are opposite directions on purpose, and neither was pinned.
+func TestNonVitalHookRefusalIsFailOpen(t *testing.T) {
+	z, s := depletionZone(t)
+	registerPool(z, "sanity", "max_sanity", 100, countingHook(), false)
+	z.defs.res.register("hp", &resourceDef{
+		ref: "hp", maxAttr: "max_hp", vital: true,
+		onDepleted: countingHook(effectOp{kind: "modify_resource", tgt: "self", resource: "hp", amount: 99}),
+	})
+
+	spent := 0 // an already-exhausted shared budget: every hook must be refused
+	mob := combatMob(z, s.entity, "subject", "", 10)
+	room := mob.location
+	setResourceCurrent(mob, "sanity", 5)
+	setResourceCurrent(mob, "fired", 0)
+
+	nonVital := &effectCtx{
+		z: z, actor: s.entity, source: s.entity, target: mob,
+		mag: 1, disp: dispHarmful, eventBudget: &spent, rng: rand.New(rand.NewSource(1)),
+	}
+	dealDamage(nonVital, mob, 50, "slash", "sanity")
+
+	require.Zero(t, firedCount(mob), "precondition: the exhausted budget must have refused the hook")
+	require.NotEqual(t, posDead, position(mob), "FAIL-OPEN: a refused NON-vital hook is simply no consequence")
+
+	vital := &effectCtx{
+		z: z, actor: s.entity, source: s.entity, target: mob,
+		mag: 1, disp: dispHarmful, eventBudget: &spent, rng: rand.New(rand.NewSource(1)),
+	}
+	dealDamage(vital, mob, 50, "slash", "hp")
+
+	require.Zero(t, firedCount(mob), "precondition: the vital hook must ALSO have been refused")
+	require.Equal(t, posDead, position(mob),
+		"FAIL-CLOSED: a refused VITAL hook must still die the engine-default way — its revive never ran")
+	require.Equal(t, 1, countRoomCorpses(room))
+}
+
 // --- The two triggers cannot be confused --------------------------------------------------------
 
 // TestPoolDepletedAndVitalDepletedAgree pins the predicate pair directly: vitalDepleted must be exactly

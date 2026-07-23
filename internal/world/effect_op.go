@@ -653,6 +653,15 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	cur := resourceCurrent(target, pool)
 	setResourceCurrent(target, pool, cur-dmg)
 	c.lastDamage = dmg
+	// The victim's death generation AS OF THIS WRITE (#69). The checkpoint below re-reads it: the events
+	// fired in between (OnDamageTaken, OnHit) may KILL the target — an execute rider, a thorns reflect, a
+	// DoT in the same list — and for a PLAYER, respawnPlayer then puts them at the start room, alive and
+	// restored. Running this blow's depletion hook after that means firing a consequence at a victim who is
+	// no longer in the fight, in a different room, with $other bound to a killer who is somewhere else: the
+	// "your harm follows you to the temple" class (#318) that the runOps cross-respawn guard exists to stop.
+	// Before #406 this was fail-safe only by accident (respawn refilled the vital, so vitalDepleted went
+	// false); with a non-vital pool nothing refilled it, so the guard has to be explicit.
+	tgtGen := deathGen(target)
 	c.z.log.Debug("deal_damage applied", "target", target.short, "type", dmgType,
 		"raw", raw, "applied", dmg, "pool", pool, "from", cur, "to", resourceCurrent(target, pool))
 
@@ -704,7 +713,15 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	// The cost is that a non-vital hook can re-run while the pool stays empty (a vital one is latched by
 	// posDead). That is a CONTENT concern, called out in ResourceDTO.OnDepleted: make the hook idempotent
 	// (`if has_affect` / `stacking: ignore`) and never put a rewarding op in one.
-	if poolDepleted(target, pool) {
+	// The deathGen re-read is the cross-respawn guard described at the write above: if the victim died
+	// during the events this blow fired, THIS blow's depletion is void — the entity that pool belonged to is
+	// gone (a corpsed mob) or has already been restored and moved (a respawned player).
+	//
+	// DEFENSE IN DEPTH, not the primary guard: respawnPlayer refills every pool (death.go), so a respawned
+	// player's pool reads full here anyway, and a dead mob is caught by onPoolDepleted's posDead entry check.
+	// Reverting this line alone leaves the suite green — it is kept because both of those are properties of
+	// OTHER functions, and this checkpoint should not depend on them staying true.
+	if deathGen(target) == tgtGen && poolDepleted(target, pool) {
 		c.z.onPoolDepleted(target, src, pool, c)
 	}
 	return dmg
