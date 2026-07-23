@@ -2,6 +2,8 @@ package world
 
 import (
 	"context"
+	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -297,3 +299,162 @@ func TestAuditCommand(t *testing.T) {
 	z.dispatch(admin, "audit Bob")
 	waitAuditLine(t, admin, "Audit history for Bob")
 }
+
+// TestAuditTierReachableByCharacter is #399 item 4: an ACCOUNT tier_changed row (subject_type=account,
+// subject_name NULL) is invisible to the by-name character read, but the STAFF `audit <name>` view now
+// merges in the account's tier history via the name -> account resolution — so tier changes are reachable
+// through a character. The mortal self-view stays character-scoped.
+func TestAuditTierReachableByCharacter(t *testing.T) {
+	ms := NewMemStore()
+	sh := NewDemoShard().WithAudit(ms)
+	z := sh.Zone()
+	ctx := context.Background()
+
+	// Bob (a character) owned by account acct-1.
+	if _, err := ms.AppendAudit(ctx, AuditEvent{
+		SubjectType: AuditSubjectCharacter, SubjectID: "id-Bob", SubjectName: "Bob",
+		ActorType: AuditActorSystem, EventKind: AuditKindDied, DedupKey: "1",
+		Payload: AuditPayload(map[string]any{"room_ref": "midgaard:room:temple"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An ACCOUNT tier change for acct-1 — subject is the account, no subject_name, so neither the by-id
+	// self-view nor the by-name staff read can see it directly.
+	if _, err := ms.AppendAudit(ctx, AuditEvent{
+		SubjectType: AuditSubjectAccount, SubjectID: "acct-1", SubjectName: "",
+		ActorType: AuditActorAccount, ActorID: "acct-1", EventKind: AuditKindTierChanged, DedupKey: "tier-1",
+		Payload: AuditPayload(map[string]any{"old_tier": "player", "new_tier": "builder"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ms.SetCharacterAccount("Bob", "acct-1")
+
+	// Precondition: the plain by-name read sees ONLY Bob's own character row, not the account tier row.
+	if rows, _ := ms.ListAuditForCharacterName(ctx, "Bob", 100); len(rows) != 1 {
+		t.Fatalf("by-name read should see only Bob's own row, got %d (the account tier row must not leak in)", len(rows))
+	}
+
+	// Staff `audit Bob` now surfaces BOTH Bob's death AND the account tier change.
+	admin := newTestPlayerEntity(z, "Admin")
+	admin.tier = tierAdmin
+	z.dispatch(admin, "audit Bob")
+	out := waitAuditLine(t, admin, "Audit history for Bob")
+	if !strings.Contains(out, AuditKindTierChanged) {
+		t.Fatalf("staff `audit <name>` did not surface the account tier change: %q", out)
+	}
+	if !strings.Contains(out, "player -> builder") {
+		t.Fatalf("the tier-change payload was not rendered: %q", out)
+	}
+}
+
+// TestAuditBatchCoalescesBurst is #399 items 1+2: the drainer coalesces a queued burst into ONE
+// AppendAuditBatch round-trip instead of one call per event, and every event is still recorded. White-box:
+// we fill the queue, then drive coalesce+handleBatch directly (no drainer goroutine) so the batching is
+// deterministic. An instrumented sink counts batch calls vs total events to prove coalescing happened.
+func TestAuditBatchCoalescesBurst(t *testing.T) {
+	ms := NewMemStore()
+	sink := &batchCountingSink{AuditSink: ms}
+	a := newAuditor(sink)
+
+	const burst = 10
+	for i := 0; i < burst; i++ {
+		a.reqs <- AuditEvent{
+			SubjectType: AuditSubjectCharacter, SubjectID: "id-Cara", SubjectName: "Cara",
+			ActorType: AuditActorSystem, EventKind: AuditKindAttributeBase, DedupKey: "grant-" + strconv.Itoa(i),
+			Payload: AuditPayload(map[string]any{"attr": "str", "old": float64(i), "new": float64(i + 1)}),
+		}
+	}
+	// Drain: take the first, coalesce the rest, write one batch. The whole burst fits under auditBatchMax,
+	// so it drains as a SINGLE batch call.
+	first := <-a.reqs
+	a.handleBatch(context.Background(), a.coalesce(first))
+
+	if sink.batchCalls != 1 {
+		t.Fatalf("a %d-event burst drained in %d batch calls, want 1 (coalescing did not happen)", burst, sink.batchCalls)
+	}
+	if sink.totalEvents != burst {
+		t.Fatalf("batch wrote %d events, want %d", sink.totalEvents, burst)
+	}
+	rows, _ := ms.ListAuditForCharacterName(context.Background(), "Cara", 100)
+	if len(rows) != burst {
+		t.Fatalf("recorded %d rows, want %d (every event in the batch must land)", len(rows), burst)
+	}
+}
+
+// TestAppendAuditBatchIdempotent is #399: a batch containing a duplicate idempotency key records the row
+// ONCE and reports the true recorded count — the per-row ON CONFLICT DO NOTHING semantics survive batching.
+func TestAppendAuditBatchIdempotent(t *testing.T) {
+	ms := NewMemStore()
+	ctx := context.Background()
+	ev := func(dk string) AuditEvent {
+		return AuditEvent{
+			SubjectType: AuditSubjectCharacter, SubjectID: "id-Dex", SubjectName: "Dex",
+			ActorType: AuditActorSystem, EventKind: AuditKindTrackAdvanced, DedupKey: dk,
+			Payload: AuditPayload(map[string]any{"track": "combat", "step": 1}),
+		}
+	}
+	// Two distinct + one duplicate of the first, all in one batch.
+	recorded, err := ms.AppendAuditBatch(ctx, []AuditEvent{ev("a"), ev("b"), ev("a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorded != 2 {
+		t.Fatalf("batch recorded %d, want 2 (the duplicate key must be an idempotent no-op)", recorded)
+	}
+	rows, _ := ms.ListAuditForCharacterName(ctx, "Dex", 100)
+	if len(rows) != 2 {
+		t.Fatalf("store holds %d rows, want 2 (the duplicate must not double-record)", len(rows))
+	}
+}
+
+// TestAuditBatchFallbackRecordsPerRow is #399 (the review's failure-atomicity finding): when a batch write
+// FAILS (an implicit-transaction rollback commits nothing), handleBatch falls back to per-row appends under
+// the same bounded ctx — so a single poison event no longer takes the whole coalesced batch down with it.
+// A fault-injecting sink forces every AppendAuditBatch to error; every event must still land via the fallback.
+func TestAuditBatchFallbackRecordsPerRow(t *testing.T) {
+	ms := NewMemStore()
+	a := newAuditor(&failBatchSink{MemStore: ms})
+	ctx := context.Background()
+
+	evs := make([]AuditEvent, 3)
+	for i := range evs {
+		evs[i] = AuditEvent{
+			SubjectType: AuditSubjectCharacter, SubjectID: "id-Eve", SubjectName: "Eve",
+			ActorType: AuditActorSystem, EventKind: AuditKindAttributeBase, DedupKey: "g-" + strconv.Itoa(i),
+			Payload: AuditPayload(map[string]any{"attr": "str", "new": float64(i)}),
+		}
+	}
+	a.handleBatch(ctx, evs) // the batch errors -> per-row fallback records all three
+
+	rows, _ := ms.ListAuditForCharacterName(ctx, "Eve", 100)
+	if len(rows) != 3 {
+		t.Fatalf("batch-fallback recorded %d rows, want 3 (a failed batch must recover per-row)", len(rows))
+	}
+}
+
+// batchCountingSink wraps an AuditSink and counts AppendAuditBatch invocations + total events written, so a
+// test can prove a burst was COALESCED into few batch calls rather than one call per event.
+type batchCountingSink struct {
+	AuditSink
+	batchCalls  int
+	totalEvents int
+}
+
+func (s *batchCountingSink) AppendAuditBatch(ctx context.Context, evs []AuditEvent) (int, error) {
+	s.batchCalls++
+	s.totalEvents += len(evs)
+	return s.AuditSink.AppendAuditBatch(ctx, evs)
+}
+
+// failBatchSink forces AppendAuditBatch to error (delegating per-row AppendAudit + reads to the wrapped
+// MemStore), so a test can prove handleBatch's per-row fallback still records every event when the batch
+// path fails — the review's failure-atomicity mitigation.
+type failBatchSink struct {
+	*MemStore
+}
+
+func (s *failBatchSink) AppendAuditBatch(context.Context, []AuditEvent) (int, error) {
+	return 0, errBatchInjected
+}
+
+var errBatchInjected = errors.New("injected batch failure")

@@ -17,9 +17,11 @@ import (
 //   - `audit <name>`: another character's trail, STAFF-ONLY. A mortal who passes a name is refused (the
 //     rank check below), so the named lookup never reaches the store for a non-staff caller.
 //
-// NOTE (known limitation, follow-up): account tier_changed rows (subject_id = the ACCOUNT uuid) do not
-// appear in either the pid-scoped self-view or the name-scoped staff view — surfacing an account's tier
-// history through a character needs a name->account resolution the world session does not carry today.
+// Account tier_changed rows (subject_id = the ACCOUNT uuid, subject_name NULL) appear in neither the
+// pid-scoped self-view nor the name-scoped character read. The STAFF `audit <name>` view now ALSO fetches
+// the account's tier history (ListAccountTierAudit resolves name -> characters.account_id -> the account's
+// tier rows) and merges it, newest-first, so an account's tier changes are reachable through a character
+// (#399 item 4). The mortal self-view stays character-scoped by design (tier history is a staff concern).
 //
 // The store call is blocking pool I/O, so — like mailList — the handler rate-limits + spawns a short-lived
 // goroutine that queries off the zone goroutine and writes straight to the session out channel. A nil
@@ -80,7 +82,18 @@ func cmdAudit(c *Context) error {
 		}
 		label = arg
 		query = func(ctx context.Context, sink AuditSink) ([]AuditEntry, error) {
-			return sink.ListAuditForCharacterName(ctx, label, auditListLimit)
+			// The character's own trail PLUS the owning account's tier history (#399 item 4), merged
+			// newest-first and capped — so `audit <name>` surfaces an account tier change even though its
+			// row is account-subject (invisible to the by-name character read).
+			charRows, err := sink.ListAuditForCharacterName(ctx, label, auditListLimit)
+			if err != nil {
+				return nil, err
+			}
+			tierRows, err := sink.ListAccountTierAudit(ctx, label, auditListLimit)
+			if err != nil {
+				return nil, err
+			}
+			return mergeAuditNewestFirst(charRows, tierRows, auditListLimit), nil
 		}
 	}
 
@@ -105,6 +118,27 @@ func cmdAudit(c *Context) error {
 		writeFrameTo(out, textFrame(renderAuditTrail(label, entries)))
 	}()
 	return nil
+}
+
+// mergeAuditNewestFirst concatenates two audit slices (the character trail + the account tier trail),
+// sorts the union newest-first, and caps it at limit (#399 item 4). Each input is already ≤limit, so the
+// union is ≤2*limit; capping after the merge keeps the newest `limit` across BOTH sources rather than
+// silently favoring one. A stable sort preserves each source's own tie order within a same-`at` instant.
+//
+// REACHABILITY CAVEAT: because the merged view is a newest-first page of `limit` rows, a rare account tier
+// change is reachable through a character only while it stays within that newest window — if the character
+// accrues ≥limit audit events NEWER than the tier change, the tier row is paged out. Acceptable for a
+// staff read (tier changes are rare and this is a paged view, not an exhaustive account report); a
+// dedicated account-history read would be the answer if absolute reachability is ever needed.
+func mergeAuditNewestFirst(a, b []AuditEntry, limit int) []AuditEntry {
+	merged := make([]AuditEntry, 0, len(a)+len(b))
+	merged = append(merged, a...)
+	merged = append(merged, b...)
+	sort.SliceStable(merged, func(i, j int) bool { return merged[i].At.After(merged[j].At) })
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
 }
 
 // renderAuditTrail formats a character's audit trail newest-first: a header + one line per event (time,

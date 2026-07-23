@@ -36,6 +36,14 @@ const auditIOTimeout = 5 * time.Second
 // wedged DB from stalling a graceful shard drain indefinitely while still flushing a healthy queue.
 const auditDrainDeadline = 5 * time.Second
 
+// auditBatchMax caps how many events one drain flush coalesces into a single AppendAuditBatch round-trip
+// (#399). The drainer takes one event, then greedily pulls up to auditBatchMax-1 more already-queued
+// events and writes them in ONE pipelined transaction — so a death-storm (or any burst) costs one
+// round-trip per batch instead of one per event, raising the throughput ceiling under a momentarily-slow
+// Postgres. Sized to the queue depth: a full queue drains in a couple of batches, and a single steady-state
+// event still flushes immediately (the coalesce loop is non-blocking, so it never waits to fill a batch).
+const auditBatchMax = 64
+
 // auditor owns the sink + a buffered request channel drained by a single background goroutine. Created
 // once per shard (newAuditor) and shared by every hosted zone; the buffered channel + single drainer
 // keep writes off every zone goroutine. A nil sink makes it a no-op, which is how a storeless boot keeps
@@ -98,9 +106,29 @@ func (a *auditor) run(ctx context.Context) {
 			a.log.Debug("auditor loop stop")
 			return
 		case ev := <-a.reqs:
-			a.handle(ctx, ev)
+			// Coalesce this event with any others already queued into ONE batch write (#399), so a burst
+			// (a death-storm) drains in a couple of round-trips instead of one per event.
+			a.handleBatch(ctx, a.coalesce(ev))
 		}
 	}
+}
+
+// coalesce greedily pulls up to auditBatchMax-1 more already-queued events onto `first`, WITHOUT blocking
+// (the default case stops the moment the queue is momentarily empty). So a single steady-state event
+// flushes immediately as a batch of one, while a burst packs a full batch — the coalesce never waits to
+// fill a batch, which would add latency to a lone event. Called only from the drainer goroutine.
+func (a *auditor) coalesce(first AuditEvent) []AuditEvent {
+	batch := make([]AuditEvent, 1, auditBatchMax)
+	batch[0] = first
+	for len(batch) < auditBatchMax {
+		select {
+		case ev := <-a.reqs:
+			batch = append(batch, ev)
+		default:
+			return batch
+		}
+	}
+	return batch
 }
 
 // drainRemaining writes every event still buffered at shutdown, under a FRESH bounded context (the run
@@ -113,21 +141,38 @@ func (a *auditor) drainRemaining() {
 	for {
 		select {
 		case ev := <-a.reqs:
-			a.handle(ctx, ev)
+			a.handleBatch(ctx, a.coalesce(ev)) // batch the shutdown flush too
 		default:
 			return
 		}
 	}
 }
 
-// handle performs one AppendAudit off the zone goroutine, under a bounded timeout. A failure logs at
-// Debug (non-fatal — the trail is observability, not a durability guarantee for gameplay); recorded=false
-// (a benign idempotent no-op) is unremarkable and silent.
-func (a *auditor) handle(ctx context.Context, ev AuditEvent) {
+// handleBatch writes one coalesced batch off the zone goroutine, under a bounded timeout. One
+// AppendAuditBatch is one round-trip regardless of batch size, so the timeout bounds the whole flush.
+//
+// On a batch error it FALLS BACK to per-row appends under the SAME bounded ctx. A failed batch is one
+// implicit transaction that committed NOTHING (all-or-nothing), so re-inserting per row is safe and, being
+// ON CONFLICT idempotent, harmless — this restores the blast radius of a single POISON event (a row the DB
+// rejects) from the whole batch (up to auditBatchMax) back to just that one row, so one bad event no longer
+// takes 63 good ones down with it. It does NOT reintroduce slow-drain under a wedged DB: the fallback
+// shares the one already-bounded ioCtx, so once that is spent (the DB-down case, where the batch and every
+// row fail alike) the remaining per-row calls fail instantly rather than each waiting a fresh timeout.
+// Everything stays best-effort and non-fatal (Debug logs only) — the trail is observability, not a
+// gameplay-durability guarantee.
+func (a *auditor) handleBatch(ctx context.Context, evs []AuditEvent) {
+	if len(evs) == 0 {
+		return
+	}
 	ioCtx, cancel := context.WithTimeout(ctx, auditIOTimeout)
 	defer cancel()
-	if _, err := a.sink.AppendAudit(ioCtx, ev); err != nil {
-		a.log.Debug("audit append failed (non-fatal)", "subject", ev.SubjectID, "kind", ev.EventKind, "err", err)
+	if _, err := a.sink.AppendAuditBatch(ioCtx, evs); err != nil {
+		a.log.Debug("audit batch append failed; falling back to per-row", "count", len(evs), "err", err)
+		for _, ev := range evs {
+			if _, err := a.sink.AppendAudit(ioCtx, ev); err != nil {
+				a.log.Debug("audit append failed (non-fatal)", "subject", ev.SubjectID, "kind", ev.EventKind, "err", err)
+			}
+		}
 	}
 }
 
