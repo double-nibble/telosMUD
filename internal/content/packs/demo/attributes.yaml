@@ -83,7 +83,11 @@ attributes:
   # engine reads that as natural immunity — a horror-typed blow at a creature with no mind is DISCARDED
   # before mitigation and threat (#405) — so adding this pool to a shared pack cannot touch anything that
   # was already here. Only content that explicitly raises pow has a mind to lose.
-  - {ref: pow, display_name: Resolve, value_kind: int, default_base: {lit: 0}, min: 0, stat: true}
+  #
+  # NOT `stat: true`, deliberately: charStatsJSON has no capacity notion, so flagging it would push
+  # `"pow":0` to every GMCP client on the shard — advertising a mind to every character that has not got
+  # one, which is the exact mirror of the Char.Vitals leak this change fixes on the pool side.
+  - {ref: pow, display_name: Resolve, value_kind: int, default_base: {lit: 0}, min: 0}
   # max_sanity = pow * 5, the d100-family convention. Derived, so anything that raises pow — a bundle
   # grant, a blessing affect — lifts the cap through the ordinary derivation stack.
   - ref: max_sanity

@@ -133,6 +133,33 @@ abilities:
       local amt = math.random(1, 8) + math.random(1, 8) + ctx.actor:attr("heal_power")
       ctx.actor:heal("hp", amt)
 
+  # steady: the RECOVERY half of the #408 Sanity exemplar, and the reason `sanity` can set `regen: 0`.
+  # A pool that never regenerates needs an AUTHORED way back — that is the d100-family rule (recovery is an
+  # act, not a timer) — and shipping the break without the cure would teach that the only way out of madness
+  # is to die, which is exactly what a level-triggered hook on a permanently-empty pool makes true.
+  #
+  # `restore` (not `heal`) is the right verb for a non-hp pool, and `remove_affect` lifts the condition even
+  # though `insane` is `dispellable: false` — dispellable gates the DISPEL op, not a targeted removal. This
+  # only works because `insane` is `stack_scope: target`: keyed by source, this lookup would silently miss
+  # any instance a different entity (or a relog) applied.
+  - ref: steady
+    name: Steady Nerves
+    invocation: command
+    words: [steady]
+    targeting: {mode: self, scope: room, range: 0, disposition: helpful}
+    tags: [cast, verbal]
+    costs:
+      - {resource: mana, amount: 10}
+    cast_time: 0
+    lag: 8
+    cooldown: 0
+    messages:
+      actor: "You breathe until the room is a room again."
+      room: "$n breathes slowly, steadying $s nerves."
+    on_resolve:
+      - {op: restore, resource: sanity, dice_num: 1, dice_size: 6, bonus: ["attr", "$actor.pow"]}
+      - {op: remove_affect, affect: insane}
+
   # bless: a beneficial BUFF — applies the `bless` affect (+accuracy/+ac) to self or an ally. Helpful, so
   # casting it on another player is treated as help (not gated). The brief's "a buff (applies a beneficial
   # affect)". apply_affect on a helpful disposition attaches directly (no debuff path).

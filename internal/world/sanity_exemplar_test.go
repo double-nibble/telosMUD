@@ -137,6 +137,115 @@ func affectStacks(e *Entity, ref string) int {
 	return 0
 }
 
+// TestShadeSwingRoutesToSanityInWorld is the in-world half of the exemplar, and the author's real question
+// about #405: does routing hold for a SWING? A swing carries the weapon's damage type and never a resource
+// (buildSwingDamageOp sets none), so before #405 a horror-clawed mob was unbuildable — its blows would have
+// landed on hp whatever its weapon said. The shipped `crypt:mob:shade` has a natural weapon of type horror
+// and nothing anywhere names a pool.
+func TestShadeSwingRoutesToSanityInWorld(t *testing.T) {
+	z := demoZoneForSanity(t)
+	shade := z.protos.get("crypt:mob:shade")
+	require.NotNil(t, shade, "the shipped pack must define the shade")
+
+	victim := sanityMob(t, z, "investigator", 4) // pow 4 => max_sanity 20
+	attacker := z.spawn("crypt:mob:shade")
+	require.NotNil(t, attacker, "the shade must spawn")
+	Move(attacker, victim.location)
+	require.Zero(t, resourceMax(attacker, "sanity"), "the shade has no mind of its own to lose")
+
+	hpBefore := resourceCurrent(victim, "hp")
+	z.startFight(attacker, victim)
+	for i := 0; i < 6; i++ {
+		z.resolveSwing(attacker, victim, 0, rand.New(rand.NewSource(int64(i+1))), newBudget())
+	}
+
+	require.Less(t, resourceCurrent(victim, "sanity"), 20, "the shade's SWINGS must land on sanity")
+	require.Equal(t, hpBefore, resourceCurrent(victim, "hp"), "and must never touch hp")
+}
+
+// TestSteadyRecoversSanityAndLiftsTheCondition closes the loop the RPG review asked for. `sanity` has
+// regen 0 — recovery is an authored act, which is the d100-family rule — so without a shipped cure the pack
+// would teach that the only way out of madness is to die. It also proves the `stack_scope: target` fix:
+// keyed by source, this remove_affect would silently miss an instance the depletion hook applied.
+func TestSteadyRecoversSanityAndLiftsTheCondition(t *testing.T) {
+	z := demoZoneForSanity(t)
+	attacker := sanityMob(t, z, "horror", 0)
+	victim := sanityMob(t, z, "investigator", 4)
+	setResourceCurrent(victim, "mana", 100)
+
+	c := &effectCtx{
+		z: z, actor: attacker, source: attacker, target: victim,
+		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1)),
+	}
+	dealDamage(c, victim, 25, "horror", "")
+	require.True(t, hasAffect(victim, "insane"), "precondition: the victim is broken")
+	require.Zero(t, resourceCurrent(victim, "sanity"))
+
+	// The cure is cast by the VICTIM here, but the point of stack_scope: target is that it need not be —
+	// the affect was applied with the hook's ctx, not this one.
+	// THE DISCRIMINATING CASE: the cure is cast by a THIRD PARTY. An affect instance is keyed by
+	// (ref, source) unless the def sets stack_scope: target, and the depletion hook applied this one with
+	// the victim as its source — so a healer's remove_affect looks up (insane, healer) and, without the
+	// target scope, silently misses. Casting it AS the victim passes either way and proves nothing; I wrote
+	// it that way first and the mutation test caught it.
+	def := z.defs.ability.get("steady")
+	require.NotNil(t, def, "the pack must ship a recovery ability")
+	healer := sanityMob(t, z, "counsellor", 0)
+	rc := &effectCtx{
+		z: z, actor: healer, source: healer, target: victim, mag: 1, disp: dispHelpful,
+		rng: rand.New(rand.NewSource(1)),
+	}
+	runOps(rc, def.ops)
+
+	require.Positive(t, resourceCurrent(victim, "sanity"), "steady must restore the pool")
+	require.False(t, hasAffect(victim, "insane"),
+		"a THIRD PARTY's remove_affect missed the condition — an affect keyed by its CAUSE rather than its sufferer is uncurable by anyone but that cause, and by nobody at all after a relog (a persisted affect re-attaches with no source)")
+}
+
+// TestRespawnWritesNoPhantomForACapacitylessPool is the durable half of the inertness property, and the
+// one the damage-path test cannot see. respawnPlayer restores every pool (#406, so a non-vital condition
+// is not inescapable), and without a capacity guard that writes a stored 0 for a pool the character has no
+// capacity in — on every death, persisted.
+//
+// A stored 0 is NOT the same as an absent key: resourceCurrent reads an absent pool as FULL and a stored 0
+// as empty. So a character who died BEFORE their content granted them capacity would come back holding a
+// durable 0, and the instant capacity arrived — exactly the path this exemplar advertises, a bundle grant
+// raising `pow` — they would read permanently empty and break on the first point of horror damage instead
+// of starting whole.
+func TestRespawnWritesNoPhantomForACapacitylessPool(t *testing.T) {
+	z := demoZoneForSanity(t)
+	s := makeRoomPlayer(z, "Commoner") // an ordinary player: pow 0, so no capacity in sanity
+	require.Zero(t, resourceMax(s.entity, "sanity"), "precondition: no capacity")
+
+	z.respawnPlayer(s.entity)
+
+	_, stored := s.entity.living.resCur["sanity"]
+	require.False(t, stored, "respawn wrote a durable phantom 0 for a pool the character has no capacity in")
+
+	// The consequence, asserted end-to-end rather than trusting the absence: once content grants capacity,
+	// the character must read FULL, not empty.
+	setAttrBase(s.entity, "pow", 4)
+	require.Equal(t, 20, resourceMax(s.entity, "sanity"), "precondition: the grant lifted the cap")
+	require.Equal(t, 20, resourceCurrent(s.entity, "sanity"),
+		"a character who died before gaining the pool must start it FULL, not permanently empty")
+}
+
+// TestRespawnStillRestoresPoolsTheCharacterHas guards the other direction: the capacity guard must not undo
+// #406's reason for restoring every pool. A character who HAS the pool and died with it empty must come
+// back whole, or the condition it carries is inescapable.
+func TestRespawnStillRestoresPoolsTheCharacterHas(t *testing.T) {
+	z := demoZoneForSanity(t)
+	s := makeRoomPlayer(z, "Investigator")
+	setAttrBase(s.entity, "pow", 4)
+	setResourceCurrent(s.entity, "sanity", 0)
+	setResourceCurrent(s.entity, "hp", 0)
+
+	z.respawnPlayer(s.entity)
+
+	require.Equal(t, 20, resourceCurrent(s.entity, "sanity"), "a pool the character HAS must still be restored")
+	require.Equal(t, resourceMax(s.entity, "hp"), resourceCurrent(s.entity, "hp"), "vitals restore as always")
+}
+
 // --- The HUD must not leak a pool the character does not have ------------------------------------
 
 // TestVitalsSurfacesAgreeOnACapacitylessPool pins the fix for the inconsistency #408 would otherwise

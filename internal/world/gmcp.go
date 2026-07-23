@@ -66,6 +66,13 @@ func (z *Zone) charVitalsJSON(e *Entity) []byte {
 		// track whose cap derives from an attribute defaulting to 0, so only some characters have one).
 		// Without this, every client on the shard receives `"sanity":0,"maxsanity":0` for a pool its
 		// character does not have and the prompt correctly refuses to show.
+		//
+		// KNOWN EDGE: the key DISAPPEARS if a character's capacity in a pool drops back to 0 (an item that
+		// granted it is unequipped, a blessing lapses). A client that merges Char.Vitals recursively rather
+		// than replacing it — Mudlet does — will keep rendering the last value it saw. The text prompt has
+		// no such problem because it re-renders wholesale. Omitting is still the right default: the common
+		// case by far is a character who simply never has the pool, and emitting 0/0 for them puts a gauge
+		// on every client for a mechanic they are not part of.
 		if resourceMax(e, ref) <= 0 {
 			continue
 		}
