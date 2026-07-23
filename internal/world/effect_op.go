@@ -73,6 +73,19 @@ type effectCtx struct {
 	// after opDealDamage returns — that read-back corrupts when death/respawn fires inside dealDamage (a
 	// player respawn restores full hp, so a `before - after` delta goes negative). 0 until dealDamage runs.
 	lastDamage int
+	// credit is the attacker to ATTRIBUTE a self-directed blow to (#407). It is set only on a depletion ctx
+	// (death.go), and dealDamage consults it only when a blow's source and target are the SAME entity —
+	// i.e. the carry-over shape, a hook dealing the overflow at the entity whose pool just emptied. Without
+	// it that blow is self-attributed and a kill through it credits nobody: no OnKill subject, no XP, no
+	// corpse loot-ownership window. It is deliberately NOT `source`: rebinding source would break the
+	// mirror case (a `tgt: other` retaliation) and would silently re-own affects and `$source.*` scope.
+	credit *Entity
+	// depletion is the arithmetic of the depletion this ctx was built for (#407) — how much of the blow the
+	// pool absorbed and how much overflowed past 0. Set ONLY on a depletionCtx (death.go), so it is scoped
+	// to exactly one hook execution and cannot bleed into the swing/cast ctx that outlives the checkpoint.
+	// A content formula reads it as `$depletion.overflow` / `.applied` / `.amount` (check.go); the zero
+	// value everywhere else makes a stray reference read 0 rather than an entity attribute.
+	depletion depletion
 	// reactACBonus is a TRANSIENT, swing-scoped defender-AC bump recorded by a to-hit REACTION (7.9,
 	// Shield: rx:modify("ac", +delta)). The swing pipeline (combat.go) sets it on this per-swing ctx
 	// from the reaction's "ac" delta BEFORE the to-hit check; resolveCheck (check.go) adds it to the
@@ -653,6 +666,32 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	cur := resourceCurrent(target, pool)
 	setResourceCurrent(target, pool, cur-dmg)
 	c.lastDamage = dmg
+	// OVERFLOW (#407): how far PAST 0 this blow drove the pool — the excess the pool could not absorb.
+	// setResourceCurrent clamps the store at 0 and the number is gone after the write, so it is captured
+	// here, where both operands are in scope, and handed to the depletion hook as a referenceable amount
+	// ($depletion.overflow). That is what a two-track system needs: a stun/stagger track carries its excess
+	// into a lethal pool, FP-below-0 bites into HP, an HP-buffer spills into a stat.
+	//
+	// It is computed at the CALLER, not returned from setResourceCurrent: that setter is a general two-sided
+	// clamp with seven callers (heal, modify_resource, an ability cost, regen, respawn, the per-round
+	// top-up, character load), and for every one of them "overflow" is either meaningless or a TOP-end
+	// discard (95 + 50 on a max-100 pool). A single returned int would be sign-ambiguous and would invite
+	// future callers to plumb a value that only means something on the damage path.
+	//
+	// INVARIANT: 0 <= overflow <= dmg, and overflow > 0 implies the pool reads 0 after the write. It is
+	// undefined only where no write happened at all — every early return above (the gate, the immunity
+	// discard, full mitigation, a negating reaction, a vital-less target) precedes this line, which is
+	// exactly why it is well-defined here. An exact-to-zero blow yields 0, so a hook must handle 0; a blow
+	// onto an ALREADY-empty pool yields the full damage, which is the carry-over case working as intended.
+	// The floor is DEFENSIVE, not live: the hook only runs when the checkpoint below sees the pool at <= 0,
+	// which means dmg >= cur, so the subtraction cannot go negative on any path that consumes this. It is
+	// kept so the value is well-defined AT ITS DEFINITION SITE instead of depending on a gate 60 lines
+	// later — a negative overflow reaching a `deal_damage` amount would be a silent heal. Mutation-testing
+	// confirms no test covers the branch, which is the point: it is an invariant, not a case.
+	overflow := dmg - cur
+	if overflow < 0 {
+		overflow = 0
+	}
 	// The victim's death generation AS OF THIS WRITE (#69). The checkpoint below re-reads it: the events
 	// fired in between (OnDamageTaken, OnHit) may KILL the target — an execute rider, a thorns reflect, a
 	// DoT in the same list — and for a PLAYER, respawnPlayer then puts them at the start room, alive and
@@ -670,6 +709,15 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	// attacker the damage is attributed to (the swing attacker; a DoT's applier; nil for a sourceless
 	// environmental hit). A self/ambient DoT (source == target) is NOT an attacker — no threat, no OnHit.
 	src := c.source
+	// ATTRIBUTION SUBSTITUTION (#407): a depletion hook runs with source == the victim, so a blow it deals
+	// AT THE VICTIM (the carry-over: "spill my overflow into my own hp") is self-directed and would be
+	// credited to nobody — no threat, no OnHit, and a kill through it resolves die(victim, killer=victim),
+	// costing the real attacker the OnKill subject, XP and the corpse loot-ownership window. `credit` is the
+	// attacker the depletion was attributed to; substituting it ONLY here, for a genuinely self-directed
+	// blow, leaves a `tgt: other` retaliation hook (thorns / death-curse) attributed exactly as before.
+	if src == target && c.credit != nil {
+		src = c.credit
+	}
 	attributable := src != nil && src != target
 	if attributable {
 		// Threat the attacker built on the target — accrued BEFORE the death scrub (die() clears the
@@ -722,7 +770,7 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	// Reverting this line alone leaves the suite green — it is kept because both of those are properties of
 	// OTHER functions, and this checkpoint should not depend on them staying true.
 	if deathGen(target) == tgtGen && poolDepleted(target, pool) {
-		c.z.onPoolDepleted(target, src, pool, c)
+		c.z.onPoolDepleted(target, src, pool, depletion{overflow: overflow, applied: dmg - overflow, amount: dmg}, c)
 	}
 	return dmg
 }
@@ -812,6 +860,22 @@ func vitalResource(e *Entity) string {
 		return primary
 	}
 	return lowest
+}
+
+// depletion is the per-blow arithmetic of the depletion that just happened (#407), handed to the hook so a
+// content amount can reference it (`$depletion.overflow` etc., check.go resolveDepletionRef). It is a value
+// type: it describes ONE blow against ONE pool and is rebuilt per depletion, never shared or mutated.
+//
+//	amount  = the mitigated damage this blow applied to the pool
+//	applied = what the pool actually ABSORBED (min(amount, current-before)) — "you lost N sanity"
+//	overflow = what it could NOT absorb (amount - applied) — the excess a two-track system carries onward
+//
+// applied + overflow == amount always, so a hook can split a blow without arithmetic. The zero value (an
+// op-list running outside a depletion) reads 0 for every field, which makes a stray reference inert.
+type depletion struct {
+	overflow int
+	applied  int
+	amount   int
 }
 
 // poolDepleted reports whether `pool` is a content-defined resource on `e` that has bottomed out — the

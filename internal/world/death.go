@@ -123,7 +123,7 @@ func (co *CorpseOwner) looterIsOwner(s *session) bool {
 // nil/empty op-list => nothing runs (engine default death). A hook that exhausts the depth/width budget
 // simply does not run — the victim then dies the engine-default way (no revive, since the cancel can only
 // happen if the hook actually ran and raised the vital).
-func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, parent *effectCtx) {
+func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, dep depletion, parent *effectCtx) {
 	if victim == nil || victim.living == nil || position(victim) == posDead {
 		return
 	}
@@ -133,7 +133,7 @@ func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, parent *effec
 	// checkpoint (never "" — the checkpoint only fires for a pool it just emptied).
 	if pool != "" {
 		if def := z.resourceDefs().get(pool); def != nil && len(def.onDepleted) > 0 {
-			dc := z.depletionCtx(victim, killer, parent)
+			dc := z.depletionCtx(victim, killer, dep, parent)
 			z.runDepletionHook(dc, def.onDepleted, victim, pool)
 		}
 	}
@@ -219,15 +219,39 @@ func (z *Zone) runDepletionHook(dc *effectCtx, ops []effectOp, victim *Entity, p
 	runOps(dc, ops)
 }
 
-// depletionCtx builds the effectCtx the on_depleted / death-adjacent ops run under: the depleted entity
-// is the actor/source/target (a self-effect on the subject), the damage source is `other` (so a hook op
-// can reference $other = the slayer / the horror that broke you). It inherits the parent's depth/rng/
-// event-budget so the hook is bounded by the SAME round budget as the swing that triggered it (no fresh
-// 256). disp neutral — a harmful op inside re-decides its own disposition and re-gates.
-func (z *Zone) depletionCtx(victim, killer *Entity, parent *effectCtx) *effectCtx {
+// depletionCtx builds the effectCtx the on_depleted / death-adjacent ops run under: the depleted entity is
+// the ACTOR and TARGET (a self-effect on the subject), the entity the emptying damage was attributed to is
+// both `source` and `other` (so a hook op can reference $other = the slayer / the horror that broke you).
+// It inherits the parent's depth/rng/event-budget so the hook is bounded by the SAME round budget as the
+// swing that triggered it (no fresh 256). disp neutral — a harmful op inside re-decides its own
+// disposition and re-gates.
+//
+// CREDIT (the #407 attribution fix) is the killer carried ALONGSIDE source, not instead of it. `source`
+// stays the victim — a depletion hook's effects are the victim's own — but a blow the hook deals AT THE
+// VICTIM ITSELF (`deal_damage target: self`, the carry-over shape) reached dealDamage with source ==
+// target, so `attributable` was false: no threat, no OnHit, and the kill resolved as die(victim,
+// killer=victim). Measured: a spilled kill gave the attacker 0 OnKill credit and produced a corpse with NO
+// owner window — free-for-all ninja-lootable — where the identical direct kill credited and owned it.
+// Content cannot compensate: an op selects its target, never its attribution.
+//
+// Rebinding `source` to the killer was the obvious fix and is WRONG — it just moves the bug to the mirror
+// case. A `tgt: other` retaliation hook (thorns, a death-curse) would then have source == target == killer,
+// so `attributable` goes false again and the retaliation builds no threat and resolves die(killer,
+// killer=killer). It also silently re-owns state: opApplyAffect keys an affect by c.source, so a sanity
+// break's self-applied 'insane' would become the KILLER's affect (changing per-source stacking and leaving
+// its ticks to fail closed once the killer detaches), and every `$source.*` in an existing hook formula
+// would flip meaning. So credit is a SEPARATE, narrower channel: dealDamage consults it only for a blow
+// whose source and target are the same entity (effect_op.go), which is exactly the self-directed
+// carry-over and nothing else.
+//
+// It does NOT widen the harm gate either way: guardHarmful keys on c.ACTOR, which stays the victim, so the
+// self-harm exemption and spawn-protection rules are byte-for-byte unchanged. A nil killer (a sourceless
+// environmental depletion) leaves credit nil and the old self-attributed shape stands, which is right for
+// the case that genuinely has no attacker.
+func (z *Zone) depletionCtx(victim, killer *Entity, dep depletion, parent *effectCtx) *effectCtx {
 	c := &effectCtx{
-		z: z, actor: victim, source: victim, target: victim, other: killer,
-		mag: 1, disp: dispNeutral,
+		z: z, actor: victim, source: victim, target: victim, other: killer, credit: killer,
+		mag: 1, disp: dispNeutral, depletion: dep,
 	}
 	if parent != nil {
 		c.rng, c.depth, c.eventBudget = parent.rng, parent.depth, parent.eventBudget

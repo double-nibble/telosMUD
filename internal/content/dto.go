@@ -769,8 +769,45 @@ type ResourceDTO struct {
 	//   - Beware WIDTH. An `area:` op in a hook re-empties every entity in the room, each of which fires its
 	//     own hook. The engine caps the total work per blow, but the content is still a room-wide cascade.
 	//
-	// NOT YET AVAILABLE: the hook cannot see HOW FAR past 0 the blow went, so a "carry the excess into the
-	// lethal pool" two-track system can be authored in shape but not in magnitude. That primitive is #407.
+	// THE BLOW'S ARITHMETIC is readable from any formula slot inside the hook (#407), as ctx scalars in the
+	// same `$` family as `$swing.index`:
+	//
+	//	$depletion.overflow — how far PAST 0 the blow drove the pool: the excess it could NOT absorb
+	//	$depletion.applied  — how much the pool actually absorbed ("you lost N sanity")
+	//	$depletion.amount   — the whole mitigated blow; applied + overflow == amount
+	//
+	// That is what makes a TWO-TRACK system authorable: a stun/stagger pool carries its excess into a
+	// lethal one, fatigue below 0 bites into health, an HP-buffer spills into a stat. The carry-over op
+	// reads the overflow through `bonus` (amount 0 + bonus is the standard formula-damage idiom):
+	//
+	//	on_depleted:
+	//	  - {op: deal_damage, target: self, resource: hp, type: trauma,
+	//	     amount: 0, bonus: ["attr", "$depletion.overflow"]}
+	//
+	// AUTHORING NOTES — these are the things that actually bite, all of them verified against the engine:
+	//
+	//   - `amount` IS A PLAIN NUMBER. `amount: ["attr", "$depletion.overflow"]` silently parses to 0 — no
+	//     error, no warning, an op that does nothing. A COMPUTED amount goes in `bonus` (or `dice_count`),
+	//     which is why the example above is `amount: 0` plus a `bonus`.
+	//   - NAME THE DESTINATION `resource`. Omitted, the carry-over lands on the PRIMARY VITAL — usually what
+	//     you want from a non-vital track, and a self-feeding loop when the hook is on the primary vital
+	//     itself (bounded by the depth cap, but not what anyone meant).
+	//   - THE CARRY-OVER IS MITIGATED AGAIN. `$depletion.*` are post-mitigation numbers, so re-dealing one
+	//     runs resist and `soak_<type>` a second time (a soak of 3 turns a 17-point spill into 14). Give the
+	//     carry-over its own damage type with no resist entry and no `soak_` attribute — that is what the
+	//     `trauma` type in the example is for.
+	//   - OVERFLOW 0 STILL FIRES. An exact-to-zero blow runs the hook carrying nothing, so a hook must read
+	//     correctly at 0.
+	//   - THE HOOK RE-RUNS WHILE THE POOL SITS AT 0 (#406 is level-triggered), and a blow onto an empty pool
+	//     overflows by its FULL amount. That is what makes a saturated track keep spilling — and it is why a
+	//     hook must be idempotent and must never grant.
+	//   - `$depletion.*` reads 0 in a `modify_resource`, `apply_affect` duration/magnitude, and any `act`/
+	//     `send` text: those take scalars, not formulas. The formula-capable ops are `deal_damage`, `heal`,
+	//     `restore` and `check` (bonus / vs / band edges, including a band's nested ops). A number cannot be
+	//     interpolated into player-facing text at all today — "you lose N sanity" is not authorable.
+	//   - THERE IS NO THRESHOLD PREDICATE. `if`'s `resource_min` compares a POOL CURRENT, not a ctx scalar,
+	//     so "lost 5+ in one blow" is written as a deterministic 0-dice `check` (`dice: "0d1"`, `bonus:
+	//     ["attr", "$depletion.applied"]`, a band with `min: 5`).
 	OnDepleted []any `json:"on_depleted" yaml:"on_depleted"`
 }
 
