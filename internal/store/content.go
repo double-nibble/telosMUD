@@ -456,7 +456,7 @@ type resourceBody struct {
 	OnEvent           map[string]any    `json:"on_event,omitempty"`        // [G3] event subscriptions (6.2)
 	OnEventLua        map[string]string `json:"on_event_lua,omitempty"`    // [G3] Lua-body event subscriptions (7.4g)
 	OnReactionLua     map[string]string `json:"on_reaction_lua,omitempty"` // result-altering reaction hooks (7.9)
-	OnDepleted        []any             `json:"on_depleted,omitempty"`     // [G-D] death hook (6.3b)
+	OnDepleted        []any             `json:"on_depleted,omitempty"`     // [G-D] depletion hook (6.3b; any pool since #406)
 	PerRound          bool              `json:"per_round,omitempty"`       // [G9] per-round reaction budget (6.4b)
 	Gauge             bool              `json:"gauge,omitempty"`           // #50: player-facing HUD pool (Char.Vitals filter)
 	// Primary is the #71 default-damage-pool flag. It rides the schemaless body JSONB so adding it needs no

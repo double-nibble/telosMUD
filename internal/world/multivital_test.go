@@ -191,7 +191,8 @@ func TestImmunityDiscardNoInstantKill(t *testing.T) {
 
 // TestNonVitalPoolDamageDoesNotKill is the security case: a runtime-supplied `resource` (e.g. a Lua
 // h:damage{resource="mana"}) that the load-time lint can't see. Draining a NON-vital pool (mana) to 0
-// must NOT trigger death — the death checkpoint gates on vitalDepleted (the pool must be `vital`).
+// must NOT trigger death — the depletion checkpoint runs the pool's hook, but the gate into die()
+// (inside onPoolDepleted) is vitalDepleted, which requires the pool to be `vital` (#406).
 func TestNonVitalPoolDamageDoesNotKill(t *testing.T) {
 	z, s := combatZone(t)
 	registerVital(z, "mana", "max_mana", 50, false, false, nil) // vital:false — a resource pool, not a life pool

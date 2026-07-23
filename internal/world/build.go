@@ -114,13 +114,14 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 			onEventLua:        parseLuaEventMap(r.OnEventLua, "resource "+r.Ref),
 			onReactionLua:     parseLuaEventMap(r.OnReactionLua, "resource "+r.Ref+" (reaction)"),
 		}
-		// on_depleted ([G-D]): the death-hook op-list, parsed like any op-list. A malformed list logs
-		// loudly and registers with whatever parsed (content-lint discipline); nil/absent => engine default
-		// death only.
+		// on_depleted ([G-D]): the DEPLETION-hook op-list, parsed like any op-list — for EVERY resource, not
+		// just a vital one (#406): a non-vital pool's hook is its non-lethal consequence. A malformed list logs
+		// loudly and registers with whatever parsed (content-lint discipline); nil/absent => no hook (a vital
+		// pool still dies the engine-default way).
 		if len(r.OnDepleted) > 0 {
 			ops, err := parseOpList(r.OnDepleted)
 			if err != nil {
-				slog.Error("content: resource on_depleted parse failed; death hook runs parsed ops only",
+				slog.Error("content: resource on_depleted parse failed; the depletion hook runs parsed ops only",
 					"resource", r.Ref, "err", err)
 			}
 			rd.onDepleted = ops
@@ -297,6 +298,15 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		slog.Warn("content: deal_damage.resource does not name a registered resource (blow will be discarded)",
 			"owner", m.owner, "resource", m.resource)
 	}
+	// Load-time content-lint (#406): a NON-VITAL resource's on_depleted is FARMABLE if it rewards. Unlike the
+	// vital/death hook — latched to an actual kill by posDead, and for a mob followed by extraction — a
+	// non-vital hook is level-triggered per BLOW, so a pool held at 0 re-runs it for one point of damage,
+	// indefinitely, with no kill required. A granting op in one is therefore an economy exploit, not a
+	// design. Warn LOUDLY at build rather than leaving it to prose in the DTO comment.
+	for _, m := range lintDepletionHookGrants(d) {
+		slog.Warn("content: a NON-VITAL resource's on_depleted contains a REWARDING op — it can be farmed by repeatedly damaging a pool already at 0 (no kill required); move the reward to a vital pool's hook or an event handler",
+			"resource", m.resource, "op", m.op)
+	}
 	// Load-time content-lint (docs/REMAINING.md §4): every learn_profession op's `profession` must name a
 	// registered kind:"profession" bundle. professionIsCapped/uncapped resolve the D2 cap by looking up
 	// that bundle (ref == the membership ref by convention); a miss means the trade grants nothing AND its
@@ -405,6 +415,64 @@ func lintDealDamageResources(d *defRegistries) []dealDamageResourceMiss {
 		}
 	})
 	return misses
+}
+
+// depletionHookGrant is one content-lint finding (#406): a NON-VITAL resource's on_depleted op-list
+// contains a REWARDING op. resource names the pool; op names the offending op kind.
+type depletionHookGrant struct {
+	resource string
+	op       string
+}
+
+// rewardingOps is the set of op kinds that hand out durable value — items, progression, abilities,
+// professions. They are the ops that must not sit in a farmable hook. Deliberately a DENY-list of things
+// that GRANT, not an allow-list of things that are safe: a narration/affect/damage op in a depletion hook
+// is the normal case and must stay lint-clean. Keep in sync with the op registry (effect_op.go).
+var rewardingOps = map[string]bool{
+	"produce_item": true, "augment_item": true,
+	"grant_track": true, "advance_track": true,
+	"grant_ability": true, "apply_bundle": true,
+	"learn_profession": true,
+}
+
+// lintDepletionHookGrants flags a rewarding op inside a NON-VITAL resource's on_depleted (#406). The
+// vital/death hook is exempt: it is latched to a real kill (posDead, and a mob is then extracted), so its
+// reward is once-per-death. A non-vital hook has no such latch and is LEVEL-triggered — every blow that
+// leaves the pool at 0 re-runs it, so a pool parked at 0 pays out for one point of damage per swing,
+// forever, with nothing dying. It walks the op TREE (flow branches + check bands) via the shared walker, so
+// a reward buried in an `if`/`chance`/`check` band is caught too. Build-time only; the caller logs at WARN
+// (does not abort boot), like the other content-lints.
+func lintDepletionHookGrants(d *defRegistries) []depletionHookGrant {
+	var found []depletionHookGrant
+	for ref, def := range d.res.table() {
+		if def == nil || def.vital || len(def.onDepleted) == 0 {
+			continue
+		}
+		var walk func(ops []effectOp)
+		walk = func(ops []effectOp) {
+			for i := range ops {
+				op := &ops[i]
+				if rewardingOps[op.kind] {
+					found = append(found, depletionHookGrant{resource: ref, op: op.kind})
+				}
+				walk(op.then)
+				walk(op.els)
+				if op.check != nil {
+					for j := range op.check.bands {
+						walk(op.check.bands[j].ops)
+					}
+				}
+			}
+		}
+		walk(def.onDepleted)
+	}
+	sort.Slice(found, func(i, j int) bool {
+		if found[i].resource != found[j].resource {
+			return found[i].resource < found[j].resource
+		}
+		return found[i].op < found[j].op
+	})
+	return found
 }
 
 // learnProfessionMiss is one content-lint finding: a learn_profession op whose `profession` does not name

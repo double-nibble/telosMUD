@@ -72,7 +72,7 @@ func TestMobDeathDropsCorpseWithLoot(t *testing.T) {
 
 // TestOnVitalDepletedIdempotent pins the posDead latch (distsys review S1): a SECOND depletion of an
 // already-dead victim — the case a DoT/affect tick or any non-swing source will create — must NO-OP,
-// not double-fire OnKill or build a duplicate corpse. die() sets posDead; onVitalDepleted checks it.
+// not double-fire OnKill or build a duplicate corpse. die() sets posDead; onPoolDepleted checks it.
 func TestOnVitalDepletedIdempotent(t *testing.T) {
 	z, s := combatZone(t)
 	z.defs.combat.register("killer", killShotProfile(100))
@@ -101,9 +101,9 @@ func TestOnVitalDepletedIdempotent(t *testing.T) {
 	}
 
 	// A second depletion (stand-in for a DoT tick landing on the already-dead mob) must be a clean no-op.
-	z.onVitalDepleted(mob, s.entity, "hp", nil)
+	z.onPoolDepleted(mob, s.entity, "hp", nil)
 	if got := countCorpses(); got != 1 {
-		t.Fatalf("second onVitalDepleted built a duplicate corpse: %d corpses, want 1 (latch failed)", got)
+		t.Fatalf("second onPoolDepleted built a duplicate corpse: %d corpses, want 1 (latch failed)", got)
 	}
 }
 

@@ -700,7 +700,8 @@ type FormulaNodeDTO = any
 
 // ResourceDTO is one content-defined resource pool (docs/ABILITIES.md §1, §1.2). max_attr names the
 // DERIVED attribute that caps the pool (so gear/affects that raise max_hp flow through derivation);
-// the engine holds `current`. vital + on_depleted is how "hp at 0 = death" is content (5.2/combat).
+// the engine holds `current`. `vital` is how "hp at 0 = death" is content (5.2/combat); on_depleted is the
+// consequence of emptying ANY pool and is independent of it (#406).
 type ResourceDTO struct {
 	Ref         string `json:"ref" yaml:"ref"`
 	DisplayName string `json:"display_name" yaml:"display_name"`
@@ -739,12 +740,37 @@ type ResourceDTO struct {
 	// modify/replace_target/consume_resource). Distinct from OnEventLua so a dual-fired checkpoint never
 	// runs one handler twice.
 	OnReactionLua map[string]string `json:"on_reaction_lua" yaml:"on_reaction_lua"`
-	// OnDepleted is the op-list the engine runs when THIS VITAL resource hits 0 — the [G-D] death hook
-	// (Phase 6.3b). It runs ON the dying entity (the victim is $actor) BEFORE the engine's die() drops
-	// combat and builds the corpse, so content can narrate or fire a last-gasp effect. An empty/absent
-	// list means "default death" (the engine still runs die()); the op-list is additive flavor, not a
-	// replacement for the engine death machinery. Only meaningful on a vital resource. With multiple vital
-	// pools (#71) each vital carries its OWN on_depleted, run for the pool that actually depleted.
+	// OnDepleted is the op-list the engine runs when DAMAGE empties THIS resource — the [G-D] depletion
+	// hook (Phase 6.3b, generalized by #406). It runs ON the depleted entity ($actor; the damage source is
+	// $other). Each pool carries its OWN on_depleted, run for the pool that actually depleted (#71).
+	//
+	//   - On a VITAL resource it is the DEATH hook: it runs BEFORE the engine's die() drops combat and
+	//     builds the corpse, so content can narrate, fire a last-gasp effect, or CANCEL the death by
+	//     reviving that pool above 0. An empty/absent list means "default death" (die() still runs); the
+	//     op-list is additive flavor, not a replacement for the engine death machinery.
+	//   - On a NON-VITAL resource (#406) it is a plain, NON-LETHAL consequence — the Call of Cthulhu model:
+	//     a `sanity` pool bottoming out applies an 'insane' affect, a Stun track incapacitates. It can
+	//     never reach die(); `vital` is what makes death the default consequence. A hook that WANTS the
+	//     break to be fatal says so by dealing damage to a vital pool.
+	//
+	// TRIGGER: the DAMAGE path only — an ability cost, a modify_resource, or a max drop that brings the
+	// pool to 0 fires nothing; the hook means "damage emptied this pool". It is LEVEL-triggered: EVERY blow
+	// that leaves the pool at 0 runs it, including blows onto an already-empty pool. That is what makes a
+	// two-track system work (a stun track whose excess carries into a lethal pool has to keep carrying it
+	// over, not just once), and it is the rule the vital/death path has always used.
+	//
+	// AUTHORING RULES that follow from level-triggering — a non-vital hook has no posDead latch to stop it
+	// repeating while the pool sits empty:
+	//   - Make it IDEMPOTENT. Guard with `if has_affect: <ref>` and/or give the applied affect
+	//     `stacking: ignore`, or the narration re-prints and the duration re-refreshes on every blow.
+	//   - NEVER put a REWARDING op in one (produce_item, advance_track, grant_ability, a currency grant).
+	//     A pool held at 0 can be hit repeatedly on purpose, which would make the reward farmable.
+	//     lintDepletionHookGrants warns at load when a non-vital hook contains one.
+	//   - Beware WIDTH. An `area:` op in a hook re-empties every entity in the room, each of which fires its
+	//     own hook. The engine caps the total work per blow, but the content is still a room-wide cascade.
+	//
+	// NOT YET AVAILABLE: the hook cannot see HOW FAR past 0 the blow went, so a "carry the excess into the
+	// lethal pool" two-track system can be authored in shape but not in magnitude. That primitive is #407.
 	OnDepleted []any `json:"on_depleted" yaml:"on_depleted"`
 }
 

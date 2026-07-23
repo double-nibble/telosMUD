@@ -194,7 +194,7 @@ func TestFleeIntoLethalOpportunityAttackRespawnsNotTeleports(t *testing.T) {
 // TestDeathWardCancelsDeath proves the user-mandated cancellable death checkpoint: a victim whose
 // on_depleted hook sets hp to 1 and applies a "rooted" (can't-move) affect does NOT die — no corpse, no
 // respawn, position stays living, and the victim ends at hp=1, rooted. The on_depleted re-check IS the
-// declarative cancel: the hook revived the vital above 0, so onVitalDepleted aborts before die().
+// declarative cancel: the hook revived the vital above 0, so onPoolDepleted aborts before die().
 func TestDeathWardCancelsDeath(t *testing.T) {
 	z, s := combatZone(t)
 	// The "rooted" CC affect the death-ward applies — a can't-move affect via a prevents tag, no stat mod.
@@ -248,13 +248,13 @@ stillPresent:
 
 // TestRecursiveOnDepletedTerminates is the M1 regression: an on_depleted that RE-DEALS lethal damage to
 // the dying entity (a buggy/malicious death hook) must TERMINATE — bounded at maxEventDepth by the death
-// seam (death.go runDeathHook) — not recurse forever into a process-fatal stack overflow. The hook can't
+// seam (death.go runDepletionHook) — not recurse forever into a process-fatal stack overflow. The hook can't
 // save the victim (it only does more damage), so the entity ends DEAD. Reaching the assertions at all is
 // the proof: an unbounded cycle would have crashed the whole process before any assert ran.
 func TestRecursiveOnDepletedTerminates(t *testing.T) {
 	z, s := combatZone(t)
 	// hp's on_depleted re-deals 50 lethal damage to SELF — the runaway the auditor reproduced. Each level
-	// empties the (already-0, re-revived-to-0?) pool and would call back into onVitalDepleted forever
+	// empties the (already-0, re-revived-to-0?) pool and would call back into onPoolDepleted forever
 	// without the depth cap. The hook never raises the vital, so the victim stays depleted -> dies.
 	z.defs.res.register("hp", &resourceDef{
 		ref: "hp", maxAttr: "max_hp", vital: true,

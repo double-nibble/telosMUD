@@ -334,7 +334,7 @@ type resourceDef struct {
 	ref         string
 	displayName string
 	maxAttr     string // derived-attr ref capping the pool; "" => no cap (unbounded)
-	vital       bool   // depletion drives death (on_depleted) — wired in 5.2/combat
+	vital       bool   // depletion drives DEATH. Since #406 that is all it means: on_depleted runs for any pool
 	// primary designates the DEFAULT-damage vital (#71 multi-vital): unrouted damage (a swing, a
 	// deal_damage with no `resource`) hits this pool. Only consulted when >1 vital exists — vitalResource
 	// prefers the primary-flagged vital, else falls back to the lowest-ref one. Immutable after build.
@@ -365,10 +365,16 @@ type resourceDef struct {
 	// onReactionLua[BeforeCastCommit] counterspell). Distinct from onEventLua so a checkpoint fired by
 	// both the bus and the reaction pass never double-fires one handler. nil => none.
 	onReactionLua map[eventKind]string
-	// onDepleted is the parsed op-list the engine runs on the dying entity when this VITAL resource
-	// hits 0 ([G-D] death hook, death.go). Runs BEFORE die() drops combat / builds the corpse, with the
-	// victim as $actor, so content can narrate / fire a last effect. nil/empty => engine default death
-	// only. Only consulted for the vital resource (vitalResource). Immutable after build.
+	// onDepleted is the parsed op-list the engine runs on an entity when DAMAGE empties this resource
+	// ([G-D] depletion hook, death.go). Runs with the depleted entity as $actor and the damage source as
+	// $other. For a VITAL resource it is the death hook: it runs BEFORE die() drops combat / builds the
+	// corpse, so content can narrate / fire a last effect / cancel the death by reviving the pool.
+	// For a NON-VITAL resource (#406) it is a plain consequence — a Sanity break applying 'insane', a Stun
+	// track carrying its excess into a lethal pool — and never reaches die(). nil/empty => no hook (a vital
+	// pool still dies the engine-default way). Fires on the DAMAGE path only: a cost, a modify_resource, or
+	// a max drop that brings the pool to 0 runs no hook. LEVEL-triggered: every blow that leaves the pool at
+	// 0 runs it, including one onto an already-empty pool (see the dealDamage checkpoint for why, and
+	// ResourceDTO.OnDepleted for the authoring rules that follow). Immutable after build.
 	onDepleted []effectOp
 }
 
