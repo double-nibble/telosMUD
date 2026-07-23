@@ -784,9 +784,30 @@ type ResourceDTO struct {
 	//	  - {op: deal_damage, target: self, resource: hp, type: trauma,
 	//	     amount: 0, bonus: ["attr", "$depletion.overflow"]}
 	//
-	// Two authoring notes. The carry-over op MUST name its destination `resource` explicitly — left to
-	// route by damage type it would land back in the pool it came from and loop. And an exact-to-zero blow
-	// has overflow 0, which still fires the hook, so a hook must read correctly at 0.
+	// AUTHORING NOTES — these are the things that actually bite, all of them verified against the engine:
+	//
+	//   - `amount` IS A PLAIN NUMBER. `amount: ["attr", "$depletion.overflow"]` silently parses to 0 — no
+	//     error, no warning, an op that does nothing. A COMPUTED amount goes in `bonus` (or `dice_count`),
+	//     which is why the example above is `amount: 0` plus a `bonus`.
+	//   - NAME THE DESTINATION `resource`. Omitted, the carry-over lands on the PRIMARY VITAL — usually what
+	//     you want from a non-vital track, and a self-feeding loop when the hook is on the primary vital
+	//     itself (bounded by the depth cap, but not what anyone meant).
+	//   - THE CARRY-OVER IS MITIGATED AGAIN. `$depletion.*` are post-mitigation numbers, so re-dealing one
+	//     runs resist and `soak_<type>` a second time (a soak of 3 turns a 17-point spill into 14). Give the
+	//     carry-over its own damage type with no resist entry and no `soak_` attribute — that is what the
+	//     `trauma` type in the example is for.
+	//   - OVERFLOW 0 STILL FIRES. An exact-to-zero blow runs the hook carrying nothing, so a hook must read
+	//     correctly at 0.
+	//   - THE HOOK RE-RUNS WHILE THE POOL SITS AT 0 (#406 is level-triggered), and a blow onto an empty pool
+	//     overflows by its FULL amount. That is what makes a saturated track keep spilling — and it is why a
+	//     hook must be idempotent and must never grant.
+	//   - `$depletion.*` reads 0 in a `modify_resource`, `apply_affect` duration/magnitude, and any `act`/
+	//     `send` text: those take scalars, not formulas. The formula-capable ops are `deal_damage`, `heal`,
+	//     `restore` and `check` (bonus / vs / band edges, including a band's nested ops). A number cannot be
+	//     interpolated into player-facing text at all today — "you lose N sanity" is not authorable.
+	//   - THERE IS NO THRESHOLD PREDICATE. `if`'s `resource_min` compares a POOL CURRENT, not a ctx scalar,
+	//     so "lost 5+ in one blow" is written as a deterministic 0-dice `check` (`dice: "0d1"`, `bonus:
+	//     ["attr", "$depletion.applied"]`, a band with `min: 5`).
 	OnDepleted []any `json:"on_depleted" yaml:"on_depleted"`
 }
 

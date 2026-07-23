@@ -3,7 +3,6 @@ package world
 import (
 	"math/rand"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -98,16 +97,21 @@ func TestOverflowEdgeCases(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			z, s := combatZone(t)
+			z, s := depletionZone(t)
 			registerPool(z, "spilled", "max_spilled", 1000, nil, false)
-			registerPool(z, "stagger", "max_stagger", 100, spillHook("spilled"), false)
+			// A COUNTER alongside the spill. The exact-to-zero row is otherwise false-green: "carried 0" is
+			// equally true if the hook never ran, so gating the checkpoint on `overflow > 0` would pass. The
+			// cardinality assertion below is what makes "overflow 0 STILL FIRES" a pinned contract.
+			registerPool(z, "stagger", "max_stagger", 100, append(countingHook(), spillHook("spilled")...), false)
 
 			mob := combatMob(z, s.entity, "subject", "", 100)
 			setResourceCurrent(mob, "stagger", tc.start)
 			setResourceCurrent(mob, "spilled", 1000)
+			setResourceCurrent(mob, "fired", 0)
 
 			dealTo(z, s.entity, mob, float64(tc.blow), "slash", "stagger")
 
+			require.Equal(t, 1, firedCount(mob), "the hook must have fired exactly once for this blow")
 			require.Equal(t, tc.wantOverflow, 1000-resourceCurrent(mob, "spilled"), tc.why)
 		})
 	}
@@ -129,6 +133,48 @@ func TestNonDepletingBlowCarriesNoOverflow(t *testing.T) {
 
 	require.Equal(t, 40, resourceCurrent(mob, "stagger"), "precondition: the pool survived the blow")
 	require.Equal(t, 500, resourceCurrent(mob, "spilled"), "a non-depleting blow must carry nothing")
+}
+
+// --- The scalar resolves in a CHECK, not just in a damage bonus ---------------------------------
+
+// TestDepletionScalarsResolveInsideACheck pins a claim the DTO doc makes and nothing else covered: that
+// `$depletion.*` works in a `check` spec — its bonus, its `vs`, its band edges, and the ops nested inside a
+// band. That is what makes the threshold shape authorable ("losing 5+ in one blow breaks you", the Call of
+// Cthulhu / Delta Green rule), since `if`'s resource_min compares a POOL CURRENT and cannot see a ctx
+// scalar. A deterministic 0-dice check is the idiom, so the branch taken is a pure function of the blow.
+func TestDepletionScalarsResolveInsideACheck(t *testing.T) {
+	z, s := depletionZone(t)
+	registerPool(z, "broke", "max_broke", 100, nil, false)
+	// A 0-dice check whose bonus IS the amount absorbed, banded at 5: a big single loss breaks you.
+	registerPool(z, "sanity", "max_sanity", 100, []effectOp{{
+		kind: "check",
+		check: &checkSpec{
+			label: "Shock", dice: mustDiceT("0d1"),
+			bonus: attrNode{ref: "$depletion.applied"},
+			bands: []checkBand{
+				{label: "shattered", min: litNode{v: 5}, ops: []effectOp{
+					{kind: "modify_resource", tgt: "self", resource: "broke", amount: 1},
+				}},
+				{label: "held", ops: nil},
+			},
+		},
+	}}, false)
+
+	// A big loss: 8 absorbed (>= 5) must take the shattered band.
+	big := combatMob(z, s.entity, "scholar", "", 100)
+	setResourceCurrent(big, "sanity", 8)
+	setResourceCurrent(big, "broke", 0)
+	dealTo(z, s.entity, big, 20, "slash", "sanity")
+	require.Equal(t, 1, resourceCurrent(big, "broke"),
+		"a check band edge did not see $depletion.applied — the threshold idiom the docs prescribe does not work")
+
+	// A small loss: 2 absorbed (< 5) must NOT. Both directions, or the band proves nothing.
+	small := combatMob(z, s.entity, "clerk", "", 100)
+	setResourceCurrent(small, "sanity", 2)
+	setResourceCurrent(small, "broke", 0)
+	dealTo(z, s.entity, small, 20, "slash", "sanity")
+	require.Equal(t, 0, resourceCurrent(small, "broke"),
+		"a loss below the threshold took the shattered band — the check is not reading the scalar")
 }
 
 // --- The scalar is SCOPED to the hook ------------------------------------------------------------
@@ -210,28 +256,115 @@ func TestStunTrackOverflowKillsThroughTheVitalPool(t *testing.T) {
 	require.Equal(t, 1, countRoomCorpses(room), "exactly one corpse")
 }
 
+// --- A spilled kill CREDITS THE REAL KILLER ------------------------------------------------------
+
+// TestSpilledKillCreditsTheAttacker is the attribution case, and it is the one that makes the two-track
+// system a real mechanic rather than a demo. The lethal blow arrives from INSIDE the victim's own hook
+// (`deal_damage target: self`), so before the fix the depletion ctx attributed it to the victim: no threat,
+// no OnHit, and die(victim, killer=victim). Measured consequences of that — the player got ZERO xp because
+// OnKill fired with the MOB as its subject, and the corpse was built with no owner window, i.e. free-for-all
+// ninja-lootable — while the identical DIRECT kill credited and owned normally.
+//
+// Content cannot compensate: an op selects its target, never its attribution. So this asserts the two
+// things a player actually experiences — did I get credit, and is the corpse mine.
+func TestSpilledKillCreditsTheAttacker(t *testing.T) {
+	z, s := combatZone(t)
+	// An "honor" pool on the KILLER with an OnKill handler: the canonical XP-credit shape (death_test.go).
+	z.defs.attr.register("max_honor", &attributeDef{ref: "max_honor", base: litNode{v: 100}})
+	z.defs.res.register("honor", &resourceDef{
+		ref: "honor", maxAttr: "max_honor",
+		onEvent: map[eventKind][]effectOp{
+			evOnKill: {{kind: "modify_resource", resource: "honor", amount: 7, tgt: "self"}},
+		},
+	})
+	registerPool(z, "stagger", "max_stagger", 100, spillHook("hp"), false)
+	setResourceCurrent(s.entity, "honor", 0)
+
+	mob := combatMob(z, s.entity, "brute", "", 20)
+	room := mob.location
+	setResourceCurrent(mob, "stagger", 5)
+
+	// One blow to the NON-VITAL track. Its overflow spills into hp and kills.
+	dealTo(z, s.entity, mob, 500, "slash", "stagger")
+
+	require.Equal(t, posDead, position(mob), "precondition: the spill must actually have killed")
+	require.Equal(t, 7, resourceCurrent(s.entity, "honor"),
+		"a SPILLED kill awarded the attacker no OnKill credit — the overflow blow was self-attributed to the victim")
+
+	corpse := roomCorpse(room)
+	require.NotNil(t, corpse, "precondition: a corpse")
+	co, ok := Get[*CorpseOwner](corpse)
+	require.True(t, ok, "a spilled kill left the corpse with NO owner window — free-for-all ninja-lootable")
+	require.Equal(t, "Hero", co.owner, "the corpse must be owned by the real killer, not the victim")
+}
+
+// TestRetaliationHookKeepsItsOwnAttribution is the MIRROR case, and it exists because the obvious version
+// of the fix above (rebind the hook ctx's `source` to the killer) passes the credit test and silently
+// breaks this one. A `tgt: other` hook — thorns, a death-curse, "lash back at whatever broke you" — deals
+// its blow at the KILLER. With source rebound to the killer that blow would be source == target again:
+// no threat, no OnHit, and a retaliation KILL would resolve die(killer, killer=killer). The narrow `credit`
+// channel substitutes only for a self-directed blow, so retaliation is attributed exactly as before.
+func TestRetaliationHookKeepsItsOwnAttribution(t *testing.T) {
+	z, s := combatZone(t)
+	registerPool(z, "sanity", "max_sanity", 100, []effectOp{
+		{kind: "deal_damage", tgt: "other", resource: "hp", amount: 40},
+	}, false)
+
+	attacker := combatMob(z, s.entity, "horror", "", 100)
+	victim := combatMob(z, s.entity, "seer", "", 100)
+	setResourceCurrent(victim, "sanity", 5)
+
+	c := &effectCtx{
+		z: z, actor: attacker, source: attacker, target: victim,
+		mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1)),
+	}
+	dealDamage(c, victim, 50, "slash", "sanity")
+
+	require.Equal(t, 60, resourceCurrent(attacker, "hp"), "precondition: the retaliation landed on the attacker")
+	require.Positive(t, attacker.living.threat[victim],
+		"the retaliation built NO threat on the attacker — a `tgt: other` hook must stay attributed to the victim, not be self-directed")
+}
+
+// TestSourcelessDepletionStaysSelfAttributed is the other side of the attribution fix: with NO attacker to
+// credit (an environmental/ambient depletion — a sourceless DoT, a trap), the hook must fall back to the
+// victim rather than crediting nobody or nil-derefing. The old shape was right for exactly this case.
+func TestSourcelessDepletionStaysSelfAttributed(t *testing.T) {
+	z, s := combatZone(t)
+	registerPool(z, "spilled", "max_spilled", 500, nil, false)
+	registerPool(z, "stagger", "max_stagger", 100, spillHook("spilled"), false)
+
+	mob := combatMob(z, s.entity, "wanderer", "", 100)
+	setResourceCurrent(mob, "stagger", 10)
+	setResourceCurrent(mob, "spilled", 500)
+
+	// A SOURCELESS blow: no attacker at all (an ambient hazard).
+	c := &effectCtx{z: z, actor: mob, source: nil, target: mob, mag: 1, disp: dispHarmful, rng: rand.New(rand.NewSource(1))}
+	dealDamage(c, mob, 30, "slash", "stagger")
+
+	require.Equal(t, 480, resourceCurrent(mob, "spilled"),
+		"a sourceless depletion must still run its hook and carry its overflow")
+	require.NotEqual(t, posDead, position(mob))
+}
+
 // TestOverflowCascadeIsBounded is the safety case. Overflow is content-controllable magnitude at a seam
 // that can re-enter itself: two pools whose hooks spill into each other are a mutual cascade. Overflow
 // never AMPLIFIES on its own (overflow <= the blow), but a content formula could multiply it, so the
 // depth/budget bound at the depletion seam has to hold with the new amount source in play.
 func TestOverflowCascadeIsBounded(t *testing.T) {
-	z, s := combatZone(t)
-	registerPool(z, "alpha", "max_alpha", 100, []effectOp{
-		{
-			kind: "deal_damage", tgt: "self", resource: "beta", amount: 0,
+	z, s := depletionZone(t)
+	amplify := func(into string) []effectOp {
+		return append(countingHook(), effectOp{
+			kind: "deal_damage", tgt: "self", resource: into, amount: 0,
 			bonus: opNode{op: "*", args: []formulaNode{attrNode{ref: "$depletion.overflow"}, litNode{v: 3}}},
-		}, // deliberately amplifying
-	}, false)
-	registerPool(z, "beta", "max_beta", 100, []effectOp{
-		{
-			kind: "deal_damage", tgt: "self", resource: "alpha", amount: 0,
-			bonus: opNode{op: "*", args: []formulaNode{attrNode{ref: "$depletion.overflow"}, litNode{v: 3}}},
-		},
-	}, false)
+		})
+	}
+	registerPool(z, "alpha", "max_alpha", 100, amplify("beta"), false)
+	registerPool(z, "beta", "max_beta", 100, amplify("alpha"), false)
 
 	mob := combatMob(z, s.entity, "ouroboros", "", 100)
 	setResourceCurrent(mob, "alpha", 5)
 	setResourceCurrent(mob, "beta", 5)
+	setResourceCurrent(mob, "fired", 0)
 
 	c := &effectCtx{
 		z: z, actor: s.entity, source: s.entity, target: mob,
@@ -239,15 +372,15 @@ func TestOverflowCascadeIsBounded(t *testing.T) {
 	}
 	require.Nil(t, c.eventBudget, "precondition: a nil budget — the seam must bound this on its own")
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		dealDamage(c, mob, 50, "slash", "alpha")
-	}()
-	select {
-	case <-done:
-	case <-time.After(20 * time.Second):
-		t.Fatal("an amplifying overflow cascade did not terminate — the depletion seam's bound does not hold")
-	}
+	// Assert the COUNT of hook executions, not wall-clock. A timeout oracle would be both flaky and
+	// useless here: the real failure mode of an unbounded cascade is a process-fatal stack overflow, which
+	// no timeout can observe — the test binary is already gone. The count is what actually distinguishes
+	// "bounded" from "runaway", and it fails loudly rather than hanging.
+	dealDamage(c, mob, 50, "slash", "alpha")
+
+	fired := firedCount(mob)
+	require.Positive(t, fired, "the cascade must actually have run (else this test proves nothing)")
+	require.LessOrEqual(t, fired, maxEventHandlers,
+		"an AMPLIFYING overflow cascade ran %d hooks off one blow — the seam's bound does not hold with a content-controlled magnitude", fired)
 	require.NotEqual(t, posDead, position(mob), "no vital pool was touched, so nothing may have died")
 }

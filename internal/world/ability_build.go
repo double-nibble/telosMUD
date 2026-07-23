@@ -524,7 +524,22 @@ func mapFloat(m map[string]any, key string) float64 {
 		return float64(n)
 	case int64:
 		return float64(n)
+	case nil:
+		return 0 // an explicit `amount:` with no value is an empty field, not a mis-typed one
 	default:
+		// PRESENT BUT NOT A NUMBER. Silently reading 0 here is the single easiest way to author an op that
+		// does nothing at all — no parse error, no runtime error, just a no-op the builder discovers in
+		// play. The trap got much easier to fall into with the ctx scalars (#407): the natural first guess
+		// is `amount: ["attr", "$depletion.overflow"]`, which lands here and yields 0, when the computed
+		// form belongs in `bonus`/`dice_count`. Content-lint discipline: log LOUDLY, still return 0.
+		//
+		// This is the generic scalar reader for EVERY op field (amount, duration, magnitude, chance, min…),
+		// so the message names the field and the offending value but cannot name the owning def — parseOp
+		// has no owner threaded through it, unlike the registry-walking lints in build.go. Good enough to
+		// act on (the value is usually unique in a pack); threading an owner through the op parser is a
+		// bigger change than this warning is worth.
+		slog.Warn("content: op field is present but not a number; it reads 0 — a COMPUTED value belongs in `bonus` or `dice_count`, not in a scalar field",
+			"field", key, "value", fmt.Sprintf("%v", v))
 		return 0
 	}
 }

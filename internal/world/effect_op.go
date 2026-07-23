@@ -73,6 +73,13 @@ type effectCtx struct {
 	// after opDealDamage returns — that read-back corrupts when death/respawn fires inside dealDamage (a
 	// player respawn restores full hp, so a `before - after` delta goes negative). 0 until dealDamage runs.
 	lastDamage int
+	// credit is the attacker to ATTRIBUTE a self-directed blow to (#407). It is set only on a depletion ctx
+	// (death.go), and dealDamage consults it only when a blow's source and target are the SAME entity —
+	// i.e. the carry-over shape, a hook dealing the overflow at the entity whose pool just emptied. Without
+	// it that blow is self-attributed and a kill through it credits nobody: no OnKill subject, no XP, no
+	// corpse loot-ownership window. It is deliberately NOT `source`: rebinding source would break the
+	// mirror case (a `tgt: other` retaliation) and would silently re-own affects and `$source.*` scope.
+	credit *Entity
 	// depletion is the arithmetic of the depletion this ctx was built for (#407) — how much of the blow the
 	// pool absorbed and how much overflowed past 0. Set ONLY on a depletionCtx (death.go), so it is scoped
 	// to exactly one hook execution and cannot bleed into the swing/cast ctx that outlives the checkpoint.
@@ -702,6 +709,15 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	// attacker the damage is attributed to (the swing attacker; a DoT's applier; nil for a sourceless
 	// environmental hit). A self/ambient DoT (source == target) is NOT an attacker — no threat, no OnHit.
 	src := c.source
+	// ATTRIBUTION SUBSTITUTION (#407): a depletion hook runs with source == the victim, so a blow it deals
+	// AT THE VICTIM (the carry-over: "spill my overflow into my own hp") is self-directed and would be
+	// credited to nobody — no threat, no OnHit, and a kill through it resolves die(victim, killer=victim),
+	// costing the real attacker the OnKill subject, XP and the corpse loot-ownership window. `credit` is the
+	// attacker the depletion was attributed to; substituting it ONLY here, for a genuinely self-directed
+	// blow, leaves a `tgt: other` retaliation hook (thorns / death-curse) attributed exactly as before.
+	if src == target && c.credit != nil {
+		src = c.credit
+	}
 	attributable := src != nil && src != target
 	if attributable {
 		// Threat the attacker built on the target — accrued BEFORE the death scrub (die() clears the
