@@ -621,19 +621,43 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	if !guardHarmful(c, target) {
 		return 0
 	}
-	// Resolve WHICH vital/resource pool this blow hits (#71). An explicit `resource` routes there; empty
-	// falls back to the primary vital. A NAMED pool the target has no capacity for (derived max <= 0 — a
-	// mindless construct with no "sanity") is NATURAL IMMUNITY: discard here, before mitigation/reaction/
-	// threat, exactly like a fully-resisted hit — never write its current negative (which would read as
-	// depleted and, for a vital, instant-kill). The default (resource == "") path is unguarded to keep the
-	// legacy swing/DoT behavior byte-for-byte; the checkpoint's vitalDepleted still gates on max > 0.
-	pool := resource
+	// Resolve WHICH vital/resource pool this blow hits, in three tiers (#71 + #405):
+	//
+	//	op.resource  ??  damage_type.target_resource  ??  the primary vital
+	//
+	// The op-level `resource` is the per-blow override and always wins. Failing that, the damage TYPE may
+	// name its own pool (#405): `psychic` routes to `sanity`, `bashing` to a stun track. That is how real
+	// systems name the track, and it is what makes the routing hold for damage the pack did not author —
+	// a third-party psychic spell, a mob's natural weapon, a Lua h:damage — none of which can be made to
+	// repeat `resource: sanity` on every op. It also covers the SWING path, which sets a damage type from
+	// the weapon but never a resource. Failing both, unrouted damage lands on the primary vital: the
+	// legacy behavior, byte-for-byte.
+	//
+	// NATURAL IMMUNITY: a ROUTED pool the target has no capacity for (derived max <= 0 — a mindless
+	// construct with no "sanity") is discarded here, before mitigation/reaction/threat, exactly like a
+	// fully-resisted hit. `routed` is what the discard keys on, NOT `resource != ""` — a type-routed blow
+	// is just as explicit a naming of a pool as an op-level one, and leaving it unguarded is the sharp
+	// edge #405 introduces: without the discard the blow writes a phantom current on a pool the entity has
+	// no capacity in, which (a) makes entityHasResource true forever, silently subscribing it to that
+	// resource's event handlers, (b) persists through dumpResources, and (c) is a stored one-way door —
+	// resourceCurrent's "absent reads as full" no longer applies, so if that pool EVER gains capacity
+	// (gear, an affect, a class grant, a content patch) the entity reads permanently empty on it, and for
+	// a vital pool the next point of damage is an instant kill.
+	//
+	// The UNROUTED path stays unguarded, deliberately: that is the legacy swing/DoT behavior and the
+	// checkpoint's max > 0 clause still stands behind it.
+	pool, routed := resource, resource != ""
+	if pool == "" {
+		if p := damageTypePool(target, dmgType); p != "" {
+			pool, routed = p, true
+		}
+	}
 	if pool == "" {
 		pool = vitalResource(target)
 	}
-	if resource != "" && resourceMax(target, pool) <= 0 {
+	if routed && resourceMax(target, pool) <= 0 {
 		c.z.log.Debug("deal_damage: target immune (no capacity in pool); discarded",
-			"target", target.short, "pool", pool)
+			"target", target.short, "pool", pool, "type", dmgType)
 		return 0
 	}
 	dmg := mitigate(target, raw, dmgType)
@@ -773,6 +797,24 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 		c.z.onPoolDepleted(target, src, pool, depletion{overflow: overflow, applied: dmg - overflow, amount: dmg}, c)
 	}
 	return dmg
+}
+
+// damageTypePool returns the resource pool the damage TYPE `dmgType` routes to (#405), or "" when the type
+// is unknown, names no pool, or the target carries no content at all. It is the middle tier of dealDamage's
+// routing precedence — consulted only when the op named no `resource` of its own.
+//
+// Deliberately shaped like mitigate: it takes the target and reads the type's def off target.zone through
+// the same accessor, so the two type-keyed lookups in the damage path read the same registry the same way
+// and neither depends on c.z (which can in principle differ from target.zone). Zone-goroutine read
+// (registry atomic.Load).
+func damageTypePool(target *Entity, dmgType string) string {
+	if target == nil || target.zone == nil || dmgType == "" {
+		return ""
+	}
+	if def := target.zone.damageTypeDefs().get(dmgType); def != nil {
+		return def.targetResource
+	}
+	return ""
 }
 
 // mitigate runs the raw damage through the damage_type_def's resist/vuln/immune matrix and the

@@ -819,6 +819,25 @@ type DamageTypeDTO struct {
 	DisplayName string             `json:"display_name" yaml:"display_name"`
 	Color       string             `json:"color" yaml:"color"`
 	Resist      map[string]float64 `json:"resist" yaml:"resist"`
+	// TargetResource routes damage of THIS KIND to a named resource pool (#405) — `psychic` to `sanity`,
+	// `bashing` to a stun track. It is how a system NAMES its tracks, and it saves an author repeating
+	// `resource: sanity` on every op. More importantly it is the only thing that routes damage the pack did
+	// not author: a third-party psychic spell, a mob's natural weapon, a Lua `h:damage{type=...}`, and every
+	// melee SWING (which carries the weapon's damage type but never a resource) would otherwise all land on
+	// hp regardless of what the type means.
+	//
+	// PRECEDENCE: an op's own `resource` wins; then this; then the primary vital. So a single op can still
+	// aim a psychic blow at hp by naming `resource: hp` explicitly.
+	//
+	// NATURAL IMMUNITY: a target with no capacity in the routed pool (derived max <= 0 — a mindless
+	// construct with no `sanity`) DISCARDS the blow entirely, before mitigation and threat. That is what
+	// makes a routed type safe to ship in a shared pack: creatures that have no such track are immune by
+	// construction, with no engine predicate and no content check.
+	//
+	// NEVER RETROFIT this onto an existing damage type in a live pack. Adding it re-aims every already
+	// authored blow of that kind — every weapon, spell and DoT — away from the pool they have always hit.
+	// Routing is a property a NEW type is born with.
+	TargetResource string `json:"target_resource" yaml:"target_resource"`
 }
 
 // AffectDTO is one content-defined status effect (docs/ABILITIES.md §5, docs/PHASE5-PLAN.md §1.4).

@@ -468,6 +468,11 @@ type resourceBody struct {
 type dmgBody struct {
 	Color  string             `json:"color,omitempty"`
 	Resist map[string]float64 `json:"resist,omitempty"`
+	// TargetResource is the #405 damage-type -> pool route. Like `primary` on resourceBody it is a
+	// non-relational field, so it MUST ride this JSONB tail at BOTH ends (the marshal in import.go and the
+	// unmarshal below) or it is silently dropped on the YAML -> Postgres -> boot round trip and every
+	// routed blow quietly lands on the primary vital in staging/prod while passing every in-memory test.
+	TargetResource string `json:"target_resource,omitempty"`
 }
 
 // affectBody is the JSONB-tail shape for an affect_defs row: the whole content.AffectBodyDTO
@@ -773,7 +778,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				dRows.Close()
 				return fmt.Errorf("store: damage_type_def %s body: %w", d.Ref, err)
 			}
-			d.Color, d.Resist = b.Color, b.Resist
+			d.Color, d.Resist, d.TargetResource = b.Color, b.Resist, b.TargetResource
 		}
 		pp := pack(pk)
 		pp.DamageTypes = append(pp.DamageTypes, d)

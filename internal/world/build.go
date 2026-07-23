@@ -132,6 +132,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	for _, dt := range lc.DamageTypes {
 		d.dmg.register(dt.Ref, &damageTypeDef{
 			ref: dt.Ref, displayName: dt.DisplayName, color: dt.Color, resist: dt.Resist,
+			targetResource: dt.TargetResource,
 		})
 	}
 	for _, af := range lc.Affects {
@@ -298,6 +299,24 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		slog.Warn("content: deal_damage.resource does not name a registered resource (blow will be discarded)",
 			"owner", m.owner, "resource", m.resource)
 	}
+	// Load-time content-lint (#405): a damage type's `target_resource` must name a registered resource. The
+	// blast radius here is far wider than a typo'd deal_damage.resource, which breaks ONE op: this one
+	// silently routes EVERY blow of that kind — every weapon, spell, DoT and third-party source — into the
+	// max<=0 immunity discard, so the whole damage kind quietly does nothing, everywhere, forever. ERROR,
+	// not WARN, for that reason.
+	for _, m := range lintDamageTypeResources(d) {
+		slog.Error("content: damage_type.target_resource does not name a registered resource — EVERY blow of this damage kind will be discarded",
+			"damage_type", m.dmgType, "resource", m.resource)
+	}
+	// Load-time content-lint (#405 companion): a deal_damage op's `type` must name a registered damage type.
+	// Nothing validated it before, because the only consumer (mitigate) no-ops silently on an unknown type.
+	// Once a type can carry a ROUTE, a typo'd `type` loses the route as well and the blow falls back to the
+	// primary vital — a psychic strike that quietly hits hp instead of sanity. That is a new silent-failure
+	// mode the routing feature creates, so it gets its own lint.
+	for _, m := range lintDealDamageTypes(d) {
+		slog.Warn("content: deal_damage.type does not name a registered damage_type (no resist matrix, and no #405 pool routing)",
+			"owner", m.owner, "type", m.dmgType)
+	}
 	// Load-time content-lint (#406): a NON-VITAL resource's on_depleted is FARMABLE if it rewards. Unlike the
 	// vital/death hook — latched to an actual kill by posDead, and for a mob followed by extraction — a
 	// non-vital hook is level-triggered per BLOW, so a pool held at 0 re-runs it for one point of damage,
@@ -412,6 +431,58 @@ func lintDealDamageResources(d *defRegistries) []dealDamageResourceMiss {
 	walkContentOps(d, func(owner string, op *effectOp) {
 		if op.kind == "deal_damage" && op.resource != "" && d.res.get(op.resource) == nil {
 			misses = append(misses, dealDamageResourceMiss{owner: owner, resource: op.resource})
+		}
+	})
+	return misses
+}
+
+// damageTypeResourceMiss is one content-lint finding (#405): a damage type whose `target_resource` does
+// not name a registered resource.
+type damageTypeResourceMiss struct {
+	dmgType  string
+	resource string
+}
+
+// lintDamageTypeResources flags each damage type whose `target_resource` names a pool that is NOT a
+// registered resource (#405). At runtime that route resolves to a pool with no def, so resourceMax reads 0
+// and dealDamage's immunity discard drops the blow — meaning the ENTIRE damage kind silently does nothing,
+// against every target, including damage authored by other packs.
+//
+// This is a flat registry walk, NOT walkContentOps: a damage-type def is not an op-list. Deterministic
+// order (sorted) so the boot log is stable. Build-time only; the caller logs at ERROR.
+func lintDamageTypeResources(d *defRegistries) []damageTypeResourceMiss {
+	var misses []damageTypeResourceMiss
+	for ref, def := range d.dmg.table() {
+		if def == nil || def.targetResource == "" {
+			continue
+		}
+		if d.res.get(def.targetResource) == nil {
+			misses = append(misses, damageTypeResourceMiss{dmgType: ref, resource: def.targetResource})
+		}
+	}
+	sort.Slice(misses, func(i, j int) bool { return misses[i].dmgType < misses[j].dmgType })
+	return misses
+}
+
+// dealDamageTypeMiss is one content-lint finding (#405): a deal_damage op whose `type` does not name a
+// registered damage type. owner locates the offending op-list.
+type dealDamageTypeMiss struct {
+	owner   string
+	dmgType string
+}
+
+// lintDealDamageTypes flags each deal_damage whose `type` names an unregistered damage type. Before #405
+// an unknown type was merely inert (mitigate finds no resist matrix and applies none), which is why nothing
+// linted it. Now a type can carry a POOL ROUTE, so a typo additionally loses the routing and the blow falls
+// back to the primary vital — a `psychick` strike that quietly damages hp instead of sanity, with no error
+// anywhere. Empty `type` (untyped damage) is the common case and never flagged. Build-time only; WARN.
+//
+// As with lintDealDamageResources, a runtime-supplied type (Lua h:damage{type=...}) is invisible here.
+func lintDealDamageTypes(d *defRegistries) []dealDamageTypeMiss {
+	var misses []dealDamageTypeMiss
+	walkContentOps(d, func(owner string, op *effectOp) {
+		if op.kind == "deal_damage" && op.dmgType != "" && d.dmg.get(op.dmgType) == nil {
+			misses = append(misses, dealDamageTypeMiss{owner: owner, dmgType: op.dmgType})
 		}
 	})
 	return misses
