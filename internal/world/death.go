@@ -123,7 +123,7 @@ func (co *CorpseOwner) looterIsOwner(s *session) bool {
 // nil/empty op-list => nothing runs (engine default death). A hook that exhausts the depth/width budget
 // simply does not run — the victim then dies the engine-default way (no revive, since the cancel can only
 // happen if the hook actually ran and raised the vital).
-func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, parent *effectCtx) {
+func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, dep depletion, parent *effectCtx) {
 	if victim == nil || victim.living == nil || position(victim) == posDead {
 		return
 	}
@@ -133,7 +133,7 @@ func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, parent *effec
 	// checkpoint (never "" — the checkpoint only fires for a pool it just emptied).
 	if pool != "" {
 		if def := z.resourceDefs().get(pool); def != nil && len(def.onDepleted) > 0 {
-			dc := z.depletionCtx(victim, killer, parent)
+			dc := z.depletionCtx(victim, killer, dep, parent)
 			z.runDepletionHook(dc, def.onDepleted, victim, pool)
 		}
 	}
@@ -224,10 +224,10 @@ func (z *Zone) runDepletionHook(dc *effectCtx, ops []effectOp, victim *Entity, p
 // can reference $other = the slayer / the horror that broke you). It inherits the parent's depth/rng/
 // event-budget so the hook is bounded by the SAME round budget as the swing that triggered it (no fresh
 // 256). disp neutral — a harmful op inside re-decides its own disposition and re-gates.
-func (z *Zone) depletionCtx(victim, killer *Entity, parent *effectCtx) *effectCtx {
+func (z *Zone) depletionCtx(victim, killer *Entity, dep depletion, parent *effectCtx) *effectCtx {
 	c := &effectCtx{
 		z: z, actor: victim, source: victim, target: victim, other: killer,
-		mag: 1, disp: dispNeutral,
+		mag: 1, disp: dispNeutral, depletion: dep,
 	}
 	if parent != nil {
 		c.rng, c.depth, c.eventBudget = parent.rng, parent.depth, parent.eventBudget

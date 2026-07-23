@@ -769,8 +769,24 @@ type ResourceDTO struct {
 	//   - Beware WIDTH. An `area:` op in a hook re-empties every entity in the room, each of which fires its
 	//     own hook. The engine caps the total work per blow, but the content is still a room-wide cascade.
 	//
-	// NOT YET AVAILABLE: the hook cannot see HOW FAR past 0 the blow went, so a "carry the excess into the
-	// lethal pool" two-track system can be authored in shape but not in magnitude. That primitive is #407.
+	// THE BLOW'S ARITHMETIC is readable from any formula slot inside the hook (#407), as ctx scalars in the
+	// same `$` family as `$swing.index`:
+	//
+	//	$depletion.overflow — how far PAST 0 the blow drove the pool: the excess it could NOT absorb
+	//	$depletion.applied  — how much the pool actually absorbed ("you lost N sanity")
+	//	$depletion.amount   — the whole mitigated blow; applied + overflow == amount
+	//
+	// That is what makes a TWO-TRACK system authorable: a stun/stagger pool carries its excess into a
+	// lethal one, fatigue below 0 bites into health, an HP-buffer spills into a stat. The carry-over op
+	// reads the overflow through `bonus` (amount 0 + bonus is the standard formula-damage idiom):
+	//
+	//	on_depleted:
+	//	  - {op: deal_damage, target: self, resource: hp, type: trauma,
+	//	     amount: 0, bonus: ["attr", "$depletion.overflow"]}
+	//
+	// Two authoring notes. The carry-over op MUST name its destination `resource` explicitly — left to
+	// route by damage type it would land back in the pool it came from and loop. And an exact-to-zero blow
+	// has overflow 0, which still fires the hook, so a hook must read correctly at 0.
 	OnDepleted []any `json:"on_depleted" yaml:"on_depleted"`
 }
 

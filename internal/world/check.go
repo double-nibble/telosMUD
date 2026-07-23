@@ -200,6 +200,11 @@ func evalCheckFormula(c *effectCtx, node formulaNode, def *Entity) float64 {
 			if v, ok := resolveSwingRef(c, ref); ok {
 				return v, nil
 			}
+			// $depletion.* is the same shape (#407): the arithmetic of the depletion this ctx was built for,
+			// so an on_depleted hook can deal the OVERFLOW into another pool.
+			if v, ok := resolveDepletionRef(c, ref); ok {
+				return v, nil
+			}
 			ent, bare := resolveCheckScope(c, ref, def)
 			return attr(ent, bare), nil
 		},
@@ -250,6 +255,36 @@ func resolveSwingRef(c *effectCtx, ref string) (float64, bool) {
 	switch ref[len("$swing."):] {
 	case "index":
 		return float64(c.swingIndex), true
+	default:
+		return 0, true
+	}
+}
+
+// resolveDepletionRef resolves a `$depletion.<field>` ctx-scalar ref (#407) to its value — the sibling of
+// resolveSwingRef, deliberately the same shape so content has ONE concept for "a number the engine put on
+// this resolution" rather than two. The fields describe the blow that emptied the pool this hook is running
+// for:
+//
+//	overflow — how far PAST 0 the blow drove the pool (the excess it could not absorb). The carry-over
+//	           amount a two-track system deals into its lethal pool.
+//	applied  — how much the pool actually ABSORBED ("you lost N sanity").
+//	amount   — the whole mitigated blow. applied + overflow == amount.
+//
+// Returns (value, true) for a recognized `$depletion.` ref; (0, false) otherwise, so the caller falls back
+// to the attr/entity-scope resolver. An UNKNOWN `$depletion.` field yields (0, true) — a clean 0, not an
+// attr miss — so a typo can never silently read an entity attribute of that name. Outside a depletion ctx
+// every field is 0 (the zero value), which makes a stray reference inert rather than an error.
+func resolveDepletionRef(c *effectCtx, ref string) (float64, bool) {
+	if !strings.HasPrefix(ref, "$depletion.") {
+		return 0, false
+	}
+	switch ref[len("$depletion."):] {
+	case "overflow":
+		return float64(c.depletion.overflow), true
+	case "applied":
+		return float64(c.depletion.applied), true
+	case "amount":
+		return float64(c.depletion.amount), true
 	default:
 		return 0, true
 	}

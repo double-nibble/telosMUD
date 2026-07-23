@@ -101,7 +101,7 @@ func TestOnVitalDepletedIdempotent(t *testing.T) {
 	}
 
 	// A second depletion (stand-in for a DoT tick landing on the already-dead mob) must be a clean no-op.
-	z.onPoolDepleted(mob, s.entity, "hp", nil)
+	z.onPoolDepleted(mob, s.entity, "hp", depletion{}, nil)
 	if got := countCorpses(); got != 1 {
 		t.Fatalf("second onPoolDepleted built a duplicate corpse: %d corpses, want 1 (latch failed)", got)
 	}
