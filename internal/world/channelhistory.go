@@ -102,3 +102,20 @@ func (h *chanHistory) snapshot(ref string) []chanHistoryEntry {
 	copy(out, ring)
 	return out
 }
+
+// drop reaps channel ref's ring entirely (#401). The ring set is keyed by ref and is INDEPENDENT of the
+// channel_def registry, so a channel REMOVED on hot reload would otherwise leave its ring orphaned —
+// unreachable (no def => the history verb refuses it) but pinning its buffered lines until shard restart,
+// a small unbounded-over-time leak. Called from the reload applier's channel-removed branch (reload.go),
+// off the zone goroutines; concurrency-safe under the same lock as append/snapshot. A no-op for an absent
+// ref (delete on a missing key is fine). NOTE: this reaps on REMOVE only — it does NOT address a channel
+// whose hear_access is LOOSENED on an edit (see the channel_def docs footgun): that is an in-place swap,
+// not a removal, and the surviving ring intentionally keeps its scrollback across a benign edit.
+func (h *chanHistory) drop(ref string) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.rings, ref)
+}

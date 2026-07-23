@@ -969,6 +969,10 @@ func (z *Zone) handle(m msg) {
 		z.promptAfterAsync(v.s) // #371: the async command owns its trailing prompt, emitted AFTER its output
 	case tellDeliverMsg:
 		v.ack <- z.deliverTellTraced(v) // drained durable tell: dedup-via-cursor, render+emit, ack/nak (#467 span)
+	case recordSentTellMsg:
+		if s := z.players[v.playerID]; s != nil { // confirmed sent-tell -> the sender's in-session ring (#401)
+			s.recordTell(tellLogEntry{outbound: true, other: v.target, otherName: v.target, body: v.body, at: v.at})
+		}
 	case tellCursorProbeMsg:
 		z.probeTellCursor(v)
 	case lastTellProbeMsg:

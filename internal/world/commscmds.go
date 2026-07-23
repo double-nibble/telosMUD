@@ -91,6 +91,15 @@ func cmdHistory(c *Context) error {
 		b.WriteByte('\n')
 		b.WriteString(ln)
 	}
+	// (e) MULTI-SHARD PARTIAL-VIEW FOOTER (#401): the ring is SHARD-LOCAL — on a multi-shard fleet it holds
+	// only lines authored on THIS shard, so a reader on a busy fleet sees a truncated history. Slice 1
+	// already logs this at ops level (z.log.Debug, "no silent caps"); this surfaces the same caveat to the
+	// PLAYER in-band so a gap doesn't read as "nothing more was said". Single-shard/bare runs (the common
+	// deployment and every test) never see it — the full history IS local there. Cross-shard aggregation
+	// (slice 2) removes the partiality and this footer with it.
+	if z.isMultiShard() {
+		b.WriteString("\n(shard-local view; may be incomplete on a busy multi-shard fleet)")
+	}
 	c.Send(b.String())
 	return nil
 }

@@ -132,6 +132,44 @@ func TestChannelRemoveFansOutRepublish(t *testing.T) {
 	}
 }
 
+// TestChannelRemoveReapsHistoryRing is #401: removing a channel on hot reload reaps its history ring. The
+// ring set is keyed by ref INDEPENDENTLY of the channel_def registry, so without the reap a removed channel
+// leaves an orphaned, unreachable ring pinning its buffered lines until shard restart (a slow memory leak).
+func TestChannelRemoveReapsHistoryRing(t *testing.T) {
+	src := content.NewMemSource()
+	src.SetPack(content.Pack{
+		Pack: "reloadtest",
+		Channels: []content.ChannelDTO{
+			{Ref: "confession", Name: "Confession", Words: []string{"confess"}, DefaultOn: true, History: 5},
+		},
+		Zones: chanReloadPack("").Zones,
+	})
+	lc, err := content.Load(context.Background(), src, []string{"reloadtest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := contentbus.NewMemBus()
+	t.Cleanup(func() { _ = bus.Close() })
+	sh := NewShardFromContent(lc, []string{"rt"}, "rt", "", nil, nil).
+		WithHotReload(src, bus, []string{"reloadtest"}, 0)
+	z := sh.Zone()
+
+	// Buffer a line so the ring is non-empty (the precondition the reap must clear).
+	s := newTestPlayerEntity(z, "Cid")
+	z.dispatch(s, "confess something")
+	if len(z.channelHistory().snapshot("confession")) == 0 {
+		t.Fatal("precondition: the channel should have buffered a history line")
+	}
+
+	// Remove the channel from the source, then drive the reload's channel-removed branch.
+	src.SetPack(content.Pack{Pack: "reloadtest", Zones: chanReloadPack("").Zones})
+	sh.reloader.reloadChannel(contentbus.Invalidation{Kind: content.KindChannel, Ref: "confession", Pack: "reloadtest"})
+
+	if got := z.channelHistory().snapshot("confession"); got != nil {
+		t.Fatalf("a removed channel left an orphaned history ring with %d lines (not reaped)", len(got))
+	}
+}
+
 // TestRetryRepublishCommsDeliversAfterDrop is the fault-injection proof for the security-relevant drop path
 // (#75): when the fan-out's postOrDrop DROPS a republish (a full zone inbox), the bounded-retry re-posts it,
 // so the too-permissive hear-set is not left permanently stale. We fill the inbox so the first post drops,

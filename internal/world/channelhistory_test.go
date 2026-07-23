@@ -147,6 +147,40 @@ func TestChannelHistoryZeroBufferNotTracked(t *testing.T) {
 	}
 }
 
+// TestChannelHistoryMultiShardFooter is #401: the history ring is SHARD-LOCAL, so on a multi-shard fleet the
+// view is potentially partial — `history <channel>` appends an in-band "may be incomplete" footer, but ONLY
+// on a multi-shard deployment. A single-shard run (the common case and every other test here) shows no
+// footer, so the caveat never noises up the normal case.
+func TestChannelHistoryMultiShardFooter(t *testing.T) {
+	sh, z, _ := commTestShard(t)
+	registerHistChannel(t, sh, "log", "Log", 5, "")
+	s := newTestPlayerEntity(z, "Cid")
+	z.dispatch(s, "log hello")
+
+	// Single-shard (sh.dir and sh.peers both nil): no footer.
+	drain(s)
+	z.dispatch(s, "history log")
+	out := nextOutput(t, s)
+	if !strings.Contains(out, "hello") {
+		t.Fatalf("history did not replay the buffered line: %q", out)
+	}
+	if strings.Contains(out, "shard-local") {
+		t.Fatalf("single-shard history must NOT carry the multi-shard footer: %q", out)
+	}
+
+	// Flip to a multi-shard fleet (a directory = another shard can route to us) and re-fetch.
+	sh.dir = newFakeLocator("Cid")
+	drain(s)
+	z.dispatch(s, "history log")
+	out = nextOutput(t, s)
+	if !strings.Contains(out, "hello") {
+		t.Fatalf("multi-shard history lost its line: %q", out)
+	}
+	if !strings.Contains(out, "shard-local") {
+		t.Fatalf("multi-shard history must carry the partial-view footer: %q", out)
+	}
+}
+
 // TestChannelHistoryBareZoneNoPanic proves a bare zone (no shard, nil chanHistory) degrades to "No
 // recent history" and never panics. We register the channel def directly on the bare zone's registry.
 func TestChannelHistoryBareZoneNoPanic(t *testing.T) {
