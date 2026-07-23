@@ -621,19 +621,43 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	if !guardHarmful(c, target) {
 		return 0
 	}
-	// Resolve WHICH vital/resource pool this blow hits (#71). An explicit `resource` routes there; empty
-	// falls back to the primary vital. A NAMED pool the target has no capacity for (derived max <= 0 — a
-	// mindless construct with no "sanity") is NATURAL IMMUNITY: discard here, before mitigation/reaction/
-	// threat, exactly like a fully-resisted hit — never write its current negative (which would read as
-	// depleted and, for a vital, instant-kill). The default (resource == "") path is unguarded to keep the
-	// legacy swing/DoT behavior byte-for-byte; the checkpoint's vitalDepleted still gates on max > 0.
-	pool := resource
+	// Resolve WHICH vital/resource pool this blow hits, in three tiers (#71 + #405):
+	//
+	//	op.resource  ??  damage_type.target_resource  ??  the primary vital
+	//
+	// The op-level `resource` is the per-blow override and always wins. Failing that, the damage TYPE may
+	// name its own pool (#405): `psychic` routes to `sanity`, `bashing` to a stun track. That is how real
+	// systems name the track, and it is what makes the routing hold for damage the pack did not author —
+	// a third-party psychic spell, a mob's natural weapon, a Lua h:damage — none of which can be made to
+	// repeat `resource: sanity` on every op. It also covers the SWING path, which sets a damage type from
+	// the weapon but never a resource. Failing both, unrouted damage lands on the primary vital: the
+	// legacy behavior, byte-for-byte.
+	//
+	// NATURAL IMMUNITY: a ROUTED pool the target has no capacity for (derived max <= 0 — a mindless
+	// construct with no "sanity") is discarded here, before mitigation/reaction/threat, exactly like a
+	// fully-resisted hit. `routed` is what the discard keys on, NOT `resource != ""` — a type-routed blow
+	// is just as explicit a naming of a pool as an op-level one, and leaving it unguarded is the sharp
+	// edge #405 introduces: without the discard the blow writes a phantom current on a pool the entity has
+	// no capacity in, which (a) makes entityHasResource true forever, silently subscribing it to that
+	// resource's event handlers, (b) persists through dumpResources, and (c) is a stored one-way door —
+	// resourceCurrent's "absent reads as full" no longer applies, so if that pool EVER gains capacity
+	// (gear, an affect, a class grant, a content patch) the entity reads permanently empty on it, and for
+	// a vital pool the next point of damage is an instant kill.
+	//
+	// The UNROUTED path stays unguarded, deliberately: that is the legacy swing/DoT behavior and the
+	// checkpoint's max > 0 clause still stands behind it.
+	pool, routed, route := resource, resource != "", "op"
 	if pool == "" {
-		pool = vitalResource(target)
+		if p := damageTypePool(target, dmgType); p != "" {
+			pool, routed, route = p, true, "type"
+		}
 	}
-	if resource != "" && resourceMax(target, pool) <= 0 {
+	if pool == "" {
+		pool, route = vitalResource(target), "primary"
+	}
+	if routed && resourceMax(target, pool) <= 0 {
 		c.z.log.Debug("deal_damage: target immune (no capacity in pool); discarded",
-			"target", target.short, "pool", pool)
+			"target", target.short, "pool", pool, "type", dmgType)
 		return 0
 	}
 	dmg := mitigate(target, raw, dmgType)
@@ -659,6 +683,23 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 		c.z.log.Debug("deal_damage: target has no vital resource; damage discarded", "target", target.short)
 		c.lastDamage = dmg
 		return dmg
+	}
+	// RE-CHECK THE CAPACITY, because the discard above happened BEFORE applyDamageReaction and this write
+	// happens after (a TOCTOU). A reaction can attach an affect that drops the routed pool's derived max to
+	// 0 mid-blow — "shatter its mind, then the psychic hit has nothing to land on" is a perfectly natural
+	// thing to author — and the earlier check is then stale. Without this the blow stores a current on a
+	// pool with NO capacity, which is worse than it sounds: setResourceCurrent only clamps the TOP end when
+	// max > 0, so the pool stores and reads back a POSITIVE value at max 0, and once anything is stored,
+	// resourceCurrent's "absent reads as full" is gone for good — when capacity returns the entity reads
+	// permanently empty, and on a vital pool the next point of damage kills.
+	//
+	// The TOCTOU predates #405 (an op-level `resource` route reaches it identically), but #405 is what takes
+	// the exposed traffic from "ops an author deliberately wrote" to EVERY blow carrying a routed type, so
+	// the guarantee this feature advertises has to actually hold.
+	if routed && resourceMax(target, pool) <= 0 {
+		c.z.log.Debug("deal_damage: target lost capacity in the routed pool mid-blow; discarded",
+			"target", target.short, "pool", pool, "type", dmgType)
+		return 0
 	}
 	// Apply to the resolved pool. The pool clamps its current at 0 (resources.go); the depletion
 	// checkpoint below turns an emptied pool into that pool's on_depleted hook, and into death when (and
@@ -701,8 +742,12 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	// Before #406 this was fail-safe only by accident (respawn refilled the vital, so vitalDepleted went
 	// false); with a non-vital pool nothing refilled it, so the guard has to be explicit.
 	tgtGen := deathGen(target)
+	// `route` names WHICH precedence tier picked the pool (op / type / primary). Without it the three-tier
+	// resolution is unobservable at the one place it matters: a registered-but-wrong route (someone adds
+	// `target_resource: mana` to `fire`) has no lint and no other signal, and an operator staring at
+	// "type=fire pool=mana" would have to already know the feature exists to explain it.
 	c.z.log.Debug("deal_damage applied", "target", target.short, "type", dmgType,
-		"raw", raw, "applied", dmg, "pool", pool, "from", cur, "to", resourceCurrent(target, pool))
+		"raw", raw, "applied", dmg, "pool", pool, "route", route, "from", cur, "to", resourceCurrent(target, pool))
 
 	// --- Threat + the lit combat events, now UNIFORM across all damage (moved out of the swing path so a
 	// spell/AoE/DoT builds threat and triggers reactions identically to a melee swing). source is the
@@ -773,6 +818,31 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 		c.z.onPoolDepleted(target, src, pool, depletion{overflow: overflow, applied: dmg - overflow, amount: dmg}, c)
 	}
 	return dmg
+}
+
+// damageTypePool returns the resource pool the damage TYPE `dmgType` routes to (#405), or "" when the type
+// is unknown, names no pool, or the target carries no content at all. It is the middle tier of dealDamage's
+// routing precedence — consulted only when the op named no `resource` of its own.
+//
+// Deliberately shaped like mitigate: it takes the target and reads the type's def off target.zone through
+// the same accessor, so the two type-keyed lookups in the damage path read the same registry the same way
+// and neither depends on c.z (which can in principle differ from target.zone). Zone-goroutine read
+// (registry atomic.Load).
+//
+// WHY THE RESOLUTION LIVES AT THE FUNNEL and not in opDealDamage: dealDamage has entry points that never
+// touch the op handler at all — Lua `h:damage{type=...}` (luaharm.go) and the reaction redirect's re-entry —
+// and routing must not drift apart from mitigation, which reads the same def one step later. Note the
+// swing path and the redirect are NOT discriminators here, though it is tempting to say so: the swing goes
+// through opDealDamage, and the redirect carries the ALREADY-RESOLVED pool forward as an explicit resource
+// rather than re-resolving against the new target (it coincides because routes are zone-global).
+func damageTypePool(target *Entity, dmgType string) string {
+	if target == nil || target.zone == nil || dmgType == "" {
+		return ""
+	}
+	if def := target.zone.damageTypeDefs().get(dmgType); def != nil {
+		return def.targetResource
+	}
+	return ""
 }
 
 // mitigate runs the raw damage through the damage_type_def's resist/vuln/immune matrix and the

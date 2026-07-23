@@ -385,6 +385,13 @@ type damageTypeDef struct {
 	displayName string
 	color       string
 	resist      map[string]float64
+	// targetResource routes damage of THIS KIND to a named resource pool (#405): `psychic` -> `sanity`,
+	// `bashing` -> a stun track. It is the middle tier of dealDamage's routing precedence (an op's own
+	// `resource` wins; absent both, damage lands on the primary vital), and it is what makes routing hold
+	// for damage the pack did not author — a third-party spell, a mob's natural weapon, a Lua h:damage, and
+	// the swing path (which carries a weapon's damage type but never a resource). "" => no routing.
+	// Immutable after build.
+	targetResource string
 }
 
 // affectStacking is the stacking mode of an affect_def (P5-D3, docs/PHASE5-PLAN.md §1.4). It governs

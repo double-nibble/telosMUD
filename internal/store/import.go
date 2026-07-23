@@ -605,7 +605,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 		}
 	}
 	for _, d := range pk.DamageTypes {
-		body, _ := json.Marshal(dmgBody{Color: d.Color, Resist: d.Resist})
+		body, _ := json.Marshal(dmgBody{Color: d.Color, Resist: d.Resist, TargetResource: d.TargetResource})
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO damage_type_defs (ref, pack, display_name, body) VALUES ($1,$2,$3,$4)`,
 			d.Ref, pk.Pack, d.DisplayName, body); err != nil {

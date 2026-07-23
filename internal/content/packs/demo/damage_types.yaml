@@ -10,7 +10,12 @@ damage_types:
   # its cold warding entirely — a content-only "undead is weak to holy" effect expressed purely through
   # which soak attributes a mob does (and does not) have. No engine knowledge of "undead" or "holy".
   - {ref: holy,  display_name: Radiant,  color: yellow, resist: {holy: 1.0}}
-  # poison already used by the §5 DoT (neutral, no matrix entry needed — kept implicit).
+  # poison: the §5 DoT's type. It carries NO resist matrix (nothing resists or is vulnerable to it) and no
+  # routing — mitigate applies no multiplier for a type with a nil matrix, so this is behaviourally
+  # identical to leaving it undeclared. It is declared anyway because a damage type is now a REFERENCEABLE
+  # def rather than a free-form string: since #405 a type can carry a `target_resource`, so an op naming an
+  # unregistered type silently loses any routing as well as its matrix, and lintDealDamageTypes flags it.
+  - {ref: poison, display_name: Poison, color: green}
 
 # Affects (status effects, docs/ABILITIES.md §5). The engine's Affected runtime (Phase 5.2) owns their
 # duration/stacking/tick/expire and feeds modifiers into derivation + prevents into the tag-CC gate.
