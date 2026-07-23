@@ -2,6 +2,7 @@ package world
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -810,6 +811,230 @@ func TestSpawnProtectionNoAggroWedgeOnSwingPath(t *testing.T) {
 	z.resolveSwing(mob, s.entity, 0, rand.New(rand.NewSource(1)), newBudget())
 	if got := resourceCurrent(s.entity, "hp"); got >= full {
 		t.Fatalf("post-window hp = %d, want < %d (swing lands after the window lapses)", got, full)
+	}
+}
+
+// TestSpawnProtectionHonorsSourcelessAmbientHazard is #397 item 1: a sourceless ambient room hazard
+// (lava/gas with NO applier) sets effSrc=occ, so its tick op runs with actor==target. That must NOT be
+// treated as genuine self-harm — a just-respawned occupant inside the spawn-protection window takes 0
+// from it, and the window SURVIVES (the field is not the player's own hostile action). Once the window
+// lapses the SAME field damages the occupant. (A real self-directed op stays exempt; see
+// TestSpawnProtectionSelfHarmExempt.)
+//
+// Table-driven over BOTH harm funnels: a deal_damage tick routes guardHarmful, while a negative
+// modify_resource tick routes guardCrossPlayerWrite (which self-short-circuits and would otherwise bypass
+// the window) — the fix threads sourcelessAmbient into both so a "sap stamina" gas field is protected too.
+func TestSpawnProtectionHonorsSourcelessAmbientHazard(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   effectOp
+	}{
+		{"deal_damage (guardHarmful)", effectOp{kind: "deal_damage", dmgType: "physical", amount: 20}},
+		{"modify_resource (guardCrossPlayerWrite)", effectOp{kind: "modify_resource", resource: "hp", amount: -20}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := spawnProtectionPulses
+			spawnProtectionPulses = 3
+			defer func() { spawnProtectionPulses = old }()
+
+			z, s := spawnProtSetup(t)
+			// A room-scoped ambient field with no applier (sourceless). A bare tick op (no modifiers/prevents)
+			// is a pure on_tick field.
+			z.defs.affect.register("lavafield", &affectDef{
+				ref: "lavafield", name: "Lava", roomScoped: true, stacking: stackRefresh, duration: 100,
+				hasTick: true, tickInterval: 1,
+				tickOps: []effectOp{tc.op},
+			})
+
+			z.respawnPlayer(s.entity)
+			if !z.spawnProtected(s.entity) {
+				t.Fatal("window should be open immediately after respawn")
+			}
+			// Capture the room AFTER respawn: respawnPlayer relocates the victim to the start room, so the
+			// field must land where the protected player stands (capturing before respawn is the vacuity trap).
+			room := s.entity.location
+			setResourceCurrent(s.entity, "hp", 50)
+
+			// Apply the sourceless field: landRoomAffectOnOccupants runs the tick on the protected occupant
+			// NOW. It must be refused — 0 change — even though actor==target (the effSrc=occ artifact).
+			inst := applyRoomAffect(room, "lavafield", nil)
+			if inst == nil {
+				t.Fatal("applyRoomAffect returned nil for a valid room-scoped field")
+			}
+			if got := resourceCurrent(s.entity, "hp"); got != 50 {
+				t.Fatalf("protected occupant lost %d hp to the ambient field during the window, want 0", 50-got)
+			}
+			// The window must SURVIVE — a sourceless ambient field is not the occupant's own hostile action.
+			if !z.spawnProtected(s.entity) {
+				t.Fatal("a sourceless ambient hazard must not drop the occupant's spawn protection")
+			}
+
+			// After the window lapses, the SAME field harms the occupant.
+			for i := uint64(0); i < spawnProtectionPulses; i++ {
+				z.pulses.tick()
+			}
+			if z.spawnProtected(s.entity) {
+				t.Fatal("window should have expired after spawnProtectionPulses ticks")
+			}
+			landRoomAffectOn(room, s.entity, inst) // re-run the field on the now-unprotected occupant
+			if got := resourceCurrent(s.entity, "hp"); got >= 50 {
+				t.Fatalf("post-expiry occupant hp = %d, want < 50 (the ambient field harms an unprotected occupant)", got)
+			}
+		})
+	}
+}
+
+// TestSpawnProtectionHonorsSourcelessAmbientCC is the CC-branch twin of item 1: a sourceless ambient CC
+// field (a snare/root with `prevents`, no applier) leases via the modifier/prevents branch of
+// landRoomAffectOn (applyDebuff), whose nonNilSource fallback also makes actor==target=occ. It must honor
+// a just-respawned occupant's window — the same one-flag fix as the damage branch — so a sourceless ambient
+// snare can't root a spawn-protected player. After the window lapses the same field roots them.
+func TestSpawnProtectionHonorsSourcelessAmbientCC(t *testing.T) {
+	old := spawnProtectionPulses
+	spawnProtectionPulses = 3
+	defer func() { spawnProtectionPulses = old }()
+
+	z, s := spawnProtSetup(t)
+	z.defs.affect.register("tarpit", &affectDef{
+		ref: "tarpit", name: "Tar", roomScoped: true, stacking: stackRefresh, duration: 100,
+		hasTick: true, tickInterval: 1,
+		prevents: []string{"move"}, // a detrimental CC field (routes applyDebuff -> guardHarmful)
+	})
+
+	z.respawnPlayer(s.entity)
+	if !z.spawnProtected(s.entity) {
+		t.Fatal("window should be open immediately after respawn")
+	}
+	room := s.entity.location // after respawn (relocation vacuity trap)
+
+	inst := applyRoomAffect(room, "tarpit", nil) // sourceless
+	if inst == nil {
+		t.Fatal("applyRoomAffect returned nil for a valid room-scoped CC field")
+	}
+	if preventsTag(s.entity, "move") {
+		t.Fatal("a sourceless ambient snare rooted a spawn-protected occupant (CC branch bypassed the window)")
+	}
+	if !z.spawnProtected(s.entity) {
+		t.Fatal("a sourceless ambient CC field must not drop the occupant's spawn protection")
+	}
+
+	for i := uint64(0); i < spawnProtectionPulses; i++ {
+		z.pulses.tick()
+	}
+	landRoomAffectOn(room, s.entity, inst) // re-run on the now-unprotected occupant
+	if !preventsTag(s.entity, "move") {
+		t.Fatal("post-expiry the ambient snare should root an unprotected occupant")
+	}
+}
+
+// TestSpawnProtectionHonorsSourcelessEntityDoT pins the affect_runtime.go twin directly (#397 item 1,
+// defense-in-depth): a sourceless entity-scoped DoT (inst.source nil -> actor==target=e in fireOnTick)
+// must honor a protected victim's window. This is latent in normal play — respawnPlayer strips hostile
+// affects before opening the window — so we open the window manually and tick a nil-source DoT.
+func TestSpawnProtectionHonorsSourcelessEntityDoT(t *testing.T) {
+	old := spawnProtectionPulses
+	spawnProtectionPulses = 3
+	defer func() { spawnProtectionPulses = old }()
+
+	z, s := spawnProtSetup(t)
+	z.defs.affect.register("curse", &affectDef{
+		ref: "curse", name: "Curse", duration: 100, hasTick: true, tickInterval: 1,
+		tickOps: []effectOp{{kind: "deal_damage", dmgType: "physical", amount: 20}},
+	})
+	setResourceCurrent(s.entity, "hp", 50)
+	// Open the window manually (the natural respawn path strips affects first, so a nil-source DoT can't
+	// coexist with a live window there — this is the structural/defense-in-depth path).
+	mutableLiving(s.entity).protectedUntil = z.pulses.pulse + spawnProtectionPulses
+	if !z.spawnProtected(s.entity) {
+		t.Fatal("window should be open")
+	}
+
+	inst := &affectInstance{def: z.affectDefs().get("curse"), source: nil, remaining: 100, magnitude: 1, stacks: 1}
+	fireOnTick(s.entity, inst, z.pulses.pulse)
+	if got := resourceCurrent(s.entity, "hp"); got != 50 {
+		t.Fatalf("a sourceless entity DoT dealt %d during the window, want 0", 50-got)
+	}
+
+	for i := uint64(0); i < spawnProtectionPulses; i++ {
+		z.pulses.tick()
+	}
+	fireOnTick(s.entity, inst, z.pulses.pulse)
+	if got := resourceCurrent(s.entity, "hp"); got >= 50 {
+		t.Fatalf("post-window hp = %d, want < 50 (a sourceless DoT lands once the window lapses)", got)
+	}
+}
+
+// TestSpawnProtectionSwingSkipDropsAttackerShield is #397 item 2 / the shield-drop parity finding: the
+// swing pre-gate short-circuits before dealDamage's guardHarmful, so it must itself drop a still-protected
+// ATTACKER's shield on the hostile attempt — else melee is the one harm path that lets a protected player
+// keep a shield a spell/Lua/cross-player write would have forfeited. Two protected players spar; the
+// attacker's own window must drop the moment it swings, even though the (protected) target takes no damage.
+func TestSpawnProtectionSwingSkipDropsAttackerShield(t *testing.T) {
+	old := spawnProtectionPulses
+	spawnProtectionPulses = 100 // long: only the attempt-based cancel hook can drop it
+	defer func() { spawnProtectionPulses = old }()
+
+	z, attacker := combatZone(t)
+	z.defs.combat.register("atk", autoHitProfile(an("$actor.damroll")))
+	attacker.entity.living.combatRef = "atk"
+	equipWeapon(attacker.entity, &Weapon{diceNum: 6, diceSize: 1, damageType: "slash"})
+
+	// A second protected player as the target, in the attacker's room.
+	target := makePlayerTargetInRoom(z, attacker.entity, "Target").entity
+	z.respawnPlayer(attacker.entity) // both freshly respawned => both protected
+	z.respawnPlayer(target)
+	// respawn may relocate to the start room; put them back together so the swing gates pass.
+	Move(target, attacker.entity.location)
+	if !z.spawnProtected(attacker.entity) || !z.spawnProtected(target) {
+		t.Fatal("both players should be protected after respawn")
+	}
+
+	z.startFight(attacker.entity, target)
+	z.resolveSwing(attacker.entity, target, 0, rand.New(rand.NewSource(1)), newBudget())
+
+	if z.spawnProtected(attacker.entity) {
+		t.Fatal("the attacker's own shield must drop when it swings at a protected target (attempt-based rule)")
+	}
+	if !z.spawnProtected(target) {
+		t.Fatal("the target's shield must survive being swung at (only the actor forfeits on a hostile attempt)")
+	}
+}
+
+// TestSpawnProtectionSuppressesPhantomSwingNarration is #397 item 2: a mob swinging at a spawn-protected
+// player must not emit the "hits you" narration (which applySwingDamage emits BEFORE dealDamage, per the
+// SC2 message-before-damage ordering) while the window is open — the player would otherwise see a phantom
+// hit every round while taking 0 damage. The pre-gate short-circuits the swing entirely; guardHarmful
+// remains the authoritative 0-damage enforcement. Once the window lapses the narration returns.
+func TestSpawnProtectionSuppressesPhantomSwingNarration(t *testing.T) {
+	old := spawnProtectionPulses
+	spawnProtectionPulses = 3
+	defer func() { spawnProtectionPulses = old }()
+
+	z, s := combatZone(t)
+	z.defs.combat.register("mobatk", autoHitProfile(an("$actor.damroll"))) // always hits; +0 bonus
+	mob := combatMob(z, s.entity, "goblin", "mobatk", 100)
+	equipWeapon(mob, &Weapon{diceNum: 6, diceSize: 1, damageType: "slash"}) // 6d1 = 6 raw
+	z.startFight(mob, s.entity)
+
+	z.respawnPlayer(s.entity)
+	if !z.spawnProtected(s.entity) {
+		t.Fatal("player should be protected after respawn")
+	}
+	drainAllText(s.out) // clear the respawn narration
+
+	// Swing during the window: no phantom "hit" narration reaches the protected player.
+	z.resolveSwing(mob, s.entity, 0, rand.New(rand.NewSource(1)), newBudget())
+	if got := drainAllText(s.out); strings.Contains(strings.ToLower(got), "hit") {
+		t.Fatalf("protected player saw phantom swing narration during the window: %q", got)
+	}
+
+	// After the window lapses, the swing lands AND narrates the hit.
+	for i := uint64(0); i < spawnProtectionPulses; i++ {
+		z.pulses.tick()
+	}
+	z.resolveSwing(mob, s.entity, 0, rand.New(rand.NewSource(1)), newBudget())
+	if got := drainAllText(s.out); !strings.Contains(strings.ToLower(got), "hit") {
+		t.Fatalf("post-window swing must narrate the hit, got %q", got)
 	}
 }
 

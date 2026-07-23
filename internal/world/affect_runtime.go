@@ -386,8 +386,10 @@ func fireOnTick(e *Entity, inst *affectInstance, pulse uint64) {
 		return
 	}
 	src := inst.source
+	sourceless := false
 	if src == nil {
-		src = e // self/ambient: the victim is the source (self-harm is never gated)
+		src = e           // self/ambient: the victim is the source (self-harm is never gated)
+		sourceless = true // ...but a sourceless ambient DoT's actor==target is an ARTIFACT (#397 item 1)
 	} else if src.location == nil || src.living == nil {
 		// FAIL-CLOSED: the affect's source has detached (reaped / handed off / mid-transfer). We must
 		// NOT evaluate the PvP gate against a stale source pointer (it could read a wrong room flag or
@@ -408,6 +410,11 @@ func fireOnTick(e *Entity, inst *affectInstance, pulse uint64) {
 		// so a poison/bleed tick — and any loot from a DoT killing blow (die reads this ctx's rng) — join
 		// the same reproducible stream as swings. Runs on the zone goroutine, so single-writer holds.
 		rng: e.zone.combatRng(),
+		// A sourceless ambient DoT (source nil -> actor==target=e) still honors a just-respawned victim's
+		// spawn-protection window — the same one-flag fix the room-field twins use (#397 item 1). Latent
+		// today (respawn strips hostile affects before opening the window), but closes the structural gap so
+		// content that lands a nil-source ambient DoT can't bypass the shield.
+		sourcelessAmbient: sourceless,
 	}
 	runOps(c, inst.def.tickOps)
 }

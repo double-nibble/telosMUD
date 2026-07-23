@@ -147,7 +147,11 @@ func landRoomAffectOn(room *Entity, occ *Entity, inst *affectInstance) {
 		// (web's prevents, a debuff modifier) on a player gates; a beneficial one (consecrate's buff)
 		// lands ungated on allies.
 		if affectIsDetrimental(def) {
-			c := &effectCtx{z: room.zone, actor: nonNilSource(src, occ), source: nonNilSource(src, occ), target: occ, mag: 1, disp: dispHarmful}
+			// sourcelessAmbient: when src==nil the nonNilSource(src, occ) fallback makes actor==target=occ, the
+			// same artifact the tickOps branch flags (#397 item 1). Without it a sourceless ambient CC field
+			// (a snare/silence/slow with no applier) would root a just-respawned occupant inside the window,
+			// since applyDebuff -> guardHarmful reads actor==target as an exempt self-effect.
+			c := &effectCtx{z: room.zone, actor: nonNilSource(src, occ), source: nonNilSource(src, occ), target: occ, mag: 1, disp: dispHarmful, sourcelessAmbient: src == nil}
 			applyDebuff(c, occ, def.ref, opts)
 		} else {
 			applyAffect(occ, def.ref, opts, nil) // a room-affect lease is a root apply (fresh cascade)
@@ -159,8 +163,10 @@ func landRoomAffectOn(room *Entity, occ *Entity, inst *affectInstance) {
 	// closed if it detached, like fireOnTick), so a harmful field gates per occupant.
 	if len(def.tickOps) > 0 {
 		effSrc := src
+		sourceless := false
 		if effSrc == nil {
-			effSrc = occ // self/ambient field: the occupant is the source (never self-gated)
+			effSrc = occ      // self/ambient field: the occupant is the source (never self-gated)
+			sourceless = true // ...but the actor==target here is an ARTIFACT, not genuine self-harm (#397 item 1)
 		} else if effSrc.location == nil || effSrc.living == nil {
 			room.zone.log.Debug("room affect tick: source detached, no-op", "ref", def.ref)
 			return
@@ -168,6 +174,10 @@ func landRoomAffectOn(room *Entity, occ *Entity, inst *affectInstance) {
 		c := &effectCtx{
 			z: room.zone, actor: effSrc, source: effSrc, target: occ,
 			mag: 1, disp: dispHarmful,
+			// A sourceless ambient hazard (lava/gas, no applier) must still honor a just-respawned
+			// occupant's spawn-protection window even though actor==target — guardHarmful reads this flag
+			// to fire ENFORCEMENT without dropping the occupant's own shield (cancellation stays !=-gated).
+			sourcelessAmbient: sourceless,
 		}
 		runOps(c, def.tickOps)
 	}

@@ -382,6 +382,23 @@ func (z *Zone) resolveSwing(attacker, target *Entity, swingIndex int, rng *rand.
 		return
 	}
 
+	// --- Gate-1b: spawn-protection narration guard (#397 item 2). guardHarmful (in dealDamage) is the
+	// AUTHORITATIVE refusal — a protected target takes 0 damage regardless. But applySwingDamage emits the
+	// "The goblin hits you." message BEFORE dealDamage (SC2 ordering), so without this a protected player
+	// would see a phantom hit every round while taking no damage. Short-circuit the whole swing here so no
+	// to-hit roll and no hit narration fire. This is a COSMETIC pre-gate, not the enforcement: it does not
+	// stopFight (the window is transient — swings resume, and land, the moment it lapses), and self-swings
+	// (actor==target, nonsensical) are excluded so nothing here can suppress a real self-effect.
+	if attacker != target && z.spawnProtected(target) {
+		// The skip bypasses dealDamage's guardHarmful, which is where a still-protected ATTACKER's own shield
+		// would otherwise drop on this hostile attempt (effect_op.go). Drop it here too so melee matches the
+		// attempt-based rule every other harm path obeys — else a protected player sparring a protected foe
+		// keeps a shield a spell/Lua/cross-player write at the same target would have forfeited. No-op unless
+		// the attacker is itself a currently-protected player.
+		z.clearSpawnProtection(attacker)
+		return
+	}
+
 	// The ctx the whole pipeline shares: the attacker is $actor, the defender is $target. swingIndex
 	// feeds $swing.index. disp is harmful so any branch's apply_affect/deal_damage gates correctly. The
 	// round-shared eventBudget bounds the OnHit/OnDamageTaken cascade's TOTAL work across the round.
