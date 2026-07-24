@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -44,8 +45,9 @@ const (
 //     roll-UNDER systems, success = `max: <skill%>` (total <= skill) with the d100 as the bare roll.
 //   - marginMin/marginMax test the MARGIN (total − dc): dc-relative windows (Fate shifts, save-by-N,
 //     contested ties = {marginMin:0, marginMax:0}).
-//   - faceEq / faceCount  test the natural FACES: "at least faceCount dice show exactly faceEq" — the
-//     ONLY way to author nat-20 auto-crit / nat-1 auto-miss (independent of total) and Blades' 6-6.
+//   - faceEq / faceCount  test the natural KEPT FACES: "at least faceCount of the dice that COUNTED
+//     show exactly faceEq" — the ONLY way to author nat-20 auto-crit / nat-1 auto-miss (independent of
+//     total) and Blades' 6-6.
 //
 // Examples (top-down; first match wins):
 //
@@ -59,15 +61,17 @@ type checkBand struct {
 	max       formulaNode // total <= max     (nil: no upper bound)
 	marginMin formulaNode // margin >= marginMin   (nil: not margin-floor-tested)
 	marginMax formulaNode // margin <= marginMax   (nil: not margin-ceiling-tested)
-	faceEq    *float64    // optional: count natural faces equal to this value (ALL rolled faces, see note)
+	faceEq    *float64    // optional: count natural KEPT faces equal to this value (see matches)
 	faceCount int         // ... require at least this many such faces (defaults to 1 when faceEq set)
 	label     string
 	ops       []effectOp
 }
 
 // matches reports whether the classified result falls in this band. eval resolves a band-edge formula
-// to its value (it carries the check's $actor/$target/$source scope); faces are the natural dice.
-func (b *checkBand) matches(total, margin float64, faces []int, eval func(formulaNode) float64) bool {
+// to its value (it carries the check's $actor/$target/$source scope); kept are the natural faces that
+// CONTRIBUTED to the magnitude (see rollDiceSpec — identical to every rolled face for any spec that
+// discards nothing, which is every kind but keepHigh/keepLow).
+func (b *checkBand) matches(total, margin float64, kept []int, eval func(formulaNode) float64) bool {
 	if b.min != nil && total < eval(b.min) {
 		return false
 	}
@@ -81,13 +85,20 @@ func (b *checkBand) matches(total, margin float64, faces []int, eval func(formul
 		return false
 	}
 	if b.faceEq != nil {
-		// faceEq counts ALL rolled faces, not just the KEPT ones. For advantage (2d20kh1) this is
-		// correct for nat-20 crit (5e crits on a 20 on EITHER die). It diverges for a nat-1 auto-MISS
-		// band under advantage (a single 1 on the discarded die would match though you shouldn't auto-
-		// miss) — a narrow combo; a faceKeptOnly flag is the v2 fix if it ever bites. Builders pairing
-		// faceEq-miss with advantage should know this.
+		// faceEq counts the KEPT faces — the dice that actually contributed to the magnitude. For every
+		// spec that discards nothing (sum / Fudge / pool) kept IS every rolled face, so this is the
+		// identity there and no existing content shifts. It matters only for keepHigh/keepLow, where
+		// counting the DISCARDED die is simply wrong: a `{face_eq: 1 -> miss}` band on a 2d20kh1 fired on
+		// 9.36% of rolls (measured) because the thrown-away die showed a 1, while the die the check
+		// actually used was the higher one. Kept-only reads 0.25% — "the roll was a 1" — and is equally
+		// correct in the other direction (a nat-20 crit band under DISadvantage must require BOTH dice to
+		// show 20, which all-faces got wrong at 9.75% vs the correct 0.25%).
+		//
+		// This is load-bearing now rather than cosmetic: the boon/bane channel (below) makes a keep spec
+		// something a TRANSIENT condition selects, so a pack authoring the ordinary nat-1/nat-20 bands hits
+		// the keep path constantly instead of never.
 		n := 0
-		for _, f := range faces {
+		for _, f := range kept {
 			if float64(f) == *b.faceEq {
 				n++
 			}
@@ -112,6 +123,48 @@ type checkVs struct {
 
 // checkSpec is a parsed, immutable check (build-time). Shareable across zone goroutines; the per-roll
 // randomness comes from the effectCtx rng at resolve time.
+//
+// # The boon/bane channel (#511) — how a TRANSIENT condition changes a pending roll
+//
+// `dice` is the neutral roll. `boon`/`bane` are scoped formulas (the same $actor/$target/$source
+// vocabulary as `bonus` and the band edges) counting how many boon and bane influences bear on this
+// roll. PRESENCE on each side — not the difference between them — selects which of three
+// content-authored dice expressions is actually rolled:
+//
+//	boon > 0 AND bane > 0  -> the neutral `dice` (they cancel)
+//	boon > 0 alone         -> boonDice
+//	bane > 0 alone         -> baneDice
+//	neither, or the selected alternative is unauthored -> the neutral `dice`
+//
+// The engine deliberately does NOT synthesize the alternative die, and this is the crux of the design
+// rather than an implementation shortcut. "Roll it twice and keep the better one" presumes the engine
+// knows which direction is better, and it does not: this repo's own demo pack authors a ROLL-UNDER
+// avoidance ladder (1d100, `max: $actor.dodge` succeeds), where keeping the HIGHER die makes you worse
+// at dodging. Synthesizing keep-highest for "advantage" would have hardcoded d20 roll-high semantics —
+// 5e vocabulary — into the engine and silently inverted that ladder. It also cannot express a boon in
+// systems whose better-roll is not a keep at all (a Blades pool's boon is an EXTRA POOL DIE: 2d6>=4 ->
+// 3d6>=4). So content names all three expressions and the engine only ever SELECTS among them.
+//
+// ANY-VERSUS-ANY CANCELLATION, deliberately, and NOT a net difference. This is 5e's actual rule: one
+// source of advantage against one of disadvantage gives a straight roll, and so do FIVE sources against
+// one. A net-difference rule (evaluate boon - bane, select on the sign) reads as equivalent and is not
+// — it resolves 5-vs-1 as advantage. Counting influences rather than summing them is also what keeps
+// the channel honest as a union abstraction: a system that wants magnitude to matter already has
+// `bonus`, which is the additive channel and composes normally.
+//
+// POLARITY AND THE HARM GATE — read this before authoring a bane. The PvP apply-gate derives whether an
+// affect is harmful from the SIGN of its modifiers (affectIsDetrimental, defs.go): a negative additive
+// is harm, a positive additive is a buff. That inference assumes higher-is-better, which is exactly
+// what a bane counter inverts — so an affect that adds +3 to a bane attribute is a real debuff the
+// sign heuristic alone would read as benign. attributeInvertedPolarity (defs.go) closes this by
+// DERIVING the inverted set from the channel's own formulas rather than asking content to declare it,
+// so an author cannot forget; see that function for the derivation rule and its limits.
+//
+// Because boon/bane are ordinary attribute formulas they compose through EVERY modifier source the
+// entity already has — affects, gear affixes, racial base values, derived attributes — with no new
+// per-entity state, no new DTO field, and therefore no store round-trip exposure. An affect grants a
+// boon by adding to an ordinary content-named attribute (`modifiers: [{attr: atk_boon, op: add,
+// value: 1}]`); nothing about the affect runtime changed to support this.
 type checkSpec struct {
 	dice       diceSpec
 	bonus      formulaNode // over the actor/target/source attrs; nil => +0
@@ -119,16 +172,81 @@ type checkSpec struct {
 	bands      []checkBand
 	visibility checkVisibility
 	label      string // optional, for emission/logging ("Climb", "Dexterity save")
+
+	// boon/bane count the influences on each side (see the type comment: presence cancels, it does not
+	// sum). nil => 0 on that side. boonDice/baneDice are the content-authored alternatives; nil => that
+	// direction has no alternative expression and the neutral `dice` is rolled even when it is selected.
+	boon     formulaNode
+	bane     formulaNode
+	boonDice *diceSpec
+	baneDice *diceSpec
+}
+
+// effectiveDice applies the boon/bane channel and returns the dice expression to actually roll. `def`
+// is the default scope for a BARE attr ref, matching whatever the caller uses for `bonus` on the same
+// spec (the actor for a top-level check, the defender for a contested sub-spec) so the two never
+// disagree about what an unprefixed name means.
+//
+// FAST PATH / IDENTITY: a spec with no boon and no bane formula returns spec.dice untouched without
+// evaluating anything. Every check authored before #511 takes this path, so the channel cannot perturb
+// existing content — and the selection is idempotent by construction, since it only ever hands back one
+// of three expressions content wrote itself and never derives a fourth from them.
+//
+// A BROKEN CHANNEL IS NO CHANNEL. If EITHER side fails to evaluate — a malformed formula, a division
+// by zero, an attribute driven to ±Inf/NaN by a modifier fold — the whole channel degrades to the
+// neutral die rather than to "that side counted zero". The distinction matters: a lone errored boon
+// collapsing to 0 would leave a live bane unopposed, so an authoring bug in the BOON half would
+// silently hand the roller the WORSE die, and a poisoned attribute would become a way to pin an
+// opponent's roll deterministically. Failing the whole channel neutral is the only direction where a
+// broken input cannot be turned into an advantage by whoever broke it.
+func effectiveDice(c *effectCtx, spec *checkSpec, def *Entity) diceSpec {
+	if spec.boon == nil && spec.bane == nil {
+		return spec.dice
+	}
+	boonV, boonOK := evalCheckCount(c, spec.boon, def)
+	baneV, baneOK := evalCheckCount(c, spec.bane, def)
+	if !boonOK || !baneOK {
+		return spec.dice
+	}
+	hasBoon, hasBane := boonV > 0, baneV > 0
+	switch {
+	case hasBoon && hasBane:
+		return spec.dice // any-versus-any: they cancel to the straight roll
+	case hasBoon && spec.boonDice != nil:
+		return *spec.boonDice
+	case hasBane && spec.baneDice != nil:
+		return *spec.baneDice
+	default:
+		return spec.dice
+	}
+}
+
+// evalCheckCount evaluates one side of the channel and reports whether the value is USABLE. It differs
+// from evalCheckFormula in refusing to launder a failure into a number: a nil node is a legitimate 0
+// (that side simply is not authored), but an evaluation error or a non-finite result yields ok=false so
+// the caller can fail the whole channel neutral. NaN is rejected by IsNaN rather than by comparison,
+// since every comparison against NaN is false and would otherwise read as "absent".
+func evalCheckCount(c *effectCtx, node formulaNode, def *Entity) (float64, bool) {
+	if node == nil {
+		return 0, true
+	}
+	v, err := evalCheckFormulaErr(c, node, def)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	return v, true
 }
 
 // checkResult is the outcome of resolving a check (returned to opCheck + emission).
 type checkResult struct {
-	roll      int     // the dice magnitude (sum, kept-sum, Fudge sum, or pool success count)
-	faces     []int   // the natural faces rolled (for emission / future nat-crit bands)
-	bonus     float64 // the evaluated bonus
-	total     float64 // roll + bonus
-	dc        float64 // the threshold (DC value, or the contested defender's total)
-	margin    float64 // total − dc
+	roll      int      // the dice magnitude (sum, kept-sum, Fudge sum, or pool success count)
+	faces     []int    // EVERY natural face rolled (for emission/logging — a player wants to see both dice)
+	kept      []int    // the faces that CONTRIBUTED to roll; what the nat-face bands test (see rollDiceSpec)
+	dice      diceSpec // the expression actually rolled — spec.dice, or a boon/bane alternative (#511)
+	bonus     float64  // the evaluated bonus
+	total     float64  // roll + bonus
+	dc        float64  // the threshold (DC value, or the contested defender's total)
+	margin    float64  // total − dc
 	contested bool
 	band      *checkBand // the matched band (nil only if bands is empty)
 	bandLabel string
@@ -139,11 +257,14 @@ type checkResult struct {
 // run the band's ops — opCheck does that, keeping the classifier free of the runOps recursion. Single-
 // writer: zone goroutine. Deterministic under a seeded ctx rng.
 func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
-	roll, faces := rollDiceSpec(c, spec.dice)
+	// The boon/bane channel (#511) picks WHICH content-authored expression this roll uses, before any
+	// dice are thrown. Bare refs in boon/bane default to $actor, matching `bonus` on the same spec.
+	dice := effectiveDice(c, spec, c.actor)
+	roll, faces, kept := rollDiceSpec(c, dice)
 	bonus := evalCheckFormula(c, spec.bonus, c.actor)
 	total := float64(roll) + bonus
 
-	res := checkResult{roll: roll, faces: faces, bonus: bonus, total: total}
+	res := checkResult{roll: roll, faces: faces, kept: kept, dice: dice, bonus: bonus, total: total}
 
 	switch {
 	case spec.vs.contested != nil:
@@ -152,7 +273,10 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 		// grapple writes the defender's stat as a plain `["attr","athletics"]` and reads the defender,
 		// not the attacker. $actor/$source remain available for an explicit cross-reference.
 		res.contested = true
-		dRoll, _ := rollDiceSpec(c, spec.vs.contested.dice)
+		// The defender's own spec gets its own boon/bane selection, scoped like its bonus ($target by
+		// default) — otherwise a contested check would let only the attacker's conditions matter, and a
+		// prone/restrained defender would contest a grapple at full strength.
+		dRoll, _, _ := rollDiceSpec(c, effectiveDice(c, spec.vs.contested, c.target))
 		res.dc = float64(dRoll) + evalCheckFormula(c, spec.vs.contested.bonus, c.target)
 	case spec.vs.dc != nil:
 		res.dc = evalCheckFormula(c, spec.vs.dc, c.actor)
@@ -171,7 +295,7 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 	// Band edges are formulas scoped like bonus/vs (default $actor), evaluated lazily per band.
 	evalEdge := func(n formulaNode) float64 { return evalCheckFormula(c, n, c.actor) }
 	for i := range spec.bands {
-		if spec.bands[i].matches(res.total, res.margin, res.faces, evalEdge) {
+		if spec.bands[i].matches(res.total, res.margin, res.kept, evalEdge) {
 			res.band = &spec.bands[i]
 			res.bandLabel = spec.bands[i].label
 			break
@@ -189,8 +313,21 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 // affect modifiers flow in); attr() owns its own cache + cycle guard, so this resolver needs neither.
 // A nil node is +0. A malformed formula logs + yields 0 (content-lint is the real gate).
 func evalCheckFormula(c *effectCtx, node formulaNode, def *Entity) float64 {
-	if node == nil {
+	v, err := evalCheckFormulaErr(c, node, def)
+	if err != nil {
 		return 0
+	}
+	return v
+}
+
+// evalCheckFormulaErr is evalCheckFormula with the error SURFACED instead of collapsed to 0. Most
+// callers (bonus, vs, band edges) genuinely want the lenient 0 — a broken edge should not abort a
+// resolution mid-flight, and content-lint is the real gate there. The boon/bane channel does not: for
+// it, "this failed" and "this counted zero" have opposite consequences (see effectiveDice), so it needs
+// to tell them apart. Same resolver, same scoping, one behaviour difference.
+func evalCheckFormulaErr(c *effectCtx, node formulaNode, def *Entity) (float64, error) {
+	if node == nil {
+		return 0, nil
 	}
 	r := &formulaResolver{
 		visited: map[string]bool{},
@@ -214,9 +351,9 @@ func evalCheckFormula(c *effectCtx, node formulaNode, def *Entity) float64 {
 		if c.z != nil {
 			c.z.log.Debug("check formula error", "err", err)
 		}
-		return 0
+		return 0, err
 	}
-	return v
+	return v, nil
 }
 
 // resolveCheckScope maps a (possibly scoped) attr ref to (entity, bareName). "$target.dex_save" ->
@@ -330,7 +467,10 @@ func emitCheck(c *effectCtx, spec *checkSpec, res checkResult) {
 	case res.contested:
 		s.send(textFrame(fmt.Sprintf("[%s] %d%+d = %d vs %d (contested) — %s",
 			label, res.roll, int(res.bonus), int(res.total), int(res.dc), res.bandLabel)))
-	case spec.dice.kind == dicePool:
+	// The EFFECTIVE die's kind, not the spec's: a boon/bane alternative may be a different kind than the
+	// neutral expression (a pool system's boon is an extra pool die), and the emission must describe the
+	// roll the player actually made.
+	case res.dice.kind == dicePool:
 		s.send(textFrame(fmt.Sprintf("[%s] %d successes — %s", label, res.roll, res.bandLabel)))
 	case spec.vs.dc == nil && !res.contested:
 		s.send(textFrame(fmt.Sprintf("[%s] %d%+d = %d — %s",

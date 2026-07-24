@@ -73,7 +73,8 @@ func rollSpecCtx(t *testing.T, notation string, seed int64) (int, []int) {
 		t.Fatalf("parseDiceSpec(%q): %v", notation, err)
 	}
 	c := &effectCtx{rng: rand.New(rand.NewSource(seed))}
-	return rollDiceSpec(c, d)
+	m, f, _ := rollDiceSpec(c, d)
+	return m, f
 }
 
 func TestRollDiceSpecD1Deterministic(t *testing.T) {
@@ -120,17 +121,17 @@ func TestRollDiceSpecSeededRepeatable(t *testing.T) {
 
 func TestSumKept(t *testing.T) {
 	faces := []int{3, 18, 9}
-	if got := sumKept(faces, 1, true); got != 18 {
+	if got, _ := sumKept(faces, 1, true); got != 18 {
 		t.Fatalf("keep-high 1 of %v = %d, want 18", faces, got)
 	}
-	if got := sumKept(faces, 1, false); got != 3 {
+	if got, _ := sumKept(faces, 1, false); got != 3 {
 		t.Fatalf("keep-low 1 of %v = %d, want 3", faces, got)
 	}
-	if got := sumKept(faces, 2, true); got != 27 {
+	if got, _ := sumKept(faces, 2, true); got != 27 {
 		t.Fatalf("keep-high 2 of %v = %d, want 27", faces, got)
 	}
 	// Keeping more than rolled keeps all; the source slice must not be mutated.
-	if got := sumKept(faces, 9, true); got != 30 {
+	if got, _ := sumKept(faces, 9, true); got != 30 {
 		t.Fatalf("keep-high 9 of %v = %d, want 30 (all)", faces, got)
 	}
 	if faces[0] != 3 || faces[1] != 18 || faces[2] != 9 {
