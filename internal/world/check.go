@@ -259,7 +259,17 @@ type checkSpec struct {
 	// SAVER must be narrated to and must be the OnCheck subject so content can author "on a successful
 	// save, the saver gains X" — otherwise unauthorable, since the roll would fire on the caster. Explicit
 	// `$actor`/`$target`/`$source` refs still bind to the FIXED ctx entities regardless of subject; only
-	// the bare-ref default and the narration/event identity follow the roller.
+	// the bare-ref default and the narration/event identity follow the roller. FOOTGUN: under
+	// subject: target a BARE `vs` DC ref also resolves to the roller (the saver), so a caster's save DC
+	// must be written explicitly as `$actor`/`$source`, never bare — a bare `dc: save_dc` would read the
+	// SAVER's attribute, not the caster's. With no bound ctx target a subject: target check simply does
+	// not narrate (emitCheck fails safe on a nil roller) — the roll still resolves.
+	//
+	// subject does NOT rebind the band OPS' target vocabulary — only the roll's scope/narration/event.
+	// Inside a subject: target save's bands the DEFAULT op target is the saver (c.target, natural), but
+	// `tgt: self`/`$actor` is still the CASTER (the ctx actor) and `tgt: other` is unbound (c.other is
+	// nil in a check ctx). So "on a failed save, the caster reacts" is authored with `tgt: self` in the
+	// fail band, which reads backwards from the "subject: target" framing — hence this note.
 	subject checkSubject
 
 	// boon/bane count the influences on each side (see the type comment: presence cancels, it does not
@@ -548,6 +558,15 @@ func resolveVisibility(spec *checkSpec) checkVisibility {
 // ops narrate). show => the full math; summary => just the band label. Phase 6 emits via the actor's
 // own stream (send); the GMCP structured emit is a reserved Phase-9 hook.
 func emitCheck(spec *checkSpec, res checkResult, roller *Entity) {
+	if roller == nil {
+		// The roller is nil whenever a `subject: target` check runs with no bound ctx target — a self-
+		// cast, an untargeted ability, an affect tick, an item proc. sessionOf(nil) would deref a nil
+		// entity's components and panic the resolution mid-op-list; there is simply nothing to narrate
+		// to, so fail safe exactly like the non-player early return below. (Every other roller-dependent
+		// site already tolerates nil: attr(nil)=0, fireEvent guards subject==nil, effectiveDice's fast
+		// path never touches the entity — emitCheck was the lone unguarded one.)
+		return
+	}
 	s, ok := sessionOf(roller)
 	if !ok {
 		return // only a player ROLLER emits to a stream (a save narrates to the saver, not the caster)

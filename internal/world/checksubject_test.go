@@ -146,6 +146,22 @@ func TestSubjectExplicitRefsBindFixed(t *testing.T) {
 		"$actor stays bound to the ctx actor even under subject: target")
 }
 
+// TestSubjectTargetNilTargetDoesNotPanic pins the fail-safe: a `subject: target` check with NO bound
+// ctx target (a self-cast, an untargeted ability, an affect tick) must resolve without panicking — the
+// roller is nil, so emitCheck simply does not narrate. Before the nil guard this deref-panicked the
+// resolution mid-op-list.
+func TestSubjectTargetNilTargetDoesNotPanic(t *testing.T) {
+	z, caster, _ := subjectZone(t)
+	c := checkCtx(z, caster.entity, caster.entity, nil) // target is nil
+
+	spec := bareSaveSpec(subjTarget)
+	spec.visibility = visShow // force the narration path — that is where the deref lived
+	require.NotPanics(t, func() {
+		res := resolveCheck(c, spec)
+		require.NotNil(t, res.band, "the roll still resolves to a band")
+	}, "a subject: target check with a nil target must fail safe, not panic")
+}
+
 // TestParseSubjectTargetWiredFromContent pins the parser: `subject: target` -> subjTarget, absent ->
 // subjActor.
 func TestParseSubjectTargetWiredFromContent(t *testing.T) {
