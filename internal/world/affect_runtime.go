@@ -195,6 +195,7 @@ func (a *Affected) recomputeMods() {
 	a.flat = nil
 	a.mul = nil
 	a.prevents = nil
+	a.damageMult = nil
 	for _, inst := range a.list {
 		scale := inst.magnitude * float64(maxInt(inst.stacks, 1))
 		for _, m := range inst.def.modifiers {
@@ -219,6 +220,24 @@ func (a *Affected) recomputeMods() {
 				a.prevents = map[string]int{}
 			}
 			a.prevents[tag]++
+		}
+		// Per-target damage multipliers (#537), composed by PRODUCT across active affects. Two
+		// resistances (0.5, 0.5) → 0.25, resist+vuln (0.5, 2) → 1 (cancel), and immunity (0) dominates
+		// anything — the natural composition, and correct for immunity and cancellation. 5e's cap of
+		// "one level of resistance" is a system rule content expresses through affect stacking, not the
+		// engine's to impose here. Deliberately NOT scaled by magnitude/stacks: a multiplier is a
+		// property of the CONDITION (you are resistant, or you are not), not a dose — a stackCount poison
+		// does not make a resistance 4× stronger. An author wanting dose-scaled resistance composes
+		// several affects.
+		for typ, m := range inst.def.damageTakenMult {
+			if a.damageMult == nil {
+				a.damageMult = map[string]float64{}
+			}
+			cur, ok := a.damageMult[typ]
+			if !ok {
+				cur = 1
+			}
+			a.damageMult[typ] = cur * m
 		}
 	}
 }

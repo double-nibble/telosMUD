@@ -318,6 +318,14 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		slog.Warn("content: deal_damage.type does not name a registered damage_type (no resist matrix, and no #405 pool routing)",
 			"owner", m.owner, "type", logcap.Value(m.dmgType))
 	}
+	// Load-time content-lint (#537): an affect's damage_taken_mult keyed by a damage type that is not
+	// registered is a silent no-op — the multiplier can never apply, because damage always carries a
+	// registered type. A vulnerability an author believes they authored simply never bites; a resistance
+	// they rely on never protects. WARN so the typo surfaces at load.
+	for _, m := range lintDamageTakenMultTypes(d) {
+		slog.Warn("content: affect damage_taken_mult names an unregistered damage_type; the multiplier will never apply",
+			"affect", logcap.Value(m.affect), "type", logcap.Value(m.dmgType))
+	}
 	// Load-time content-lint (#406): a NON-VITAL resource's on_depleted is FARMABLE if it rewards. Unlike the
 	// vital/death hook — latched to an actual kill by posDead, and for a mob followed by extraction — a
 	// non-vital hook is level-triggered per BLOW, so a pool held at 0 re-runs it for one point of damage,
@@ -502,6 +510,34 @@ func lintDealDamageTypes(d *defRegistries) []dealDamageTypeMiss {
 		if op.kind == "deal_damage" && op.dmgType != "" && d.dmg.get(op.dmgType) == nil {
 			misses = append(misses, dealDamageTypeMiss{owner: owner, dmgType: op.dmgType})
 		}
+	})
+	return misses
+}
+
+// damageTakenMultMiss is one content-lint finding (#537): an affect's damage_taken_mult names a damage
+// type that is not registered, so the multiplier is dead.
+type damageTakenMultMiss struct {
+	affect  string
+	dmgType string
+}
+
+// lintDamageTakenMultTypes flags each affect whose damage_taken_mult keys an unregistered damage type.
+// Build-time only; WARN (a dead multiplier is a content bug, not a boot blocker). Deterministic order
+// (sorted by affect then type) so the log is stable across Go's randomized map iteration.
+func lintDamageTakenMultTypes(d *defRegistries) []damageTakenMultMiss {
+	var misses []damageTakenMultMiss
+	for ref, def := range d.affect.table() {
+		for typ := range def.damageTakenMult {
+			if d.dmg.get(typ) == nil {
+				misses = append(misses, damageTakenMultMiss{affect: ref, dmgType: typ})
+			}
+		}
+	}
+	sort.Slice(misses, func(i, j int) bool {
+		if misses[i].affect != misses[j].affect {
+			return misses[i].affect < misses[j].affect
+		}
+		return misses[i].dmgType < misses[j].dmgType
 	})
 	return misses
 }

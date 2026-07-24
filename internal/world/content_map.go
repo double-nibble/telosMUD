@@ -118,6 +118,13 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 	if len(a.Body.Prevents) > 0 {
 		prevents = append(prevents, a.Body.Prevents...)
 	}
+	var dmgMult map[string]float64
+	if len(a.Body.DamageTakenMult) > 0 {
+		dmgMult = make(map[string]float64, len(a.Body.DamageTakenMult))
+		for k, v := range a.Body.DamageTakenMult {
+			dmgMult[k] = v
+		}
+	}
 	def := &affectDef{
 		ref:         a.Ref,
 		name:        a.Name,

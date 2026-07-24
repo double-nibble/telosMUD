@@ -875,7 +875,13 @@ type AffectBodyDTO struct {
 	Duration  int                 `json:"duration" yaml:"duration"`
 	Modifiers []AffectModifierDTO `json:"modifiers" yaml:"modifiers"`
 	Prevents  []string            `json:"prevents" yaml:"prevents"`
-	Tick      *AffectTickDTO      `json:"tick" yaml:"tick"`
+	// DamageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on incoming damage the bearer takes while
+	// the affect is active: `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` = resist fire, be
+	// vulnerable to cold, immune to poison. The per-target analogue of a damage type's global resist
+	// scalar. Composed across active affects by product; an absent type is ×1. A value > 1 is a
+	// VULNERABILITY (a debuff — the harm gate treats such an affect as detrimental).
+	DamageTakenMult map[string]float64 `json:"damage_taken_mult" yaml:"damage_taken_mult"`
+	Tick            *AffectTickDTO     `json:"tick" yaml:"tick"`
 	OnApply   any                 `json:"on_apply" yaml:"on_apply"`   // RESERVED op-list (5.3)
 	OnExpire  any                 `json:"on_expire" yaml:"on_expire"` // RESERVED op-list (5.3)
 	Resist    map[string]any      `json:"resist" yaml:"resist"`       // RESERVED resist spec (5.3)
