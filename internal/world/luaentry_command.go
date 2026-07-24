@@ -75,6 +75,18 @@ func (z *Zone) runCustomCommand(s *session, verb, arg, body string) {
 	if z.lua == nil || s == nil || s.entity == nil {
 		return
 	}
+	// DOWNED backstop (#535, security F3). A death-suspended (downed/dying, held at 0) actor cannot
+	// invoke a custom command — mirroring the swing/react/cast gates (canAct, checkRequires). Custom Lua
+	// verbs dispatch straight from the parser and do NOT pass through canAct/checkRequires or the tag-CC
+	// gate, so without this an unconscious/dying player could keep acting (e.g. a builder `smite` verb
+	// whose body calls h:damage) — the "unkillable-and-acting" hole F3 closes for engine verbs, reached
+	// through a non-engine one. Gated at the command ENTRY, deliberately NOT in the harm funnel: the
+	// dying affect's own on_tick resolves the downed state via `deal_damage self` (the actor there IS the
+	// downed victim), so a funnel-level actor-downed check would break content's death-save loop.
+	if deathSuspended(s.entity) {
+		s.send(textFrame("You can't do that right now."))
+		return
+	}
 	rt := z.lua
 	ch := rt.chunkFor("command:"+verb, body)
 	if ch == nil {

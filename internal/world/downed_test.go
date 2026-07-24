@@ -3,6 +3,7 @@ package world
 import (
 	"testing"
 
+	playv1 "github.com/double-nibble/telosmud/api/gen/telosmud/play/v1"
 	"github.com/double-nibble/telosmud/internal/content"
 
 	"github.com/stretchr/testify/require"
@@ -384,4 +385,39 @@ func TestDownedPlayerCannotCast(t *testing.T) {
 
 	open := &abilityDef{ref: "shout", name: "shout", invocation: "command", words: []string{"shout"}}
 	require.False(t, z.checkRequires(caster, open), "a downed player cannot cast even an open ability")
+}
+
+// TestDownedPlayerCannotRunCustomCommand pins the CUSTOM-COMMAND backstop (security re-review Finding 1):
+// custom Lua verbs dispatch straight from the parser and do NOT pass through canAct/checkRequires, so
+// without a gate at the command entry a downed player could keep acting through a builder-authored verb
+// (the "unkillable-and-acting" hole, reached via a non-engine verb). A downed player's custom command
+// must not run its body.
+func TestDownedPlayerCannotRunCustomCommand(t *testing.T) {
+	z := newZone("cmd")
+	room := z.newEntity("cmd:room:hall")
+	Add(room, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["cmd:room:hall"] = room
+	z.defs.affect.register("dying", &affectDef{ref: "dying", duration: 30, suspendsDeath: true})
+	// A custom verb whose body records that it RAN (sets a state flag) — so we can prove it did NOT.
+	registerCustomCommand(z.defs, content.CommandDTO{
+		Verb: "smite",
+		Lua:  `self:send("ZAP"); state_ran = "yes"`,
+	})
+	s := &session{character: "Downed", out: make(chan *playv1.ServerFrame, 8), epoch: 1}
+	z.newPlayerEntity(s, "Downed")
+	Move(s.entity, room)
+	z.players["Downed"] = s
+
+	// Baseline: the verb runs normally when NOT downed.
+	z.dispatch(s, "smite")
+	require.Contains(t, drainAllText(s.out), "ZAP", "a healthy player's custom verb runs")
+
+	// Down the player, then dispatch again: the body must not run.
+	applyAffect(s.entity, "dying", attachOpts{}, nil)
+	require.True(t, deathSuspended(s.entity))
+	z.dispatch(s, "smite")
+	out := drainAllText(s.out)
+	require.Contains(t, out, "You can't do that right now.",
+		"a downed player's custom verb must be refused")
+	require.NotContains(t, out, "ZAP", "a downed player's custom verb body must NOT run")
 }

@@ -899,6 +899,13 @@ type AffectBodyDTO struct {
 	// applies dying UNCONDITIONALLY makes the bearer unkillable (every lethal blow re-downs it).
 	// suspends_death is also treated as DETRIMENTAL by the harm gate: a cross-player apply routes through
 	// guardHarmful (a self-buff / "second wind" self-apply stays ungated).
+	//
+	// PERSISTENCE (by design): the downed state (a suspends_death affect + a vital at 0) is durable and
+	// reloads intact — a player who logs out downed returns downed, and the dying affect's death-save
+	// on_tick resumes on reconnect (the finite clock effectively pauses while detached). A downed actor
+	// cannot act on reconnect any more than in-world: canAct, the cast gate, and the custom-command entry
+	// all refuse a death-suspended actor. A pack that prefers a clean slate can instead resolve a
+	// persisted-downed entity to death on login from its own reattach hook.
 	SuspendsDeath bool `json:"suspends_death" yaml:"suspends_death"`
 	// DamageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on incoming damage the bearer takes while
 	// the affect is active: `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` = resist fire, be
