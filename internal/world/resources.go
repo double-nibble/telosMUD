@@ -142,6 +142,14 @@ func runRegen(e *Entity) {
 	if e == nil || e.living == nil || e.zone == nil {
 		return
 	}
+	// DOWNED SUPPRESSION (#535): a death-suspended entity (held alive at 0 in a depleted vital) must NOT
+	// passively regen — otherwise a downed entity heals itself out of the downed state with nobody doing
+	// anything, defeating the hold. All regen is paused for the duration of the suspension; content's
+	// dying affect owns the resolution (deal lethal, revive, or expire-and-recover). Regen resumes the
+	// instant the suspension lifts, so a stabilized entity recovers normally.
+	if deathSuspended(e) {
+		return
+	}
 	fighting := position(e) == posFighting
 	for ref, def := range e.zone.resourceDefs().table() {
 		if def.regen <= 0 {

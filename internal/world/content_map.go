@@ -147,6 +147,7 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		prevents:       prevents,
 		tags:           tags,
 		grantsImmunity: grantsImmunity,
+		suspendsDeath:  a.Body.SuspendsDeath,
 		onApply:        a.Body.OnApply,
 		onExpire:       a.Body.OnExpire,
 		onApplyLua:     a.Body.OnApplyLua,

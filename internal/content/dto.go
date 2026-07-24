@@ -883,6 +883,10 @@ type AffectBodyDTO struct {
 	// immune to while active: `grants_immunity: [charm, fear]`. applyAffect vetoes a matching incoming
 	// affect before it attaches (before its on_apply fires). A grants_immunity affect is beneficial.
 	GrantsImmunity []string `json:"grants_immunity" yaml:"grants_immunity"`
+	// SuspendsDeath (#535): while this affect is active, its bearer is held ALIVE at 0 in a depleted
+	// vital pool instead of dying (the downed/dying state). A content `dying` affect sets this + a finite
+	// duration + prevents tags + an on_tick death-save loop; the hp pool's on_depleted hook applies it.
+	SuspendsDeath bool `json:"suspends_death" yaml:"suspends_death"`
 	// DamageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on incoming damage the bearer takes while
 	// the affect is active: `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` = resist fire, be
 	// vulnerable to cold, immune to poison. The per-target analogue of a damage type's global resist

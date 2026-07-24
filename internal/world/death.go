@@ -165,7 +165,43 @@ func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, dep depletion
 	if !vitalDepleted(victim, pool) {
 		return
 	}
+	// THE THIRD DISPOSITION (#535): DOWNED/DYING. A content affect carrying suspends_death holds the
+	// victim ALIVE at 0 instead of dying — the "unconscious and dying, not dead" state. This sits between
+	// the vital gate above and die() below, deliberately: it is NOT a second die() call site (die() still
+	// has exactly one, so "a non-vital depletion can never kill" stays structural), and it runs AFTER the
+	// on_depleted hook, so the hook that APPLIES the dying affect (apply_affect self) has already run and
+	// its suspension is visible here. The pool stays at 0, posDead is left unset, no corpse, no respawn:
+	// the victim is down. Content's dying affect (its on_tick death-save loop + finite duration) owns the
+	// resolution — deal true lethal to end it, revive above 0, or let it expire and recover via regen
+	// (which resumes once the suspension lifts; runRegen skips a suspended entity so it can't self-revive
+	// out of downed).
+	//
+	// LEVEL-TRIGGERED HOLD: a further blow onto the already-empty vital re-enters here and re-holds
+	// (still suspended) — which is correct: "damage while dying" is a content concern the dying affect's
+	// on_damage/on_tick handles (a death-save failure), not an engine kill. The re-entry guard above and
+	// the deathGen fence keep this bounded; the hold adds no new recursion (it is a plain early return).
+	if deathSuspended(victim) {
+		z.log.Debug("death suspended: victim held at 0 (downed/dying, #535)",
+			"victim", targetShort(victim), "pool", pool)
+		return
+	}
 	z.die(victim, killer, parent)
+}
+
+// deathSuspended reports whether entity e carries any active affect that holds it alive at 0 in a
+// depleted vital pool (#535 — the downed/dying state). O(active affects), zone-goroutine read. A
+// nil/absent Affected component suspends nothing (the engine-default: a depletion kills).
+func deathSuspended(e *Entity) bool {
+	a, ok := Get[*Affected](e)
+	if !ok {
+		return false
+	}
+	for _, inst := range a.list {
+		if inst.def != nil && inst.def.suspendsDeath {
+			return true
+		}
+	}
+	return false
 }
 
 // runDepletionHook runs an on_depleted op-list under the SAME depth/width bound fireEvent applies to an

@@ -480,6 +480,14 @@ type affectDef struct {
 	// whose ref/category/tags intersect this set — before it attaches and before its on_apply fires. The
 	// runtime unions these into Affected.immunity. A grants_immunity affect is BENEFICIAL (protective).
 	grantsImmunity []string
+	// suspendsDeath (#535) holds the bearer ALIVE at 0 in a depleted vital pool instead of dying. While
+	// any active affect with this flag is on an entity, onPoolDepleted does NOT die() a vital-depleted
+	// victim — it leaves the pool at 0, unlatched, alive (the "downed/dying" state). Content authors a
+	// `dying` affect with `suspends_death: true`, a finite duration, prevents tags (act/move/cast) to
+	// lock the downed bearer, and an on_tick that runs the death-save loop; the vital pool's on_depleted
+	// hook applies it. The engine provides only the hold-at-0 + no-auto-regen-revive; content owns the
+	// resolution (deal lethal to end it, revive above 0, or let it expire and recover). See deathSuspended.
+	suspendsDeath bool
 	// damageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on INCOMING damage the bearer takes: a
 	// content-declared `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` makes the bearer resistant
 	// (½), vulnerable (×2), or immune (×0) to that type while the affect is active. It is the per-TARGET
