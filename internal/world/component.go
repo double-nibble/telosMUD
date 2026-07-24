@@ -41,6 +41,7 @@ const (
 	KindStack       // Phase 13.2: a stackable material's per-instance count
 	KindKept        // #36: a per-instance "do not drop" marker (keep/unkeep)
 	KindCorpseOwner // security hardening: a corpse's killer loot-ownership window (anti-ninja-loot)
+	KindReleased    // #443: a transient marker — WHO (which player) last dropped/put this item (cross-char transfer audit)
 )
 
 // Component is the capability a struct grants when added to an entity. The single

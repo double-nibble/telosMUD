@@ -458,3 +458,27 @@ func (s *failBatchSink) AppendAuditBatch(context.Context, []AuditEvent) (int, er
 }
 
 var errBatchInjected = errors.New("injected batch failure")
+
+// TestAuditLowPriorityWatermarkReservesHeadroom (#443 Finding B): once the shared auditor queue is past the
+// reserve watermark, a low-priority item_transferred enqueue is SHED, while a critical kind still enqueues —
+// so a transfer flood can never starve died/tier_changed out of the queue. Deterministic: the drainer is
+// NOT started, so the buffered channel fills and stays filled.
+func TestAuditLowPriorityWatermarkReservesHeadroom(t *testing.T) {
+	a := newAuditor(NewMemStore()) // enabled sink; run() NOT called, so nothing drains the channel
+	for i := 0; i < auditLowPriorityWatermark; i++ {
+		a.enqueueLowPriority(AuditEvent{EventKind: AuditKindItemTransferred})
+	}
+	if got := len(a.reqs); got != auditLowPriorityWatermark {
+		t.Fatalf("queue depth after filling to the watermark = %d, want %d", got, auditLowPriorityWatermark)
+	}
+	// At the watermark a further LOW-priority event is shed (queue unchanged)...
+	a.enqueueLowPriority(AuditEvent{EventKind: AuditKindItemTransferred})
+	if got := len(a.reqs); got != auditLowPriorityWatermark {
+		t.Fatalf("a low-priority event was NOT shed past the watermark: depth %d, want %d", got, auditLowPriorityWatermark)
+	}
+	// ...but a CRITICAL kind still enqueues into the reserved headroom.
+	a.enqueue(AuditEvent{EventKind: AuditKindDied})
+	if got := len(a.reqs); got != auditLowPriorityWatermark+1 {
+		t.Fatalf("a critical kind must still enqueue past the watermark: depth %d, want %d", got, auditLowPriorityWatermark+1)
+	}
+}
