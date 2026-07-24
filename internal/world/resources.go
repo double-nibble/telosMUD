@@ -142,14 +142,16 @@ func runRegen(e *Entity) {
 	if e == nil || e.living == nil || e.zone == nil {
 		return
 	}
-	// DOWNED SUPPRESSION (#535): a death-suspended entity (held alive at 0 in a depleted vital) must NOT
-	// passively regen — otherwise a downed entity heals itself out of the downed state with nobody doing
-	// anything, defeating the hold. All regen is paused for the duration of the suspension; content's
-	// dying affect owns the resolution (deal lethal, revive, or expire-and-recover). Regen resumes the
-	// instant the suspension lifts, so a stabilized entity recovers normally.
-	if deathSuspended(e) {
-		return
-	}
+	// DOWNED SUPPRESSION (#535): a death-suspended entity must not passively heal ITSELF OUT of the
+	// downed state — otherwise a downed entity revives with nobody doing anything, defeating the hold.
+	// But the suppression is SCOPED to the pool that is actually holding it at 0: only a DEPLETED VITAL
+	// pool is frozen while suspended (see the per-pool skip in the loop below). A suspends_death affect
+	// on an otherwise-healthy entity (its cross-player apply now routes through the harm gate, but a
+	// self-buff or a not-yet-triggered "guardian angel" is legitimate) must NOT freeze that entity's
+	// unrelated pools — a blanket skip here would make any suspends_death affect a total regen-denial
+	// debuff. Content's dying affect owns the resolution (deal lethal, revive, or expire-and-recover);
+	// regen of the held vital resumes the instant the suspension lifts.
+	suspended := deathSuspended(e)
 	fighting := position(e) == posFighting
 	for ref, def := range e.zone.resourceDefs().table() {
 		if def.regen <= 0 {
@@ -169,6 +171,13 @@ func runRegen(e *Entity) {
 		}
 		cur := resourceCurrent(e, ref)
 		if cur >= maxV {
+			continue
+		}
+		// The downed hold, scoped (#535): while death-suspended, freeze regen of a DEPLETED VITAL pool
+		// only — that is the pool holding the entity at 0, and letting it tick would self-revive out of
+		// downed. Non-vital pools (mana, stamina) and any non-depleted pool still regen normally, so a
+		// suspends_death affect is not a blanket regen-denial debuff on a healthy bearer.
+		if suspended && def.vital && cur <= 0 {
 			continue
 		}
 		// Lua `regen` formula (7.4f): a pack may compute the per-tick regen amount in Lua (a

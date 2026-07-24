@@ -589,6 +589,19 @@ func affectIsDetrimental(def *affectDef, h harmPolarity) bool {
 	if len(def.prevents) > 0 {
 		return true // any CC tag is harm by construction
 	}
+	if def.suspendsDeath {
+		// SUSPENDS_DEATH (#535) is harm-relevant and the sign heuristic is blind to it (this is the same
+		// harm-gate-blindness class as the bane counters, condition flags, vulnerabilities, and immunity
+		// grants above — the sixth of the round). It is genuinely detrimental to a victim two ways: while
+		// active it SUPPRESSES the depleted vital's passive regen (a no-modifier "undying" affect is a
+		// pure heal-denial debuff), and it TRAPS a victim held at 0 — unable to die→respawn to escape,
+		// unable to regen out — for the affect's whole duration. The polarity is ambiguous (a guardian-
+		// angel no-death buff on an ALLY is benign), so — exactly as modify_resource gates ANY cross-
+		// player write regardless of sign, since the engine cannot know a content pool's polarity — err
+		// toward gating: a cross-player apply routes through guardHarmful. Self-apply stays ungated, so a
+		// legitimate "second wind" self-buff still lands.
+		return true
+	}
 	if hasVulnerability(def) {
 		return true // a per-target VULNERABILITY (#537): taking >1× damage of a type is a debuff
 	}

@@ -518,13 +518,14 @@ func (z *Zone) swingGatesPass(attacker, target *Entity) bool {
 		return false
 	}
 	if !canAct(attacker) {
-		return false // sleeping/dead attacker cannot swing
+		// sleeping/dead attacker cannot swing — and, since #535, canAct also refuses a DOWNED (death-
+		// suspended) attacker structurally, so a downed entity cannot keep attacking even without a
+		// content `prevents: [act]` tag and even if dragged into a fighting link.
+		return false
 	}
-	// An attacker prevented from ACTING (a downed/dying entity's `prevents: [act]`, a stun, a paralyze)
-	// does not swing (#535/#540). canAct is position-only; this is the tag-CC half, so a content
-	// condition that locks a bearer out of acting also stops its melee — the same `prevents` set the
-	// cast gate and the reaction gate read. A downed entity (held at 0, prevents act) therefore cannot
-	// keep attacking even if it was dragged into a fighting link.
+	// An attacker prevented from ACTING by a content CC tag (a stun, a paralyze, a dying affect's
+	// `prevents: [act]`) does not swing (#540). This is the tag-CC half, complementing the structural
+	// downed/position gate in canAct above — the same `prevents` set the cast and reaction gates read.
 	if preventsTag(attacker, "act") {
 		return false
 	}

@@ -825,9 +825,14 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	//   - A vital pool can also reach 0 off the damage path (modify_resource, an ability cost, a max drop);
 	//     the next blow onto that already-empty vital must still kill. An edge rule would leave an
 	//     unkillable 0-hp victim.
-	// The cost is that a non-vital hook can re-run while the pool stays empty (a vital one is latched by
-	// posDead). That is a CONTENT concern, called out in ResourceDTO.OnDepleted: make the hook idempotent
-	// (`if has_affect` / `stacking: ignore`) and never put a rewarding op in one.
+	// The cost is that a hook can re-run while the pool stays empty. For a NON-vital pool nothing latches
+	// the re-entry, so this is a CONTENT concern (called out in ResourceDTO.OnDepleted): make the hook
+	// idempotent (`if has_affect` / `stacking: ignore`) and never put a rewarding op in one. For a VITAL
+	// pool the re-entry was historically latched by posDead (die() fires once, then the entry check bars
+	// re-entry) — EXCEPT once a downed/dying state (#535) holds a vital-depleted victim ALIVE at 0, where
+	// posDead is never set. The engine closes that gap itself: onPoolDepleted short-circuits an already-
+	// death-suspended victim BEFORE running the hook, so a downed vital pool's hook does not re-fire per
+	// blow (no re-applied dying, no farmed reward). See onPoolDepleted's already-downed re-hold guard.
 	// The deathGen re-read is the cross-respawn guard described at the write above: if the victim died
 	// during the events this blow fired, THIS blow's depletion is void — the entity that pool belonged to is
 	// gone (a corpsed mob) or has already been restored and moved (a respawned player).
