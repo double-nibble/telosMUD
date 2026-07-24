@@ -105,6 +105,12 @@ func buildSnapshot(s *session) *handoffv1.PlayerSnapshot {
 		// the EFFECTIVE hear-set (recomputed against ITS channel_defs + the live entity) to the gate on
 		// arrival, so the gate's receiver HEAR-filter is correct for the destination's content.
 		CommsState: dumpCommsStateJSON(s),
+		// Carry the per-character command-alias subtree (#353) across the handoff so a cross-shard walk is
+		// alias-transparent: a player's `alias`/`unalias` shortcuts do not reset when they change shard. Its
+		// OWN dedicated field (session-scoped, like CommsState — NOT part of the entity StateJson below).
+		// Empty for a player with no aliases (the common case); bound by snapshotSigningInput like every other
+		// carried subtree, so a keyless/insecure destination cannot inject a forged alias map.
+		Aliases: dumpAliasStateJSON(s),
 		// Carry the player's REMAINING entity state (inventory, equipment, attribute bases, resource
 		// currents, affects with remaining durations, flags, cooldowns with remaining, self.state) across
 		// the seam so a midgaard->darkwood walk no longer drops gear/stats/affects (the full-state-carry

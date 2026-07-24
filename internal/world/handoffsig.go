@@ -112,6 +112,12 @@ func snapshotSigningInput(req *handoffv1.PrepareRequest) []byte {
 	// concurrent cap and mint rate limit, and falsely attributing the mints in the audit log. It grants no
 	// elevation, so it is a milder class than the tier, but it is bound on identical terms.
 	writeStr(snap.GetAccount())
+	// aliases (#353) is a data-only, session-scoped subtree (verb->expansion) re-fed to the parser as ordinary
+	// player input. Bound here — appended at a fixed position after the pre-existing fields — so a keyless/
+	// insecure or network attacker cannot inject or rewrite a forged alias map into an in-flight handoff. It
+	// grants no elevation (expansion runs before the MinRank gate), so the threat is mild, but a length-prefixed
+	// write costs nothing and keeps every carried subtree uniformly signed.
+	writeStr(snap.GetAliases())
 
 	return h.Sum(nil)
 }

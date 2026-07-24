@@ -212,6 +212,15 @@ func (z *Zone) dispatch(s *session, line string) {
 	verb, rest := split(line)
 	lower := strings.ToLower(verb)
 
+	// Alias expansion (#353): a player-defined shortcut (`alias bc burn corpse`) is expanded into a full
+	// command line HERE, at the split step the parser doc reserved for it, BEFORE verb resolution — so an
+	// alias can target any verb the resolver handles (base/ability/custom/channel/toggle) and grants no
+	// privilege (the MinRank gate below runs on the RESOLVED verb, after expansion). Trailing input is
+	// appended Unix-style. Cycle-/depth-bounded (aliases.go). A no-op (unallocated) for a player with no
+	// aliases. Runs BEFORE the AFK-clear so an alias to `afk`/`afk <msg>` is treated as the afk verb there.
+	verb, rest, _ = z.expandAlias(s, lower, rest)
+	lower = verb // expandAlias returns the (already-lowercased) expanded verb
+
 	// AFK clears on the player's NEXT input (Phase 8.6): any non-blank command they type un-AFKs them and
 	// refreshes presence/who. The `afk` command runs AFTER this clear, so `afk <msg>` still SETS afk (it
 	// re-sets it inside the handler) — only a DIFFERENT command clears a standing AFK. Cheap: a no-op
