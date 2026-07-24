@@ -495,7 +495,38 @@ func (z *Zone) emitRoomInfo(s *session, r *Entity) {
 // untouched; only the departure/arrival broadcast strings now flow through act() (same
 // text). dir is already canonical here (the registry binds each movement command to its
 // canonical direction).
+// isRoomExit reports whether the player's current room has an exit keyed `dir` (#370). It backs the
+// named-exit dispatch fall-through (parser.go): a content exit keyword becomes typeable as a movement verb.
+// It checks the ordinary `exits` map ONLY — never `entrances` (dungeon doors, whose crossing is the
+// instance-entry security path, reached exclusively through registered direction verbs, never an arbitrary
+// typed keyword). Pure read of zone-owned state; zone goroutine. False for a session with no live entity/room.
+func (z *Zone) isRoomExit(s *session, dir string) bool {
+	if s == nil || s.entity == nil {
+		return false
+	}
+	from := s.entity.location
+	if from == nil || from.room == nil {
+		return false
+	}
+	_, ok := from.room.exits[dir]
+	return ok
+}
+
+// maxTraverseRedirects bounds how many times a `traverse` hook may redirect a single move (#370) before the
+// engine refuses further redirection — a cheap loop/cycle backstop (a hook that redirects grove->gate->grove,
+// or one that redirects unconditionally), analogous to the alias-expansion depth cap. At the floor a further
+// redirect is refused as a block ("hopelessly turned around").
+const maxTraverseRedirects = 3
+
+// move traverses `dir` from the player's current room — the player-command movement entry (the mv() verbs and
+// the named-exit dispatch fall-through). It is the depth-0 entry to attemptMove; a `traverse` hook's redirect
+// re-enters attemptMove with a decremented redirect budget. Returns true only when it RELEASED OWNERSHIP of
+// the session (an intra-shard transfer / cross-shard handoff).
 func (z *Zone) move(s *session, dir string) bool {
+	return z.attemptMove(s, dir, maxTraverseRedirects)
+}
+
+func (z *Zone) attemptMove(s *session, dir string, redirectsLeft int) bool {
 	if dir == "" {
 		s.send(textFrame("Go where?"))
 		return false
@@ -535,7 +566,15 @@ func (z *Zone) move(s *session, dir string) bool {
 		// contain entrances. IF A FOLLOW MECHANIC IS EVER ADDED it becomes the first path that moves a player
 		// through a direction on someone else's initiative, and it MUST refuse an entrance direction or this
 		// property collapses silently.
-		if tmpl, isDoor := from.room.entrances[dir]; isDoor {
+		//
+		// #370: the `traverse` hook's redirect(dir) IS exactly such a path — it re-feeds a CONTENT-CHOSEN
+		// direction into attemptMove — so the entrance branch is gated on the DEPTH-0 (player-typed) move only:
+		// playerTyped is true iff no redirect has been consumed (the redirect budget is still full). A redirect
+		// recursion (redirectsLeft < max) therefore can NEVER reach the instance-mint door — a redirect that
+		// names an entrance key simply misses both maps and yields "You can't go that way." This keeps
+		// entrances reachable exclusively through the player's own typed direction, as #435 requires.
+		playerTyped := redirectsLeft == maxTraverseRedirects
+		if tmpl, isDoor := from.room.entrances[dir]; isDoor && playerTyped {
 			// Every refusal — not instanceable, caps, rate limit, no nesting, no verified account, a mint
 			// already pending, a draining shard — is requestInstanceEntry's or the async mint's, and each
 			// already speaks to the player. `true` is the gate decision: the mover IS the invoking actor.
@@ -551,6 +590,47 @@ func (z *Zone) move(s *session, dir string) bool {
 		return false
 	}
 	destZone, destRoom := parseRef(ref)
+
+	// Cancellable traverse hook (#370): fire the FROM room's `traverse` trigger BEFORE any transfer branch
+	// (local / intra-shard / cross-shard), so content can BLOCK, message, or redirect a move — a guard
+	// stepping in, a locked gate, a quest gate — including a cross-zone move. Placed here (after the exit
+	// resolves, before the branch split) precisely so it gates every destination uniformly. It runs on the
+	// zone goroutine before the move commits; nil-safe / allow when the room carries no `traverse` handler.
+	gateGen := deathGen(s.entity)
+	gateOrigin := s.entity.location
+	blocked, msg, redirectDir := z.fireCanExit(s.entity, from, dir, string(ref))
+	// REDIRECT takes precedence: the hook asked to send the mover through a DIFFERENT exit of this same room
+	// (a portal, a confusion effect). Re-attempt the move via that exit, bounded by the redirect budget so a
+	// hook that redirects unconditionally — or a redirect cycle — cannot recurse without end. At the floor a
+	// further redirect is refused as a block. A redirect to the SAME exit is ignored (treated as no redirect)
+	// so a hook can `redirect(ev.dir)` harmlessly. The mover is unmoved here, so the re-attempt re-resolves
+	// from the same room with the new direction.
+	if redirectDir != "" && redirectDir != dir {
+		if redirectsLeft <= 0 {
+			s.send(textFrame("You are hopelessly turned around and can't make any progress."))
+			z.log.Debug("move redirect budget exhausted", "player", s.character, "room", from.proto, "dir", dir)
+			return false
+		}
+		z.log.Debug("move redirected by traverse hook", "player", s.character, "from_dir", dir, "to_dir", redirectDir)
+		return z.attemptMove(s, redirectDir, redirectsLeft-1)
+	}
+	if blocked {
+		if msg == "" {
+			msg = "You can't go that way."
+		}
+		s.send(textFrame(msg))
+		z.log.Debug("move blocked by traverse hook", "player", s.character, "room", from.proto, "dir", dir)
+		return false
+	}
+	// The hook may have relocated or killed the mover — a co-located guard mob it revealed that then acted, a
+	// future living-actor context. If so, ABANDON this move so we don't teleport the relocated/respawned player
+	// onward: the hook's outcome stands. This mirrors the fireLeaveRoom re-check below; the deathGen check
+	// catches a lethal reaction that respawned the mover in place (location unchanged). A bare room hook (actor
+	// has no Living) cannot itself harm/relocate the player — the harm gate fails closed — so this is
+	// forward-looking defense-in-depth on the single move funnel, not a hot path today.
+	if deathGen(s.entity) != gateGen || s.entity.location != gateOrigin || position(s.entity) == posDead {
+		return false
+	}
 
 	// Intra-shard cross-zone move: the destination is a DIFFERENT zone that THIS shard
 	// also hosts. Transfer the player in-process — no handoff, no snapshot, no epoch

@@ -494,9 +494,16 @@ func insertRooms(ctx context.Context, tx pgx.Tx, pack string, z content.ZoneDTO)
 		// foreign key into rooms(ref), and an entrance names a ZONE, so it could never satisfy it. Anything
 		// added here must also be read back in BOTH loadRoomDefinition and loadRooms — a field written and
 		// not read survives the YAML tree loader and dies only on the store round trip, which is why every
-		// world test would still pass. RoomDTO.Lua is dropped by this path today for exactly that reason.
+		// world test would still pass.
 		if len(r.InstanceEntrances) > 0 {
 			rb["instance_entrances"] = r.InstanceEntrances
+		}
+		// #370: a room's OPTIONAL trigger block (the cancellable `traverse` hook, `enter`/`leave`, …) rides the
+		// body JSONB like instance_entrances. It was dropped through Postgres until the first demo ROOM with a
+		// Lua block (darkwood sanctum's warden) surfaced the gap in TestStorePackRoundTrip — the exact
+		// write-without-read trap the comment above warns about. Read back in BOTH loadRoomDefinition and loadRooms.
+		if r.Lua != "" {
+			rb["lua"] = r.Lua
 		}
 		body, _ := json.Marshal(rb)
 		var coord []byte // the [x,y,z] minimap position rides the dedicated coord JSONB column (Phase 9.3b)

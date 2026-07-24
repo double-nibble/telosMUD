@@ -1,6 +1,8 @@
 package world
 
 import (
+	"strings"
+
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/double-nibble/telosmud/internal/textsan"
@@ -368,6 +370,111 @@ func (z *Zone) fireRoomLeave(leaver, room *Entity) {
 	}
 	rt := z.lua
 	rt.fireTrigger(room, "leave", rt.rootCtx(room), rt.evTable(leaver, ""))
+}
+
+// fireCanExit fires the room's CANCELLABLE `traverse` trigger BEFORE a move commits (#370): the mover is
+// attempting to leave `room` via exit `dir` toward `dest` (a room ref). Unlike every other movement trigger
+// — which fires at or AFTER the commit and cannot stop the move — this one gates it. The handler may:
+//
+//   - call block("message") — CANCEL and show the mover that message (the guard example: "A grizzled
+//     guard steps in front of you.");
+//   - return false — CANCEL with the engine's default "You can't go that way." message;
+//   - call redirect("dir") — send the mover through a DIFFERENT EXIT of this same room instead (a portal, a
+//     confusion effect). The engine performs the redirected move, bounded by a redirect budget (move()), so
+//     a redirect loop cannot recurse without end. Redirect takes precedence over block. TWO caveats for
+//     content authors: (a) the redirect target RE-FIRES this same hook (it re-enters the move), so an
+//     unconditional block()+redirect() that does not guard on ev.exit self-traps the mover — always key the
+//     hook on ev.exit; (b) a redirect may name a CROSS-ZONE exit and thus carry the mover across a zone/shard
+//     boundary through the normal transfer/handoff path. A redirect target is resolved through `exits` ONLY
+//     (never an instance entrance — the #435 door stays reachable only by the player's own typed direction).
+//
+// Any other outcome (no call, a nil/true/absent return) ALLOWS the move. The handler runs on the zone
+// goroutine (single-writer) with a clean ROOT ctx whose actor is the ROOM (so a spawn/harm op inside it is
+// attributed to the room script and gated normally) — so it can reveal a guard, gate on a flag/quest, or
+// message the mover. Returns (blocked, message, redirectDir). FAILS OPEN: a room with no `traverse` handler,
+// an unscripted room, a quarantined instance, or a handler that ERRORS all ALLOW the move — a buggy gate must
+// never imprison a player. A CONSEQUENCE: a `traverse` hook is NOT a hard security boundary — a script error
+// un-gates it. A builder wanting an un-bypassable gate must not implement it solely as a traverse hook (the
+// one real security sink behind a move, an instance entrance, is guarded independently by requestInstanceEntry).
+func (z *Zone) fireCanExit(mover, room *Entity, dir, dest string) (bool, string, string) {
+	if z == nil || z.lua == nil || mover == nil || room == nil || !Has[*Scripted](room) {
+		return false, "", ""
+	}
+	rt := z.lua
+	es := rt.ensureEntityScript(room)
+	if es == nil {
+		return false, "", ""
+	}
+	h, ok := es.handlers.RawGetString("traverse").(*lua.LFunction)
+	if !ok {
+		return false, "", "" // no traverse gate on this room: allow
+	}
+	key := breakerKeyInstance(es.rid)
+	if rt.breakerDisabled(key) {
+		return false, "", "" // quarantined instance: allow (fail-open)
+	}
+
+	// The decision is threaded out of Lua via `block`/`redirect` closures bound in the call env (so a handler
+	// calls a bare `block("msg")` / `redirect("north")`, mirroring `on`/`self`), plus the handler's boolean
+	// return.
+	blocked := false
+	msg := ""
+	redirectDir := ""
+	blockFn := rt.L.NewFunction(func(l *lua.LState) int {
+		blocked = true
+		if l.GetTop() >= 1 {
+			// The message is content-supplied text delivered to a player client — clean it (markup-safe strip)
+			// exactly like every other script-supplied outbound string.
+			msg = textsan.CleanMarkup(l.OptString(1, ""))
+		}
+		return 0
+	})
+	redirectFn := rt.L.NewFunction(func(l *lua.LState) int {
+		// A redirect direction is a room exit KEY re-fed to move() — lowercase + trim so it matches the exit
+		// map like a typed verb does. The engine bounds the re-attempt (move()'s redirect budget).
+		redirectDir = strings.ToLower(strings.TrimSpace(l.OptString(1, "")))
+		return 0
+	})
+
+	ev := rt.evTable(mover, "")
+	ev.RawSetString("dir", lua.LString(dir))
+	ev.RawSetString("exit", lua.LString(dir)) // alias: the exit KEYWORD the mover invoked (== dir today)
+	if dest != "" {
+		ev.RawSetString("to", lua.LString(dest)) // the destination room ref, for a gate that keys on WHERE
+	}
+	binds := map[string]lua.LValue{
+		"self":     rt.newHandle(room),
+		"state":    es.state,
+		"ev":       ev,
+		"block":    blockFn,
+		"redirect": redirectFn,
+	}
+
+	L := rt.L
+	env := rt.freshCallEnv(binds)
+	h.Env = env
+	c := rt.rootCtx(room)
+	inv := &luaInvocation{actor: c.actor, depth: c.depth, eventBudget: c.eventBudget, breakerKey: key}
+	prev := rt.inv
+	rt.inv = inv
+	defer func() { rt.inv = prev }()
+
+	top := L.GetTop()
+	L.Push(h)
+	L.Push(ev)
+	if err := rt.pcallGuarded(key, "trigger:traverse:#"+ridStr(es.rid), 1, 1); err != nil {
+		rt.log.Warn("lua traverse trigger error (isolated; move ALLOWED, fail-open)",
+			"event", "traverse", "rid", es.rid, "err", err.Error())
+		L.SetTop(top)
+		return false, "", "" // an errored gate must not trap the player
+	}
+	ret := L.Get(-1)
+	L.SetTop(top)
+	// A handler that returns exactly `false` blocks too (with the default message unless it also called block).
+	if b, isBool := ret.(lua.LBool); isBool && !bool(b) {
+		blocked = true
+	}
+	return blocked, msg, redirectDir
 }
 
 // fireDeath fires the `death` trigger on a dying scripted entity (ev.actor = the killer, may be

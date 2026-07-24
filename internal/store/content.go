@@ -184,9 +184,10 @@ func (p *Pool) loadRoomDefinition(ctx context.Context, ref, pack string) (conten
 	var flags, entrances []byte
 	err := p.pool.QueryRow(ctx,
 		`SELECT ref, name, COALESCE(sector, ''), COALESCE(body->>'long', ''),
-		        COALESCE(body->'flags', '[]'::jsonb), COALESCE(body->'instance_entrances', '{}'::jsonb)
+		        COALESCE(body->'flags', '[]'::jsonb), COALESCE(body->'instance_entrances', '{}'::jsonb),
+		        COALESCE(body->>'lua', '')
 		   FROM rooms WHERE ref = $1 AND pack = $2`, ref, pack).
-		Scan(&r.Ref, &r.Name, &r.Sector, &r.Long, &flags, &entrances)
+		Scan(&r.Ref, &r.Name, &r.Sector, &r.Long, &flags, &entrances, &r.Lua) // #370: room trigger block
 	if errors.Is(err, pgx.ErrNoRows) {
 		return content.Definition{Kind: content.KindRoom, Ref: ref, Found: false}, nil
 	}
@@ -290,7 +291,8 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 	rows, err := p.pool.Query(ctx,
 		`SELECT ref, zone_ref, name, COALESCE(sector, ''), COALESCE(body->>'long', ''),
 		        COALESCE(body->'flags', '[]'::jsonb), coord,
-		        COALESCE(body->'instance_entrances', '{}'::jsonb)
+		        COALESCE(body->'instance_entrances', '{}'::jsonb),
+		        COALESCE(body->>'lua', '')
 		   FROM rooms WHERE pack = ANY($1) ORDER BY zone_ref, ref`, enabled)
 	if err != nil {
 		return fmt.Errorf("store: query rooms: %w", err)
@@ -299,7 +301,7 @@ func (p *Pool) loadRooms(ctx context.Context, enabled []string, zones map[string
 		var r content.RoomDTO
 		var zoneRef string
 		var flags, coord, entrances []byte
-		if err := rows.Scan(&r.Ref, &zoneRef, &r.Name, &r.Sector, &r.Long, &flags, &coord, &entrances); err != nil {
+		if err := rows.Scan(&r.Ref, &zoneRef, &r.Name, &r.Sector, &r.Long, &flags, &coord, &entrances, &r.Lua); err != nil { // #370: room trigger block
 			rows.Close()
 			return fmt.Errorf("store: scan room: %w", err)
 		}
