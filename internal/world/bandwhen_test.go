@@ -453,11 +453,10 @@ func TestConditionFlagGateIsWiredIntoApplyAffect(t *testing.T) {
 	require.Equal(t, 0.0, attr(victim.entity, "autofail_save"))
 }
 
-// TestWhenScreensNonFiniteAttributes drives a `when`-referenced attribute non-finite through
-// resolveCheck, so the finiteness screen is pinned by BEHAVIOUR rather than only by a direct unit test
-// on the helper. The bare-ref case is fully closed here; the LAUNDERED case is not, and is asserted as
-// a known limit so it cannot quietly regress in either direction.
-func TestWhenScreensNonFiniteAttributes(t *testing.T) {
+// bandCorruptZone builds a whenZone whose `corrupt` attribute is driven out of range, so the #513
+// tests below share one poisoning fixture. Returns the poisoned target too.
+func bandCorruptZone(t *testing.T) (*Zone, *session, *Entity) {
+	t.Helper()
 	z, caster, mob := whenZone(t)
 	z.defs.attr.register("corrupt", &attributeDef{ref: "corrupt", base: litNode{v: 1}})
 	for _, ref := range []string{"huge_a", "huge_b"} {
@@ -468,6 +467,18 @@ func TestWhenScreensNonFiniteAttributes(t *testing.T) {
 	}
 	applyAffect(mob, "huge_a", attachOpts{}, nil)
 	applyAffect(mob, "huge_b", attachOpts{}, nil)
+	return z, caster, mob
+}
+
+// TestWhenRefusesADegradedAttribute is the #513 property RESTORED. A `when` predicate reading a
+// screened attribute must NOT force its band — a content defect must leave the roll respected, never
+// force the outcome. This is the exact property the silent-saturation attempt destroyed: it handed the
+// predicate a bounded-but-usable 1e12 that read as truthy, so a poisoned attribute FORCED an auto-crit.
+// The degraded marker restores it: a degraded attribute makes the whole `when` formula error, which
+// collapses to 0, so the predicate is false.
+func TestWhenRefusesADegradedAttribute(t *testing.T) {
+	z, caster, mob := bandCorruptZone(t)
+	require.True(t, attrIsDegraded(mob, "corrupt"), "the fixture must actually degrade the attribute")
 
 	c := checkCtx(z, caster.entity, caster.entity, mob)
 	band := func(when formulaNode) string {
@@ -477,58 +488,38 @@ func TestWhenScreensNonFiniteAttributes(t *testing.T) {
 		}).bandLabel
 	}
 
-	// The fold now SATURATES rather than overflowing (attributes.go), so the fixture's overflow lands
-	// at the engine ceiling instead of at +Inf. Assert against the ceiling itself rather than a guessed
-	// sentinel — an earlier version of this precondition hardcoded MaxFloat64 and went red the moment
-	// the fold fix landed, because the two branches were only ever verified separately.
-	poisoned := attr(mob, "corrupt")
-	require.Equal(t, attrFoldCeiling, poisoned,
-		"the fixture must drive the fold past overflow; it should saturate at the ceiling")
+	require.Equal(t, "normal", band(attrNode{ref: "$target.corrupt"}),
+		"a degraded attribute must NOT force its band — the content defect must not decide the outcome")
 
-	// A SATURATED attribute is a large finite number, and a large positive number is legitimately a
-	// present influence — so this now reads as forced, and correctly so. The property that matters is
-	// that nothing NON-FINITE reaches the predicate, which is asserted directly below.
-	require.False(t, math.IsInf(poisoned, 0), "no infinity may reach a state predicate")
-	require.False(t, math.IsNaN(poisoned))
-	require.Equal(t, "forced", band(attrNode{ref: "$target.corrupt"}),
-		"a saturated (finite, large) attribute is a legitimate truthy predicate")
+	// A NON-degraded truthy attribute on the same spec still forces, so the refusal is specific to the
+	// degraded marker and not a blanket failure of `when`. (An unset attribute is 0 -> not forced, which
+	// is why the control has to SET one.)
+	require.Equal(t, "normal", band(attrNode{ref: "$target.helpless"}), "unset -> 0 -> not forced")
+	setAttrBase(mob, "helpless", 1) // an ordinary, non-degraded truthy attribute
+	require.False(t, attrIsDegraded(mob, "helpless"))
+	require.Equal(t, "forced", band(attrNode{ref: "$target.helpless"}),
+		"an ordinary truthy attribute still forces — the refusal is specific to degradation")
 }
 
-// TestWhenLaunderingHoleIsClosed is the former known-limit test, updated now that the fold is bounded.
-//
-// It USED to record a hole: evalFinite screens only a formula's final value, so `min(+Inf, 1)`
-// laundered an infinite attribute into a clean 1 and could force a band outcome the roll could not
-// prevent. With attr() saturating, there is no infinity left to launder — the wrapper now sees a large
-// finite number, and `min(1e12, 1) == 1` is an ordinary truthy predicate rather than a poisoned one.
-//
-// The test is kept rather than deleted because the SHAPE is what mattered: it pins that no non-finite
-// value can reach a predicate through a wrapper, which is the property the fold fix buys.
-func TestWhenLaunderingHoleIsClosed(t *testing.T) {
-	z, caster, mob := whenZone(t)
-	z.defs.attr.register("corrupt", &attributeDef{ref: "corrupt", base: litNode{v: 1}})
-	for _, ref := range []string{"huge_a", "huge_b"} {
-		z.defs.affect.register(ref, &affectDef{
-			ref: ref, name: ref, stacking: stackRefresh, maxStacks: 1, duration: 100,
-			modifiers: []affectModifier{{attr: "corrupt", add: false, value: 1e308}},
-		})
-	}
-	applyAffect(mob, "huge_a", attachOpts{}, nil)
-	applyAffect(mob, "huge_b", attachOpts{}, nil)
-
+// TestWhenLaunderingIsClosedByPropagation pins that the marker survives a WRAPPER. The old hole was
+// `min(+Inf, 1) == 1` laundering an infinity into a clean predicate. Now `corrupt` is finite (screened
+// to the ceiling), but it is DEGRADED, and derivation propagates the marker — so a formula reading it,
+// wrapped or not, still errors and the band is not forced. This is why propagation matters: without it,
+// the wrapper would launder the degradation exactly as it once laundered the infinity.
+func TestWhenLaunderingIsClosedByPropagation(t *testing.T) {
+	z, caster, mob := bandCorruptZone(t)
 	c := checkCtx(z, caster.entity, caster.entity, mob)
+
 	laundered := opFormula("min", attrNode{ref: "$target.corrupt"}, litNode{v: 1})
 	got := resolveCheck(c, &checkSpec{
 		dice:  mustDice(t, "1d1"),
 		bands: []checkBand{{when: laundered, label: "forced"}, {label: "normal"}},
 	}).bandLabel
 
-	// Still "forced" — but for an entirely different and legitimate reason than before. Previously the
-	// predicate was satisfied by a laundered INFINITY; now it is satisfied by min(1e12, 1) == 1, an
-	// ordinary positive number. The assertion that carries the security property is the finiteness one.
-	require.Equal(t, "forced", got)
-	require.False(t, math.IsInf(attr(mob, "corrupt"), 0),
-		"THE PROPERTY: no wrapper can launder a non-finite attribute into a predicate, because the fold "+
-			"no longer produces one")
+	require.False(t, math.IsInf(attr(mob, "corrupt"), 0), "the attribute is finite (screened)...")
+	require.True(t, attrIsDegraded(mob, "corrupt"), "...but degraded...")
+	require.Equal(t, "normal", got,
+		"...so a wrapper reading it still refuses to force: the marker cannot be laundered away")
 }
 
 // TestEmptyFormulaFieldIsRejected pins the present-but-null gate. `parseFormula(nil)` returns

@@ -7,160 +7,303 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// attrfinite_test.go covers the finiteness guard on the ATTRIBUTE MODIFIER FOLD.
+// attrfinite_test.go covers the magnitude bound + degraded-marker on the attribute modifier fold.
 //
-// resolveAttr guards the attribute's own base FORMULA with evalFinite, but the fold that follows it —
-// `(base + flat) * mul` summed and multiplied across every modifier source — had no guard at all. Two
-// ordinary content affects (a `mul` modifier is a documented affect shape) therefore drive any
-// attribute to ±Inf, and NaN additionally escapes the attribute_def's declared min/max clamp, because
-// every comparison against NaN is false.
+// # What broke, and the two opposed constraints the fix has to satisfy
 //
-// WHAT IS ACTUALLY REACHABLE, measured rather than assumed: op formulas are already safe, since they
-// resolve through evalFinite and a non-finite result collapses to 0. The exposed consumers are the
-// ones that read attr() DIRECTLY — resourceMax (`int(attr(...))`, which yields MaxInt64 and an
-// unkillable pool) and soak — plus any predicate comparing against a NaN, which silently takes the
-// unexpected branch.
+// resolveAttr computed `(base + flat) * mul` across every modifier source with no bound. Two ordinary
+// content affects with a large modifier drive an attribute to ±Inf (1e308 x 1e308), and even one
+// finite 1e300 modifier leaves int() to wrap. Two independent reviews established that neither obvious
+// remedy is safe ALONE:
+//
+//   - Failing an overflow CLOSED (resolve to 0, the cycle path's behaviour) is unsafe for a DIRECT
+//     reader: 0 on max_hp means resourceMax <= 0, which is the natural-immunity discard AND makes the
+//     entity undying. So a direct reader wants a bounded NUMBER.
+//   - Saturating to a finite number SILENTLY is unsafe for a FORMULA reader: before any screen, an
+//     overflow was +Inf and evalFinite rejected it, so a deal_damage bonus reading a poisoned
+//     attribute contributed 0 — the formula path failed closed for free. A legitimate-looking 1e12
+//     hands every formula a usable one-shot value. So a formula reader wants the value REFUSED.
+//
+// The fix does both: attrScreen returns a bounded value AND flags the attribute degraded; direct
+// readers get the number, formula readers (evalCheckFormulaErr) refuse the degraded marker.
 
-// infZone registers an attribute plus two multiplicative affects large enough to overflow float64 when
-// composed. Nothing here is exotic content — a `mul` modifier is an ordinary, documented affect shape.
-func infZone(t *testing.T) (*Zone, *Entity) {
+// foldZone registers an attribute plus affects that drive it out of range. `mulValue`/`addValue`
+// select the poisoning shape without a helper explosion.
+func foldZone(t *testing.T, attrName string, mods ...affectModifier) (*Zone, *Entity) {
 	t.Helper()
 	z, caster := abilityTestZone(t)
-	z.defs.attr.register("power", &attributeDef{ref: "power", base: litNode{v: 2}})
-	z.defs.affect.register("huge_a", &affectDef{
-		ref: "huge_a", name: "Huge A", stacking: stackRefresh, maxStacks: 1, duration: 100,
-		modifiers: []affectModifier{{attr: "power", add: false, value: 1e308}},
-	})
-	z.defs.affect.register("huge_b", &affectDef{
-		ref: "huge_b", name: "Huge B", stacking: stackRefresh, maxStacks: 1, duration: 100,
-		modifiers: []affectModifier{{attr: "power", add: false, value: 1e308}},
-	})
+	if z.defs.attr.get(attrName) == nil {
+		z.defs.attr.register(attrName, &attributeDef{ref: attrName, base: litNode{v: 2}})
+	}
+	for i, m := range mods {
+		ref := "poison_" + string(rune('a'+i))
+		z.defs.affect.register(ref, &affectDef{
+			ref: ref, name: ref, stacking: stackRefresh, maxStacks: 1, duration: 100,
+			modifiers: []affectModifier{m},
+		})
+		applyAffect(caster.entity, ref, attachOpts{}, nil)
+	}
 	return z, caster.entity
 }
 
-// TestModFoldOverflowIsClampedNotInfinite is the headline guard: composing two large multipliers must
-// not yield a non-finite attribute.
-func TestModFoldOverflowIsClampedNotInfinite(t *testing.T) {
-	z, e := infZone(t)
-	require.Equal(t, 2.0, attr(e, "power"))
-
-	applyAffect(e, "huge_a", attachOpts{}, nil)
-	applyAffect(e, "huge_b", attachOpts{}, nil)
-
-	got := attr(e, "power")
-	require.False(t, math.IsInf(got, 0), "the fold overflowed to %v — an infinite attribute", got)
-	require.False(t, math.IsNaN(got), "the fold produced NaN")
-	require.Equal(t, attrFoldCeiling, got, "an overflowing fold saturates at the engine ceiling")
-	_ = z
-}
-
-// TestResourceMaxCannotReachMaxInt64 is the CONSEQUENCE test, and it pins the harm that is actually
-// reachable rather than the one that is easiest to assume.
-//
-// The tempting story is "a poisoned attribute in a damage formula becomes int(+Inf) = MaxInt64, an
-// instant kill". MEASURED, THAT IS FALSE: every op formula resolves through evalFinite, which rejects
-// a non-finite result and yields 0, so a deal_damage bonus reading an infinite attribute contributes
-// nothing and the blow lands for its base amount. The formula path was already guarded.
-//
-// The reachable path is the one that does NOT go through a formula. resourceMax is
-// `int(attr(e, def.maxAttr))` — a direct read and an unguarded conversion — so an infinite max_hp
-// yields a pool whose maximum is MaxInt64. The harm is the OPPOSITE of a one-shot: an entity with an
-// effectively bottomless vital pool is unkillable, and since resourceCurrent treats an absent pool as
-// full, it starts there. `soak_<type>` (effect_op.go) is the same shape and grants total immunity.
-func TestResourceMaxCannotReachMaxInt64(t *testing.T) {
-	z, caster := abilityTestZone(t)
-	e := caster.entity
-	for _, ref := range []string{"bloat_a", "bloat_b"} {
-		z.defs.affect.register(ref, &affectDef{
-			ref: ref, name: ref, stacking: stackRefresh, maxStacks: 1, duration: 100,
-			modifiers: []affectModifier{{attr: "max_hp", add: false, value: 1e308}},
+// TestAttrScreen is the table test for the screen primitive itself, across the whole input space the
+// panel called out: ±Inf, NaN, above/below the ceiling, exactly the ceiling, a non-finite FALLBACK
+// (the hole the first attempt had — it returned an infinite fallback verbatim), denormals, and -0.
+func TestAttrScreen(t *testing.T) {
+	c := attrFoldCeiling
+	for _, tc := range []struct {
+		name       string
+		v, fb      float64
+		want       float64
+		wantScreen bool
+	}{
+		{"an ordinary value passes untouched", 42, 0, 42, false},
+		{"exactly the ceiling is not screened", c, 0, c, false},
+		{"just over the ceiling saturates", c * 1.0001, 0, c, true},
+		{"a huge finite value saturates (the case a finiteness-only screen missed)", 1e300, 0, c, true},
+		{"a negative over the ceiling saturates toward the floor", -1e300, 0, -c, true},
+		{"+Inf saturates at the ceiling", math.Inf(1), 0, c, true},
+		{"-Inf saturates at the floor", math.Inf(-1), 0, -c, true},
+		{"NaN falls back to a finite fallback", math.NaN(), 7, 7, true},
+		{"NaN with a NaN fallback resolves to 0", math.NaN(), math.NaN(), 0, true},
+		{"NaN with an INFINITE fallback resolves to 0 (the self-hole)", math.NaN(), math.Inf(1), 0, true},
+		{"NaN with an over-ceiling fallback resolves to 0", math.NaN(), 1e300, 0, true},
+		{"a denormal is an ordinary value", 5e-324, 0, 5e-324, false},
+		{"negative zero passes untouched", math.Copysign(0, -1), 0, math.Copysign(0, -1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, screened := attrScreen(tc.v, tc.fb)
+			require.Equal(t, tc.wantScreen, screened, "screened flag")
+			if math.IsNaN(tc.want) {
+				require.True(t, math.IsNaN(got))
+			} else {
+				require.Equal(t, tc.want, got)
+			}
+			require.False(t, math.IsInf(got, 0), "the screen must never RETURN a non-finite value")
+			require.False(t, math.IsNaN(got), "the screen must never return NaN")
 		})
 	}
-	applyAffect(e, "bloat_a", attachOpts{}, nil)
-	applyAffect(e, "bloat_b", attachOpts{}, nil)
+}
 
-	require.False(t, math.IsInf(attr(e, "max_hp"), 0), "the fold must not hand a pool an infinite max")
+// TestOverflowIsBoundedThroughResolveAttr drives the screen through the real derivation, so the wiring
+// (resolveAttr calling attrScreen and threading the flag out) is pinned — not just the helper.
+func TestOverflowIsBoundedThroughResolveAttr(t *testing.T) {
+	t.Run("multiplicative overflow to Inf", func(t *testing.T) {
+		z, e := foldZone(t, "power",
+			affectModifier{attr: "power", add: false, value: 1e308},
+			affectModifier{attr: "power", add: false, value: 1e308})
+		require.Equal(t, attrFoldCeiling, attr(e, "power"))
+		require.True(t, attrIsDegraded(e, "power"))
+		_ = z
+	})
+
+	t.Run("ONE finite large modifier is bounded too (the F3 case)", func(t *testing.T) {
+		// This is the case a finiteness-only screen let through: 1e300 is finite, so a screen that only
+		// checked IsInf/IsNaN would pass it and int() would wrap.
+		z, e := foldZone(t, "might", affectModifier{attr: "might", add: true, value: 1e300})
+		require.Equal(t, attrFoldCeiling, attr(e, "might"))
+		require.True(t, attrIsDegraded(e, "might"))
+		_ = z
+	})
+
+	t.Run("an ordinary finite fold is untouched and not degraded", func(t *testing.T) {
+		z, caster := abilityTestZone(t)
+		e := caster.entity
+		z.defs.attr.register("might", &attributeDef{ref: "might", base: litNode{v: 10}})
+		z.defs.affect.register("plus3", &affectDef{
+			ref: "plus3", duration: 100, maxStacks: 1,
+			modifiers: []affectModifier{{attr: "might", add: true, value: 3}},
+		})
+		z.defs.affect.register("double", &affectDef{
+			ref: "double", duration: 100, maxStacks: 1,
+			modifiers: []affectModifier{{attr: "might", add: false, value: 2}},
+		})
+		applyAffect(e, "plus3", attachOpts{}, nil)
+		applyAffect(e, "double", attachOpts{}, nil)
+		require.Equal(t, 26.0, attr(e, "might"), "(10+3)*2 — an ordinary fold is untouched")
+		require.False(t, attrIsDegraded(e, "might"), "and not flagged degraded")
+		_ = z
+	})
+}
+
+// TestNaNFoldFallsBackToBaseNotZero pins the fallback SEMANTIC — the guard the first attempt left
+// unmutated. A `mul: 0` nullify over an overflowed additive is `(Inf + flat) * 0 = NaN`, and the
+// screen must fall back to the pre-modifier base rather than to 0 (0 would drop the attribute to
+// nothing, silently defeating any downstream reader). Base itself is finite here.
+func TestNaNFoldFallsBackToBase(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	z.defs.attr.register("might", &attributeDef{ref: "might", base: litNode{v: 40}})
+	z.defs.affect.register("bloat", &affectDef{
+		ref: "bloat", duration: 100, maxStacks: 1,
+		modifiers: []affectModifier{{attr: "might", add: true, value: math.MaxFloat64}},
+	})
+	z.defs.affect.register("bloat2", &affectDef{
+		ref: "bloat2", duration: 100, maxStacks: 1,
+		modifiers: []affectModifier{{attr: "might", add: true, value: math.MaxFloat64}},
+	})
+	z.defs.affect.register("nullify", &affectDef{
+		ref: "nullify", duration: 100, maxStacks: 1,
+		modifiers: []affectModifier{{attr: "might", add: false, value: 0}},
+	})
+	applyAffect(e, "bloat", attachOpts{}, nil)
+	applyAffect(e, "bloat2", attachOpts{}, nil) // additive part overflows to +Inf
+	applyAffect(e, "nullify", attachOpts{}, nil)
+
+	got := attr(e, "might")
+	require.False(t, math.IsNaN(got), "the fold went NaN via (Inf + flat) * 0; must not surface")
+	require.Equal(t, 40.0, got, "NaN falls back to the pre-modifier base, not to 0")
+	require.True(t, attrIsDegraded(e, "might"))
+}
+
+// TestScreenBeforeClampThenBackstopAfter pins the ORDERING the panel proved was untested. The NaN/Inf
+// screen runs BEFORE the declared clamp (so the fallback is re-clamped into the author's range), and a
+// magnitude backstop runs AFTER it (so a declared max larger than the ceiling cannot reintroduce an
+// unbounded value). Both directions are asserted, through resolveAttr, not a mirrored copy of it.
+func TestScreenBeforeClampThenBackstopAfter(t *testing.T) {
+	t.Run("a NaN fold is re-clamped into a declared range", func(t *testing.T) {
+		z, caster := abilityTestZone(t)
+		e := caster.entity
+		lo, hi := 1.0, 5.0
+		z.defs.attr.register("skill", &attributeDef{ref: "skill", base: litNode{v: 3}, min: &lo, max: &hi})
+		z.defs.affect.register("inf", &affectDef{
+			ref: "inf", duration: 100, maxStacks: 1,
+			modifiers: []affectModifier{{attr: "skill", add: true, value: math.MaxFloat64}},
+		})
+		z.defs.affect.register("inf2", &affectDef{
+			ref: "inf2", duration: 100, maxStacks: 1,
+			modifiers: []affectModifier{{attr: "skill", add: true, value: math.MaxFloat64}},
+		})
+		z.defs.affect.register("null", &affectDef{
+			ref: "null", duration: 100, maxStacks: 1,
+			modifiers: []affectModifier{{attr: "skill", add: false, value: 0}},
+		})
+		applyAffect(e, "inf", attachOpts{}, nil)
+		applyAffect(e, "inf2", attachOpts{}, nil)
+		applyAffect(e, "null", attachOpts{}, nil)
+		// NaN -> fallback base 3 -> clamped into [1,5] -> 3. If the screen ran AFTER the clamp, the NaN
+		// would slip through the clamp untouched (every NaN comparison is false) and surface.
+		require.Equal(t, 3.0, attr(e, "skill"))
+		require.False(t, math.IsNaN(attr(e, "skill")))
+	})
+
+	t.Run("backstop catches a value a declared MIN raised above the ceiling", func(t *testing.T) {
+		// The case ONLY the post-clamp backstop catches: the fold is small and in range, so the pre-clamp
+		// screen passes it untouched, but a declared `min` larger than the ceiling then RAISES it past the
+		// bound. Without the backstop after the clamp, this attribute escapes at 1e13.
+		z, caster := abilityTestZone(t)
+		e := caster.entity
+		bigMin := 1e13
+		z.defs.attr.register("floored", &attributeDef{ref: "floored", base: litNode{v: 5}, min: &bigMin})
+		require.Equal(t, attrFoldCeiling, attr(e, "floored"),
+			"a declared min above the ceiling is itself clamped by the backstop")
+		require.True(t, attrIsDegraded(e, "floored"))
+	})
+}
+
+// TestDegradedFlagIsClearedWithTheCache pins that the degraded marker does not outlive the derivation
+// that produced it: once the poisoning affect expires and the cache is dirtied, the attribute recomputes
+// clean and is no longer degraded. A stale marker would keep a formula refusing a now-healthy
+// attribute forever — the mirror hazard of never setting it.
+func TestDegradedFlagIsClearedWithTheCache(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	z.defs.attr.register("power", &attributeDef{ref: "power", base: litNode{v: 2}})
+	z.defs.affect.register("poison", &affectDef{
+		ref: "poison", duration: 100, maxStacks: 1,
+		modifiers: []affectModifier{{attr: "power", add: true, value: 1e300}},
+	})
+	applyAffect(e, "poison", attachOpts{}, nil)
+	require.True(t, attrIsDegraded(e, "power"), "poisoned -> degraded")
+
+	// Expire the affect; the tick/expiry dirties the cache.
+	a, _ := Get[*Affected](e)
+	for _, inst := range append([]*affectInstance(nil), a.list...) {
+		a.expire(e, inst, nil)
+	}
+	require.Equal(t, 2.0, attr(e, "power"), "the attribute recomputes to its clean base")
+	require.False(t, attrIsDegraded(e, "power"),
+		"the degraded marker must be cleared with the cache, not linger after the poison is gone")
+}
+
+// TestDerivedOfDegradedIsAlsoDegraded pins the propagation: an attribute DERIVED from a screened one is
+// itself untrustworthy, so the marker rides through derivation. Without it, `armour = soak` would
+// launder a screened soak into a clean attribute that a formula would then trust.
+func TestDerivedOfDegradedIsAlsoDegraded(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	z.defs.attr.register("soak_raw", &attributeDef{ref: "soak_raw", base: litNode{v: 1}})
+	z.defs.attr.register("armour", &attributeDef{ref: "armour", base: opNode{op: "*", args: []formulaNode{attrNode{ref: "soak_raw"}, litNode{v: 1}}}})
+	z.defs.affect.register("corrupt", &affectDef{
+		ref: "corrupt", duration: 100, maxStacks: 1,
+		modifiers: []affectModifier{{attr: "soak_raw", add: true, value: 1e300}},
+	})
+	applyAffect(e, "corrupt", attachOpts{}, nil)
+
+	require.True(t, attrIsDegraded(e, "soak_raw"), "the leaf is degraded")
+	require.Equal(t, attrFoldCeiling, attr(e, "armour"), "the derived value is bounded and finite")
+	require.True(t, attrIsDegraded(e, "armour"),
+		"a value DERIVED from a degraded attribute is itself degraded — else the marker laundered away")
+}
+
+// TestInductiveBoundHoldsAcrossDerivation is the argument for the ceiling being below sqrt(2^63): even
+// B = A*A, with A screened at the ceiling, stays finite and re-bounded rather than blowing int64.
+func TestInductiveBoundHoldsAcrossDerivation(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	z.defs.attr.register("a", &attributeDef{ref: "a", base: litNode{v: 1}})
+	z.defs.attr.register("b", &attributeDef{ref: "b", base: opNode{op: "*", args: []formulaNode{attrNode{ref: "a"}, attrNode{ref: "a"}}}})
+	z.defs.affect.register("poison", &affectDef{
+		ref: "poison", duration: 100, maxStacks: 1,
+		modifiers: []affectModifier{{attr: "a", add: true, value: 1e300}},
+	})
+	applyAffect(e, "poison", attachOpts{}, nil)
+
+	require.Equal(t, attrFoldCeiling, attr(e, "a"))
+	// b's formula evaluates a=1e12, so a*a=1e24 — finite, so evalFinite passes it — and b's own screen
+	// pulls it back to the ceiling. Every level re-bounds.
+	require.Equal(t, attrFoldCeiling, attr(e, "b"))
+	require.Less(t, attr(e, "b"), float64(1)*(1<<62), "must stay well inside int64")
+}
+
+// --- Consequence tests: the two opposed constraints, each measured at a real consumer -------------
+
+// TestDirectReaderGetsABoundedNumber is the OWNING-ENGINEER half: resourceMax reads attr() directly
+// via int(), and a poisoned max_hp must yield a large bounded pool — NOT MaxInt64 (arm64) or MinInt64
+// (amd64, which is <= 0 and hits the natural-immunity discard). Erroring to 0 would be the immunity
+// bug; a bounded number is the fix.
+func TestDirectReaderGetsABoundedNumber(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	z.defs.affect.register("bloat", &affectDef{
+		ref: "bloat", duration: 100, maxStacks: 1,
+		modifiers: []affectModifier{{attr: "max_hp", add: true, value: 1e300}},
+	})
+	applyAffect(e, "bloat", attachOpts{}, nil)
+
 	got := resourceMax(e, "hp")
-	require.NotEqual(t, math.MaxInt64, got,
-		"int(+Inf) is MaxInt64 on this platform — an unkillable entity with a bottomless vital pool")
-	// A FROZEN bound, tied to the ceiling but not re-derived from it: whatever attrFoldCeiling is, the
-	// int it produces must stay far short of wrapping. Raising the ceiling past this is the regression.
-	require.Less(t, got, 1<<40)
-	require.Positive(t, got, "...while still being a large, visibly-wrong number an operator can spot")
+	require.Positive(t, got, "must be a positive pool, not MinInt64 (which would read as immune/undying)")
+	require.Less(t, got, 1<<41, "and bounded well short of an int64 wrap on any architecture")
+	require.Equal(t, int(attrFoldCeiling), got, "int(ceiling) exactly")
 }
 
-// TestSaturatedSoakDoesNotGrantTotalImmunity covers the second direct-attr consumer. soak reads
-// `attr(target, "soak_<type>")` without a formula in between, so an infinite value would subtract
-// infinity from every blow.
-func TestSaturatedSoakDoesNotGrantTotalImmunity(t *testing.T) {
-	z, caster := abilityTestZone(t)
-	e := caster.entity
-	z.defs.attr.register("soak_fire", &attributeDef{ref: "soak_fire", base: litNode{v: 1}})
-	for _, ref := range []string{"ward_a", "ward_b"} {
-		z.defs.affect.register(ref, &affectDef{
-			ref: ref, name: ref, stacking: stackRefresh, maxStacks: 1, duration: 100,
-			modifiers: []affectModifier{{attr: "soak_fire", add: false, value: 1e308}},
-		})
-	}
+// TestFormulaReaderRefusesADegradedAttribute is the SECURITY half: a deal_damage bonus reading a
+// poisoned attribute must contribute 0, not a bounded-but-usable one-shot. This is the property the
+// silent-saturation attempt DESTROYED — it dealt 1e12 damage where this asserts the blow lands for its
+// base amount.
+func TestFormulaReaderRefusesADegradedAttribute(t *testing.T) {
+	z, e := foldZone(t, "power", affectModifier{attr: "power", add: false, value: 1e308},
+		affectModifier{attr: "power", add: false, value: 1e308})
+	require.True(t, attrIsDegraded(e, "power"))
+
 	mob := makeMobTarget(z, e, "goblin")
-	applyAffect(mob, "ward_a", attachOpts{}, nil)
-	applyAffect(mob, "ward_b", attachOpts{}, nil)
+	setResourceCurrent(mob, "hp", 100)
+	c := seededCtx(z, e, mob, dispHarmful)
+	// The documented "flat amount + scoped attribute bonus" damage shape.
+	op := &effectOp{kind: "deal_damage", dmgType: "fire", amount: 5, bonus: attrNode{ref: "$actor.power"}}
+	require.NoError(t, opDealDamage(c, op))
 
-	require.False(t, math.IsInf(soak(mob, "fire"), 0), "soak must stay finite")
-	// The saturated soak is still enormous, so the blow is fully absorbed — that is CONTENT's problem
-	// and is legitimate behaviour for a huge soak. What must not happen is a non-finite intermediate.
-	require.False(t, math.IsNaN(soak(mob, "fire")))
-}
-
-// TestClampDoesNotContainNaN documents WHY the guard sits in the fold rather than relying on the
-// attribute_def's declared range: a NaN passes straight through a min/max clamp untouched, because
-// every comparison against NaN is false. An author who bounded their attribute defensively is not
-// protected by that bound.
-func TestClampDoesNotContainNaN(t *testing.T) {
-	lo, hi := 1.0, 5.0
-	nan := math.NaN()
-
-	// The clamp as resolveAttr applies it, reproduced in isolation on a NaN.
-	//
-	// staticcheck flags these comparisons as always-false, which is EXACTLY the point being
-	// demonstrated: that is why a declared range cannot contain a NaN, and why the finiteness screen
-	// has to run before the clamp rather than relying on it.
-	v := nan
-	//nolint:staticcheck // SA4012: the always-false NaN comparison IS the trap under demonstration
-	if v < lo {
-		v = lo
-	}
-	//nolint:staticcheck // SA4012: as above — a NaN survives both bounds untouched
-	if v > hi {
-		v = hi
-	}
-	require.True(t, math.IsNaN(v), "a declared [1,5] range does NOT contain a NaN — this is the trap")
-
-	// And the guard's own behaviour on the same input.
-	require.Equal(t, 0.0, finiteOrFallback(nan, 0), "NaN resolves to the documented fallback")
-	require.Equal(t, attrFoldCeiling, finiteOrFallback(math.Inf(1), 0), "+Inf saturates at the ceiling")
-	require.Equal(t, -attrFoldCeiling, finiteOrFallback(math.Inf(-1), 0), "-Inf saturates at the floor")
-	require.Equal(t, 3.25, finiteOrFallback(3.25, 0), "an ordinary value passes through untouched")
-}
-
-// TestFiniteFoldIsUnchangedForOrdinaryContent is the non-regression half: the guard must be invisible
-// to every attribute whose modifiers compose to a finite number, which is all existing content.
-func TestFiniteFoldIsUnchangedForOrdinaryContent(t *testing.T) {
-	z, caster := abilityTestZone(t)
-	e := caster.entity
-	z.defs.attr.register("might", &attributeDef{ref: "might", base: litNode{v: 10}})
-	z.defs.affect.register("plus3", &affectDef{
-		ref: "plus3", name: "Plus3", stacking: stackRefresh, maxStacks: 1, duration: 100,
-		modifiers: []affectModifier{{attr: "might", add: true, value: 3}},
-	})
-	z.defs.affect.register("double", &affectDef{
-		ref: "double", name: "Double", stacking: stackRefresh, maxStacks: 1, duration: 100,
-		modifiers: []affectModifier{{attr: "might", add: false, value: 2}},
-	})
-
-	require.Equal(t, 10.0, attr(e, "might"))
-	applyAffect(e, "plus3", attachOpts{}, nil)
-	require.Equal(t, 13.0, attr(e, "might"))
-	applyAffect(e, "double", attachOpts{}, nil)
-	require.Equal(t, 26.0, attr(e, "might"), "(10+3)*2 — the ordinary fold is untouched")
+	require.Equal(t, 5, c.lastDamage,
+		"the degraded bonus must contribute 0 — the blow lands for its base amount, NOT a one-shot")
+	require.Equal(t, 95, resourceCurrent(mob, "hp"))
 }

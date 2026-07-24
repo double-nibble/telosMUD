@@ -50,6 +50,11 @@ type modSource interface {
 type attrCache struct {
 	dirty  bool
 	values map[string]float64
+	// degraded records which attributes the finiteness/magnitude screen had to rewrite (attrScreen).
+	// It is cleared with `values`, so it never outlives the derivation it describes. Formulas refuse a
+	// degraded attribute (evalCheckFormulaErr) so the FORMULA path stays fail-closed, while direct
+	// readers still get a bounded number — see attrScreen for why those two want opposite things.
+	degraded map[string]bool
 }
 
 // markAttrsDirty invalidates an entity's whole derivation cache. Called whenever a base override or
@@ -79,23 +84,39 @@ func attr(e *Entity, name string) float64 {
 	// already-COW'd mob fall through unchanged.
 	l := mutableLiving(e)
 	if l.attrs.dirty || l.attrs.values == nil {
-		// Flush the whole cache on the first read after a dirty: clear it and recompute lazily.
+		// Flush the whole cache on the first read after a dirty: clear it and recompute lazily. The
+		// degraded set is cleared with it so a screen never outlives the derivation that produced it.
 		l.attrs.values = map[string]float64{}
+		l.attrs.degraded = nil
 		l.attrs.dirty = false
 	}
 	if v, ok := l.attrs.values[name]; ok {
 		return v
 	}
-	v, err := resolveAttr(e, name, map[string]bool{})
+	v, degraded, err := resolveAttr(e, name, map[string]bool{})
 	if err != nil {
 		// A cycle or malformed formula that escaped the load-time lint: log + return 0 rather than
 		// crashing the zone goroutine. Content-lint is the real gate; this is the defensive net.
 		if e.zone != nil {
 			e.zone.log.Debug("attr resolve error", "attr", name, "rid", e.rid, "err", err)
 		}
-		v = 0
+		v, degraded = 0, false
 	}
 	l.attrs.values[name] = v
+	if degraded {
+		if l.attrs.degraded == nil {
+			l.attrs.degraded = map[string]bool{}
+		}
+		l.attrs.degraded[name] = true
+		// WARN, not Debug: this is a content defect an operator has to be able to find, and a saturated
+		// value is otherwise indistinguishable from a big number someone meant to author. The rate is
+		// bounded by cache invalidation (once per attribute per dirty cycle), NOT by read volume —
+		// attr() memoizes, so a hot loop reading a degraded attribute logs once.
+		if e.zone != nil {
+			e.zone.log.Warn("attribute modifier fold produced an out-of-range value; screened",
+				"attr", name, "rid", e.rid, "screened_to", v, "ceiling", attrFoldCeiling)
+		}
+	}
 	return v
 }
 
@@ -105,18 +126,24 @@ func attr(e *Entity, name string) float64 {
 // derived-of-derived and the visited-set cycle guard both work. Cached values are NOT consulted
 // here (the top-level attr() owns the cache); within one resolution we recompute referenced attrs,
 // which is fine — content formulas are shallow and the top-level call memoizes the final value.
-func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, error) {
+func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, bool, error) {
 	reg := e.zone.attrDefs()
 	def := reg.get(name)
 	if def == nil {
 		// Unknown attribute: 0. Contentless entity / a ref to a non-existent attr resolves sanely.
-		return 0, nil
+		return 0, false, nil
 	}
 	if visited[name] {
-		return 0, fmt.Errorf("attribute cycle through %q", name)
+		return 0, false, fmt.Errorf("attribute cycle through %q", name)
 	}
 	visited[name] = true
 	defer delete(visited, name)
+
+	// degraded accumulates across this whole resolution: an attribute DERIVED from a screened one is
+	// itself untrustworthy, even though its own arithmetic stayed in range. Propagating keeps the
+	// formula-side refusal honest — otherwise `armour = soak * 1` would launder a screened `soak` into
+	// a clean value, which is the same laundering the boon/bane channel had to close.
+	degraded := false
 
 	// 1. base: a per-entity override (race/class/level/point-buy) replaces the def's default base.
 	var base float64
@@ -125,13 +152,17 @@ func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, erro
 	} else if def.base != nil {
 		r := &formulaResolver{
 			resolve: func(ref string, v map[string]bool) (float64, error) {
-				return resolveAttr(e, ref, v)
+				rv, rd, err := resolveAttr(e, ref, v)
+				if rd {
+					degraded = true
+				}
+				return rv, err
 			},
 			visited: visited,
 		}
 		v, err := evalFinite(def.base, r)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		base = v
 	}
@@ -143,65 +174,107 @@ func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, erro
 		flat += src.flatMod(name)
 		mul *= src.mulMod(name)
 	}
-	val := finiteOrFallback((base+flat)*mul, base)
+	// The NaN/Inf screen runs BEFORE the declared clamp so the substituted value is then re-clamped
+	// into the author's own range — a `max: 100` still wins over the fallback. It must also precede the
+	// clamp for a second reason: a declared range does NOT contain a NaN, because every comparison
+	// against NaN is false, so `val < *def.min` and `val > *def.max` are both false and a NaN would
+	// pass through a [1,5] range untouched.
+	val, screened := attrScreen((base+flat)*mul, base)
+	if screened {
+		degraded = true
+	}
 
 	// 3. clamp to the attribute_def's declared range.
-	//
-	// The finiteness screen above runs BEFORE this clamp, and that order is load-bearing rather than
-	// incidental: a declared range does NOT contain a NaN. Every comparison against NaN is false, so
-	// `val < *def.min` and `val > *def.max` are both false and a NaN passes through a [1,5] range
-	// untouched. An author who bounded their attribute defensively would not be protected by that bound.
 	if def.min != nil && val < *def.min {
 		val = *def.min
 	}
 	if def.max != nil && val > *def.max {
 		val = *def.max
 	}
-	return val, nil
+
+	// 4. The magnitude BACKSTOP, deliberately after the declared clamp: an author declaring
+	// `max: 1e300` must not be able to reintroduce an unbounded value. This is what makes "every
+	// attribute read is within ±attrFoldCeiling" a real postcondition rather than an aspiration, and
+	// it is what the induction over derived-of-derived rests on.
+	if bounded, cut := attrScreen(val, 0); cut {
+		val, degraded = bounded, true
+	}
+	return val, degraded, nil
 }
 
-// attrFoldCeiling is the magnitude an overflowing modifier fold saturates to. It is deliberately far
-// above any sane content value and far below the point where arithmetic on it stops behaving — large
-// enough that no legitimate attribute is ever clamped by it, small enough that a downstream
-// multiplication or int() conversion stays finite and bounded.
+// attrFoldCeiling is the magnitude bound every derived attribute is held within. A trillion is far
+// above any stat a ruleset plausibly wants (this engine's own maxKillMagnitude is 1e5, a raid boss's
+// max_hp is ~1e7) and far below 2^63, so `int(attr(...))` is provably safe for any value that passes
+// this bound.
+//
+// KNOWN COST, stated rather than discovered later: it is a BACKSTOP applied after the attribute_def's
+// own min/max, so it overrides a declared max larger than itself. A pack wanting a genuine
+// above-a-trillion accumulator (an idle/incremental XP total) is clamped. That is the deliberate trade
+// — an unbounded accumulator and an overflow are indistinguishable to the engine, and the overflow is
+// the one with security consequences.
 const attrFoldCeiling = 1e12
 
-// finiteOrFallback screens the result of the modifier fold. `fallback` is the value to use when the
-// result is NaN — the pre-modifier base, i.e. "the modifiers cancelled out to nonsense, so ignore
-// them" — while ±Inf saturates at ±attrFoldCeiling, preserving the direction the content intended.
+// attrScreen bounds a derived attribute and reports whether it had to. `fallback` is the value to use
+// when the fold is NaN — the pre-modifier base, i.e. "the modifiers composed to nonsense, so ignore
+// them" — and is itself screened, since a non-finite base would otherwise walk straight back out.
 //
-// # Why this guard exists at all
+// # Why a MAGNITUDE bound and not just a finiteness screen
 //
-// evalFinite already screens an attribute's own BASE FORMULA, so before this the fold was the one
-// unguarded step in derivation. Two ordinary content affects with a large multiplicative modifier
-// compose to +Inf (1e308 × 1e308), and nothing downstream expected that:
+// A finiteness-only screen bounds nothing: `1e300` is finite, so it passes, and `int(1e300)` still
+// wraps. One affect with an ordinary large modifier is enough — no overflow to infinity required. The
+// magnitude bound is also what makes the guarantee INDUCTIVE across derived-of-derived: an attribute
+// B defined as `A * A` evaluates to 1e24 from a bounded A, and then B's own screen pulls it back to
+// the ceiling, so EVERY attribute is within ±ceiling at every level of derivation rather than only at
+// the leaves.
 //
-//   - mitigate returns int(v). In Go, int(+Inf) is IMPLEMENTATION-DEFINED and on this platform yields
-//     MaxInt64, so a damage formula reading a poisoned attribute becomes an instant kill on any target,
-//     through the ordinary gated damage path, from two affects an author could plausibly write.
-//   - a NaN survives the declared min/max clamp (see above), so the attribute stays NaN forever.
-//   - a NaN compares false against everything, so any threshold reading it silently takes the
-//     unexpected branch — including a check band's state predicate, where "false" and "true" are the
-//     difference between a forced outcome and a rolled one.
+// # Why screening and erroring are both wrong on their own
 //
-// Saturating rather than erroring is deliberate. This runs on the hot derivation path for every
-// attribute read on the zone goroutine; a content defect must degrade to a large-but-sane number, not
-// abort a resolution mid-flight or spam a log per read. The value is still visibly wrong to an
-// operator, which is what a content defect should look like.
-func finiteOrFallback(v, fallback float64) float64 {
-	switch {
-	case math.IsNaN(v):
-		if math.IsNaN(fallback) {
-			return 0
+// This is the part two independent reviews disagreed about, and both were right about their own half.
+//
+// Erroring (the cycle path's behaviour: resolve to 0) is NOT safe here. Zero on `max_hp` means
+// `resourceMax <= 0`, which is the natural-immunity discard in dealDamage AND falsifies the death
+// predicate — so failing an attribute closed lands on exactly the security-critical path the bug
+// itself reaches. A bounded number is strictly better for a direct reader.
+//
+// Saturating silently is ALSO not safe, in the other direction. Before any screen existed, an
+// overflowed attribute was ±Inf, and evalFinite rejected it at every formula, so the formula path
+// failed CLOSED for free: a `deal_damage` bonus reading a poisoned attribute contributed 0. Replacing
+// the infinity with a legitimate-looking 1e12 deletes that marker and hands every formula a usable
+// one-shot value — measured at 1e12 damage where the same fixture previously dealt its base amount.
+//
+// So the screen does both: it returns a BOUNDED value for direct readers, and it records that the
+// value is DEGRADED so formulas can keep refusing it. The marker is what preserves the fail-closed
+// property that finiteness used to provide implicitly.
+func attrScreen(v, fallback float64) (float64, bool) {
+	if math.IsNaN(v) {
+		if !isFiniteBounded(fallback) {
+			return 0, true
 		}
-		return fallback
-	case math.IsInf(v, 1):
-		return attrFoldCeiling
-	case math.IsInf(v, -1):
-		return -attrFoldCeiling
-	default:
-		return v
+		return fallback, true
 	}
+	// ±Inf and any over-ceiling magnitude collapse to the same clause: `Abs(±Inf) > ceiling` is true,
+	// so infinity needs no branch of its own. Copysign carries the direction, so a poisoned soak clamps
+	// toward +ceiling and a poisoned penalty toward −ceiling.
+	if math.Abs(v) > attrFoldCeiling {
+		return math.Copysign(attrFoldCeiling, v), true
+	}
+	return v, false
+}
+
+// isFiniteBounded reports whether v is a value the screen would pass unchanged.
+func isFiniteBounded(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && math.Abs(v) <= attrFoldCeiling
+}
+
+// attrIsDegraded reports whether attribute `name` on e had to be screened. It resolves the attribute
+// first (through the memoizing accessor) so the flag is always populated before it is read.
+func attrIsDegraded(e *Entity, name string) bool {
+	if e == nil || e.living == nil {
+		return false
+	}
+	attr(e, name)
+	l := e.living
+	return l.attrs.degraded != nil && l.attrs.degraded[name]
 }
 
 // setAttrBase installs a per-entity base override for attribute `name` (the instance state that

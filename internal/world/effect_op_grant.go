@@ -111,7 +111,10 @@ func attrBaseValue(e *Entity, name string) float64 {
 		return 0
 	}
 	r := &formulaResolver{
-		resolve: func(ref string, v map[string]bool) (float64, error) { return resolveAttr(e, ref, v) },
+		resolve: func(ref string, v map[string]bool) (float64, error) {
+			rv, _, err := resolveAttr(e, ref, v) // the degraded flag is attr()'s to record, not this path's
+			return rv, err
+		},
 		visited: map[string]bool{},
 	}
 	v, err := evalFinite(def.base, r)
