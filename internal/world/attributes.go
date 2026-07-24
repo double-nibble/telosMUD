@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -142,9 +143,14 @@ func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, erro
 		flat += src.flatMod(name)
 		mul *= src.mulMod(name)
 	}
-	val := (base + flat) * mul
+	val := finiteOrFallback((base+flat)*mul, base)
 
 	// 3. clamp to the attribute_def's declared range.
+	//
+	// The finiteness screen above runs BEFORE this clamp, and that order is load-bearing rather than
+	// incidental: a declared range does NOT contain a NaN. Every comparison against NaN is false, so
+	// `val < *def.min` and `val > *def.max` are both false and a NaN passes through a [1,5] range
+	// untouched. An author who bounded their attribute defensively would not be protected by that bound.
 	if def.min != nil && val < *def.min {
 		val = *def.min
 	}
@@ -152,6 +158,50 @@ func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, erro
 		val = *def.max
 	}
 	return val, nil
+}
+
+// attrFoldCeiling is the magnitude an overflowing modifier fold saturates to. It is deliberately far
+// above any sane content value and far below the point where arithmetic on it stops behaving — large
+// enough that no legitimate attribute is ever clamped by it, small enough that a downstream
+// multiplication or int() conversion stays finite and bounded.
+const attrFoldCeiling = 1e12
+
+// finiteOrFallback screens the result of the modifier fold. `fallback` is the value to use when the
+// result is NaN — the pre-modifier base, i.e. "the modifiers cancelled out to nonsense, so ignore
+// them" — while ±Inf saturates at ±attrFoldCeiling, preserving the direction the content intended.
+//
+// # Why this guard exists at all
+//
+// evalFinite already screens an attribute's own BASE FORMULA, so before this the fold was the one
+// unguarded step in derivation. Two ordinary content affects with a large multiplicative modifier
+// compose to +Inf (1e308 × 1e308), and nothing downstream expected that:
+//
+//   - mitigate returns int(v). In Go, int(+Inf) is IMPLEMENTATION-DEFINED and on this platform yields
+//     MaxInt64, so a damage formula reading a poisoned attribute becomes an instant kill on any target,
+//     through the ordinary gated damage path, from two affects an author could plausibly write.
+//   - a NaN survives the declared min/max clamp (see above), so the attribute stays NaN forever.
+//   - a NaN compares false against everything, so any threshold reading it silently takes the
+//     unexpected branch — including a check band's state predicate, where "false" and "true" are the
+//     difference between a forced outcome and a rolled one.
+//
+// Saturating rather than erroring is deliberate. This runs on the hot derivation path for every
+// attribute read on the zone goroutine; a content defect must degrade to a large-but-sane number, not
+// abort a resolution mid-flight or spam a log per read. The value is still visibly wrong to an
+// operator, which is what a content defect should look like.
+func finiteOrFallback(v, fallback float64) float64 {
+	switch {
+	case math.IsNaN(v):
+		if math.IsNaN(fallback) {
+			return 0
+		}
+		return fallback
+	case math.IsInf(v, 1):
+		return attrFoldCeiling
+	case math.IsInf(v, -1):
+		return -attrFoldCeiling
+	default:
+		return v
+	}
 }
 
 // setAttrBase installs a per-entity base override for attribute `name` (the instance state that
