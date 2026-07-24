@@ -118,6 +118,13 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 	if len(a.Body.Prevents) > 0 {
 		prevents = append(prevents, a.Body.Prevents...)
 	}
+	var tags, grantsImmunity []string
+	if len(a.Body.Tags) > 0 {
+		tags = append(tags, a.Body.Tags...)
+	}
+	if len(a.Body.GrantsImmunity) > 0 {
+		grantsImmunity = append(grantsImmunity, a.Body.GrantsImmunity...)
+	}
 	var dmgMult map[string]float64
 	if len(a.Body.DamageTakenMult) > 0 {
 		dmgMult = make(map[string]float64, len(a.Body.DamageTakenMult))
@@ -135,17 +142,19 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		dispellable: a.Dispellable,
 		roomScoped:  a.Scope == "room", // [G13] room-scoped affect (web/darkness/...); default entity-scoped
 
-		duration:      a.Body.Duration,
-		modifiers:     mods,
-		prevents:      prevents,
-		onApply:       a.Body.OnApply,
-		onExpire:      a.Body.OnExpire,
-		onApplyLua:    a.Body.OnApplyLua,
-		onExpireLua:   a.Body.OnExpireLua,
-		onDispelLua:   a.Body.OnDispelLua,
-		onEvent:       parseEventMap(a.Body.OnEvent, "affect "+a.Ref),
-		onEventLua:    parseLuaEventMap(a.Body.OnEventLua, "affect "+a.Ref),
-		onReactionLua: parseLuaEventMap(a.Body.OnReactionLua, "affect "+a.Ref+" (reaction)"),
+		duration:       a.Body.Duration,
+		modifiers:      mods,
+		prevents:       prevents,
+		tags:           tags,
+		grantsImmunity: grantsImmunity,
+		onApply:        a.Body.OnApply,
+		onExpire:       a.Body.OnExpire,
+		onApplyLua:     a.Body.OnApplyLua,
+		onExpireLua:    a.Body.OnExpireLua,
+		onDispelLua:    a.Body.OnDispelLua,
+		onEvent:        parseEventMap(a.Body.OnEvent, "affect "+a.Ref),
+		onEventLua:     parseLuaEventMap(a.Body.OnEventLua, "affect "+a.Ref),
+		onReactionLua:  parseLuaEventMap(a.Body.OnReactionLua, "affect "+a.Ref+" (reaction)"),
 	}
 	if t := a.Body.Tick; t != nil {
 		def.hasTick = true

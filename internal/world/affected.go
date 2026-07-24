@@ -66,6 +66,11 @@ type Affected struct {
 	// nil until some active affect declares a multiplier.
 	damageMult map[string]float64
 
+	// immunity (#538) is the UNION of every active affect's grants_immunity tokens (a set), recomputed
+	// alongside prevents. applyAffect vetoes an incoming affect whose ref/category/tags intersect this
+	// set. A multiset (count) like prevents, so two overlapping immunity grants unwind cleanly on expire.
+	immunity map[string]int
+
 	// registered records that this component has already been addModSource'd onto the entity, so a
 	// second attach does not register a duplicate source (the single-source invariant).
 	registered bool
@@ -123,6 +128,45 @@ func preventsTag(e *Entity, tag string) bool {
 		return false
 	}
 	return a.prevents[tag] > 0
+}
+
+// immuneToAffect reports whether entity e is immune to affect def `def` (#538) — whether any active
+// affect's grants_immunity set intersects the incoming affect's IDENTITY: its ref, its category, or
+// any of its tags. Returns the matching token so content/logging can name what blocked it. O(1 + tags)
+// — reads the pre-unioned immunity multiset. A nil/absent Affected component (or def) is immune to
+// nothing. The match set is the UNION {ref} ∪ {category} ∪ tags so an author can declare immunity at
+// any granularity: to one specific affect, to a whole category, or to a cross-cutting tag.
+func immuneToAffect(e *Entity, def *affectDef) (string, bool) {
+	if def == nil {
+		return "", false
+	}
+	a, ok := Get[*Affected](e)
+	if !ok || a.immunity == nil {
+		return "", false
+	}
+	if a.immunity[def.ref] > 0 {
+		return def.ref, true
+	}
+	if def.category != "" && a.immunity[def.category] > 0 {
+		return def.category, true
+	}
+	for _, t := range def.tags {
+		if a.immunity[t] > 0 {
+			return t, true
+		}
+	}
+	return "", false
+}
+
+// grantsToken reports whether affect def's own grants_immunity list contains `tok` (#538) — used by the
+// self-ward exemption so an affect that grants immunity to a token it itself carries can still refresh.
+func grantsToken(def *affectDef, tok string) bool {
+	for _, g := range def.grantsImmunity {
+		if g == tok {
+			return true
+		}
+	}
+	return false
 }
 
 // preventsAny reports whether any active affect prevents ANY of the given tags — the exact step-3
