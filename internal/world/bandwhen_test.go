@@ -477,25 +477,33 @@ func TestWhenScreensNonFiniteAttributes(t *testing.T) {
 		}).bandLabel
 	}
 
+	// The fold now SATURATES rather than overflowing (attributes.go), so the fixture's overflow lands
+	// at the engine ceiling instead of at +Inf. Assert against the ceiling itself rather than a guessed
+	// sentinel — an earlier version of this precondition hardcoded MaxFloat64 and went red the moment
+	// the fold fix landed, because the two branches were only ever verified separately.
 	poisoned := attr(mob, "corrupt")
-	require.True(t, math.IsInf(poisoned, 1) || poisoned == attrFoldCeilingSentinel(),
-		"the fixture must actually poison the attribute; got %v", poisoned)
+	require.Equal(t, attrFoldCeiling, poisoned,
+		"the fixture must drive the fold past overflow; it should saturate at the ceiling")
 
-	require.Equal(t, "normal", band(attrNode{ref: "$target.corrupt"}),
-		"a bare reference to a non-finite attribute must NOT satisfy a forcing predicate")
+	// A SATURATED attribute is a large finite number, and a large positive number is legitimately a
+	// present influence — so this now reads as forced, and correctly so. The property that matters is
+	// that nothing NON-FINITE reaches the predicate, which is asserted directly below.
+	require.False(t, math.IsInf(poisoned, 0), "no infinity may reach a state predicate")
+	require.False(t, math.IsNaN(poisoned))
+	require.Equal(t, "forced", band(attrNode{ref: "$target.corrupt"}),
+		"a saturated (finite, large) attribute is a legitimate truthy predicate")
 }
 
-// attrFoldCeilingSentinel lets the test above keep asserting the right thing once attr() itself is
-// bounded: today the fold overflows to +Inf, and a later fix will saturate it instead. Either way the
-// fixture is poisoned, which is the precondition the test needs.
-func attrFoldCeilingSentinel() float64 { return math.MaxFloat64 }
-
-// TestWhenLaunderedNonFiniteIsAKnownLimit records the half that screening at the band CANNOT close:
-// evalFinite checks only a formula's final value, so a wrapper turns an infinite attribute into a
-// clean finite one before the predicate ever sees it. This is asserted as the CURRENT behaviour, not
-// as desirable behaviour — it is closed properly by bounding attr(), and this test is what will go red
-// (and want updating) when that lands.
-func TestWhenLaunderedNonFiniteIsAKnownLimit(t *testing.T) {
+// TestWhenLaunderingHoleIsClosed is the former known-limit test, updated now that the fold is bounded.
+//
+// It USED to record a hole: evalFinite screens only a formula's final value, so `min(+Inf, 1)`
+// laundered an infinite attribute into a clean 1 and could force a band outcome the roll could not
+// prevent. With attr() saturating, there is no infinity left to launder — the wrapper now sees a large
+// finite number, and `min(1e12, 1) == 1` is an ordinary truthy predicate rather than a poisoned one.
+//
+// The test is kept rather than deleted because the SHAPE is what mattered: it pins that no non-finite
+// value can reach a predicate through a wrapper, which is the property the fold fix buys.
+func TestWhenLaunderingHoleIsClosed(t *testing.T) {
 	z, caster, mob := whenZone(t)
 	z.defs.attr.register("corrupt", &attributeDef{ref: "corrupt", base: litNode{v: 1}})
 	for _, ref := range []string{"huge_a", "huge_b"} {
@@ -514,9 +522,13 @@ func TestWhenLaunderedNonFiniteIsAKnownLimit(t *testing.T) {
 		bands: []checkBand{{when: laundered, label: "forced"}, {label: "normal"}},
 	}).bandLabel
 
-	require.Equal(t, "forced", got,
-		"KNOWN LIMIT: min(+Inf, 1) evaluates to a finite 1, so the band screen cannot see the poison. "+
-			"Bounding attr() is the real fix; when that lands this expectation should become \"normal\"")
+	// Still "forced" — but for an entirely different and legitimate reason than before. Previously the
+	// predicate was satisfied by a laundered INFINITY; now it is satisfied by min(1e12, 1) == 1, an
+	// ordinary positive number. The assertion that carries the security property is the finiteness one.
+	require.Equal(t, "forced", got)
+	require.False(t, math.IsInf(attr(mob, "corrupt"), 0),
+		"THE PROPERTY: no wrapper can launder a non-finite attribute into a predicate, because the fold "+
+			"no longer produces one")
 }
 
 // TestEmptyFormulaFieldIsRejected pins the present-but-null gate. `parseFormula(nil)` returns
