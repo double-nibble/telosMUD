@@ -562,7 +562,15 @@ func (z *Zone) attemptMove(s *session, dir string, redirectsLeft int) bool {
 		// contain entrances. IF A FOLLOW MECHANIC IS EVER ADDED it becomes the first path that moves a player
 		// through a direction on someone else's initiative, and it MUST refuse an entrance direction or this
 		// property collapses silently.
-		if tmpl, isDoor := from.room.entrances[dir]; isDoor {
+		//
+		// #370: the `traverse` hook's redirect(dir) IS exactly such a path — it re-feeds a CONTENT-CHOSEN
+		// direction into attemptMove — so the entrance branch is gated on the DEPTH-0 (player-typed) move only:
+		// playerTyped is true iff no redirect has been consumed (the redirect budget is still full). A redirect
+		// recursion (redirectsLeft < max) therefore can NEVER reach the instance-mint door — a redirect that
+		// names an entrance key simply misses both maps and yields "You can't go that way." This keeps
+		// entrances reachable exclusively through the player's own typed direction, as #435 requires.
+		playerTyped := redirectsLeft == maxTraverseRedirects
+		if tmpl, isDoor := from.room.entrances[dir]; isDoor && playerTyped {
 			// Every refusal — not instanceable, caps, rate limit, no nesting, no verified account, a mint
 			// already pending, a draining shard — is requestInstanceEntry's or the async mint's, and each
 			// already speaks to the player. `true` is the gate decision: the mover IS the invoking actor.

@@ -270,6 +270,48 @@ func TestTraverseHookRedirect(t *testing.T) {
 	}
 }
 
+// TestTraverseHookRedirectCannotReachInstanceEntrance is the #435-invariant regression guard for the
+// redirect primitive (security review F1): a `traverse` hook that redirect()s toward an instance ENTRANCE
+// key must NOT reach requestInstanceEntry — entrances are reachable ONLY by the player's own typed direction
+// (the depth-0 move), never a content-initiated redirect recursion. The redirect misses `exits`, the entrance
+// branch is skipped (not the player-typed move), and the player is refused with the ordinary message.
+func TestTraverseHookRedirectCannotReachInstanceEntrance(t *testing.T) {
+	z := newZone("tz")
+	roomA := z.newEntity("tz:room:a")
+	// `north` is a real exit; `crypt` is an instance ENTRANCE (a dungeon door), not an ordinary exit.
+	r := &Room{
+		exits:     map[string]ProtoRef{"north": "tz:room:b"},
+		entrances: map[string]string{"crypt": "somedungeon"},
+	}
+	Add(roomA, r)
+	// The hook tries to shove the mover through the dungeon door via redirect.
+	Add(roomA, &Scripted{source: `on("traverse", function(ev)
+		if ev.exit == "north" then redirect("crypt") end
+	end)`})
+	z.rooms["tz:room:a"] = roomA
+	roomB := z.newEntity("tz:room:b")
+	Add(roomB, &Room{exits: map[string]ProtoRef{"south": "tz:room:a"}})
+	z.rooms["tz:room:b"] = roomB
+	z.startRoom = "tz:room:a"
+
+	s := &session{character: "Walker", out: make(chan *playv1.ServerFrame, 256), epoch: 1}
+	z.newPlayerEntity(s, "Walker")
+	Move(s.entity, roomA)
+	z.players["Walker"] = s
+
+	z.dispatch(s, "north")
+
+	if s.instanceMintPending {
+		t.Fatal("a redirect toward an instance entrance reached requestInstanceEntry (#435 invariant violated)")
+	}
+	if s.entity.location != roomA {
+		t.Fatalf("the mover should have been refused (stayed in A), but is at %v", s.entity.location)
+	}
+	if !sessionSaw(s, "can't go that way") {
+		t.Fatal("the refused redirect-to-entrance did not yield the ordinary 'can't go that way' message")
+	}
+}
+
 // TestTraverseHookRedirectLoopBounded proves the redirect budget: a hook that redirects UNCONDITIONALLY (so
 // every re-attempt redirects again) is refused after maxTraverseRedirects hops rather than recursing forever,
 // and the mover stays put.

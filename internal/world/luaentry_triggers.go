@@ -379,16 +379,23 @@ func (z *Zone) fireRoomLeave(leaver, room *Entity) {
 //   - call block("message") — CANCEL and show the mover that message (the guard example: "A grizzled
 //     guard steps in front of you.");
 //   - return false — CANCEL with the engine's default "You can't go that way." message;
-//   - call redirect("dir") — send the mover through a DIFFERENT exit of this same room instead (a portal, a
+//   - call redirect("dir") — send the mover through a DIFFERENT EXIT of this same room instead (a portal, a
 //     confusion effect). The engine performs the redirected move, bounded by a redirect budget (move()), so
-//     a redirect loop cannot recurse without end. Redirect takes precedence over block.
+//     a redirect loop cannot recurse without end. Redirect takes precedence over block. TWO caveats for
+//     content authors: (a) the redirect target RE-FIRES this same hook (it re-enters the move), so an
+//     unconditional block()+redirect() that does not guard on ev.exit self-traps the mover — always key the
+//     hook on ev.exit; (b) a redirect may name a CROSS-ZONE exit and thus carry the mover across a zone/shard
+//     boundary through the normal transfer/handoff path. A redirect target is resolved through `exits` ONLY
+//     (never an instance entrance — the #435 door stays reachable only by the player's own typed direction).
 //
 // Any other outcome (no call, a nil/true/absent return) ALLOWS the move. The handler runs on the zone
 // goroutine (single-writer) with a clean ROOT ctx whose actor is the ROOM (so a spawn/harm op inside it is
 // attributed to the room script and gated normally) — so it can reveal a guard, gate on a flag/quest, or
 // message the mover. Returns (blocked, message, redirectDir). FAILS OPEN: a room with no `traverse` handler,
 // an unscripted room, a quarantined instance, or a handler that ERRORS all ALLOW the move — a buggy gate must
-// never imprison a player.
+// never imprison a player. A CONSEQUENCE: a `traverse` hook is NOT a hard security boundary — a script error
+// un-gates it. A builder wanting an un-bypassable gate must not implement it solely as a traverse hook (the
+// one real security sink behind a move, an instance entrance, is guarded independently by requestInstanceEntry).
 func (z *Zone) fireCanExit(mover, room *Entity, dir, dest string) (bool, string, string) {
 	if z == nil || z.lua == nil || mover == nil || room == nil || !Has[*Scripted](room) {
 		return false, "", ""
