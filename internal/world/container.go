@@ -167,6 +167,9 @@ func cmdGet(c *Context) error {
 		return nil
 	}
 	Move(target, c.Actor)
+	// #443: audit a pickup that crossed a character boundary (a different player dropped this). BEFORE the
+	// stack merge below, which may detach `target` — the marker + stack count must be read off it while live.
+	c.z.recordCrossCharTransfer(c.Actor, target)
 	c.z.act("You get $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n gets $p.", c.Actor, target, nil, "", "", ToRoom)
 	// Stackable materials merge into an existing stack on pickup (Phase 13.2); a fully-absorbed pickup is
@@ -212,6 +215,7 @@ func (z *Zone) getFrom(c *Context, item, cont string) error {
 	}
 	for _, m := range matches {
 		Move(m, c.Actor)
+		c.z.recordCrossCharTransfer(c.Actor, m) // #443: audit a pickup that crossed a character boundary
 		c.z.act2("You get $p from $P.", c.Actor, m, box, nil, "", "", ToActor)
 		c.z.act2("$n gets $p from $P.", c.Actor, m, box, nil, "", "", ToRoom)
 	}
@@ -239,6 +243,7 @@ func cmdDrop(c *Context) error {
 		return nil
 	}
 	Move(target, c.Actor.location)
+	c.z.stampReleased(target, c.Actor) // #443: record WHO externalized it, so a DIFFERENT player's pickup is auditable
 	c.z.act("You drop $p.", c.Actor, target, nil, "", "", ToActor)
 	c.z.act("$n drops $p.", c.Actor, target, nil, "", "", ToRoom)
 	c.z.log.Debug("cmd drop", "player", c.s.character, "item", target.proto)
@@ -290,6 +295,7 @@ func cmdPut(c *Context) error {
 			break
 		}
 		Move(m, box)
+		c.z.stampReleased(m, c.Actor) // #443: a put into a droppable/shared container is a potential cross-char handoff
 		c.z.act2("You put $p in $P.", c.Actor, m, box, nil, "", "", ToActor)
 		c.z.act2("$n puts $p in $P.", c.Actor, m, box, nil, "", "", ToRoom)
 	}

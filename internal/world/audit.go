@@ -53,6 +53,12 @@ const (
 	AuditKindAttributeBase    = "attribute_base_changed"
 	AuditKindTrackAdvanced    = "track_advanced"
 	AuditKindTierChanged      = "tier_changed"
+	// AuditKindItemTransferred (#443): an unbound item crossed a CHARACTER boundary — one player dropped/put
+	// it and a DIFFERENT player picked it up. The detectability first step for the cross-row dupe residual
+	// (#432 F1): an externalized copy lands in another characters row under ITS own epoch, which the source
+	// row's fence cannot reconcile, so this durable paired record is what makes such a transfer knowable
+	// after the fact. It does NOT prevent anything — it converts "we cannot know" into "we can know".
+	AuditKindItemTransferred = "item_transferred"
 )
 
 // The subject_type / actor_type strings. subject_type says WHAT a row is about (a character or an

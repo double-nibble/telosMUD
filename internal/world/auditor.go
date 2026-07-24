@@ -85,6 +85,30 @@ func (a *auditor) enqueue(ev AuditEvent) {
 	}
 }
 
+// auditLowPriorityWatermark reserves queue headroom for the rare, security-critical kinds (died / tier_changed
+// / character_created / attribute_base_changed / track_advanced). A HIGH-FREQUENCY, LOW-VALUE kind
+// (item_transferred, #443) must not be able to fill the shared queue and raise THEIR drop probability — an
+// attacker-influenceable degradation (two confederates looping drop/get), and a way to mask another dupe row
+// (security review, Finding B). Sized to HALF the depth: transfers may use up to the first half, but the
+// second half is always available to the critical kinds regardless of transfer volume.
+const auditLowPriorityWatermark = auditQueueDepth / 2
+
+// enqueueLowPriority enqueues a high-frequency, low-value event but SHEDS it once the queue is already past
+// auditLowPriorityWatermark, reserving the rest of the depth for the security-critical kinds (see the
+// watermark doc). Below the watermark it behaves exactly like enqueue. The len() read is a cheap heuristic —
+// a momentary race just means one extra low-priority event slips in or is shed, never a critical-kind drop.
+func (a *auditor) enqueueLowPriority(ev AuditEvent) {
+	if !a.enabled() {
+		return
+	}
+	if len(a.reqs) >= auditLowPriorityWatermark {
+		a.log.Debug("low-priority audit event shed to reserve queue headroom for critical kinds",
+			"subject", ev.SubjectID, "kind", ev.EventKind)
+		return
+	}
+	a.enqueue(ev)
+}
+
 // run drains the queue on a single background goroutine until ctx is cancelled. Each AppendAudit does
 // its blocking I/O here, OFF every zone goroutine. Started once by Shard.Run.
 //
@@ -277,5 +301,40 @@ func (z *Zone) auditTrackStep(subject *Entity, trackRef string, step int, thresh
 		EventKind:   AuditKindTrackAdvanced,
 		DedupKey:    trackRef + "\x1f" + strconv.Itoa(step),
 		Payload:     AuditPayload(map[string]any{"track": trackRef, "step": step, "threshold": threshold}),
+	})
+}
+
+// auditItemTransfer records an unbound item crossing a CHARACTER boundary — an item one player DROPPED or PUT
+// that a DIFFERENT player picked up (#443). SUBJECT is the ACQUIRER (the item's new durable home — the
+// surviving externalized copy the #432 residual is about), ACTOR is the RELEASER (the source, keyed so a
+// reconciler can spot an externalization during a double-own window). dedup_key is a FRESH UUID: each
+// transfer is a distinct event with no natural per-lifetime key (two legitimate trades of the same ref are
+// two rows). A storeless shard, an unsaved acquirer, or a mob acquirer emits nothing. The releaser fields
+// come from the Released marker (recordCrossCharTransfer already gated releaser != acquirer). This is
+// DETECTION only — it neither prevents the transfer nor asserts a conservation invariant.
+func (z *Zone) auditItemTransfer(acquirer *Entity, rel *Released, item *Entity) {
+	if !z.auditEnabled() || !isPlayer(acquirer) || acquirer.pid == nil {
+		return
+	}
+	roomRef := ""
+	if acquirer.location != nil {
+		roomRef = string(acquirer.location.proto)
+	}
+	stack := 1 // a non-material item is a single instance; a material carries its stack count
+	if s, ok := Get[*Stack](item); ok {
+		stack = s.count
+	}
+	z.shard.auditor.enqueueLowPriority(AuditEvent{ // #443: high-frequency kind — must not starve died/tier
+		SubjectType: AuditSubjectCharacter,
+		SubjectID:   string(*acquirer.pid),
+		SubjectName: acquirer.Name(),
+		ActorType:   AuditActorCharacter,
+		ActorID:     rel.pid,
+		EventKind:   AuditKindItemTransferred,
+		DedupKey:    uuid.NewString(),
+		Payload: AuditPayload(map[string]any{
+			"item_ref": string(item.proto), "stack": stack,
+			"from_name": rel.name, "to_name": acquirer.Name(), "room_ref": roomRef,
+		}),
 	})
 }
