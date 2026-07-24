@@ -77,6 +77,7 @@ const (
 	evOnApplyAffect     eventKind = "OnApplyAffect"     // an affect attached — reserved
 	evOnAffectTick      eventKind = "OnAffectTick"      // an affect ticked — reserved
 	evOnAffectExpire    eventKind = "OnAffectExpire"    // an affect expired — reserved
+	evOnAffectBlocked   eventKind = "OnAffectBlocked"   // an incoming affect was vetoed by immunity (#538)
 
 	// Phase 11.3 progression events. The engine FIRES these (the track machinery + skill use); content
 	// subscribes to react with flavor/unlocks. They keep `level` out of the engine — a track raises a
@@ -104,7 +105,7 @@ const (
 var knownEventKinds = map[eventKind]bool{
 	evOnCheck: true, evOnAbilityResolved: true, evOnHit: true, evOnDamageTaken: true,
 	evOnKill: true, evOnLeaveRoom: true, evBeforeCastCommit: true, evOnRest: true,
-	evOnApplyAffect: true, evOnAffectTick: true, evOnAffectExpire: true, evOnEnter: true,
+	evOnApplyAffect: true, evOnAffectTick: true, evOnAffectExpire: true, evOnAffectBlocked: true, evOnEnter: true,
 	evToHit:       true,
 	evOnTrackStep: true, evOnLevel: true, evOnSkillUse: true, // Phase 11.3 progression events
 }

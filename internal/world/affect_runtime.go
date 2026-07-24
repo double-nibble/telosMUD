@@ -87,6 +87,20 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 		return inst
 	}
 
+	// IMMUNITY VETO (#538): a target trait can reject an incoming affect by its identity (ref/category/
+	// tag) BEFORE it attaches and BEFORE its on_apply hook fires — the whole point of the primitive, and
+	// why the check must sit here rather than at OnApplyAffect (which fires post-attach). Deliberately
+	// AFTER the reattach branch: a persistence load re-installs saved state verbatim and must be
+	// deterministic regardless of the order affects restore in (an immunity affect and a vetoed affect
+	// restoring in either order must yield the same set), so the load path is never vetoed — a player who
+	// gained immunity while logged out is handled by the same lifecycle that would strip it, not by a
+	// load-order-sensitive veto here. A live apply (a cast, a proc, a tick) IS vetoed.
+	if tok, immune := immuneToAffect(e, def); immune {
+		e.zone.log.Debug("affect apply vetoed: target is immune", "ref", ref, "matched", tok, "rid", e.rid)
+		fireOnAffectBlocked(e, def, opts.source, parent)
+		return nil // no attach, no stacking, no on_apply, no recompute — as if the apply never happened
+	}
+
 	inst := a.byKey[key]
 	if inst == nil {
 		// First instance of this (ref[,source]): install fresh.
@@ -197,6 +211,7 @@ func (a *Affected) recomputeMods() {
 	a.mul = nil
 	a.prevents = nil
 	a.damageMult = nil
+	a.immunity = nil
 	for _, inst := range a.list {
 		scale := inst.magnitude * float64(maxInt(inst.stacks, 1))
 		for _, m := range inst.def.modifiers {
@@ -221,6 +236,12 @@ func (a *Affected) recomputeMods() {
 				a.prevents = map[string]int{}
 			}
 			a.prevents[tag]++
+		}
+		for _, tok := range inst.def.grantsImmunity {
+			if a.immunity == nil {
+				a.immunity = map[string]int{}
+			}
+			a.immunity[tok]++
 		}
 		// Per-target damage multipliers (#537), composed by PRODUCT across active affects. Two
 		// resistances (0.5, 0.5) → 0.25, resist+vuln (0.5, 2) → 1 (cancel), and immunity (0) dominates
@@ -398,6 +419,24 @@ func fireOnAffectExpire(e *Entity, inst *affectInstance, parent *effectCtx) {
 	// affect's source as the counterpart). `parent` threads the in-flight cascade for a NESTED expire
 	// (a remove_affect/dispel op a handler ran) so it trips the guards; a root expire passes nil.
 	e.zone.fireEvent(parent, evOnAffectExpire, e, inst.source, 1)
+}
+
+// fireOnAffectBlocked lights the OnAffectBlocked event (#538) when an incoming affect was vetoed by the
+// target's immunity — so content can narrate "your ward flares" or a proc can react. Subject = the
+// immune entity, counterpart = the affect's would-be source (nil for a self/ambient apply). `parent`
+// threads any in-flight cascade so a nested apply-that-was-blocked trips the same depth/width guards.
+//
+// KNOWN LIMIT, stated so it is a property and not an oversight: the event payload carries subject +
+// source + mag, but NOT the blocked affect's ref — the fireEvent signature has no ref channel, and
+// OnApplyAffect has the identical gap (an OnApplyAffect subscriber can't name which affect attached
+// either). Content narrates at the granularity of "an incoming effect was warded", which is the common
+// case (mind_blank flares regardless of which charm hit it). Threading a ref through the event payload
+// is a broader change to fireEvent that would land OnApplyAffect and OnAffectBlocked together.
+func fireOnAffectBlocked(e *Entity, def *affectDef, source *Entity, parent *effectCtx) {
+	if e.zone == nil || def == nil {
+		return
+	}
+	e.zone.fireEvent(parent, evOnAffectBlocked, e, source, 1)
 }
 
 // fireOnTick runs an affect's on_tick op-list through the GATED effect-op interpreter (Phase 5.3

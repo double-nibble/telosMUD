@@ -469,6 +469,17 @@ type affectDef struct {
 
 	modifiers []affectModifier // additive/multiplicative attribute mods while active
 	prevents  []string         // tags this affect blocks (§6 tag CC); the runtime unions these
+	// tags (#538) are open-string categories THIS affect carries — what it IS, for immunity matching:
+	// a charm affect carries `tags: [charm, mind]`, a poison `tags: [poison]`. An incoming affect is
+	// vetoed if the target is immune to its ref, its category, OR any of these tags. Distinct from
+	// `prevents` (what the affect stops the BEARER from doing) — these describe the affect itself.
+	tags []string
+	// grantsImmunity (#538) is the set of affect refs/categories/tags THIS affect makes its bearer
+	// immune to: a "mind blank" carries `grants_immunity: [charm, fear]`, an undead race
+	// `grants_immunity: [poison, charm, disease]`. While active, applyAffect vetoes any incoming affect
+	// whose ref/category/tags intersect this set — before it attaches and before its on_apply fires. The
+	// runtime unions these into Affected.immunity. A grants_immunity affect is BENEFICIAL (protective).
+	grantsImmunity []string
 	// damageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on INCOMING damage the bearer takes: a
 	// content-declared `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` makes the bearer resistant
 	// (½), vulnerable (×2), or immune (×0) to that type while the affect is active. It is the per-TARGET

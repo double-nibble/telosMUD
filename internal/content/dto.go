@@ -875,6 +875,14 @@ type AffectBodyDTO struct {
 	Duration  int                 `json:"duration" yaml:"duration"`
 	Modifiers []AffectModifierDTO `json:"modifiers" yaml:"modifiers"`
 	Prevents  []string            `json:"prevents" yaml:"prevents"`
+	// Tags (#538) are the open-string categories this affect carries (what it IS): a charm affect
+	// `tags: [charm, mind]`. An incoming affect is vetoed if the target is immune to its ref, category,
+	// or any of these tags. Distinct from Prevents (what the affect stops the bearer from DOING).
+	Tags []string `json:"tags" yaml:"tags"`
+	// GrantsImmunity (#538) is the set of affect refs/categories/tags this affect makes its bearer
+	// immune to while active: `grants_immunity: [charm, fear]`. applyAffect vetoes a matching incoming
+	// affect before it attaches (before its on_apply fires). A grants_immunity affect is beneficial.
+	GrantsImmunity []string `json:"grants_immunity" yaml:"grants_immunity"`
 	// DamageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on incoming damage the bearer takes while
 	// the affect is active: `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` = resist fire, be
 	// vulnerable to cold, immune to poison. The per-target analogue of a damage type's global resist
