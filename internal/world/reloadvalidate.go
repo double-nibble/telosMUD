@@ -363,6 +363,16 @@ func sharedDefProblems(s *reloadScope) []string {
 		}
 		problems = append(problems, fmt.Sprintf("%s trust ladder: %s", where, v.Detail))
 	}
+	// Non-finite numeric literals (#557): a `.nan`/`.inf` in an attribute-feeding field. The engine
+	// screens it at runtime, so it is not zone-graph-unsafe — but a human `reload` deliberately
+	// propagating a pack should refuse a clear authoring defect, matching the trust-ladder posture. The
+	// owning pack must be in scope so an unrelated pack's stray literal doesn't block this reload.
+	for _, v := range content.LintFinite(full) {
+		if !s.inScope(v.Pack) {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf("non-finite (%s) numeric literal in %s (ref %q)", v.Kind, v.Field, v.Ref))
+	}
 	return capProblems(problems)
 }
 

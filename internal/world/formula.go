@@ -197,11 +197,15 @@ func (n opNode) eval(r *formulaResolver) (float64, error) {
 
 // evalFinite evaluates a formula node and FAILS CLOSED on a non-finite result (docs/REMAINING.md §4). A
 // content formula can overflow to ±Inf (`1e308*1e308`) or produce NaN (`Inf-Inf`, `0*Inf`) with no
-// arithmetic error; left unchecked that non-finite value reaches a game value as `int(+Inf)`=maxint64 (e.g.
-// maxint damage on the ungated paths) or `int(NaN)`=0. Only the TOP-LEVEL result is checked, so a harmless
-// intermediate Inf that a `min`/`clamp` tames back to a finite value is still allowed — only a formula whose
-// FINAL value is non-finite is rejected. Every top-level formula consumer (check bonus, attribute base,
-// grant base) evaluates through this, so the guard is inherited uniformly rather than re-implemented per op.
+// arithmetic error; left unchecked that non-finite value reaches a game value through an `int()`
+// conversion whose result is IMPLEMENTATION-DEFINED — arm64 saturates (`int(+Inf)` == MaxInt64), amd64
+// (CI + prod) returns the integer-indefinite `MinInt64`, and both are harmful (a huge positive on the
+// ungated paths, or a negative that reads as `<= 0` and hits the immunity/undying path). Only the
+// TOP-LEVEL result is checked, so a harmless intermediate Inf that a `min`/`clamp` tames back to a
+// finite value is still allowed — only a formula whose FINAL value is non-finite is rejected. Every
+// top-level formula consumer (check bonus, attribute base, grant base) evaluates through this, so the
+// guard is inherited uniformly rather than re-implemented per op. NOTE this guards a FORMULA's own
+// arithmetic; the attribute MODIFIER FOLD is a separate seam bounded by attrScreen (attributes.go).
 func evalFinite(n formulaNode, r *formulaResolver) (float64, error) {
 	v, err := n.eval(r)
 	if err != nil {

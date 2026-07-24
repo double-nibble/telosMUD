@@ -127,7 +127,16 @@ func opAdvanceTrack(c *effectCtx, op *effectOp) error {
 	// Raise the progress attribute base by amount (accumulating, seeded from the def default on first
 	// touch — the 11.1 modify_attribute_base semantics).
 	if def.progressAttr != "" {
-		setAttrBase(c.target, def.progressAttr, attrBaseValue(c.target, def.progressAttr)+op.amount)
+		seed, degraded := attrBaseValue(c.target, def.progressAttr)
+		if degraded {
+			// A degraded seed would bake a screened value into the permanent progress base (see
+			// opModifyAttributeBase). Skip the accumulate; the track advance below still runs off the
+			// live derived progress, which is bounded.
+			c.z.log.Warn("advance_track: progress base seed is degraded; base accumulate skipped",
+				"track", op.track, "attr", def.progressAttr)
+		} else {
+			setAttrBase(c.target, def.progressAttr, seed+op.amount)
+		}
 	}
 	// Apply every newly-crossed step's grants. The current progress is the live derived value (mods
 	// included; for a plain xp attribute that is the base). The stored step is the high-water.

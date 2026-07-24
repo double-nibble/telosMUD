@@ -204,6 +204,16 @@ func LintPacks(packs []Pack) {
 			"the channel may be unintentionally open or unreachable",
 			"pack", v.Pack, "channel", logcap.Value(v.Channel), "field", v.Field, "detail", logcap.Value(v.Detail))
 	}
+	// Content-lint (#557): a NON-FINITE numeric literal (±Inf / NaN) in a field that feeds the attribute
+	// stack. YAML 1.1 `.inf`/`.nan` decode into a DTO float64 with no error, so `value: .nan` on a
+	// modifier is a one-token poison. The engine's fold screen (world.attrScreen) bounds it regardless,
+	// so this is defense in depth + operator signal — it names the offending def so a builder fixes the
+	// typo instead of finding a degraded attribute in play. Non-fatal at boot (the reload gate rejects it).
+	for _, v := range LintFinite(packs) {
+		slog.Error("content: non-finite numeric literal in an attribute-feeding field ("+v.Kind+"); "+
+			"the engine will screen it to a bounded value and mark the attribute degraded — fix the literal",
+			"pack", v.Pack, "ref", logcap.Value(v.Ref), "field", v.Field)
+	}
 }
 
 // Merge assembles already-read packs into a LoadedContent, applying the last-write-wins-by-ref

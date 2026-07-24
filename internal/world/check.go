@@ -159,6 +159,12 @@ func (b *checkBand) matches(total, margin float64, kept []int, eval func(formula
 	return true
 }
 
+// A poisoned attribute can no longer reach truthyPredicate as a non-finite value: the fold is bounded
+// (attributes.go), and a screened attribute makes its whole check formula error, which evalCheckFormula
+// collapses to 0 — so a `when` reading a degraded attribute yields 0 and this predicate is false. The
+// `!math.IsInf` clause below is therefore belt-and-braces for a hypothetical non-attribute Inf; the
+// live protection is the degraded-refusal in evalCheckFormulaErr.
+//
 // truthyPredicate is the engine's one definition of "this content predicate holds": STRICTLY POSITIVE
 // and finite.
 //
@@ -404,6 +410,16 @@ func evalCheckFormulaErr(c *effectCtx, node formulaNode, def *Entity) (float64, 
 				return v, nil
 			}
 			ent, bare := resolveCheckScope(c, ref, def)
+			// A DEGRADED attribute fails the whole formula (attributes.go attrScreen). Before the
+			// modifier fold was bounded, an overflowed attribute was ±Inf and evalFinite rejected it
+			// here for free — so this path failed CLOSED, and a deal_damage bonus reading a poisoned
+			// attribute contributed 0. Bounding the fold replaced the infinity with a legitimate-looking
+			// number, which would have handed every formula a usable one-shot value (measured: 1e12
+			// damage where the same fixture previously dealt its base amount). Refusing the degraded
+			// marker restores that property explicitly instead of relying on an accident of IEEE-754.
+			if attrIsDegraded(ent, bare) {
+				return 0, fmt.Errorf("attribute %q is degraded (screened by the fold bound)", bare)
+			}
 			return attr(ent, bare), nil
 		},
 	}
