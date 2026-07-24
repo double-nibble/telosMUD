@@ -11,6 +11,7 @@ package world
 import (
 	"context"
 	"log/slog"
+	"math"
 )
 
 // attachOpts carries the optional knobs an apply_affect op supplies. Zero values mean "use the def's
@@ -237,7 +238,15 @@ func (a *Affected) recomputeMods() {
 			if !ok {
 				cur = 1
 			}
-			a.damageMult[typ] = cur * m
+			// Normalize EACH FACTOR before multiplying, not the composed product at read time. This is a
+			// security requirement, not tidiness: the read-time clamp only catches an ODD count of
+			// negatives — two `-3` factors compose to +9, a vulnerability that never trips a
+			// post-composition `m < 0` guard, is classified a benign buff by hasVulnerability (which reads
+			// the raw >1 test), and so lands cross-player ungated and amplifies incoming damage 9×. Clamping
+			// per-factor to [0, ceiling] (and NaN to identity) makes that impossible: every factor is in
+			// [0, ceiling], a product of factors <= 1 is <= 1, so a composed value > 1 REQUIRES a raw factor
+			// > 1 — which hasVulnerability flags as harm and the PvP gate refuses.
+			a.damageMult[typ] = cur * normDamageMultFactor(m)
 		}
 	}
 }
@@ -436,6 +445,25 @@ func fireOnTick(e *Entity, inst *affectInstance, pulse uint64) {
 		sourcelessAmbient: sourceless,
 	}
 	runOps(c, inst.def.tickOps)
+}
+
+// normDamageMultFactor clamps one content-declared damage_taken_mult factor (#537) into the safe
+// domain [0, damageTakenMultCeiling] before it composes into the product. A negative factor becomes 0
+// (immunity — a negative multiplier is nonsensical content and must never heal), a NaN becomes 1 (an
+// unusable value is ignored, not treated as harm or immunity), and an over-ceiling / +Inf factor is
+// capped. Doing this per-factor rather than on the composed product is what closes the two-negatives
+// amplification hole (see recomputeMods).
+func normDamageMultFactor(m float64) float64 {
+	if math.IsNaN(m) {
+		return 1
+	}
+	if m < 0 {
+		return 0
+	}
+	if m > damageTakenMultCeiling {
+		return damageTakenMultCeiling
+	}
+	return m
 }
 
 func maxInt(a, b int) int {

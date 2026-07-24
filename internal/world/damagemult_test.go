@@ -1,6 +1,7 @@
 package world
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -200,4 +201,113 @@ func TestLintDamageTakenMultTypes(t *testing.T) {
 	require.Equal(t, "typo", misses[0].affect)
 	require.Equal(t, "clod", misses[0].dmgType)
 	require.Equal(t, "frost", misses[1].dmgType)
+}
+
+// TestVulnerabilityThresholdBoundary pins that the harm test is strictly > 1: a multiplier of exactly
+// 1.0 is a no-op (not harm), and a resistance (< 1) is a buff. Only > 1 is a vulnerability. Without
+// this, a `>= 1` threshold would wrongly gate a no-op or (with a looser bug) a resistance.
+func TestVulnerabilityThresholdBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mult float64
+		harm bool
+	}{
+		{"exactly 1.0 is a no-op, not harm", 1.0, false},
+		{"just above 1 is a vulnerability", 1.0000001, true},
+		{"just below 1 is a resistance (buff)", 0.9999999, false},
+		{"0.5 resistance is a buff", 0.5, false},
+		{"0 immunity is a buff", 0, false},
+		{"2 vulnerability is harm", 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			def := &affectDef{ref: "x", damageTakenMult: map[string]float64{"fire": tc.mult}}
+			require.Equal(t, tc.harm, affectIsDetrimental(def, harmPolarity{}))
+			require.Equal(t, !tc.harm, affectSurvivesRespawn(def, harmPolarity{}),
+				"a non-harmful multiplier affect survives respawn; a harmful one does not")
+		})
+	}
+}
+
+// TestTwoNegativesDoNotComposeToAmplification is the P1 SECURITY test. Two `{fire:-3}` affects — each
+// classified a benign buff by the harm gate — would, under a read-time-only clamp, compose to +9 and
+// amplify incoming damage 9× on a non-consenting target. Per-factor normalization at COMPOSITION makes
+// each factor 0 (immunity), so the product is 0, not 9.
+func TestTwoNegativesDoNotComposeToAmplification(t *testing.T) {
+	z, _, mob := multZone(t)
+	for _, ref := range []string{"neg1", "neg2"} {
+		z.defs.affect.register(ref, &affectDef{
+			ref: ref, duration: 100, maxStacks: 1,
+			damageTakenMult: map[string]float64{"fire": -3},
+		})
+		applyAffect(mob, ref, attachOpts{}, nil)
+	}
+	require.Equal(t, 0.0, damageTakenMult(mob, "fire"),
+		"two negatives must compose to immunity (0), NOT amplification (+9)")
+	require.Equal(t, 0, mitigate(mob, 40, "fire"))
+
+	// And each negative affect on its own is classified a BUFF (immunity), not harm — so this is not a
+	// gate bypass: neither affect is a vulnerability, and composition cannot manufacture one.
+	neg := &affectDef{ref: "neg", damageTakenMult: map[string]float64{"fire": -3}}
+	require.False(t, affectIsDetrimental(neg, harmPolarity{}), "a negative is immunity-like, a buff")
+}
+
+// TestNaNMultiplierIsNeutralized pins that a NaN factor (authorable as `.nan` in YAML, or composable
+// as 0×Inf) reads as identity, never reaching an int() conversion where int(NaN) is
+// implementation-defined — a determinism hazard.
+func TestNaNMultiplierIsNeutralized(t *testing.T) {
+	z, _, mob := multZone(t)
+	z.defs.affect.register("nan", &affectDef{
+		ref: "nan", duration: 100, maxStacks: 1,
+		damageTakenMult: map[string]float64{"fire": math.NaN()},
+	})
+	applyAffect(mob, "nan", attachOpts{}, nil)
+	require.Equal(t, 1.0, damageTakenMult(mob, "fire"), "a NaN factor is ignored (identity)")
+	require.Equal(t, 40, mitigate(mob, 40, "fire"), "so the blow is unscaled, not int(NaN)")
+
+	// Pin the COMPOSITION layer independently of the reader's defensive clamp: the composed map itself
+	// must never contain a non-finite value, so any future consumer that bypasses the reader is safe.
+	a, _ := Get[*Affected](mob)
+	require.False(t, math.IsNaN(a.damageMult["fire"]), "the composed map must never store NaN")
+	require.False(t, math.IsInf(a.damageMult["fire"], 0), "...nor Inf")
+
+	// The 0 × Inf composition case: an immunity plus an Inf-vulnerability. Inf clamps to the ceiling
+	// per-factor, so 0 × ceiling = 0, not NaN.
+	z.defs.affect.register("imm", &affectDef{ref: "imm", duration: 100, maxStacks: 1, damageTakenMult: map[string]float64{"cold": 0}})
+	z.defs.affect.register("inf", &affectDef{ref: "inf", duration: 100, maxStacks: 1, damageTakenMult: map[string]float64{"cold": math.Inf(1)}})
+	applyAffect(mob, "imm", attachOpts{}, nil)
+	applyAffect(mob, "inf", attachOpts{}, nil)
+	require.False(t, math.IsNaN(damageTakenMult(mob, "cold")), "0 × Inf must not surface as NaN")
+	require.Equal(t, 0.0, damageTakenMult(mob, "cold"), "immunity dominates: 0 × ceiling = 0")
+}
+
+// TestMixedAffectThroughApplyGate pins the boundary case: an affect that both resists and makes
+// vulnerable is a debuff overall and must be refused at a non-consenting player.
+func TestMixedAffectThroughApplyGate(t *testing.T) {
+	z, caster, _ := multZone(t)
+	victim := makePlayerTargetInRoom(z, caster, "Victim")
+	z.defs.affect.register("mixedhex", &affectDef{
+		ref: "mixedhex", name: "Mixed Hex", stacking: stackRefresh, maxStacks: 1, duration: 100,
+		damageTakenMult: map[string]float64{"fire": 0.5, "cold": 2},
+	})
+	c := &effectCtx{z: z, actor: caster, source: caster, target: victim.entity, mag: 1, disp: dispNeutral}
+	require.NoError(t, opApplyAffect(c, &effectOp{kind: "apply_affect", affect: "mixedhex"}))
+	require.False(t, hasAffect(victim.entity, "mixedhex"),
+		"an affect with ANY vulnerability is a debuff and must be gated, even if it also resists")
+}
+
+// TestLintDamageTakenMultValues pins the value lint: non-finite and negative values are flagged.
+func TestLintDamageTakenMultValues(t *testing.T) {
+	z, _ := abilityTestZone(t)
+	z.defs.dmg.register("cold", &damageTypeDef{ref: "cold"})
+	z.defs.affect.register("ok", &affectDef{ref: "ok", damageTakenMult: map[string]float64{"fire": 0.5, "cold": 2}})
+	z.defs.affect.register("bad", &affectDef{ref: "bad", damageTakenMult: map[string]float64{
+		"fire": math.NaN(), "cold": -3,
+	}})
+	misses := lintDamageTakenMultValues(z.defs)
+	require.Len(t, misses, 2, "%+v", misses)
+	require.Equal(t, "bad", misses[0].affect)
+	require.Equal(t, "cold", misses[0].dmgType)
+	require.Equal(t, "negative", misses[0].reason)
+	require.Equal(t, "fire", misses[1].dmgType)
+	require.Equal(t, "non-finite", misses[1].reason)
 }

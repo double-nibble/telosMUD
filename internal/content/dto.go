@@ -882,9 +882,9 @@ type AffectBodyDTO struct {
 	// VULNERABILITY (a debuff — the harm gate treats such an affect as detrimental).
 	DamageTakenMult map[string]float64 `json:"damage_taken_mult" yaml:"damage_taken_mult"`
 	Tick            *AffectTickDTO     `json:"tick" yaml:"tick"`
-	OnApply   any                 `json:"on_apply" yaml:"on_apply"`   // RESERVED op-list (5.3)
-	OnExpire  any                 `json:"on_expire" yaml:"on_expire"` // RESERVED op-list (5.3)
-	Resist    map[string]any      `json:"resist" yaml:"resist"`       // RESERVED resist spec (5.3)
+	OnApply         any                `json:"on_apply" yaml:"on_apply"`   // RESERVED op-list (5.3)
+	OnExpire        any                `json:"on_expire" yaml:"on_expire"` // RESERVED op-list (5.3)
+	Resist          map[string]any     `json:"resist" yaml:"resist"`       // RESERVED resist spec (5.3)
 	// OnApplyLua/OnExpireLua/OnDispelLua are the OPTIONAL Lua affect hooks (Phase 7.4d): a Lua body
 	// run when the affect attaches / expires / is dispelled, with `self` the affected entity and
 	// the affect's source as the harm actor. Empty for a pure-data affect.

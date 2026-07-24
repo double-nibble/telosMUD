@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"log/slog"
+	"math"
 	"math/rand"
 )
 
@@ -917,6 +918,13 @@ func damageTakenMult(target *Entity, dmgType string) float64 {
 	}
 	m, ok := a.damageMult[dmgType]
 	if !ok {
+		return 1
+	}
+	// Defense in depth: recomputeMods already normalizes each factor into [0, ceiling], so the composed
+	// value should already be in range. These clamps are the last seam before an int() conversion and
+	// must not depend on that staying true — a NaN (int(NaN) is implementation-defined, a determinism
+	// hazard) reads as identity, a negative can never heal, and the product is bounded.
+	if math.IsNaN(m) {
 		return 1
 	}
 	if m < 0 {
