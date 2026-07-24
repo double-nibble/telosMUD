@@ -163,7 +163,7 @@ func opApplyAffect(c *effectCtx, op *effectOp) error {
 	}
 	opts := attachOpts{source: c.source, duration: op.duration, magnitude: op.magnitude}
 	def := c.target.zone.affectDefs().get(op.affect)
-	detrimental := affectIsDetrimental(def)
+	detrimental := affectIsDetrimental(def, c.target.zone.invertedAttrs())
 	if op.harmful || c.disp == dispHarmful || detrimental {
 		c.z.log.Debug("apply_affect routed through gate (derived harm)", "affect", op.affect,
 			"op_harmful", op.harmful, "disp", int(c.disp), "derived", detrimental)

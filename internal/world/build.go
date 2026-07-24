@@ -336,6 +336,17 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		slog.Error("content: learn_profession.profession does not name a kind:profession bundle",
 			"owner", m.owner, "profession", m.profession)
 	}
+	// Derive the INVERTED-POLARITY attribute set (#511) once every registry is populated — it reads the
+	// boon/bane formulas on every registered check, so it must run after abilities AND combat profiles
+	// are built. The harm derivations (affectIsDetrimental / affectSurvivesRespawn) consult it so a
+	// debuff expressed as "+3 to a bane counter" is gated and purged like the "-3 to a stat" it is;
+	// without it the sign heuristic reads that affect as a buff. Empty (nil) for content that uses no
+	// boon/bane, which restores the pre-#511 behaviour byte for byte.
+	d.invertedAttrs = attributeInvertedPolarity(d)
+	if len(d.invertedAttrs) > 0 {
+		slog.Debug("content: derived inverted-polarity attributes from the boon/bane channel",
+			"count", len(d.invertedAttrs))
+	}
 	slog.Debug("global defs registered", "attributes", d.attr.len(),
 		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len(),
 		"abilities", d.ability.len(), "ability_commands", len(d.abilityCmds),

@@ -4,6 +4,8 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/double-nibble/telosmud/internal/content"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,6 +43,11 @@ func boonZone(t *testing.T) (*Zone, *session, *Entity) {
 	return z, caster, makeMobTarget(z, caster.entity, "goblin")
 }
 
+// divByZero builds a formula that FAILS to evaluate (formula.go rejects division by zero), so a test
+// can distinguish "this side counted zero" from "this side could not be evaluated" — which
+// effectiveDice must treat differently.
+func divByZero() formulaNode { return opFormula("/", litNode{v: 1}, litNode{v: 0}) }
+
 // fiveESpec is the canonical 5e-shaped to-hit: a neutral d20, with content naming BOTH alternatives
 // itself. The boon formula reads the attacker's own boon PLUS one the defender grants — the whole
 // "attacks against a prone target have advantage" case, expressed with the scoping the engine already
@@ -77,13 +84,21 @@ func TestEffectiveDiceSelectionMatrix(t *testing.T) {
 		want     string
 	}{
 		{"no channel authored at all", nil, nil, &boonD, &baneD, "1d20"},
-		{"net positive picks the boon die", litNode{v: 1}, nil, &boonD, &baneD, "2d20kh1"},
-		{"net negative picks the bane die", nil, litNode{v: 1}, &boonD, &baneD, "2d20kl1"},
-		{"equal boon and bane cancel to the neutral die", litNode{v: 3}, litNode{v: 3}, &boonD, &baneD, "1d20"},
-		{"many boons and one bane still cancel (sign, not magnitude)", litNode{v: 9}, litNode{v: 1}, &boonD, &baneD, "2d20kh1"},
-		{"net positive with no boon die authored falls back", litNode{v: 1}, nil, nil, &baneD, "1d20"},
-		{"net negative with no bane die authored falls back", nil, litNode{v: 1}, &boonD, nil, "1d20"},
+		{"a boon alone picks the boon die", litNode{v: 1}, nil, &boonD, &baneD, "2d20kh1"},
+		{"a bane alone picks the bane die", nil, litNode{v: 1}, &boonD, &baneD, "2d20kl1"},
+		{"one of each cancels to the neutral die", litNode{v: 1}, litNode{v: 1}, &boonD, &baneD, "1d20"},
+		// The rule is ANY-versus-ANY, which is 5e's. A net-difference rule would resolve these two rows
+		// as advantage/disadvantage respectively; both must be the straight roll.
+		{"nine boons against one bane still cancel", litNode{v: 9}, litNode{v: 1}, &boonD, &baneD, "1d20"},
+		{"one boon against nine banes still cancel", litNode{v: 1}, litNode{v: 9}, &boonD, &baneD, "1d20"},
+		{"a boon with no boon die authored falls back", litNode{v: 1}, nil, nil, &baneD, "1d20"},
+		{"a bane with no bane die authored falls back", nil, litNode{v: 1}, &boonD, nil, "1d20"},
 		{"a zero-valued boon formula is not a boon", litNode{v: 0}, nil, &boonD, &baneD, "1d20"},
+		{"a negative boon count is not a boon", litNode{v: -4}, nil, &boonD, &baneD, "1d20"},
+		// A BROKEN channel is no channel: a side that fails to evaluate must not leave the other side
+		// unopposed, which would turn an authoring bug in the boon half into a bane.
+		{"an errored boon fails the whole channel neutral", divByZero(), litNode{v: 1}, &boonD, &baneD, "1d20"},
+		{"an errored bane fails the whole channel neutral", litNode{v: 1}, divByZero(), &boonD, &baneD, "1d20"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,20 +124,30 @@ func TestBoonChannelReadsLiveAffects(t *testing.T) {
 
 	applyAffect(caster.entity, "curse", attachOpts{}, nil)
 	require.Equal(t, "1d20", effectiveDice(c, spec, c.actor).raw,
-		"boon + bane cancel to the neutral die (5e's rule falls out of sign(net))")
+		"one boon and one bane cancel to the neutral die")
 
-	// A SECOND bless stacks the attribute to 2 vs 1 bane — but cancellation is by SIGN, so this must
-	// flip back to the boon die rather than 'out-weighing' anything by magnitude.
+	// A SECOND bless makes it 2 boons against 1 bane. 5e's rule is ANY-versus-ANY, so this must STAY
+	// cancelled — a net-difference rule would wrongly resolve it as advantage.
 	applyAffect(caster.entity, "bless", attachOpts{}, nil)
-	require.Equal(t, "2d20kh1", effectiveDice(c, spec, c.actor).raw)
+	require.Equal(t, "1d20", effectiveDice(c, spec, c.actor).raw,
+		"two boons against one bane still cancel: presence, not magnitude")
 
-	// Reset to cancelled, then let the DEFENDER supply the deciding boon: the prone/helpless case,
-	// keyed off $target on the attacker's own spec.
-	applyAffect(caster.entity, "curse", attachOpts{}, nil) // 2 bless vs 2 curse -> net 0
-	require.Equal(t, "1d20", effectiveDice(c, spec, c.actor).raw)
+	// The DEFENDER can supply a boon too (the prone/helpless case, keyed off $target on the attacker's
+	// own spec) — but while a bane is live it must still cancel.
 	applyAffect(mob, "prone", attachOpts{}, nil)
+	require.Equal(t, "1d20", effectiveDice(c, spec, c.actor).raw)
+
+	// Drop the bane by expiring the curse, and the accumulated boons finally take the boon die. This
+	// also proves the channel tracks affect REMOVAL, not just application.
+	a, ok := Get[*Affected](caster.entity)
+	require.True(t, ok)
+	for _, inst := range append([]*affectInstance(nil), a.list...) {
+		if inst.def.ref == "curse" {
+			a.expire(caster.entity, inst, nil)
+		}
+	}
 	require.Equal(t, "2d20kh1", effectiveDice(c, spec, c.actor).raw,
-		"a prone DEFENDER grants the attacker the boon through $target scoping")
+		"with the bane gone the boon side selects, including the $target-granted one")
 }
 
 // TestChannelLearnsNoDirection is the anti-5e-vocabulary property, and the reason the engine selects
@@ -409,4 +434,315 @@ func TestParseCheckSpecAcceptsEveryDocumentedKey(t *testing.T) {
 	require.NotNil(t, spec.boonDice)
 	require.NotNil(t, spec.baneDice)
 	require.Len(t, spec.bands, 4)
+}
+
+// TestParsedBoonKeyActuallyBoons is the PARSER->SELECTION wiring test. Every other behavioural test in
+// this file hand-builds a checkSpec in Go, so swapping the parser's two destinations (`boon` writing
+// spec.bane and vice versa) left the entire package green — a pack authoring `boon:` would have got
+// disadvantage. This drives a spec that came out of parseCheckSpec through effectiveDice, which is the
+// only shape that pins the two together.
+func TestParsedBoonKeyActuallyBoons(t *testing.T) {
+	z, caster, mob := boonZone(t)
+	c := checkCtx(z, caster.entity, caster.entity, mob)
+
+	spec, err := parseCheckSpec(map[string]any{
+		"dice":      "1d20",
+		"boon":      []any{"attr", "$actor.atk_boon"},
+		"bane":      []any{"attr", "$actor.atk_bane"},
+		"boon_dice": "2d20kh1",
+		"bane_dice": "2d20kl1",
+		"bands":     []any{map[string]any{"label": "hit"}},
+	})
+	require.NoError(t, err)
+
+	applyAffect(caster.entity, "bless", attachOpts{}, nil)
+	require.Equal(t, "2d20kh1", effectiveDice(c, spec, c.actor).raw,
+		"the `boon` KEY must feed the boon side")
+
+	// Remove the boon, add a bane: the other direction, so a swap cannot pass by symmetry.
+	a, _ := Get[*Affected](caster.entity)
+	for _, inst := range append([]*affectInstance(nil), a.list...) {
+		a.expire(caster.entity, inst, nil)
+	}
+	applyAffect(caster.entity, "curse", attachOpts{}, nil)
+	require.Equal(t, "2d20kl1", effectiveDice(c, spec, c.actor).raw,
+		"the `bane` KEY must feed the bane side")
+}
+
+// TestEmitCheckDescribesTheSelectedDie pins that emission reads the EFFECTIVE die's kind, not the
+// spec's. A boon alternative may be a different KIND than the neutral expression (a pool system's boon
+// is an extra pool die), and reverting this to spec.dice left the suite green in both directions.
+func TestEmitCheckDescribesTheSelectedDie(t *testing.T) {
+	z, caster, mob := boonZone(t)
+
+	drain := func() []string {
+		var out []string
+		for {
+			select {
+			case f := <-caster.out:
+				if o := f.GetOutput(); o != nil {
+					out = append(out, o.GetMarkup())
+				}
+			default:
+				return out
+			}
+		}
+	}
+
+	t.Run("neutral sum, boon selects a pool", func(t *testing.T) {
+		boonD := mustDice(t, "3d1>=1") // deterministic: 3 faces of 1, all succeed
+		spec := &checkSpec{
+			label: "Probe", dice: mustDice(t, "1d1"), boonDice: &boonD,
+			boon: attrNode{ref: "$actor.atk_boon"}, visibility: visShow,
+			bands: []checkBand{{label: "ok"}},
+		}
+		c := checkCtx(z, caster.entity, caster.entity, mob)
+		resolveCheck(c, spec)
+		require.Equal(t, []string{"[Probe] 1+0 = 1 — ok"}, drain(), "the neutral sum renders as a total")
+
+		applyAffect(caster.entity, "bless", attachOpts{}, nil)
+		resolveCheck(c, spec)
+		require.Equal(t, []string{"[Probe] 3 successes — ok"}, drain(),
+			"once the POOL alternative is selected, emission must describe a pool")
+	})
+
+	t.Run("neutral pool, bane selects a sum", func(t *testing.T) {
+		a, _ := Get[*Affected](caster.entity)
+		for _, inst := range append([]*affectInstance(nil), a.list...) {
+			a.expire(caster.entity, inst, nil)
+		}
+		baneD := mustDice(t, "1d1")
+		spec := &checkSpec{
+			label: "Probe", dice: mustDice(t, "2d1>=1"), baneDice: &baneD,
+			bane: attrNode{ref: "$actor.atk_bane"}, visibility: visShow,
+			bands: []checkBand{{label: "ok"}},
+		}
+		c := checkCtx(z, caster.entity, caster.entity, mob)
+		resolveCheck(c, spec)
+		require.Equal(t, []string{"[Probe] 2 successes — ok"}, drain())
+
+		applyAffect(caster.entity, "curse", attachOpts{}, nil)
+		resolveCheck(c, spec)
+		require.Equal(t, []string{"[Probe] 1+0 = 1 — ok"}, drain(),
+			"the SUM alternative must render as a total, not as successes")
+	})
+}
+
+// TestBoonDiceRejectsNonStringValues closes the VALUE axis of the typo gate. mapStr yields "" for any
+// non-string, so a present-but-wrongly-typed alternative would silently leave the channel inert — the
+// same permanent no-op the unknown-KEY gate exists to prevent, reached one axis over.
+func TestBoonDiceRejectsNonStringValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		val  any
+	}{
+		{"a bare number", float64(20)},
+		{"an int", 20},
+		{"a sequence", []any{"2d20kh1"}},
+		{"a bool", true},
+		{"a nested map", map[string]any{"dice": "2d20kh1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseCheckSpec(map[string]any{
+				"dice": "1d20", "boon_dice": tc.val,
+				"bands": []any{map[string]any{"label": "hit"}},
+			})
+			require.Error(t, err, "a present boon_dice of the wrong type must not be read as absent")
+			// Assert the TYPE-specific message, not merely that some error mentions the key: without the
+			// type check the value still fails, but as a confusing "empty expression" from parseDiceSpec,
+			// so a laxer assertion would pass with the guard deleted.
+			require.Contains(t, err.Error(), "boon_dice: must be a dice-notation string")
+		})
+	}
+}
+
+// TestInvertedPolarityGatesABaneDebuff is the SECURITY property. The PvP apply-gate derives harm from
+// the SIGN of a modifier, which assumes higher-is-better. A bane counter inverts exactly that, so
+// `{attr: atk_bane, op: add, value: 3}` — a real debuff that forces the bearer onto the worse die on
+// every roll — would read as a buff, skip applyDebuff/guardHarmful entirely, and land on a
+// non-consenting player in a no-PvP room. attributeInvertedPolarity is what closes it.
+func TestInvertedPolarityGatesABaneDebuff(t *testing.T) {
+	inverted := map[string]bool{"atk_bane": true, "grants_boon_to_attackers": true}
+
+	hex := &affectDef{ref: "hex", modifiers: []affectModifier{{attr: "atk_bane", add: true, value: 3}}}
+	marked := &affectDef{ref: "marked", modifiers: []affectModifier{{attr: "grants_boon_to_attackers", add: true, value: 1}}}
+	bless := &affectDef{ref: "bless", modifiers: []affectModifier{{attr: "atk_boon", add: true, value: 1}}}
+	cleanse := &affectDef{ref: "cleanse", modifiers: []affectModifier{{attr: "atk_bane", add: true, value: -2}}}
+
+	t.Run("without the inverted set the debuffs read as benign", func(t *testing.T) {
+		require.False(t, affectIsDetrimental(hex, nil), "this is the hole the derivation closes")
+		require.True(t, affectSurvivesRespawn(hex, nil), "...and it would survive the respawn purge too")
+	})
+
+	t.Run("with it they are gated and purged", func(t *testing.T) {
+		require.True(t, affectIsDetrimental(hex, inverted))
+		require.False(t, affectSurvivesRespawn(hex, inverted))
+		require.True(t, affectIsDetrimental(marked, inverted))
+		require.False(t, affectSurvivesRespawn(marked, inverted))
+	})
+
+	t.Run("genuine buffs stay ungated so blessing an ally still lands", func(t *testing.T) {
+		require.False(t, affectIsDetrimental(bless, inverted), "a boon counter is higher-is-better")
+		require.True(t, affectSurvivesRespawn(bless, inverted))
+		require.False(t, affectIsDetrimental(cleanse, inverted), "LOWERING a bane counter is a buff")
+		require.True(t, affectSurvivesRespawn(cleanse, inverted))
+	})
+}
+
+// TestAttributeInvertedPolarityDerivation pins the derivation rule itself: which refs land in the set
+// and, just as importantly, which do NOT. The rule is by ROLE — a bane on the roller, or a boon on a
+// counterpart — so a bare ref works identically in a top-level spec and a contested sub-spec.
+func TestAttributeInvertedPolarityDerivation(t *testing.T) {
+	spec := &checkSpec{
+		dice: mustDice(t, "1d20"),
+		boon: opFormula("+", attrNode{ref: "$target.victim_marked"}, attrNode{ref: "$actor.my_boon"}),
+		bane: opFormula("+", attrNode{ref: "my_bane"}, attrNode{ref: "$target.their_defence"}),
+		vs: checkVs{contested: &checkSpec{
+			dice: mustDice(t, "1d20"),
+			bane: attrNode{ref: "defender_bane"}, // bare == the roller == the defender
+		}},
+		bands: []checkBand{{label: "hit", ops: []effectOp{{
+			kind:  "check",
+			check: &checkSpec{dice: mustDice(t, "1d6"), boon: attrNode{ref: "$source.nested_marked"}},
+		}}}},
+	}
+	d := &defRegistries{
+		ability: newDefRegistry[*abilityDef](),
+		bundle:  newDefRegistry[*bundleDef](),
+		track:   newDefRegistry[*trackDef](),
+		affect:  newDefRegistry[*affectDef](),
+		res:     newDefRegistry[*resourceDef](),
+		combat:  newDefRegistry[*combatProfile](),
+	}
+	d.combat.register("melee", &combatProfile{toHit: spec})
+
+	got := attributeInvertedPolarity(d)
+
+	// Inverted: a bane on the ROLLER, and a boon on a COUNTERPART.
+	require.True(t, got["my_bane"], "a bare bane ref is the roller's own bane counter")
+	require.True(t, got["victim_marked"], "a $target-scoped boon is a counter on the victim")
+	require.True(t, got["defender_bane"], "a bare bane inside a CONTESTED sub-spec is the defender's")
+	require.True(t, got["nested_marked"], "a check nested in a band's op-list is still walked")
+
+	// NOT inverted: the ordinary higher-is-better shapes.
+	require.False(t, got["my_boon"], "the roller's own boon counter is higher-is-better")
+	require.False(t, got["their_defence"], "a $target-scoped BANE is the target's defence, a good stat")
+
+	require.Nil(t, attributeInvertedPolarity(&defRegistries{
+		ability: newDefRegistry[*abilityDef](), bundle: newDefRegistry[*bundleDef](),
+		track: newDefRegistry[*trackDef](), affect: newDefRegistry[*affectDef](),
+		res: newDefRegistry[*resourceDef](), combat: newDefRegistry[*combatProfile](),
+	}), "content with no boon/bane derives an empty set, restoring pre-#511 behaviour exactly")
+}
+
+// TestBrokenCombatProfileRefusesTheSwing pins the fail-CLOSED direction. A nil toHit is how the engine
+// spells the legitimate "no classifier authored, the swing auto-lands" case, so folding a PARSE FAILURE
+// into it would turn one typo into "nothing can ever miss" for every entity using the profile.
+func TestBrokenCombatProfileRefusesTheSwing(t *testing.T) {
+	good := buildCombatProfile(content.CombatProfileDTO{
+		Ref: "ok", ToHit: map[string]any{"dice": "1d20", "bands": []any{map[string]any{"label": "hit"}}},
+	})
+	require.False(t, good.broken)
+	require.NotNil(t, good.toHit)
+
+	for _, tc := range []struct {
+		name string
+		dto  content.CombatProfileDTO
+	}{
+		{"an unknown key in to_hit", content.CombatProfileDTO{Ref: "bad", ToHit: map[string]any{
+			"dice": "1d20", "dice_boon": "2d20kh1", "bands": []any{map[string]any{"label": "hit"}},
+		}}},
+		{"an unknown key in an avoidance rung", content.CombatProfileDTO{Ref: "bad", Avoidance: []any{
+			map[string]any{"dice": "1d100", "margin_minimum": float64(0), "bands": []any{map[string]any{"label": "dodge"}}},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := buildCombatProfile(tc.dto)
+			require.True(t, p.broken,
+				"a sub-spec that failed to parse must mark the profile broken, not silently degrade it")
+		})
+	}
+}
+
+// TestBrokenProfileRefusesTheSwing is the WIRING half of the fail-closed fix — separate from the
+// buildCombatProfile test above, which pins only that the flag gets SET. Mutation-testing showed the
+// flag being set and the swing consulting it were independently unpinned: deleting the check in
+// resolveSwing left the suite green, which is precisely the auto-hit regression the flag exists to
+// prevent. Both directions are asserted (attacker-broken and defender-broken).
+func TestBrokenProfileRefusesTheSwing(t *testing.T) {
+	for _, tc := range []struct{ name, whose string }{
+		{"the attacker's profile is broken", "attacker"},
+		{"the defender's profile is broken", "defender"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			z, s := combatZone(t)
+			// A profile with NO to_hit at all: the legitimate degenerate case that auto-hits. The broken
+			// profile below must NOT behave like this one, which is the whole point.
+			z.defs.combat.register("healthy", &combatProfile{})
+			z.defs.combat.register("busted", &combatProfile{broken: true})
+
+			mob := combatMob(z, s.entity, "dummy", "", 100)
+			if tc.whose == "attacker" {
+				s.entity.living.combatRef, mob.living.combatRef = "busted", "healthy"
+			} else {
+				s.entity.living.combatRef, mob.living.combatRef = "healthy", "busted"
+			}
+			equipWeapon(s.entity, &Weapon{diceNum: 6, diceSize: 1, damageType: "slash"})
+
+			rng := rand.New(rand.NewSource(1))
+			z.resolveSwing(s.entity, mob, 0, rng, newBudget())
+			require.Equal(t, 100, resourceCurrent(mob, "hp"),
+				"a broken profile must resolve NO swing — falling through would auto-hit for full damage")
+		})
+	}
+
+	// The control: the same setup with two healthy (empty) profiles DOES land a blow, so the assertion
+	// above cannot pass merely because the harness never swings.
+	t.Run("control: healthy profiles still swing", func(t *testing.T) {
+		z, s := combatZone(t)
+		z.defs.combat.register("healthy", &combatProfile{})
+		mob := combatMob(z, s.entity, "dummy", "", 100)
+		s.entity.living.combatRef, mob.living.combatRef = "healthy", "healthy"
+		equipWeapon(s.entity, &Weapon{diceNum: 6, diceSize: 1, damageType: "slash"})
+		z.resolveSwing(s.entity, mob, 0, rand.New(rand.NewSource(1)), newBudget())
+		require.Less(t, resourceCurrent(mob, "hp"), 100, "the control swing must actually land")
+	})
+}
+
+// TestBoonChannelThroughTheSwingPipeline drives the channel through resolveSwing rather than
+// resolveCheck directly — 5e advantage-on-attacks is the motivating case, and the swing path is where
+// a real pack meets it. The to-hit is rigged so the neutral die MISSES and the boon die HITS, making
+// the selection observable as damage rather than as an internal return value.
+func TestBoonChannelThroughTheSwingPipeline(t *testing.T) {
+	z, s := combatZone(t)
+	z.defs.attr.register("atk_boon", &attributeDef{ref: "atk_boon"})
+	z.defs.affect.register("bless", &affectDef{
+		ref: "bless", name: "Blessed", stacking: stackRefresh, maxStacks: 1, duration: 100,
+		modifiers: []affectModifier{{attr: "atk_boon", add: true, value: 1}},
+	})
+
+	// Neutral 1d1 totals 1 (below the DC of 2 -> miss); the boon alternative 3d1 totals 3 (-> hit).
+	boonD := mustDice(t, "3d1")
+	z.defs.combat.register("attacker", &combatProfile{
+		toHit: &checkSpec{
+			label: "Attack", dice: mustDice(t, "1d1"), boonDice: &boonD,
+			boon: attrNode{ref: "$actor.atk_boon"},
+			vs:   checkVs{dc: litNode{v: 2}},
+			bands: []checkBand{
+				{marginMin: bn(0), label: "hit"},
+				{label: "miss"},
+			},
+		},
+	})
+	s.entity.living.combatRef = "attacker"
+	equipWeapon(s.entity, &Weapon{diceNum: 6, diceSize: 1, damageType: "slash"})
+	mob := combatMob(z, s.entity, "dummy", "", 100)
+
+	z.resolveSwing(s.entity, mob, 0, rand.New(rand.NewSource(1)), newBudget())
+	require.Equal(t, 100, resourceCurrent(mob, "hp"), "unblessed, the neutral die misses")
+
+	applyAffect(s.entity, "bless", attachOpts{}, nil)
+	z.resolveSwing(s.entity, mob, 0, rand.New(rand.NewSource(1)), newBudget())
+	require.Less(t, resourceCurrent(mob, "hp"), 100,
+		"blessed, the boon die is selected and the same swing lands")
 }

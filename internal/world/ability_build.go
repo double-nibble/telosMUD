@@ -311,13 +311,17 @@ func parseOp(v any) (effectOp, error) {
 // checkSpecKeys / checkBandKeys are the COMPLETE authored key sets for a check spec and one of its
 // bands. rejectUnknownKeys turns a typo into a build error instead of a silent no-op.
 //
-// WHY THIS IS WORTH A GATE: every field here is optional, so an unrecognised key is indistinguishable
-// from an absent one. `boon_dice` mistyped as `dice_boon` yields a check that parses cleanly, runs
-// forever, and simply never takes the boon — the exact false-green shape that has bitten this project
-// repeatedly (a feature whose tests pass because the feature was never wired). The check body rides the
-// content DTO as an untyped `any`, so no struct decoder catches it either; this is the only gate there
-// is. Adding a field to checkSpec/checkBand means adding its key here — the parser will not accept it
-// otherwise, so the two cannot drift apart silently.
+// WHY THIS IS WORTH A GATE: every field here except `bands` is optional, so an unrecognised key is
+// indistinguishable from an absent one. `boon_dice` mistyped as `dice_boon` yields a check that parses
+// cleanly, runs forever, and simply never takes the boon — the exact false-green shape that has bitten
+// this project repeatedly (a feature whose tests pass because the feature was never wired). The check
+// body rides the content DTO as an untyped `any`, so no struct decoder catches it either; this is the
+// only gate there is. Adding a field to checkSpec/checkBand means adding its key here — the parser will
+// not accept it otherwise, so the two cannot drift apart silently.
+//
+// The KEY axis is only half of it: a key spelled right but given the wrong TYPE is the same silent
+// no-op, so the value readers below (boon_dice/bane_dice) reject a present-but-non-string value rather
+// than letting mapStr's "" stand in for absence.
 var (
 	checkSpecKeys = map[string]bool{
 		"label": true, "dice": true, "bonus": true, "vs": true, "bands": true, "visibility": true,
@@ -395,13 +399,23 @@ func parseCheckSpec(v any) (*checkSpec, error) {
 		key string
 		dst **diceSpec
 	}{{"boon_dice", &spec.boonDice}, {"bane_dice", &spec.baneDice}} {
-		if s := mapStr(m, e.key); s != "" {
-			d, err := parseDiceSpec(s)
-			if err != nil {
-				return nil, fmt.Errorf("%s: %w", e.key, err)
-			}
-			*e.dst = &d
+		raw, present := m[e.key]
+		if !present {
+			continue
 		}
+		// PRESENT-BUT-WRONG-TYPE IS AN ERROR, not an absence. mapStr yields "" for any non-string, so
+		// `boon_dice: 20` (a bare YAML number), a sequence, or a nested map would otherwise leave the
+		// alternative nil and the channel permanently inert — the same silent no-op the unknown-key gate
+		// exists to prevent, reached through the value axis instead of the key axis.
+		s, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s: must be a dice-notation string, got %T", e.key, raw)
+		}
+		d, err := parseDiceSpec(s)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", e.key, err)
+		}
+		*e.dst = &d
 	}
 
 	vs, err := parseCheckVs(m["vs"])

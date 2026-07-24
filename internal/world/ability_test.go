@@ -525,7 +525,7 @@ func TestAffectIsDetrimentalDerivation(t *testing.T) {
 		{"nil", nil, false},
 	}
 	for _, tc := range cases {
-		if got := affectIsDetrimental(tc.def); got != tc.want {
+		if got := affectIsDetrimental(tc.def, nil); got != tc.want {
 			t.Errorf("%s: affectIsDetrimental = %v, want %v", tc.name, got, tc.want)
 		}
 	}

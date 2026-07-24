@@ -146,7 +146,7 @@ func landRoomAffectOn(room *Entity, occ *Entity, inst *affectInstance) {
 		// Route through the harm funnel exactly like opApplyAffect derives: a detrimental room affect
 		// (web's prevents, a debuff modifier) on a player gates; a beneficial one (consecrate's buff)
 		// lands ungated on allies.
-		if affectIsDetrimental(def) {
+		if affectIsDetrimental(def, room.zone.invertedAttrs()) {
 			// sourcelessAmbient: when src==nil the nonNilSource(src, occ) fallback makes actor==target=occ, the
 			// same artifact the tickOps branch flags (#397 item 1). Without it a sourceless ambient CC field
 			// (a snare/silence/slow with no applier) would root a just-respawned occupant inside the window,

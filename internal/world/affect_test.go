@@ -134,13 +134,13 @@ func TestAffectStrippedOnRespawnPredicate(t *testing.T) {
 		if def == nil {
 			t.Fatalf("def %q not registered", tc.ref)
 		}
-		if got := affectStrippedOnRespawn(def); got != tc.want {
+		if got := affectStrippedOnRespawn(def, nil); got != tc.want {
 			t.Errorf("affectStrippedOnRespawn(%q) = %v, want stripped=%v", tc.ref, got, tc.want)
 		}
 	}
 	// A nil def can't be proven benign, so it fails toward stripping (though no nil-def instance ever exists).
-	if !affectStrippedOnRespawn(nil) {
-		t.Error("affectStrippedOnRespawn(nil) should be true (fail toward stripping)")
+	if !affectStrippedOnRespawn(nil, nil) {
+		t.Error("affectStrippedOnRespawn(nil, nil) should be true (fail toward stripping)")
 	}
 }
 

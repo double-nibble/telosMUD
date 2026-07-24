@@ -73,6 +73,14 @@ type combatProfile struct {
 	// $actor.damroll`). Built once from content (content_map.go), evaluated by opDealDamage scoped to the
 	// attacker ($actor). nil => raw weapon dice only. This is what lets a sword add STR as CONTENT (no Lua).
 	damageBonus formulaNode
+
+	// broken records that a sub-spec of this profile FAILED TO PARSE at build (content_map.go). It is
+	// NOT the same as "authored nothing": a nil toHit legitimately means "no classifier, the swing
+	// auto-lands", so folding a parse failure into it would convert one typo into "nothing can ever
+	// miss" for every entity using the profile — and a dropped avoidance rung into a silently weaker
+	// defender. A broken profile refuses to resolve swings instead, so a content defect surfaces as a
+	// visibly non-functional profile rather than an invisible balance change.
+	broken bool
 }
 
 // startFight puts `attacker` into combat with `target` and, classically, makes the target RETALIATE
@@ -408,6 +416,22 @@ func (z *Zone) resolveSwing(attacker, target *Entity, swingIndex int, rng *rand.
 	}
 
 	prof := combatProfileFor(attacker)
+	// A profile whose content failed to parse resolves NO swing (see combatProfile.broken). Fail-closed
+	// on harm: an unresolvable to-hit must not fall through to the auto-hit default, which would make a
+	// single authoring typo delete missing, crits and fumbles for every user of the profile at once.
+	if prof != nil && prof.broken {
+		z.log.Error("combat: attacker's combat profile failed to build; swing refused",
+			"attacker", targetShort(attacker), "target", targetShort(target))
+		return
+	}
+	// The DEFENDER's broken profile is equally disqualifying, and for the sharper reason: its avoidance
+	// ladder is the layer that would have been dropped, so resolving the swing anyway silently strips
+	// the defence the content authored.
+	if dprof := defenderProfile(target); dprof != nil && dprof.broken {
+		z.log.Error("combat: defender's combat profile failed to build; swing refused",
+			"attacker", targetShort(attacker), "target", targetShort(target))
+		return
+	}
 
 	// --- To-hit REACTION checkpoint (7.9, P7-D8 / T12): BEFORE the to-hit roll, fire a result-altering
 	// reaction about the DEFENDER (subject = target, other = attacker) so a Lua Shield hook can raise

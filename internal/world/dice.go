@@ -184,11 +184,15 @@ func capDice(n int) int {
 // incorrect nat-face band. A `{face_eq: 1 -> miss}` band tested against ALL faces fires when EITHER
 // die of a 2d20kh1 shows a 1 (9.36% measured), when the roll the check actually used was the OTHER,
 // higher die; the same band tested against the KEPT face fires at 0.25%, which is what "the die you
-// rolled was a 1" means. Emission and logging still want every face (a player wants to see both dice),
-// so both are reported and the caller picks: checkBand.matches reads KEPT, emitCheck reads all.
+// rolled was a 1" means. checkBand.matches therefore reads KEPT.
 //
-// The kept slice aliases nothing the caller can mutate through — sumKept copies before sorting, and
-// the non-keep kinds return the same backing array as `faces`, which no caller writes to.
+// `faces` is reported alongside because the full roll is what a player would want shown under a boon
+// ("you rolled 17 and 4"). Nothing renders it yet — emitCheck prints the magnitude, not the faces — so
+// today it is carried for logging and for that pending emission, not consumed by the classifier.
+//
+// ALIASING: for the non-keep kinds `kept` and `faces` are THE SAME SLICE (nothing was discarded, so
+// copying would be waste). Callers must treat both as read-only. sumKept's `kept` is a sub-slice of a
+// private sorted copy, so it aliases neither the caller's input nor `faces`.
 func rollDiceSpec(c *effectCtx, d diceSpec) (magnitude int, faces, kept []int) {
 	rollFace := func(size int) int {
 		if size <= 0 {
@@ -248,8 +252,9 @@ func rollDiceSpec(c *effectCtx, d diceSpec) (magnitude int, faces, kept []int) {
 }
 
 // sumKept sums the highest (or lowest) `keep` of faces without mutating the caller's slice, and
-// returns the kept faces alongside the sum. The kept slice is a fresh allocation (a sub-slice of the
-// sorted COPY), so the caller can neither mutate nor observe the sort through it.
+// returns the kept faces alongside the sum. The kept slice is a sub-slice of a PRIVATE sorted copy, so
+// it aliases nothing the caller holds — but it is still backed by that copy, so appending to it would
+// write into the discarded remainder. Treat it as read-only.
 func sumKept(faces []int, keep int, high bool) (int, []int) {
 	if keep <= 0 || len(faces) == 0 {
 		return 0, nil

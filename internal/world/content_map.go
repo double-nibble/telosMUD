@@ -178,16 +178,25 @@ func protoLiving(d *content.LivingDTO) *Living {
 
 // buildCombatProfile parses a CombatProfileDTO into the runtime combatProfile (combat.go): the to-hit
 // check spec, the ordered avoidance ladder (each a check spec), and the [G-A] damage bonus formula.
-// Build-time only (defineGlobals). A malformed sub-spec logs loudly and is dropped from the profile
-// (content-lint is the real gate) rather than aborting boot. Returns the profile (never nil — an
-// all-malformed profile is an empty one that auto-hits).
+// Build-time only (defineGlobals). Returns the profile (never nil).
+//
+// A malformed sub-spec logs loudly and marks the profile BROKEN rather than aborting boot. The broken
+// flag exists because "dropped" is not a safe default here: a nil toHit is how the engine spells the
+// legitimate degenerate case "this content authored no to-hit classifier, so a swing auto-lands", and
+// collapsing a FAILED PARSE into that same state means one typo in a to-hit silently turns off missing
+// — every swing lands, no crits, no nat-1 — for every entity using the profile. The avoidance ladder
+// fails the same way in the other direction: a dropped rung silently deletes a defensive layer. Both
+// are content defects presenting as balance changes with no runtime signal, which is exactly the shape
+// that goes unnoticed. combatProfileFor's callers treat a broken profile as "cannot resolve a swing"
+// (combat.go), so the failure is loud and local instead of quiet and global.
 func buildCombatProfile(d content.CombatProfileDTO) *combatProfile {
 	p := &combatProfile{}
 	if d.ToHit != nil {
 		spec, err := parseCheckSpec(d.ToHit)
 		if err != nil {
-			slog.Error("content: combat profile to_hit parse failed; profile auto-hits",
+			slog.Error("content: combat profile to_hit parse failed; profile marked BROKEN (its swings will not resolve)",
 				"profile", d.Ref, "err", err)
+			p.broken = true
 		} else {
 			p.toHit = spec
 		}
@@ -195,8 +204,9 @@ func buildCombatProfile(d content.CombatProfileDTO) *combatProfile {
 	for i, av := range d.Avoidance {
 		spec, err := parseCheckSpec(av)
 		if err != nil {
-			slog.Error("content: combat profile avoidance check parse failed; dropped",
+			slog.Error("content: combat profile avoidance check parse failed; profile marked BROKEN (its swings will not resolve)",
 				"profile", d.Ref, "index", i, "err", err)
+			p.broken = true
 			continue
 		}
 		p.avoidance = append(p.avoidance, spec)

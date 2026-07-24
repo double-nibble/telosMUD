@@ -1,6 +1,7 @@
 package world
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -123,6 +124,13 @@ type defRegistries struct {
 	recipe  *defRegistry[*recipeDef]     // Phase 13.5 crafting recipes
 	help    *defRegistry[*helpDef]       // #64 builder-defined help topics
 
+	// invertedAttrs is the DERIVED set of attributes whose polarity is reversed — higher is worse for
+	// the bearer — computed once at the end of defineGlobals from the boon/bane channel's own formulas
+	// (attributeInvertedPolarity). The harm derivations read it so a debuff authored as a POSITIVE
+	// modifier on a bane counter is still gated + purged. nil for content that uses no boon/bane, which
+	// is the pre-#511 behaviour exactly. Set once at build, then read-only (like defaultCombat).
+	invertedAttrs map[string]bool
+
 	// trust is the pack's content-defined trust ladder (#27/#29, Round 9 Slice 0): tier→rank + granted
 	// reserved flags, built from lc.TrustTiers. nil => the engine default ladder (player/builder/admin,
 	// the round-8 mapping); the z.trustLadder() accessor substitutes the default so reads never nil-deref.
@@ -212,6 +220,16 @@ func (z *Zone) affectDefs() *defRegistry[*affectDef] {
 
 func (z *Zone) abilityDefs() *defRegistry[*abilityDef] {
 	return z.defBundle().ability
+}
+
+// invertedAttrs returns the derived reversed-polarity attribute set (#511) the harm derivations
+// consult. nil-safe: a zone with no def bundle (a bare test zone) has no channel and so no inverted
+// attributes, and a nil map reads as "none" at every lookup.
+func (z *Zone) invertedAttrs() map[string]bool {
+	if z == nil {
+		return nil
+	}
+	return z.defBundle().invertedAttrs
 }
 
 // combatProfiles is the zone-goroutine read accessor for the global combat-profile registry (combat.go,
@@ -511,11 +529,23 @@ var detrimentalCategories = map[string]bool{
 //
 // A genuinely-beneficial affect (only stat-raising modifiers, no prevents, a non-affliction category)
 // returns false and stays UNGATED — a buff on an ally still lands. Pure read of the immutable def.
-func affectIsDetrimental(def *affectDef) bool {
+// `inverted` is the set of attributes whose polarity is REVERSED — higher is worse for the bearer —
+// derived from the boon/bane channel's own formulas (attributeInvertedPolarity). For those the sign
+// test flips: a POSITIVE additive is the harm. A nil/empty set restores the pre-#511 behaviour exactly.
+func affectIsDetrimental(def *affectDef, inverted map[string]bool) bool {
 	if def == nil {
 		return false
 	}
 	for _, m := range def.modifiers {
+		if inverted[m.attr] {
+			// On an inverted attribute the harmful direction is UP (+3 atk_bane is a debuff), so any
+			// modifier that raises it is harm. A modifier that LOWERS one is a genuine buff and is left
+			// ungated, so blessing an ally still lands.
+			if (m.add && m.value > 0) || (!m.add && m.value > 1) {
+				return true
+			}
+			continue // an inverted attribute must not also be judged by the higher-is-better test below
+		}
 		if m.add && m.value < 0 {
 			return true // a flat stat reduction
 		}
@@ -541,8 +571,136 @@ func affectIsDetrimental(def *affectDef) bool {
 // while a false negative is the exact bug #318 exists to close (a hostile effect following you to the temple).
 // This is intentionally BROADER than affectIsDetrimental (the PvP apply-gate's def-only harm test, which is
 // itself a strict subset of the runtime gate's harm notion) — left unchanged so PvP semantics don't move.
-func affectStrippedOnRespawn(def *affectDef) bool {
-	return !affectSurvivesRespawn(def)
+func affectStrippedOnRespawn(def *affectDef, inverted map[string]bool) bool {
+	return !affectSurvivesRespawn(def, inverted)
+}
+
+// attributeInvertedPolarity DERIVES the set of attributes whose polarity is reversed — higher is WORSE
+// for the entity carrying them — by reading the boon/bane channel's own formulas across all registered
+// content. It exists because the harm derivations above infer detriment from the SIGN of a modifier,
+// which silently assumes every attribute is higher-is-better. A bane counter is precisely the attribute
+// that breaks that assumption: `{attr: atk_bane, op: add, value: 3}` is a real debuff (it forces the
+// bearer onto the worse die on every roll) that the sign test alone reads as a buff, so it would skip
+// applyDebuff -> guardHarmful entirely and land on a non-consenting player in a no-PvP room — and would
+// then survive the respawn purge as "provably benign" besides.
+//
+// WHY DERIVED RATHER THAN DECLARED. An `attribute_def` flag (`polarity: inverted`) would be simpler to
+// read, and it would be exactly as strong as content's discipline in remembering it — a forgotten flag
+// re-opens the hole silently, which is the failure mode this project keeps re-learning. Referencing an
+// attribute in a bane formula IS the act of making it inverted, so deriving the set from that reference
+// cannot be forgotten: the declaration and the usage are the same token.
+//
+// THE RULE, by the ROLE a ref plays rather than by which entity it names:
+//
+//   - a BANE term scoped to the roller (a bare ref, or $actor) — the bearer's own counter making the
+//     bearer's roll worse. Inverted.
+//   - a BOON term scoped to someone OTHER than the roller ($target, $source) — the classic
+//     "attacks against a prone creature have advantage": a counter on the victim that helps everyone
+//     rolling against them. Inverted for its bearer.
+//
+// A bare ref means "the roller" in both a top-level spec (the actor) and a contested sub-spec (the
+// defender), so the role-based rule holds in both without needing to know which entity that is.
+//
+// LIMITS, stated rather than implied. The mirror cases — a bane scoped to $target, a boon scoped to the
+// roller — are the ordinary higher-is-better shapes and are deliberately NOT inverted. An attribute
+// used in BOTH roles across different specs lands in the set, which errs toward gating; that matches
+// the documented posture of the harm derivations ("errs toward gating"). And this covers the CHANNEL
+// only: an attribute a pack invents with reversed polarity and never routes through boon/bane (a raw
+// `corruption` stat) is still invisible to the sign test, exactly as it was before #511. That is a
+// pre-existing property of affectIsDetrimental and is not narrowed or widened here.
+//
+// Build-time only, over the immutable registries; the result is stored once on defRegistries and read
+// lock-free thereafter.
+func attributeInvertedPolarity(d *defRegistries) map[string]bool {
+	out := map[string]bool{}
+	seen := map[*checkSpec]bool{}
+
+	var addSpec func(s *checkSpec)
+	var walkOps func(ops []effectOp)
+
+	addSpec = func(s *checkSpec) {
+		if s == nil || seen[s] {
+			return // the seen-set also terminates any cycle a shared sub-spec could form
+		}
+		seen[s] = true
+		collect := func(n formulaNode, rollerScopeInverts bool) {
+			if n == nil {
+				return
+			}
+			refs := map[string]bool{}
+			n.refs(refs)
+			for ref := range refs {
+				scope, bare := attrRefScope(ref)
+				if bare == "" {
+					continue
+				}
+				if (scope == refScopeRoller) == rollerScopeInverts {
+					out[bare] = true
+				}
+			}
+		}
+		collect(s.bane, true)  // a bane on the ROLLER is inverted
+		collect(s.boon, false) // a boon on someone OTHER than the roller is inverted
+		addSpec(s.vs.contested)
+		for i := range s.bands {
+			walkOps(s.bands[i].ops)
+		}
+	}
+	walkOps = func(ops []effectOp) {
+		for i := range ops {
+			op := &ops[i]
+			addSpec(op.check)
+			walkOps(op.then)
+			walkOps(op.els)
+		}
+	}
+
+	// Every op-list the content registries carry (abilities, bundles, tracks, affect ticks/on_event,
+	// resource on_depleted/on_event) — walkContentOps already descends band op-lists for us.
+	walkContentOps(d, func(_ string, op *effectOp) { addSpec(op.check) })
+	// Combat profiles are NOT op-lists, so walkContentOps never reaches them — and they are where the
+	// to-hit and avoidance checks actually live, which is the channel's primary home.
+	for _, p := range d.combat.table() {
+		if p == nil {
+			continue
+		}
+		addSpec(p.toHit)
+		for _, av := range p.avoidance {
+			addSpec(av)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// refScope classifies an attr ref by the ROLE it addresses, which is what the polarity rule keys on.
+type refScope int
+
+const (
+	refScopeRoller refScope = iota // a bare ref, or an explicit $actor — the entity making this roll
+	refScopeOther                  // $target / $source — a counterpart to the roll
+)
+
+// attrRefScope splits a (possibly scoped) attr ref into its role and its bare attribute name.
+// "$target.grants_boon" -> (refScopeOther, "grants_boon"); "atk_bane" -> (refScopeRoller, "atk_bane").
+// A scope with no attribute after it yields an empty name, which the caller skips.
+func attrRefScope(ref string) (refScope, string) {
+	if !strings.HasPrefix(ref, "$") {
+		return refScopeRoller, ref
+	}
+	rest := ref[1:]
+	scope, name := rest, ""
+	if dot := strings.IndexByte(rest, '.'); dot >= 0 {
+		scope, name = rest[:dot], rest[dot+1:]
+	}
+	switch scope {
+	case "target", "source":
+		return refScopeOther, name
+	default: // "actor", and any unknown scope, which resolveCheckScope resolves to the default entity
+		return refScopeRoller, name
+	}
 }
 
 // affectSurvivesRespawn reports whether an affect is PROVABLY benign to its bearer and so may be KEPT across a
@@ -559,11 +717,19 @@ func affectStrippedOnRespawn(def *affectDef) bool {
 //     safe false positive (author a genuine HoT with heal/restore, which the engine treats as benign).
 //
 // A nil def can't be proven benign, so it does not survive (fail toward stripping). Pure read of the immutable def.
-func affectSurvivesRespawn(def *affectDef) bool {
+func affectSurvivesRespawn(def *affectDef, inverted map[string]bool) bool {
 	if def == nil {
 		return false
 	}
 	for _, m := range def.modifiers {
+		if inverted[m.attr] {
+			// Polarity reversed (#511): raising an inverted attribute is the harm, so a modifier that
+			// raises one is not provably benign and the affect must not survive the respawn purge.
+			if (m.add && m.value > 0) || (!m.add && m.value > 1) {
+				return false
+			}
+			continue
+		}
 		if m.add && m.value < 0 {
 			return false // a flat stat reduction
 		}

@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -60,7 +61,7 @@ type checkBand struct {
 	max       formulaNode // total <= max     (nil: no upper bound)
 	marginMin formulaNode // margin >= marginMin   (nil: not margin-floor-tested)
 	marginMax formulaNode // margin <= marginMax   (nil: not margin-ceiling-tested)
-	faceEq    *float64    // optional: count natural faces equal to this value (ALL rolled faces, see note)
+	faceEq    *float64    // optional: count natural KEPT faces equal to this value (see matches)
 	faceCount int         // ... require at least this many such faces (defaults to 1 when faceEq set)
 	label     string
 	ops       []effectOp
@@ -126,9 +127,14 @@ type checkVs struct {
 // # The boon/bane channel (#511) — how a TRANSIENT condition changes a pending roll
 //
 // `dice` is the neutral roll. `boon`/`bane` are scoped formulas (the same $actor/$target/$source
-// vocabulary as `bonus` and the band edges) whose NET SIGN selects which of three content-authored
-// dice expressions is actually rolled: net > 0 picks boonDice, net < 0 picks baneDice, net == 0 (or an
-// unauthored alternative) rolls `dice` unchanged. That is the whole engine rule.
+// vocabulary as `bonus` and the band edges) counting how many boon and bane influences bear on this
+// roll. PRESENCE on each side — not the difference between them — selects which of three
+// content-authored dice expressions is actually rolled:
+//
+//	boon > 0 AND bane > 0  -> the neutral `dice` (they cancel)
+//	boon > 0 alone         -> boonDice
+//	bane > 0 alone         -> baneDice
+//	neither, or the selected alternative is unauthored -> the neutral `dice`
 //
 // The engine deliberately does NOT synthesize the alternative die, and this is the crux of the design
 // rather than an implementation shortcut. "Roll it twice and keep the better one" presumes the engine
@@ -139,9 +145,20 @@ type checkVs struct {
 // systems whose better-roll is not a keep at all (a Blades pool's boon is an EXTRA POOL DIE: 2d6>=4 ->
 // 3d6>=4). So content names all three expressions and the engine only ever SELECTS among them.
 //
-// Netting by sign — not by magnitude — is what makes 5e's cancellation rule ("any advantage plus any
-// disadvantage is a straight roll, regardless of how many of each") fall out for free, while a system
-// that wants degrees can read the same counters through `bonus` instead.
+// ANY-VERSUS-ANY CANCELLATION, deliberately, and NOT a net difference. This is 5e's actual rule: one
+// source of advantage against one of disadvantage gives a straight roll, and so do FIVE sources against
+// one. A net-difference rule (evaluate boon - bane, select on the sign) reads as equivalent and is not
+// — it resolves 5-vs-1 as advantage. Counting influences rather than summing them is also what keeps
+// the channel honest as a union abstraction: a system that wants magnitude to matter already has
+// `bonus`, which is the additive channel and composes normally.
+//
+// POLARITY AND THE HARM GATE — read this before authoring a bane. The PvP apply-gate derives whether an
+// affect is harmful from the SIGN of its modifiers (affectIsDetrimental, defs.go): a negative additive
+// is harm, a positive additive is a buff. That inference assumes higher-is-better, which is exactly
+// what a bane counter inverts — so an affect that adds +3 to a bane attribute is a real debuff the
+// sign heuristic alone would read as benign. attributeInvertedPolarity (defs.go) closes this by
+// DERIVING the inverted set from the channel's own formulas rather than asking content to declare it,
+// so an author cannot forget; see that function for the derivation rule and its limits.
 //
 // Because boon/bane are ordinary attribute formulas they compose through EVERY modifier source the
 // entity already has — affects, gear affixes, racial base values, derived attributes — with no new
@@ -156,37 +173,68 @@ type checkSpec struct {
 	visibility checkVisibility
 	label      string // optional, for emission/logging ("Climb", "Dexterity save")
 
-	// boon/bane are the scoped formulas whose net sign selects the die (see the type comment). nil => 0
-	// on that side. boonDice/baneDice are the content-authored alternatives; nil => that direction has no
-	// alternative expression and the neutral `dice` is rolled even when the net favours it.
+	// boon/bane count the influences on each side (see the type comment: presence cancels, it does not
+	// sum). nil => 0 on that side. boonDice/baneDice are the content-authored alternatives; nil => that
+	// direction has no alternative expression and the neutral `dice` is rolled even when it is selected.
 	boon     formulaNode
 	bane     formulaNode
 	boonDice *diceSpec
 	baneDice *diceSpec
 }
 
-// effectiveDice applies the boon/bane channel: it nets the two scoped formulas and returns the dice
-// expression to actually roll. `def` is the default scope for a BARE attr ref, matching whatever the
-// caller uses for `bonus` on the same spec (the actor for a top-level check, the defender for a
-// contested sub-spec) so the two never disagree about what an unprefixed name means.
+// effectiveDice applies the boon/bane channel and returns the dice expression to actually roll. `def`
+// is the default scope for a BARE attr ref, matching whatever the caller uses for `bonus` on the same
+// spec (the actor for a top-level check, the defender for a contested sub-spec) so the two never
+// disagree about what an unprefixed name means.
 //
 // FAST PATH / IDENTITY: a spec with no boon and no bane formula returns spec.dice untouched without
 // evaluating anything. Every check authored before #511 takes this path, so the channel cannot perturb
 // existing content — and the selection is idempotent by construction, since it only ever hands back one
 // of three expressions content wrote itself and never derives a fourth from them.
+//
+// A BROKEN CHANNEL IS NO CHANNEL. If EITHER side fails to evaluate — a malformed formula, a division
+// by zero, an attribute driven to ±Inf/NaN by a modifier fold — the whole channel degrades to the
+// neutral die rather than to "that side counted zero". The distinction matters: a lone errored boon
+// collapsing to 0 would leave a live bane unopposed, so an authoring bug in the BOON half would
+// silently hand the roller the WORSE die, and a poisoned attribute would become a way to pin an
+// opponent's roll deterministically. Failing the whole channel neutral is the only direction where a
+// broken input cannot be turned into an advantage by whoever broke it.
 func effectiveDice(c *effectCtx, spec *checkSpec, def *Entity) diceSpec {
 	if spec.boon == nil && spec.bane == nil {
 		return spec.dice
 	}
-	net := evalCheckFormula(c, spec.boon, def) - evalCheckFormula(c, spec.bane, def)
+	boonV, boonOK := evalCheckCount(c, spec.boon, def)
+	baneV, baneOK := evalCheckCount(c, spec.bane, def)
+	if !boonOK || !baneOK {
+		return spec.dice
+	}
+	hasBoon, hasBane := boonV > 0, baneV > 0
 	switch {
-	case net > 0 && spec.boonDice != nil:
+	case hasBoon && hasBane:
+		return spec.dice // any-versus-any: they cancel to the straight roll
+	case hasBoon && spec.boonDice != nil:
 		return *spec.boonDice
-	case net < 0 && spec.baneDice != nil:
+	case hasBane && spec.baneDice != nil:
 		return *spec.baneDice
 	default:
 		return spec.dice
 	}
+}
+
+// evalCheckCount evaluates one side of the channel and reports whether the value is USABLE. It differs
+// from evalCheckFormula in refusing to launder a failure into a number: a nil node is a legitimate 0
+// (that side simply is not authored), but an evaluation error or a non-finite result yields ok=false so
+// the caller can fail the whole channel neutral. NaN is rejected by IsNaN rather than by comparison,
+// since every comparison against NaN is false and would otherwise read as "absent".
+func evalCheckCount(c *effectCtx, node formulaNode, def *Entity) (float64, bool) {
+	if node == nil {
+		return 0, true
+	}
+	v, err := evalCheckFormulaErr(c, node, def)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	return v, true
 }
 
 // checkResult is the outcome of resolving a check (returned to opCheck + emission).
@@ -265,8 +313,21 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 // affect modifiers flow in); attr() owns its own cache + cycle guard, so this resolver needs neither.
 // A nil node is +0. A malformed formula logs + yields 0 (content-lint is the real gate).
 func evalCheckFormula(c *effectCtx, node formulaNode, def *Entity) float64 {
-	if node == nil {
+	v, err := evalCheckFormulaErr(c, node, def)
+	if err != nil {
 		return 0
+	}
+	return v
+}
+
+// evalCheckFormulaErr is evalCheckFormula with the error SURFACED instead of collapsed to 0. Most
+// callers (bonus, vs, band edges) genuinely want the lenient 0 — a broken edge should not abort a
+// resolution mid-flight, and content-lint is the real gate there. The boon/bane channel does not: for
+// it, "this failed" and "this counted zero" have opposite consequences (see effectiveDice), so it needs
+// to tell them apart. Same resolver, same scoping, one behaviour difference.
+func evalCheckFormulaErr(c *effectCtx, node formulaNode, def *Entity) (float64, error) {
+	if node == nil {
+		return 0, nil
 	}
 	r := &formulaResolver{
 		visited: map[string]bool{},
@@ -290,9 +351,9 @@ func evalCheckFormula(c *effectCtx, node formulaNode, def *Entity) float64 {
 		if c.z != nil {
 			c.z.log.Debug("check formula error", "err", err)
 		}
-		return 0
+		return 0, err
 	}
-	return v
+	return v, nil
 }
 
 // resolveCheckScope maps a (possibly scoped) attr ref to (entity, bareName). "$target.dex_save" ->
