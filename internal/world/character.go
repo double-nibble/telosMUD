@@ -162,6 +162,14 @@ type StateJSON struct {
 	// every channel at its default_on, no ignores, not AFK — the established backward-compat
 	// default, so a returning player keeps the pre-8.6 behavior.
 	Comms *CommsStateJSON `json:"comms,omitempty"`
+	// Aliases is the player's data-only command-alias subtree (#353): the per-character `alias`/`unalias`
+	// expansion map (verb token -> expansion). It is a SESSION-scoped durable subtree (like Comms/Tells —
+	// NOT part of dumpStateComponents), the durable home of the shortcuts the parser expands at dispatch.
+	// dumpAliasState marshals it; loadAliasState rehydrates it. It is DATA ONLY (strings, both bounded-length
+	// player text re-fed to the parser as ordinary input) — no code, no handles — and size-guarded
+	// (aliasMaxCount / the name+body rune caps) like the Comms/Tells subtrees. A pre-#353 save (nil Aliases)
+	// loads with no aliases — the established backward-compat default.
+	Aliases map[string]string `json:"aliases,omitempty"`
 }
 
 // CommsStateJSON is the durable form of a player's receiver-side comms preferences (Phase 8.6,
@@ -214,6 +222,23 @@ func unmarshalCommsState(raw string) (*CommsStateJSON, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// marshalAliasState / unmarshalAliasState keep the alias-map JSON encode/decode in one place (#353) — the
+// marshalCommsState precedent. The handoff-carry form (handoff.go aliases) marshals through here; the durable
+// form (StateJSON.Aliases) is embedded and marshalled by the parent StateJSON json.Marshal. Both are
+// json.Marshal of the same map[string]string, so the two are byte-identical (Go sorts string map keys).
+func marshalAliasState(m map[string]string) (string, error) {
+	b, err := json.Marshal(m)
+	return string(b), err
+}
+
+func unmarshalAliasState(raw string) (map[string]string, error) {
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // TellCursorJSON is the durable per-player delivered-cursor (Phase 8.5, OQ-4): Delivered[authorID] is
@@ -410,8 +435,9 @@ func dumpCharacter(s *session) CharSnapshot {
 	}
 	st := dumpStateComponents(e)
 	st.AppliedSeq = s.appliedSeq
-	st.Tells = dumpTellCursor(s) // Phase 8.5 — the durable-tell delivered-cursor (OQ-4)
-	st.Comms = dumpCommsState(s) // Phase 8.6 — the receiver-side comms-state subtree (P8-D7)
+	st.Tells = dumpTellCursor(s)   // Phase 8.5 — the durable-tell delivered-cursor (OQ-4)
+	st.Comms = dumpCommsState(s)   // Phase 8.6 — the receiver-side comms-state subtree (P8-D7)
+	st.Aliases = dumpAliasState(s) // #353 — the per-character command-alias subtree
 	zoneRef, room := durableLocation(s)
 	return CharSnapshot{
 		PID:     pid,
@@ -858,6 +884,11 @@ func loadCharacter(z *Zone, s *session, snap CharSnapshot) {
 	// (re)publishes the effective hear-set to the gate AFTER load (zone.go join/attach). SESSION-scoped
 	// (not in applyStateComponents); on the handoff path comms rides its own dedicated snapshot field.
 	loadCommsState(s, snap.State.Comms)
+
+	// Rehydrate the per-character command-alias subtree (#353): the `alias`/`unalias` shortcuts. A pre-#353
+	// save (nil Aliases) installs no aliases (the backward-compat default). SESSION-scoped (not in
+	// applyStateComponents); on the handoff path aliases ride their own dedicated snapshot field.
+	loadAliasState(s, snap.State.Aliases)
 
 	z.log.Debug("character loaded", "player", s.character, "pid", snap.PID,
 		"state_version", snap.StateVersion, "applied", s.appliedSeq,

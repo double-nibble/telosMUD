@@ -1832,6 +1832,10 @@ func (z *Zone) prepare(m prepareMsg) {
 	// ignore/AFK survive the cross-shard walk. Empty (all-default / pre-8.6 snapshot) installs nothing.
 	// The effective hear-set is re-published to the gate when this pending session activates (attach).
 	loadCommsStateJSON(s, m.snap.GetCommsState())
+	// Rehydrate the per-character command-alias subtree carried on the snapshot (#353) so a player's
+	// `alias`/`unalias` shortcuts survive the cross-shard walk. Empty (no aliases / pre-#353 snapshot)
+	// installs nothing — identical to a fresh login with no aliases.
+	loadAliasStateJSON(s, m.snap.GetAliases())
 	// Rehydrate the player's REMAINING entity state carried on the snapshot (the full-state-carry fix):
 	// inventory into contents + Wearer slots, attribute base overrides, resource currents clamped to the
 	// DESTINATION-derived max, affects re-attached with their REMAINING durations (no on_apply re-fire),

@@ -195,4 +195,13 @@ message PlayerSnapshot {
   // Empty is a valid and safe value: the destination session then may not mint an instance, which is the same
   // fail-closed posture a dev/unverified login has.
   string account = 17;
+  // aliases is the player's data-only command-alias subtree (#353): the per-character `alias`/`unalias`
+  // expansion map, marshalled as the same JSON the StateJSON.Aliases subtree persists. It is a SESSION-scoped
+  // durable subtree (like comms_state, field 14) — NOT part of the entity state_json (field 15) — so it rides
+  // its OWN field. Carried on the handoff so a cross-shard walk is alias-transparent: a player's shortcuts do
+  // not reset when they change shard. Empty for a player with no aliases (the common case), which the
+  // destination loads as an empty map — identical to a pre-#353 snapshot (the backward-compat default). It is
+  // DATA ONLY (a map of verb->expansion, both bounded-length player text re-fed to the parser as ordinary
+  // input, no code/handles) and is bound by snapshot_sig like every other carried subtree.
+  string aliases = 18;
 }

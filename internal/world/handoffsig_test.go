@@ -70,6 +70,9 @@ func TestVerifySnapshotRejectsTamper(t *testing.T) {
 		// downgrade (to "builder") and a strip (to the empty baseline) must be caught.
 		"tier_change": func(r *handoffv1.PrepareRequest) { r.Snapshot.Tier = "builder" },
 		"tier_strip":  func(r *handoffv1.PrepareRequest) { r.Snapshot.Tier = "" },
+		// #353: injecting a command alias onto an in-flight handoff must break the signature — the alias map
+		// is data-only re-fed to the parser, so binding it keeps a forged/insecure destination from planting one.
+		"aliases": func(r *handoffv1.PrepareRequest) { r.Snapshot.Aliases = `{"bc":"burn corpse"}` },
 	}
 	for name, mutate := range tamper {
 		t.Run(name, func(t *testing.T) {

@@ -88,6 +88,10 @@ func registerCommands() []*Command {
 	// Screen utilities (#31): `clear` — engine-owned raw-ANSI output, universal. Low-priority so `cl` still
 	// abbreviates to `close`.
 	base = append(base, screenCommands()...)
+	// Command aliases (#353): `alias`/`unalias`. Registered last (lowest priority) with the other QoL verbs
+	// so they never shadow or abbreviate a movement/look/say verb; both names are RESERVED (an alias can
+	// never be defined over them). Expansion itself runs earlier, at the dispatch split step (aliases.go).
+	base = append(base, aliasCommands()...)
 	// NOTE: `help` (#64) is NOT registered here. Its handler (cmdHelp) transitively reads baseTable to
 	// auto-include the command set, so registering it inside this function — which baseTable's initializer
 	// calls — would form a package-init cycle. It is appended post-construction via an init() in help.go.

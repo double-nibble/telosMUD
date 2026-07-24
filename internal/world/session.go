@@ -306,6 +306,13 @@ type session struct {
 	// default_on, no ignores, not AFK).
 	comms *commsState
 
+	// aliases is the player's in-memory command-alias map (#353, aliases.go): per-character `alias`/`unalias`
+	// shortcuts expanded at the dispatch split step. Zone-owned (only the zone goroutine reads/writes it), so
+	// it needs no lock — exactly like comms. Loaded from StateJSON.Aliases on login, carried on the handoff
+	// snapshot (its own dedicated field, handoff-transparency), dumped on save. nil until first touched
+	// (loadAliasState / a define lazily create it); a nil aliases has no shortcuts.
+	aliases *aliasState
+
 	// Destination side: a PENDING session has been rehydrated by Prepare and is waiting
 	// for the gate to re-dial. Its entity is not yet in a room's contents and it applies
 	// no input until an Attach carrying the matching token activates it. token is the
