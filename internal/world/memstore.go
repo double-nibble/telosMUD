@@ -49,11 +49,16 @@ type MemStore struct {
 	// store hit concurrently). auditKeys is the dedup set the ON CONFLICT DO NOTHING guard models.
 	audit     []AuditEntry
 	auditKeys map[string]bool
+	// charAccounts mirrors the characters.account_id column the pgx ListAccountTierAudit join reads
+	// (#399): lower-cased character name -> owning account UUID. The MemStore has no characters table, so a
+	// test registers the link with SetCharacterAccount; ListAccountTierAudit resolves name -> account here
+	// exactly as the SQL join resolves it, so the hermetic and gated tier-by-character reads agree.
+	charAccounts map[string]string
 }
 
 // NewMemStore returns an empty in-memory store/checkpointer.
 func NewMemStore() *MemStore {
-	return &MemStore{rows: map[string]CharSnapshot{}, ckpt: map[string]CharSnapshot{}, auditKeys: map[string]bool{}}
+	return &MemStore{rows: map[string]CharSnapshot{}, ckpt: map[string]CharSnapshot{}, auditKeys: map[string]bool{}, charAccounts: map[string]string{}}
 }
 
 // key normalizes a character name the way CITEXT does (case-insensitive), so "Alice" and "alice"
@@ -352,6 +357,53 @@ func (m *MemStore) AppendAudit(_ context.Context, ev AuditEvent) (bool, error) {
 		At:      at,
 	})
 	return true, nil
+}
+
+// AppendAuditBatch records many events under one lock (#399), returning how many were newly recorded (the
+// rest were idempotent no-ops). It mirrors the pgx batch: per-row ON CONFLICT DO NOTHING idempotency, so
+// two colliding events in one batch record once. The mem path takes/releases the lock per row inside the
+// loop via AppendAudit — the atomicity the pgx batch gets from its transaction is a durability concern the
+// mem double need not model; the observable result (which rows recorded, in insertion order) is identical.
+func (m *MemStore) AppendAuditBatch(ctx context.Context, evs []AuditEvent) (int, error) {
+	recorded := 0
+	for _, ev := range evs {
+		ok, err := m.AppendAudit(ctx, ev)
+		if err != nil {
+			return recorded, err
+		}
+		if ok {
+			recorded++
+		}
+	}
+	return recorded, nil
+}
+
+// SetCharacterAccount registers character NAME's owning account UUID for the mem ListAccountTierAudit
+// resolution (#399) — the test-double stand-in for the characters.account_id column the pgx join reads.
+// Names are CITEXT in the store, so the key is lower-cased to match the case-insensitive join.
+func (m *MemStore) SetCharacterAccount(name, accountID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.charAccounts[memKey(name)] = accountID
+}
+
+// ListAccountTierAudit returns the tier_changed trail for the account owning character NAME, newest-first,
+// capped at limit (#399 item 4) — the mem mirror of the pgx name -> characters.account_id -> account tier
+// rows join. An unregistered name (no account link, like a dev/login character) yields no rows. Scoped to
+// tier_changed on the resolved account, exactly like the SQL WHERE.
+func (m *MemStore) ListAccountTierAudit(_ context.Context, name string, limit int) ([]AuditEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if name == "" {
+		return nil, nil
+	}
+	accountID, ok := m.charAccounts[memKey(name)]
+	if !ok || accountID == "" {
+		return nil, nil // no owning account -> no tier history reachable through this character
+	}
+	return m.auditWhereLocked(func(e AuditEntry) bool {
+		return e.SubjectType == AuditSubjectAccount && e.SubjectID == accountID && e.EventKind == AuditKindTierChanged
+	}, limit), nil
 }
 
 // jsonRoundTrip marshals then unmarshals a payload map so its value types match what a JSONB column

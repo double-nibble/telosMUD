@@ -107,6 +107,18 @@ type AuditSink interface {
 	// it never propagates onto the zone goroutine (the auditor drains this off-goroutine).
 	AppendAudit(ctx context.Context, ev AuditEvent) (recorded bool, err error)
 
+	// AppendAuditBatch records many events in ONE round-trip (#399), returning how many were newly
+	// recorded (the rest were idempotent no-ops). The async auditor's drainer coalesces a burst of
+	// events and flushes them here, so a death-storm costs one round-trip, not one per death. Each event
+	// keeps the same per-row ON CONFLICT DO NOTHING idempotency as AppendAudit.
+	AppendAuditBatch(ctx context.Context, evs []AuditEvent) (recorded int, err error)
+
+	// ListAccountTierAudit returns the tier_changed trail for the ACCOUNT that owns character NAME,
+	// newest-first, capped at limit (#399). tier_changed rows are account-subject (subject_name NULL) and
+	// so are reachable by neither by-id nor by-name reads; this resolves character name -> account -> the
+	// account's tier rows so the staff `audit <name>` view can surface an account's tier history.
+	ListAccountTierAudit(ctx context.Context, name string, limit int) ([]AuditEntry, error)
+
 	// ListAuditForSubject returns the trail for one subject UUID, newest-first, capped at limit. Used
 	// by the account/by-id read path.
 	ListAuditForSubject(ctx context.Context, subjectID string, limit int) ([]AuditEntry, error)
