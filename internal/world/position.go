@@ -46,7 +46,19 @@ func setPosition(e *Entity, p Position) {
 // sleeping entities cannot. The round driver gates each attacker's swings on this (combat.go gate-1).
 func canAct(e *Entity) bool {
 	p := position(e)
-	return p != posSleeping && p != posDead
+	if p == posSleeping || p == posDead {
+		return false
+	}
+	// DOWNED = STRUCTURALLY CANNOT ACT (#535, security F3). A death-suspended entity (held alive at 0 in
+	// a depleted vital) is unconscious/dying — it cannot swing (swingGatesPass gates on canAct) or take
+	// a reaction (canReact gates on canAct). This is keyed on the SUSPENSION itself, not on content
+	// remembering to add `prevents: [act]` to its dying affect: without it, a suspends_death affect with
+	// no prevents tags produces a bearer that cannot die (every lethal blow re-holds) yet can still
+	// attack — an unkillable-and-acting PvP exploit. Being downed implies cannot-act structurally.
+	if deathSuspended(e) {
+		return false
+	}
+	return true
 }
 
 // reactPreventTag is the conventional CC tag an incapacitating affect carries to suppress reactions

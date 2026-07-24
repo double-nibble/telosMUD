@@ -127,6 +127,25 @@ func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, dep depletion
 	if victim == nil || victim.living == nil || position(victim) == posDead {
 		return
 	}
+	// ALREADY-DOWNED RE-HOLD (#535, security F2 / combat P1). This checkpoint is LEVEL-triggered: a
+	// further blow onto an already-empty vital re-enters here. If the victim is ALREADY death-suspended,
+	// re-hold at 0 and return WITHOUT running the pool's on_depleted hook again. Re-running it every blow
+	// is a live exploit: the reference hp hook re-applies the `dying` affect, and under stackRefresh that
+	// resets its finite death-save duration every swing (an eternal, unresolvable hold — the fight never
+	// ends), while any rewarding op in the hook (a `produce_item`/`grant_*` consolation prize) is handed
+	// out once PER swing — a farmable dupe the #406 depletion-hook lint cannot see, because it EXEMPTS
+	// vital pools on the (now-false, with a downed state in the pack) premise that a vital hook fires
+	// once-per-death latched by posDead. A downed entity never latches posDead, so the engine — not the
+	// lint, not the content author remembering to guard — must make the vital hook idempotent while
+	// downed. The FIRST depleting blow (not yet suspended) still falls through to run the hook that
+	// applies the dying affect (see the post-hook hold below); only re-entries onto an already-held
+	// victim are short-circuited here. A different vital pool depleting while downed likewise just
+	// re-holds — "already dying, a second break does not separately kill".
+	if deathSuspended(victim) {
+		z.log.Debug("death suspended: re-hold at 0 without re-running the depletion hook (#535)",
+			"victim", targetShort(victim), "pool", pool)
+		return
+	}
 	gen := deathGen(victim)
 	// Run the on_depleted hook of the pool that ACTUALLY depleted (#71/#406) — each pool carries its own
 	// hook, so a sanity break must run sanity's, not hp's. pool is the routed pool from the dealDamage
@@ -165,7 +184,44 @@ func (z *Zone) onPoolDepleted(victim, killer *Entity, pool string, dep depletion
 	if !vitalDepleted(victim, pool) {
 		return
 	}
+	// THE THIRD DISPOSITION (#535): DOWNED/DYING. A content affect carrying suspends_death holds the
+	// victim ALIVE at 0 instead of dying — the "unconscious and dying, not dead" state. This sits between
+	// the vital gate above and die() below, deliberately: it is NOT a second die() call site (die() still
+	// has exactly one, so "a non-vital depletion can never kill" stays structural), and it runs AFTER the
+	// on_depleted hook, so the hook that APPLIES the dying affect (apply_affect self) has already run and
+	// its suspension is visible here. The pool stays at 0, posDead is left unset, no corpse, no respawn:
+	// the victim is down. Content's dying affect (its on_tick death-save loop + finite duration) owns the
+	// resolution — deal true lethal to end it, revive above 0, or let it expire and recover via regen
+	// (which resumes once the suspension lifts; runRegen skips a suspended entity so it can't self-revive
+	// out of downed).
+	//
+	// FIRST-DOWN HOLD: the on_depleted hook above just applied the dying affect (apply_affect self), so
+	// the suspension is now visible — hold at 0. A LATER blow onto this now-suspended victim short-
+	// circuits at the already-downed re-hold guard at the TOP of this function (which skips the hook), so
+	// this post-hook check fires only on the transition INTO downed. "Damage while dying" (a death-save
+	// failure) is a content concern the dying affect's on_tick/on_damage owns, not an engine kill.
+	if deathSuspended(victim) {
+		z.log.Debug("death suspended: victim held at 0 (downed/dying, #535)",
+			"victim", targetShort(victim), "pool", pool)
+		return
+	}
 	z.die(victim, killer, parent)
+}
+
+// deathSuspended reports whether entity e carries any active affect that holds it alive at 0 in a
+// depleted vital pool (#535 — the downed/dying state). O(active affects), zone-goroutine read. A
+// nil/absent Affected component suspends nothing (the engine-default: a depletion kills).
+func deathSuspended(e *Entity) bool {
+	a, ok := Get[*Affected](e)
+	if !ok {
+		return false
+	}
+	for _, inst := range a.list {
+		if inst.def != nil && inst.def.suspendsDeath {
+			return true
+		}
+	}
+	return false
 }
 
 // runDepletionHook runs an on_depleted op-list under the SAME depth/width bound fireEvent applies to an

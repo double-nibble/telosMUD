@@ -480,6 +480,14 @@ type affectDef struct {
 	// whose ref/category/tags intersect this set — before it attaches and before its on_apply fires. The
 	// runtime unions these into Affected.immunity. A grants_immunity affect is BENEFICIAL (protective).
 	grantsImmunity []string
+	// suspendsDeath (#535) holds the bearer ALIVE at 0 in a depleted vital pool instead of dying. While
+	// any active affect with this flag is on an entity, onPoolDepleted does NOT die() a vital-depleted
+	// victim — it leaves the pool at 0, unlatched, alive (the "downed/dying" state). Content authors a
+	// `dying` affect with `suspends_death: true`, a finite duration, prevents tags (act/move/cast) to
+	// lock the downed bearer, and an on_tick that runs the death-save loop; the vital pool's on_depleted
+	// hook applies it. The engine provides only the hold-at-0 + no-auto-regen-revive; content owns the
+	// resolution (deal lethal to end it, revive above 0, or let it expire and recover). See deathSuspended.
+	suspendsDeath bool
 	// damageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on INCOMING damage the bearer takes: a
 	// content-declared `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` makes the bearer resistant
 	// (½), vulnerable (×2), or immune (×0) to that type while the affect is active. It is the per-TARGET
@@ -580,6 +588,19 @@ func affectIsDetrimental(def *affectDef, h harmPolarity) bool {
 	}
 	if len(def.prevents) > 0 {
 		return true // any CC tag is harm by construction
+	}
+	if def.suspendsDeath {
+		// SUSPENDS_DEATH (#535) is harm-relevant and the sign heuristic is blind to it (this is the same
+		// harm-gate-blindness class as the bane counters, condition flags, vulnerabilities, and immunity
+		// grants above — the sixth of the round). It is genuinely detrimental to a victim two ways: while
+		// active it SUPPRESSES the depleted vital's passive regen (a no-modifier "undying" affect is a
+		// pure heal-denial debuff), and it TRAPS a victim held at 0 — unable to die→respawn to escape,
+		// unable to regen out — for the affect's whole duration. The polarity is ambiguous (a guardian-
+		// angel no-death buff on an ALLY is benign), so — exactly as modify_resource gates ANY cross-
+		// player write regardless of sign, since the engine cannot know a content pool's polarity — err
+		// toward gating: a cross-player apply routes through guardHarmful. Self-apply stays ungated, so a
+		// legitimate "second wind" self-buff still lands.
+		return true
 	}
 	if hasVulnerability(def) {
 		return true // a per-target VULNERABILITY (#537): taking >1× damage of a type is a debuff

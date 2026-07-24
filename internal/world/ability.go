@@ -330,6 +330,14 @@ func (z *Zone) checkRequires(s *session, def *abilityDef) bool {
 		s.send(textFrame("That isn't ready yet."))
 		return false
 	}
+	// DOWNED backstop (#535, security F3): a death-suspended actor (held at 0, unconscious/dying) cannot
+	// cast — structurally, not by content remembering `prevents: [cast]`. Mirrors the canAct gate the
+	// swing and reaction paths use, so no verb lets a downed entity act.
+	if deathSuspended(actor) {
+		z.log.Debug("ability lifecycle: blocked at step 3 (downed/dying, #535)", "ability", def.ref, "actor", actor.short)
+		s.send(textFrame("You can't do that right now."))
+		return false
+	}
 	// Tag-CC (§6): the ability's own tags PLUS its requires.not_prevented tags must not be prevented.
 	checkTags := def.tags
 	if len(def.notPrevented) > 0 {

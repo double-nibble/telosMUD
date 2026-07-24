@@ -883,6 +883,30 @@ type AffectBodyDTO struct {
 	// immune to while active: `grants_immunity: [charm, fear]`. applyAffect vetoes a matching incoming
 	// affect before it attaches (before its on_apply fires). A grants_immunity affect is beneficial.
 	GrantsImmunity []string `json:"grants_immunity" yaml:"grants_immunity"`
+	// SuspendsDeath (#535): while this affect is active, its bearer is held ALIVE at 0 in a depleted
+	// vital pool instead of dying (the downed/dying state). A content `dying` affect sets this + a finite
+	// duration + prevents tags + an on_tick death-save loop; the hp pool's on_depleted hook applies it.
+	//
+	// CONTENT CONTRACT — the vital on_depleted hook that applies a suspends_death affect MUST gate its
+	// own re-apply so the victim can eventually be FINISHED. The engine holds a downed victim at 0 and
+	// (to prevent an eternal hold / a farmed reward) will NOT re-run the on_depleted hook while the
+	// suspension is active — but once content's death-save loop RESOLVES to death it must remove the
+	// suspension AND stop the hook from re-applying it, or the next depleting blow simply re-downs the
+	// victim. Model the death-save budget as a resource (e.g. `death_saves`, max 3) and gate the hook:
+	//   on_depleted: [ if death_saves >= 1 then [apply_affect dying] ]      # else: no re-down
+	// the dying affect's on_tick decrements death_saves on a failed save and, at 0, removes itself and
+	// deals lethal — so the finishing depletion falls through the (now no-op) hook to die(). A hook that
+	// applies dying UNCONDITIONALLY makes the bearer unkillable (every lethal blow re-downs it).
+	// suspends_death is also treated as DETRIMENTAL by the harm gate: a cross-player apply routes through
+	// guardHarmful (a self-buff / "second wind" self-apply stays ungated).
+	//
+	// PERSISTENCE (by design): the downed state (a suspends_death affect + a vital at 0) is durable and
+	// reloads intact — a player who logs out downed returns downed, and the dying affect's death-save
+	// on_tick resumes on reconnect (the finite clock effectively pauses while detached). A downed actor
+	// cannot act on reconnect any more than in-world: canAct, the cast gate, and the custom-command entry
+	// all refuse a death-suspended actor. A pack that prefers a clean slate can instead resolve a
+	// persisted-downed entity to death on login from its own reattach hook.
+	SuspendsDeath bool `json:"suspends_death" yaml:"suspends_death"`
 	// DamageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on incoming damage the bearer takes while
 	// the affect is active: `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` = resist fire, be
 	// vulnerable to cold, immune to poison. The per-target analogue of a damage type's global resist
