@@ -101,6 +101,10 @@ func (rt *luaRuntime) installHandleType() {
 		// content flags (Room.namedFlags — e.g. `forge`, `overworld`, `landmark_lake`), which are DISTINCT
 		// from has_flag's entity (Living) flags. Pure read, display-safe.
 		"has_room_flag": rt.hHasRoomFlag,
+		// nearby-creature presence (#363): the NARROW, security-reviewed disclosure primitive the overworld
+		// minimap uses to mark a roaming mob in an adjacent cell. Presence-only (a bool), gated on the
+		// `open_sight` opt-in flag on BOTH the target and anchor rooms + canSee + mobs-only. See hHasVisibleCreature.
+		"has_visible_creature": rt.hHasVisibleCreature,
 		// content player toggles (#358): read the subject player's toggle state (default-aware). Pure read,
 		// safe inside a display template — e.g. the overworld `room` template gates on self:toggle("overworld").
 		"toggle": rt.hToggle,
@@ -668,6 +672,77 @@ func (rt *luaRuntime) hOccupants(l *lua.LState) int {
 		visible = append(visible, occ)
 	}
 	return rt.pushHandleList(l, visible)
+}
+
+// roomFlagOpenSight is the opt-in room flag that sanctions the #363 nearby-creature disclosure. The engine
+// reads this specific flag name (like pvp.go reads "safe"/"arena"): a room carrying it DECLARES that its
+// occupants' PRESENCE may be perceived from an adjacent open_sight room in a display render. It is builder-
+// declared and confined to outdoor/overworld terrain, never arbitrary rooms — that declaration IS the security
+// boundary of the primitive.
+const roomFlagOpenSight = "open_sight"
+
+// roomCarriesFlag reports whether room entity e has the named content flag (Room.namedFlags). nil-safe;
+// mirrors hHasRoomFlag's read. A non-room / flagless entity yields false.
+func roomCarriesFlag(e *Entity, name string) bool {
+	return e != nil && e.room != nil && e.room.namedFlags != nil && e.room.namedFlags[name]
+}
+
+// hHasVisibleCreature is the #363 NARROW, presence-only disclosure primitive for the overworld minimap. In a
+// DISPLAY render it reports whether room handle `e` holds at least one canSee-visible NON-PLAYER creature —
+// but ONLY when the disclosure is builder-sanctioned and bounded, so it re-opens NONE of the general
+// foreign-room scry the #253 guard (displayReachesForeignRoom) prevents:
+//
+//   - it is a DISPLAY render (rt.inv.display) — a mechanics script already has occupants()/mud.scan, so this
+//     adds no capability there; it exists only to let a display disclose PRESENCE where the #253 guard would
+//     otherwise (correctly) return nothing;
+//   - BOTH `e` AND the viewer's ANCHOR room carry the `open_sight` opt-in room flag, so the disclosure is
+//     content-declared and confined to flagged (outdoor/overworld) terrain — a dungeon room's template can
+//     never use it to scry an adjacent field, and a field can never disclose into an unflagged room;
+//   - the creature is canSee-visible to the viewer (wizinvis / concealment stay hidden) and is not the viewer;
+//   - it is a MOB, never a player — so this can never become a PvP position-tracker (identity aside, even the
+//     bare presence of another PLAYER is withheld).
+//
+// It discloses PRESENCE ONLY — a bool, never a name, count, identity, or handle — so the marker is a coarse
+// "something roams there". It anchors to the FROZEN displayRoom (like displayReachesForeignRoom), so a template
+// cannot teleport the viewer mid-render to shift the anchor and widen the disclosure (the #253 TOCTOU). It
+// FAILS CLOSED on every missing precondition (not a display, no viewer, either room unflagged, non-room handle).
+// NOTE on darkness: canSee's darkness check is co-location-gated and does not apply to a foreign room, so a mob
+// in an unlit adjacent cell still marks — acceptable here because the builder has DECLARED this terrain
+// open-sighted (an outdoor, lit expanse) by flagging it; wizinvis/magical concealment (not co-location-gated)
+// still hide.
+func (rt *luaRuntime) hHasVisibleCreature(l *lua.LState) int {
+	e := resolveHandle(l, 1)
+	if e == nil || e.zone == nil || rt.inv == nil || !rt.inv.display || !Has[*Room](e) {
+		l.Push(lua.LFalse)
+		return 1
+	}
+	viewer := rt.inv.actor
+	if viewer == nil {
+		l.Push(lua.LFalse) // fail closed: no perspective to disclose to
+		return 1
+	}
+	// Both the target room and the viewer's FROZEN anchor room must carry the open_sight opt-in. The anchor is
+	// the render-start room, not the live actor.location (the #253 anti-TOCTOU); a direct-invocation test may
+	// leave displayRoom nil, so fall back to the live location there (tests do not relocate mid-render).
+	anchor := rt.inv.displayRoom
+	if anchor == nil {
+		anchor = viewer.location
+	}
+	if anchor == nil || !roomCarriesFlag(anchor, roomFlagOpenSight) || !roomCarriesFlag(e, roomFlagOpenSight) {
+		l.Push(lua.LFalse)
+		return 1
+	}
+	for _, occ := range e.contents {
+		if occ == viewer || occ == nil || !isCreature(occ) || isPlayer(occ) {
+			continue // mark a MOB's presence only — never the viewer, never another player
+		}
+		if e.zone.canSee(viewer, occ) {
+			l.Push(lua.LTrue) // presence disclosed: a visible mob roams here
+			return 1
+		}
+	}
+	l.Push(lua.LFalse)
+	return 1
 }
 
 // hRoomItems returns the entity's non-creature contents COALESCED — the ground-item listing `look` renders,
