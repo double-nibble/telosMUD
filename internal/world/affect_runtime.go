@@ -169,7 +169,7 @@ func stripHostileAffects(e *Entity) {
 	kept := make([]*affectInstance, 0, len(a.list))
 	removed := false
 	for _, inst := range a.list {
-		if affectStrippedOnRespawn(inst.def, e.zone.invertedAttrs()) {
+		if affectStrippedOnRespawn(inst.def, e.zone.harmPolarity()) {
 			delete(a.byKey, keyFor(inst.def, inst.source))
 			removed = true
 			continue

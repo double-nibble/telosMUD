@@ -573,7 +573,7 @@ func TestBoonDiceRejectsNonStringValues(t *testing.T) {
 // every roll — would read as a buff, skip applyDebuff/guardHarmful entirely, and land on a
 // non-consenting player in a no-PvP room. attributeInvertedPolarity is what closes it.
 func TestInvertedPolarityGatesABaneDebuff(t *testing.T) {
-	inverted := map[string]bool{"atk_bane": true, "grants_boon_to_attackers": true}
+	inverted := harmPolarity{inverted: map[string]bool{"atk_bane": true, "grants_boon_to_attackers": true}}
 
 	hex := &affectDef{ref: "hex", modifiers: []affectModifier{{attr: "atk_bane", add: true, value: 3}}}
 	marked := &affectDef{ref: "marked", modifiers: []affectModifier{{attr: "grants_boon_to_attackers", add: true, value: 1}}}
@@ -581,8 +581,8 @@ func TestInvertedPolarityGatesABaneDebuff(t *testing.T) {
 	cleanse := &affectDef{ref: "cleanse", modifiers: []affectModifier{{attr: "atk_bane", add: true, value: -2}}}
 
 	t.Run("without the inverted set the debuffs read as benign", func(t *testing.T) {
-		require.False(t, affectIsDetrimental(hex, nil), "this is the hole the derivation closes")
-		require.True(t, affectSurvivesRespawn(hex, nil), "...and it would survive the respawn purge too")
+		require.False(t, affectIsDetrimental(hex, harmPolarity{}), "this is the hole the derivation closes")
+		require.True(t, affectSurvivesRespawn(hex, harmPolarity{}), "...and it would survive the respawn purge too")
 	})
 
 	t.Run("with it they are gated and purged", func(t *testing.T) {
