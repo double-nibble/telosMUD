@@ -256,13 +256,18 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("gate: load TLS cert/key: %w", err)
 		}
-		ln, err := tls.Listen("tcp", s.tlsListen, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+		cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+		// Bind a PLAIN listener and sniff each connection for a TLS ClientHello (#486) rather than tls.Listen:
+		// a plaintext client (wrong port / TLS not enabled in the MUD client) then gets a "use TLS" line
+		// instead of a silent handshake-failure hang. A real TLS client is wrapped back into tls.Server with
+		// zero added latency; see tlssniff.go.
+		ln, err := net.Listen("tcp", s.tlsListen)
 		if err != nil {
 			return err
 		}
 		slog.Info("gate listening (TLS)", "addr", s.tlsListen)
 		wg.Add(1)
-		go func() { defer wg.Done(); s.serveListener(ctx, ln, true) }()
+		go func() { defer wg.Done(); s.serveTLSListener(ctx, ln, cfg) }()
 		started++
 	}
 
