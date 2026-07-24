@@ -20,6 +20,7 @@ package world
 import (
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -306,10 +307,58 @@ func parseOp(v any) (effectOp, error) {
 //	  bands:
 //	    - { margin_min: 0, label: success, ops: [ ... ] }   # made the save
 //	    - { label: failure, ops: [ ... ] }                  # default (no test)
+//
+// checkSpecKeys / checkBandKeys are the COMPLETE authored key sets for a check spec and one of its
+// bands. rejectUnknownKeys turns a typo into a build error instead of a silent no-op.
+//
+// WHY THIS IS WORTH A GATE: every field here is optional, so an unrecognised key is indistinguishable
+// from an absent one. `boon_dice` mistyped as `dice_boon` yields a check that parses cleanly, runs
+// forever, and simply never takes the boon — the exact false-green shape that has bitten this project
+// repeatedly (a feature whose tests pass because the feature was never wired). The check body rides the
+// content DTO as an untyped `any`, so no struct decoder catches it either; this is the only gate there
+// is. Adding a field to checkSpec/checkBand means adding its key here — the parser will not accept it
+// otherwise, so the two cannot drift apart silently.
+var (
+	checkSpecKeys = map[string]bool{
+		"label": true, "dice": true, "bonus": true, "vs": true, "bands": true, "visibility": true,
+		"boon": true, "bane": true, "boon_dice": true, "bane_dice": true,
+	}
+	checkBandKeys = map[string]bool{
+		"label": true, "ops": true, "min": true, "max": true,
+		"margin_min": true, "margin_max": true, "face_eq": true, "face_count": true,
+	}
+)
+
+// rejectUnknownKeys fails when `m` carries a key `known` does not list. The message names every
+// offender (sorted, so the error is stable across Go's randomized map iteration) plus the legal set, so
+// a builder staring at a boot log can fix the typo without reading engine source.
+func rejectUnknownKeys(m map[string]any, known map[string]bool, what string) error {
+	var bad []string
+	for k := range m {
+		if !known[k] {
+			bad = append(bad, k)
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	sort.Strings(bad)
+	legal := make([]string, 0, len(known))
+	for k := range known {
+		legal = append(legal, k)
+	}
+	sort.Strings(legal)
+	return fmt.Errorf("%s: unknown key(s) %s (legal keys: %s)",
+		what, strings.Join(bad, ", "), strings.Join(legal, ", "))
+}
+
 func parseCheckSpec(v any) (*checkSpec, error) {
 	m, ok := asMap(v)
 	if !ok {
 		return nil, fmt.Errorf("check spec must be an object, got %T", v)
+	}
+	if err := rejectUnknownKeys(m, checkSpecKeys, "check"); err != nil {
+		return nil, err
 	}
 	spec := &checkSpec{label: mapStr(m, "label"), visibility: parseVisibility(mapStr(m, "visibility"))}
 
@@ -325,6 +374,34 @@ func parseCheckSpec(v any) (*checkSpec, error) {
 			return nil, fmt.Errorf("bonus: %w", err)
 		}
 		spec.bonus = node
+	}
+
+	// The boon/bane channel (#511). The two formulas net by SIGN to select one of three content-authored
+	// expressions (check.go effectiveDice). Each half is independently optional: a spec may author a boon
+	// with no bane, or a bane die with no boon die.
+	for _, e := range []struct {
+		key string
+		dst *formulaNode
+	}{{"boon", &spec.boon}, {"bane", &spec.bane}} {
+		if raw, present := m[e.key]; present {
+			node, err := parseFormula(raw)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", e.key, err)
+			}
+			*e.dst = node
+		}
+	}
+	for _, e := range []struct {
+		key string
+		dst **diceSpec
+	}{{"boon_dice", &spec.boonDice}, {"bane_dice", &spec.baneDice}} {
+		if s := mapStr(m, e.key); s != "" {
+			d, err := parseDiceSpec(s)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", e.key, err)
+			}
+			*e.dst = &d
+		}
 	}
 
 	vs, err := parseCheckVs(m["vs"])
@@ -376,6 +453,9 @@ func parseCheckBand(v any) (checkBand, error) {
 	m, ok := asMap(v)
 	if !ok {
 		return checkBand{}, fmt.Errorf("band must be an object, got %T", v)
+	}
+	if err := rejectUnknownKeys(m, checkBandKeys, "band"); err != nil {
+		return checkBand{}, err
 	}
 	band := checkBand{
 		label:     mapStr(m, "label"),

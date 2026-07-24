@@ -173,10 +173,23 @@ func capDice(n int) int {
 }
 
 // rollDiceSpec rolls d and collapses it to a single magnitude per its kind, using the ctx rng when
-// present (tests inject a seeded rng for determinism; production uses the package default). It also
-// returns the natural faces rolled (for visibility emission and future nat-crit bands). Single-
-// writer: zone goroutine.
-func rollDiceSpec(c *effectCtx, d diceSpec) (int, []int) {
+// present (tests inject a seeded rng for determinism; production uses the package default). It
+// returns THREE things: the magnitude, ALL natural faces rolled, and the KEPT faces — the subset that
+// actually contributed to the magnitude. Single-writer: zone goroutine.
+//
+// # Why "kept" is a separate return and not just `faces`
+//
+// For every kind except keepHigh/keepLow the two are identical (nothing is discarded), so the
+// distinction only exists for a keep spec — but there it is the difference between a correct and an
+// incorrect nat-face band. A `{face_eq: 1 -> miss}` band tested against ALL faces fires when EITHER
+// die of a 2d20kh1 shows a 1 (9.36% measured), when the roll the check actually used was the OTHER,
+// higher die; the same band tested against the KEPT face fires at 0.25%, which is what "the die you
+// rolled was a 1" means. Emission and logging still want every face (a player wants to see both dice),
+// so both are reported and the caller picks: checkBand.matches reads KEPT, emitCheck reads all.
+//
+// The kept slice aliases nothing the caller can mutate through — sumKept copies before sorting, and
+// the non-keep kinds return the same backing array as `faces`, which no caller writes to.
+func rollDiceSpec(c *effectCtx, d diceSpec) (magnitude int, faces, kept []int) {
 	rollFace := func(size int) int {
 		if size <= 0 {
 			return 0
@@ -196,7 +209,7 @@ func rollDiceSpec(c *effectCtx, d diceSpec) (int, []int) {
 			faces = append(faces, f)
 			sum += f
 		}
-		return sum, faces
+		return sum, faces, faces // nothing is discarded: every face contributed
 
 	case dicePool:
 		faces := make([]int, 0, d.num)
@@ -208,14 +221,19 @@ func rollDiceSpec(c *effectCtx, d diceSpec) (int, []int) {
 				count++
 			}
 		}
-		return count, faces
+		// Every face is rolled AND read (a non-succeeding pool die still counted toward the tally, it just
+		// contributed 0), so nothing is "discarded" in the keep sense — kept == faces. A pool's own
+		// success threshold is not a keep filter; treating it as one would make face_eq on a pool blind to
+		// the failures, which is not what a pool's nat-face band means.
+		return count, faces, faces
 
 	case diceKeepHigh, diceKeepLow:
 		faces := make([]int, 0, d.num)
 		for i := 0; i < d.num; i++ {
 			faces = append(faces, rollFace(d.size))
 		}
-		return sumKept(faces, d.keep, d.kind == diceKeepHigh), faces
+		sum, kept := sumKept(faces, d.keep, d.kind == diceKeepHigh)
+		return sum, faces, kept
 
 	default: // diceSum
 		faces := make([]int, 0, d.num)
@@ -225,14 +243,16 @@ func rollDiceSpec(c *effectCtx, d diceSpec) (int, []int) {
 			faces = append(faces, f)
 			sum += f
 		}
-		return sum, faces
+		return sum, faces, faces // nothing is discarded: every face contributed
 	}
 }
 
-// sumKept sums the highest (or lowest) `keep` of faces without mutating the caller's slice.
-func sumKept(faces []int, keep int, high bool) int {
+// sumKept sums the highest (or lowest) `keep` of faces without mutating the caller's slice, and
+// returns the kept faces alongside the sum. The kept slice is a fresh allocation (a sub-slice of the
+// sorted COPY), so the caller can neither mutate nor observe the sort through it.
+func sumKept(faces []int, keep int, high bool) (int, []int) {
 	if keep <= 0 || len(faces) == 0 {
-		return 0
+		return 0, nil
 	}
 	cp := make([]int, len(faces))
 	copy(cp, faces)
@@ -247,15 +267,15 @@ func sumKept(faces []int, keep int, high bool) int {
 	if keep > len(cp) {
 		keep = len(cp)
 	}
-	sum := 0
+	var kept []int
 	if high {
-		for _, v := range cp[len(cp)-keep:] {
-			sum += v
-		}
+		kept = cp[len(cp)-keep:]
 	} else {
-		for _, v := range cp[:keep] {
-			sum += v
-		}
+		kept = cp[:keep]
 	}
-	return sum
+	sum := 0
+	for _, v := range kept {
+		sum += v
+	}
+	return sum, kept
 }

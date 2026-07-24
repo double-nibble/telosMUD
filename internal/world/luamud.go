@@ -154,7 +154,7 @@ func (rt *luaRuntime) mudRoll(l *lua.LState) int {
 		l.RaiseError("mud.roll: %v", err)
 		return 0
 	}
-	total, _ := rollDiceSpec(&effectCtx{z: rt.zone, rng: rt.rng}, d)
+	total, _, _ := rollDiceSpec(&effectCtx{z: rt.zone, rng: rt.rng}, d)
 	l.Push(lua.LNumber(total))
 	return 1
 }
