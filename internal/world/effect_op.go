@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"log/slog"
+	"math"
 	"math/rand"
 )
 
@@ -882,10 +883,57 @@ func mitigate(target *Entity, raw float64, dmgType string) int {
 		}
 	}
 	v -= soak(target, dmgType)
+	// Per-target multiplier (#537), applied AFTER soak: `(raw × globalMatrix − soak) × perTargetMult`.
+	// Order matters and is deliberate — 5e resistance halves LAST, after other reduction, and applying
+	// the multiplier to the post-soak number is also the more composable reading (a vulnerability
+	// amplifies what actually got through the armour, immunity zeroes the whole blow regardless of
+	// soak). Absence is ×1, so a target with no multiplier is byte-for-byte unchanged.
+	v *= damageTakenMult(target, dmgType)
 	if v < 0 {
 		v = 0
 	}
 	return int(v)
+}
+
+// damageTakenMultCeiling caps the composed per-target multiplier (#537). A content author (or a
+// malicious pack) could stack vulnerability affects toward an unbounded amplifier; this bounds the
+// worst case to a large-but-survivable factor so a blow's damage stays a sane int() — the same
+// defensive posture as the attribute fold bound, at the one seam a per-target multiplier is consumed.
+const damageTakenMultCeiling = 1000.0
+
+// damageTakenMult returns the per-target incoming-damage multiplier for `dmgType` on target — the
+// PRODUCT-composed contribution of every active affect's damage_taken_mult (#537), or 1 when the
+// target has no Affected component or no multiplier for this type. The identity is 1 (an absent type
+// leaves the blow unscaled), NOT 0 — a map miss must not zero the damage. A negative composed value
+// (an author authoring a negative multiplier) is clamped to 0 (immunity), since a negative multiplier
+// would turn damage into healing, which no content should be able to do through this seam. The result
+// is capped at damageTakenMultCeiling. Zone-goroutine read.
+func damageTakenMult(target *Entity, dmgType string) float64 {
+	if target == nil || dmgType == "" {
+		return 1
+	}
+	a, ok := Get[*Affected](target)
+	if !ok || a.damageMult == nil {
+		return 1
+	}
+	m, ok := a.damageMult[dmgType]
+	if !ok {
+		return 1
+	}
+	// Defense in depth: recomputeMods already normalizes each factor into [0, ceiling], so the composed
+	// value should already be in range. These clamps are the last seam before an int() conversion and
+	// must not depend on that staying true — a NaN (int(NaN) is implementation-defined, a determinism
+	// hazard) reads as identity, a negative can never heal, and the product is bounded.
+	if math.IsNaN(m) {
+		return 1
+	}
+	if m < 0 {
+		return 0
+	}
+	if m > damageTakenMultCeiling {
+		return damageTakenMultCeiling
+	}
+	return m
 }
 
 // soak is the FLAT damage reduction a target's armor contributes, by damage TYPE ([G-B], docs/COMBAT.md

@@ -11,6 +11,7 @@ package world
 import (
 	"context"
 	"log/slog"
+	"math"
 )
 
 // attachOpts carries the optional knobs an apply_affect op supplies. Zero values mean "use the def's
@@ -195,6 +196,7 @@ func (a *Affected) recomputeMods() {
 	a.flat = nil
 	a.mul = nil
 	a.prevents = nil
+	a.damageMult = nil
 	for _, inst := range a.list {
 		scale := inst.magnitude * float64(maxInt(inst.stacks, 1))
 		for _, m := range inst.def.modifiers {
@@ -219,6 +221,32 @@ func (a *Affected) recomputeMods() {
 				a.prevents = map[string]int{}
 			}
 			a.prevents[tag]++
+		}
+		// Per-target damage multipliers (#537), composed by PRODUCT across active affects. Two
+		// resistances (0.5, 0.5) → 0.25, resist+vuln (0.5, 2) → 1 (cancel), and immunity (0) dominates
+		// anything — the natural composition, and correct for immunity and cancellation. 5e's cap of
+		// "one level of resistance" is a system rule content expresses through affect stacking, not the
+		// engine's to impose here. Deliberately NOT scaled by magnitude/stacks: a multiplier is a
+		// property of the CONDITION (you are resistant, or you are not), not a dose — a stackCount poison
+		// does not make a resistance 4× stronger. An author wanting dose-scaled resistance composes
+		// several affects.
+		for typ, m := range inst.def.damageTakenMult {
+			if a.damageMult == nil {
+				a.damageMult = map[string]float64{}
+			}
+			cur, ok := a.damageMult[typ]
+			if !ok {
+				cur = 1
+			}
+			// Normalize EACH FACTOR before multiplying, not the composed product at read time. This is a
+			// security requirement, not tidiness: the read-time clamp only catches an ODD count of
+			// negatives — two `-3` factors compose to +9, a vulnerability that never trips a
+			// post-composition `m < 0` guard, is classified a benign buff by hasVulnerability (which reads
+			// the raw >1 test), and so lands cross-player ungated and amplifies incoming damage 9×. Clamping
+			// per-factor to [0, ceiling] (and NaN to identity) makes that impossible: every factor is in
+			// [0, ceiling], a product of factors <= 1 is <= 1, so a composed value > 1 REQUIRES a raw factor
+			// > 1 — which hasVulnerability flags as harm and the PvP gate refuses.
+			a.damageMult[typ] = cur * normDamageMultFactor(m)
 		}
 	}
 }
@@ -417,6 +445,25 @@ func fireOnTick(e *Entity, inst *affectInstance, pulse uint64) {
 		sourcelessAmbient: sourceless,
 	}
 	runOps(c, inst.def.tickOps)
+}
+
+// normDamageMultFactor clamps one content-declared damage_taken_mult factor (#537) into the safe
+// domain [0, damageTakenMultCeiling] before it composes into the product. A negative factor becomes 0
+// (immunity — a negative multiplier is nonsensical content and must never heal), a NaN becomes 1 (an
+// unusable value is ignored, not treated as harm or immunity), and an over-ceiling / +Inf factor is
+// capped. Doing this per-factor rather than on the composed product is what closes the two-negatives
+// amplification hole (see recomputeMods).
+func normDamageMultFactor(m float64) float64 {
+	if math.IsNaN(m) {
+		return 1
+	}
+	if m < 0 {
+		return 0
+	}
+	if m > damageTakenMultCeiling {
+		return damageTakenMultCeiling
+	}
+	return m
 }
 
 func maxInt(a, b int) int {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 
@@ -318,6 +319,23 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		slog.Warn("content: deal_damage.type does not name a registered damage_type (no resist matrix, and no #405 pool routing)",
 			"owner", m.owner, "type", logcap.Value(m.dmgType))
 	}
+	// Load-time content-lint (#537): an affect's damage_taken_mult keyed by a damage type that is not
+	// registered is a silent no-op — the multiplier can never apply, because damage always carries a
+	// registered type. A vulnerability an author believes they authored simply never bites; a resistance
+	// they rely on never protects. WARN so the typo surfaces at load.
+	for _, m := range lintDamageTakenMultTypes(d) {
+		slog.Warn("content: affect damage_taken_mult names an unregistered damage_type; the multiplier will never apply",
+			"affect", logcap.Value(m.affect), "type", logcap.Value(m.dmgType))
+	}
+	// Load-time content-lint (#537): a damage_taken_mult VALUE that is non-finite or negative. The runtime
+	// normalizes each factor into [0, ceiling] (a negative -> immunity, a NaN -> identity), so this never
+	// misbehaves — but a negative or `.nan`/`.inf` value is almost certainly an authoring mistake, and the
+	// engine's silent correction would otherwise hide it. WARN names the offending affect + type.
+	for _, m := range lintDamageTakenMultValues(d) {
+		slog.Warn("content: affect damage_taken_mult has a "+m.reason+" value; the engine will normalize it, "+
+			"but this is almost certainly an authoring error",
+			"affect", logcap.Value(m.affect), "type", logcap.Value(m.dmgType), "value", m.value)
+	}
 	// Load-time content-lint (#406): a NON-VITAL resource's on_depleted is FARMABLE if it rewards. Unlike the
 	// vital/death hook — latched to an actual kill by posDead, and for a mob followed by extraction — a
 	// non-vital hook is level-triggered per BLOW, so a pool held at 0 re-runs it for one point of damage,
@@ -502,6 +520,66 @@ func lintDealDamageTypes(d *defRegistries) []dealDamageTypeMiss {
 		if op.kind == "deal_damage" && op.dmgType != "" && d.dmg.get(op.dmgType) == nil {
 			misses = append(misses, dealDamageTypeMiss{owner: owner, dmgType: op.dmgType})
 		}
+	})
+	return misses
+}
+
+// damageTakenMultMiss is one content-lint finding (#537): an affect's damage_taken_mult names a damage
+// type that is not registered, so the multiplier is dead.
+type damageTakenMultMiss struct {
+	affect  string
+	dmgType string
+}
+
+// lintDamageTakenMultTypes flags each affect whose damage_taken_mult keys an unregistered damage type.
+// Build-time only; WARN (a dead multiplier is a content bug, not a boot blocker). Deterministic order
+// (sorted by affect then type) so the log is stable across Go's randomized map iteration.
+func lintDamageTakenMultTypes(d *defRegistries) []damageTakenMultMiss {
+	var misses []damageTakenMultMiss
+	for ref, def := range d.affect.table() {
+		for typ := range def.damageTakenMult {
+			if d.dmg.get(typ) == nil {
+				misses = append(misses, damageTakenMultMiss{affect: ref, dmgType: typ})
+			}
+		}
+	}
+	sort.Slice(misses, func(i, j int) bool {
+		if misses[i].affect != misses[j].affect {
+			return misses[i].affect < misses[j].affect
+		}
+		return misses[i].dmgType < misses[j].dmgType
+	})
+	return misses
+}
+
+// damageTakenMultValueMiss is one content-lint finding (#537): a damage_taken_mult value that is
+// non-finite or negative — an almost-certain authoring error the runtime silently normalizes.
+type damageTakenMultValueMiss struct {
+	affect  string
+	dmgType string
+	value   float64
+	reason  string // "non-finite" | "negative"
+}
+
+// lintDamageTakenMultValues flags each affect damage_taken_mult whose value is NaN/±Inf or negative.
+// Build-time only; WARN. Deterministic order (affect then type).
+func lintDamageTakenMultValues(d *defRegistries) []damageTakenMultValueMiss {
+	var misses []damageTakenMultValueMiss
+	for ref, def := range d.affect.table() {
+		for typ, v := range def.damageTakenMult {
+			switch {
+			case math.IsNaN(v) || math.IsInf(v, 0):
+				misses = append(misses, damageTakenMultValueMiss{affect: ref, dmgType: typ, value: v, reason: "non-finite"})
+			case v < 0:
+				misses = append(misses, damageTakenMultValueMiss{affect: ref, dmgType: typ, value: v, reason: "negative"})
+			}
+		}
+	}
+	sort.Slice(misses, func(i, j int) bool {
+		if misses[i].affect != misses[j].affect {
+			return misses[i].affect < misses[j].affect
+		}
+		return misses[i].dmgType < misses[j].dmgType
 	})
 	return misses
 }

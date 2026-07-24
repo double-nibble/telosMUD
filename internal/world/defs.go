@@ -469,6 +469,14 @@ type affectDef struct {
 
 	modifiers []affectModifier // additive/multiplicative attribute mods while active
 	prevents  []string         // tags this affect blocks (§6 tag CC); the runtime unions these
+	// damageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on INCOMING damage the bearer takes: a
+	// content-declared `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` makes the bearer resistant
+	// (½), vulnerable (×2), or immune (×0) to that type while the affect is active. It is the per-TARGET
+	// analogue of the global damage_type resist matrix (which is one scalar per type for EVERYONE): this
+	// is keyed to the individual and is typically transient (Rage's b/p/s resistance, Barkskin, an
+	// elemental's fire immunity). The runtime composes these across active affects by PRODUCT into
+	// Affected.damageMult; mitigate consults it. An absent type is identity (×1). See damageTakenMult.
+	damageTakenMult map[string]float64
 
 	tickInterval int  // fire on_tick every N pulses; 0 => no tick
 	hasTick      bool // whether a tick spec was authored (interval may legitimately be 0-guarded)
@@ -562,8 +570,25 @@ func affectIsDetrimental(def *affectDef, h harmPolarity) bool {
 	if len(def.prevents) > 0 {
 		return true // any CC tag is harm by construction
 	}
+	if hasVulnerability(def) {
+		return true // a per-target VULNERABILITY (#537): taking >1× damage of a type is a debuff
+	}
 	if detrimentalCategories[def.category] {
 		return true
+	}
+	return false
+}
+
+// hasVulnerability reports whether an affect makes its bearer take MORE damage of any type (#537) — a
+// damage_taken_mult entry > 1. Unlike a bane counter or a condition flag, this polarity is KNOWN to the
+// engine (>1 is unambiguously worse for the bearer), so it needs no derived set: the harm derivations
+// consult it directly. A resistance (<1) or immunity (0) is a BUFF and is deliberately not flagged, so
+// warding an ally still lands ungated.
+func hasVulnerability(def *affectDef) bool {
+	for _, m := range def.damageTakenMult {
+		if m > 1 {
+			return true
+		}
 	}
 	return false
 }
@@ -848,6 +873,9 @@ func affectSurvivesRespawn(def *affectDef, h harmPolarity) bool {
 	}
 	if len(def.prevents) > 0 {
 		return false
+	}
+	if hasVulnerability(def) {
+		return false // a vulnerability (#537) is harm; it must not survive the respawn purge
 	}
 	if detrimentalCategories[def.category] {
 		return false

@@ -60,6 +60,12 @@ type Affected struct {
 	// modifiers. preventsTag reads it; the engine never names a CC type (§6 — open strings).
 	prevents map[string]int // tag -> count of active affects preventing it (a multiset for clean removal)
 
+	// damageMult (#537) is the per-DAMAGE-TYPE incoming-damage multiplier, PRODUCT-composed across every
+	// active affect's damageTakenMult, recomputed alongside the modifiers. mitigate reads it via
+	// damageTakenMult(); an absent type is identity (×1), which is why absence must read as 1 and not 0.
+	// nil until some active affect declares a multiplier.
+	damageMult map[string]float64
+
 	// registered records that this component has already been addModSource'd onto the entity, so a
 	// second attach does not register a duplicate source (the single-source invariant).
 	registered bool
