@@ -49,6 +49,22 @@ func canAct(e *Entity) bool {
 	return p != posSleeping && p != posDead
 }
 
+// reactPreventTag is the conventional CC tag an incapacitating affect carries to suppress reactions
+// (#540). It sits alongside the other open-string prevents tags (move/cast/verbal): an affect that
+// stuns/paralyzes/knocks-unconscious lists `prevents: [react, ...]`. The engine names no condition —
+// this is just the tag the reaction gate queries, exactly as the cast gate queries the ability's tags.
+const reactPreventTag = "react"
+
+// canReact reports whether an entity may take a REACTION — an action out of turn (an opportunity
+// attack, a Shield, a Counterspell, an OnDamageTaken reaction). It is stricter than canAct in one
+// direction only: a reactor must be able to act by POSITION (not sleeping/dead) AND must not carry an
+// affect that prevents the `react` tag. That second half is what lets a content-defined incapacitating
+// condition (stunned/paralyzed/unconscious) suppress reactions without the engine learning any
+// condition name — the same tag mechanism the ability cast gate uses. Zone-goroutine read.
+func canReact(e *Entity) bool {
+	return canAct(e) && !preventsTag(e, reactPreventTag)
+}
+
 // canDefend reports whether the entity's position allows it to DEFEND (the to-hit/avoidance the swing
 // pipeline runs against it still applies, but a dead target cannot be attacked at all). A sleeping
 // target defends — content's evasion/avoidance attributes carry the penalty (a content concern), not

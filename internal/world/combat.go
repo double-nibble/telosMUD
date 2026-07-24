@@ -191,6 +191,23 @@ func (z *Zone) fireLeaveRoom(parent *effectCtx, leaver *Entity) {
 			leaver.living == nil || leaver.location == nil || reactor.location != leaver.location {
 			continue
 		}
+		// INCAPACITATION GATE (#540): the opportunity attack is a reaction, and OnLeaveRoom is its
+		// checkpoint — it fires ONLY for a foe currently engaged with the leaver. An incapacitated reactor
+		// takes no OA. Gating here suppresses only THIS reactor's OnLeaveRoom fire; every OTHER bus event
+		// it subscribes to (a DoT tick, a level-up, an affect expiry) is untouched.
+		//
+		// SCOPE NOTE, stated precisely (a review nit): unlike OnDamageTaken — where the reaction pass
+		// (gated) and the on_event bus (a passive thorns, ungated) are SEPARATE fires — OnLeaveRoom has
+		// only the one bus fire, so gating it also suppresses any PASSIVE on_event[OnLeaveRoom] handler for
+		// an incapacitated reactor. That is deliberate: OnLeaveRoom is treated as a reaction-only
+		// checkpoint (it exists to model the OA and fires only for an engaged foe). A builder wanting a
+		// passive "my quarry fled" hook that survives incapacitation should use OnEnter / a movement hook,
+		// not OnLeaveRoom. Splitting the OA onto its own reaction discriminator is a larger change;
+		// recorded here so the contract is explicit rather than silently contradicted.
+		if !canReact(reactor) {
+			z.log.Debug("opportunity attack refused: reactor is incapacitated", "reactor", reactor.short)
+			continue
+		}
 		z.fireEvent(parent, evOnLeaveRoom, reactor, leaver, 1)
 	}
 }
