@@ -385,6 +385,21 @@ func (z *Zone) fireReaction(c *effectCtx, kind eventKind, rk reactKind, subject,
 	if z == nil || z.lua == nil || subject == nil {
 		return &reaction{kind: rk}
 	}
+	// INCAPACITATION GATE (#540): a reaction is an action taken OUT OF TURN, so an incapacitated reactor
+	// takes none — a stunned defender does not Shield, a paralyzed observer does not Counterspell, an
+	// unconscious target runs no OnDamageTaken reaction. The `subject` of every fireReaction caller IS
+	// the reactor (the defender, the observer, the damage-taker), so gating here covers all three
+	// reaction checkpoints at their one chokepoint. The opportunity-attack path does NOT flow through
+	// here (it rides the OnLeaveRoom bus); fireLeaveRoom gates its own reactor loop with the same test.
+	//
+	// This gates ONLY the reaction checkpoints, never the plain event bus — a stunned creature must
+	// still take DoT ticks, still level, still have affects expire. Content draws the passive/reactive
+	// line by choosing on_reaction_lua (gated here) vs on_event (ungated): a passive thorns shield keeps
+	// firing while stunned, a reactive Shield does not. See canReact.
+	if !canReact(subject) {
+		z.log.Debug("reaction refused: reactor is incapacitated", "event", string(kind), "subject", subject.short)
+		return &reaction{kind: rk, c: c}
+	}
 	// ZONE-LEVEL RECURSION BACKSTOP (the can't-forget guard, maxEventCascadeDepth — event.go): a
 	// reaction that fires an action that fires a reaction (an OnDamageTaken→damage→OnDamageTaken loop)
 	// recurses the Go stack regardless of whether the per-ctx depth was threaded. The same backstop
