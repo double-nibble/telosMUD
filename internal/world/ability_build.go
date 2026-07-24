@@ -417,6 +417,18 @@ func parseCheckSpec(v any) (*checkSpec, error) {
 		}
 		*e.dst = &d
 	}
+	// An alternative die with NO formula to select it is unreachable: effectiveDice returns the neutral
+	// die whenever both sides are nil, so the author has written a rule that reads as live and can never
+	// fire. That is the same silent no-op the key and type gates above exist to prevent, reached by
+	// authoring a perfectly valid key with nothing to drive it — and it is the likeliest way to half-adopt
+	// the channel (add the dice, forget the counter). The mirror is deliberately NOT an error: a `boon`
+	// with no `boon_dice` is the documented "this direction has no alternative expression" case.
+	if spec.boonDice != nil && spec.boon == nil {
+		return nil, fmt.Errorf("boon_dice is authored but `boon` is not, so it can never be selected")
+	}
+	if spec.baneDice != nil && spec.bane == nil {
+		return nil, fmt.Errorf("bane_dice is authored but `bane` is not, so it can never be selected")
+	}
 
 	vs, err := parseCheckVs(m["vs"])
 	if err != nil {

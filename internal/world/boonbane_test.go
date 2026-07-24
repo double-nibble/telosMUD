@@ -2,6 +2,7 @@ package world
 
 import (
 	"math/rand"
+	"reflect"
 	"testing"
 
 	"github.com/double-nibble/telosmud/internal/content"
@@ -177,7 +178,6 @@ func TestChannelLearnsNoDirection(t *testing.T) {
 	got := effectiveDice(c, pool, c.actor)
 	require.Equal(t, "3d6>=4", got.raw)
 	require.Equal(t, dicePool, got.kind, "the boon alternative may be a different KIND than the neutral die")
-	_ = mob
 }
 
 // TestUnauthoredSpecIsUntouched is the non-regression guarantee: every check authored before #511 has
@@ -194,6 +194,11 @@ func TestUnauthoredSpecIsUntouched(t *testing.T) {
 	for _, notation := range []string{"1d20", "4d6kh3", "3d20kl1", "4dF", "5d6>4", "1d100"} {
 		t.Run(notation, func(t *testing.T) {
 			spec := &checkSpec{dice: mustDice(t, notation)}
+			// NOTE the claim being made: the returned spec is field-for-field identical. The fast path in
+			// effectiveDice is an OPTIMISATION, not the source of that identity — with it deleted, nil
+			// formulas evaluate to 0, neither side is present, and the default branch returns spec.dice
+			// anyway. So this pins the identity, which is what matters; it does not pin "nothing was
+			// evaluated", which is unobservable from behaviour.
 			require.Equal(t, spec.dice, effectiveDice(c, spec, c.actor),
 				"a spec with no boon/bane formula must be returned unchanged, field for field")
 		})
@@ -300,9 +305,15 @@ func TestResolveCheckClassifiesOnKeptFaces(t *testing.T) {
 func TestKeptEqualsAllFacesForNonKeepKinds(t *testing.T) {
 	for _, notation := range []string{"1d20", "3d6", "4dF", "5d6>4", "5d6>=5"} {
 		t.Run(notation, func(t *testing.T) {
-			c := &effectCtx{rng: rand.New(rand.NewSource(7))}
-			_, faces, kept := rollDiceSpec(c, mustDice(t, notation))
-			require.Equal(t, faces, kept, "a kind that discards nothing must report every face as kept")
+			d := mustDice(t, notation)
+			for seed := int64(0); seed < 25; seed++ {
+				_, faces, kept := rollDiceSpec(&effectCtx{rng: rand.New(rand.NewSource(seed))}, d)
+				// CARDINALITY FIRST: without this the equality below is vacuously satisfiable by
+				// returning nil for both slices, which is exactly what a mutation that drops the faces
+				// entirely would do.
+				require.Len(t, faces, d.num, "seed %d: every declared die must be rolled", seed)
+				require.Equal(t, faces, kept, "a kind that discards nothing must report every face as kept")
+			}
 		})
 	}
 }
@@ -745,4 +756,221 @@ func TestBoonChannelThroughTheSwingPipeline(t *testing.T) {
 	z.resolveSwing(s.entity, mob, 0, rand.New(rand.NewSource(1)), newBudget())
 	require.Less(t, resourceCurrent(mob, "hp"), 100,
 		"blessed, the boon die is selected and the same swing lands")
+}
+
+// TestRollDiceSpecHonoursKeepDirection pins the keep DIRECTION at rollDiceSpec, which is the joint the
+// unit tests around it left open: dice_test.go only PARSES "2d20kl1" (asserting the kind), and the
+// kept-face tests call sumKept directly. So hardcoding sumKept's `high` argument at the rollDiceSpec
+// call site — every disadvantage roll in the engine silently becoming advantage — survived the entire
+// package. That is the same wiring-untested-while-both-ends-are shape as the face_eq fix, one layer
+// down, and it is why this test asserts magnitude AND kept together, for BOTH directions.
+func TestRollDiceSpecHonoursKeepDirection(t *testing.T) {
+	for _, tc := range []struct {
+		notation string
+		want     func(a, b int) int
+	}{
+		{"2d20kh1", func(a, b int) int { return max(a, b) }},
+		{"2d20kl1", func(a, b int) int { return min(a, b) }},
+	} {
+		t.Run(tc.notation, func(t *testing.T) {
+			d := mustDice(t, tc.notation)
+			differed := 0
+			for seed := int64(0); seed < 300; seed++ {
+				mag, faces, kept := rollDiceSpec(&effectCtx{rng: rand.New(rand.NewSource(seed))}, d)
+				require.Len(t, faces, 2, "seed %d", seed)
+				want := tc.want(faces[0], faces[1])
+				require.Equal(t, want, mag, "seed %d: faces %v", seed, faces)
+				require.Equal(t, []int{want}, kept, "seed %d: faces %v", seed, faces)
+				if faces[0] != faces[1] {
+					differed++
+				}
+			}
+			// The precondition: if the two dice never differed, keep-high and keep-low are
+			// indistinguishable and this test would prove nothing.
+			require.Greater(t, differed, 200, "the sample must contain rolls where the two dice DIFFER")
+		})
+	}
+}
+
+// TestResolveCheckClassifiesOnKeptFacesUnderABane is the BANE mirror of the keep-high wiring test. The
+// PR's own claim has two halves — a nat-1 miss band under a boon die, and a nat-20 crit band under a
+// bane die (which all-faces fired at 9.75% where 5e wants 0.25%) — and only the first had coverage.
+func TestResolveCheckClassifiesOnKeptFacesUnderABane(t *testing.T) {
+	z, caster, mob := boonZone(t)
+	twenty := 20.0
+	baneD := mustDice(t, "2d20kl1")
+	spec := &checkSpec{
+		dice: mustDice(t, "1d20"), baneDice: &baneD,
+		bane:  attrNode{ref: "$actor.atk_bane"},
+		bands: []checkBand{{faceEq: &twenty, label: "crit"}, {label: "plain"}},
+	}
+	applyAffect(caster.entity, "curse", attachOpts{}, nil) // select the keep-low die
+
+	discriminating := 0
+	for seed := int64(0); seed < 400; seed++ {
+		c := &effectCtx{
+			z: z, actor: caster.entity, source: caster.entity, target: mob,
+			mag: 1, rng: rand.New(rand.NewSource(seed)),
+		}
+		res := resolveCheck(c, spec)
+		require.Len(t, res.faces, 2, "the bane die must have been selected")
+
+		used := min(res.faces[0], res.faces[1])
+		if (res.faces[0] == 20 || res.faces[1] == 20) && used != 20 {
+			discriminating++
+			require.Equal(t, "plain", res.bandLabel,
+				"seed %d rolled %v: a DISCARDED 20 must not crit when the check used a %d", seed, res.faces, used)
+		}
+		require.Equal(t, used == 20, res.bandLabel == "crit", "seed %d rolled %v", seed, res.faces)
+	}
+	require.Greater(t, discriminating, 20,
+		"the sample must contain rolls where a DISCARDED die showed 20, or the test proves nothing")
+}
+
+// TestCheckKeySetsCannotDriftFromTheStructs makes rejectUnknownKeys' documented promise — "adding a
+// field to checkSpec/checkBand means adding its key here, so the two cannot drift apart silently" —
+// actually enforceable. It guards BOTH directions: a struct field with no legal key would be
+// unauthorable, and a legal key with no field is a silently accepted no-op, which is precisely the
+// shape the gate exists to prevent.
+func TestCheckKeySetsCannotDriftFromTheStructs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		keys   map[string]bool
+		fields map[string]string // struct field -> the content key that feeds it
+	}{
+		{
+			name: "checkSpec", keys: checkSpecKeys,
+			fields: map[string]string{
+				"dice": "dice", "bonus": "bonus", "vs": "vs", "bands": "bands",
+				"visibility": "visibility", "label": "label",
+				"boon": "boon", "bane": "bane", "boonDice": "boon_dice", "baneDice": "bane_dice",
+			},
+		},
+		{
+			name: "checkBand", keys: checkBandKeys,
+			fields: map[string]string{
+				"min": "min", "max": "max", "marginMin": "margin_min", "marginMax": "margin_max",
+				"faceEq": "face_eq", "faceCount": "face_count", "label": "label", "ops": "ops",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var typ reflect.Type
+			if tc.name == "checkSpec" {
+				typ = reflect.TypeOf(checkSpec{})
+			} else {
+				typ = reflect.TypeOf(checkBand{})
+			}
+			for i := 0; i < typ.NumField(); i++ {
+				name := typ.Field(i).Name
+				key, mapped := tc.fields[name]
+				require.True(t, mapped,
+					"%s.%s is a new field with no entry in this test's map — decide whether it is authorable "+
+						"and either register its key in %sKeys or record it here as engine-internal", tc.name, name, tc.name)
+				require.True(t, tc.keys[key],
+					"%s.%s maps to content key %q, which %sKeys does not accept — the field is unauthorable",
+					tc.name, name, key, tc.name)
+			}
+			for key := range tc.keys {
+				found := false
+				for _, k := range tc.fields {
+					if k == key {
+						found = true
+						break
+					}
+				}
+				require.True(t, found,
+					"legal key %q is accepted by the parser but feeds no %s field — a silently accepted no-op",
+					key, tc.name)
+			}
+		})
+	}
+}
+
+// TestUnreachableAlternativeIsRejected closes the last silent-no-op in the channel's authoring surface.
+// A boon_dice with no boon formula parses cleanly and can NEVER be selected (effectiveDice returns the
+// neutral die when both formulas are nil), so the author has written a rule that looks live and is
+// permanently dead — the same class the unknown-key and wrong-type gates exist to prevent, reached by
+// authoring a valid key with nothing to drive it.
+func TestUnreachableAlternativeIsRejected(t *testing.T) {
+	bands := []any{map[string]any{"label": "hit"}}
+
+	for _, tc := range []struct {
+		name, missing string
+		m             map[string]any
+	}{
+		{"boon_dice with no boon formula", "boon", map[string]any{
+			"dice": "1d20", "boon_dice": "2d20kh1", "bands": bands,
+		}},
+		{"bane_dice with no bane formula", "bane", map[string]any{
+			"dice": "1d20", "bane_dice": "2d20kl1", "bands": bands,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseCheckSpec(tc.m)
+			require.Error(t, err, "an alternative die that can never be selected must not parse silently")
+			require.Contains(t, err.Error(), tc.missing)
+		})
+	}
+
+	t.Run("a formula with no alternative die is legal", func(t *testing.T) {
+		// The mirror case is NOT an error: authoring only `boon` with no `boon_dice` is the documented
+		// "this direction has no alternative expression" case, and a shared bane_dice may be the point.
+		_, err := parseCheckSpec(map[string]any{
+			"dice": "1d20", "boon": []any{"attr", "x"}, "bands": bands,
+		})
+		require.NoError(t, err)
+	})
+}
+
+// TestRollUnderBoonMakesTheActorBetter is the DELIVERABLE behind "the engine learns no direction".
+// Every other test in this file asserts which NOTATION comes back, which is the seam; the claim the
+// design actually rests on is an outcome — that a content-authored boon on a ROLL-UNDER ladder makes
+// the actor better at dodging. An engine that synthesized keep-highest for "advantage" would return a
+// plausible-looking 2d100kh1 and pass every notation assertion while measurably inverting the ladder
+// (measured on the rejected design: success 40% -> 16%). Deterministic: fixed seeds, no wall clock.
+func TestRollUnderBoonMakesTheActorBetter(t *testing.T) {
+	z, caster, mob := boonZone(t)
+	// resolveAttr returns 0 for an UNREGISTERED attribute, so the def must exist for the band edge to
+	// read anything — a base override alone would leave the threshold at 0 and nothing would ever
+	// succeed, which is a silently-passing-nothing shape worth being explicit about.
+	z.defs.attr.register("dodge", &attributeDef{ref: "dodge", base: litNode{v: 40}}) // roll 40 or under
+
+	boonD := mustDice(t, "2d100kl1") // roll-under: a BOON keeps the LOW die
+	ladder := &checkSpec{
+		label: "Dodge", dice: mustDice(t, "1d100"), boonDice: &boonD,
+		boon: attrNode{ref: "$actor.atk_boon"},
+		bands: []checkBand{
+			{max: attrNode{ref: "$actor.dodge"}, label: "dodge"},
+			{label: "fail"},
+		},
+	}
+
+	rate := func() float64 {
+		hits := 0
+		const n = 4000
+		for seed := int64(0); seed < n; seed++ {
+			c := &effectCtx{
+				z: z, actor: caster.entity, source: caster.entity, target: mob,
+				mag: 1, rng: rand.New(rand.NewSource(seed)),
+			}
+			if resolveCheck(c, ladder).bandLabel == "dodge" {
+				hits++
+			}
+		}
+		return float64(hits) / n
+	}
+
+	neutral := rate()
+	applyAffect(caster.entity, "bless", attachOpts{}, nil)
+	boosted := rate()
+	t.Logf("roll-under dodge rate: neutral %.3f -> boon %.3f", neutral, boosted)
+
+	// Oracles from first principles, NOT from the implementation: a single d100 succeeds at p = 0.40;
+	// keeping the lower of two succeeds at 1-(1-p)^2 = 0.64.
+	require.InDelta(t, 0.40, neutral, 0.03, "the neutral 1d100 ladder succeeds at ~the skill value")
+	require.InDelta(t, 0.64, boosted, 0.03, "keep-LOW of two d100 succeeds at 1-(1-p)^2")
+	require.Greater(t, boosted, neutral+0.15,
+		"a content-authored roll-under boon must make the actor BETTER at dodging — an engine that "+
+			"assumed higher-is-better would have made this WORSE")
 }
