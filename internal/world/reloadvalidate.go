@@ -252,6 +252,16 @@ func zoneGraphProblems(s *reloadScope) []string {
 			problems = append(problems, fmt.Sprintf("pack %q %s %q has characters outside its safe charset %s (would break GMCP keys / comms subjects / the tokenizer)", v.Pack, v.Field, v.Value, v.Charset))
 		}
 	}
+	// Ref length (#483): an identity token past RefMaxLen bytes is a store-integrity hazard — a ref is a
+	// btree PRIMARY KEY (a token past the ~2704-byte ceiling fails the import transaction at runtime) and
+	// composes NATS subjects / GMCP keys. Hard REJECT for an in-scope pack only, like the charset lint. The
+	// raw value rides into the message; capProblems (below, the shared #481 funnel) bounds it so a 200KB
+	// token can't ride the whole slice into the reject/boot/snapshot log sinks.
+	for _, v := range content.LintRefLength(s.full, content.RefMaxLen) {
+		if s.inScope(v.Pack) {
+			problems = append(problems, fmt.Sprintf("pack %q %s token %q is %d bytes (max %d) — a ref is a store primary key and composes NATS subjects / GMCP keys; shorten it", v.Pack, v.Field, v.Value, v.Length, v.Max))
+		}
+	}
 	return capProblems(problems)
 }
 

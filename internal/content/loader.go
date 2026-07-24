@@ -173,6 +173,16 @@ func LintPacks(packs []Pack) {
 			"it can break GMCP keys / comms subjects / the tokenizer — rename it",
 			"pack", v.Pack, "field", v.Field, "value", logcap.Value(v.Value), "allowed", v.Charset)
 	}
+	// Content-lint (#483): warn on any identity token longer than RefMaxLen bytes. A ref is a store PRIMARY
+	// KEY (the Postgres btree row has a ~2704-byte ceiling — a longer ref fails the import transaction at
+	// runtime, a durability failure) and composes NATS comms subjects / GMCP JSON keys / the proto-cache key;
+	// an over-long token is a store-integrity + log-hygiene hazard the charset lint doesn't catch. Non-fatal
+	// at boot (the reload gate hard-rejects it).
+	for _, v := range LintRefLength(packs, RefMaxLen) {
+		slog.Warn("content: identity token exceeds the max byte length; a ref is a store primary key (btree "+
+			"ceiling) and composes NATS subjects / GMCP keys — shorten it",
+			"pack", v.Pack, "field", v.Field, "length", v.Length, "max", v.Max, "value", logcap.Value(v.Value))
+	}
 	// Content-lint (#111): trust-ladder footguns — a baseline tier granting a capability (elevates the whole
 	// playerbase), duplicate/nameless rungs, un-grantable flags. Non-fatal at boot (the reload gate hard-rejects
 	// the Reject-severity ones), but logged at Error so a REJECT can never scroll past as routine noise.

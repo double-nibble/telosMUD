@@ -438,3 +438,47 @@ func TestValidatePacksTrustLadderReject(t *testing.T) {
 		t.Fatalf("the default ladder must not be rejected, got: %v", p)
 	}
 }
+
+// TestReloadRejectsOverLongRef (#483): the reload gate hard-rejects an IN-SCOPE pack shipping an identity
+// token past RefMaxLen bytes — a ref is a store btree PRIMARY KEY (a token past the ~2704-byte ceiling fails
+// the import transaction at runtime) and composes NATS subjects / GMCP keys. The SAME violation in a
+// not-reloaded (out-of-scope) pack must NOT block the reload (the in-scope gate, like the charset lint).
+func TestReloadRejectsOverLongRef(t *testing.T) {
+	longRef := strings.Repeat("a", content.RefMaxLen+1) // charset-clean, one byte over the length bound
+	pack := content.Pack{
+		Pack:  "a",
+		Zones: []content.ZoneDTO{{Ref: "az", Rooms: []content.RoomDTO{{Ref: longRef}}}},
+	}
+	problems := validatePacks([]content.Pack{pack}, map[string]bool{"a": true})
+	found := false
+	for _, p := range problems {
+		if strings.Contains(p, "bytes (max") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a length-specific rejection for the over-long room ref; got: %v", problems)
+	}
+	// Out-of-scope: a not-reloaded pack's pre-existing over-long ref must not block THIS reload.
+	if p := validatePacks([]content.Pack{pack}, map[string]bool{"other": true}); len(p) != 0 {
+		t.Fatalf("out-of-scope over-long ref must not block the reload: %v", p)
+	}
+}
+
+// TestReloadOverLongRefBounded (#483): a 300KB over-long ref's rejection string is capped by the shared
+// problems funnel (capProblems, #481) — the length-lint reject can't echo the raw token into a log sink.
+func TestReloadOverLongRefBounded(t *testing.T) {
+	pack := content.Pack{
+		Pack:  "a",
+		Zones: []content.ZoneDTO{{Ref: "az", Rooms: []content.RoomDTO{{Ref: strings.Repeat("a", 300*1024)}}}},
+	}
+	problems := validatePacks([]content.Pack{pack}, map[string]bool{"a": true})
+	if len(problems) == 0 {
+		t.Fatal("expected a rejection for the 300KB room ref")
+	}
+	for i, p := range problems {
+		if len(p) > boundedFieldMax {
+			t.Errorf("problem[%d] not bounded: %d bytes (echoed the raw over-long ref)", i, len(p))
+		}
+	}
+}

@@ -132,6 +132,72 @@ func LintRefCharset(packs []Pack) []RefCharsetViolation {
 	return out
 }
 
+// RefMaxLen bounds an identity token's BYTE length (#483). Refs are STORE PRIMARY KEYS:
+// internal/store/foreignrefs.go documents zones.ref / rooms.ref / item_prototypes.ref / the `*_defs` tables
+// as `ref TEXT PRIMARY KEY`, and a Postgres btree index row has a hard ~2704-byte ceiling (default 8KB page)
+// — a ref past it makes the import transaction FAIL at runtime ("index row size N exceeds btree maximum
+// 2704"), a durability failure, not cosmetic. Refs also compose the NATS comms subject telos.comms.chan.<ref>,
+// GMCP JSON keys, the shared proto-cache key, and foreign refs persisted inside player-state JSONB. The
+// charset lint (LintRefCharset) bounds the character SET of an identity token; nothing bounded its LENGTH, so
+// a 200KB all-`a` ref passed the charset gate. The longest real identity token in the embedded core+demo
+// packs is 27 bytes (midgaard:obj:leather-gloves); verbs are ≤ ~10. 256 bytes gives ~9.5× headroom and sits
+// well under the 2704-byte btree ceiling — bounding the store-integrity, GMCP-key, comms-subject, and
+// log-hygiene consequences at once while never clipping a real token. Measured in BYTES (len), the unit both
+// the btree ceiling and the subject/log sinks care about.
+const RefMaxLen = 256
+
+// RefLengthViolation is one finding: an identity token whose byte length exceeds RefMaxLen.
+type RefLengthViolation struct {
+	Pack   string // the pack that ships the token
+	Field  string // the struct field it came from ("Ref" | "Verb" | "Surface" | "Name" | "Exits" | "Formulas" | "Pack" | ...)
+	Value  string // the offending token (the caller log-caps it — it can be arbitrarily long)
+	Length int    // its byte length (the actionable fact for the operator message)
+	Max    int    // the bound it exceeded (RefMaxLen)
+}
+
+// LintRefLength returns a finding for every identity token whose BYTE length exceeds maxLen. It visits the EXACT
+// SAME identity-token set as LintRefCharset — Ref/Verb/Surface, the type-qualified verb lists (refListFields),
+// the refNameFields def-names, and the refKeyFields map KEYS — by reusing walkRefFields, so the length bound
+// can never drift from the charset lint's token set (the #483 non-drift requirement). The isDir flag is
+// irrelevant here (length is charset-independent), so a direction key is bounded by the same limit — a 200KB
+// direction is equally bad for a GMCP key / a log line. Build-time and non-fatal at boot (the caller logs,
+// like the other content-lints); the reload gate treats it as a HARD REJECT — a ref past the btree-PK ceiling
+// would otherwise fail the import transaction at runtime. Empty tokens are skipped (an omitempty ref means
+// "not set"). Dedupe mirrors LintRefCharset: one finding per distinct (field,value) within a pack.
+func LintRefLength(packs []Pack, maxLen int) []RefLengthViolation {
+	var out []RefLengthViolation
+	for _, p := range packs {
+		seen := map[string]bool{} // dedupe an identical (field,value) repeated within one pack
+		emit := func(field, value string) {
+			if value == "" || len(value) <= maxLen {
+				return
+			}
+			key := field + "\x00" + value
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			out = append(out, RefLengthViolation{Pack: p.Pack, Field: field, Value: value, Length: len(value), Max: maxLen})
+		}
+		// The identity tokens the charset lint also visits (Ref/Verb/Surface, the verb lists, the def-names,
+		// the exit-direction KEYS) — shared via walkRefFields so the two lints can never drift.
+		walkRefFields(reflect.ValueOf(p), func(field, value string, _ bool) { emit(field, value) })
+		// Length-only store PRIMARY KEYS the charset lint deliberately does NOT visit, but that the byte bound
+		// (the btree ceiling) MUST still reach (#483 persistence review). Each sinks into an equality lookup /
+		// a composite PK, never a NATS subject or a GMCP key, so it needs the LENGTH bound but not the charset
+		// gate — which is why they live here, not in refKeyFields:
+		//   - the pack NAME — pack_meta.pack PRIMARY KEY, and a column of every composite *_defs PK; and
+		//   - each ruleset-formula override NAME — the KEY of formula_defs (pack, name), a composite btree PK.
+		// A 200KB value in either would pass every charset lint and then fail the import transaction at runtime
+		// ("index row size N exceeds btree maximum 2704"), exactly like an over-long ref.
+		emit("Pack", p.Pack)
+		for name := range p.Formulas {
+			emit("Formulas", name)
+		}
+	}
+	return out
+}
+
 // walkRefFields recursively visits v, invoking fn(fieldName, value, isDir) for every identity token: an
 // exported string struct field whose name is in refFieldNames or whose <Type>.<Field> is in refNameFields
 // (isDir=false); every element of a []string field whose <Type>.<Field> is in refListFields (isDir=false);
