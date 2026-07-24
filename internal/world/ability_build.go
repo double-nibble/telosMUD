@@ -325,7 +325,7 @@ func parseOp(v any) (effectOp, error) {
 var (
 	checkSpecKeys = map[string]bool{
 		"label": true, "dice": true, "bonus": true, "vs": true, "bands": true, "visibility": true,
-		"boon": true, "bane": true, "boon_dice": true, "bane_dice": true,
+		"boon": true, "bane": true, "boon_dice": true, "bane_dice": true, "subject": true,
 	}
 	checkBandKeys = map[string]bool{
 		"label": true, "ops": true, "min": true, "max": true,
@@ -451,6 +451,28 @@ func parseCheckSpec(v any) (*checkSpec, error) {
 		return nil, fmt.Errorf("vs: %w", err)
 	}
 	spec.vs = vs
+
+	// subject (who rolls): "actor" (default) or "target" (the saving-throw idiom). A present-but-unknown
+	// value is an error, not a silent fall to the default — the same discipline as boon_dice's type gate.
+	if raw, present := m["subject"]; present {
+		switch s := mapStr(m, "subject"); s {
+		case "actor", "":
+			if raw != nil && s == "" {
+				return nil, fmt.Errorf("subject must be a string \"actor\" or \"target\", got %T", raw)
+			}
+			spec.subject = subjActor
+		case "target":
+			// A contested vs already has TWO explicit rollers (attacker spec + defender sub-spec), so
+			// flipping the top-level roller to the target is ambiguous — reject it rather than resolve it
+			// surprisingly. The save idiom is a DC / pure-total check, never contested.
+			if spec.vs.contested != nil {
+				return nil, fmt.Errorf("subject: target is not allowed with a contested vs (a contested check already rolls both sides)")
+			}
+			spec.subject = subjTarget
+		default:
+			return nil, fmt.Errorf("subject must be \"actor\" or \"target\", got %q", s)
+		}
+	}
 
 	bandsRaw, ok := asList(m["bands"])
 	if !ok {

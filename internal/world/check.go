@@ -181,6 +181,15 @@ func (b *checkBand) matches(total, margin float64, kept []int, eval func(formula
 // explicitly; -Inf falls out with NaN.
 func truthyPredicate(v float64) bool { return v > 0 && !math.IsInf(v, 1) }
 
+// checkSubject selects who rolls a check (its narration + OnCheck-event identity + bare-ref default
+// scope). See checkSpec.subject.
+type checkSubject int
+
+const (
+	subjActor  checkSubject = iota // the ctx actor rolls (default): a skill use, a to-hit
+	subjTarget                     // the ctx target rolls: the saving-throw idiom
+)
+
 // checkVs is the threshold a check resolves against: either a DC formula, or a CONTESTED defender
 // check (the defender rolls their own spec; the resulting total becomes the DC).
 type checkVs struct {
@@ -239,6 +248,19 @@ type checkSpec struct {
 	bands      []checkBand
 	visibility checkVisibility
 	label      string // optional, for emission/logging ("Climb", "Dexterity save")
+
+	// subject names WHO ROLLS this check — the "checker". It governs three things that were previously
+	// hardwired to the ctx actor: (1) the DEFAULT scope of bare attribute refs in dice/bonus/vs/bands/
+	// boon/bane (a bare `dex_save` reads the roller); (2) who the resolved roll is NARRATED to
+	// (emitCheck sends to the roller's own stream); (3) the subject of the OnCheck event (fireCheckEvent),
+	// with the OTHER side riding as the event `other`. Default subjActor = the ctx actor rolls (a skill
+	// use, a to-hit, an attacker's check) — unchanged, existing behaviour. subjTarget = the ctx TARGET
+	// rolls: this is the SAVING-THROW idiom (a caster forces the victim to make a Dex save), where the
+	// SAVER must be narrated to and must be the OnCheck subject so content can author "on a successful
+	// save, the saver gains X" — otherwise unauthorable, since the roll would fire on the caster. Explicit
+	// `$actor`/`$target`/`$source` refs still bind to the FIXED ctx entities regardless of subject; only
+	// the bare-ref default and the narration/event identity follow the roller.
+	subject checkSubject
 
 	// boon/bane count the influences on each side (see the type comment: presence cancels, it does not
 	// sum). nil => 0 on that side. boonDice/baneDice are the content-authored alternatives; nil => that
@@ -324,11 +346,19 @@ type checkResult struct {
 // run the band's ops — opCheck does that, keeping the classifier free of the runOps recursion. Single-
 // writer: zone goroutine. Deterministic under a seeded ctx rng.
 func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
+	// WHO ROLLS (#535/#511 follow-up): the subject selector picks the roller. Default = the ctx actor;
+	// subject: target = the ctx target rolls (the saving-throw idiom). The roller is the DEFAULT scope for
+	// bare refs and the narration + OnCheck-event identity; the other side is the counterpart. Explicit
+	// $actor/$target/$source refs are unaffected (they bind the fixed ctx entities).
+	roller, counterpart := c.actor, c.target
+	if spec.subject == subjTarget {
+		roller, counterpart = c.target, c.actor
+	}
 	// The boon/bane channel (#511) picks WHICH content-authored expression this roll uses, before any
-	// dice are thrown. Bare refs in boon/bane default to $actor, matching `bonus` on the same spec.
-	dice := effectiveDice(c, spec, c.actor)
+	// dice are thrown. Bare refs in boon/bane default to the roller, matching `bonus` on the same spec.
+	dice := effectiveDice(c, spec, roller)
 	roll, faces, kept := rollDiceSpec(c, dice)
-	bonus := evalCheckFormula(c, spec.bonus, c.actor)
+	bonus := evalCheckFormula(c, spec.bonus, roller)
 	total := float64(roll) + bonus
 
 	res := checkResult{roll: roll, faces: faces, kept: kept, dice: dice, bonus: bonus, total: total}
@@ -346,7 +376,7 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 		dRoll, _, _ := rollDiceSpec(c, effectiveDice(c, spec.vs.contested, c.target))
 		res.dc = float64(dRoll) + evalCheckFormula(c, spec.vs.contested.bonus, c.target)
 	case spec.vs.dc != nil:
-		res.dc = evalCheckFormula(c, spec.vs.dc, c.actor)
+		res.dc = evalCheckFormula(c, spec.vs.dc, roller)
 	default:
 		res.dc = 0 // a pure-total check (e.g. PbtA): bands test the total directly, margin == total
 	}
@@ -359,8 +389,8 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 	res.dc += c.reactACBonus
 	res.margin = res.total - res.dc
 
-	// Band edges are formulas scoped like bonus/vs (default $actor), evaluated lazily per band.
-	evalEdge := func(n formulaNode) float64 { return evalCheckFormula(c, n, c.actor) }
+	// Band edges are formulas scoped like bonus/vs (default = the roller), evaluated lazily per band.
+	evalEdge := func(n formulaNode) float64 { return evalCheckFormula(c, n, roller) }
 	for i := range spec.bands {
 		if spec.bands[i].matches(res.total, res.margin, res.kept, evalEdge) {
 			res.band = &spec.bands[i]
@@ -369,8 +399,8 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 		}
 	}
 
-	fireCheckEvent(c, res)
-	emitCheck(c, spec, res)
+	fireCheckEvent(c, res, roller, counterpart)
+	emitCheck(spec, res, roller)
 	return res
 }
 
@@ -517,10 +547,10 @@ func resolveVisibility(spec *checkSpec) checkVisibility {
 // emitCheck surfaces the roll to the actor per the resolved visibility. hide => nothing (the band's
 // ops narrate). show => the full math; summary => just the band label. Phase 6 emits via the actor's
 // own stream (send); the GMCP structured emit is a reserved Phase-9 hook.
-func emitCheck(c *effectCtx, spec *checkSpec, res checkResult) {
-	s, ok := sessionOf(c.actor)
+func emitCheck(spec *checkSpec, res checkResult, roller *Entity) {
+	s, ok := sessionOf(roller)
 	if !ok {
-		return // only a player-driven check emits to a stream
+		return // only a player ROLLER emits to a stream (a save narrates to the saver, not the caster)
 	}
 	vis := resolveVisibility(spec)
 	// Staff `rolls on` (#30) upgrades a check hidden ONLY by the engine default (visInherit) to full math
@@ -559,13 +589,14 @@ func emitCheck(c *effectCtx, spec *checkSpec, res checkResult) {
 }
 
 // fireCheckEvent fires the OnCheck in-zone event ([G2e]/[G3]) for content to react to a resolved check
-// (a rage build on a successful save, a proc on a skill use). The subject is the checker (c.actor); the
-// counterpart (c.target — the save's caster, the contested foe) rides as the event `other` so a handler
-// can `target: other`. Synchronous, single-writer, depth-guarded (event.go). Slice 6.2 made this a real
-// dispatch (was reserved-log in 6.1).
-func fireCheckEvent(c *effectCtx, _ checkResult) {
+// (a rage build on a successful save, a proc on a skill use). The subject is the ROLLER (the checker —
+// the ctx actor by default, or the ctx target for a `subject: target` save); the counterpart (the
+// save's caster, the contested foe) rides as the event `other` so a handler can `target: other`. This
+// is why the save idiom needs the subject selector: "on a successful Con save, the saver gains X" must
+// fire OnCheck ON THE SAVER, not the caster. Synchronous, single-writer, depth-guarded (event.go).
+func fireCheckEvent(c *effectCtx, _ checkResult, roller, counterpart *Entity) {
 	if c.z == nil {
 		return
 	}
-	c.z.fireEvent(c, evOnCheck, c.actor, c.target, 1)
+	c.z.fireEvent(c, evOnCheck, roller, counterpart, 1)
 }
