@@ -329,7 +329,7 @@ var (
 	}
 	checkBandKeys = map[string]bool{
 		"label": true, "ops": true, "min": true, "max": true,
-		"margin_min": true, "margin_max": true, "face_eq": true, "face_count": true,
+		"margin_min": true, "margin_max": true, "face_eq": true, "face_count": true, "when": true,
 	}
 )
 
@@ -492,7 +492,11 @@ func parseCheckBand(v any) (checkBand, error) {
 		key string
 		dst *formulaNode
 	}{
-		{"min", &band.min}, {"max", &band.max}, {"margin_min", &band.marginMin}, {"margin_max", &band.marginMax},
+		{"min", &band.min},
+		{"max", &band.max},
+		{"margin_min", &band.marginMin},
+		{"margin_max", &band.marginMax},
+		{"when", &band.when}, // the #513 state axis
 	} {
 		if raw, present := m[e.key]; present {
 			node, err := parseFormula(raw)

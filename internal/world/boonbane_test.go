@@ -850,7 +850,8 @@ func TestCheckKeySetsCannotDriftFromTheStructs(t *testing.T) {
 			name: "checkBand", keys: checkBandKeys,
 			fields: map[string]string{
 				"min": "min", "max": "max", "marginMin": "margin_min", "marginMax": "margin_max",
-				"faceEq": "face_eq", "faceCount": "face_count", "label": "label", "ops": "ops",
+				"faceEq": "face_eq", "faceCount": "face_count", "when": "when",
+				"label": "label", "ops": "ops",
 			},
 		},
 	} {

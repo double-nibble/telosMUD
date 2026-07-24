@@ -63,8 +63,12 @@ type checkBand struct {
 	marginMax formulaNode // margin <= marginMax   (nil: not margin-ceiling-tested)
 	faceEq    *float64    // optional: count natural KEPT faces equal to this value (see matches)
 	faceCount int         // ... require at least this many such faces (defaults to 1 when faceEq set)
-	label     string
-	ops       []effectOp
+	// when is a STATE predicate (#513): a scoped truthy formula, ANDed with the axes above like any
+	// other of them. It is what lets a band be selected by the state of an entity rather than by the
+	// roll — the fifth axis, and the only one that does not read the dice at all. See matches.
+	when  formulaNode
+	label string
+	ops   []effectOp
 }
 
 // matches reports whether the classified result falls in this band. eval resolves a band-edge formula
@@ -72,6 +76,25 @@ type checkBand struct {
 // CONTRIBUTED to the magnitude (see rollDiceSpec — identical to every rolled face for any spec that
 // discards nothing, which is every kind but keepHigh/keepLow).
 func (b *checkBand) matches(total, margin float64, kept []int, eval func(formulaNode) float64) bool {
+	// The STATE axis (#513), tested first because it is the cheapest way for a band to disqualify
+	// itself and because it is the only axis that ignores the roll entirely. It is ANDed with the
+	// others exactly like they are ANDed with each other — `when` does not override anything, which is
+	// what keeps this a band predicate rather than a new engine concept.
+	//
+	// A band carrying ONLY `when` and no dice test is how content expresses an outcome the roll cannot
+	// change: place it above the natural bands and it wins whenever its predicate holds.
+	//
+	//	{label: crit, when: ["attr", "$target.helpless"]}   # auto-crit: no roll can prevent it
+	//	{face_eq: 20, label: crit}                          # the natural crit, still there
+	//	{label: fail, when: ["attr", "$actor.autofail_save"]}   # auto-fail, ordered FIRST
+	//
+	// TRUTHINESS is "non-zero AND finite". The finiteness half is not pedantry: a formula error yields
+	// 0 (false, so the band is skipped and the roll decides — the fail-safe direction), but a modifier
+	// fold can produce NaN, and `NaN != 0` is TRUE in Go, so a naive test would fire a forced band on a
+	// poisoned attribute. Both non-finite cases read as false.
+	if b.when != nil && !truthyPredicate(eval(b.when)) {
+		return false
+	}
 	if b.min != nil && total < eval(b.min) {
 		return false
 	}
@@ -113,6 +136,11 @@ func (b *checkBand) matches(total, margin float64, kept []int, eval func(formula
 	}
 	return true
 }
+
+// truthyPredicate is the engine's one definition of "this content predicate holds": non-zero and
+// finite. NaN and ±Inf read as FALSE rather than as true-because-not-zero, so an attribute poisoned by
+// a modifier fold cannot satisfy a state predicate it should not.
+func truthyPredicate(v float64) bool { return v != 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // checkVs is the threshold a check resolves against: either a DC formula, or a CONTESTED defender
 // check (the defender rolls their own spec; the resulting total becomes the DC).
