@@ -307,3 +307,75 @@ func TestFormulaReaderRefusesADegradedAttribute(t *testing.T) {
 		"the degraded bonus must contribute 0 — the blow lands for its base amount, NOT a one-shot")
 	require.Equal(t, 95, resourceCurrent(mob, "hp"))
 }
+
+// TestBaseFormulaOverflowIsScreenedNotZeroed pins the seam both #557 reviews flagged: a base FORMULA
+// that overflows must be BOUNDED and marked degraded, not errored to 0. Zero on a direct-read attr
+// like max_hp is the undying/immunity path this whole change exists to prevent, so the base seam must
+// behave like the fold seam.
+func TestBaseFormulaOverflowIsScreenedNotZeroed(t *testing.T) {
+	t.Run("a base formula overflowing to +Inf is bounded", func(t *testing.T) {
+		z, caster := abilityTestZone(t)
+		e := caster.entity
+		// max_hp base = 1e300 * 1e300 -> +Inf. Must screen to the ceiling, not error to 0.
+		z.defs.attr.register("max_hp", &attributeDef{
+			ref:  "max_hp",
+			base: opNode{op: "*", args: []formulaNode{litNode{v: 1e300}, litNode{v: 1e300}}},
+		})
+		require.Equal(t, attrFoldCeiling, attr(e, "max_hp"), "an overflowing base is bounded, not 0")
+		require.True(t, attrIsDegraded(e, "max_hp"))
+		require.Positive(t, resourceMax(e, "hp"), "resourceMax must be positive, not 0 (undying)")
+	})
+
+	t.Run("a division taming to Inf is bounded", func(t *testing.T) {
+		z, caster := abilityTestZone(t)
+		e := caster.entity
+		z.defs.attr.register("tiny", &attributeDef{ref: "tiny", base: litNode{v: 1e-300}})
+		z.defs.attr.register("huge", &attributeDef{
+			ref:  "huge",
+			base: opNode{op: "/", args: []formulaNode{litNode{v: 1e300}, attrNode{ref: "tiny"}}},
+		})
+		require.Equal(t, attrFoldCeiling, attr(e, "huge"), "1e300/1e-300 overflows and is bounded")
+		require.True(t, attrIsDegraded(e, "huge"))
+	})
+
+	t.Run("a genuine base error (div by zero) still resolves to 0", func(t *testing.T) {
+		z, caster := abilityTestZone(t)
+		e := caster.entity
+		z.defs.attr.register("zero", &attributeDef{ref: "zero", base: litNode{v: 0}})
+		z.defs.attr.register("bad", &attributeDef{
+			ref:  "bad",
+			base: opNode{op: "/", args: []formulaNode{litNode{v: 5}, attrNode{ref: "zero"}}},
+		})
+		require.Equal(t, 0.0, attr(e, "bad"), "a div-by-zero is a real error and resolves to 0")
+		require.False(t, attrIsDegraded(e, "bad"), "an error is not a screen — not degraded")
+	})
+}
+
+// TestGrantRefusesADegradedSeed pins Finding 1: modify_attribute_base must not SNAPSHOT a degraded
+// value into a permanent base, which would launder the poison into a clean, formula-trusted number.
+func TestGrantRefusesADegradedSeed(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	// power is degraded by an overflowing fold; scaled_power's base reads it.
+	z.defs.attr.register("power", &attributeDef{ref: "power", base: litNode{v: 2}})
+	z.defs.attr.register("scaled_power", &attributeDef{ref: "scaled_power", base: attrNode{ref: "power"}})
+	for _, ref := range []string{"h1", "h2"} {
+		z.defs.affect.register(ref, &affectDef{
+			ref: ref, duration: 100, maxStacks: 1,
+			modifiers: []affectModifier{{attr: "power", add: false, value: 1e308}},
+		})
+	}
+	applyAffect(e, "h1", attachOpts{}, nil)
+	applyAffect(e, "h2", attachOpts{}, nil)
+	require.True(t, attrIsDegraded(e, "scaled_power"), "scaled_power derives from the degraded power")
+
+	c := seededCtx(z, e, e, dispNeutral)
+	require.NoError(t, opModifyAttributeBase(c, &effectOp{kind: "modify_attribute_base", attr: "scaled_power", amount: 0}))
+
+	// The grant must have been REFUSED: no explicit base override was written, so the attribute still
+	// derives (degraded) rather than snapshotting a clean 1e12 the next formula would trust.
+	require.True(t, attrIsDegraded(e, "scaled_power"),
+		"a refused grant leaves the attribute degraded; a laundered snapshot would read clean")
+	_, hasOverride := e.living.attrBase["scaled_power"]
+	require.False(t, hasOverride, "no permanent base override may be written from a degraded seed")
+}

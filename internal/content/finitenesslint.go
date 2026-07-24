@@ -47,6 +47,12 @@ func LintFinite(packs []Pack) []FinitenessViolation {
 			checkPtr(p.Pack, a.Ref, "attribute "+a.Ref+".min", a.Min)
 			checkPtr(p.Pack, a.Ref, "attribute "+a.Ref+".max", a.Max)
 			checkPtr(p.Pack, a.Ref, "attribute "+a.Ref+".default_base.lit", a.DefaultBase.Lit)
+			// A base FORMULA (the nested-array AST) can carry `.inf`/`.nan` as a bare number literal
+			// anywhere in the tree — `default_base: {expr: ["+", .nan, 5]}`. Walk it; the DefaultBase.Lit
+			// check above only covers the literal-base form.
+			walkFormulaLiterals(a.DefaultBase.Expr, func(v float64) {
+				check(p.Pack, a.Ref, "attribute "+a.Ref+".default_base.expr", v)
+			})
 		}
 		for _, af := range p.Affects {
 			for i, m := range af.Body.Modifiers {
@@ -55,6 +61,25 @@ func LintFinite(packs []Pack) []FinitenessViolation {
 		}
 	}
 	return out
+}
+
+// walkFormulaLiterals descends a decoded formula-AST value (the generic nested-array form) and calls
+// `visit` for every bare numeric literal it finds. A formula node is either a number (a literal), a
+// list whose head is an op string followed by argument nodes, or (defensively) other shapes it
+// ignores. Both float64 (YAML/JSON decode) and int are handled.
+func walkFormulaLiterals(n any, visit func(float64)) {
+	switch v := n.(type) {
+	case float64:
+		visit(v)
+	case int:
+		visit(float64(v))
+	case []any:
+		// [op, arg, arg, ...] — skip the head (an op string or `lit`/`attr` marker) but a `["lit", n]`
+		// still surfaces its number as an element, so walk every element and let the number case catch it.
+		for _, e := range v {
+			walkFormulaLiterals(e, visit)
+		}
+	}
 }
 
 // fieldPath renders a stable, index-bearing field path without pulling in fmt (this file is on the

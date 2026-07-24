@@ -29,7 +29,15 @@ func opModifyAttributeBase(c *effectCtx, op *effectOp) error {
 		return nil // gated cross-player write: clean no-op
 	}
 	// Capture the pre-write base so the audit row carries old/new/delta (#350). Read BEFORE setAttrBase.
-	old := attrBaseValue(c.target, op.attr)
+	old, degraded := attrBaseValue(c.target, op.attr)
+	if degraded {
+		// The seed derives from a screened (poisoned) attribute. Snapshotting it into a PERMANENT base
+		// override would launder the degradation into a clean, formula-trusted number — fail closed
+		// instead, matching the formula-side refusal. A content defect must not become durable state.
+		c.z.log.Warn("modify_attribute_base refused: the base seed derives from a degraded attribute",
+			"attr", op.attr, "target", targetShort(c.target))
+		return nil
+	}
 	newVal := old + op.amount
 	setAttrBase(c.target, op.attr, newVal)
 	// Durable audit (#350): a permanent attribute-base grant is a tracked event. Enqueued off the zone
@@ -99,27 +107,36 @@ func opClearFlag(c *effectCtx, op *effectOp) error {
 // else the attribute def's evaluated default base (the same base step resolveAttr does), else 0. It is the
 // "modify from the current base" seed for modify_attribute_base, so a delta on an un-overridden stat
 // starts from the def default rather than zero. Read-only; zone goroutine.
-func attrBaseValue(e *Entity, name string) float64 {
+// It also reports whether the computed value is DEGRADED — whether the base formula read an attribute
+// the fold screen had to bound (attributes.go). A grant that would SNAPSHOT a degraded value into a
+// permanent base override is a laundering channel: the snapshot is a fresh, non-degraded number, so
+// the propagation that keeps live derivation honest cannot reach it, and a formula later trusts the
+// baked-in poison. The callers refuse a degraded seed for that reason.
+func attrBaseValue(e *Entity, name string) (float64, bool) {
 	if e == nil || e.living == nil {
-		return 0
+		return 0, false
 	}
 	if ov, ok := e.living.attrBase[name]; ok {
-		return ov
+		return ov, false // an explicit override is authoritative content, not a derived value
 	}
 	def := e.zone.attrDefs().get(name)
 	if def == nil || def.base == nil {
-		return 0
+		return 0, false
 	}
+	degraded := false
 	r := &formulaResolver{
 		resolve: func(ref string, v map[string]bool) (float64, error) {
-			rv, _, err := resolveAttr(e, ref, v) // the degraded flag is attr()'s to record, not this path's
+			rv, rd, err := resolveAttr(e, ref, v)
+			if rd {
+				degraded = true
+			}
 			return rv, err
 		},
 		visited: map[string]bool{},
 	}
 	v, err := evalFinite(def.base, r)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return v
+	return v, degraded
 }

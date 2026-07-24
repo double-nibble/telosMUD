@@ -160,11 +160,22 @@ func resolveAttr(e *Entity, name string, visited map[string]bool) (float64, bool
 			},
 			visited: visited,
 		}
-		v, err := evalFinite(def.base, r)
+		// The base formula is evaluated with PLAIN eval, not evalFinite, then SCREENED — deliberately.
+		// evalFinite would return an error on a non-finite RESULT and resolveAttr would resolve to 0,
+		// which is the very undying/immunity outcome this file exists to prevent: 0 on max_hp means
+		// resourceMax <= 0. A base that overflows to ±Inf (`1000/defense` with defense 0 taming to Inf,
+		// or `1e300*1e300`) must instead be bounded and marked degraded, exactly like the fold. A genuine
+		// error (a cycle, a division by zero) is still an error and still resolves to 0 — eval returns
+		// those as errors, not as non-finite values, so this only reinterprets the non-finite-RESULT case.
+		v, err := def.base.eval(r)
 		if err != nil {
 			return 0, false, err
 		}
-		base = v
+		var baseScreened bool
+		base, baseScreened = attrScreen(v, 0)
+		if baseScreened {
+			degraded = true
+		}
 	}
 
 	// 2. + flat mods, then × multipliers, summed/multiplied across every modifier source.

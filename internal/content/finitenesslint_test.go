@@ -88,3 +88,26 @@ func TestLintFiniteEndToEndFromYAML(t *testing.T) {
 	require.Equal(t, "NaN", got[0].Kind)
 	require.Equal(t, "cursed", got[0].Ref)
 }
+
+// TestLintFiniteWalksBaseFormula pins that a non-finite literal nested in a base FORMULA (not just the
+// literal-base form) is caught — the gap the security review flagged.
+func TestLintFiniteWalksBaseFormula(t *testing.T) {
+	nan := math.NaN()
+	inf := math.Inf(1)
+	packs := []Pack{{
+		Pack: "bad",
+		Attributes: []AttributeDTO{
+			{Ref: "a_expr_nan", DefaultBase: BaseSpecDTO{Expr: []any{"+", nan, float64(5)}}},
+			{Ref: "a_expr_deep", DefaultBase: BaseSpecDTO{Expr: []any{"*", float64(2), []any{"-", inf, float64(1)}}}},
+			{Ref: "a_expr_ok", DefaultBase: BaseSpecDTO{Expr: []any{"+", float64(1), float64(2)}}},
+		},
+	}}
+	got := LintFinite(packs)
+	byRef := map[string]int{}
+	for _, v := range got {
+		byRef[v.Ref]++
+	}
+	require.Equal(t, 1, byRef["a_expr_nan"], "a NaN literal in a formula is caught")
+	require.Equal(t, 1, byRef["a_expr_deep"], "an Inf nested deeper in the tree is caught")
+	require.Zero(t, byRef["a_expr_ok"], "an all-finite formula is clean")
+}
