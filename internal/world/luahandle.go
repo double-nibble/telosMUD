@@ -676,16 +676,16 @@ func (rt *luaRuntime) hOccupants(l *lua.LState) int {
 
 // roomFlagOpenSight is the opt-in room flag that sanctions the #363 nearby-creature disclosure. The engine
 // reads this specific flag name (like pvp.go reads "safe"/"arena"): a room carrying it DECLARES that its
-// occupants' PRESENCE may be perceived from an adjacent open_sight room in a display render. It is builder-
-// declared and confined to outdoor/overworld terrain, never arbitrary rooms — that declaration IS the security
-// boundary of the primitive.
+// occupants' PRESENCE may be perceived from another open_sight room in a display render. It is builder-declared
+// and confined to outdoor/overworld terrain, never arbitrary rooms — that declaration IS the security boundary
+// of the primitive.
+//
+// BUILDER NOTE ON SCOPE: the flag is the WHOLE gate — the primitive does not itself bound distance. Flagging a
+// room `open_sight` opts its mob-presence into disclosure to ANY other open_sight room in the same zone whose
+// template reaches it, not only immediate neighbours. "Nearby" is the calling template's policy (the overworld
+// `room` template limits itself to a 5x5 flood-fill window); the engine enforces only the mutual opt-in. Flag
+// only terrain where a coarse presence marker is intended (open outdoor expanses), not enclosed rooms.
 const roomFlagOpenSight = "open_sight"
-
-// roomCarriesFlag reports whether room entity e has the named content flag (Room.namedFlags). nil-safe;
-// mirrors hHasRoomFlag's read. A non-room / flagless entity yields false.
-func roomCarriesFlag(e *Entity, name string) bool {
-	return e != nil && e.room != nil && e.room.namedFlags != nil && e.room.namedFlags[name]
-}
 
 // hHasVisibleCreature is the #363 NARROW, presence-only disclosure primitive for the overworld minimap. In a
 // DISPLAY render it reports whether room handle `e` holds at least one canSee-visible NON-PLAYER creature —
@@ -728,7 +728,7 @@ func (rt *luaRuntime) hHasVisibleCreature(l *lua.LState) int {
 	if anchor == nil {
 		anchor = viewer.location
 	}
-	if anchor == nil || !roomCarriesFlag(anchor, roomFlagOpenSight) || !roomCarriesFlag(e, roomFlagOpenSight) {
+	if anchor == nil || !roomFlag(anchor, roomFlagOpenSight) || !roomFlag(e, roomFlagOpenSight) {
 		l.Push(lua.LFalse)
 		return 1
 	}

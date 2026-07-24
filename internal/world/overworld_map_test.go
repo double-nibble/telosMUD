@@ -243,6 +243,12 @@ func TestOverworldGeneratedZoneShape(t *testing.T) {
 			if !e.room.namedFlags["overworld"] {
 				t.Fatalf("%s is missing the `overworld` flag (map scoping depends on it)", ref)
 			}
+			// #363: every plains room must ALSO carry `open_sight` so the minimap's nearby-mob marker
+			// (has_visible_creature) can disclose presence between plains cells. A hand-edit dropping it would
+			// silently kill the marker without any other test failing, so pin it in the shape guard.
+			if !e.room.namedFlags["open_sight"] {
+				t.Fatalf("%s is missing the `open_sight` flag (the #363 nearby-mob marker depends on it)", ref)
+			}
 			n++
 		}
 	}
