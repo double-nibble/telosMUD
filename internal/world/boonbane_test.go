@@ -844,6 +844,7 @@ func TestCheckKeySetsCannotDriftFromTheStructs(t *testing.T) {
 				"dice": "dice", "bonus": "bonus", "vs": "vs", "bands": "bands",
 				"visibility": "visibility", "label": "label",
 				"boon": "boon", "bane": "bane", "boonDice": "boon_dice", "baneDice": "bane_dice",
+				"subject": "subject",
 			},
 		},
 		{
