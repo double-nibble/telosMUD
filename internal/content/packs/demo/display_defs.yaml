@@ -76,9 +76,13 @@ display_defs:
         elseif h:has_room_flag("landmark_lake") then rec.icon = "~"
         elseif h:has_room_flag("landmark_house") then rec.icon = "H"
         elseif h:has_room_flag("landmark_hill") then rec.icon = "^"
+        elseif h:has_visible_creature() then rec.icon = "!"
         else rec.icon = "." end
-        -- NOTE: nearby-creature markers (a roaming mob as `!`) are deferred — a display template may NOT read
-        -- a FOREIGN room's occupants (#253 anti-scry). Tracked as a follow-up; the plains still spawn roamers.
+        -- #363 nearby-creature marker: `!` marks a cell where a canSee-visible roaming MOB is present. It uses
+        -- the purpose-built has_visible_creature disclosure primitive (luahandle.go), which reveals PRESENCE
+        -- ONLY (no identity) and only for `open_sight`-flagged terrain on BOTH this cell and the player's cell —
+        -- so it does NOT re-open the #253 foreign-room anti-scry (h:occupants() still discloses nothing here).
+        -- Landmarks keep their icon (navigation); a plain cell with a mob shows `!`. The centre is always `@`.
         for _, e in ipairs(h:exits()) do
           local d = e.dir
           local ndx, ndy = dx, dy

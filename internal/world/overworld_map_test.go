@@ -100,11 +100,9 @@ func TestOverworldMapLandmarkIcons(t *testing.T) {
 	}
 }
 
-// TestOverworldMapDoesNotDiscloseForeignOccupants documents (and guards) the current SECURE behaviour: a
-// display template may not read a FOREIGN room's occupants (#253 anti-scry), so a mob in an ADJACENT room is
-// NOT drawn on the map. Nearby-creature markers are a deferred follow-up needing a purpose-built disclosure
-// primitive. This test pins that the template does not leak an adjacent creature today.
-func TestOverworldMapDoesNotDiscloseForeignOccupants(t *testing.T) {
+// TestOverworldMapMarksNearbyVisibleMob is the #363 feature: a canSee-visible roaming MOB one cell away is
+// drawn as a coarse `!` presence marker, via the purpose-built has_visible_creature disclosure primitive.
+func TestOverworldMapMarksNearbyVisibleMob(t *testing.T) {
 	z, _, render := overworldViewer(t)
 	mob := z.newEntity("overworld:mob:probe")
 	Add(mob, &Living{})
@@ -115,11 +113,13 @@ func TestOverworldMapDoesNotDiscloseForeignOccupants(t *testing.T) {
 	if !ok {
 		t.Fatal("template did not render")
 	}
-	// The adjacent mob must NOT surface as a marker (the #253 guard makes h:occupants() empty for a foreign
-	// room). The only non-map glyphs are the player @ and any landmark; `!` is reserved for the deferred
-	// nearby-creature feature, so it must be absent here.
-	if strings.Contains(sheet, "!") {
-		t.Fatalf("map disclosed an adjacent-room creature (violates the #253 display anti-scry guard):\n%s", sheet)
+	if !strings.Contains(sheet, "!") {
+		t.Fatalf("map did not mark the adjacent visible mob with `!`:\n%s", sheet)
+	}
+	// CRUCIAL: presence only — the mob's IDENTITY never leaks. The general foreign-room anti-scry (#253) still
+	// holds: the sheet must not contain the mob's short/name (the marker is a bare `!`).
+	if strings.Contains(sheet, "a test beast") {
+		t.Fatalf("map disclosed the adjacent creature's IDENTITY (only presence is allowed):\n%s", sheet)
 	}
 }
 
@@ -242,6 +242,12 @@ func TestOverworldGeneratedZoneShape(t *testing.T) {
 			}
 			if !e.room.namedFlags["overworld"] {
 				t.Fatalf("%s is missing the `overworld` flag (map scoping depends on it)", ref)
+			}
+			// #363: every plains room must ALSO carry `open_sight` so the minimap's nearby-mob marker
+			// (has_visible_creature) can disclose presence between plains cells. A hand-edit dropping it would
+			// silently kill the marker without any other test failing, so pin it in the shape guard.
+			if !e.room.namedFlags["open_sight"] {
+				t.Fatalf("%s is missing the `open_sight` flag (the #363 nearby-mob marker depends on it)", ref)
 			}
 			n++
 		}
