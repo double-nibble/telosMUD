@@ -158,6 +158,17 @@ func immuneToAffect(e *Entity, def *affectDef) (string, bool) {
 	return "", false
 }
 
+// grantsToken reports whether affect def's own grants_immunity list contains `tok` (#538) — used by the
+// self-ward exemption so an affect that grants immunity to a token it itself carries can still refresh.
+func grantsToken(def *affectDef, tok string) bool {
+	for _, g := range def.grantsImmunity {
+		if g == tok {
+			return true
+		}
+	}
+	return false
+}
+
 // preventsAny reports whether any active affect prevents ANY of the given tags — the exact step-3
 // query shape (does an affect block any tag this ability carries?). Returns the first blocked tag.
 func preventsAny(e *Entity, tags []string) (string, bool) {

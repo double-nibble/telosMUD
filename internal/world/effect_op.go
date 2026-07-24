@@ -958,13 +958,15 @@ func soak(target *Entity, dmgType string) float64 {
 // target routes through guardHarmful before attaching, exactly like dealDamage. A helpful/neutral
 // apply_affect (a buff on self/ally) does NOT go through here — it attaches directly. This is the
 // second harmful op that funnels through the ONE guard, so the can't-bypass property covers debuffs
-// too. Returns true if the affect was applied (false on a gated block). Single-writer: zone goroutine.
+// too. Returns true iff the affect actually ATTACHED — false on a gated block AND false on a #538
+// immunity veto (applyAffect returns nil when the target was immune). The return is "did an affect land
+// on the target", not merely "did the harm gate pass", so a caller that counts afflictions or narrates
+// "you afflict X" reads the truth. Single-writer: zone goroutine.
 func applyDebuff(c *effectCtx, target *Entity, affectRef string, opts attachOpts) bool {
 	if !guardHarmful(c, target) {
 		return false
 	}
-	applyAffect(target, affectRef, opts, c) // thread the cascade ctx (bounds a nested OnApplyAffect)
-	return true
+	return applyAffect(target, affectRef, opts, c) != nil // thread the cascade ctx (bounds a nested OnApplyAffect)
 }
 
 // vitalResource returns the ref of the target's PRIMARY (default-damage) vital resource (hp in the

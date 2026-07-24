@@ -95,7 +95,21 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 	// restoring in either order must yield the same set), so the load path is never vetoed — a player who
 	// gained immunity while logged out is handled by the same lifecycle that would strip it, not by a
 	// load-order-sensitive veto here. A live apply (a cast, a proc, a tick) IS vetoed.
-	if tok, immune := immuneToAffect(e, def); immune {
+	//
+	// SEMANTIC, stated explicitly (review): immunity BLOCKS NEW afflictions; it does NOT cleanse one
+	// already attached. Gaining a charm-ward while charmed leaves the charm active — cleansing is a
+	// separate remove_affect/dispel op (which a ward can run from its own on_apply). And immunity matches
+	// on IDENTITY, not polarity, so a ward against a `mind` tag also blocks a benign affect that reuses
+	// that tag; the shared token namespace is content's to keep disjoint. (The HARM GATE reads polarity
+	// separately — a grant that can block a beneficial affect is classified harm at applyDebuff so it
+	// can't be applied cross-player — but this identity veto itself is polarity-blind.)
+	//
+	// SELF-WARD EXEMPTION: an affect must not veto its OWN re-application. A ward that grants immunity to
+	// a token it itself carries (spell_shield tagged `magic` granting immunity to `magic`) would else
+	// refuse its own refresh and decay to a one-shot. When the matched token is one the INCOMING def
+	// grants, the incoming affect IS a source of that immunity, so its (re)apply falls through to the
+	// stacking rule below.
+	if tok, immune := immuneToAffect(e, def); immune && !grantsToken(def, tok) {
 		e.zone.log.Debug("affect apply vetoed: target is immune", "ref", ref, "matched", tok, "rid", e.rid)
 		fireOnAffectBlocked(e, def, opts.source, parent)
 		return nil // no attach, no stacking, no on_apply, no recompute — as if the apply never happened

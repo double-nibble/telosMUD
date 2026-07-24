@@ -3,6 +3,8 @@ package world
 import (
 	"testing"
 
+	"github.com/double-nibble/telosmud/internal/content"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -197,4 +199,173 @@ func TestImmunityGrantIsBenign(t *testing.T) {
 	mind := &affectDef{ref: "mind_blank", grantsImmunity: []string{"charm"}}
 	require.False(t, affectIsDetrimental(mind, harmPolarity{}), "granting immunity is protective, a buff")
 	require.True(t, affectSurvivesRespawn(mind, harmPolarity{}), "a protective ward survives respawn")
+}
+
+// immHarmZone builds a zone with the harm-polarity sets DERIVED, so affectIsDetrimental sees the
+// immune-to-a-buff classification (#538 security fix). It registers a benign HoT (regen) and a
+// harmful charm, then an immune-to-regen (harmful) and immune-to-charm (benign) grant.
+func immHarmZone(t *testing.T) (*Zone, *session) {
+	t.Helper()
+	z, caster := abilityTestZone(t)
+	z.defs.affect.register("regen", &affectDef{
+		ref: "regen", name: "Regeneration", category: "blessing", stacking: stackRefresh, maxStacks: 1, duration: 100,
+		tags: []string{"heal"}, // beneficial: no modifiers/prevents; a HoT
+	})
+	z.defs.affect.register("charm", &affectDef{
+		ref: "charm", name: "Charmed", category: "enchantment", stacking: stackRefresh, maxStacks: 1, duration: 100,
+		tags: []string{"charm"}, prevents: []string{"act"}, // harmful: a CC
+	})
+	z.defs.affect.register("immune_regen", &affectDef{
+		ref: "immune_regen", name: "Immune to Regen", stacking: stackRefresh, maxStacks: 1, duration: 100,
+		grantsImmunity: []string{"heal"}, // blocks the benign regen -> HARM
+	})
+	z.defs.affect.register("immune_charm", &affectDef{
+		ref: "immune_charm", name: "Immune to Charm", stacking: stackRefresh, maxStacks: 1, duration: 100,
+		grantsImmunity: []string{"charm"}, // blocks the harmful charm -> a ward, BENIGN
+	})
+	// Derive the harm-polarity sets (defineGlobals does this at boot).
+	z.defs.harm.harmfulImmunityGrants = harmfulImmunityGrantRefs(z.defs, z.defs.harm)
+	return z, caster
+}
+
+// TestImmuneToBuffIsClassifiedHarm is the SECURITY fix (#538 F1). A grants_immunity affect that can
+// block a BENEFICIAL affect (immune-to-heal) is a debuff — it must be gated cross-player and stripped
+// on respawn. An immune-to-charm ward (blocks a harmful affect) stays a buff.
+func TestImmuneToBuffIsClassifiedHarm(t *testing.T) {
+	z, _ := immHarmZone(t)
+	h := z.defs.harm
+
+	require.True(t, h.harmfulImmunityGrants["immune_regen"], "immune-to-a-buff must be derived harmful")
+	require.False(t, h.harmfulImmunityGrants["immune_charm"], "immune-to-a-debuff (a ward) stays benign")
+
+	immRegen := z.defs.affect.get("immune_regen")
+	immCharm := z.defs.affect.get("immune_charm")
+	require.True(t, affectIsDetrimental(immRegen, h), "immune-to-heal is a debuff")
+	require.False(t, affectSurvivesRespawn(immRegen, h), "...and must not survive respawn")
+	require.False(t, affectIsDetrimental(immCharm, h), "immune-to-charm is a ward, a buff")
+	require.True(t, affectSurvivesRespawn(immCharm, h))
+}
+
+// TestImmuneToHealIsGatedCrossPlayer is the end-to-end SECURITY property: an attacker applying
+// immune-to-heal to a non-consenting player in a no-PvP room must be REFUSED — otherwise they block
+// the victim's healing ungated (the reported HIGH hole).
+func TestImmuneToHealIsGatedCrossPlayer(t *testing.T) {
+	z, caster := immHarmZone(t)
+	victim := makePlayerTargetInRoom(z, caster.entity, "Victim")
+	c := &effectCtx{z: z, actor: caster.entity, source: caster.entity, target: victim.entity, mag: 1, disp: dispNeutral}
+	require.NoError(t, opApplyAffect(c, &effectOp{kind: "apply_affect", affect: "immune_regen"}))
+	require.False(t, hasAffect(victim.entity, "immune_regen"),
+		"immune-to-heal is harm — it must be refused at a non-consenting player, not land ungated")
+
+	// The ward (immune-to-charm) is benign, so warding an ally still lands.
+	require.NoError(t, opApplyAffect(c, &effectOp{kind: "apply_affect", affect: "immune_charm"}))
+	require.True(t, hasAffect(victim.entity, "immune_charm"), "warding an ally against charm still lands")
+}
+
+// TestSelfWardCanRefresh pins the abilities-review P2 fix: an affect that grants immunity to a token it
+// itself carries must not veto its OWN re-application (else it decays to a one-shot).
+func TestSelfWardCanRefresh(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	e := caster.entity
+	z.defs.affect.register("spell_shield", &affectDef{
+		ref: "spell_shield", name: "Spell Shield", stacking: stackRefresh, maxStacks: 1, duration: 10,
+		tags: []string{"magic"}, grantsImmunity: []string{"magic"}, // wards magic AND is tagged magic
+	})
+	inst := applyAffect(e, "spell_shield", attachOpts{}, nil)
+	require.NotNil(t, inst)
+	inst.remaining = 3 // simulate decay
+	// Re-cast: must REFRESH (not be vetoed by its own magic-immunity).
+	inst2 := applyAffect(e, "spell_shield", attachOpts{}, nil)
+	require.NotNil(t, inst2, "a self-ward must be able to refresh itself")
+	require.Equal(t, 10, inst2.remaining, "the refresh reset the duration")
+
+	// But it STILL wards a DIFFERENT magic affect from a different source.
+	z.defs.affect.register("fireball_curse", &affectDef{
+		ref: "fireball_curse", stacking: stackRefresh, maxStacks: 1, duration: 100, tags: []string{"magic"},
+	})
+	require.Nil(t, applyAffect(e, "fireball_curse", attachOpts{}, nil), "a different magic affect is still warded")
+}
+
+// TestImmunityDoesNotCleanseExisting pins the abilities-review P4 semantic: immunity blocks NEW
+// afflictions, it does not strip one already attached.
+func TestImmunityDoesNotCleanseExisting(t *testing.T) {
+	_, _, mob := immunityZone(t)
+	applyAffect(mob, "charm", attachOpts{}, nil)
+	require.True(t, hasAffect(mob, "charm"), "charmed first")
+	applyAffect(mob, "mind_blank", attachOpts{}, nil)
+	require.True(t, hasAffect(mob, "charm"),
+		"gaining immunity does NOT cleanse an existing charm — block-new, not cleanse")
+}
+
+// TestVetoThroughTheRealDebuffPath is the abilities-review P5 coverage: drive the veto through
+// opApplyAffect -> applyDebuff -> guardHarmful -> applyAffect (the path real harmful content uses), and
+// confirm applyDebuff now reports false when the affect was vetoed (the P1 contract fix).
+func TestVetoThroughTheRealDebuffPath(t *testing.T) {
+	z, caster := abilityTestZone(t)
+	z.defs.affect.register("mind_blank", &affectDef{
+		ref: "mind_blank", stacking: stackRefresh, maxStacks: 1, duration: 100, grantsImmunity: []string{"charm"},
+	})
+	z.defs.affect.register("charm", &affectDef{
+		ref: "charm", category: "enchantment", stacking: stackRefresh, maxStacks: 1, duration: 100,
+		tags: []string{"charm"}, prevents: []string{"act"},
+	})
+	mob := makeMobTarget(z, caster.entity, "goblin")
+	applyAffect(mob, "mind_blank", attachOpts{}, nil)
+
+	c := seededCtx(z, caster.entity, mob, dispHarmful)
+	landed := applyDebuff(c, mob, "charm", attachOpts{source: caster.entity})
+	require.False(t, landed, "applyDebuff must report FALSE when the affect was vetoed by immunity")
+	require.False(t, hasAffect(mob, "charm"))
+
+	// The debuff DID land on a non-immune target (control), so applyDebuff's true is real.
+	other := makeMobTarget(z, caster.entity, "orc")
+	require.True(t, applyDebuff(seededCtx(z, caster.entity, other, dispHarmful), other, "charm", attachOpts{}))
+	require.True(t, hasAffect(other, "charm"))
+}
+
+// TestHarmfulImmunityGrantDerivation covers each match granularity of the derivation independently
+// (ref/category/tag), since a fixture that only matches by tag leaves the ref/category branches
+// unpinned.
+func TestHarmfulImmunityGrantDerivation(t *testing.T) {
+	z, _ := abilityTestZone(t)
+	// A benign buff with distinct ref/category/tag tokens.
+	z.defs.affect.register("blessing", &affectDef{
+		ref: "blessing", category: "holy", stacking: stackRefresh, maxStacks: 1, duration: 100,
+		tags: []string{"light"}, // benign: no modifiers/prevents
+	})
+	// Grants that block it by each granularity.
+	z.defs.affect.register("g_ref", &affectDef{ref: "g_ref", grantsImmunity: []string{"blessing"}})
+	z.defs.affect.register("g_cat", &affectDef{ref: "g_cat", grantsImmunity: []string{"holy"}})
+	z.defs.affect.register("g_tag", &affectDef{ref: "g_tag", grantsImmunity: []string{"light"}})
+	// A grant that blocks nothing benign (an unknown token).
+	z.defs.affect.register("g_none", &affectDef{ref: "g_none", grantsImmunity: []string{"nonexistent"}})
+
+	got := harmfulImmunityGrantRefs(z.defs, z.defs.harm)
+	require.True(t, got["g_ref"], "blocking a benign affect by REF is harm")
+	require.True(t, got["g_cat"], "blocking a benign affect by CATEGORY is harm")
+	require.True(t, got["g_tag"], "blocking a benign affect by TAG is harm")
+	require.False(t, got["g_none"], "granting immunity to nothing that exists is not harm")
+}
+
+// TestHarmfulImmunityGrantsPopulatedAtBuild pins the build WIRING: defineGlobals must derive and store
+// the set, not leave it nil. Every other harm test builds the set by hand.
+func TestHarmfulImmunityGrantsPopulatedAtBuild(t *testing.T) {
+	lc := &content.LoadedContent{
+		Affects: []content.AffectDTO{
+			{Ref: "regen", Category: "blessing", Body: content.AffectBodyDTO{
+				Duration: 100, Tags: []string{"heal"},
+			}},
+			{Ref: "immune_regen", Body: content.AffectBodyDTO{
+				Duration: 100, GrantsImmunity: []string{"heal"},
+			}},
+		},
+	}
+	d := newDefRegistries()
+	defineGlobals(d, lc)
+	require.True(t, d.harm.harmfulImmunityGrants["immune_regen"],
+		"defineGlobals must derive and store the harmful-immunity-grant set from the shipped affects")
+
+	// And the derived set must reach the harm decision through the real accessor.
+	imm := d.affect.get("immune_regen")
+	require.True(t, affectIsDetrimental(imm, d.harm))
 }

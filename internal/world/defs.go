@@ -584,6 +584,9 @@ func affectIsDetrimental(def *affectDef, h harmPolarity) bool {
 	if hasVulnerability(def) {
 		return true // a per-target VULNERABILITY (#537): taking >1× damage of a type is a debuff
 	}
+	if h.harmfulImmunityGrants[def.ref] {
+		return true // a grants_immunity (#538) that blocks a BENEFICIAL affect (immune-to-heal) is harm
+	}
 	if detrimentalCategories[def.category] {
 		return true
 	}
@@ -602,6 +605,65 @@ func hasVulnerability(def *affectDef) bool {
 		}
 	}
 	return false
+}
+
+// harmfulImmunityGrantRefs DERIVES the set of affect refs whose grants_immunity (#538) can block a
+// BENEFICIAL affect — and is therefore a debuff, not a ward. It exists to close the same harm-gate hole
+// as #511/#513/#537: a grants_immunity affect has no modifiers and no prevents, so the sign-based
+// affectIsDetrimental reads it as benign and it lands UNGATED on a non-consenting player. But "immune
+// to heal" or "immune to a blessing" is harm — the polarity lives in WHAT the immunity blocks, which
+// the sign test never inspects. "Immune to charm" stays a buff (charm is itself harm; warding an ally
+// is protective).
+//
+// THE RULE: a grant is harmful iff any token it grants (matched by ref / category / tag) names a
+// registered affect that is NOT detrimental by its OWN properties. "Own properties" is the base harm
+// test (modifiers / prevents / vulnerability / inverted-attr / condition-flag / category) — deliberately
+// NOT including THIS immunity derivation, so the computation is one non-recursive pass: an affect that
+// only grants immunity is itself base-benign, and an immunity-to-an-immunity does not spiral.
+//
+// Build-time, over the immutable registries; stored once in harmPolarity and read-only thereafter.
+// Errs toward gating when a token matches both a benign and a harmful affect (it is added to the set),
+// matching the documented posture of the other harm derivations. A token that matches NO registered
+// affect at build is treated benign (not gated) — acceptable, since an immunity blocks nothing until a
+// matching affect exists, and this is no worse than the pre-#538 status quo.
+func harmfulImmunityGrantRefs(d *defRegistries, h harmPolarity) map[string]bool {
+	affects := d.affect.table()
+	// Index every registered affect by each of its match tokens (ref/category/tag) -> is it base-benign?
+	// A token is "protective to block" if ANY affect it names is base-benign; but we also want "errs
+	// toward gating", so a token that names a benign affect flags the grant regardless of other matches.
+	benignToken := map[string]bool{}
+	for _, b := range affects {
+		if b == nil {
+			continue
+		}
+		if affectIsDetrimental(b, h) { // base test: h has no harmfulImmunityGrants yet (built after this)
+			continue
+		}
+		// b is a beneficial affect; every token that names it is a token whose immunity blocks a buff.
+		benignToken[b.ref] = true
+		if b.category != "" {
+			benignToken[b.category] = true
+		}
+		for _, t := range b.tags {
+			benignToken[t] = true
+		}
+	}
+	out := map[string]bool{}
+	for _, a := range affects {
+		if a == nil {
+			continue
+		}
+		for _, tok := range a.grantsImmunity {
+			if benignToken[tok] {
+				out[a.ref] = true
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // affectStrippedOnRespawn reports whether an affect must be PURGED when its bearer respawns (#318): death is a
@@ -626,6 +688,13 @@ type harmPolarity struct {
 	inverted map[string]bool
 	// conditionFlags: read by a band state predicate (conditionFlagAttrs). ANY modifier is gate-worthy.
 	conditionFlags map[string]bool
+	// harmfulImmunityGrants (#538): the set of affect REFS whose grants_immunity can block a BENEFICIAL
+	// affect (immune-to-heal, immune-to-a-buff) — which is harm, not a ward. Derived
+	// (harmfulImmunityGrantRefs) because the polarity of an immunity depends on what it blocks, which the
+	// sign-based harm test never inspects: "immune to charm" is a buff (charm is harm), "immune to heal"
+	// is a debuff. Without this an attacker's immune-to-heal affect lands ungated on a non-consenting
+	// player. nil for content with no such grant.
+	harmfulImmunityGrants map[string]bool
 }
 
 // attributeInvertedPolarity DERIVES the set of attributes whose polarity is reversed — higher is WORSE
@@ -887,6 +956,9 @@ func affectSurvivesRespawn(def *affectDef, h harmPolarity) bool {
 	}
 	if hasVulnerability(def) {
 		return false // a vulnerability (#537) is harm; it must not survive the respawn purge
+	}
+	if h.harmfulImmunityGrants[def.ref] {
+		return false // an immune-to-heal grant (#538) is harm; it must not survive respawn
 	}
 	if detrimentalCategories[def.category] {
 		return false

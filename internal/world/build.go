@@ -364,9 +364,14 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		inverted:       attributeInvertedPolarity(d),
 		conditionFlags: conditionFlagAttrs(d),
 	}
-	if len(d.harm.inverted) > 0 || len(d.harm.conditionFlags) > 0 {
-		slog.Debug("content: derived harm-polarity attribute sets from the check formulas",
-			"inverted", len(d.harm.inverted), "condition_flags", len(d.harm.conditionFlags))
+	// The immune-to-a-buff derivation (#538) runs AFTER the attribute sets above, because it calls
+	// affectIsDetrimental on every affect to decide which are benign — and that uses inverted/
+	// conditionFlags. It reads d.harm as it stands now (without harmfulImmunityGrants), which is exactly
+	// the non-recursive base test the derivation is defined against; only then is the result stored.
+	d.harm.harmfulImmunityGrants = harmfulImmunityGrantRefs(d, d.harm)
+	if len(d.harm.inverted) > 0 || len(d.harm.conditionFlags) > 0 || len(d.harm.harmfulImmunityGrants) > 0 {
+		slog.Debug("content: derived harm-polarity sets", "inverted", len(d.harm.inverted),
+			"condition_flags", len(d.harm.conditionFlags), "harmful_immunity_grants", len(d.harm.harmfulImmunityGrants))
 	}
 	slog.Debug("global defs registered", "attributes", d.attr.len(),
 		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len(),
