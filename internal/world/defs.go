@@ -124,12 +124,12 @@ type defRegistries struct {
 	recipe  *defRegistry[*recipeDef]     // Phase 13.5 crafting recipes
 	help    *defRegistry[*helpDef]       // #64 builder-defined help topics
 
-	// invertedAttrs is the DERIVED set of attributes whose polarity is reversed — higher is worse for
-	// the bearer — computed once at the end of defineGlobals from the boon/bane channel's own formulas
-	// (attributeInvertedPolarity). The harm derivations read it so a debuff authored as a POSITIVE
-	// modifier on a bane counter is still gated + purged. nil for content that uses no boon/bane, which
-	// is the pre-#511 behaviour exactly. Set once at build, then read-only (like defaultCombat).
-	invertedAttrs map[string]bool
+	// harm holds the DERIVED attribute sets the harm derivations consult (#511 inverted polarity, #513
+	// condition flags), computed once at the end of defineGlobals from the content's own check formulas.
+	// They exist because affectIsDetrimental infers harm from a modifier's SIGN, which assumes
+	// higher-is-better and cannot see either a bane counter or a condition flag. Zero value = the
+	// pre-#511 sign-only behaviour. Set once at build, then read-only (like defaultCombat).
+	harm harmPolarity
 
 	// trust is the pack's content-defined trust ladder (#27/#29, Round 9 Slice 0): tier→rank + granted
 	// reserved flags, built from lc.TrustTiers. nil => the engine default ladder (player/builder/admin,
@@ -222,14 +222,14 @@ func (z *Zone) abilityDefs() *defRegistry[*abilityDef] {
 	return z.defBundle().ability
 }
 
-// invertedAttrs returns the derived reversed-polarity attribute set (#511) the harm derivations
-// consult. nil-safe: a zone with no def bundle (a bare test zone) has no channel and so no inverted
-// attributes, and a nil map reads as "none" at every lookup.
-func (z *Zone) invertedAttrs() map[string]bool {
+// harmPolarity returns the derived attribute sets (#511 inverted polarity, #513 condition flags) the
+// harm derivations consult. nil-safe: a zone with no def bundle (a bare test zone) derives nothing, and
+// a nil map reads as "none" at every lookup.
+func (z *Zone) harmPolarity() harmPolarity {
 	if z == nil {
-		return nil
+		return harmPolarity{}
 	}
-	return z.defBundle().invertedAttrs
+	return z.defBundle().harm
 }
 
 // combatProfiles is the zone-goroutine read accessor for the global combat-profile registry (combat.go,
@@ -532,12 +532,18 @@ var detrimentalCategories = map[string]bool{
 // `inverted` is the set of attributes whose polarity is REVERSED — higher is worse for the bearer —
 // derived from the boon/bane channel's own formulas (attributeInvertedPolarity). For those the sign
 // test flips: a POSITIVE additive is the harm. A nil/empty set restores the pre-#511 behaviour exactly.
-func affectIsDetrimental(def *affectDef, inverted map[string]bool) bool {
+func affectIsDetrimental(def *affectDef, h harmPolarity) bool {
 	if def == nil {
 		return false
 	}
 	for _, m := range def.modifiers {
-		if inverted[m.attr] {
+		if h.conditionFlags[m.attr] {
+			// A CONDITION FLAG (#513): an attribute a band state-predicate reads. Which direction helps
+			// is written in the band's label, which the engine never reads, so ANY modifier that moves
+			// one is gate-worthy. See conditionFlagAttrs.
+			return true
+		}
+		if h.inverted[m.attr] {
 			// On an inverted attribute the harmful direction is UP (+3 atk_bane is a debuff), so any
 			// modifier that raises it is harm. A modifier that LOWERS one is a genuine buff and is left
 			// ungated, so blessing an ally still lands.
@@ -571,8 +577,19 @@ func affectIsDetrimental(def *affectDef, inverted map[string]bool) bool {
 // while a false negative is the exact bug #318 exists to close (a hostile effect following you to the temple).
 // This is intentionally BROADER than affectIsDetrimental (the PvP apply-gate's def-only harm test, which is
 // itself a strict subset of the runtime gate's harm notion) — left unchanged so PvP semantics don't move.
-func affectStrippedOnRespawn(def *affectDef, inverted map[string]bool) bool {
-	return !affectSurvivesRespawn(def, inverted)
+func affectStrippedOnRespawn(def *affectDef, h harmPolarity) bool {
+	return !affectSurvivesRespawn(def, h)
+}
+
+// harmPolarity is the pair of DERIVED attribute sets the harm derivations consult, bundled so the two
+// cannot be passed in the wrong order or silently forgotten at a call site. Both are computed once at
+// the end of defineGlobals and read-only thereafter; a zero value restores the pre-#511 sign-only
+// behaviour exactly, which is what a bare test zone gets.
+type harmPolarity struct {
+	// inverted: higher is WORSE for the bearer (attributeInvertedPolarity). The sign test flips.
+	inverted map[string]bool
+	// conditionFlags: read by a band state predicate (conditionFlagAttrs). ANY modifier is gate-worthy.
+	conditionFlags map[string]bool
 }
 
 // attributeInvertedPolarity DERIVES the set of attributes whose polarity is reversed — higher is WORSE
@@ -608,6 +625,12 @@ func affectStrippedOnRespawn(def *affectDef, inverted map[string]bool) bool {
 // only: an attribute a pack invents with reversed polarity and never routes through boon/bane (a raw
 // `corruption` stat) is still invisible to the sign test, exactly as it was before #511. That is a
 // pre-existing property of affectIsDetrimental and is not narrowed or widened here.
+//
+// BAND STATE PREDICATES (#513) ARE NOT HANDLED HERE — see conditionFlagAttrs, which gates them
+// unconditionally instead of trying to infer their polarity. The role rule above genuinely does not
+// transfer to them: for boon/bane the CHANNEL NAME carries the polarity, whereas for a `when` the
+// polarity lives in which band the predicate sits on, and band semantics are vocabulary the engine
+// refuses to learn.
 //
 // Build-time only, over the immutable registries; the result is stored once on defRegistries and read
 // lock-free thereafter.
@@ -675,6 +698,89 @@ func attributeInvertedPolarity(d *defRegistries) map[string]bool {
 	return out
 }
 
+// conditionFlagAttrs returns every attribute named by a band STATE predicate (#513) anywhere in the
+// registered content. A modifier touching one of these — IN EITHER DIRECTION — is treated as
+// gate-worthy by the harm derivations.
+//
+// # Why this does not try to infer polarity, unlike attributeInvertedPolarity
+//
+// A `when` predicate selects a BAND, and which way that cuts is written in the band's label, which is
+// content's word and which the engine deliberately never reads. `{label: fail, when: autofail_save}`
+// and `{label: success, when: blessed}` are structurally identical: a flag on the roller that selects
+// an outcome. A role-based rule (the one that works for boon/bane, because the channel name carries
+// the polarity) closes only the $target-scoped half — measured — and leaves the auto-fail-save half
+// wide open, which is the more dangerous of the two.
+//
+// So the engine does not guess. It observes that a `when`-referenced attribute IS, by construction, a
+// content-declared condition flag rather than a continuous stat, and gates any affect that moves one.
+// This is not a novel posture: opModifyAttributeBase (effect_op_grant.go) already gates EVERY
+// cross-player attribute-base write regardless of sign, for exactly this reason — "the engine cannot
+// know whether raising a content stat or setting a content flag helps or harms the other player, so
+// the safe default gates every cross-player write". apply_affect is the op that tried to be clever
+// with a sign heuristic, and every hole of this class has lived there.
+//
+// THE COST is that a genuinely BENEFICIAL condition flag cannot be applied to a non-consenting other
+// player — a buff on a consenting ally, on yourself, or on a mob is unaffected, since the gate is the
+// PvP one. That is the same trade modify_attribute_base already ships, so it is consistent rather than
+// new. It is also cheap to adopt now precisely because no content uses `when` yet: the strict rule
+// lands before anyone authors around a lax one.
+//
+// A SEPARATE SET, not folded into invertedAttrs, and that distinction is load-bearing: the inverted
+// path gates only the POSITIVE direction (raising an inverted attribute is the harm), so a negative
+// modifier on a condition flag would slip straight through it.
+//
+// KNOWN LIMIT, stated so it is a property and not an oversight: band EDGES (min/max/margin_min/
+// margin_max) are not walked, and the pre-#513 sentinel encoding (`min: 1e6*(1-$target.helpless)`)
+// can express the same forcing through them. That gap predates this primitive and is unchanged by it.
+func conditionFlagAttrs(d *defRegistries) map[string]bool {
+	out := map[string]bool{}
+	seen := map[*checkSpec]bool{}
+
+	var addSpec func(s *checkSpec)
+	var walkOps func(ops []effectOp)
+	addSpec = func(s *checkSpec) {
+		if s == nil || seen[s] {
+			return
+		}
+		seen[s] = true
+		for i := range s.bands {
+			if s.bands[i].when == nil {
+				continue
+			}
+			refs := map[string]bool{}
+			s.bands[i].when.refs(refs)
+			for ref := range refs {
+				if _, bare := attrRefScope(ref); bare != "" {
+					out[bare] = true
+				}
+			}
+			walkOps(s.bands[i].ops)
+		}
+		addSpec(s.vs.contested)
+	}
+	walkOps = func(ops []effectOp) {
+		for i := range ops {
+			addSpec(ops[i].check)
+			walkOps(ops[i].then)
+			walkOps(ops[i].els)
+		}
+	}
+	walkContentOps(d, func(_ string, op *effectOp) { addSpec(op.check) })
+	for _, p := range d.combat.table() {
+		if p == nil {
+			continue
+		}
+		addSpec(p.toHit)
+		for _, av := range p.avoidance {
+			addSpec(av)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // refScope classifies an attr ref by the ROLE it addresses, which is what the polarity rule keys on.
 type refScope int
 
@@ -717,12 +823,15 @@ func attrRefScope(ref string) (refScope, string) {
 //     safe false positive (author a genuine HoT with heal/restore, which the engine treats as benign).
 //
 // A nil def can't be proven benign, so it does not survive (fail toward stripping). Pure read of the immutable def.
-func affectSurvivesRespawn(def *affectDef, inverted map[string]bool) bool {
+func affectSurvivesRespawn(def *affectDef, h harmPolarity) bool {
 	if def == nil {
 		return false
 	}
 	for _, m := range def.modifiers {
-		if inverted[m.attr] {
+		if h.conditionFlags[m.attr] {
+			return false // a condition flag is never provably benign (#513) — see conditionFlagAttrs
+		}
+		if h.inverted[m.attr] {
 			// Polarity reversed (#511): raising an inverted attribute is the harm, so a modifier that
 			// raises one is not provably benign and the affect must not survive the respawn purge.
 			if (m.add && m.value > 0) || (!m.add && m.value > 1) {

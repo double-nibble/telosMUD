@@ -329,9 +329,16 @@ var (
 	}
 	checkBandKeys = map[string]bool{
 		"label": true, "ops": true, "min": true, "max": true,
-		"margin_min": true, "margin_max": true, "face_eq": true, "face_count": true,
+		"margin_min": true, "margin_max": true, "face_eq": true, "face_count": true, "when": true,
 	}
 )
+
+// emptyFormulaField is the shared error for a formula key that is PRESENT but null. It is its own
+// function so the two parse sites (a spec's boon/bane, a band's bounds + when) cannot drift into
+// disagreeing about whether an empty value is an absence.
+func emptyFormulaField(key string) error {
+	return fmt.Errorf("%s: is present but empty; give it a formula or remove the key entirely", key)
+}
 
 // rejectUnknownKeys fails when `m` carries a key `known` does not list. The message names every
 // offender (sorted, so the error is stable across Go's randomized map iteration) plus the legal set, so
@@ -388,6 +395,15 @@ func parseCheckSpec(v any) (*checkSpec, error) {
 		dst *formulaNode
 	}{{"boon", &spec.boon}, {"bane", &spec.bane}} {
 		if raw, present := m[e.key]; present {
+			// PRESENT-BUT-NULL IS AN ERROR, not an absence. parseFormula(nil) returns (nil, nil), so a
+			// bare `when:` / `boon:` in YAML — an author mid-edit, a template that interpolated empty, a
+			// merge that dropped a value — would leave the field nil and the whole axis SKIPPED. For a
+			// band bound that silently widens the band; for `when` it fails OPEN, turning a when-only
+			// forcing band placed first into an unconditional one, so every swing on that profile crits
+			// with no error and no broken flag. Same class as the boon_dice type gate, one axis over.
+			if raw == nil {
+				return nil, emptyFormulaField(e.key)
+			}
 			node, err := parseFormula(raw)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", e.key, err)
@@ -447,6 +463,16 @@ func parseCheckSpec(v any) (*checkSpec, error) {
 		}
 		spec.bands = append(spec.bands, band)
 	}
+	// A `when` on the LAST band (#513) makes "no band matched" reachable for the first time. Before the
+	// state axis the final band was conventionally test-less and therefore always matched, so res.band
+	// was nil only for an empty list; now a false predicate on the last band can leave nothing matched —
+	// and a nil band does NOT mean failure. classifyToHit reads it as a HIT and avoidanceSucceeded as
+	// "did not avoid", so a total of 1 against a DC of 50 would report as a hit. Reject it at parse: the
+	// author wants a fall-through band beneath their predicate.
+	if n := len(spec.bands); n > 0 && spec.bands[n-1].when != nil {
+		return nil, fmt.Errorf("the LAST band carries `when`, so a false predicate would leave NO band " +
+			"matched — and an unmatched check reads as a hit, not a failure; add a fall-through band below it")
+	}
 	return spec, nil
 }
 
@@ -461,6 +487,18 @@ func parseCheckVs(v any) (checkVs, error) {
 			sub, err := parseCheckSpec(cv)
 			if err != nil {
 				return checkVs{}, fmt.Errorf("contested: %w", err)
+			}
+			// resolveCheck consumes ONLY a contested sub-spec's dice and bonus — its bands are never
+			// classified. A `when` there is therefore authored, parsed, and permanently dead, which is
+			// exactly the silent-no-op class the boon_dice-without-boon check rejects. Called out
+			// specifically for `when` because it is the axis that makes an author reach for it ("a
+			// restrained creature auto-loses the contest"), which is not expressible on this side.
+			for i := range sub.bands {
+				if sub.bands[i].when != nil {
+					return checkVs{}, fmt.Errorf("contested: band[%d] carries `when`, but a contested "+
+						"sub-spec's bands are never classified (only its dice and bonus are used), so it "+
+						"can never fire", i)
+				}
 			}
 			return checkVs{contested: sub}, nil
 		}
@@ -492,9 +530,22 @@ func parseCheckBand(v any) (checkBand, error) {
 		key string
 		dst *formulaNode
 	}{
-		{"min", &band.min}, {"max", &band.max}, {"margin_min", &band.marginMin}, {"margin_max", &band.marginMax},
+		{"min", &band.min},
+		{"max", &band.max},
+		{"margin_min", &band.marginMin},
+		{"margin_max", &band.marginMax},
+		{"when", &band.when}, // the #513 state axis
 	} {
 		if raw, present := m[e.key]; present {
+			// PRESENT-BUT-NULL IS AN ERROR, not an absence. parseFormula(nil) returns (nil, nil), so a
+			// bare `when:` / `boon:` in YAML — an author mid-edit, a template that interpolated empty, a
+			// merge that dropped a value — would leave the field nil and the whole axis SKIPPED. For a
+			// band bound that silently widens the band; for `when` it fails OPEN, turning a when-only
+			// forcing band placed first into an unconditional one, so every swing on that profile crits
+			// with no error and no broken flag. Same class as the boon_dice type gate, one axis over.
+			if raw == nil {
+				return checkBand{}, emptyFormulaField(e.key)
+			}
 			node, err := parseFormula(raw)
 			if err != nil {
 				return checkBand{}, fmt.Errorf("%s: %w", e.key, err)

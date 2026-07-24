@@ -63,8 +63,12 @@ type checkBand struct {
 	marginMax formulaNode // margin <= marginMax   (nil: not margin-ceiling-tested)
 	faceEq    *float64    // optional: count natural KEPT faces equal to this value (see matches)
 	faceCount int         // ... require at least this many such faces (defaults to 1 when faceEq set)
-	label     string
-	ops       []effectOp
+	// when is a STATE predicate (#513): a scoped truthy formula, ANDed with the axes above like any
+	// other of them. It is what lets a band be selected by the state of an entity rather than by the
+	// roll — the fifth axis, and the only one that does not read the dice at all. See matches.
+	when  formulaNode
+	label string
+	ops   []effectOp
 }
 
 // matches reports whether the classified result falls in this band. eval resolves a band-edge formula
@@ -72,6 +76,44 @@ type checkBand struct {
 // CONTRIBUTED to the magnitude (see rollDiceSpec — identical to every rolled face for any spec that
 // discards nothing, which is every kind but keepHigh/keepLow).
 func (b *checkBand) matches(total, margin float64, kept []int, eval func(formulaNode) float64) bool {
+	// The STATE axis (#513) — the only axis that ignores the roll entirely. It is ANDed with the others
+	// exactly like they are ANDed with each other; `when` does not override anything, which is what
+	// keeps this a band predicate rather than a new engine concept.
+	//
+	// It is tested LAST, after the free faceEq scan and the numeric bounds. Every axis is
+	// side-effect-free so the order is behaviourally unobservable, but `when` is the only axis that is
+	// always a formula evaluation (faceEq is a plain slice scan, and a numeric bound is often absent),
+	// so a band like {face_eq: 20, when: ...} should not pay the eval on every roll when the face test
+	// would have rejected it anyway.
+	//
+	// A band carrying ONLY `when` and no dice test is how content expresses an outcome the roll cannot
+	// change. ORDERING IS THE WHOLE OF IT, and it is not simply "put it at the top": bands are
+	// first-match-wins, so a forced band must sit BELOW anything that must outrank it and above
+	// everything it outranks. In 5e a natural 1 misses even against a paralyzed target, so the auto-crit
+	// goes UNDER the nat-1 band:
+	//
+	//	{face_eq: 1, label: miss}                                          # a nat-1 still misses
+	//	{when: ["attr", "$target.helpless"], margin_min: 0, label: crit}   # auto-crit on a hit that LANDS
+	//	{face_eq: 20, label: crit}                                         # the natural crit, still there
+	//	{margin_min: 0, label: hit}
+	//	{label: miss}
+	//
+	// (The margin_min on the forced band is load-bearing too — without it, auto-crit would promote a
+	// MISS to a crit.)
+	//
+	// TRUTHINESS is "strictly positive". It deliberately matches the boon/bane channel's `> 0` rather
+	// than using `!= 0`, because the formula vocabulary has no negation: "A unless B" is naturally
+	// written `A - B`, and under a non-zero rule that fires again once B exceeds A — reintroducing the
+	// very affine-overshoot-on-the-second-stack defect this primitive exists to eliminate (see
+	// TestSentinelEncodingBreaksOnStacking).
+	//
+	// Non-finite reads as false, and this is REACHABLE rather than the dead belt-and-braces it looks
+	// like. evalFinite rejects a non-finite FINAL result, so a bare `["attr", x]` on a poisoned
+	// attribute already fails closed — but it checks only the top level, so any wrapper LAUNDERS the
+	// poison into a finite value: `min($target.helpless, 1)` on an +Inf attribute evaluates to a clean
+	// 1. That is the natural way an author normalizes a stacking flag for a boolean predicate, and it
+	// would convert an overflowed counter into a guaranteed forced outcome. Screening here catches the
+	// bare case; the laundered case is only fully closed by bounding attr() itself.
 	if b.min != nil && total < eval(b.min) {
 		return false
 	}
@@ -111,8 +153,27 @@ func (b *checkBand) matches(total, margin float64, kept []int, eval func(formula
 			return false
 		}
 	}
+	if b.when != nil && !truthyPredicate(eval(b.when)) {
+		return false
+	}
 	return true
 }
+
+// truthyPredicate is the engine's one definition of "this content predicate holds": STRICTLY POSITIVE
+// and finite.
+//
+// Strictly positive, not merely non-zero, and this matters more than it looks. The formula vocabulary
+// has no `not`/`==`/`>=`, so an author writing "A unless B" reaches for `A - B`. Under a non-zero rule
+// that expression is true at -1 as well as at 1, so a SECOND source of B flips the predicate back on —
+// exactly the affine-overshoot defect that makes sentinel band edges unusable and that this primitive
+// was added to replace. Positive-only also agrees with the boon/bane channel's `> 0` in the same file,
+// so content has one truthiness rule rather than two.
+//
+// NaN needs no clause of its own: every comparison against NaN is false, so `v > 0` already rejects
+// it. (That is exactly why "> 0" is safer than "!= 0" here — under a non-zero rule NaN would read as
+// TRUE.) +Inf is the only non-finite value `v > 0` would accept, so it is the only one rejected
+// explicitly; -Inf falls out with NaN.
+func truthyPredicate(v float64) bool { return v > 0 && !math.IsInf(v, 1) }
 
 // checkVs is the threshold a check resolves against: either a DC formula, or a CONTESTED defender
 // check (the defender rolls their own spec; the resulting total becomes the DC).

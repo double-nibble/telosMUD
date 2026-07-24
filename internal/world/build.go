@@ -342,10 +342,13 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	// debuff expressed as "+3 to a bane counter" is gated and purged like the "-3 to a stat" it is;
 	// without it the sign heuristic reads that affect as a buff. Empty (nil) for content that uses no
 	// boon/bane, which restores the pre-#511 behaviour byte for byte.
-	d.invertedAttrs = attributeInvertedPolarity(d)
-	if len(d.invertedAttrs) > 0 {
-		slog.Debug("content: derived inverted-polarity attributes from the boon/bane channel",
-			"count", len(d.invertedAttrs))
+	d.harm = harmPolarity{
+		inverted:       attributeInvertedPolarity(d),
+		conditionFlags: conditionFlagAttrs(d),
+	}
+	if len(d.harm.inverted) > 0 || len(d.harm.conditionFlags) > 0 {
+		slog.Debug("content: derived harm-polarity attribute sets from the check formulas",
+			"inverted", len(d.harm.inverted), "condition_flags", len(d.harm.conditionFlags))
 	}
 	slog.Debug("global defs registered", "attributes", d.attr.len(),
 		"resources", d.res.len(), "damage_types", d.dmg.len(), "affects", d.affect.len(),
