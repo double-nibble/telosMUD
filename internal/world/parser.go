@@ -270,6 +270,20 @@ func (z *Zone) dispatch(s *session, line string) {
 			z.sendPrompt(s)
 			return
 		}
+		// Named exit (#370): an unknown verb that EXACTLY matches a content exit keyword in the player's
+		// CURRENT room traverses it — so a pack can author an exit keyed `grove`/`portal` and the player just
+		// types `grove` to walk it. Consulted LAST (after ability/custom/channel/toggle) and by EXACT match
+		// only, so it never shadows or abbreviates a core/movement verb (a compass abbreviation still wins).
+		// move() does the actual traversal — local/cross-zone/cross-shard AND the cancellable traverse hook —
+		// so a named exit behaves exactly like a compass exit, including the released-ownership contract.
+		if z.isRoomExit(s, lower) {
+			z.log.Debug("dispatch: named exit", "player", s.character, "exit", lower)
+			if z.move(s, lower) {
+				return // move released ownership (transfer/handoff): the destination prompts
+			}
+			z.sendPrompt(s)
+			return
+		}
 		// An unknown verb is verbatim player input: when the line is a single token (no whitespace),
 		// `lower` IS that whole token — e.g. a link code or a /login URL pasted one beat late into the
 		// game prompt. This is the exact credential-leak the issue names, so the typed token is attached

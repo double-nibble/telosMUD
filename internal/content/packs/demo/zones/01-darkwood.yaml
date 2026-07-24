@@ -41,9 +41,29 @@ zones:
         name: A Warded Sanctum
         long: >-
           Runes pulse faintly along the walls of this hidden chamber. The air thrums with
-          guarded, watchful magic.
+          guarded, watchful magic. A warded archway leads deeper in.
+        # #370 named exit + cancellable traverse hook. `warded` is a NAMED exit (a content keyword, not a
+        # compass direction) — a player just types `warded` to attempt it. The room's `traverse` hook is the
+        # canonical guard example: it fires BEFORE the move commits and BLOCKS the crossing unless the mover
+        # carries the `proven` flag, so the inner sanctum is gated on a condition (a key/quest/flag). Only the
+        # `warded` exit is gated — `west` (the stalker's chase route) is untouched, proving the gate is
+        # per-exit. block(msg) shows the mover the message and cancels the move; a proven player passes freely.
         exits:
           west: darkwood:room:webtunnel
+          warded: darkwood:room:innersanctum
+        lua: |
+          on("traverse", function(ev)
+            if ev.exit == "warded" and not ev.actor:has_flag("proven") then
+              block("A spectral warden shimmers into being and bars the archway. \"None may pass unproven.\"")
+            end
+          end)
+      - ref: darkwood:room:innersanctum
+        name: The Inner Sanctum
+        long: >-
+          A silent vault of concentrated power, hidden beyond the warden's ward. Motes of
+          light drift in the still air.
+        exits:
+          out: darkwood:room:sanctum
     item_prototypes:
       # The goblin's loot: a rusty knife it carries (armed via the reset `into` the mob). When the goblin
       # dies (Phase 6.3b) its inventory flows into its corpse, so `get all corpse` recovers the knife.
