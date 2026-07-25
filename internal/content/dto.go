@@ -967,6 +967,14 @@ type AffectBodyDTO struct {
 	// all refuse a death-suspended actor. A pack that prefers a clean slate can instead resolve a
 	// persisted-downed entity to death on login from its own reattach hook.
 	SuspendsDeath bool `json:"suspends_death" yaml:"suspends_death"`
+	// Concentration (#539): this affect is CONCENTRATION-bound to its SOURCE — a caster concentrates on at
+	// most ONE such effect at a time, WHEREVER it lives (a charmed enemy, a room field, the caster). When
+	// the source applies a NEW concentration affect, the engine auto-expires the source's PRIOR one (firing
+	// its on_expire so an anchored effect tears down), and when the source is INCAPACITATED (stunned/downed/
+	// dead) its concentration breaks. This is the single-slot half; the break-on-damaged-save half is clean
+	// content (an OnDamageTaken reaction that rx:cancel()s the affect). A concentration affect with a nil
+	// source (self/ambient) is not tracked (there is no caster to bind the slot to). It rides the body JSONB.
+	Concentration bool `json:"concentration" yaml:"concentration"`
 	// DamageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on incoming damage the bearer takes while
 	// the affect is active: `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` = resist fire, be
 	// vulnerable to cold, immune to poison. The per-target analogue of a damage type's global resist

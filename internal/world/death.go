@@ -380,6 +380,10 @@ func (z *Zone) die(victim, killer *Entity, parent *effectCtx) {
 	l.dying = true
 	l.deaths++
 
+	// CONCENTRATION break on death (#539): a dead caster holds no concentration, and a concentration spell
+	// whose TARGET just died ends (freeing its caster). Both are handled here, once, inside the dying latch.
+	z.breakConcentrationInvolving(victim)
+
 	// Durable audit (#350): record the player's permanent death exactly once. This sits INSIDE the
 	// l.dying-latched, deaths-bumped once-only region, so a re-entrant die() (a DoT tick landing the same
 	// round as the killing swing) early-returned above and never reaches here — and the deaths counter is

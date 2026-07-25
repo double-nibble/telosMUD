@@ -513,6 +513,10 @@ type affectDef struct {
 	// hook applies it. The engine provides only the hold-at-0 + no-auto-regen-revive; content owns the
 	// resolution (deal lethal to end it, revive above 0, or let it expire and recover). See deathSuspended.
 	suspendsDeath bool
+	// concentration (#539) marks a source-bound concentration affect: the engine keeps a per-source slot
+	// (Zone.concentration) holding at most one such affect per source, auto-expiring the source's prior one
+	// on a new one and breaking it when the source is incapacitated. See concentrationApply/breakConcentration.
+	concentration bool
 	// damageTakenMult (#537) is a per-DAMAGE-TYPE multiplier on INCOMING damage the bearer takes: a
 	// content-declared `damage_taken_mult: {fire: 0.5, cold: 2.0, poison: 0}` makes the bearer resistant
 	// (½), vulnerable (×2), or immune (×0) to that type while the affect is active. It is the per-TARGET
