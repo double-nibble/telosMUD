@@ -712,9 +712,33 @@ type ResourceDTO struct {
 	// defines MORE THAN ONE vital: without it the engine falls back to the lowest-ref vital by sort order,
 	// which is an arbitrary (and footgun-prone: "blood" sorts before "hp") pick. With exactly one vital it
 	// is redundant. lintVitalResources warns when >1 vital exists and none is flagged primary.
-	Primary           bool `json:"primary" yaml:"primary"`
-	Regen             int  `json:"regen" yaml:"regen"`                           // per-tick flat regen (reserved; ticks ride 5.2)
-	DepletedThreshold int  `json:"depleted_threshold" yaml:"depleted_threshold"` // reserved (vital depletion, 5.2)
+	Primary bool `json:"primary" yaml:"primary"`
+	// Absorb marks this pool as a PRE-VITAL absorption BUFFER (#536): temp HP / a ward / a shield. Damage
+	// routed to the pool it FRONTS is subtracted from this buffer FIRST, spilling only the remainder onward
+	// — for ALL damage types, before the vital. Unlike a routed pool, an absorb buffer with no current is
+	// simply skipped (it never makes an entity IMMUNE — the blow flows to the vital). It is INSTANCE-SET,
+	// not derived: give it NO max_attr, and set its current with `set_resource` (a rolled 2d4+CON), so its
+	// capacity is the rolled amount, not a stat. Temp HP does not stack — a re-cast takes the HIGHER value
+	// via `set_resource ... mode: take_higher`. It is not healing and (by content) is wiped on rest.
+	//
+	// DO NOT ROUTE DAMAGE AT AN ABSORB POOL. A buffer is consulted as a pre-step; it is never a damage
+	// DESTINATION. Because it has no max_attr, aiming a deal_damage `resource:` or a damage-type
+	// `target_resource:` at it hits the natural-immunity discard (max 0 => the blow is dropped) and the
+	// target reads as IMMUNE to that route. Author the buffer, then damage the VITAL it fronts.
+	//
+	// A FULLY-ABSORBED blow reaches the vital as 0 — a no-op there, exactly like full mitigation: it fires
+	// the OnDamageTaken REACTION (which acts on the incoming blow, before the buffer — a 5e concentration
+	// save still triggers on temp-HP loss) but NOT the OnDamageTaken BUS, builds no threat, and fires no
+	// depletion. A partial absorb fires the bus with the SPILLOVER. So a passive "when I take damage"
+	// bus hook (thorns, aggro-record) keys on damage that REACHED the vital; a reaction keys on the attempt.
+	Absorb bool `json:"absorb" yaml:"absorb"`
+	// Fronts names the pool this absorb buffer sits IN FRONT OF (#536) — the pool whose incoming damage it
+	// soaks first. Empty => the primary vital (the common case: temp HP fronts hp). A buffer only absorbs a
+	// blow whose resolved destination pool matches this, so a ward fronting `hp` does not soak a psychic
+	// blow routed to `sanity`. Ignored unless Absorb is set.
+	Fronts            string `json:"fronts" yaml:"fronts"`
+	Regen             int    `json:"regen" yaml:"regen"`                           // per-tick flat regen (reserved; ticks ride 5.2)
+	DepletedThreshold int    `json:"depleted_threshold" yaml:"depleted_threshold"` // reserved (vital depletion, 5.2)
 	// RegenInCombat lets a resource keep regenerating while its owner is FIGHTING. Default false: the
 	// engine PAUSES passive regen for an entity in combat (the classic Diku "no rest mid-fight" rule), so
 	// a mob's hp regen does not claw back a fresh player's swings round after round. A pack that wants

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"sort"
 )
 
 // effect_op.go is the effect-op INTERPRETER (docs/ABILITIES.md §3, docs/PHASE5-PLAN.md §1.3) — the
@@ -288,6 +289,11 @@ type effectOp struct {
 	// check is the parsed check spec for the `check` flow op (nil for every other op). Its bands
 	// carry their own nested op-lists (check.go), so a check recurses into runOps like if/chance.
 	check *checkSpec
+
+	// mode selects the write semantics of set_resource (#536): "take_higher" (higher-of-current-and-amount,
+	// temp HP's non-stacking re-cast) or "set"/"absolute"/"" (write the amount outright). Ignored by other
+	// ops.
+	mode string
 }
 
 // effectOpHandler is a registered op implementation. It runs on the zone goroutine with full single-
@@ -309,6 +315,7 @@ func init() {
 		"heal":            opHeal,
 		"restore":         opRestore,
 		"modify_resource": opModifyResource,
+		"set_resource":    opSetResource, // #536: absolute / take-higher pool write (temp HP)
 		"apply_affect":    opApplyAffect,
 		"remove_affect":   opRemoveAffect,
 		"dispel":          opDispel,
@@ -660,6 +667,52 @@ func guardCrossPlayerWrite(c *effectCtx, target *Entity) bool {
 // behavior). A depletion drives death only when the hit pool is VITAL (vitalDepleted), so a blow to a
 // non-vital pool (a stagger/mana bar) subtracts, may run that pool's on_depleted hook (#406), and never
 // kills.
+// absorbPreVital consults the target's active absorb BUFFERS (#536) that FRONT `pool` and soaks incoming
+// `dmg` from them BEFORE it reaches the vital, returning the SPILLOVER. Temp HP / a ward absorbs all
+// damage types before HP. A buffer with no current is skipped — an absent buffer never confers immunity,
+// the blow simply flows to the vital. Multiple buffers drain in a DETERMINISTIC order (sorted by ref) so
+// the outcome is reproducible. Each buffer write is a plain decrement (a buffer is not a vital, so no
+// depletion hook fires; a shattered-ward reaction is content's via a threshold predicate). O(resource
+// defs) — local, zone-goroutine only.
+func absorbPreVital(target *Entity, pool string, dmg int) int {
+	if target == nil || target.zone == nil || target.living == nil || dmg <= 0 || pool == "" {
+		return dmg
+	}
+	primary := vitalResource(target)
+	table := target.zone.resourceDefs().table()
+	refs := make([]string, 0, len(table))
+	for ref, def := range table {
+		if !def.absorb {
+			continue
+		}
+		fronts := def.fronts
+		if fronts == "" {
+			fronts = primary // an unqualified buffer fronts the primary vital (temp HP fronts hp)
+		}
+		if fronts != pool {
+			continue
+		}
+		if resourceCurrent(target, ref) <= 0 {
+			continue // no buffer charge: skip (never immunity)
+		}
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	for _, ref := range refs {
+		if dmg <= 0 {
+			break
+		}
+		cur := resourceCurrent(target, ref)
+		absorbed := cur
+		if absorbed > dmg {
+			absorbed = dmg
+		}
+		setResourceCurrent(target, ref, cur-absorbed)
+		dmg -= absorbed
+	}
+	return dmg
+}
+
 func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource string) int {
 	c.lastDamage = 0
 	if target == nil || target.living == nil {
@@ -750,6 +803,23 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 		c.z.log.Debug("deal_damage: target lost capacity in the routed pool mid-blow; discarded",
 			"target", target.short, "pool", pool, "type", dmgType)
 		return 0
+	}
+	// PRE-VITAL ABSORPTION (#536): a temp-HP / ward buffer fronting `pool` soaks the blow FIRST (all damage
+	// types), spilling only the remainder to the vital. It sits AFTER mitigation + the OnDamageTaken
+	// reaction (it is a passive buffer, not a to-hit/soak reaction) and BEFORE the vital write, so the pool
+	// write, the overflow, threat, the OnDamageTaken BUS and the depletion hook all see the SPILLOVER. A
+	// FULLY-absorbed blow reaches the vital as 0 and is a clean no-op there — exactly like full mitigation
+	// (the early return at the top of this funnel), so it builds no threat and fires no depletion. An
+	// absent/empty buffer is skipped, so having no temp HP never confers immunity. The buffer write is a
+	// plain decrement (no depletion hook of its own — a "your ward shatters" reaction is content's, via a
+	// threshold predicate on the buffer pool).
+	if spill := absorbPreVital(target, pool, dmg); spill != dmg {
+		dmg = spill
+		if dmg <= 0 {
+			c.lastDamage = 0
+			c.z.log.Debug("deal_damage fully absorbed by a pre-vital buffer", "target", target.short, "pool", pool)
+			return 0
+		}
 	}
 	// Apply to the resolved pool. The pool clamps its current at 0 (resources.go); the depletion
 	// checkpoint below turns an emptied pool into that pool's on_depleted hook, and into death when (and

@@ -603,6 +603,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 			Regen: r.Regen, RegenInCombat: r.RegenInCombat, DepletedThreshold: r.DepletedThreshold,
 			OnEvent: r.OnEvent, OnEventLua: r.OnEventLua, OnReactionLua: r.OnReactionLua,
 			OnDepleted: r.OnDepleted, PerRound: r.PerRound, Gauge: r.Gauge, Primary: r.Primary,
+			Absorb: r.Absorb, Fronts: r.Fronts, // #536: pre-vital absorption buffer
 		})
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO resource_defs (ref, pack, display_name, max_attr, vital, body)

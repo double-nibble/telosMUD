@@ -147,6 +147,43 @@ func opModifyResource(c *effectCtx, op *effectOp) error {
 	return nil
 }
 
+// opSetResource: set_resource(target, resource, amount, mode). Writes a pool to an ABSOLUTE value (mode
+// "set"/"absolute"/"", the default) or the HIGHER of current-and-amount (mode "take_higher"/"higher" —
+// temp HP's non-stacking re-cast, where a fresh 2d4+CON replaces the old only if it rolls higher). The
+// amount is rolled via the SHARED rollOpAmount (flat `amount` + dice + a scoped `bonus` formula), so a
+// ward is `2d4 + $actor.con_bonus`, clamped non-negative. This is the take-higher / set-absolute write the
+// absorb-buffer primitive (#536) needs — modify_resource is strictly additive (cur+delta), which cannot
+// express "roll a NEW temp HP amount, keep the higher."
+//
+// GATED like modify_resource: the engine cannot know a content pool's polarity (setting a "corruption"
+// pool high is harm; a "temp_hp" buffer is a boon), so ANY cross-player write routes through the ONE
+// shared guardCrossPlayerWrite and no-ops on a deny. A SELF write (a self-shield) is ungated; an ally
+// shield needs the same PvP consent every cross-player write does.
+func opSetResource(c *effectCtx, op *effectOp) error {
+	if c.target == nil {
+		return fmt.Errorf("set_resource: no target")
+	}
+	if op.resource == "" {
+		return fmt.Errorf("set_resource: no resource")
+	}
+	if !guardCrossPlayerWrite(c, c.target) {
+		return nil // clean no-op on a gated block
+	}
+	amt := int(rollOpAmount(c, op))
+	if amt < 0 {
+		amt = 0 // a pool current is non-negative; a negative roll floors to 0 (setResourceCurrent clamps too)
+	}
+	switch op.mode {
+	case "take_higher", "higher":
+		if cur := resourceCurrent(c.target, op.resource); amt > cur {
+			setResourceCurrent(c.target, op.resource, amt)
+		}
+	default: // "set" / "absolute" / ""
+		setResourceCurrent(c.target, op.resource, amt)
+	}
+	return nil
+}
+
 // opApplyAffect: apply_affect(target, id, {duration, magnitude}). Whether the apply is GATED is
 // DERIVED from the affect def (affectIsDetrimental) — never trusted from the content label alone
 // (§7/D2: a detrimental affect mislabeled helpful/neutral/unlabeled must NOT land on a protected player

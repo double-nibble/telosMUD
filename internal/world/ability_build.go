@@ -198,6 +198,7 @@ func parseOp(v any) (effectOp, error) {
 		return effectOp{}, fmt.Errorf("op missing 'op' kind")
 	}
 	op.resource = mapStr(m, "resource")
+	op.mode = mapStr(m, "mode") // #536: set_resource write mode ("take_higher" | "set")
 	op.affect = firstStr(m, "affect", "id")
 	op.dmgType = firstStr(m, "type", "damage_type")
 	op.attr = firstStr(m, "attr", "attribute") // Phase 11.1: modify_attribute_base target
