@@ -22,6 +22,7 @@ package world
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 )
 
@@ -287,24 +288,53 @@ func opSend(c *effectCtx, op *effectOp) error {
 	return nil
 }
 
-// opIf: if(cond, then, else). A minimal v1 condition with two predicate shapes:
+// opIf: if(cond, then, else). Its condition has these predicate shapes, ORed together:
 //   - has_affect (op.affect): branch on whether the target has the named affect ("if poisoned, then ...");
-//   - resource_min (op.ifResource >= op.ifResourceMin): branch on the SUBJECT's resource current — the
-//     [G9] reaction-budget guard "if reactions >= 1, then [spend + opportunity attack]". The pool is read
-//     off the ctx SUBJECT: the actor by default, or the counterpart when the if itself carries `target:
-//     other` (runOps rebinds c.target before the handler, so the read tracks the selected entity).
+//   - a NUMERIC COMPARISON (#542): `<lhs> <cmp> <rhs>` where lhs is a pool current (ifResource) OR a
+//     formula (ifValue — an attribute / a ctx scalar like $depletion.overflow), cmp is >=/<=/>/</==/!=
+//     (ifCmp, default >=), and rhs is a formula (ifThreshold) or the legacy literal (ifResourceMin). This
+//     is what lets a derived threshold be authored declaratively — "hp <= half of max_hp" (bloodied via an
+//     OnDamageTaken handler), "$depletion.overflow >= max_hp" (instant death via an on_depleted hook) —
+//     rather than forcing Lua. The legacy `if reactions >= 1` reaction-budget guard is the default-cmp
+//     case, byte-for-byte unchanged. The pool/formula is read off the ctx SUBJECT: the actor by default,
+//     or the counterpart when the if itself carries `target: other` (runOps rebinds c.target first).
 //
-// An empty affect ref AND an empty resource leave cond false. The query vocabulary expands in later
-// slices; the flow op itself is the registered seam. Branches recurse back into runOps (same ctx).
+// An empty affect ref AND an empty resource/ifValue leave cond false. Branches recurse into runOps.
 func opIf(c *effectCtx, op *effectOp) error {
 	cond := false
-	if op.ifResource != "" {
-		// Read the pool off the resolved ctx target (runOps already applied any `target: self|other`).
+	// NUMERIC PREDICATE (#542): a comparison of a numeric LHS against a numeric RHS. The LHS is a POOL
+	// CURRENT (ifResource) or, when the compared quantity is not a pool, a FORMULA (ifValue — an attribute
+	// or a ctx scalar like $depletion.overflow). The RHS is a FORMULA (ifThreshold — a derived threshold
+	// like max_hp/2), or the legacy ifResourceMin literal when no formula is authored. The comparator
+	// (ifCmp) defaults to ">=" so pre-#542 `if resource >= min` content is unchanged. Both formulas scope
+	// to the ctx SUBJECT (the actor by default; `target: other` selected the counterpart before us).
+	if op.ifResource != "" || op.ifValue != nil {
+		// Read off the resolved ctx target (runOps already applied any `target: self|other`).
 		subject := c.target
 		if subject == nil {
 			subject = c.actor
 		}
-		cond = subject != nil && float64(resourceCurrent(subject, op.ifResource)) >= op.ifResourceMin
+		if subject != nil {
+			// A degraded/broken formula operand makes the comparison INDETERMINATE. evalCheckFormula would
+			// collapse it to 0 — which is fine for an additive bonus (0 = no contribution) but NOT for a
+			// threshold, where 0 is an extreme of the range: a degraded `max_hp` on the headline instant-
+			// death predicate `$depletion.overflow >= max_hp` collapses the RHS to 0, and overflow >= 0 is
+			// always true, firing the HARMFUL branch on a debuffed victim. So evaluate with the error
+			// SURFACED and, if either operand fails (errored formula, degraded attribute, non-finite), leave
+			// cond FALSE — the predicate fails toward INACTION (skip `then`), the same "a broken channel is
+			// no channel" discipline as the boon/bane selection and the check `when` axis. (#542 review.)
+			lhsVal, lhsOK := float64(resourceCurrent(subject, op.ifResource)), true
+			if op.ifValue != nil { // formula LHS takes precedence when set
+				v, err := evalCheckFormulaErr(c, op.ifValue, subject)
+				lhsVal, lhsOK = v, err == nil
+			}
+			rhsVal, rhsOK := op.ifResourceMin, true // legacy literal is always finite
+			if op.ifThreshold != nil {
+				v, err := evalCheckFormulaErr(c, op.ifThreshold, subject)
+				rhsVal, rhsOK = v, err == nil
+			}
+			cond = lhsOK && rhsOK && compareIf(lhsVal, op.ifCmp, rhsVal)
+		}
 	}
 	if op.affect != "" && c.target != nil {
 		if def := c.target.zone.affectDefs().get(op.affect); def != nil {
@@ -323,6 +353,45 @@ func opIf(c *effectCtx, op *effectOp) error {
 		runOps(c, op.els)
 	}
 	return nil
+}
+
+// compareIf evaluates `lhs <cmp> rhs` for the #542 numeric predicate. cmp is one of >=,<=,>,<,==,!=;
+// an empty or unrecognized cmp defaults to ">=" (the legacy reaction-budget comparison, so pre-#542
+// content and a content typo both fall back to the historical behaviour rather than silently inverting).
+// Equality uses a small epsilon because both operands can be DERIVED floats (max_hp/2 on an odd max),
+// where exact float equality would be a footgun; the ordered comparisons are exact.
+func compareIf(lhs float64, cmp string, rhs float64) bool {
+	// Equality uses a RELATIVE epsilon so it holds at any magnitude: an absolute 1e-9 is below a float64
+	// ULP once the operands reach ~1e9 (the codebase anticipates derived values that large), where `==`
+	// would then miss values that are equal after rounding. Scaling by the larger operand keeps == and !=
+	// exact complements (|d| <= eps vs |d| > eps) at hp-scale and at overflow/damage scale alike. The
+	// ordered comparisons stay exact — they have no boundary-match hazard.
+	eps := 1e-9 * math.Max(1, math.Max(math.Abs(lhs), math.Abs(rhs)))
+	switch cmp {
+	case "<=":
+		return lhs <= rhs
+	case ">":
+		return lhs > rhs
+	case "<":
+		return lhs < rhs
+	case "==":
+		return math.Abs(lhs-rhs) <= eps
+	case "!=":
+		return math.Abs(lhs-rhs) > eps
+	default: // ">=" and any unrecognized comparator (defense in depth; parse rejects unknown comparators)
+		return lhs >= rhs
+	}
+}
+
+// isValidIfCmp reports whether cmp is one of the recognized #542 comparison operators. Parse rejects any
+// other non-empty value (an empty cmp is the legacy ">=" default, handled at runtime by compareIf).
+func isValidIfCmp(cmp string) bool {
+	switch cmp {
+	case ">=", "<=", ">", "<", "==", "!=":
+		return true
+	default:
+		return false
+	}
 }
 
 // opChance: chance(p, then). Runs the `then` op-list with probability p (deterministic via the ctx

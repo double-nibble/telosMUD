@@ -231,12 +231,59 @@ func parseOp(v any) (effectOp, error) {
 	if rm, ok := asMap(m["resource_min"]); ok {
 		op.ifResource = mapStr(rm, "resource")
 		op.ifResourceMin = mapFloat(rm, "min")
+		// #542: the nested block also carries the comparator and a formula RHS, so a derived threshold is
+		// authorable here too (`resource_min: {resource: hp, op: "<=", value: [/, max_hp, 2]}`). `op` is a
+		// free key inside this sub-map (it does not collide with the op-level "op" kind).
+		if c := mapStr(rm, "op"); c != "" {
+			op.ifCmp = c
+		}
+		if v, present := rm["value"]; present {
+			node, err := parseFormula(v)
+			if err != nil {
+				return effectOp{}, fmt.Errorf("if resource_min value: %w", err)
+			}
+			op.ifThreshold = node
+		}
 	}
 	if r := mapStr(m, "if_resource"); r != "" {
 		op.ifResource = r
 	}
 	if _, present := m["if_resource_min"]; present {
 		op.ifResourceMin = mapFloat(m, "if_resource_min")
+	}
+	// #542 richer predicate (flat keys): `cmp` (the comparator, NOT `op` — that names the op kind), an
+	// optional `lhs` FORMULA (an attribute / ctx scalar like $depletion.overflow, when the compared
+	// quantity is not a pool), and a `threshold` FORMULA RHS (a derived value like max_hp/2). All optional;
+	// absent leaves the legacy resource>=literal behaviour intact.
+	if c := mapStr(m, "cmp"); c != "" {
+		op.ifCmp = c
+	}
+	if lhs, present := m["lhs"]; present {
+		node, err := parseFormula(lhs)
+		if err != nil {
+			return effectOp{}, fmt.Errorf("if lhs: %w", err)
+		}
+		op.ifValue = node
+	}
+	if th, present := m["threshold"]; present {
+		node, err := parseFormula(th)
+		if err != nil {
+			return effectOp{}, fmt.Errorf("if threshold: %w", err)
+		}
+		op.ifThreshold = node
+	}
+	// #542 review: validate the predicate at PARSE (fail the content load) rather than defaulting/branching
+	// silently at runtime. (1) An unknown comparator is REJECTED, not silently coerced to ">=" — a typo'd
+	// "=<" would otherwise invert a fire-when-low predicate into fire-when-high. (2) A comparator/threshold
+	// with NO left-hand side (no resource, no lhs) is an incomplete predicate that would silently branch
+	// `else`; reject it so the author sees the mistake at boot. Only checked for the `if` op.
+	if op.kind == "if" {
+		if op.ifCmp != "" && !isValidIfCmp(op.ifCmp) {
+			return effectOp{}, fmt.Errorf("if: unknown comparator %q (want one of >= <= > < == !=)", op.ifCmp)
+		}
+		if (op.ifCmp != "" || op.ifThreshold != nil) && op.ifResource == "" && op.ifValue == nil {
+			return effectOp{}, fmt.Errorf("if: a comparator/threshold needs a left-hand side (resource or lhs)")
+		}
 	}
 	// Dice: "<N>d<S>" form for deal_damage; or explicit dice_num/dice_size.
 	if dice := mapStr(m, "dice"); dice != "" {

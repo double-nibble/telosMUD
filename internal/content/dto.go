@@ -805,9 +805,12 @@ type ResourceDTO struct {
 	//     `send` text: those take scalars, not formulas. The formula-capable ops are `deal_damage`, `heal`,
 	//     `restore` and `check` (bonus / vs / band edges, including a band's nested ops). A number cannot be
 	//     interpolated into player-facing text at all today — "you lose N sanity" is not authorable.
-	//   - THERE IS NO THRESHOLD PREDICATE. `if`'s `resource_min` compares a POOL CURRENT, not a ctx scalar,
-	//     so "lost 5+ in one blow" is written as a deterministic 0-dice `check` (`dice: "0d1"`, `bonus:
-	//     ["attr", "$depletion.applied"]`, a band with `min: 5`).
+	//   - THRESHOLD PREDICATES ARE DIRECT (#542): `if` now compares a numeric LHS (a pool current, or a
+	//     `lhs` FORMULA reading an attribute / a ctx scalar like `$depletion.overflow`) against a FORMULA
+	//     RHS (`threshold`), with a comparator (`cmp`: >= <= > < == !=). So "lost 5+ in one blow" is
+	//     `{op: if, lhs: ["attr","$depletion.applied"], cmp: ">=", threshold: 5, then: [...]}`, and
+	//     "instant death on massive overflow" is `lhs: ["attr","$depletion.overflow"], cmp: ">=",
+	//     threshold: ["attr","max_hp"]`. The 0-dice `check` idiom still works but is no longer required.
 	OnDepleted []any `json:"on_depleted" yaml:"on_depleted"`
 }
 
