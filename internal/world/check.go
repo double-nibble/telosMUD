@@ -349,6 +349,11 @@ type checkResult struct {
 	contested bool
 	band      *checkBand // the matched band (nil only if bands is empty)
 	bandLabel string
+	// roller is WHO rolled this check — the ctx actor by default, or the ctx target under subject: target
+	// (the saving-throw idiom). Exposed so a caller acting on the OUTCOME (e.g. opCheck wiring crit
+	// dice-doubling off the crit band, #544) reads attributes from the entity that actually rolled rather
+	// than re-deriving the subject. nil only if the roller was nil (an untargeted subject: target check).
+	roller *Entity
 }
 
 // resolveCheck rolls the spec, evaluates bonus/vs against the ctx bindings, classifies into the first
@@ -371,7 +376,7 @@ func resolveCheck(c *effectCtx, spec *checkSpec) checkResult {
 	bonus := evalCheckFormula(c, spec.bonus, roller)
 	total := float64(roll) + bonus
 
-	res := checkResult{roll: roll, faces: faces, kept: kept, dice: dice, bonus: bonus, total: total}
+	res := checkResult{roll: roll, faces: faces, kept: kept, dice: dice, bonus: bonus, total: total, roller: roller}
 
 	switch {
 	case spec.vs.contested != nil:

@@ -69,6 +69,15 @@ type effectCtx struct {
 	// in resolveCheckScope) — PF iterative attacks (-5/-10/-15 by swing) are authorable without it. It is
 	// 0 outside the swing loop (a spell's deal_damage / a check unrelated to a swing reads $swing.index 0).
 	swingIndex int
+	// critDiceMult is the crit DICE-doubling factor (#544): the number of times a deal_damage/heal op
+	// rolls its DICE term on a critical, adding extra NdS rather than scaling the whole roll. It doubles
+	// the DICE ONLY — the flat `amount`/`bonus` are added once — which is the 5e crit (1d8+3 -> 2d8+3) and
+	// the correct VARIANCE (rolling more dice, not multiplying one roll by a constant). It is SEPARATE from
+	// and composes with the whole-roll `crit_mult` (which rides c.mag): a pack picks double-dice (crit_dice)
+	// or double-total (crit_mult) or both. The swing crit sets it from the attacker's `crit_dice` attribute
+	// (combat.go applySwingDamage); a check-band crit sets it from the roller's `crit_dice` around the band
+	// ops (opCheck), so spell crits share the mechanism. 0/1 => no doubling (rollOpAmount rolls dice once).
+	critDiceMult int
 	// lastDamage is the integer damage the most recent dealDamage call applied through THIS ctx (6.5).
 	// The swing path reads it for the combat message / threat instead of re-reading the victim's vital
 	// after opDealDamage returns — that read-back corrupts when death/respawn fires inside dealDamage (a

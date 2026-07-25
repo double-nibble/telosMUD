@@ -589,21 +589,30 @@ func (z *Zone) swingGatesPass(attacker, target *Entity) bool {
 }
 
 // applySwingDamage runs the damage stage for a landed swing. The damage is a deal_damage op carrying the
-// attacker's WEAPON profile ([G-A] scoped bonus); a crit multiplies it via the `crit_mult` attribute on
-// the ctx mag (so the one deal_damage path crits cleanly). The whole consequence chain — threat,
+// attacker's WEAPON profile ([G-A] scoped bonus); a crit scales it via the `crit_mult` attribute (whole
+// roll, on the ctx mag) and/or the `crit_dice` attribute (dice term only, on c.critDiceMult — #544), so
+// the one deal_damage path crits cleanly either way. The whole consequence chain — threat,
 // OnDamageTaken, OnHit, and the death/on_depleted checkpoint — now lives INSIDE the shared dealDamage
 // funnel (effect_op.go, 6.5 uniform death), so a swing, a spell, an AoE, and a DoT all kill and react
 // through ONE path. Here we only build the swing op, apply the crit multiplier, emit the swing message,
 // then run it. Single-writer: zone goroutine.
 func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit bool) {
 	dmgOp := buildSwingDamageOp(attacker)
-	// Crit multiplier: a content `crit_mult` attribute (>1) scales the whole damage roll through the ctx
-	// magnitude — the SAME deal_damage path, no special crit op (P6-D6: crit is content numbers). 1 (or
-	// unset) => no scaling.
-	prevMag := c.mag
+	// Crit scaling — TWO independent, composable content knobs (#544):
+	//   crit_mult (>1): scales the WHOLE damage roll (dice + flat bonus) via the ctx magnitude — the
+	//     PF/WoW "double the total" crit. The SAME deal_damage path, no special crit op.
+	//   crit_dice (>1): multiplies the DICE COUNT only via c.critDiceMult (rollOpAmount) — the 5e "double
+	//     the dice, not the modifier" crit (1d8+3 -> 2d8+3), with the correct extra-dice variance.
+	// A pack picks one (5e: crit_dice:2, crit_mult:1) or the other (PF/WoW: crit_mult:2, crit_dice:1); if
+	// it sets both they compound (2 x rolling 2d8) — a deliberate content choice, not an engine default.
+	// Both default to no-op (crit_mult unset/1, crit_dice unset/1). Restored after the op like c.mag.
+	prevMag, prevCritDice := c.mag, c.critDiceMult
 	if crit {
 		if m := attr(attacker, "crit_mult"); m > 1 {
 			c.mag = prevMag * m
+		}
+		if cd := int(attr(attacker, "crit_dice")); cd > 1 {
+			c.critDiceMult = cd
 		}
 	}
 	// SC2 (distsys): emit the "You hit $N" message BEFORE opDealDamage. The funnel now runs death INSIDE
@@ -619,6 +628,7 @@ func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit boo
 	// (c.lastDamage carries the applied amount for anything downstream that needs it).
 	_ = opDealDamage(c, dmgOp)
 	c.mag = prevMag
+	c.critDiceMult = prevCritDice
 }
 
 // buildSwingDamageOp builds the deal_damage op for an attacker's swing from its WEAPON profile + the
@@ -717,10 +727,10 @@ func classifyToHit(res checkResult) (hit, crit bool) {
 	if res.band == nil {
 		return true, false
 	}
-	switch res.band.label {
-	case "miss", "fumble":
+	switch {
+	case res.band.label == "miss" || res.band.label == "fumble":
 		return false, false
-	case "crit", "critical":
+	case isCritBandLabel(res.band.label): // shared crit-label convention (#544)
 		return true, true
 	default:
 		return true, false
