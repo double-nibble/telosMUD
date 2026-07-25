@@ -69,6 +69,11 @@ type effectCtx struct {
 	// in resolveCheckScope) — PF iterative attacks (-5/-10/-15 by swing) are authorable without it. It is
 	// 0 outside the swing loop (a spell's deal_damage / a check unrelated to a swing reads $swing.index 0).
 	swingIndex int
+	// affectLevel is the POTENCY of the affect a dispel's per-affect check gate is currently testing
+	// (#545) — exposed to that check as the `$affect.level` ctx scalar so a contested dispel DC can read
+	// `10 + $affect.level`. Set by opDispel around each candidate's gate check and cleared after; 0
+	// everywhere else (a stray `$affect.level` outside a dispel gate reads 0).
+	affectLevel int
 	// critDiceMult is the crit DICE-doubling factor (#544): the number of times a deal_damage/heal op
 	// rolls its DICE term on a critical, adding extra NdS rather than scaling the whole roll. It doubles
 	// the DICE ONLY — the flat `amount`/`bonus` are added once — which is the 5e crit (1d8+3 -> 2d8+3) and

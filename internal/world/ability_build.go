@@ -331,8 +331,11 @@ func parseOp(v any) (effectOp, error) {
 		op.els = sub
 	}
 	// The `check` flow op carries its spec (dice/bonus/vs/bands) under a nested `check` object, kept
-	// separate from deal_damage's top-level `dice` so the richer notation never entangles the two.
-	if op.kind == "check" {
+	// separate from deal_damage's top-level `dice` so the richer notation never entangles the two. `dispel`
+	// (#545) reuses the same nested `check` as its optional per-affect gate (resolved with $affect.level),
+	// so parse the spec for either kind. Only parse when a `check` object is actually present, so a bare
+	// dispel (no gate) stays check-less.
+	if op.kind == "check" || (op.kind == "dispel" && m["check"] != nil) {
 		spec, err := parseCheckSpec(m["check"])
 		if err != nil {
 			return effectOp{}, fmt.Errorf("check: %w", err)

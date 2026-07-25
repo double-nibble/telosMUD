@@ -466,6 +466,16 @@ type affectDef struct {
 	roomScoped bool
 
 	duration int // base duration in PULSES (heartbeat-denominated; conserved across save/load)
+	// indefinite (#545) marks a duration that NEVER counts down: the affect ends only via dispel /
+	// remove_affect / death (an "until dispelled" ward, a permanent racial trait). The tick skips its
+	// countdown/expiry and its stored `remaining` sentinel round-trips through save/load unchanged. It
+	// replaces the "author a huge duration" hack (the engine has no other permanent affect). Parsed from
+	// DurationKind == "indefinite".
+	indefinite bool
+	// level (#545) is the affect's POTENCY rank: dispel strips the HIGHEST-level effect first, and a
+	// dispel's optional per-affect check gate reads it as `$affect.level`. 0 (unranked) by default; names
+	// no engine mechanic on its own.
+	level int
 
 	modifiers []affectModifier // additive/multiplicative attribute mods while active
 	prevents  []string         // tags this affect blocks (§6 tag CC); the runtime unions these

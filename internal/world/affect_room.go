@@ -93,11 +93,16 @@ func applyRoomAffect(room *Entity, ref string, source *Entity) *affectInstance {
 func attachRoomInstance(_ *Entity, a *Affected, def *affectDef, source *Entity) *affectInstance {
 	key := keyFor(def, source)
 	dur := def.duration
+	if def.indefinite {
+		dur = durationIndefinite // #545: an "until dispelled" room field never counts down
+	}
 	if existing := a.byKey[key]; existing != nil {
-		switch def.stacking {
-		case stackExtend:
+		switch {
+		case def.indefinite:
+			// sentinel stays; no timer to refresh/extend
+		case def.stacking == stackExtend:
 			existing.remaining += dur
-		case stackIgnore:
+		case def.stacking == stackIgnore:
 			// first wins
 		default: // refresh / count both reset the timer for a room field
 			existing.remaining = dur
@@ -262,11 +267,13 @@ func roomTickOnce(room *Entity, a *Affected, _ uint64) {
 				landRoomAffectOnOccupants(room, inst)
 			}
 		}
-		if inst.remaining > 0 {
-			inst.remaining--
-		}
-		if inst.remaining <= 0 {
-			expireRoomAffect(room, a, inst)
+		if !inst.def.indefinite { // #545: an indefinite room field ends only via clear/dispel, never the tick
+			if inst.remaining > 0 {
+				inst.remaining--
+			}
+			if inst.remaining <= 0 {
+				expireRoomAffect(room, a, inst)
+			}
 		}
 	}
 }

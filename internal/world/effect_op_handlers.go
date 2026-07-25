@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sort"
 )
 
 // randIntn is the package-default rng draw (math/rand) used when a ctx carries no injected rng. Tests
@@ -217,11 +218,21 @@ func opRemoveAffect(c *effectCtx, op *effectOp) error {
 	return nil
 }
 
-// opDispel: dispel(target, {category, count}). Removes up to `count` (amount) dispellable affects of
-// a matching category (the op.text carries the category; empty = any). On a SELF/ally/mob target this
+// opDispel: dispel(target, {category, count, check}). Removes up to `count` (amount) dispellable affects
+// of a matching category (the op.text carries the category; empty = any). On a SELF/ally/mob target this
 // is a cleanse (helpful) — ungated. But dispelling another PLAYER's affects strips their protective
 // buffs = HARM, so on a non-self player target it routes through the ONE shared guardHarmful and aborts
 // cleanly on a deny (same funnel as deal_damage). count<=0 means "all matching".
+//
+// ORDERING BY LEVEL (#545): candidates are removed HIGHEST-LEVEL first (affectDef.level DESC), so a
+// count-limited dispel strips the strongest effects — 5e Dispel Magic's "removes the highest-level
+// effect". Ties keep active-list order (stable).
+//
+// PER-AFFECT CHECK GATE (#545, optional): when the dispel op carries a `check` spec, it is resolved ONCE
+// PER CANDIDATE with the affect's potency exposed as `$affect.level` (so the DC can read `10 +
+// $affect.level`, 5e's contested dispel). A candidate whose gate check RESISTS (its matched band is a
+// fail/miss/resist band) is left attached and does NOT count against the limit; the dispel moves on to
+// the next. With no `check`, every matching candidate is removed unconditionally (the prior behaviour).
 func opDispel(c *effectCtx, op *effectOp) error {
 	if c.target == nil || c.target.living == nil {
 		return fmt.Errorf("dispel: no living target")
@@ -234,20 +245,49 @@ func opDispel(c *effectCtx, op *effectOp) error {
 	if !ok {
 		return nil
 	}
-	limit := int(op.amount)
-	removed := 0
-	// Snapshot: expire mutates a.list.
-	snapshot := make([]*affectInstance, len(a.list))
-	copy(snapshot, a.list)
-	for _, inst := range snapshot {
-		if limit > 0 && removed >= limit {
-			break
-		}
+	// Gather the dispellable, category-matching candidates, then order HIGHEST-LEVEL first (#545). Built
+	// as a snapshot up front (expire mutates a.list); the per-candidate presence re-check below covers a
+	// cascade that removed one mid-loop.
+	var cands []*affectInstance
+	for _, inst := range a.list {
 		if !inst.def.dispellable {
 			continue
 		}
 		if op.text != "" && inst.def.category != op.text {
 			continue
+		}
+		cands = append(cands, inst)
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].def.level > cands[j].def.level })
+
+	limit := int(op.amount)
+	removed := 0
+	for _, inst := range cands {
+		if limit > 0 && removed >= limit {
+			break
+		}
+		// Re-check presence: a prior candidate's on_dispel/on_expire cascade may have already removed this
+		// one (or it expired). keyFor(def, source) is how expire keys removal.
+		if a.byKey[keyFor(inst.def, inst.source)] != inst {
+			continue
+		}
+		// PER-AFFECT CHECK GATE: resolve the dispel's check with this affect's level bound to $affect.level.
+		// A resist leaves the affect and does not consume the limit. Restored after so a stray $affect.level
+		// elsewhere reads 0.
+		if op.check != nil {
+			prev := c.affectLevel
+			c.affectLevel = inst.def.level
+			res := resolveCheck(c, op.check)
+			c.affectLevel = prev
+			if dispelResisted(res) {
+				continue
+			}
+			// Re-check presence AFTER the gate: resolveCheck fires OnCheck, whose handler could have
+			// removed/re-applied this very instance (a pathological but reachable re-entrancy). Expiring a
+			// stale inst would delete a same-key affect that OnCheck freshly re-applied. Skip if it is gone.
+			if a.byKey[keyFor(inst.def, inst.source)] != inst {
+				continue
+			}
 		}
 		// Lua on_dispel hook (7.4d): fires BEFORE removal (the affect is still attached) so the
 		// hook can read its own magnitude/state. on_expire then also fires from expire() — a
@@ -259,6 +299,26 @@ func opDispel(c *effectCtx, op *effectOp) error {
 		removed++
 	}
 	return nil
+}
+
+// dispelResisted reports whether a dispel's per-affect check gate (#545) FAILED to remove the affect —
+// i.e. the affect withstood the dispel. Convention (shared with classifyToHit's fail labels): a matched
+// band labelled "resist", "fail", or "miss" is a resist; any OTHER matched band is a success (the affect
+// is removed). An UNMATCHED gate roll (res.band == nil — the author's bands didn't cover the roll) is
+// treated as a RESIST, the FAIL-SAFE default (review): an indeterminate gate must NOT strip a protective
+// buff (a cross-player dispel is harm), matching the "indeterminate predicate fails toward inaction"
+// discipline. A bare dispel with NO check never reaches here (it removes unconditionally) — this fail-safe
+// applies only when a gate check was authored but classified nothing.
+func dispelResisted(res checkResult) bool {
+	if res.band == nil {
+		return true // unmatched gate roll: do not remove (fail-safe)
+	}
+	switch res.band.label {
+	case "resist", "fail", "miss":
+		return true
+	default:
+		return false
+	}
 }
 
 // opAct: act(template, to). Emits a perspective message (step-9 style) via the zone's act(). to is

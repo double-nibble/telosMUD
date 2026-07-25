@@ -454,6 +454,11 @@ func evalCheckFormulaErr(c *effectCtx, node formulaNode, def *Entity) (float64, 
 			if v, ok := resolveDepletionRef(c, ref); ok {
 				return v, nil
 			}
+			// $affect.* is the same ctx-scalar shape (#545): the potency of the affect a dispel gate is
+			// currently testing, so a contested dispel DC can read `10 + $affect.level`.
+			if v, ok := resolveAffectRef(c, ref); ok {
+				return v, nil
+			}
 			ent, bare := resolveCheckScope(c, ref, def)
 			// A DEGRADED attribute fails the whole formula (attributes.go attrScreen). Before the
 			// modifier fold was bounded, an overflowed attribute was ±Inf and evalFinite rejected it
@@ -544,6 +549,25 @@ func resolveDepletionRef(c *effectCtx, ref string) (float64, bool) {
 		return float64(c.depletion.applied), true
 	case "amount":
 		return float64(c.depletion.amount), true
+	default:
+		return 0, true
+	}
+}
+
+// resolveAffectRef resolves a `$affect.<field>` ctx-scalar ref (#545) — the sibling of resolveSwingRef/
+// resolveDepletionRef, same shape so content has ONE concept for "a number the engine put on this
+// resolution". The only field is `level`: the potency of the affect a dispel's per-affect check gate is
+// testing (opDispel sets c.affectLevel around each candidate's gate check), so a dispel DC can be
+// authored as `10 + $affect.level`. Returns (value, true) for a recognized `$affect.` ref; (0, false)
+// otherwise. An UNKNOWN `$affect.` field yields (0, true) — a clean 0, not an attr miss — so a typo can
+// never silently read an entity attribute. Outside a dispel gate c.affectLevel is 0 (the zero value).
+func resolveAffectRef(c *effectCtx, ref string) (float64, bool) {
+	if !strings.HasPrefix(ref, "$affect.") {
+		return 0, false
+	}
+	switch ref[len("$affect."):] {
+	case "level":
+		return float64(c.affectLevel), true
 	default:
 		return 0, true
 	}
