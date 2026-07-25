@@ -255,12 +255,26 @@ type effectOp struct {
 	area string
 
 	// ifResource + ifResourceMin are the `if` flow op's RESOURCE-threshold condition ([G9] reaction
-	// budget): `if <ifResource> >= <ifResourceMin>` over the CURRENT of the ctx subject's pool (the actor
+	// budget): `if <ifResource> <ifCmp> <threshold>` over the CURRENT of the ctx subject's pool (the actor
 	// by default; `target: other` selects the counterpart). This is what lets a content reaction guard on
 	// "do I have a reaction left?" — `if reactions >= 1, then [spend + opportunity attack]`. Empty
-	// ifResource leaves `if` on its has_affect condition (op.affect), unchanged.
+	// ifResource (and ifValue) leaves `if` on its has_affect condition (op.affect), unchanged.
 	ifResource    string
-	ifResourceMin float64
+	ifResourceMin float64 // legacy literal RHS; used only when ifThreshold is nil (back-compat)
+
+	// The richer predicate vocabulary (#542) generalizes the above from "resource >= literal" to a full
+	// comparison of a numeric LHS against a numeric RHS FORMULA. Both sides can be DERIVED, so an author
+	// can express "hp <= half of max_hp" or "$depletion.overflow >= max_hp" (instant death) declaratively
+	// instead of dropping to Lua. All fields default to the legacy behaviour when unset.
+	//   - ifCmp is the comparison operator: ">=" (default), "<=", ">", "<", "==", "!=".
+	//   - ifValue is an optional FORMULA LHS, used when the compared quantity is NOT a pool current — an
+	//     attribute, a ctx scalar ($swing.index / $depletion.overflow), or an arithmetic of them. When set
+	//     it takes precedence over ifResource as the LHS. Scoped to the ctx subject (bare refs read it).
+	//   - ifThreshold is the RHS FORMULA (a derived threshold like max_hp/2), scoped to the subject. When
+	//     nil the legacy ifResourceMin literal is used, so pre-#542 content is byte-for-byte unchanged.
+	ifCmp       string
+	ifValue     formulaNode
+	ifThreshold formulaNode
 
 	// then/els are the nested branches for the flow ops (if/chance). Parsed recursively.
 	then []effectOp
