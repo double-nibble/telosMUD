@@ -665,6 +665,21 @@ type CombatProfileDTO struct {
 	ToHit       any            `json:"to_hit" yaml:"to_hit"`             // a check body (parseCheckSpec)
 	Avoidance   []any          `json:"avoidance" yaml:"avoidance"`       // ordered avoidance check bodies
 	DamageBonus FormulaNodeDTO `json:"damage_bonus" yaml:"damage_bonus"` // [G-A] scoped damage bonus formula
+	// Multiattack (#543) is an ordered HETEROGENEOUS attack routine — a monster's Multiattack of DIFFERENT
+	// attacks (bite 1d10 + 2 claws 1d6). When set it replaces the `attacks`-count × one-weapon loop: the
+	// round resolves sum(count) swings, each using its own dice/type/(optional per-attack)bonus. Empty =>
+	// the homogeneous path (a martial's Extra Attack re-using one weapon, already fine). Rides the JSONB body.
+	Multiattack []AttackEntryDTO `json:"multiattack" yaml:"multiattack"`
+}
+
+// AttackEntryDTO is one attack of a heterogeneous Multiattack routine (#543): `count` swings of `dice`
+// (an "NdS" string) of damage `type`, plus an optional per-attack `bonus` formula (absent => the
+// profile's damage_bonus). Count defaults to 1.
+type AttackEntryDTO struct {
+	Count int            `json:"count" yaml:"count"`
+	Dice  string         `json:"dice" yaml:"dice"` // "1d10"
+	Type  string         `json:"type" yaml:"type"`
+	Bonus FormulaNodeDTO `json:"bonus" yaml:"bonus"`
 }
 
 // AttributeDTO is one content-defined attribute (docs/ABILITIES.md §1, docs/PHASE5-PLAN.md §1.1).

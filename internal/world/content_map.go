@@ -256,6 +256,32 @@ func buildCombatProfile(d content.CombatProfileDTO) *combatProfile {
 			p.damageBonus = node
 		}
 	}
+	// #543 heterogeneous multiattack: parse each routine entry's dice/type/count + optional per-entry bonus.
+	// A malformed dice spec marks the profile BROKEN (like a bad to-hit) so a typo surfaces as a
+	// non-resolving profile rather than a silently-wrong attack; a bad per-entry bonus is ignored (falls
+	// back to the profile's damageBonus), matching the top-level damage_bonus lenience.
+	for i, ae := range d.Multiattack {
+		n, s, err := parseDice(ae.Dice)
+		if err != nil {
+			slog.Error("content: combat profile multiattack dice parse failed; profile marked BROKEN",
+				"profile", d.Ref, "index", i, "err", err)
+			p.broken = true
+			continue
+		}
+		entry := attackEntry{count: ae.Count, diceNum: n, diceSize: s, dmgType: ae.Type}
+		if entry.count < 1 {
+			entry.count = 1
+		}
+		if ae.Bonus != nil {
+			if node, err := parseFormula(ae.Bonus); err != nil {
+				slog.Error("content: combat profile multiattack bonus parse failed; using the profile damage_bonus",
+					"profile", d.Ref, "index", i, "err", err)
+			} else {
+				entry.bonus = node
+			}
+		}
+		p.routine = append(p.routine, entry)
+	}
 	return p
 }
 
