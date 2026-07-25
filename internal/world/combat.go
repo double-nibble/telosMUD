@@ -37,7 +37,8 @@ import (
 // the iteration ORDER is centralized — the [G-G] simultaneous-default seam: the order is a stable sort
 // by a content-overridable `combat_order` attribute (default 0 => stable insertion-ish order over a
 // sorted key), NOT initiative. 5e initiative is an OPTIONAL content check at combat-start that writes
-// combat_order; the driver just sorts by it.
+// combat_order; the driver just sorts by it. That combat-start hook is the OnEnterCombat event (#547),
+// fired from startFight about each entrant, so content can roll combat_order before the first round.
 
 // PULSE_VIOLENCE is the combat round length in base pulses (pulse.go pulseInterval). Diku's violence
 // pulse is ~2.4s; at the 250ms base pulse that is 10 pulses. It is the only combat-timing knob — every
@@ -101,16 +102,62 @@ func (z *Zone) startFight(attacker, target *Entity) bool {
 	if position(target) == posDead {
 		return false
 	}
+	// Capture who is ENTERING combat (transitioning from not-fighting) BEFORE we mutate the fighting
+	// links, so OnEnterCombat fires once per genuine entry (#547) — never on a re-`kill` of a new foe
+	// while ALREADY engaged (that is a target switch, not a fresh entry, so no re-roll). It fires per
+	// ENTRY, not per fight: an entity that FLED (stopFight cleared its fighting link) and then re-engages
+	// DOES re-enter combat and re-fires — content that wants once-per-fight semantics must make its
+	// OnEnterCombat handler idempotent (e.g. gate on combat_order already being set). The engine reports
+	// entry faithfully; idempotency is content's (engine = mechanism, content = policy).
+	attackerEntering := attacker.living.fighting == nil
 	mutableLiving(attacker).fighting = target // COW: forking a proto-aliased mob's Living before setting its fighting target (else the proto retains a stale pointer)
 	setPosition(attacker, posFighting)
 	// Retaliation: an unengaged target turns and fights its attacker (classic auto-retaliate). A target
 	// already fighting someone else keeps its current target (threat/assist is 6.3b).
+	targetEntering := false
 	if target.living.fighting == nil {
 		mutableLiving(target).fighting = attacker // COW: same, for the retaliating target
 		setPosition(target, posFighting)
+		targetEntering = true
+	}
+	// OnEnterCombat CHECKPOINT (#547, the initiative seam): fire the in-zone event about each side that
+	// JUST entered the fight, with its opponent as `other`, so a content `check` can roll initiative into
+	// `combat_order` (combat.go's round driver sorts by it) BEFORE the first round resolves — the first
+	// PULSE_VIOLENCE has not fired yet (ensureCombatRound only arms it below). Fired here, not per-round,
+	// so the roll happens ONCE at fight start.
+	//
+	// The root ctx carries z.combatRng() so an initiative check's dice draw from the ZONE combat rng, not
+	// the process-global math/rand — the #58 seeded-combat invariant (a seeded replay must reproduce
+	// initiative order exactly as it reproduces swings). eventBudget is left nil so each entrant's fire
+	// roots its OWN fresh width budget (fireEvent allocates one); startFight takes no ctx parameter to
+	// thread an outer cascade's budget, and the zone-level maxEventCascadeDepth backstop (event.go) bounds
+	// Go-stack recursion regardless. KNOWN bounded amplification: startFight is reachable from aggroOnEntry,
+	// which a Lua on_event handler can drive via h:move — so an OnEnterCombat cascade can root INSIDE an
+	// existing cascade with a fresh budget rather than sharing it; the 32-frame backstop caps that to
+	// finite work (not a spin), which is why threading a budget here is a nicety, not a safety requirement.
+	// A harmful op in a handler still funnels guardHarmful (no gate bypass).
+	//
+	// Liveness is RE-CHECKED before each fire: the attacker-side handler may lethally proc (a one-shot
+	// ambush) and kill/detach the target before its own entry event fires; combatEntryLive suppresses a
+	// fire about a now-dead/room-detached entity (harmful ops already fail-closed on a detached actor, but
+	// a benign self-apply/act/set_flag would otherwise run on a corpse). Symmetric on both sides.
+	root := &effectCtx{z: z, rng: z.combatRng()}
+	if attackerEntering && combatEntryLive(attacker) {
+		z.fireEvent(root, evOnEnterCombat, attacker, target, 1)
+	}
+	if targetEntering && combatEntryLive(target) {
+		z.fireEvent(root, evOnEnterCombat, target, attacker, 1)
 	}
 	z.ensureCombatRound()
 	return true
+}
+
+// combatEntryLive reports whether e is still a valid SUBJECT for an OnEnterCombat fire (#547): a living,
+// in-room, non-dead entity. It guards the sequential-fire edge where the first entrant's handler kills or
+// relocates a combatant before that combatant's own entry event fires — we must not fire OnEnterCombat
+// about a dead or room-detached entity. Zone-goroutine read.
+func combatEntryLive(e *Entity) bool {
+	return e != nil && e.living != nil && e.location != nil && position(e) != posDead
 }
 
 // stopFight removes `e` from combat: clears its fighting target and drops it back to standing (unless

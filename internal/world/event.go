@@ -72,6 +72,7 @@ const (
 	evOnDamageTaken     eventKind = "OnDamageTaken"     // an entity took damage — live 6.3a
 	evOnKill            eventKind = "OnKill"            // an entity died to the subject — live 6.3b
 	evOnLeaveRoom       eventKind = "OnLeaveRoom"       // an engaged foe is leaving a room (the OA checkpoint) — live 6.4b
+	evOnEnterCombat     eventKind = "OnEnterCombat"     // an entity just ENTERED a fight (the initiative checkpoint) — live 6.3b (#547)
 	evBeforeCastCommit  eventKind = "BeforeCastCommit"  // an ability is about to commit (the cast checkpoint) — live 6.4b
 	evOnRest            eventKind = "OnRest"            // the subject rested — reserved 6.2b (regen/rest)
 	evOnApplyAffect     eventKind = "OnApplyAffect"     // an affect attached — reserved
@@ -104,7 +105,7 @@ const (
 // engine event (that would silently fail to fire forever).
 var knownEventKinds = map[eventKind]bool{
 	evOnCheck: true, evOnAbilityResolved: true, evOnHit: true, evOnDamageTaken: true,
-	evOnKill: true, evOnLeaveRoom: true, evBeforeCastCommit: true, evOnRest: true,
+	evOnKill: true, evOnLeaveRoom: true, evOnEnterCombat: true, evBeforeCastCommit: true, evOnRest: true,
 	evOnApplyAffect: true, evOnAffectTick: true, evOnAffectExpire: true, evOnAffectBlocked: true, evOnEnter: true,
 	evToHit:       true,
 	evOnTrackStep: true, evOnLevel: true, evOnSkillUse: true, // Phase 11.3 progression events
