@@ -48,6 +48,19 @@ func rollOpAmount(c *effectCtx, op *effectOp) float64 {
 	if op.diceCount != nil {
 		num = int(evalCheckFormula(c, op.diceCount, c.actor))
 	}
+	// CRIT DICE-DOUBLING (#544): on a crit the DICE COUNT is multiplied (2d8 instead of 1d8) so the roll
+	// gains extra NdS with the correct variance — NOT a constant scale of one roll. Applied to the dice
+	// COUNT only, so the flat `amount` and the scoped `bonus` below are added ONCE (the 5e rule: a crit
+	// doubles the dice, not the modifier). Rolling `num*mult` dice of the same size is distributionally
+	// identical to rolling the term `mult` times. Inert (mult <= 1) outside a crit; the whole-roll
+	// `crit_mult` path composes separately through c.mag below. NOTE: the doubled count is still subject to
+	// rollDice's maxDice ceiling (the anti-spin bound), so a [G-A] dice_count formula already near maxDice
+	// loses its crit doubling to the clamp — a crit adds no extra dice at the very top of the scaling
+	// curve. Acceptable: that ceiling exists to stop a runaway count from spinning the zone goroutine, and
+	// degrading to fewer dice is the safe direction. Realistic content is far below the cap.
+	if c.critDiceMult > 1 && num > 0 {
+		num *= c.critDiceMult
+	}
 	if num > 0 && op.diceSize > 0 {
 		amt += float64(rollDice(c, num, op.diceSize))
 	}
@@ -333,9 +346,44 @@ func opCheck(c *effectCtx, op *effectOp) error {
 	}
 	res := resolveCheck(c, op.check)
 	if res.band != nil {
+		// CRIT DICE-DOUBLING for a CHECK-BAND crit (#544): when the matched band is a crit (its label is
+		// "crit"/"critical"), scale the DICE term of any deal_damage/heal in the band's ops by the ROLLER's
+		// `crit_dice` attribute — so a SPELL attack roll's crit doubles dice exactly like a melee swing crit
+		// (which applySwingDamage handles outside opCheck). The roller is res.roller (the ctx actor by
+		// default, or the ctx TARGET under subject: target — the saving-throw idiom), so the attribute is
+		// read from the entity that actually rolled, matching the check's own scoping. This is the ONLY crit
+		// knob wired here: the whole-roll `crit_mult` stays a swing-only mechanism, so a pack's melee
+		// crit_mult can't silently double spell damage. Inert unless content sets crit_dice > 1 (default 1).
+		//
+		// SEMANTICS (documented decisions, not accidents):
+		//   - SET, not multiply (c.critDiceMult = cd): a check crit band inside an already-critting swing/
+		//     band overwrites rather than compounds, so two nested crit bands do NOT stack to 4x. crit_dice
+		//     therefore composes differently from crit_mult (which multiplies through c.mag); a pack wanting
+		//     multiplicative crit uses crit_mult.
+		//   - The context covers the WHOLE band op-list, including a NESTED non-crit check's ops: everything
+		//     that happens on the crit is crit damage. Saved/restored around the band ops so the outer crit
+		//     context (a swing crit, an enclosing band) is exactly restored afterwards.
+		//   - "crit"/"critical" is a RESERVED mechanical band label here (as in classifyToHit): a band so
+		//     labelled with a deal_damage in it doubles when the roller has crit_dice > 1, even if the author
+		//     meant the label as flavor. Documented in docs/ABILITIES.md; inert for packs that never set
+		//     crit_dice.
+		prevCritDice := c.critDiceMult
+		if isCritBandLabel(res.band.label) {
+			if cd := int(attr(res.roller, "crit_dice")); cd > 1 {
+				c.critDiceMult = cd
+			}
+		}
 		runOps(c, res.band.ops)
+		c.critDiceMult = prevCritDice
 	}
 	return nil
+}
+
+// isCritBandLabel reports whether a check-band label denotes a critical (the engine-fixed convention,
+// shared with classifyToHit in combat.go): "crit" or "critical". Used to wire crit dice-doubling to a
+// spell/ability check-band crit (#544) without the engine naming any content.
+func isCritBandLabel(label string) bool {
+	return label == "crit" || label == "critical"
 }
 
 // rollDice rolls diceNum d diceSize (each die 1..size), using the ctx rng when present for
