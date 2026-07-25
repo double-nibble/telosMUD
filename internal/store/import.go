@@ -694,7 +694,7 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	// into the same CombatProfileDTO the embedded YAML produces.
 	for _, cp := range pk.CombatProfiles {
 		body, err := json.Marshal(combatProfileBody{
-			ToHit: cp.ToHit, Avoidance: cp.Avoidance, DamageBonus: cp.DamageBonus,
+			ToHit: cp.ToHit, Avoidance: cp.Avoidance, DamageBonus: cp.DamageBonus, Multiattack: cp.Multiattack,
 		})
 		if err != nil {
 			return fmt.Errorf("store: marshal combat profile %s body: %w", cp.Ref, err)

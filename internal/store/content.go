@@ -495,6 +495,10 @@ type combatProfileBody struct {
 	ToHit       any                    `json:"to_hit,omitempty"`
 	Avoidance   []any                  `json:"avoidance,omitempty"`
 	DamageBonus content.FormulaNodeDTO `json:"damage_bonus,omitempty"`
+	// Multiattack (#543) is the heterogeneous attack routine; it rides the body JSONB like the rest, so
+	// BOTH ends (import marshal + load unmarshal) must carry it or a DB round-trip drops the routine and a
+	// mob reverts to its single-weapon swing (the def-table field-drop class).
+	Multiattack []content.AttackEntryDTO `json:"multiattack,omitempty"`
 }
 
 // channelBody is the JSONB-tail shape for a channel_defs row (Phase 8.3): everything that is not the
@@ -915,6 +919,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 				return fmt.Errorf("store: combat_profile_def %s body: %w", cp.Ref, err)
 			}
 			cp.ToHit, cp.Avoidance, cp.DamageBonus = b.ToHit, b.Avoidance, b.DamageBonus
+			cp.Multiattack = b.Multiattack // #543 heterogeneous attack routine
 		}
 		pp := pack(pk)
 		pp.CombatProfiles = append(pp.CombatProfiles, cp)

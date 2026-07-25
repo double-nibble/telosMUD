@@ -82,6 +82,19 @@ type combatProfile struct {
 	// attacker ($actor). nil => raw weapon dice only. This is what lets a sword add STR as CONTENT (no Lua).
 	damageBonus formulaNode
 
+	// routine is an optional HETEROGENEOUS multiattack ([#543]): an ordered list of distinct attacks the
+	// swing loop cycles (a monster's Multiattack — bite 1d10 + 2 claws 1d6), each with its OWN dice/type/
+	// bonus/count. When non-empty it REPLACES the `attacks`-count × one-weapon loop: the round resolves
+	// sum(count) swings, each using its entry's dice instead of the wielded weapon. Empty => the classic
+	// homogeneous path (the martial Extra-Attack case, which re-uses one weapon, is already fine there).
+	//
+	// A routine REPLACES `attacks`, it does not multiply it: a mob with `attacks: 3` AND a routine swings
+	// sum(count), not 3 x sum(count), and a haste effect granting +attacks adds nothing to a routine
+	// attacker (content models a hasted multiattacker with an extra routine entry). All entries share the
+	// profile's ONE `to_hit` — a per-entry attack bonus is out of scope (the issue's schema is dice/type/
+	// bonus/count, damage-side only).
+	routine []attackEntry
+
 	// broken records that a sub-spec of this profile FAILED TO PARSE at build (content_map.go). It is
 	// NOT the same as "authored nothing": a nil toHit legitimately means "no classifier, the swing
 	// auto-lands", so folding a parse failure into it would convert one typo into "nothing can ever
@@ -89,6 +102,17 @@ type combatProfile struct {
 	// defender. A broken profile refuses to resolve swings instead, so a content defect surfaces as a
 	// visibly non-functional profile rather than an invisible balance change.
 	broken bool
+}
+
+// attackEntry is one attack in a heterogeneous multiattack routine (#543): `count` swings of `diceNum`d
+// `diceSize` of `dmgType`, plus an optional per-attack `bonus` formula (nil => the profile's damageBonus).
+// A bite (count 1, 1d10) then two claws (count 2, 1d6) is two entries. Immutable after build.
+type attackEntry struct {
+	count    int
+	diceNum  int
+	diceSize int
+	dmgType  string
+	bonus    formulaNode // optional per-entry damage bonus; nil => the profile's damageBonus
 }
 
 // startFight puts `attacker` into combat with `target` and, classically, makes the target RETALIATE
@@ -431,6 +455,36 @@ func (z *Zone) gatherCombatants() []*Entity {
 // round. `budget` is the round-shared event budget (runCombatRound) every swing's OnHit/OnDamageTaken
 // threads. Single-writer: zone goroutine.
 func (z *Zone) resolveSwings(attacker *Entity, _ uint64, budget *int) {
+	rng := z.combatRng()
+	// HETEROGENEOUS MULTIATTACK (#543): if the attacker's profile authored a routine (bite + 2 claws),
+	// cycle it — each entry contributes `count` swings using ITS dice, not the `attacks`-count × one-weapon
+	// loop. The total is capped at maxSwingsPerRound (a runaway routine can't spin the goroutine). The
+	// per-round swing index is the FLAT index across the routine (so $swing.index / PF iterative penalties
+	// still count every swing in order). The target is re-read per swing (a swing that ends the fight stops
+	// the rest of the round).
+	if prof := combatProfileFor(attacker); prof != nil && !prof.broken && len(prof.routine) > 0 {
+		idx := 0
+		for i := range prof.routine {
+			entry := prof.routine[i] // copy: pass a stable pointer per iteration
+			if entry.count < 1 {
+				continue // a zero-count entry contributes no swing (content normalizes to >=1; this keeps
+				// the loop's termination independent of the parser for any non-content constructor).
+			}
+			for k := 0; k < entry.count; k++ {
+				if idx >= maxSwingsPerRound {
+					return
+				}
+				target := attacker.living.fighting
+				if target == nil {
+					return
+				}
+				z.resolveSwingEntry(attacker, target, idx, rng, budget, &entry)
+				idx++
+			}
+		}
+		return
+	}
+	// Homogeneous path (no routine): `attacks` swings, all with the wielded weapon.
 	n := int(attr(attacker, "attacks"))
 	if n < 1 {
 		n = 1 // every combatant gets at least one swing (a contentless attacker still swings once)
@@ -438,7 +492,6 @@ func (z *Zone) resolveSwings(attacker *Entity, _ uint64, budget *int) {
 	if n > maxSwingsPerRound {
 		n = maxSwingsPerRound
 	}
-	rng := z.combatRng()
 	for i := 0; i < n; i++ {
 		target := attacker.living.fighting
 		if target == nil {
@@ -455,7 +508,20 @@ func (z *Zone) resolveSwings(attacker *Entity, _ uint64, budget *int) {
 // `swingIndex` is the 0-based index within the round ([G-H], exposed to the to-hit/damage formulas as
 // $swing.index). The whole pipeline runs on the zone goroutine; every harmful application funnels
 // dealDamage -> guardHarmful (the harm funnel is unchanged — no new harm path is introduced here).
+//
+// resolveSwing is the homogeneous entry point (one wielded weapon) — it delegates to resolveSwingEntry
+// with no routine entry. resolveSwingEntry adds the #543 heterogeneous-multiattack override so a routine's
+// per-attack dice replace the weapon; keeping resolveSwing's signature stable leaves every direct caller
+// (tests, the classic loop) untouched.
 func (z *Zone) resolveSwing(attacker, target *Entity, swingIndex int, rng *rand.Rand, budget *int) {
+	z.resolveSwingEntry(attacker, target, swingIndex, rng, budget, nil)
+}
+
+// resolveSwingEntry is resolveSwing with an optional #543 multiattack `entry`: when non-nil, the damage
+// stage uses the entry's dice/type/bonus instead of the attacker's wielded weapon (a heterogeneous
+// Multiattack). nil => the wielded-weapon path. Everything else (gates, to-hit, avoidance, crit, soak,
+// OnHit) is identical.
+func (z *Zone) resolveSwingEntry(attacker, target *Entity, swingIndex int, rng *rand.Rand, budget *int, entry *attackEntry) {
 	// --- Gate-1: position / same-room / target alive (visibility + safe-room ride the gates below) ----
 	if !z.swingGatesPass(attacker, target) {
 		return
@@ -559,7 +625,7 @@ func (z *Zone) resolveSwing(attacker, target *Entity, swingIndex int, rng *rand.
 	// $actor.damroll + str). A crit scales it via a damage MULTIPLIER attribute the content sets
 	// (`crit_mult`); the multiply rides the ctx mag so the SAME deal_damage path doubles cleanly. The
 	// damage op + its soak/mitigate are run through buildSwingDamage. ------------------------------
-	z.applySwingDamage(c, attacker, target, crit)
+	z.applySwingDamage(c, attacker, target, crit, entry)
 }
 
 // swingGatesPass runs the swing pipeline's gates (docs/COMBAT.md §3 step-1). The attacker must be able
@@ -611,8 +677,8 @@ func (z *Zone) swingGatesPass(attacker, target *Entity) bool {
 // funnel (effect_op.go, 6.5 uniform death), so a swing, a spell, an AoE, and a DoT all kill and react
 // through ONE path. Here we only build the swing op, apply the crit multiplier, emit the swing message,
 // then run it. Single-writer: zone goroutine.
-func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit bool) {
-	dmgOp := buildSwingDamageOp(attacker)
+func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit bool, entry *attackEntry) {
+	dmgOp := buildSwingDamageOpEntry(attacker, entry)
 	// Crit scaling — TWO independent, composable content knobs (#544):
 	//   crit_mult (>1): scales the WHOLE damage roll (dice + flat bonus) via the ctx magnitude — the
 	//     PF/WoW "double the total" crit. The SAME deal_damage path, no special crit op.
@@ -654,7 +720,27 @@ func (z *Zone) applySwingDamage(c *effectCtx, attacker, target *Entity, crit boo
 // Weapon component anyway (a mob is spawned wielding its natural weapon, or the prototype carries a
 // Weapon directly). The bonus formula is read from the attacker's combat profile.
 func buildSwingDamageOp(attacker *Entity) *effectOp {
+	return buildSwingDamageOpEntry(attacker, nil)
+}
+
+// buildSwingDamageOpEntry is buildSwingDamageOp with an optional #543 multiattack `entry`. When entry is
+// non-nil the dice + damage type come from the ROUTINE entry (a bite's 1d10, a claw's 1d6) instead of the
+// wielded weapon, and the bonus is the entry's own formula falling back to the profile's damageBonus —
+// so a heterogeneous Multiattack's per-attack dice flow through the SAME deal_damage funnel (mitigation,
+// crit, threat, OnHit) as a weapon swing. nil entry => the wielded-weapon path, unchanged.
+func buildSwingDamageOpEntry(attacker *Entity, entry *attackEntry) *effectOp {
 	op := &effectOp{kind: "deal_damage"}
+	prof := combatProfileFor(attacker)
+	if entry != nil {
+		// A routine attack: the entry supplies the dice + type; its bonus, or the profile's, is the [G-A]
+		// scoped formula.
+		op.diceNum, op.diceSize, op.dmgType = entry.diceNum, entry.diceSize, entry.dmgType
+		op.bonus = entry.bonus
+		if op.bonus == nil && prof != nil {
+			op.bonus = prof.damageBonus
+		}
+		return op
+	}
 	if w := wieldedWeapon(attacker); w != nil {
 		op.diceNum, op.diceSize, op.dmgType = w.diceNum, w.diceSize, w.damageType
 	} else {
@@ -665,7 +751,7 @@ func buildSwingDamageOp(attacker *Entity) *effectOp {
 	// The damage BONUS is a content formula ([G-A]) the attacker's combat profile carries — `$actor.str +
 	// $actor.damroll` etc. It is parsed once at content build and stored as op.bonus so opDealDamage adds
 	// it scoped to $actor. A profile with no bonus formula leaves op.bonus nil (raw weapon dice only).
-	if prof := combatProfileFor(attacker); prof != nil {
+	if prof != nil {
 		op.bonus = prof.damageBonus
 	}
 	return op
