@@ -109,6 +109,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		rd := &resourceDef{
 			ref: r.Ref, displayName: r.DisplayName, maxAttr: r.MaxAttr,
 			vital: r.Vital, primary: r.Primary, regen: r.Regen, regenInCombat: r.RegenInCombat,
+			absorb: r.Absorb, fronts: r.Fronts, // #536: a pre-vital absorption buffer (temp HP / ward)
 			depletedThreshold: r.DepletedThreshold,
 			perRound:          r.PerRound,
 			gauge:             r.Gauge,
@@ -295,6 +296,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 	// lethal), but with >1 vital and none flagged `primary` the default-damage pool falls back to an
 	// arbitrary sorted-ref pick — nudge the author to designate one.
 	lintVitalResources(d.res.table())
+	lintAbsorbResources(d.res.table()) // #536: absorb buffer must be instance-set (no max_attr)
 	// Load-time content-lint (#71): a deal_damage op's `resource` (the routed pool) must name a registered
 	// resource — a typo silently discards the blow at runtime (max<=0 immunity). Warn so an author sees it.
 	for _, m := range lintDealDamageResources(d) {
@@ -400,6 +402,27 @@ func lintVitalResources(table map[string]*resourceDef) {
 		sort.Strings(vitals)
 		slog.Warn("content: multiple VITAL resources defined but none flagged `primary`; unrouted damage defaults to the lowest ref — designate a primary",
 			"vitals", vitals, "fallback", vitals[0])
+	}
+}
+
+// lintAbsorbResources flags an ABSORB buffer (#536) that ALSO declares a max_attr — a contradiction. An
+// absorb buffer's capacity is INSTANCE-SET (written by set_resource to a rolled amount), which is why it
+// must have NO max_attr; adding one makes the capacity stat-derived instead, and if that derived max ever
+// reaches 0 the "no capacity reads as nothing" rule (resourceCurrent) zeroes the stored charge — silently
+// breaking the buffer. Build-time only; WARN, does not abort boot (content-lint discipline). (Routing a
+// damage TYPE at an absorb pool is separately caught by lintDamageTypeResources, since a buffer has no
+// max_attr and that lint already flags a no-max_attr target as a discarded route.)
+func lintAbsorbResources(table map[string]*resourceDef) {
+	var bad []string
+	for ref, def := range table {
+		if def != nil && def.absorb && def.maxAttr != "" {
+			bad = append(bad, ref)
+		}
+	}
+	if len(bad) > 0 {
+		sort.Strings(bad)
+		slog.Warn("content: an ABSORB buffer declares a max_attr; its capacity must be INSTANCE-SET (no max_attr) — remove the cap so set_resource controls it",
+			"resources", bad)
 	}
 }
 

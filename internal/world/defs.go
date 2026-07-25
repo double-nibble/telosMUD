@@ -356,7 +356,15 @@ type resourceDef struct {
 	// primary designates the DEFAULT-damage vital (#71 multi-vital): unrouted damage (a swing, a
 	// deal_damage with no `resource`) hits this pool. Only consulted when >1 vital exists — vitalResource
 	// prefers the primary-flagged vital, else falls back to the lowest-ref one. Immutable after build.
-	primary           bool
+	primary bool
+	// absorb (#536) marks a PRE-VITAL absorption buffer (temp HP / ward / shield): damage routed to the
+	// pool it FRONTS is soaked from this buffer first (for all types), spilling only the remainder to the
+	// vital. Instance-set capacity (no maxAttr), take-higher writes (set_resource). An absorb pool with no
+	// current is skipped — it never makes the entity immune. See absorbPreVital (effect_op.go).
+	absorb bool
+	// fronts (#536) is the pool this absorb buffer sits in front of; "" => the primary vital. A buffer only
+	// soaks a blow whose resolved pool matches this.
+	fronts            string
 	regen             int  // per-tick flat regen (reserved; regen ticks ride 5.2)
 	regenInCombat     bool // keep regenerating while the owner is fighting (default false: pause in combat)
 	depletedThreshold int  // reserved (vital depletion threshold)

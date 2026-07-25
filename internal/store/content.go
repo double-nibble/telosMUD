@@ -465,6 +465,11 @@ type resourceBody struct {
 	// migration; without persisting it a DB round-trip would drop a multi-vital pack's primary designation
 	// and default damage would fall back to the arbitrary lowest-ref pool (the def-table field-drop class).
 	Primary bool `json:"primary,omitempty"`
+	// Absorb + Fronts are the #536 pre-vital absorption-buffer flags (temp HP / wards). Like Primary they
+	// ride the body JSONB (no migration); dropping them on a DB round-trip would turn a persisted temp-HP
+	// pool back into an ordinary resource, so both ends (import marshal + load unmarshal) must carry them.
+	Absorb bool   `json:"absorb,omitempty"`
+	Fronts string `json:"fronts,omitempty"`
 }
 
 type dmgBody struct {
@@ -750,6 +755,7 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 			r.PerRound = b.PerRound
 			r.Gauge = b.Gauge
 			r.Primary = b.Primary
+			r.Absorb, r.Fronts = b.Absorb, b.Fronts // #536: pre-vital absorption buffer
 		}
 		pp := pack(pk)
 		pp.Resources = append(pp.Resources, r)
