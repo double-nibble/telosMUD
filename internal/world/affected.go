@@ -60,6 +60,13 @@ type Affected struct {
 	// modifiers. preventsTag reads it; the engine never names a CC type (§6 — open strings).
 	prevents map[string]int // tag -> count of active affects preventing it (a multiset for clean removal)
 
+	// preventsSrc (#546) is the SOURCE-RELATIVE prevents set: tag -> source-entity -> count. An affect's
+	// preventsSource tags are keyed here by the affect's SOURCE (the charmer), so preventsTagAgainstTarget
+	// can answer "is the bearer blocked from <tag> against <this specific entity>?" — charmed can't attack
+	// the charmer but attacks everyone else. Recomputed alongside prevents; a multiset (count) so two
+	// overlapping charms from the same source unwind cleanly on expire. nil until some affect declares one.
+	preventsSrc map[string]map[*Entity]int
+
 	// damageMult (#537) is the per-DAMAGE-TYPE incoming-damage multiplier, PRODUCT-composed across every
 	// active affect's damageTakenMult, recomputed alongside the modifiers. mitigate reads it via
 	// damageTakenMult(); an absent type is identity (×1), which is why absence must read as 1 and not 0.
@@ -178,6 +185,37 @@ func preventsAny(e *Entity, tags []string) (string, bool) {
 	}
 	for _, t := range tags {
 		if a.prevents[t] > 0 {
+			return t, true
+		}
+	}
+	return "", false
+}
+
+// preventsTagFromSource reports whether entity e is blocked from acting with `tag` against `source`
+// SPECIFICALLY (#546) — the SOURCE-RELATIVE half only. It is TRUE when an active affect on e declares
+// `prevents_source: [tag]` and its source IS `source` (charmed can't attack the charmer). It deliberately
+// does NOT consult the GLOBAL prevents set: a global `prevents: [tag]` is a separate, target-less block
+// the caller already checks (the ability tag-CC gate, the swing "act" gate), and folding it in here would
+// silently start blocking actions those gates never blocked. A nil source matches nothing (there is no
+// "them" to scope against). O(1). Zone goroutine.
+func preventsTagFromSource(e *Entity, tag string, source *Entity) bool {
+	if source == nil {
+		return false
+	}
+	a, ok := Get[*Affected](e)
+	if !ok || a.preventsSrc == nil {
+		return false
+	}
+	bySrc := a.preventsSrc[tag]
+	return bySrc != nil && bySrc[source] > 0
+}
+
+// preventsAnyFromSource reports whether ANY of `tags` is source-relative-blocked against `source` (#546) —
+// the step-3 action-gate shape for an ability (its tags) resolved against its bound target. Returns the
+// first blocked tag. Source-relative only (see preventsTagFromSource).
+func preventsAnyFromSource(e *Entity, tags []string, source *Entity) (string, bool) {
+	for _, t := range tags {
+		if preventsTagFromSource(e, t, source) {
 			return t, true
 		}
 	}

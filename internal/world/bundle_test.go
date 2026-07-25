@@ -47,17 +47,17 @@ func TestAbilityOwnershipGate(t *testing.T) {
 	z.defs.ability.register("lay_on_hands", gated)
 
 	// Before the grant, the gate refuses it.
-	if z.checkRequires(src, gated) {
+	if z.checkRequires(src, gated, nil) {
 		t.Fatal("an ungranted ownership-gated ability passed the requires gate")
 	}
 	// An UN-gated ability (no requires_grant) is allowed without a grant.
 	open := &abilityDef{ref: "shout", name: "shout", invocation: "command", words: []string{"shout"}}
-	if !z.checkRequires(src, open) {
+	if !z.checkRequires(src, open, nil) {
 		t.Fatal("an un-gated ability was wrongly refused (the gate must be opt-in)")
 	}
 	// After the grant, the gated ability passes.
 	grantAbility(src.entity, "lay_on_hands")
-	if !z.checkRequires(src, gated) {
+	if !z.checkRequires(src, gated, nil) {
 		t.Fatal("a granted ownership-gated ability was still refused")
 	}
 }

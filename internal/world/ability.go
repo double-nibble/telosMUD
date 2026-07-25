@@ -49,8 +49,8 @@ func (z *Zone) castAbility(s *session, def *abilityDef, arg string, rng *rand.Ra
 	}
 	z.log.Debug("ability lifecycle: targets", "ability", def.ref, "target", targetShort(target))
 
-	// --- Step 3: check requires (attr thresholds + tag-CC) -----------------------------------
-	if !z.checkRequires(s, def) {
+	// --- Step 3: check requires (attr thresholds + tag-CC, incl. source-relative CC vs the target) ---
+	if !z.checkRequires(s, def, target) {
 		return // checkRequires sent the block message
 	}
 
@@ -321,7 +321,7 @@ func (z *Zone) resolveAbilityTarget(actor *Entity, def *abilityDef, arg string) 
 // tag-CC — does any active affect on the actor `prevents` a tag this ability carries (or a
 // requires.not_prevented tag)? The 5.2 preventsAny query is now ENFORCED here. Returns true to proceed;
 // on a block it sends the actor a message and returns false. Single-writer: zone goroutine.
-func (z *Zone) checkRequires(s *session, def *abilityDef) bool {
+func (z *Zone) checkRequires(s *session, def *abilityDef, target *Entity) bool {
 	actor := s.entity
 	// Cooldown ([G8], Phase 6.3a): refuse an ability still cooling down. This is the step-3 gate the
 	// armed cooldown map (armCooldown) backs — today's fires-and-logs became a real gate.
@@ -347,6 +347,20 @@ func (z *Zone) checkRequires(s *session, def *abilityDef) bool {
 		z.log.Debug("ability lifecycle: blocked at step 3 (tag-CC)",
 			"ability", def.ref, "actor", actor.short, "tag", tag)
 		s.send(textFrame("You can't do that right now."))
+		return false
+	}
+	// SOURCE-RELATIVE tag-CC (#546): a charm/fear blocks a tagged action ONLY when it targets the affect's
+	// source (the charmer). A global block is handled above; this catches "can't attack the charmer" while
+	// leaving the same ability usable against anyone else. Checked against the resolved SINGLE target (an
+	// AoE's per-victim harm funnels guardHarmful, not this gate). A nil target is never blocked
+	// (preventsTagFromSource short-circuits on a nil source), so target.Name() below is unreachable with a
+	// nil target. A self-targeted ability where the actor is somehow its OWN charm source (a nonsensical
+	// self-sourced prevents_source — a content error, expressible via applyAffect{source: self}) would
+	// self-block here; that fails SAFE (refuses the action) rather than corrupting anything.
+	if tag, blocked := preventsAnyFromSource(actor, checkTags, target); blocked {
+		z.log.Debug("ability lifecycle: blocked at step 3 (source-relative tag-CC)",
+			"ability", def.ref, "actor", actor.short, "tag", tag, "target", targetShort(target))
+		s.send(textFrame("You can't bring yourself to do that to " + target.Name() + "."))
 		return false
 	}
 	// Attribute thresholds.

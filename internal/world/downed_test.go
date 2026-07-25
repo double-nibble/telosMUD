@@ -384,7 +384,7 @@ func TestDownedPlayerCannotCast(t *testing.T) {
 	require.True(t, deathSuspended(caster.entity))
 
 	open := &abilityDef{ref: "shout", name: "shout", invocation: "command", words: []string{"shout"}}
-	require.False(t, z.checkRequires(caster, open), "a downed player cannot cast even an open ability")
+	require.False(t, z.checkRequires(caster, open, nil), "a downed player cannot cast even an open ability")
 }
 
 // TestDownedPlayerCannotRunCustomCommand pins the CUSTOM-COMMAND backstop (security re-review Finding 1):
