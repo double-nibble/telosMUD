@@ -764,6 +764,11 @@ func (z *Zone) transferOut(s *session, dest *Zone, destRoom ProtoRef, departMsg 
 	// owned *Entity that dest's round driver would deref), and an opponent left behind must not stay
 	// posFighting at a now-departed target. The room scan still finds opponents here (pre-detach).
 	z.disengage(s.entity)
+	// Concentration is TRANSIENT across a zone seam, exactly like combat (#539 review): break any
+	// concentration involving the mover (as source OR as a spell's target) BEFORE it detaches, while it is
+	// still THIS zone's to write — so the origin never keeps a slot pointing at an entity another goroutine
+	// will own. Done pre-Move so expireConcentration's holder.zone==z guard permits the teardown here.
+	z.breakConcentrationInvolving(s.entity)
 	if departMsg != "" {
 		z.actConceal(departMsg, s.entity, ToRoom) // #100: silent to those who can't see the mover
 	}

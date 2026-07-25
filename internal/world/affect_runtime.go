@@ -93,6 +93,13 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 		inst.magnitude = mag
 		inst.stacks = st
 		inst.sinceTick = 0
+		// #539 NON-DURABILITY (review): the concentration SLOT is NOT restored on load. An affect's source
+		// is not persisted (AffectJSON carries no source — the same fail-open property every source-keyed
+		// affect behaviour has), so a reload cannot re-establish which source concentrates on what. A
+		// self-cast concentration buff therefore reloads LIVE but UNSLOTTED — the single-slot cap is not
+		// enforced against it until the caster re-casts a concentration spell (which claims a fresh slot).
+		// This matches #546's "source-keyed affect state is transient across the persistence seam". Durable
+		// single-slot would require persisting + re-resolving the source pointer, a broader change.
 		a.recomputeMods()
 		markAttrsDirty(e)
 		a.ensureTick(e)
@@ -172,6 +179,26 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 	a.recomputeMods()
 	markAttrsDirty(e)
 	a.ensureTick(e)
+	// CONCENTRATION single-slot (#539): a concentration affect bound to a source claims that source's one
+	// slot, expiring its prior concentration (wherever attached). Done after recomputeMods so the new affect
+	// is fully live before the prior tears down. A nil source is untracked.
+	if def.concentration && opts.source != nil {
+		e.zone.concentrationApply(opts.source, e, inst)
+	}
+	// CONCENTRATION break-on-incapacitation (#539): if THIS apply incapacitated a source that is currently
+	// concentrating (a stun/paralyze/downed affect landing on the caster), break its concentration. Checked
+	// for EVERY apply (not just concentration ones) because the incapacitating affect is a different affect
+	// from the concentration one. Uses the post-recompute prevents/position so the new CC is visible.
+	//
+	// TRIGGER BOUNDARY (review): the break is APPLY-driven + DEATH-driven (die(), death.go). It catches the
+	// in-scope incapacitators — a `prevents: [act]` stun (unioned at recompute) and the #535 downed/dying
+	// state (a suspends_death affect applied via apply_affect, so canAct is false here). It does NOT catch
+	// an incapacitation driven purely by a direct setPosition op (sleep with no affect) or a hold-at-0 with
+	// no apply — those break only at the next apply/death re-check. In-scope content uses affects, so this
+	// is a documented edge, not a live gap.
+	if _, concentrating := e.zone.concentration[e]; concentrating && concentrationBroken(e) {
+		e.zone.breakConcentration(e)
+	}
 	e.zone.republishCommsOnAccessChange(e) // hear-access may have crossed a channel floor (docs/REMAINING.md §1)
 	fireOnApplyAffect(e, inst, parent)     // RESERVED hook + OnApplyAffect bus fire (threads the cascade)
 	e.zone.log.Debug("affect attached", "ref", ref, "rid", e.rid,
@@ -196,6 +223,12 @@ func (a *Affected) expire(e *Entity, inst *affectInstance, parent *effectCtx) {
 		}
 	}
 	delete(a.byKey, keyFor(inst.def, inst.source))
+	// #539: a concentration affect ending for ANY reason (countdown, dispel, a damage-save cancel, the
+	// respawn strip) frees its source's slot so the source can concentrate again. Idempotent — a no-op if a
+	// newer spell already replaced the slot, or breakConcentration already cleared it.
+	if inst.def.concentration && inst.source != nil {
+		e.zone.clearConcentrationSlot(inst.source, inst)
+	}
 	a.recomputeMods()
 	markAttrsDirty(e)
 	e.zone.republishCommsOnAccessChange(e) // hear-access may have crossed a channel floor (docs/REMAINING.md §1)

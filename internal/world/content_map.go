@@ -155,6 +155,7 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		tags:           tags,
 		grantsImmunity: grantsImmunity,
 		suspendsDeath:  a.Body.SuspendsDeath,
+		concentration:  a.Body.Concentration, // #539 source-bound single-slot concentration
 		onApply:        a.Body.OnApply,
 		onExpire:       a.Body.OnExpire,
 		onApplyLua:     a.Body.OnApplyLua,

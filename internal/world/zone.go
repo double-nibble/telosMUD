@@ -227,6 +227,15 @@ type Zone struct {
 	// fixed seed for a known sequence; a replay harness can inject a recorded seed the same way.
 	combatRand *rand.Rand
 
+	// concentration is the per-SOURCE concentration slot (#539): a caster concentrates on at most ONE
+	// concentration-flagged affect at a time, so this maps a source entity to the single such affect it
+	// currently maintains — WHEREVER that affect lives (a remote charmed enemy, a room field, the caster
+	// itself). Applying a new concentration affect expires the source's prior one; incapacitating the
+	// source breaks it; the affect's own expiry (natural/dispel/save-break/respawn-strip) clears the slot.
+	// The stored *Entity keys are only compared / used to expire a live affect on the zone goroutine (never
+	// dereferenced after the holder is gone — the expire clears the slot first). Zone-owned; single-writer.
+	concentration map[*Entity]concentrationSlot
+
 	// repopPulse holds the cancel handle for this zone's repop-cadence pulse callback (reset.go).
 	// nil until startRepop registers it at build time (skipped when reset_secs==0 — no timed
 	// reset). The callback re-runs the reset script each stride, ON this goroutine (single-writer).
@@ -708,7 +717,8 @@ func newZone(id string) *Zone {
 		// every restart (the id is public) — worse than today's global rand — and would correlate this
 		// stream with z.lua.rng (also id-seeded). A test or a replay harness reassigns z.combatRand with a
 		// FIXED seed for a reproducible sequence. Mutated only on the zone goroutine (single-writer).
-		combatRand: rand.New(rand.NewSource(rand.Int63())), //nolint:gosec // gameplay roll, not security
+		combatRand:    rand.New(rand.NewSource(rand.Int63())), //nolint:gosec // gameplay roll, not security
+		concentration: map[*Entity]concentrationSlot{},        // #539 per-source concentration slot
 		// A private, empty prototype cache by default. A shard-hosted zone has this
 		// replaced with the shared per-shard cache (newShard); a bare test zone keeps its
 		// own so spawn works standalone.
@@ -1170,6 +1180,10 @@ func (z *Zone) leave(id string) {
 			z.enqueueSave(id, s, saveFinal)
 		}
 	}
+	// Concentration teardown on leave (#539 review): break any concentration involving this player (as
+	// source or as a spell's target) while it is still THIS zone's to write, so no slot survives pointing
+	// at a departed/offline entity. Mirrors the transferOut seam; done before Move detaches it.
+	z.breakConcentrationInvolving(s.entity)
 	if r := s.entity.location; r != nil {
 		z.actConceal("$n leaves.", s.entity, ToRoom) // #100: silent to those who can't see the leaver
 		Move(s.entity, nil)
