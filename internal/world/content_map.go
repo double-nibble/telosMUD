@@ -118,6 +118,10 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 	if len(a.Body.Prevents) > 0 {
 		prevents = append(prevents, a.Body.Prevents...)
 	}
+	var preventsSource []string
+	if len(a.Body.PreventsSource) > 0 {
+		preventsSource = append(preventsSource, a.Body.PreventsSource...)
+	}
 	var tags, grantsImmunity []string
 	if len(a.Body.Tags) > 0 {
 		tags = append(tags, a.Body.Tags...)
@@ -147,6 +151,7 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		level:          a.Body.Level,                        // #545: potency rank for dispel ordering / $affect.level (in the JSONB body)
 		modifiers:      mods,
 		prevents:       prevents,
+		preventsSource: preventsSource, // #546 source-relative CC
 		tags:           tags,
 		grantsImmunity: grantsImmunity,
 		suspendsDeath:  a.Body.SuspendsDeath,

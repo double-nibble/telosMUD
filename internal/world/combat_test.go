@@ -734,7 +734,7 @@ func TestCooldownGatesAndElapses(t *testing.T) {
 	if !z.onCooldown(s.entity, "bash") {
 		t.Fatalf("bash should be on cooldown right after arming")
 	}
-	if z.checkRequires(s, def) {
+	if z.checkRequires(s, def, nil) {
 		t.Fatalf("checkRequires should block an ability still on cooldown")
 	}
 	for i := 0; i < 5; i++ {

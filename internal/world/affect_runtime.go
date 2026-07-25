@@ -252,6 +252,7 @@ func (a *Affected) recomputeMods() {
 	a.flat = nil
 	a.mul = nil
 	a.prevents = nil
+	a.preventsSrc = nil
 	a.damageMult = nil
 	a.immunity = nil
 	for _, inst := range a.list {
@@ -278,6 +279,21 @@ func (a *Affected) recomputeMods() {
 				a.prevents = map[string]int{}
 			}
 			a.prevents[tag]++
+		}
+		// SOURCE-RELATIVE prevents (#546): key each tag by the affect's SOURCE (the charmer), so the gate can
+		// block only actions targeting that specific entity. A nil source (a self/ambient affect) cannot be
+		// source-relative — there is no "them" to scope against — so it is skipped (a nil-source charm is a
+		// content error; it simply never blocks anything, rather than silently becoming a global block).
+		if inst.source != nil {
+			for _, tag := range inst.def.preventsSource {
+				if a.preventsSrc == nil {
+					a.preventsSrc = map[string]map[*Entity]int{}
+				}
+				if a.preventsSrc[tag] == nil {
+					a.preventsSrc[tag] = map[*Entity]int{}
+				}
+				a.preventsSrc[tag][inst.source]++
+			}
 		}
 		for _, tok := range inst.def.grantsImmunity {
 			if a.immunity == nil {

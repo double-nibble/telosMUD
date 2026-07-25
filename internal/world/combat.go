@@ -52,6 +52,13 @@ const PULSE_VIOLENCE uint64 = 10 //nolint:revive // PULSE_VIOLENCE is a delibera
 // sane attacks/round; mirrors the maxDice spirit (a hard ceiling on per-tick work).
 const maxSwingsPerRound = 50
 
+// attackSwingTag is the engine-named CC tag a melee swing carries for the source-relative gate (#546):
+// content authors a charm as `prevents_source: [attack]` and the swing gate checks this tag against the
+// swing's target. Like "act" (the universal act gate) and "move", it is one of the few CC tags the engine
+// names; every OTHER tag is open content. It gates ONLY the source-relative half — a global `prevents:
+// [attack]` does not stop swings (that is "act"'s role).
+const attackSwingTag = "attack"
+
 // combatProfile is an entity's parsed combat data (built from content, content_map.go): the to-hit
 // check the entity rolls when it ATTACKS, and the ordered avoidance ladder it rolls when it DEFENDS.
 // Immutable after build (shared from the prototype by reference); the per-roll randomness is the ctx
@@ -574,6 +581,14 @@ func (z *Zone) swingGatesPass(attacker, target *Entity) bool {
 	// `prevents: [act]`) does not swing (#540). This is the tag-CC half, complementing the structural
 	// downed/position gate in canAct above — the same `prevents` set the cast and reaction gates read.
 	if preventsTag(attacker, "act") {
+		return false
+	}
+	// SOURCE-RELATIVE CC (#546): a charmed attacker cannot swing at the CHARMER specifically — a
+	// `prevents_source: [attack]` affect keyed to that source blocks a melee swing whose target IS the
+	// source, while leaving the attacker free to swing at anyone else. The melee swing carries the engine
+	// `attackSwingTag`; only the SOURCE-relative half is consulted (a global `prevents: [attack]` does not
+	// gate swings — that is the `act` tag's job above, unchanged).
+	if preventsTagFromSource(attacker, attackSwingTag, target) {
 		return false
 	}
 	if !canDefend(target) {

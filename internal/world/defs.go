@@ -479,6 +479,13 @@ type affectDef struct {
 
 	modifiers []affectModifier // additive/multiplicative attribute mods while active
 	prevents  []string         // tags this affect blocks (§6 tag CC); the runtime unions these
+	// preventsSource (#546) is SOURCE-RELATIVE crowd control: tags blocked only for an action whose TARGET
+	// is this affect's own source (the charmer). Charmed = `prevents_source: [attack]`. The runtime keys
+	// these per (tag, source) in Affected.preventsSrc; the cast + swing gates check the action's target
+	// against it. Distinct from `prevents` (a global, target-less block). It gates ONLY the single-target
+	// cast + melee swing paths — an AoE/reaction/DoT/Lua-damage funnel guardHarmful, not this (see the
+	// PreventsSource DTO doc for the full scope). Not durable (source is not persisted; fails open on load).
+	preventsSource []string
 	// tags (#538) are open-string categories THIS affect carries — what it IS, for immunity matching:
 	// a charm affect carries `tags: [charm, mind]`, a poison `tags: [poison]`. An incoming affect is
 	// vetoed if the target is immune to its ref, its category, OR any of these tags. Distinct from

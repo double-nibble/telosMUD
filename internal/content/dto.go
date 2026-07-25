@@ -892,6 +892,25 @@ type AffectBodyDTO struct {
 	Level     int                 `json:"level" yaml:"level"`
 	Modifiers []AffectModifierDTO `json:"modifiers" yaml:"modifiers"`
 	Prevents  []string            `json:"prevents" yaml:"prevents"`
+	// PreventsSource (#546) is the SOURCE-RELATIVE crowd control: tags the affect blocks only for an action
+	// whose TARGET is the affect's own SOURCE. Charmed is `prevents_source: [attack]` — the bearer can't
+	// attack the CHARMER specifically, but attacks everyone else freely. Distinct from Prevents (a GLOBAL
+	// block against a tag, no target). It rides the body JSONB, so it round-trips with no migration.
+	//
+	// SCOPE — read before authoring. This is a TARGETING gate at exactly TWO points: a melee swing
+	// (swingGatesPass, the `attack` tag) and a single-target ability cast (the step-3 gate, checked against
+	// the RESOLVED primary target). It is NOT a hard "cannot harm the source" firewall. These paths
+	// deliberately BYPASS it (each still independently PvP-gated by guardHarmful): an AoE whose blast
+	// catches the source (an AoE targets an AREA, not the source — matching 5e's "can't TARGET the
+	// charmer"); a reaction / opportunity attack (a declarative op-list, not a swing); a Lua h:damage or a
+	// pre-existing DoT/thorns already on the source; a mob's ability-cast or a proc (only a player CAST and
+	// any creature's MELEE are gated). It is also NOT durable: the affect's source is not persisted, so the
+	// block fails OPEN across save/load, reconnect, or a cross-zone handoff-and-return (the same property
+	// every source-keyed affect behaviour has). Model "can't attack the charmer" as intent, not safety.
+	//
+	// Frightened's "can't move CLOSER to the source" is the same CONCEPTUAL shape but is NOT wired here —
+	// the movement path has no source-relative gate yet; only cast + swing do.
+	PreventsSource []string `json:"prevents_source" yaml:"prevents_source"`
 	// Tags (#538) are the open-string categories this affect carries (what it IS): a charm affect
 	// `tags: [charm, mind]`. An incoming affect is vetoed if the target is immune to its ref, category,
 	// or any of these tags. Distinct from Prevents (what the affect stops the bearer from DOING).
