@@ -875,7 +875,21 @@ type AffectDTO struct {
 // Modifiers feed derivation; Prevents feeds the tag-CC set; Tick carries the interval + the RESERVED
 // on_tick op-list (a DoT's deal_damage lands in 5.3). OnApply/OnExpire/Resist are reserved shape.
 type AffectBodyDTO struct {
-	Duration  int                 `json:"duration" yaml:"duration"`
+	Duration int `json:"duration" yaml:"duration"`
+	// DurationKind selects HOW the duration ends (#545), beyond the default pulse countdown:
+	//   - "" / "countdown" (default): Duration pulses tick down; the affect expires at 0.
+	//   - "indefinite" (a.k.a. until_dispelled): the affect NEVER counts down — it ends only via dispel /
+	//     remove_affect / death. This replaces the "author a huge Duration" hack (see the demo `insane`
+	//     affect), which the engine can never make truly permanent. Duration is ignored for this kind.
+	// Event-terminated kinds ("until you rest") are a reserved extension: they need OnRest to fire (a
+	// separate slice), so they are not accepted yet — an unknown kind falls back to countdown.
+	DurationKind string `json:"duration_kind" yaml:"duration_kind"`
+	// Level is the affect's POTENCY (#545): a content-defined rank used by dispel ordering (a dispel strips
+	// the HIGHEST-level effect first, 5e Dispel Magic) and reachable in a dispel's per-affect check gate as
+	// `$affect.level` (so a contested dispel DC is `10 + $affect.level`). 0 (unranked) by default; it names
+	// no engine mechanic on its own. It lives in the BODY (not a first-class column) so it round-trips
+	// through the affect_defs JSONB with no schema migration.
+	Level     int                 `json:"level" yaml:"level"`
 	Modifiers []AffectModifierDTO `json:"modifiers" yaml:"modifiers"`
 	Prevents  []string            `json:"prevents" yaml:"prevents"`
 	// Tags (#538) are the open-string categories this affect carries (what it IS): a charm affect

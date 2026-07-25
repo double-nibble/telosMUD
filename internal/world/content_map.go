@@ -143,6 +143,8 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		roomScoped:  a.Scope == "room", // [G13] room-scoped affect (web/darkness/...); default entity-scoped
 
 		duration:       a.Body.Duration,
+		indefinite:     a.Body.DurationKind == "indefinite", // #545: never counts down (unknown kind => countdown)
+		level:          a.Body.Level,                        // #545: potency rank for dispel ordering / $affect.level (in the JSONB body)
 		modifiers:      mods,
 		prevents:       prevents,
 		tags:           tags,

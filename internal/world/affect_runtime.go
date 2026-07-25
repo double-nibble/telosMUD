@@ -14,6 +14,13 @@ import (
 	"math"
 )
 
+// durationIndefinite is the sentinel `remaining` an INDEFINITE affect (#545) carries: the tick never
+// decrements or expires it (it ends only via dispel / remove_affect / death), and it round-trips through
+// save/load unchanged so a persisted ward reloads still-indefinite. Negative so it is unmistakably not a
+// live countdown (a countdown is always >= 0). The affect's def.indefinite flag is the AUTHORITY; this
+// value is what the runtime stores/serializes for such an instance.
+const durationIndefinite = -1
+
 // attachOpts carries the optional knobs an apply_affect op supplies. Zero values mean "use the def's
 // defaults" (duration from the def, magnitude 1, the def's stacking). reattach=true is the persistence
 // path: it sets remaining from the SNAPSHOT (not the def's full duration) and suppresses the on_apply
@@ -76,6 +83,13 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 			a.byKey[key] = inst
 		}
 		inst.remaining = dur
+		if def.indefinite && opts.duration <= 0 {
+			// #545: restore the sentinel for a genuinely-indefinite reattach (a saved -1 must not become
+			// def.duration). A POSITIVE saved remaining is a FINITE lease copy of an indefinite room field
+			// (landRoomAffectOn passes a finite lease duration) — it must reload finite so it still lapses,
+			// not become a permanent CC. opts.duration (the saved remaining) is the discriminator.
+			inst.remaining = durationIndefinite
+		}
 		inst.magnitude = mag
 		inst.stacks = st
 		inst.sinceTick = 0
@@ -139,6 +153,20 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 		case stackIgnore:
 			// First wins: the new application is a no-op (timer + stacks unchanged).
 		}
+	}
+
+	// #545: an INDEFINITE affect carries the sentinel remaining regardless of stacking mode — a refresh/
+	// count/extend must not install a finite countdown on an "until dispelled" effect (extend would even
+	// have summed two sentinels). The tick skips its countdown; it ends only via dispel/remove/death.
+	//
+	// EXCEPTION — an explicit positive opts.duration wins (review): the per-occupant LEASE of an indefinite
+	// room field (landRoomAffectOn) passes a FINITE lease duration deliberately, so the copy lapses shortly
+	// after the occupant leaves the room. Forcing the sentinel here made that lease permanent (the CC
+	// followed the player out of the room and persisted across relog). Honoring an explicit finite duration
+	// keeps the lease finite while a bare `apply_affect` of an indefinite def (opts.duration 0) stays
+	// indefinite. So an author CAN pin an indefinite affect to a finite window by passing a duration.
+	if def.indefinite && opts.duration <= 0 {
+		inst.remaining = durationIndefinite
 	}
 
 	a.recomputeMods()
@@ -384,11 +412,17 @@ func (a *Affected) tickOnce(e *Entity, pulse uint64) {
 				e.zone.fireEvent(nil, evOnAffectTick, e, inst.source, float64(maxInt(inst.stacks, 1)))
 			}
 		}
-		if inst.remaining > 0 {
-			inst.remaining--
-		}
-		if inst.remaining <= 0 {
-			a.expire(e, inst, nil) // a tick-countdown expiry is a genuine root (fresh cascade)
+		// #545 INDEFINITE: never count down, never expire from the tick — an "until dispelled" affect ends
+		// only via dispel / remove_affect / death. Skipping the block below (where remaining == sentinel -1
+		// would otherwise satisfy `<= 0` and expire it immediately) is what makes it durable. Its on_tick
+		// (if any) still fired above, so an indefinite DoT/aura keeps pulsing.
+		if !inst.def.indefinite {
+			if inst.remaining > 0 {
+				inst.remaining--
+			}
+			if inst.remaining <= 0 {
+				a.expire(e, inst, nil) // a tick-countdown expiry is a genuine root (fresh cascade)
+			}
 		}
 	}
 	runRegen(e)
