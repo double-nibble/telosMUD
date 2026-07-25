@@ -33,6 +33,7 @@ type affectInstance struct {
 	remaining int     // pulses left before expiry; decremented each tick, expires at 0
 	magnitude float64 // the applied magnitude (scales modifier/tick effect); 1 by default
 	stacks    int     // current stack count (>=1); scales magnitude for stackCount affects
+	rung      int     // #541 LADDER: current rung (1-based) for a ladder affect (def.rungs); 0/1 = rung 1
 	sinceTick int     // pulses since the last on_tick fire (for tick.interval counting)
 }
 

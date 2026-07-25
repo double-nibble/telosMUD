@@ -262,6 +262,7 @@ type AffectJSON struct {
 	Remaining int     `json:"remaining"`        // pulses left (authoritative on load; never reset to full)
 	Mag       float64 `json:"mag,omitempty"`    // applied magnitude (1 if absent)
 	Stacks    int     `json:"stacks,omitempty"` // stack count (1 if absent)
+	Rung      int     `json:"rung,omitempty"`   // #541 ladder rung (1-based; 0/absent = rung 1 for a ladder affect)
 }
 
 // ResourceJSON is the durable form of one resource pool: the current value only (Cur). The max is a
@@ -658,6 +659,7 @@ func dumpAffects(e *Entity) []AffectJSON {
 			Remaining: inst.remaining,
 			Mag:       inst.magnitude,
 			Stacks:    inst.stacks,
+			Rung:      inst.rung, // #541 ladder rung (0 for a non-ladder affect)
 		})
 	}
 	return out
@@ -946,7 +948,7 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 		// These can RAISE a resource's max attribute, so they MUST land before the resource clamp below.
 		for _, af := range st.Affects {
 			applyAffect(e, af.ID, attachOpts{
-				duration: af.Remaining, magnitude: af.Mag, stacks: af.Stacks, reattach: true,
+				duration: af.Remaining, magnitude: af.Mag, stacks: af.Stacks, rung: af.Rung, reattach: true,
 			}, nil) // a persistence reattach is a root (and skips on_apply/the bus fire anyway)
 		}
 		// Re-install the entity's named flags (Phase 5.3, flags.go) — e.g. a player's "pvp" consent. The

@@ -255,6 +255,91 @@ func opRemoveAffect(c *effectCtx, op *effectOp) error {
 	return nil
 }
 
+// opIncrementRung: increment_rung(target, affect, [amount]). Raises a LADDER affect's rung by `amount`
+// (default 1), APPLYING the affect at that rung if the target doesn't have it yet (the first exhaustion
+// level). Raising exhaustion is HARM, so a cross-player increment routes through the ONE shared
+// guardCrossPlayerWrite and no-ops on a deny. The rung is clamped to the top; it never overflows.
+func opIncrementRung(c *effectCtx, op *effectOp) error { return adjustRung(c, op, +1) }
+
+// opDecrementRung: decrement_rung(target, affect, [amount]). Lowers a LADDER affect's rung by `amount`
+// (default 1) — the exhaustion "recover 1 on a long rest" step. Dropping BELOW rung 1 removes the affect
+// (fully recovered). Recovery is HELPFUL, so it is ungated (like heal). A no-op if the target lacks the affect.
+func opDecrementRung(c *effectCtx, op *effectOp) error { return adjustRung(c, op, -1) }
+
+// adjustRung moves a ladder affect's rung by sign*amount (#541). Shared by increment/decrement_rung.
+func adjustRung(c *effectCtx, op *effectOp, sign int) error {
+	if c.target == nil || c.target.living == nil {
+		return fmt.Errorf("adjust_rung: no living target")
+	}
+	if op.affect == "" {
+		return fmt.Errorf("adjust_rung: no affect ref")
+	}
+	by := int(op.amount)
+	if by <= 0 {
+		by = 1 // default step of 1 rung
+	}
+	def := c.target.zone.affectDefs().get(op.affect)
+	if def == nil || len(def.rungs) == 0 {
+		return nil // not a ladder affect: nothing to adjust
+	}
+	// GATE BOTH DIRECTIONS (security review): any rung change on ANOTHER player's ladder affect is a
+	// cross-player affect WRITE — increment worsens (obvious harm), and DECREMENT strips/weakens it, which
+	// is harm too when the ladder is BENEFICIAL (a graded blessing/momentum) or when scope_target keying
+	// lets an attacker reach an instance they never sourced. The engine can't know a content ladder's
+	// polarity, so — exactly like dispel/remove_affect/modify_resource — every cross-player rung write
+	// funnels the ONE shared guardCrossPlayerWrite (which self-short-circuits for a self/mob target, so
+	// exhaustion recovery on yourself and a mob's own ladder stay ungated). A gated cross-player call is a
+	// clean no-op; an ally rung change needs the same PvP consent every cross-player affect write does.
+	if !guardCrossPlayerWrite(c, c.target) {
+		return nil // gated block: clean no-op
+	}
+	a, ok := Get[*Affected](c.target)
+	inst := (*affectInstance)(nil)
+	if ok {
+		inst = a.byKey[keyFor(def, c.source)]
+	}
+	if inst == nil {
+		if sign < 0 {
+			return nil // decrementing an absent ladder affect: nothing to recover
+		}
+		// Increment with no existing instance: install the affect (at rung 1), then raise to `by`.
+		inst = applyAffect(c.target, op.affect, attachOpts{source: c.source}, c)
+		if inst == nil {
+			return nil // unknown ref / immunity veto / no living
+		}
+		inst.rung = clampRung(def, by)
+		a, _ = Get[*Affected](c.target)
+		a.recomputeMods()
+		markAttrsDirty(c.target)
+		return nil
+	}
+	newRung := inst.rung
+	if newRung < 1 {
+		newRung = 1
+	}
+	newRung += sign * by
+	if newRung < 1 {
+		// Fell off the bottom of the ladder: fully recovered — remove the affect.
+		a.expire(c.target, inst, c)
+		return nil
+	}
+	inst.rung = clampRung(def, newRung)
+	a.recomputeMods()
+	markAttrsDirty(c.target)
+	return nil
+}
+
+// clampRung clamps a 1-based rung into [1, len(def.rungs)].
+func clampRung(def *affectDef, r int) int {
+	if r < 1 {
+		return 1
+	}
+	if r > len(def.rungs) {
+		return len(def.rungs)
+	}
+	return r
+}
+
 // opDispel: dispel(target, {category, count, check}). Removes up to `count` (amount) dispellable affects
 // of a matching category (the op.text carries the category; empty = any). On a SELF/ally/mob target this
 // is a cleanse (helpful) — ungated. But dispelling another PLAYER's affects strips their protective

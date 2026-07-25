@@ -30,6 +30,7 @@ type attachOpts struct {
 	duration  int     // override remaining duration in pulses; <=0 => the def's duration
 	magnitude float64 // applied magnitude; <=0 => 1
 	stacks    int     // initial stacks (reattach path); <=0 => 1
+	rung      int     // #541 initial ladder rung (reattach path); <1 => rung 1 for a ladder affect
 	reattach  bool    // persistence re-attach: remaining is authoritative, no stacking, no on_apply
 }
 
@@ -92,6 +93,9 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 		}
 		inst.magnitude = mag
 		inst.stacks = st
+		if len(def.rungs) > 0 { // #541: restore the saved ladder rung (clamped; default rung 1)
+			inst.rung = clampRung(def, opts.rung)
+		}
 		inst.sinceTick = 0
 		// #539 NON-DURABILITY (review): the concentration SLOT is NOT restored on load. An affect's source
 		// is not persisted (AffectJSON carries no source — the same fail-open property every source-keyed
@@ -138,8 +142,12 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 
 	inst := a.byKey[key]
 	if inst == nil {
-		// First instance of this (ref[,source]): install fresh.
+		// First instance of this (ref[,source]): install fresh. A LADDER affect (#541) starts at rung 1;
+		// increment_rung raises it (rungIndex treats 0 as 1 too, so this is clarity, not strictly required).
 		inst = &affectInstance{def: def, source: opts.source, remaining: dur, magnitude: mag, stacks: 1}
+		if len(def.rungs) > 0 {
+			inst.rung = 1
+		}
 		a.list = append(a.list, inst)
 		a.byKey[key] = inst
 	} else {
@@ -156,6 +164,12 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 			inst.magnitude = mag
 		case stackExtend:
 			inst.remaining += dur // sum durations
+			inst.magnitude = mag
+		case stackHighest:
+			// HIGHEST-WINS (#541): a same-key re-apply REFRESHES like refresh (duration + magnitude). The
+			// non-summing part is across DIFFERENT sources' instances (recomputeMods takes the strongest);
+			// this same-(ref,source) branch must still refresh so a re-cast doesn't let the buff lapse.
+			inst.remaining = dur
 			inst.magnitude = mag
 		case stackIgnore:
 			// First wins: the new application is a no-op (timer + stacks unchanged).
@@ -288,9 +302,42 @@ func (a *Affected) recomputeMods() {
 	a.preventsSrc = nil
 	a.damageMult = nil
 	a.immunity = nil
+	// HIGHEST-WINS (#541): a stackHighest affect does NOT sum across its instances — only the STRONGEST
+	// instance of each such ref contributes (5e "same-effect doesn't stack, take the strongest"). Compute
+	// the winner (max magnitude*stacks) per ref up front; a weaker duplicate is skipped whole below.
+	var highestWinner map[string]*affectInstance
 	for _, inst := range a.list {
+		if inst.def.stacking == stackHighest {
+			if highestWinner == nil {
+				highestWinner = map[string]*affectInstance{}
+			}
+			if w := highestWinner[inst.def.ref]; w == nil || instScale(inst) > instScale(w) {
+				highestWinner[inst.def.ref] = inst
+			}
+		}
+	}
+	for _, inst := range a.list {
+		// A weaker duplicate of a highest-wins ref contributes nothing (non-summing) — its modifiers,
+		// prevents, immunity, damageMult AND preventsSource are all dropped. For the shared def-level sets
+		// (prevents/immunity/damageMult) the winner re-supplies identical values, so no net loss. The one
+		// tension (review F5, LOW): preventsSource is keyed PER SOURCE, so a highest-wins affect that ALSO
+		// declares prevents_source would keep only the winner's source-relative CC. The two are semantically
+		// at odds (highest-wins is for symmetric buffs/debuffs, not per-source charm); no content combines them.
+		if inst.def.stacking == stackHighest && highestWinner[inst.def.ref] != inst {
+			continue
+		}
+		// Resolve this instance's modifier + prevents set. A LADDER affect (#541) uses the CURRENT rung's
+		// set (a discrete level, un-scaled) instead of the top-level modifiers/prevents; a plain affect uses
+		// the def's, scaled by magnitude*stacks. The rung's non-linear per-level effects (exhaustion rung 4
+		// halves max HP, rung 6 is death) are exactly what a scaled single debuff can't express.
+		mods, prevents := inst.def.modifiers, inst.def.prevents
 		scale := inst.magnitude * float64(maxInt(inst.stacks, 1))
-		for _, m := range inst.def.modifiers {
+		if len(inst.def.rungs) > 0 {
+			r := inst.def.rungs[rungIndex(inst)]
+			mods, prevents = r.modifiers, r.prevents
+			scale = 1 // a ladder rung is a discrete level, not a dose to stack-scale
+		}
+		for _, m := range mods {
 			if m.add {
 				if a.flat == nil {
 					a.flat = map[string]float64{}
@@ -307,7 +354,7 @@ func (a *Affected) recomputeMods() {
 				a.mul[m.attr] = cur * m.value
 			}
 		}
-		for _, tag := range inst.def.prevents {
+		for _, tag := range prevents {
 			if a.prevents == nil {
 				a.prevents = map[string]int{}
 			}
@@ -600,6 +647,31 @@ func normDamageMultFactor(m float64) float64 {
 		return damageTakenMultCeiling
 	}
 	return m
+}
+
+// instScale is an affect instance's effective strength, used by highest-wins (#541) to pick the strongest
+// instance of a ref. For a LADDER affect the strength IS the current RUNG (magnitude/stacks are both 1 for
+// a ladder, so without this two ladder instances would tie at 1 and a weaker rung installed first would
+// suppress a severe one — security review F2); for a plain affect it is magnitude × stacks.
+func instScale(inst *affectInstance) float64 {
+	if len(inst.def.rungs) > 0 {
+		return float64(rungIndex(inst) + 1) // 1-based rung
+	}
+	return inst.magnitude * float64(maxInt(inst.stacks, 1))
+}
+
+// rungIndex returns the 0-based index into def.rungs for a ladder affect's CURRENT rung (#541), clamping
+// the 1-based inst.rung into [1, len(rungs)]. A 0/absent rung reads as rung 1. Caller guarantees rungs is
+// non-empty.
+func rungIndex(inst *affectInstance) int {
+	r := inst.rung
+	if r < 1 {
+		r = 1
+	}
+	if r > len(inst.def.rungs) {
+		r = len(inst.def.rungs)
+	}
+	return r - 1
 }
 
 func maxInt(a, b int) int {
