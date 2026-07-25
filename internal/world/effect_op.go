@@ -318,6 +318,8 @@ func init() {
 		"set_resource":    opSetResource, // #536: absolute / take-higher pool write (temp HP)
 		"apply_affect":    opApplyAffect,
 		"remove_affect":   opRemoveAffect,
+		"increment_rung":  opIncrementRung, // #541 ladder: raise exhaustion/madness rung (apply if absent)
+		"decrement_rung":  opDecrementRung, // #541 ladder: lower rung (remove below 1)
 		"dispel":          opDispel,
 		"act":             opAct,
 		"send":            opSend,

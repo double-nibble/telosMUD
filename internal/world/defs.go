@@ -430,6 +430,12 @@ const (
 	stackCount                         // count up to maxStacks, magnitude scales; DoTs like poison
 	stackExtend                        // sum remaining + new duration
 	stackIgnore                        // first wins; the new application is a no-op
+	// stackHighest (#541): HIGHEST-WINS / non-summing. When several instances of this ref are active (two
+	// casters' Bless), the entity gets ONLY the STRONGEST instance's contribution, not the sum — 5e's
+	// "same-effect doesn't stack, take the strongest". Instances are still keyed per (ref, source); the
+	// aggregation change is in recomputeMods (only the max-scale instance of the ref contributes). A
+	// same-(ref,source) re-apply refreshes duration + magnitude like refresh.
+	stackHighest
 )
 
 // parseStacking maps the content stacking string onto the enum. Unknown/"" => refresh (the §5 default).
@@ -441,6 +447,8 @@ func parseStacking(s string) affectStacking {
 		return stackExtend
 	case "ignore":
 		return stackIgnore
+	case "highest":
+		return stackHighest // #541 highest-wins / non-summing
 	default:
 		return stackRefresh
 	}
@@ -453,6 +461,20 @@ type affectModifier struct {
 	attr  string
 	add   bool // true => additive (flatMod); false => multiplicative (mulMod)
 	value float64
+}
+
+// affectRung is one step of a LADDER affect (#541): a graded condition (exhaustion, madness tiers, WoW
+// disease stacks) where each rung carries its OWN, potentially non-linear modifier + prevents set — NOT a
+// linear scaling of one debuff. Exhaustion's rung 4 halves max HP, which "6× a -1 debuff" can never
+// express. A rung carries only modifiers + prevents; a LETHAL top rung ("rung 6 = death") is content-
+// composed (a max-HP-emptying modifier leaves the victim at 0/0 ALIVE — death is a lethal deal_damage the
+// content fires on reaching the top). A ladder affect (affectDef.rungs non-empty) applies the CURRENT rung's set
+// only (affectInstance.rung), and increment_rung/decrement_rung ops move the rung; decrementing below 1
+// removes the affect (fully recovered). Rungs are authored as the FULL set at that level, so content owns
+// whether a rung is cumulative (5e exhaustion) or replacing.
+type affectRung struct {
+	modifiers []affectModifier
+	prevents  []string
 }
 
 // affectDef is the runtime form of an AffectDTO (docs/ABILITIES.md §5): a content-defined status
@@ -486,7 +508,11 @@ type affectDef struct {
 	level int
 
 	modifiers []affectModifier // additive/multiplicative attribute mods while active
-	prevents  []string         // tags this affect blocks (§6 tag CC); the runtime unions these
+	// rungs (#541) is the LADDER: when non-empty, this affect is a graded ladder (exhaustion) whose CURRENT
+	// rung (affectInstance.rung, 1-based) supplies the modifiers/prevents — not `modifiers`/`prevents`
+	// above. increment_rung/decrement_rung move the rung; decrementing below 1 removes the affect.
+	rungs    []affectRung
+	prevents []string // tags this affect blocks (§6 tag CC); the runtime unions these
 	// preventsSource (#546) is SOURCE-RELATIVE crowd control: tags blocked only for an action whose TARGET
 	// is this affect's own source (the charmer). Charmed = `prevents_source: [attack]`. The runtime keys
 	// these per (tag, source) in Affected.preventsSrc; the cast + swing gates check the action's target
@@ -588,35 +614,56 @@ var detrimentalCategories = map[string]bool{
 // `inverted` is the set of attributes whose polarity is REVERSED — higher is worse for the bearer —
 // derived from the boon/bane channel's own formulas (attributeInvertedPolarity). For those the sign
 // test flips: a POSITIVE additive is the harm. A nil/empty set restores the pre-#511 behaviour exactly.
+// modifierIsDetrimental classifies ONE affect modifier as harm, honouring the inverted/condition-flag
+// polarity sets (#511/#513). Shared by affectIsDetrimental across the top-level AND the ladder-rung
+// modifier lists (#541) so the derivation cannot be blind to where the harm is authored.
+func modifierIsDetrimental(m affectModifier, h harmPolarity) bool {
+	if h.conditionFlags[m.attr] {
+		// A CONDITION FLAG (#513): an attribute a band state-predicate reads. Which direction helps is
+		// written in the band's label, which the engine never reads, so ANY modifier that moves one is
+		// gate-worthy.
+		return true
+	}
+	if h.inverted[m.attr] {
+		// On an inverted attribute the harmful direction is UP (+3 atk_bane is a debuff); a modifier that
+		// LOWERS one is a genuine buff and stays ungated so blessing an ally still lands.
+		return (m.add && m.value > 0) || (!m.add && m.value > 1)
+	}
+	if m.add && m.value < 0 {
+		return true // a flat stat reduction
+	}
+	if !m.add && m.value < 1 {
+		return true // a multiplicative stat reduction (×<1)
+	}
+	return false
+}
+
 func affectIsDetrimental(def *affectDef, h harmPolarity) bool {
 	if def == nil {
 		return false
 	}
 	for _, m := range def.modifiers {
-		if h.conditionFlags[m.attr] {
-			// A CONDITION FLAG (#513): an attribute a band state-predicate reads. Which direction helps
-			// is written in the band's label, which the engine never reads, so ANY modifier that moves
-			// one is gate-worthy. See conditionFlagAttrs.
+		if modifierIsDetrimental(m, h) {
 			return true
-		}
-		if h.inverted[m.attr] {
-			// On an inverted attribute the harmful direction is UP (+3 atk_bane is a debuff), so any
-			// modifier that raises it is harm. A modifier that LOWERS one is a genuine buff and is left
-			// ungated, so blessing an ally still lands.
-			if (m.add && m.value > 0) || (!m.add && m.value > 1) {
-				return true
-			}
-			continue // an inverted attribute must not also be judged by the higher-is-better test below
-		}
-		if m.add && m.value < 0 {
-			return true // a flat stat reduction
-		}
-		if !m.add && m.value < 1 {
-			return true // a multiplicative stat reduction (×<1)
 		}
 	}
 	if len(def.prevents) > 0 {
 		return true // any CC tag is harm by construction
+	}
+	// LADDER (#541, review): a ladder affect's harm lives in its RUNGS, not the (empty) top-level
+	// modifiers/prevents — so classify it detrimental if ANY rung carries a harmful modifier or a prevents
+	// tag. Without this a rung-only exhaustion applied via a bare apply_affect would be judged benign and
+	// land on a non-consenting player UNGATED (the 6th harm-classifier blind spot, alongside #511/#513/
+	// #537/#535/#538). The union-over-rungs is conservative: if it can be worse at any rung, it gates.
+	for _, r := range def.rungs {
+		for _, m := range r.modifiers {
+			if modifierIsDetrimental(m, h) {
+				return true
+			}
+		}
+		if len(r.prevents) > 0 {
+			return true
+		}
 	}
 	if def.suspendsDeath {
 		// SUSPENDS_DEATH (#535) is harm-relevant and the sign heuristic is blind to it (this is the same
@@ -983,26 +1030,25 @@ func affectSurvivesRespawn(def *affectDef, h harmPolarity) bool {
 		return false
 	}
 	for _, m := range def.modifiers {
-		if h.conditionFlags[m.attr] {
-			return false // a condition flag is never provably benign (#513) — see conditionFlagAttrs
-		}
-		if h.inverted[m.attr] {
-			// Polarity reversed (#511): raising an inverted attribute is the harm, so a modifier that
-			// raises one is not provably benign and the affect must not survive the respawn purge.
-			if (m.add && m.value > 0) || (!m.add && m.value > 1) {
-				return false
-			}
-			continue
-		}
-		if m.add && m.value < 0 {
-			return false // a flat stat reduction
-		}
-		if !m.add && m.value < 1 {
-			return false // a multiplicative stat reduction (×<1)
+		if modifierIsDetrimental(m, h) {
+			return false // a harmful modifier is never provably benign (#511/#513)
 		}
 	}
 	if len(def.prevents) > 0 {
 		return false
+	}
+	// LADDER (#541, review): a rung-only ladder's harm lives in its rungs, not the top-level lists — a
+	// hostile exhaustion would otherwise be judged "provably benign" and SURVIVE the respawn purge (the
+	// same blind spot affectIsDetrimental had). Any harmful rung modifier or rung prevents disqualifies it.
+	for _, r := range def.rungs {
+		for _, m := range r.modifiers {
+			if modifierIsDetrimental(m, h) {
+				return false
+			}
+		}
+		if len(r.prevents) > 0 {
+			return false
+		}
 	}
 	if hasVulnerability(def) {
 		return false // a vulnerability (#537) is harm; it must not survive the respawn purge

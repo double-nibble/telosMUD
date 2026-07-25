@@ -915,7 +915,17 @@ type AffectBodyDTO struct {
 	// through the affect_defs JSONB with no schema migration.
 	Level     int                 `json:"level" yaml:"level"`
 	Modifiers []AffectModifierDTO `json:"modifiers" yaml:"modifiers"`
-	Prevents  []string            `json:"prevents" yaml:"prevents"`
+	// Rungs (#541) makes this a LADDER affect: a graded condition (exhaustion, madness/corruption tiers,
+	// WoW disease stacks) where each rung carries its OWN, possibly non-linear modifier + prevents set —
+	// what "N x a -1 debuff" can never express (exhaustion rung 4 halves max HP). A rung carries only
+	// modifiers + prevents, so a LETHAL top rung ("rung 6 = death") is composed by CONTENT (a modifier that
+	// empties max HP does NOT itself kill — the victim sits at 0/0, alive; pair the ladder with a lethal
+	// deal_damage the content fires when it reaches the top). The
+	// affect tracks a CURRENT rung (1-based); `increment_rung`/`decrement_rung` ops move it (decrementing
+	// below 1 removes the affect). When Rungs is set the top-level Modifiers/Prevents are ignored — the
+	// current rung supplies them. Rides the body JSONB (no migration).
+	Rungs    []AffectRungDTO `json:"rungs" yaml:"rungs"`
+	Prevents []string        `json:"prevents" yaml:"prevents"`
 	// PreventsSource (#546) is the SOURCE-RELATIVE crowd control: tags the affect blocks only for an action
 	// whose TARGET is the affect's own SOURCE. Charmed is `prevents_source: [attack]` — the bearer can't
 	// attack the CHARMER specifically, but attacks everyone else freely. Distinct from Prevents (a GLOBAL
@@ -1010,6 +1020,14 @@ type AffectModifierDTO struct {
 	Attr  string  `json:"attr" yaml:"attr"`
 	Op    string  `json:"op" yaml:"op"` // "add" | "mul"
 	Value float64 `json:"value" yaml:"value"`
+}
+
+// AffectRungDTO is one rung of a LADDER affect (#541): the modifier + prevents set that applies at that
+// exhaustion/madness level. Rungs are ordered lowest-first; the affect's current rung (1-based) selects
+// which one is live. Author each rung as the FULL set at that level (content owns cumulative vs replacing).
+type AffectRungDTO struct {
+	Modifiers []AffectModifierDTO `json:"modifiers" yaml:"modifiers"`
+	Prevents  []string            `json:"prevents" yaml:"prevents"`
 }
 
 // AffectTickDTO is an affect's periodic-hook spec: every Interval pulses the runtime fires OnTick.

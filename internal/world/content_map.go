@@ -118,6 +118,16 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 	if len(a.Body.Prevents) > 0 {
 		prevents = append(prevents, a.Body.Prevents...)
 	}
+	// #541 LADDER: parse each rung's own modifier + prevents set. A ladder affect (rungs non-empty) uses
+	// the CURRENT rung's set, not the top-level modifiers/prevents.
+	var rungs []affectRung
+	for _, r := range a.Body.Rungs {
+		rm := make([]affectModifier, 0, len(r.Modifiers))
+		for _, m := range r.Modifiers {
+			rm = append(rm, affectModifier{attr: m.Attr, add: m.Op != "mul", value: m.Value})
+		}
+		rungs = append(rungs, affectRung{modifiers: rm, prevents: append([]string(nil), r.Prevents...)})
+	}
 	var preventsSource []string
 	if len(a.Body.PreventsSource) > 0 {
 		preventsSource = append(preventsSource, a.Body.PreventsSource...)
@@ -150,6 +160,7 @@ func buildAffectDef(a content.AffectDTO) *affectDef {
 		indefinite:     a.Body.DurationKind == "indefinite", // #545: never counts down (unknown kind => countdown)
 		level:          a.Body.Level,                        // #545: potency rank for dispel ordering / $affect.level (in the JSONB body)
 		modifiers:      mods,
+		rungs:          rungs, // #541 ladder rungs
 		prevents:       prevents,
 		preventsSource: preventsSource, // #546 source-relative CC
 		tags:           tags,
