@@ -743,7 +743,14 @@ func (z *Zone) aggroOnEntry(mover *Entity, room *Entity) {
 	if position(mover) == posDead {
 		return
 	}
-	for _, occ := range room.contents {
+	// Snapshot room.contents before the loop: since #547, startFight synchronously runs OnEnterCombat
+	// handlers, which are content that can mutate room.contents (a lethal proc -> die() -> Move(victim,
+	// nil), a spawn, a relocate). Ranging the live slice while a body mutation reslices its backing array
+	// in place could skip a would-be aggressor or re-visit a stale tail. The snapshot fixes the iteration
+	// set; startFight re-validates same-room/liveness per pair, so a relocated occ simply no-ops.
+	occupants := make([]*Entity, len(room.contents))
+	copy(occupants, room.contents)
+	for _, occ := range occupants {
 		if occ == mover || occ.living == nil || isPlayer(occ) {
 			continue
 		}
