@@ -220,9 +220,12 @@ func parseOp(v any) (effectOp, error) {
 	op.text = firstStr(m, "text", "template", "message")
 	op.to = mapStr(m, "to")
 	op.harmful = mapBool(m, "harmful")
-	op.fixed = mapBool(m, "fixed") // #515: opt out of ctx-magnitude scaling (a fixed rider in a mag handler)
-	op.tgt = mapStr(m, "target")   // event-handler target selector: "self" | "other" (else ctx.target)
-	op.area = mapStr(m, "area")    // [G12] per-op AoE selector: "room" | "room_and_adjacent" (else single)
+	op.fixed = mapBool(m, "fixed")  // #515: opt out of ctx-magnitude scaling (a fixed rider in a mag handler)
+	op.tgt = mapStr(m, "target")    // event-handler target selector: "self" | "other" (else ctx.target)
+	op.moveRoom = mapStr(m, "room") // #516 teleport: a literal destination room ref
+	op.moveDest = mapStr(m, "dest") // #516 teleport: "actor" | "start" destination selector
+	op.moveDir = mapStr(m, "dir")   // #516 push: the exit direction to force the target through
+	op.area = mapStr(m, "area")     // [G12] per-op AoE selector: "room" | "room_and_adjacent" (else single)
 	// `if` reads its condition affect under has_affect (falls back to affect/id above).
 	if has := firstStr(m, "has_affect"); has != "" {
 		op.affect = has

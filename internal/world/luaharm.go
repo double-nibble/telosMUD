@@ -429,47 +429,63 @@ func (rt *luaRuntime) destIsLocalRoom(dest *Entity) bool {
 // of the ability). Whichever fires threads the invocation's cascade depth/eventBudget (invariant 5)
 // via parentCtx — never a fresh root — so a relocation inside an event cascade shares its budget.
 func (rt *luaRuntime) relocateWithinZone(e, dest *Entity, provokeOAs bool) bool {
+	return rt.zone.relocateEntity(e, dest, provokeOAs, rt.parentCtx())
+}
+
+// relocateEntity is the SHARED same-zone relocation primitive (#516): the engine-move combat discipline —
+// the optional OnLeaveRoom checkpoint (opportunity attacks), a forced disengage so no `fighting` pointer /
+// posFighting survives the room change, and a POST-MOVE LIVENESS RE-CHECK before each arrival hook. Both the
+// Lua handles (h:move/h:teleport/h:recall, via relocateWithinZone) and the declarative move/teleport ops
+// (effect_op_move.go) funnel through here, so the reviewed discipline lives in ONE place. `parent` threads
+// the caller's cascade depth/eventBudget/rng into the OnLeaveRoom + OnEnter fires (invariant 5) — the Lua
+// path passes rt.parentCtx(), a declarative op passes its own ctx; nil roots a fresh budget. Both e and dest
+// MUST be this zone's (the callers guarantee same-zone), so no cross-zone entity is ever dereferenced.
+// Returns true if the entity actually relocated. Single-writer: zone goroutine.
+func (z *Zone) relocateEntity(e, dest *Entity, provokeOAs bool, parent *effectCtx) bool {
 	if e == nil || dest == nil || e.location == nil {
 		return false
 	}
+	// SINGLE-WRITER (security review #516): refuse to relocate an entity that is NOT this zone's, or INTO a
+	// room that is NOT this zone's. The primitive derefs and fires events on BOTH e and dest, so a cross-zone
+	// entity/destination would breach the per-zone single-writer boundary (a latent use-after-free). Callers
+	// are meant to guarantee same-zone; enforcing it HERE makes the property structural for every caller (the
+	// declarative ops AND the Lua handles) rather than a trusted precondition — and forecloses the latent bug
+	// a future summon-of-remote op (a cross-zone c.target) would otherwise open.
+	if e.location.zone != z || dest.zone != z {
+		return false
+	}
 	origin := e.location
-	// (a) The OnLeaveRoom checkpoint — only for the walk-like h:move. Fired BEFORE detach, while the
-	// leaver and every engaged reactor are still live + in-room (the fail-closed-on-detached harm
-	// funnel). The cascade ctx threads rt.inv's budget (invariant 5), not a fresh root.
+	// (a) The OnLeaveRoom checkpoint — only for the walk-like move. Fired BEFORE detach, while the leaver
+	// and every engaged reactor are still live + in-room (the fail-closed-on-detached harm funnel).
 	if provokeOAs {
-		rt.zone.fireLeaveRoom(rt.parentCtx(), e)
-		// Post-checkpoint liveness re-check: a lethal opportunity attack may have killed the leaver
-		// (die -> respawn relocated them; a changed location / posDead is the signal) — abort cleanly
-		// rather than continuing to relocate a respawned/dead mover. Mirrors the engine move/flee guard.
+		z.fireLeaveRoom(parent, e)
+		// Post-checkpoint liveness re-check: a lethal opportunity attack may have killed the leaver — abort
+		// cleanly rather than continuing to relocate a respawned/dead mover. Mirrors the engine move/flee guard.
 		if e.location != origin || position(e) == posDead {
 			return false
 		}
 	}
-	// (c) The fighting entity: a relocated FIGHTER disengages BOTH directions, so no `fighting` pointer
-	// or posFighting spans two rooms (the invariant the same-room round driver depends on). disengage is
-	// a no-op for an unengaged mover. Done while e is still in `origin`, so its opponents are still
-	// reachable to have their links to e dropped.
-	rt.zone.disengage(e)
+	// (c) The fighting entity: a relocated FIGHTER disengages BOTH directions, so no `fighting` pointer or
+	// posFighting spans two rooms (the invariant the same-room round driver depends on). disengage is a no-op
+	// for an unengaged mover. Done while e is still in `origin`, so its opponents are still reachable.
+	z.disengage(e)
 	// The move itself.
 	Move(e, dest)
-	// (b) The arrival hooks, each guarded by a POST-hook LIVENESS RE-CHECK: a hook (a room death-field,
-	// an aggro-on-entry cascade, the OnEnter bus — now that 7.8 lit OnEnter) can kill the entrant or
-	// re-relocate it mid-arrival. After EACH hook, re-validate that e is still alive and still where we
-	// put it before running the NEXT hook — fail safe (stop, no use-after-relocation) otherwise. The
-	// arrival order mirrors the engine move's local-move tail (affects -> aggro -> OnEnter).
+	// (b) The arrival hooks, each guarded by a POST-hook LIVENESS RE-CHECK: a hook (a room death-field, an
+	// aggro-on-entry cascade, the OnEnter bus) can kill the entrant or re-relocate it mid-arrival. After EACH
+	// hook, re-validate e is still alive and still where we put it before the NEXT hook — fail safe otherwise.
 	stillHere := func() bool { return e.location == dest && position(e) != posDead }
 	applyRoomAffectsTo(e)
 	if !stillHere() {
 		return true // it DID relocate; an arrival hook then killed/moved it — that path owns it now
 	}
-	rt.zone.aggroOnEntry(e, dest)
+	z.aggroOnEntry(e, dest)
 	if !stillHere() {
 		return true
 	}
-	// OnEnter bus (7.8): the movement hook a resource/affect on_event or a Lua bus handler subscribes
-	// to — fired about the entrant (subject), dest the counterpart. Threads the invocation's budget
-	// (invariant 5) via parentCtx, NOT a fresh root, so a relocation inside a cascade shares its caps.
-	rt.zone.fireEvent(rt.parentCtx(), evOnEnter, e, dest, 1)
+	// OnEnter bus (7.8): fired about the entrant (subject), dest the counterpart. Threads the caller's budget
+	// (invariant 5) via parent, NOT a fresh root, so a relocation inside a cascade shares its caps.
+	z.fireEvent(parent, evOnEnter, e, dest, 1)
 	return true
 }
 
