@@ -35,6 +35,10 @@ type affectInstance struct {
 	stacks    int     // current stack count (>=1); scales magnitude for stackCount affects
 	rung      int     // #541 LADDER: current rung (1-based) for a ladder affect (def.rungs); 0/1 = rung 1
 	sinceTick int     // pulses since the last on_tick fire (for tick.interval counting)
+	// fromEquip marks an affect DERIVED from a worn item (#515): it is re-applied from the wearer's gear on
+	// load, so dumpAffects SKIPS it (persisting it would double-apply on reload and, since the source is not
+	// persisted, orphan a copy that unequip can no longer find by its item key). Transient, gear-derived state.
+	fromEquip bool
 }
 
 // Affected is the live status-effect component (component.go KindAffected). It holds the entity's

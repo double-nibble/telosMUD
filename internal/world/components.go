@@ -338,6 +338,10 @@ type Wearable struct {
 	// rolled affix. These are prototype data (every instance grants them), distinct from per-instance Quality.
 	add map[string]float64
 	mul map[string]float64
+	// equipAffects are the affect refs applied to the wearer while this item is equipped (#515), keyed by
+	// the item as source. Applied on wear/wield/hold and removed on remove/destroy/transfer; re-derived on
+	// equipment load (they are NOT independently persisted). nil when the item declares none.
+	equipAffects []string
 }
 
 func (*Wearable) componentKind() Kind { return KindWearable }

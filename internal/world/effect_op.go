@@ -65,6 +65,16 @@ type effectCtx struct {
 	// bounded — not just recursion depth. A wide subscription set that the depth cap alone wouldn't stop
 	// (N handlers each firing M events) can't starve the single-writer zone goroutine.
 	eventBudget *int
+	// onHitActor is the ATTACKER whose OnHit handler this ctx is running inside (#515): fireEvent sets it to
+	// an OnHit's subject and propagates it to every nested fire (a non-OnHit fire keeps the enclosing value;
+	// a NEW OnHit re-points it to that OnHit's subject). opDealDamage skips re-firing OnHit when the blow's
+	// source IS this actor — so a flame-tongue proc's bonus damage (src == the attacker already within its
+	// own OnHit) does NOT re-trigger the attacker's OnHit, cutting the self-loop that would otherwise
+	// amplify damage to the depth/budget cap. A DIFFERENT source's damage inside the cascade (a victim's
+	// thorns reflect back at the attacker) is NOT suppressed — that reflector legitimately "hit" and its own
+	// OnHit fires. OnDamageTaken always fires regardless. nil outside an OnHit cascade (a swing/spell procs
+	// OnHit normally). It is a pointer used ONLY as an identity key (never dereferenced), like an affect source.
+	onHitActor *Entity
 	// swingIndex is the 0-based index of the current melee swing within a combat round ([G-H], combat.go).
 	// The swing pipeline sets it per swing so a to-hit/damage formula can read `$swing.index` (resolved
 	// in resolveCheckScope) — PF iterative attacks (-5/-10/-15 by swing) are authorable without it. It is
@@ -244,6 +254,10 @@ type effectOp struct {
 	// nil => not used (the flat amount + literal NdS path). Evaluated via the check scoping (check.go).
 	bonus     formulaNode
 	diceCount formulaNode
+	// fixed (#515) opts a deal_damage/heal/restore op OUT of ctx-magnitude scaling (rollOpAmount): a FIXED
+	// rider inside a mag-carrying handler (a flame-tongue's flat "+1d6 fire on hit", where the OnHit mag is
+	// the blow damage) instead of a proportional one. Inert outside a mag context (a plain cast has mag 1).
+	fixed     bool
 	duration  int     // affect duration override (apply_affect)
 	magnitude float64 // affect magnitude override (apply_affect)
 	prob      float64 // probability (chance)
@@ -900,7 +914,13 @@ func dealDamage(c *effectCtx, target *Entity, raw float64, dmgType, resource str
 	// SC1 liveness re-check: OnDamageTaken above may have KILLED/respawned src (a thorns reflect that fells
 	// the attacker), so re-validate src is alive + in-room before firing OnHit — never proc on a dead mob
 	// or a just-respawned full-hp player. (src is captured pre-OnDamageTaken; this re-reads its state.)
-	if attributable && src.living != nil && src.location != nil && position(src) != posDead {
+	// #515: an OnHit handler's own deal_damage must NOT re-fire the SAME attacker's OnHit — the proc's bonus
+	// damage is part of THIS hit, not a fresh one. Without the guard a flame-tongue (OnHit -> deal_damage)
+	// re-triggers itself, dealing its bonus once per cascade level up to the depth/budget cap. c.onHitActor
+	// is the attacker whose OnHit we're inside (fireEvent); suppressing only when src IS that actor keeps a
+	// DIFFERENT source's damage in the cascade (a victim's thorns reflect) proccing its own OnHit. A swing/
+	// spell has onHitActor nil, so it procs normally.
+	if attributable && src != c.onHitActor && src.living != nil && src.location != nil && position(src) != posDead {
 		c.z.fireEvent(c, evOnHit, src, target, float64(dmg))
 	}
 

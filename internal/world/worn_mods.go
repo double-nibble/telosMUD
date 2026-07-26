@@ -78,6 +78,7 @@ func unequipFromWearer(holder, item *Entity) {
 	}
 	delete(wr.worn, loc)
 	applyWornMods(holder, wr)
+	removeEquipAffects(holder, item) // #515: a destroyed/transferred worn item drops its on-equip affects too
 }
 
 // applyWornMods is the shared post-equip hook the wear/wield/hold/remove verbs (and the load path) call:
