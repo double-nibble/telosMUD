@@ -268,10 +268,18 @@ func (z *Zone) fireEvent(parent *effectCtx, kind eventKind, subject, other *Enti
 	depth := 0
 	var rng *rand.Rand
 	var budget *int
+	// #515: track the attacker whose OnHit we're inside. A NEW OnHit points it at THAT OnHit's subject; any
+	// other fire keeps the enclosing value (propagated from parent) so a nested handler still knows the
+	// current attacker. opDealDamage suppresses only that attacker's OnHit re-fire (the self-loop).
+	var onHitActor *Entity
 	if parent != nil {
 		depth = parent.depth
 		rng = parent.rng            // thread the deterministic rng (tests) into handler ctxs
 		budget = parent.eventBudget // share the cascade's total-work budget
+		onHitActor = parent.onHitActor
+	}
+	if kind == evOnHit {
+		onHitActor = subject
 	}
 	if depth >= maxEventDepth {
 		z.log.Warn("event depth budget exhausted; handlers dropped",
@@ -308,6 +316,7 @@ func (z *Zone) fireEvent(parent *effectCtx, kind eventKind, subject, other *Enti
 		c := &effectCtx{
 			z: z, actor: subject, source: subject, target: subject, other: other,
 			mag: mag, disp: dispNeutral, rng: rng, depth: depth + 1, eventBudget: budget,
+			onHitActor: onHitActor,
 		}
 		if h.luaSrc != "" {
 			// A Lua-BODY handler (7.4g): run it via invokeFromCtx threading THIS cascade ctx `c` —

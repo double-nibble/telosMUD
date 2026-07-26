@@ -69,7 +69,12 @@ func rollOpAmount(c *effectCtx, op *effectOp) float64 {
 	if op.bonus != nil {
 		amt += evalCheckFormula(c, op.bonus, c.actor)
 	}
-	if c.mag > 0 {
+	// The ctx magnitude scales the amount (a DoT's stacks; for an OnHit/OnDamageTaken handler, the BLOW's
+	// damage). That is what a PROPORTIONAL proc wants (lifesteal = heal 20% of damage, a rider scaling with
+	// the hit). But a FIXED rider — a flame-tongue's "+1d6 fire on every hit" (#515's headline example) —
+	// must NOT scale with the blow, or it deals 1d6×damage. `fixed` opts an op out of mag-scaling so a
+	// content author can add a flat bonus inside a mag-carrying handler.
+	if c.mag > 0 && !op.fixed {
 		amt *= c.mag
 	}
 	return amt

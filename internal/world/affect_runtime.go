@@ -32,6 +32,12 @@ type attachOpts struct {
 	stacks    int     // initial stacks (reattach path); <=0 => 1
 	rung      int     // #541 initial ladder rung (reattach path); <1 => rung 1 for a ladder affect
 	reattach  bool    // persistence re-attach: remaining is authoritative, no stacking, no on_apply
+	fromEquip bool    // #515: this apply is derived from a worn item — mark the instance transient (not persisted)
+	// suppressApply skips the on_apply hook + OnApplyAffect bus fire (#515): the load-time re-derivation of a
+	// gear equip-affect must NOT re-fire on_apply (the item was already equipped — a relog is not a new
+	// equip event; firing it would let a player farm an on-apply proc by re-logging). A LIVE wear passes
+	// false so on_apply fires normally. Distinct from `reattach`, which also rewrites duration semantics.
+	suppressApply bool
 }
 
 // applyAffect applies affect `ref` to entity e (docs/PHASE5-PLAN.md §1.4 — the runtime function
@@ -144,7 +150,7 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 	if inst == nil {
 		// First instance of this (ref[,source]): install fresh. A LADDER affect (#541) starts at rung 1;
 		// increment_rung raises it (rungIndex treats 0 as 1 too, so this is clarity, not strictly required).
-		inst = &affectInstance{def: def, source: opts.source, remaining: dur, magnitude: mag, stacks: 1}
+		inst = &affectInstance{def: def, source: opts.source, remaining: dur, magnitude: mag, stacks: 1, fromEquip: opts.fromEquip}
 		if len(def.rungs) > 0 {
 			inst.rung = 1
 		}
@@ -214,7 +220,9 @@ func applyAffect(e *Entity, ref string, opts attachOpts, parent *effectCtx) *aff
 		e.zone.breakConcentration(e)
 	}
 	e.zone.republishCommsOnAccessChange(e) // hear-access may have crossed a channel floor (docs/REMAINING.md §1)
-	fireOnApplyAffect(e, inst, parent)     // RESERVED hook + OnApplyAffect bus fire (threads the cascade)
+	if !opts.suppressApply {
+		fireOnApplyAffect(e, inst, parent) // RESERVED hook + OnApplyAffect bus fire (threads the cascade)
+	}
 	e.zone.log.Debug("affect attached", "ref", ref, "rid", e.rid,
 		"remaining", inst.remaining, "stacks", inst.stacks, "stacking", def.stacking)
 	return inst
@@ -273,6 +281,15 @@ func stripHostileAffects(e *Entity) {
 	kept := make([]*affectInstance, 0, len(a.list))
 	removed := false
 	for _, inst := range a.list {
+		// #515: an equip-DERIVED affect is tied to the STILL-WORN item, not to the death — respawn keeps the
+		// player's gear, so its equip-affects must persist (a flame-tongue proc must keep proccing after a
+		// death; a cursed item's debuff must not be sheddable by dying). Skipping the strip is SAFE against
+		// the #318 hostile-purge purpose: a fromEquip affect is ALWAYS self-sourced from the victim's OWN
+		// equipped item — an attacker has no path to apply one — so exempting it opens no cross-player hole.
+		if inst.fromEquip {
+			kept = append(kept, inst)
+			continue
+		}
 		if affectStrippedOnRespawn(inst.def, e.zone.harmPolarity()) {
 			delete(a.byKey, keyFor(inst.def, inst.source))
 			removed = true

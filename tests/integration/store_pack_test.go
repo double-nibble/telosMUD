@@ -469,6 +469,37 @@ func findAffect(affects []content.AffectDTO, ref string) *content.AffectDTO {
 	return nil
 }
 
+// TestStoreEquipAffectsRoundTrip (#515): WearableDTO.EquipAffects rides INSIDE prototypes.body's `wearable`
+// object, so it should survive the store round-trip. A dedicated minimal pack pins it by name against real
+// Postgres — a store body that reconstructed the Wearable without the field would drop the equip affects
+// (and every on-equip effect / OnHit proc) wherever content is served from the store.
+func TestStoreEquipAffectsRoundTrip(t *testing.T) {
+	p := helpers.OpenTestPool(t)
+	ctx := context.Background()
+
+	pk := content.Pack{
+		Pack: "equipfx",
+		Zones: []content.ZoneDTO{{
+			Ref: "z", StartRoom: "z:room:a",
+			Rooms: []content.RoomDTO{{Ref: "z:room:a", Name: "A", Long: "a room"}},
+			Items: []content.ProtoDTO{{
+				Ref: "z:obj:flamesword", Short: "a flaming sword", Keywords: []string{"sword"},
+				Wearable: &content.WearableDTO{Locations: []string{"wield"}, EquipAffects: []string{"flametongue", "sharpness"}},
+			}},
+		}},
+	}
+	require.NoError(t, p.ImportPack(ctx, pk), "import equip-affects pack")
+	lc, err := content.Load(ctx, p, []string{pk.Pack})
+	require.NoError(t, err, "load from postgres")
+
+	item := findItem(lc.Zones, "z:obj:flamesword")
+	require.NotNil(t, item, "the flaming sword survived the round trip")
+	require.NotNil(t, item.Wearable, "the sword kept its wearable component through the store")
+	require.Equal(t, []string{"flametongue", "sharpness"}, item.Wearable.EquipAffects,
+		"round-trip DROPPED WearableDTO.EquipAffects: on-equip affects / OnHit procs would silently vanish "+
+			"wherever content is served from the store")
+}
+
 // findMob returns the mob ProtoDTO with the given ref across all zones, or nil.
 func findMob(zones []content.ZoneDTO, ref string) *content.ProtoDTO {
 	for zi := range zones {

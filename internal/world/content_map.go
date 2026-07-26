@@ -318,6 +318,9 @@ func wearableFromNames(names []string) *Wearable {
 // so mulMod stays the identity.
 func wearableFromDTO(d *content.WearableDTO) *Wearable {
 	w := wearableFromNames(d.Locations)
+	if len(d.EquipAffects) > 0 {
+		w.equipAffects = append([]string(nil), d.EquipAffects...) // #515: affects applied while equipped
+	}
 	for _, m := range d.Modifiers {
 		if m.Attr == "" {
 			continue

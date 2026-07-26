@@ -1303,6 +1303,15 @@ type WearableDTO struct {
 	// a rolled affix these are FIXED on the prototype — every instance grants them. A "sets AC 18" plate is
 	// content (a derived AC attr + a flat armor_base modifier here), not a new op.
 	Modifiers []AffectModifierDTO `json:"modifiers,omitempty" yaml:"modifiers,omitempty"`
+
+	// EquipAffects are the affect refs applied to the WEARER while this item is equipped, and removed when
+	// it is unequipped (#515). This is how an item confers an on-equip magic effect OR an OnHit proc: an
+	// equip-applied affect participates in the event bus like any active affect, so a weapon whose
+	// equip-affect declares `on_event: { OnHit: [...] }` deals its bonus damage (flame-tongue) with no new
+	// item-subscription machinery. The affect is keyed by the ITEM (its source) so unequip/destroy removes
+	// exactly this item's contribution. Equip-affects are DERIVED state (re-applied from worn gear on load,
+	// never independently persisted), so an equip-affect def is typically `indefinite` (it lasts while worn).
+	EquipAffects []string `json:"equip_affects,omitempty" yaml:"equip_affects,omitempty"`
 }
 
 // WearSlotDTO is one content-defined equipment slot (#35, docs/MUDLIB.md §3): a wear location an item may

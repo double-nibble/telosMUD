@@ -654,6 +654,13 @@ func dumpAffects(e *Entity) []AffectJSON {
 	}
 	out := make([]AffectJSON, 0, len(a.list))
 	for _, inst := range a.list {
+		// #515: a gear-DERIVED equip affect is NOT persisted — it is re-applied from the wearer's worn items
+		// on load (loadCharacter re-equips, then applyEquipAffects re-derives). Persisting it would
+		// double-apply on reload and orphan a copy unequip could no longer find by its item key (the source
+		// is not persisted). Skip it, exactly as the #514 static stat mods are recomputed, not stored.
+		if inst.fromEquip {
+			continue
+		}
 		out = append(out, AffectJSON{
 			ID:        inst.def.ref,
 			Remaining: inst.remaining,
@@ -1029,6 +1036,10 @@ func applyStateComponents(z *Zone, s *session, st StateJSON) (droppedItems int) 
 			droppedItems += dropped
 			if item != nil {
 				wr.worn[loc] = item
+				// #515: re-derive the item's on-equip affects (they are transient, not persisted). QUIET: the
+				// item was already equipped, so a relog must not re-fire the affect's on_apply hook. Done before
+				// the resource clamp below so a +max_hp equip-affect raises the cap first, like a gear stat mod.
+				applyEquipAffects(e, item, true)
 			}
 		}
 		// #35: register + sum the worn affix bonus now, so the resource clamp below sees the gear-boosted

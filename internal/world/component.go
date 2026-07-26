@@ -271,6 +271,9 @@ func cloneComponent(c Component) Component {
 				cp.mul[k] = val
 			}
 		}
+		if v.equipAffects != nil {
+			cp.equipAffects = append([]string(nil), v.equipAffects...)
+		}
 		return &cp
 	case *Weapon:
 		cp := *v // all value fields (dice/type/class/verb)
@@ -301,6 +304,10 @@ func cloneComponent(c Component) Component {
 		// registration (which would point modSrcs at the prototype's Wearer) or a stale bonus map.
 		cp.registered = false
 		cp.mods = nil
+		// #515 NOTE: a cloned pre-equipped entity does NOT receive its worn items' equip-affects here — no
+		// content path authors a mob wearing an item today (a mob's Weapon rides its own prototype, not a
+		// worn item entity), so there is nothing to derive. If mob-equipping is ever added (a reset op or a
+		// Lua equip handle placing an item in worn[]), applyEquipAffects(quiet) MUST be wired at that seam.
 		return &cp
 	default:
 		panic("world: cloneComponent missing case for " + reflect.TypeOf(c).String() +
