@@ -59,8 +59,29 @@ func LintFinite(packs []Pack) []FinitenessViolation {
 				check(p.Pack, af.Ref, fieldPath("affect", af.Ref, i, "value"), m.Value)
 			}
 		}
+		// #514: static WORN modifiers feed the SAME attribute modifier stack as affect modifiers (a worn
+		// item's add/mul folds into the wearer's flatMod/mulMod), so a non-finite `value` on one is the same
+		// poison. They ride item — and, defensively, mob — prototypes inside each zone.
+		for zi := range p.Zones {
+			for pi := range p.Zones[zi].Items {
+				lintWearableModifiers(check, p.Pack, p.Zones[zi].Items[pi])
+			}
+			for pi := range p.Zones[zi].Mobs {
+				lintWearableModifiers(check, p.Pack, p.Zones[zi].Mobs[pi])
+			}
+		}
 	}
 	return out
+}
+
+// lintWearableModifiers checks a prototype's static worn modifier values for non-finiteness (#514).
+func lintWearableModifiers(check func(pack, ref, field string, v float64), pack string, proto ProtoDTO) {
+	if proto.Wearable == nil {
+		return
+	}
+	for i, m := range proto.Wearable.Modifiers {
+		check(pack, proto.Ref, fieldPath("wearable", proto.Ref, i, "value"), m.Value)
+	}
 }
 
 // walkFormulaLiterals descends a decoded formula-AST value (the generic nested-array form) and calls

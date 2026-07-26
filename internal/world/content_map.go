@@ -57,7 +57,7 @@ func protoComponents(p content.ProtoDTO) componentSet {
 		}
 	}
 	if d := p.Wearable; d != nil {
-		comps[reflect.TypeFor[*Wearable]()] = wearableFromNames(d.Locations)
+		comps[reflect.TypeFor[*Wearable]()] = wearableFromDTO(d)
 	}
 	if d := p.Weapon; d != nil {
 		comps[reflect.TypeFor[*Weapon]()] = &Weapon{
@@ -308,4 +308,34 @@ func wearableFromNames(names []string) *Wearable {
 		}
 	}
 	return wearableFor(locs...)
+}
+
+// wearableFromDTO builds a Wearable from its content DTO: the slot vocabulary (wearableFromNames) plus the
+// static worn stat modifiers (#514). Modifiers accumulate by attr into an add map (Op "add"/default, flat)
+// and a mul map (Op "mul", product), so two "+1 str" modifiers on one item sum and two "×1.1" ones multiply
+// — the same accumulation recomputeWornMods does ACROSS items. An unknown Op is treated as "add" (the safe
+// additive default) rather than silently dropped. Nil maps when the item declares no modifier of that kind,
+// so mulMod stays the identity.
+func wearableFromDTO(d *content.WearableDTO) *Wearable {
+	w := wearableFromNames(d.Locations)
+	for _, m := range d.Modifiers {
+		if m.Attr == "" {
+			continue
+		}
+		if m.Op == "mul" {
+			if w.mul == nil {
+				w.mul = map[string]float64{}
+			}
+			if _, ok := w.mul[m.Attr]; !ok {
+				w.mul[m.Attr] = 1
+			}
+			w.mul[m.Attr] *= m.Value
+		} else {
+			if w.add == nil {
+				w.add = map[string]float64{}
+			}
+			w.add[m.Attr] += m.Value
+		}
+	}
+	return w
 }

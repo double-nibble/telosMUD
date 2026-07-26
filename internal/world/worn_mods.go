@@ -19,23 +19,44 @@ func ensureWornModSource(e *Entity) {
 	wr.registered = true
 }
 
-// recomputeWornMods re-sums every worn item's rolled affixes into the Wearer's mods map and dirties the
-// wearer's attribute cache, so the next attr() reflects the current gear. Called after any wear/wield/hold/
-// remove and after loading a character's equipment. A worn item with no Quality (an un-rolled prototype)
-// contributes nothing. Repeated attrs across items ADD (two +2-str rings give +4 str).
+// recomputeWornMods re-sums every worn item's stat modifiers into the Wearer's maps and dirties the wearer's
+// attribute cache, so the next attr() reflects the current gear. Called after any wear/wield/hold/remove and
+// after loading a character's equipment. Each worn item contributes both its PROTOTYPE static modifiers
+// (#514: the Wearable's add/mul, present on every instance) and its PER-INSTANCE rolled affixes (#35:
+// Quality.Affixes, add-only). Additive contributions SUM across items and both sources (two +2-str items ->
+// +4 str, a +2 static ring stacking its own +1 rolled affix -> +3); multiplicative ones MULTIPLY. An item
+// with neither a Wearable-with-modifiers nor a Quality contributes nothing.
 func recomputeWornMods(e *Entity, wr *Wearer) {
-	m := make(map[string]float64)
+	add := make(map[string]float64)
+	var mul map[string]float64
 	for _, item := range wr.worn {
 		if item == nil {
 			continue
 		}
+		// Static prototype modifiers (#514): flat add + multiplicative.
+		if wd, ok := Get[*Wearable](item); ok {
+			for attr, v := range wd.add {
+				add[attr] += v
+			}
+			for attr, v := range wd.mul {
+				if mul == nil {
+					mul = make(map[string]float64)
+				}
+				if _, seen := mul[attr]; !seen {
+					mul[attr] = 1
+				}
+				mul[attr] *= v
+			}
+		}
+		// Per-instance rolled affixes (#35): additive.
 		if q, ok := Get[*Quality](item); ok {
 			for attr, v := range q.Affixes {
-				m[attr] += v
+				add[attr] += v
 			}
 		}
 	}
-	wr.mods = m
+	wr.mods = add
+	wr.muls = mul
 	markAttrsDirty(e)
 }
 

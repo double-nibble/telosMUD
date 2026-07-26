@@ -265,6 +265,21 @@ func TestStorePackRoundTrip(t *testing.T) {
 	assert.Equal(t, fromYAML.WorldScript, fromDB.WorldScript, "round-trip: pack world_script scalar")
 	assert.NotEmpty(t, fromYAML.WorldScript, "the demo pack should ship a world_script (#47)")
 
+	// Static worn stat modifier (#514): WearableDTO.Modifiers rides INSIDE prototypes.body's `wearable`
+	// object, so it should survive the whole-item DeepEqual above — but the demo helmet is the one item that
+	// exercises it, and a nested field-drop (a store body that reconstructs the Wearable without the field)
+	// would be an opaque whole-struct diff. Pin it BY NAME so a drop names the field. The demo helmet grants
+	// +1 strength while worn.
+	dbHelmet := findItem(fromDB.Zones, "midgaard:obj:helmet")
+	require.NotNil(t, dbHelmet, "the iron helmet survived the round trip")
+	require.NotNil(t, dbHelmet.Wearable, "the helmet kept its wearable component through the store")
+	require.Len(t, dbHelmet.Wearable.Modifiers, 1,
+		"round-trip DROPPED WearableDTO.Modifiers: the helmet's static +1-str modifier parses from YAML but "+
+			"comes back empty from Postgres, so declarative worn stat bonuses silently vanish wherever content "+
+			"is served from the store")
+	assert.Equal(t, content.AffectModifierDTO{Attr: "strength", Op: "add", Value: 1}, dbHelmet.Wearable.Modifiers[0],
+		"round-trip mangled the helmet's static worn modifier")
+
 	// Deep-compare every pack-GLOBAL def kind, the same way the zone DeepEqual above covers zone
 	// content. THIS is the systemic catch: a global def is NOT zone content, so the zones-only
 	// round-trip never saw a top-level field silently dropped on the store import/load path — the
@@ -460,6 +475,18 @@ func findMob(zones []content.ZoneDTO, ref string) *content.ProtoDTO {
 		for mi := range zones[zi].Mobs {
 			if zones[zi].Mobs[mi].Ref == ref {
 				return &zones[zi].Mobs[mi]
+			}
+		}
+	}
+	return nil
+}
+
+// findItem returns the item ProtoDTO with the given ref across all zones, or nil.
+func findItem(zones []content.ZoneDTO, ref string) *content.ProtoDTO {
+	for zi := range zones {
+		for ii := range zones[zi].Items {
+			if zones[zi].Items[ii].Ref == ref {
+				return &zones[zi].Items[ii]
 			}
 		}
 	}

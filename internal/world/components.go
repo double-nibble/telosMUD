@@ -332,6 +332,12 @@ const (
 // slice 4: wear/wield/hold consult it to pick a legal slot; remove returns the item to inventory.
 type Wearable struct {
 	locs []WearLoc // the slot refs this item may occupy (as authored)
+	// add / mul are the item's STATIC worn stat modifiers (#514): the flat and multiplicative attribute
+	// deltas this prototype grants WHILE EQUIPPED. nil when the item declares none. Read by recomputeWornMods
+	// on the wearer when this item is worn, folded into the wearer's Wearer.mods / Wearer.muls exactly like a
+	// rolled affix. These are prototype data (every instance grants them), distinct from per-instance Quality.
+	add map[string]float64
+	mul map[string]float64
 }
 
 func (*Wearable) componentKind() Kind { return KindWearable }
@@ -366,11 +372,16 @@ func wearableFor(locs ...WearLoc) *Wearable {
 // rest. remove just clears the slot, leaving the item carried.
 type Wearer struct {
 	worn map[WearLoc]*Entity
-	// mods is the SUMMED flat attribute bonus contributed by every currently-worn item's rolled
-	// Quality affixes (#35 — gear confers stats). It is the Wearer's modSource view: recomputed by
-	// recomputeWornMods on every wear/remove, read O(1) by flatMod during attribute derivation. This
-	// mirrors the Affected pattern (affected.go): register the source ONCE, recompute on change.
+	// mods is the SUMMED flat attribute bonus contributed by every currently-worn item: each item's rolled
+	// Quality affixes (#35) PLUS its prototype's static `add` modifiers (#514 — armor's "+2 AC"). It is the
+	// Wearer's modSource flat view: recomputed by recomputeWornMods on every wear/remove, read O(1) by
+	// flatMod during attribute derivation. Mirrors the Affected pattern (affected.go): register ONCE,
+	// recompute on change.
 	mods map[string]float64
+	// muls is the PRODUCT of every worn item's prototype static `mul` modifiers (#514), attr -> product.
+	// Nil/absent => the identity (1). Read O(1) by mulMod. Rolled affixes are add-only, so muls comes purely
+	// from static prototype modifiers.
+	muls map[string]float64
 	// registered records that this Wearer has already been addModSource'd onto its entity, so a second
 	// actorWearer/equip never double-registers (which would double-count the gear bonus).
 	registered bool
@@ -378,11 +389,21 @@ type Wearer struct {
 
 func (*Wearer) componentKind() Kind { return KindWearable } // shares the wearable kind tag
 
-// flatMod / mulMod implement modSource (attributes.go §1.1): the Wearer contributes each worn item's
-// rolled affix as an ADDITIVE attribute bonus, summed across all worn gear (recomputeWornMods). Gear is
-// purely additive for now, so mulMod is the identity. Read on the zone goroutine during derivation.
+// flatMod / mulMod implement modSource (attributes.go §1.1): the Wearer contributes each worn item's rolled
+// affixes AND its prototype's static modifiers (#514) — additive ones summed into mods, multiplicative ones
+// multiplied into muls (recomputeWornMods). An attr no worn item touches reads the identity (0 flat / 1 mul).
+// Read on the zone goroutine during derivation.
 func (w *Wearer) flatMod(ref string) float64 { return w.mods[ref] }
-func (w *Wearer) mulMod(string) float64      { return 1 }
+
+func (w *Wearer) mulMod(ref string) float64 {
+	if w.muls == nil {
+		return 1
+	}
+	if v, ok := w.muls[ref]; ok {
+		return v
+	}
+	return 1
+}
 
 // slotOf returns the slot an item currently occupies on this wearer, or WearLocNone.
 func (w *Wearer) slotOf(item *Entity) WearLoc {

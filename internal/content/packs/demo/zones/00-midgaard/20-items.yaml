@@ -11,7 +11,9 @@ zones:
         short: an iron helmet
         long: An iron helmet rests here.
         physical: {weight: 3, material: iron}
-        wearable: {locations: [head]}
+        # A static worn stat modifier (#514): the helmet grants +1 strength while worn — a fixed prototype
+        # bonus (every instance carries it), distinct from a per-instance rolled affix.
+        wearable: {locations: [head], modifiers: [{attr: strength, op: add, value: 1}]}
       - ref: midgaard:obj:sword
         keywords: [sword, steel, long]
         short: a steel longsword
