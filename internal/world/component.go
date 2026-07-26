@@ -249,7 +249,28 @@ func cloneComponent(c Component) Component {
 		cp := *v // all value fields (capacity/closed/locked/keyRef)
 		return &cp
 	case *Wearable:
-		cp := *v // single value field (locations bitmask)
+		// locs is a []WearLoc slice and add/mul (#514) are maps — all reference-typed. They are effectively
+		// immutable prototype data today (only wearableFromDTO writes them; recomputeWornMods reads them), so
+		// a shallow copy would be safe RIGHT NOW. But cloneComponent's contract is "never alias the
+		// prototype": deep-copy so a future in-place mutator (a reforge/re-enchant op) can never leak a
+		// modifier to the prototype and every sibling clone — the same discipline the *Wearer/*Affected cases
+		// below apply to their reference fields.
+		cp := *v
+		if v.locs != nil {
+			cp.locs = append([]WearLoc(nil), v.locs...)
+		}
+		if v.add != nil {
+			cp.add = make(map[string]float64, len(v.add))
+			for k, val := range v.add {
+				cp.add[k] = val
+			}
+		}
+		if v.mul != nil {
+			cp.mul = make(map[string]float64, len(v.mul))
+			for k, val := range v.mul {
+				cp.mul[k] = val
+			}
+		}
 		return &cp
 	case *Weapon:
 		cp := *v // all value fields (dice/type/class/verb)

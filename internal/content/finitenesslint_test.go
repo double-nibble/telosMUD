@@ -76,12 +76,47 @@ func TestLintFinite(t *testing.T) {
 	require.Empty(t, LintFinite([]Pack{{Pack: "good", Attributes: []AttributeDTO{{Ref: "a", Min: &ok}}}}))
 }
 
+// TestLintFiniteWearableModifiers (#514): a non-finite value on a static WORN modifier is caught, since it
+// feeds the same attribute stack as an affect modifier. Item AND mob prototypes are walked.
+func TestLintFiniteWearableModifiers(t *testing.T) {
+	inf := math.Inf(1)
+	nan := math.NaN()
+
+	packs := []Pack{{
+		Pack: "bad",
+		Zones: []ZoneDTO{{
+			Ref: "z1",
+			Items: []ProtoDTO{
+				{Ref: "z1:obj:cursed-ring", Wearable: &WearableDTO{Modifiers: []AffectModifierDTO{
+					{Attr: "str", Op: "add", Value: 1},
+					{Attr: "dex", Op: "mul", Value: inf},
+				}}},
+				{Ref: "z1:obj:clean-ring", Wearable: &WearableDTO{Modifiers: []AffectModifierDTO{{Attr: "str", Op: "add", Value: 2}}}},
+			},
+			Mobs: []ProtoDTO{
+				{Ref: "z1:mob:hexed", Wearable: &WearableDTO{Modifiers: []AffectModifierDTO{{Attr: "con", Op: "add", Value: nan}}}},
+			},
+		}},
+	}}
+
+	got := LintFinite(packs)
+	byField := map[string]FinitenessViolation{}
+	for _, v := range got {
+		byField[v.Field] = v
+	}
+	require.Len(t, got, 2, "exactly the two non-finite worn modifiers: %+v", got)
+	require.Equal(t, "Inf", byField["wearable z1:obj:cursed-ring modifier[1].value"].Kind)
+	require.Equal(t, "z1:obj:cursed-ring", byField["wearable z1:obj:cursed-ring modifier[1].value"].Ref)
+	require.Equal(t, "NaN", byField["wearable z1:mob:hexed modifier[0].value"].Kind)
+}
+
 // TestLintFiniteEndToEndFromYAML is the wiring proof: a real YAML modifier with `.nan` reaches the
 // lint through the actual DTO decode, not a hand-built struct.
 func TestLintFiniteEndToEndFromYAML(t *testing.T) {
 	var af AffectDTO
 	require.NoError(t, yaml.Unmarshal([]byte(
-		"ref: cursed\nbody:\n  modifiers:\n    - {attr: autofail_save, op: add, value: .nan}\n"), &af))
+		"ref: cursed\nbody:\n  modifiers:\n    - {attr: autofail_save, op: add, value: .nan}\n",
+	), &af))
 
 	got := LintFinite([]Pack{{Pack: "p", Affects: []AffectDTO{af}}})
 	require.Len(t, got, 1)

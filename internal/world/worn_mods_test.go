@@ -1,6 +1,10 @@
 package world
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/double-nibble/telosmud/internal/content"
+)
 
 // worn_mods_test.go — #35 worn-affix stat effect. Done-when: wearing an item with a rolled affix raises the
 // wearer's derived attribute; removing it drops the bonus; multiple sources stack additively; and the
@@ -137,6 +141,164 @@ func TestAugmentWornItemAppliesLive(t *testing.T) {
 	}
 	if got := wornStrength(actor); got != base+5 {
 		t.Fatalf("strength after augmenting a worn item by +4 (from +1) = %v, want %v (live)", got, base+5)
+	}
+}
+
+// TestWornStaticModifierFlat (#514): an item's PROTOTYPE static `add` modifier raises the wearer's attribute
+// while worn and drops on remove — no rolled Quality needed (every instance grants it).
+func TestWornStaticModifierFlat(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	base := wornStrength(actor)
+
+	addTestItem(e.z, actor, "plate armor", []string{"plate"},
+		&Wearable{locs: []WearLoc{WearLocBody}, add: map[string]float64{"strength": 2}})
+
+	e.run("wear plate")
+	if got := wornStrength(actor); got != base+2 {
+		t.Fatalf("strength after wearing +2-str plate = %v, want %v", got, base+2)
+	}
+	e.run("remove plate")
+	if got := wornStrength(actor); got != base {
+		t.Fatalf("strength after removing the plate = %v, want %v (back to base)", got, base)
+	}
+}
+
+// TestWornStaticModifierMul (#514): a static `mul` modifier scales the attribute multiplicatively (and
+// mulMod returns to the identity when the item is removed).
+func TestWornStaticModifierMul(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	base := wornStrength(actor)
+
+	addTestItem(e.z, actor, "a giant's crown", []string{"crown"},
+		&Wearable{locs: []WearLoc{WearLocHead}, mul: map[string]float64{"strength": 1.5}})
+
+	e.run("wear crown")
+	if got := wornStrength(actor); got != base*1.5 {
+		t.Fatalf("strength wearing a ×1.5-str crown = %v, want %v", got, base*1.5)
+	}
+	e.run("remove crown")
+	if got := wornStrength(actor); got != base {
+		t.Fatalf("strength after removing the crown = %v, want %v (mul back to identity)", got, base)
+	}
+}
+
+// TestWornStaticAndRolledStack (#514): a prototype static `add` and a per-instance rolled affix on the SAME
+// item both apply — the static modifier and the rolled Quality sum.
+func TestWornStaticAndRolledStack(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	base := wornStrength(actor)
+
+	addTestItem(e.z, actor, "an enchanted helm", []string{"helm"},
+		&Wearable{locs: []WearLoc{WearLocHead}, add: map[string]float64{"strength": 2}},
+		&Quality{Affixes: map[string]float64{"strength": 1}})
+
+	e.run("wear helm")
+	if got := wornStrength(actor); got != base+3 {
+		t.Fatalf("strength with +2 static and +1 rolled = %v, want %v", got, base+3)
+	}
+}
+
+// TestWornStaticModifiersStackAcrossItems (#514): static adds SUM and static muls MULTIPLY across worn items.
+func TestWornStaticModifiersStackAcrossItems(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	base := wornStrength(actor)
+
+	addTestItem(e.z, actor, "iron gauntlets", []string{"gauntlets"},
+		&Wearable{locs: []WearLoc{WearLocHands}, add: map[string]float64{"strength": 3}})
+	addTestItem(e.z, actor, "mighty boots", []string{"boots"},
+		&Wearable{locs: []WearLoc{WearLocFeet}, mul: map[string]float64{"strength": 2}})
+
+	e.run("wear gauntlets")
+	e.run("wear boots")
+	// Derivation is (base + flat) * mul: (base + 3) * 2.
+	if got := wornStrength(actor); got != (base+3)*2 {
+		t.Fatalf("strength with +3 flat and ×2 = %v, want %v", got, (base+3)*2)
+	}
+	e.run("remove boots")
+	if got := wornStrength(actor); got != base+3 {
+		t.Fatalf("strength after removing the ×2 boots = %v, want %v", got, base+3)
+	}
+}
+
+// TestWearableFromDTO (#514): the content DTO's Modifiers parse into the Wearable's add/mul maps — "add"
+// (and an unknown op) accumulate into add; "mul" into mul; repeated attrs combine.
+func TestWearableFromDTO(t *testing.T) {
+	d := &content.WearableDTO{
+		Locations: []string{"body"},
+		Modifiers: []content.AffectModifierDTO{
+			{Attr: "ac", Op: "add", Value: 2},
+			{Attr: "ac", Op: "add", Value: 1},         // sums -> ac add 3
+			{Attr: "strength", Op: "mul", Value: 1.5}, // -> mul
+			{Attr: "dex", Op: "", Value: 4},           // empty op defaults to add
+			{Attr: "", Op: "add", Value: 9},           // no attr -> skipped
+		},
+	}
+	w := wearableFromDTO(d)
+	if w.add["ac"] != 3 {
+		t.Fatalf("ac add = %v, want 3 (summed)", w.add["ac"])
+	}
+	if w.add["dex"] != 4 {
+		t.Fatalf("dex add = %v, want 4 (empty op defaults to add)", w.add["dex"])
+	}
+	if w.mul["strength"] != 1.5 {
+		t.Fatalf("strength mul = %v, want 1.5", w.mul["strength"])
+	}
+	if _, ok := w.add[""]; ok {
+		t.Fatal("an attr-less modifier must be skipped")
+	}
+}
+
+// TestDemoHelmetStaticModifierLiveEndToEnd (#514) is the WIRING guard: it spawns the REAL demo iron helmet
+// (which declares a static +1 strength modifier in its YAML) through the content pipeline, wears it, and
+// asserts the wearer's derived strength rises by 1. This pins the whole chain — YAML -> WearableDTO ->
+// wearableFromDTO -> Wearable.add -> recomputeWornMods -> attr — that the hand-built &Wearable{} unit tests
+// bypass. Reverting content_map.go from wearableFromDTO to wearableFromNames (dropping modifiers at spawn)
+// fails HERE.
+func TestDemoHelmetStaticModifierLiveEndToEnd(t *testing.T) {
+	z := newDemoZone("midgaard", newProtoCache())
+	s := newTestPlayerEntity(z, "Helm")
+	Move(s.entity, z.rooms["midgaard:room:temple"])
+	base := attr(s.entity, "strength")
+
+	helm := z.spawn(ProtoRef("midgaard:obj:helmet"))
+	if helm == nil {
+		t.Fatal("could not spawn the demo helmet")
+	}
+	Move(helm, s.entity) // into the player's inventory
+
+	z.dispatch(s, "wear helmet")
+	if got := attr(s.entity, "strength"); got != base+1 {
+		t.Fatalf("strength after wearing the demo helmet = %v, want %v (+1 from its static modifier)", got, base+1)
+	}
+	z.dispatch(s, "remove helmet")
+	if got := attr(s.entity, "strength"); got != base {
+		t.Fatalf("strength after removing the demo helmet = %v, want %v (bonus dropped)", got, base)
+	}
+}
+
+// TestWornStaticModifierNoDoubleCountOnRewear (#514): like the rolled-affix rewear guard, a static modifier
+// must land on the single-counted value across wear/remove/wear cycles (the recompute-from-scratch seam).
+func TestWornStaticModifierNoDoubleCountOnRewear(t *testing.T) {
+	e := newCmdEnv(t)
+	actor := e.actor.entity
+	base := wornStrength(actor)
+
+	addTestItem(e.z, actor, "a heavy crown", []string{"crown"},
+		&Wearable{locs: []WearLoc{WearLocHead}, add: map[string]float64{"strength": 5}})
+
+	for i := 0; i < 3; i++ {
+		e.run("wear crown")
+		if got := wornStrength(actor); got != base+5 {
+			t.Fatalf("iteration %d: strength worn = %v, want %v (no double-count)", i, got, base+5)
+		}
+		e.run("remove crown")
+		if got := wornStrength(actor); got != base {
+			t.Fatalf("iteration %d: strength removed = %v, want %v", i, got, base)
+		}
 	}
 }
 

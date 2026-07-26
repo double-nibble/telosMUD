@@ -1296,6 +1296,13 @@ type PhysicalDTO struct {
 // slots and packs the bitmask, keeping the slot enum an internal detail.
 type WearableDTO struct {
 	Locations []string `json:"locations" yaml:"locations"`
+	// Modifiers are the item's STATIC worn stat modifiers (#514): the flat/multiplicative attribute deltas
+	// a prototype declaratively grants while equipped (armor's "+2 AC", a ring's "+1 to a save"). They feed
+	// the SAME wearer modSource path as per-instance rolled affixes (Quality.Affixes), so a worn item's total
+	// bonus is its static modifiers PLUS whatever it rolled. Op is "add" (flat, the default) or "mul". Unlike
+	// a rolled affix these are FIXED on the prototype — every instance grants them. A "sets AC 18" plate is
+	// content (a derived AC attr + a flat armor_base modifier here), not a new op.
+	Modifiers []AffectModifierDTO `json:"modifiers,omitempty" yaml:"modifiers,omitempty"`
 }
 
 // WearSlotDTO is one content-defined equipment slot (#35, docs/MUDLIB.md §3): a wear location an item may

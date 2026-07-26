@@ -144,6 +144,12 @@ func TestDemoPackPrototypeParity(t *testing.T) {
 
 	if w := protos.get("midgaard:obj:helmet").comps[wearT].(*Wearable); !w.canWear(WearLocHead) {
 		t.Errorf("helmet wearable does not advertise head: %v", w)
+	} else if w.add["strength"] != 1 {
+		// #514: the demo helmet's static +1-str modifier must reach the built component through the REAL
+		// content pipeline (protoComponents -> wearableFromDTO). This pins the content->component wiring the
+		// hand-built &Wearable{} unit tests bypass — reverting content_map.go to wearableFromNames (dropping
+		// modifiers at spawn) fails HERE.
+		t.Errorf("helmet static modifier not wired through the content pipeline: add = %v, want strength:1", w.add)
 	}
 	sw := protos.get("midgaard:obj:sword")
 	if w := sw.comps[wearT].(*Wearable); !w.canWear(WearLocWield) {
