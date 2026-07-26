@@ -286,35 +286,60 @@ func parseOp(v any) (effectOp, error) {
 			return effectOp{}, fmt.Errorf("if: a comparator/threshold needs a left-hand side (resource or lhs)")
 		}
 	}
-	// Dice: "<N>d<S>" form for deal_damage; or explicit dice_num/dice_size.
-	if dice := mapStr(m, "dice"); dice != "" {
-		n, s, err := parseDice(dice)
+	// Dice. The die COUNT is set by EXACTLY ONE of `dice` / `dice_num` / `dice_count`; the SIZE comes from
+	// the `dice` shorthand or the `dice_size` key.
+	//   - `dice: "<N>d<S>"`                      — a FIXED count AND size (the shorthand).
+	//   - `dice_num: <int>` (+ `dice_size`)      — a literal count.
+	//   - `dice_num: [formula]` OR `dice_count: [formula]` (+ `dice_size`) — a COMPUTED count (#517: the
+	//     level-scaled cantrip / spell-slot-upcast rider). A formula in `dice_num` is IDENTICAL to
+	//     `dice_count` — the two spellings route to the same slot, so they must not both appear.
+	// Setting the count more than one way is contradictory content, so parseOp REJECTS it rather than
+	// silently dropping one source (the silent-0 / silent-precedence footgun this hardening closes). The
+	// prior code read `dice_num` only inside the `dice`-absent branch, so `dice: "1d10"` + a scaling
+	// `dice_num`/`dice_count` — the natural cantrip shape — silently ignored the scaler.
+	_, hasDice := m["dice"]
+	_, hasDiceNum := m["dice_num"]
+	_, hasDiceCount := m["dice_count"]
+	if countSources(hasDice, hasDiceNum, hasDiceCount) > 1 {
+		return effectOp{}, fmt.Errorf("op %q: the die count is set more than once — use exactly one of `dice`, `dice_num`, `dice_count`", op.kind)
+	}
+	op.diceSize = int(mapFloat(m, "dice_size")) // 0 when absent; the `dice` shorthand overrides it below
+	switch {
+	case hasDice:
+		n, s, err := parseDice(mapStr(m, "dice"))
 		if err != nil {
 			return effectOp{}, err
 		}
 		op.diceNum, op.diceSize = n, s
-	} else {
-		op.diceNum = int(mapFloat(m, "dice_num"))
-		op.diceSize = int(mapFloat(m, "dice_size"))
+	case hasDiceNum:
+		// A numeric value is the literal count; a non-numeric value (a [head, args...] formula) routes to
+		// the diceCount slot, so the natural `dice_num` key scales a cantrip/upcast instead of hitting the
+		// int(mapFloat(...)) silent-0 that a present-but-non-numeric value would otherwise produce.
+		if dn := m["dice_num"]; isNumericVal(dn) {
+			op.diceNum = int(mapFloat(m, "dice_num"))
+		} else {
+			node, err := parseFormula(dn)
+			if err != nil {
+				return effectOp{}, fmt.Errorf("dice_num: %w", err)
+			}
+			op.diceCount = node
+		}
+	case hasDiceCount:
+		node, err := parseFormula(m["dice_count"])
+		if err != nil {
+			return effectOp{}, fmt.Errorf("dice_count: %w", err)
+		}
+		op.diceCount = node
 	}
-	// [G-A] formula-damage: a scoped attribute `bonus` formula added to deal_damage's amount, and an
-	// optional `dice_count` formula (a level-scaled dice count, paired with dice_size). Both parse via
-	// the same prefix-AST evaluator as check formulas; nil when absent (the flat amount + literal dice
-	// path is unchanged). `bonus` here is the OP's top-level bonus (a check's own bonus lives under its
-	// nested `check` object, so there is no collision).
+	// [G-A] formula-damage: a scoped attribute `bonus` formula added to deal_damage's amount (parsed via
+	// the same prefix-AST evaluator as check formulas; nil when absent). `bonus` here is the OP's top-level
+	// bonus (a check's own bonus lives under its nested `check` object, so there is no collision).
 	if b, present := m["bonus"]; present {
 		node, err := parseFormula(b)
 		if err != nil {
 			return effectOp{}, fmt.Errorf("bonus: %w", err)
 		}
 		op.bonus = node
-	}
-	if dc, present := m["dice_count"]; present {
-		node, err := parseFormula(dc)
-		if err != nil {
-			return effectOp{}, fmt.Errorf("dice_count: %w", err)
-		}
-		op.diceCount = node
 	}
 	// Nested branches for flow ops.
 	if t, present := m["then"]; present {
@@ -647,6 +672,30 @@ func parseVisibility(s string) checkVisibility {
 	default:
 		return visInherit
 	}
+}
+
+// isNumericVal reports whether a decoded content value is a plain number (the JSON/YAML number kinds),
+// as opposed to a formula node (a []any) or any other type. Used to let a key like `dice_num` accept
+// EITHER an int literal or a formula AST without silently reading a formula as 0 (#517).
+func isNumericVal(v any) bool {
+	switch v.(type) {
+	case float64, int, int64:
+		return true
+	default:
+		return false
+	}
+}
+
+// countSources counts how many of the given presence flags are true — used to reject content that sets
+// the die count more than one way (`dice` / `dice_num` / `dice_count`, #517).
+func countSources(flags ...bool) int {
+	n := 0
+	for _, f := range flags {
+		if f {
+			n++
+		}
+	}
+	return n
 }
 
 // mapFloatPtr returns a pointer to the float at key, or nil if the key is absent (so a band can
