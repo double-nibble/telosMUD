@@ -56,13 +56,17 @@ type NATSBus struct {
 // on the whole comms space, its Publish on any comms subject returns ErrPublishForbidden). The role is
 // fixed by the constructor, never a mutable field — a gate process gets a gate handle and structurally
 // cannot publish comms (P8-A2, #554).
-func NewWorld(url string) (*NATSBus, error) { return connect(url, RoleWorld, "telos-commbus-world") }
+func NewWorld(url string, opts ...DialOption) (*NATSBus, error) {
+	return connect(url, RoleWorld, "telos-commbus-world", opts...)
+}
 
 // NewGate dials url and returns a RoleGate handle (the sink) — see NewWorld.
-func NewGate(url string) (*NATSBus, error) { return connect(url, RoleGate, "telos-commbus-gate") }
+func NewGate(url string, opts ...DialOption) (*NATSBus, error) {
+	return connect(url, RoleGate, "telos-commbus-gate", opts...)
+}
 
-func connect(url string, role Role, name string) (*NATSBus, error) {
-	nc, err := nats.Connect(url,
+func connect(url string, role Role, name string, opts ...DialOption) (*NATSBus, error) {
+	natsOpts := []nats.Option{
 		nats.Timeout(connectTimeout),
 		nats.Name(name),
 		// Reconnect quietly in the background: a NATS blip should degrade comms transiently, not
@@ -70,7 +74,10 @@ func connect(url string, role Role, name string) (*NATSBus, error) {
 		// (at-most-once); the durable path (8.5) is JetStream, which survives a reconnect.
 		nats.RetryOnFailedConnect(false),
 		nats.MaxReconnects(-1),
-	)
+	}
+	// #552: per-identity credentials, if configured (else anonymous — today's no-auth default).
+	natsOpts = append(natsOpts, buildDialConfig(opts).natsOptions()...)
+	nc, err := nats.Connect(url, natsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("commbus: connect %q: %w", url, err)
 	}

@@ -120,26 +120,29 @@ func durableConsumerConfig(subj, consumerID string, maxAckPending int) jetstream
 // bus's connection) and ensures the COMMS_TELL stream exists, returning a ready JetStream or an error
 // (the caller degrades to DisabledJetStream). An empty url is a configuration "no JetStream" and is a
 // caller decision (open() handles it), not an error here.
-func NewJetStream(url string) (*NATSJetStream, error) {
-	return dialJetStream(url, jsStreamName, DtellPrefix+">")
+func NewJetStream(url string, opts ...DialOption) (*NATSJetStream, error) {
+	return dialJetStream(url, jsStreamName, DtellPrefix+">", opts...)
 }
 
 // NewScopeJetStream is the durable transport for the SCOPED EVENT BUS (Phase 10.2b): same machinery as
 // the tell stream, bound to the WORLD_EVENTS stream over telos.scope.>. A director/zone wires this as
 // the scopebus durable tier so a state-changing world event survives a restart. Empty url is a caller
 // decision (degrade to DisabledJetStream), not an error here.
-func NewScopeJetStream(url string) (*NATSJetStream, error) {
-	return dialJetStream(url, jsScopeStreamName, ScopeSubjectPrefix+">")
+func NewScopeJetStream(url string, opts ...DialOption) (*NATSJetStream, error) {
+	return dialJetStream(url, jsScopeStreamName, ScopeSubjectPrefix+">", opts...)
 }
 
 // dialJetStream opens a connection and ensures the named stream over subjectFilter.
-func dialJetStream(url, streamName, subjectFilter string) (*NATSJetStream, error) {
-	nc, err := nats.Connect(url,
+func dialJetStream(url, streamName, subjectFilter string, opts ...DialOption) (*NATSJetStream, error) {
+	natsOpts := []nats.Option{
 		nats.Timeout(connectTimeout),
 		nats.Name("telos-commbus-jetstream"),
 		nats.RetryOnFailedConnect(false),
 		nats.MaxReconnects(-1),
-	)
+	}
+	// #552: same per-identity credentials as the transient bus (one identity, two connections).
+	natsOpts = append(natsOpts, buildDialConfig(opts).natsOptions()...)
+	nc, err := nats.Connect(url, natsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("commbus: jetstream connect %q: %w", url, err)
 	}
@@ -449,14 +452,14 @@ func (c *natsConsumer) Stop() error {
 // OpenJetStream is the optional/never-fatal wiring helper (mirrors OpenWorld/OpenGate): it dials url
 // and, on failure or an empty url, logs via logf and returns DisabledJetStream() so boot never fails
 // on an unreachable broker. The world wiring uses this for the durable-tell handle.
-func OpenJetStream(url string, logf func(err error)) JetStream {
+func OpenJetStream(url string, logf func(err error), opts ...DialOption) JetStream {
 	if url == "" {
 		if logf != nil {
 			logf(nil)
 		}
 		return DisabledJetStream()
 	}
-	js, err := NewJetStream(url)
+	js, err := NewJetStream(url, opts...)
 	if err != nil {
 		if logf != nil {
 			logf(err)
@@ -469,14 +472,14 @@ func OpenJetStream(url string, logf func(err error)) JetStream {
 // OpenScopeJetStream is OpenJetStream for the scoped-event stream (the scopebus durable tier): never
 // fatal — an empty/unreachable url degrades to DisabledJetStream so a director runs without durable
 // orchestration rather than failing boot.
-func OpenScopeJetStream(url string, logf func(err error)) JetStream {
+func OpenScopeJetStream(url string, logf func(err error), opts ...DialOption) JetStream {
 	if url == "" {
 		if logf != nil {
 			logf(nil)
 		}
 		return DisabledJetStream()
 	}
-	js, err := NewScopeJetStream(url)
+	js, err := NewScopeJetStream(url, opts...)
 	if err != nil {
 		if logf != nil {
 			logf(err)

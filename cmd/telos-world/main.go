@@ -359,13 +359,16 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 	// a RoleWorld commbus handle (commbus.OpenWorld ONLY — never OpenGate). NATS unreachable => a Disabled
 	// no-op bus => channels degrade to "temporarily offline" for the speaker, never a boot failure
 	// (the never-fatal rule, mirroring openContentBus + the gate's commbus.OpenGate).
+	// #552: the world identity's broker credentials, applied to all three of its commbus connections
+	// (transient comms, the scope stream, the durable-tell stream) — one identity, three connections.
+	natsCreds := commbus.WithUserPassword(cfg.NATS.User, cfg.NATS.Password)
 	comms := commbus.OpenWorld(cfg.NATS.URL, func(err error) {
 		if err != nil {
 			slog.Warn("nats unavailable; comms disabled (world source)", "url", cfg.NATS.URL, "err", err)
 			return
 		}
 		slog.Info("comms bus ready (world source)", "url", cfg.NATS.URL)
-	})
+	}, natsCreds)
 
 	// Optional scoped event bus (Phase 10.3b/c): the world SUBSCRIBES to the region/world scopes so a
 	// director's state broadcast updates each hosted zone's read-replica (world.flag/region:get), and it
@@ -380,7 +383,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			return
 		}
 		slog.Info("scope event stream ready", "url", cfg.NATS.URL)
-	})
+	}, natsCreds)
 	scopeSource := "world-" + cfg.ShardID + "-" + uuid.NewString()[:8]
 	scopeBus := scopebus.New(comms).WithDurable(scopeJS, scopeSource)
 
@@ -394,7 +397,7 @@ func buildShard(ctx context.Context, stop func(), cfg config.Config, zones []str
 			return
 		}
 		slog.Info("durable tell stream ready", "url", cfg.NATS.URL)
-	})
+	}, natsCreds)
 
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -678,7 +681,8 @@ func openLivePool(ctx context.Context, cfg config.Config) *store.Pool {
 // Returns the contentbus.Bus interface so the disabled path is a true nil interface (a typed nil
 // *NATSBus would be non-nil and slip past WithHotReload's nil guard).
 func openContentBus(cfg config.Config) contentbus.Bus {
-	bus, err := contentbus.Connect(cfg.NATS.URL)
+	// #552: the world identity's broker credentials for the content-invalidation subscription.
+	bus, err := contentbus.Connect(cfg.NATS.URL, contentbus.WithUserPassword(cfg.NATS.User, cfg.NATS.Password))
 	if err != nil {
 		slog.Warn("nats unavailable; content hot reload disabled", "url", cfg.NATS.URL, "err", err)
 		return nil

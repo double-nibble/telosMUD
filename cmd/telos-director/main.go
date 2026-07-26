@@ -124,16 +124,18 @@ func main() {
 	// (the scope subjects are not ACL-guarded; only chan/tell are); the durable half is the WORLD_EVENTS
 	// JetStream stream. Both degrade to Disabled when NATS is down (orchestration input/output goes quiet,
 	// never a boot failure). The instanceID seeds the down-broadcast author + the durable idempotency keys.
+	// #552: the director's own broker credentials, applied to BOTH its connections (one identity).
+	natsCreds := commbus.WithUserPassword(cfg.NATS.User, cfg.NATS.Password)
 	scopeComms := commbus.OpenWorld(cfg.NATS.URL, func(err error) {
 		if err != nil {
 			slog.Warn("nats unavailable; director scope broadcast disabled", "url", cfg.NATS.URL, "err", err)
 		}
-	})
+	}, natsCreds)
 	scopeJS := commbus.OpenScopeJetStream(cfg.NATS.URL, func(err error) {
 		if err != nil {
 			slog.Warn("scope jetstream unavailable; director signal-up consume disabled", "url", cfg.NATS.URL, "err", err)
 		}
-	})
+	}, natsCreds)
 	scopeBus := scopebus.New(scopeComms).WithDurable(scopeJS, instanceID)
 
 	// Load the scheduled-spawn definitions (Phase 12.4): the director owns the long-timer boss schedules
@@ -424,12 +426,14 @@ type contentPuller struct {
 
 func (p contentPuller) Pull(ctx context.Context, spec director.PullSpec) (director.PullOutcome, error) {
 	opts := contentpull.Options{
-		ContentURL:  p.cfg.Content.URL,
-		Version:     spec.Version,
-		Token:       p.cfg.Content.Token,
-		CacheDir:    p.cfg.Content.CacheDir,
-		PostgresDSN: p.cfg.Postgres.DSN,
-		NATSURL:     p.cfg.NATS.URL,
+		ContentURL:   p.cfg.Content.URL,
+		Version:      spec.Version,
+		Token:        p.cfg.Content.Token,
+		CacheDir:     p.cfg.Content.CacheDir,
+		PostgresDSN:  p.cfg.Postgres.DSN,
+		NATSURL:      p.cfg.NATS.URL,
+		NATSUser:     p.cfg.NATS.User,     // #552: the content.invalidate publisher identity's creds
+		NATSPassword: p.cfg.NATS.Password, // #552
 		// The guard is still WIRED under force (below) — ForcePrune only downgrades its veto to a report,
 		// so the operator learns what they overrode instead of it silently not being checked.
 		ForcePrune: spec.Force,

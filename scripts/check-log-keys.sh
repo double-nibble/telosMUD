@@ -23,7 +23,7 @@ set -euo pipefail
 
 # Sensitive slog KEYS. Anchored to the double-quoted key form so struct tags (`json:"body"`) and map
 # literals (`"text":`) do not match — only a positional slog arg `"key", value` / `"key")` does.
-keys='line|body|text|token|secret|assertion|keywords'
+keys='line|body|text|token|secret|assertion|keywords|password'
 
 # A structured-log call on the line.
 logcall='\.(Debug|Info|Warn|Error|Debugf|Infof|Warnf|Errorf|DebugContext|InfoContext|WarnContext|ErrorContext)\('

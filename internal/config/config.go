@@ -163,8 +163,18 @@ func (r RedisConfig) DirectoryAddress() (addr string, dedicated bool) {
 }
 
 // NATSConfig configures the NATS connection (the comms/events bus).
+//
+// User/Password are the per-IDENTITY broker credentials (#552): each binary (world, gate, director,
+// seed) supplies its OWN identity's credentials via its own TELOS_NATS_USER / TELOS_NATS_PASSWORD env,
+// so the broker can enforce a per-role publish/subscribe permission matrix. BOTH empty = an anonymous
+// connect (today's no-auth default) — a credentialed client still connects to a no-auth server, so
+// carrying these before the broker enforces them is inert and independently deployable. Absent/wrong
+// credentials must degrade like an unreachable broker (a Disabled no-op handle), never a failed boot;
+// a rejection surfaces ASYNC as an authorization violation, not as a dial error (see commbus dialing).
 type NATSConfig struct {
-	URL string `yaml:"url"`
+	URL      string `yaml:"url"`
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
 }
 
 // Default returns the baseline config pointing at the local dev stack
@@ -309,6 +319,12 @@ func (c *Config) applyEnv() {
 	}
 	if v, ok := os.LookupEnv("TELOS_NATS_URL"); ok {
 		c.NATS.URL = v
+	}
+	if v, ok := os.LookupEnv("TELOS_NATS_USER"); ok { // #552 — per-identity broker credentials
+		c.NATS.User = v
+	}
+	if v, ok := os.LookupEnv("TELOS_NATS_PASSWORD"); ok {
+		c.NATS.Password = v
 	}
 	if v, ok := os.LookupEnv("TELOS_GATE_LISTEN"); ok {
 		c.GateListen = v

@@ -102,13 +102,15 @@ func runPurge(ctx context.Context, cfg config.Config, pack string) error {
 // Postgres nor NATS. The pipeline itself is shared with the director-coordinated pull (slice 4 PR E).
 func run(ctx context.Context, cfg config.Config, check bool) error {
 	res, err := contentpull.Pull(ctx, contentpull.Options{
-		ContentURL:  cfg.Content.URL,
-		Version:     cfg.Content.Version,
-		Token:       cfg.Content.Token,
-		CacheDir:    cfg.Content.CacheDir,
-		PostgresDSN: cfg.Postgres.DSN,
-		NATSURL:     cfg.NATS.URL,
-		Check:       check,
+		ContentURL:   cfg.Content.URL,
+		Version:      cfg.Content.Version,
+		Token:        cfg.Content.Token,
+		CacheDir:     cfg.Content.CacheDir,
+		PostgresDSN:  cfg.Postgres.DSN,
+		NATSURL:      cfg.NATS.URL,
+		NATSUser:     cfg.NATS.User,     // #552: the content.invalidate publisher identity's creds
+		NATSPassword: cfg.NATS.Password, // #552
+		Check:        check,
 	})
 	if err != nil {
 		return err

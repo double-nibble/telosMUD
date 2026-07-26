@@ -54,12 +54,16 @@ func (disabledSub) Unsubscribe() error { return nil }
 // bus of the right role so boot never fails on an unreachable broker. The caller passes a small log
 // hook (so this package needs no logging policy) and gets back a ready-to-use Bus. An empty url also
 // yields a Disabled bus (comms simply off) rather than a dial error.
-func OpenWorld(url string, logf func(err error)) Bus { return open(url, RoleWorld, logf) }
+func OpenWorld(url string, logf func(err error), opts ...DialOption) Bus {
+	return open(url, RoleWorld, logf, opts...)
+}
 
 // OpenGate is OpenWorld for a GATE process — same never-fatal degradation, the RoleGate handle.
-func OpenGate(url string, logf func(err error)) Bus { return open(url, RoleGate, logf) }
+func OpenGate(url string, logf func(err error), opts ...DialOption) Bus {
+	return open(url, RoleGate, logf, opts...)
+}
 
-func open(url string, role Role, logf func(err error)) Bus {
+func open(url string, role Role, logf func(err error), opts ...DialOption) Bus {
 	if url == "" {
 		if logf != nil {
 			logf(nil)
@@ -72,9 +76,9 @@ func open(url string, role Role, logf func(err error)) Bus {
 	)
 	switch role {
 	case RoleGate:
-		bus, err = NewGate(url)
+		bus, err = NewGate(url, opts...)
 	default:
-		bus, err = NewWorld(url)
+		bus, err = NewWorld(url, opts...)
 	}
 	if err != nil {
 		if logf != nil {

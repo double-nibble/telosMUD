@@ -115,6 +115,34 @@ func TestEnvOverridesYAML(t *testing.T) {
 	}
 }
 
+// TestNATSCredentialsEnv pins the #552 per-identity broker credentials: TELOS_NATS_USER /
+// TELOS_NATS_PASSWORD override the config, and BOTH default to empty (anonymous — today's no-auth
+// default) so a deploy that has not set them behaves exactly as before. Each binary reads its OWN
+// identity's credentials from its OWN env, which is how the broker distinguishes world/gate/director/seed.
+func TestNATSCredentialsEnv(t *testing.T) {
+	// Default: absent env => empty credentials => anonymous connect (inert until the broker enforces).
+	base, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if base.NATS.User != "" || base.NATS.Password != "" {
+		t.Fatalf("NATS credentials must default empty (anonymous), got user=%q password=%q", base.NATS.User, base.NATS.Password)
+	}
+
+	t.Setenv("TELOS_NATS_USER", "world")
+	t.Setenv("TELOS_NATS_PASSWORD", "s3cret")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATS.User != "world" {
+		t.Errorf("NATS.User = %q, want env override", cfg.NATS.User)
+	}
+	if cfg.NATS.Password != "s3cret" {
+		t.Errorf("NATS.Password = %q, want env override", cfg.NATS.Password)
+	}
+}
+
 // TestAllowInsecureDefaultsFalse (#247/#251) pins the fail-closed-by-default posture: AllowInsecure must be
 // FALSE unless TELOS_ALLOW_INSECURE is explicitly set. The security gates key on this, NOT on Env (which
 // defaults to "dev"), so a production deploy that simply forgot the secret refuses to boot rather than

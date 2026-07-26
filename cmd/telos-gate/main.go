@@ -109,7 +109,7 @@ func main() {
 			return
 		}
 		slog.Info("comms bus ready (gate sink)", "url", cfg.NATS.URL)
-	})
+	}, commbus.WithUserPassword(cfg.NATS.User, cfg.NATS.Password)) // #552: the gate identity's broker creds
 	defer func() { _ = comms.Close() }()
 
 	srv := gate.New(cfg.GateListen, dir, comms)
