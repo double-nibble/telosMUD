@@ -33,8 +33,8 @@ func TestRestAndVitals(t *testing.T) {
 	// --- rest -> already-resting -> stand (the bodily-state verbs) ---
 	from := c.Len()
 	c.Send("rest")
-	require.Truef(t, c.ExpectFrom(from, "You sit down and rest.", 10*time.Second),
-		"`rest` did not confirm entering the resting state; transcript:\n%s", c.Transcript())
+	require.Truef(t, c.ExpectFrom(from, "You sit down for a short rest.", 10*time.Second),
+		"`rest` did not confirm entering the resting (short-rest) state; transcript:\n%s", c.Transcript())
 
 	from = c.Len()
 	c.Send("rest")
@@ -45,6 +45,16 @@ func TestRestAndVitals(t *testing.T) {
 	c.Send("stand")
 	require.Truef(t, c.ExpectFrom(from, "You stand up.", 10*time.Second),
 		"`stand` did not confirm leaving the resting state; transcript:\n%s", c.Transcript())
+
+	// --- rest long (the long-rest discriminator, #512) -> stand ---
+	from = c.Len()
+	c.Send("rest long")
+	require.Truef(t, c.ExpectFrom(from, "You settle in for a long rest.", 10*time.Second),
+		"`rest long` did not confirm entering the long-rest state; transcript:\n%s", c.Transcript())
+	from = c.Len()
+	c.Send("stand")
+	require.Truef(t, c.ExpectFrom(from, "You stand up.", 10*time.Second),
+		"`stand` after a long rest did not confirm; transcript:\n%s", c.Transcript())
 
 	// --- vitals on -> confirmation AND the plain-text prompt gains the "[hp: cur/max ...]" prefix ---
 	// The confirmation and the next prompt both land in the window after `vitals on`, so a single scoped
