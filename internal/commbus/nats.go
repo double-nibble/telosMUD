@@ -20,9 +20,11 @@ import (
 // failure, exactly as hot reload degrades when NATS is down.
 //
 // The PUBLISH ACL (P8-A2) lives on the handle's Role, NOT in the broker: NATS itself has no notion
-// of our world/gate split, so the gate handle REFUSES a chan/tell publish in-process, before the
-// message can reach the wire. A deployment must therefore only ever hand a gate process a RoleGate
-// handle (NewGate); the structural asymmetry is what makes the impersonation gate hold.
+// of our world/gate split, so the gate handle REFUSES a publish on any comms subject in-process
+// (#554), before the message can reach the wire. A deployment must therefore only ever hand a gate
+// process a RoleGate handle (NewGate); the structural asymmetry is what makes the impersonation gate
+// hold. (Broker-level identity enforcement — the defense against a process connecting to NATS
+// directly — is #552; this in-process guard and that broker ACL are defense in depth, not substitutes.)
 
 // connectTimeout bounds the initial NATS dial so an unreachable broker fails fast into the
 // disabled-bus fallback rather than hanging boot (matches contentbus.connectTimeout).
@@ -50,10 +52,10 @@ type NATSBus struct {
 
 // NewWorld / NewGate dial url and return a role-scoped NATSBus, or an error if the broker is
 // unreachable (the caller degrades to Disabled()). NewWorld returns a RoleWorld handle (the message
-// source — it MAY publish chan/tell); NewGate returns a RoleGate handle (the sink — subscribe-only on
-// chan/tell, its Publish on a guarded subject returns ErrPublishForbidden). The role is fixed by the
-// constructor, never a mutable field — a gate process gets a gate handle and structurally cannot
-// publish chan/tell (P8-A2).
+// source — it MAY publish any comms subject); NewGate returns a RoleGate handle (the sink — subscribe-only
+// on the whole comms space, its Publish on any comms subject returns ErrPublishForbidden). The role is
+// fixed by the constructor, never a mutable field — a gate process gets a gate handle and structurally
+// cannot publish comms (P8-A2, #554).
 func NewWorld(url string) (*NATSBus, error) { return connect(url, RoleWorld, "telos-commbus-world") }
 
 // NewGate dials url and returns a RoleGate handle (the sink) — see NewWorld.
@@ -132,7 +134,7 @@ func (b *NATSBus) Role() Role { return b.role }
 func (b *NATSBus) Available() bool { return b.nc != nil && b.nc.IsConnected() }
 
 // Publish enforces the ACL (P8-A2), marshals msg, and publishes it on subj. The ACL check is FIRST
-// and IN-PROCESS: a RoleGate handle publishing a chan/tell subject returns ErrPublishForbidden and
+// and IN-PROCESS: a RoleGate handle publishing ANY comms subject returns ErrPublishForbidden and
 // NOTHING reaches the broker — the impersonation gate holds even though NATS has no role concept.
 // msg.Subject is stamped to subj so a wildcard subscriber can dispatch on the concrete subject. A
 // closed connection returns ErrBusClosed. Off any zone goroutine (the source world's publish path).

@@ -16,9 +16,9 @@ import (
 //   - PER-SUBSCRIPTION ORDERED delivery (P8-A3): each subscription drains a single buffered channel
 //     with one goroutine, so a single subject's messages reach that subscriber IN PUBLISH ORDER. A
 //     slow handler never blocks Publish or another subscriber.
-//   - The PUBLISH ACL (P8-A2): a RoleGate handle's Publish on a chan/tell subject is refused with
+//   - The PUBLISH ACL (P8-A2): a RoleGate handle's Publish on ANY comms subject is refused with
 //     ErrPublishForbidden BEFORE anything is enqueued — the gate role structurally cannot author a
-//     chan/tell message even in-process. The ACL is enforced on the HANDLE, and many handles can
+//     comms message even in-process. The ACL is enforced on the HANDLE, and many handles can
 //     share one underlying MemBus core (so a "world" handle and a "gate" handle in the same test see
 //     the same fan-out but have different publish rights).
 //
@@ -41,17 +41,17 @@ type memCore struct {
 	subs   map[*memSub]struct{}
 }
 
-// NewMemBus returns a MemBus with the WORLD role (it may publish chan/tell) — the convenient default
-// for tests that do not exercise the ACL asymmetry. For an ACL test, build a world handle AND a gate
-// handle over the SAME core with NewWorldBus/NewGateBus.
+// NewMemBus returns a MemBus with the WORLD role (it may publish any comms subject) — the convenient
+// default for tests that do not exercise the ACL asymmetry. For an ACL test, build a world handle AND a
+// gate handle over the SAME core with NewWorldBus/NewGateBus.
 func NewMemBus() *MemBus {
 	return &MemBus{core: newMemCore(), role: RoleWorld}
 }
 
 // NewWorldBus / NewGateBus return two handles over ONE shared in-process core with the WORLD and GATE
 // roles respectively — the in-process model of "the same broker, a publishing world client and a
-// subscribe-only gate client." The gate handle's Publish on a chan/tell subject returns
-// ErrPublishForbidden (P8-A2). Subscriptions on either handle see the same fan-out.
+// subscribe-only gate client." The gate handle's Publish on any comms subject returns
+// ErrPublishForbidden (P8-A2, #554). Subscriptions on either handle see the same fan-out.
 func NewWorldBus() (*MemBus, *MemBus) {
 	core := newMemCore()
 	return &MemBus{core: core, role: RoleWorld}, &MemBus{core: core, role: RoleGate}
@@ -91,8 +91,8 @@ func (b *MemBus) Role() Role { return b.role }
 func (b *MemBus) Available() bool { return true }
 
 // Publish enforces the ACL then fans msg out to every subscriber whose pattern matches subj, IN
-// PUBLISH ORDER per subscriber. The ACL check is FIRST (P8-A2): a RoleGate handle publishing a
-// chan/tell subject returns ErrPublishForbidden and NOTHING is enqueued — the impersonation gate.
+// PUBLISH ORDER per subscriber. The ACL check is FIRST (P8-A2): a RoleGate handle publishing ANY
+// comms subject returns ErrPublishForbidden and NOTHING is enqueued — the impersonation gate.
 // msg.Subject is stamped to subj so the sink can dispatch on it regardless of a wildcard subscription.
 func (b *MemBus) Publish(ctx context.Context, subj string, msg Message) error {
 	if b.role == RoleGate && isACLGuarded(subj) {

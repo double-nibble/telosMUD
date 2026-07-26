@@ -4,8 +4,9 @@ package gate
 // gate is the SINK for player-scoped cross-shard messages (channels, tells). The world is the SOURCE (it
 // holds the authoritative author identity and publishes; P8-A2); the gate SUBSCRIBES on behalf of each
 // connected player and renders received messages straight onto the existing writer path. The gate never
-// publishes a chan/tell — its commbus handle is RoleGate, structurally subscribe-only on those subjects
-// (the impersonation gate; commbus.go).
+// publishes ANY comms subject — its commbus handle is RoleGate, structurally subscribe-only on the whole
+// telos.comms. space (the impersonation gate; commbus.go, #554). The chan/tell roots are the
+// player-authored impersonation surface specifically; config/roster/presence a gate also never authors.
 //
 // # Why the comms client lives at CONNECTION scope (the load-bearing P8-D1 proof)
 //

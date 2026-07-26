@@ -56,9 +56,15 @@ func waitForLen(t *testing.T, c *collector, n int) {
 	require.Failf(t, "timed out", "wanted %d messages, got %d", n, c.len())
 }
 
-// TestPublishACL is the SECURITY test (P8-A2, the impersonation gate): a GATE-role handle CANNOT
-// publish on a chan/tell subject; a WORLD-role handle CAN; presence (engine mechanism) is not
-// ACL-guarded for either. Table-driven over (role, subject) -> expected error.
+// TestPublishACL is the SECURITY test (P8-A2, the impersonation gate, #554): a GATE-role handle CANNOT
+// publish on ANY comms subject (the gate is subscribe-only on the whole telos.comms. space); a
+// WORLD-role handle CAN publish every comms subject. A subject OUTSIDE the comms root is not guarded
+// here (the guard is scoped to SubjectRoot, not "everything"). Table-driven over (role, subject) ->
+// expected error, covering EVERY subject root so a newly-added root cannot silently escape the guard.
+//
+// Per the testing standard this must be mutation-resistant: with the pre-#554 chan/tell-only guard the
+// config/roster/presence gate rows returned nil, so those rows fail against the old predicate — they
+// are the rows that assert the widening actually happened, not a vacuous restatement of chan/tell.
 func TestPublishACL(t *testing.T) {
 	world, gate := NewWorldBus() // two handles over one shared in-process core
 	defer world.Close()
@@ -72,15 +78,24 @@ func TestPublishACL(t *testing.T) {
 		subject string
 		wantErr error
 	}{
+		// A WORLD handle may publish every comms subject (it is the authoritative source).
 		{"world may publish chan", world, ChanSubject("gossip"), nil},
 		{"world may publish tell", world, TellSubject("alice"), nil},
 		{"world may publish presence", world, PresenceSubject, nil},
+		{"world may publish config", world, ConfigSubject("alice"), nil},
+		{"world may publish roster", world, RosterSubject("gossip"), nil},
+		// A GATE handle is subscribe-only on the ENTIRE comms space — every comms root is forbidden.
 		{"gate may NOT publish chan", gate, ChanSubject("gossip"), ErrPublishForbidden},
 		{"gate may NOT publish tell", gate, TellSubject("alice"), ErrPublishForbidden},
-		// presence is engine mechanism (a shard heartbeats its own residents) — NOT the impersonation
-		// surface, so it is deliberately not gate-forbidden. (Phase 8.4 publishes presence from the
-		// world; a gate has no reason to, but the ACL line is drawn at chan/tell.)
-		{"gate may publish presence (not ACL-guarded)", gate, PresenceSubject, nil},
+		// presence/config/roster are engine mechanism a WORLD may author, but a GATE authors NONE of
+		// them (#554): a forged config rewrites a player's hear-set/ignore list, a forged roster
+		// misreports a channel's listeners, and a gate publishes presence for no legitimate reason.
+		{"gate may NOT publish presence", gate, PresenceSubject, ErrPublishForbidden},
+		{"gate may NOT publish config", gate, ConfigSubject("alice"), ErrPublishForbidden},
+		{"gate may NOT publish roster", gate, RosterSubject("gossip"), ErrPublishForbidden},
+		// The guard is scoped to the comms root, not global: a non-comms subject is not this ACL's
+		// concern (a gate never publishes one, but the guard must not silently swallow all subjects).
+		{"gate publish outside comms root is not guarded here", gate, "content.invalidate", nil},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -243,10 +258,13 @@ func TestDisabledBusNoOp(t *testing.T) {
 	// World publish on a disabled bus is a silent no-op (nil error, no delivery).
 	require.NoError(t, w.Publish(context.Background(), ChanSubject("gossip"), Message{Body: "x"}))
 
-	// The ACL still holds on a disabled gate: a chan/tell publish is forbidden; presence is allowed.
+	// The ACL still holds on a disabled gate: a publish on ANY comms subject is forbidden (#554),
+	// whether or not the broker is up. A non-comms subject is outside this guard.
 	require.ErrorIs(t, g.Publish(context.Background(), ChanSubject("gossip"), Message{Body: "x"}), ErrPublishForbidden)
 	require.ErrorIs(t, g.Publish(context.Background(), TellSubject("bob"), Message{Body: "x"}), ErrPublishForbidden)
-	require.NoError(t, g.Publish(context.Background(), PresenceSubject, Message{Body: "x"}))
+	require.ErrorIs(t, g.Publish(context.Background(), PresenceSubject, Message{Body: "x"}), ErrPublishForbidden)
+	require.ErrorIs(t, g.Publish(context.Background(), ConfigSubject("bob"), Message{Body: "x"}), ErrPublishForbidden)
+	require.NoError(t, g.Publish(context.Background(), "content.invalidate", Message{Body: "x"}))
 
 	require.NoError(t, w.Close())
 	require.NoError(t, g.Close())

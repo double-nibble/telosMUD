@@ -98,8 +98,8 @@ func main() {
 
 	// The Phase-8 comms bus (P8-D1-B: the gate is the comms SINK). It is opened via
 	// commbus.OpenGate ONLY — NEVER OpenWorld and NEVER the test-only MemBus.WorldHandle():
-	// a gate is structurally subscribe-only on chan/tell subjects (the publish ACL / the
-	// impersonation gate, P8-A2). A gate handed a world handle would let a forged client author
+	// a gate is structurally subscribe-only on the whole telos.comms. space (the publish ACL / the
+	// impersonation gate, P8-A2, #554). A gate handed a world handle would let a forged client author
 	// a channel/tell line, defeating the whole boundary. Optional/never-fatal, mirroring
 	// cmd/telos-world's openContentBus: an unreachable broker (or an empty URL) yields a Disabled
 	// RoleGate no-op so comms degrade to unavailable, never a boot failure.

@@ -11,13 +11,15 @@
 // Comms is the first player-authored, cross-shard, fan-out surface. No single-writer serializes a
 // cross-shard channel, so correctness rests on two invariants enforced HERE, in the transport:
 //
-//  1. The publish ACL (P8-A2 — the impersonation gate). Subjects under telos.comms.chan.* and
-//     telos.comms.tell.* are published to by WORLD shards ONLY; GATES are SUBSCRIBE-ONLY on them. A
-//     receiver trusts the payload's author field PRECISELY BECAUSE the only writers are source
-//     worlds that set it from the live *Entity. If a gate could publish, the impersonation gate is
-//     gone. This is enforced as a HANDLE ASYMMETRY: OpenWorld returns a handle that can Publish +
-//     Subscribe; OpenGate returns a handle whose Publish on a chan/tell subject is REFUSED
-//     (ErrPublishForbidden) — the gate role structurally lacks the chan/tell publish capability.
+//  1. The publish ACL (P8-A2 — the impersonation gate). Every subject under the telos.comms. root is
+//     published to by WORLD shards (and the director) ONLY; GATES are SUBSCRIBE-ONLY on the whole
+//     space (#554). A receiver trusts the payload's author field PRECISELY BECAUSE the only writers
+//     are source worlds that set it from the live *Entity. If a gate could publish, the impersonation
+//     gate is gone. This is enforced as a HANDLE ASYMMETRY: OpenWorld returns a handle that can
+//     Publish + Subscribe; OpenGate returns a handle whose Publish on ANY comms subject is REFUSED
+//     (ErrPublishForbidden) — the gate role structurally lacks the comms publish capability. The
+//     chan/tell roots are the player-authored impersonation surface specifically; config/roster/
+//     presence are engine mechanism a world may author, but a GATE authors none of them.
 //
 //  2. Per-author ordering (P8-A3). Every message carries a monotonic per-author Seq; a single
 //     subject is one ordered stream (the broker — and the MemBus — impose one publish order per
@@ -50,10 +52,11 @@ import (
 // with contentbus's content.invalidate. The durable JetStream streams (dtell/mail) are slice 8.5+;
 // 8.1 lays the taxonomy and the two transient roots (chan/tell) plus presence.
 //
-// SubjectRoot is the namespace prefix for every comms subject. ChanPrefix/TellPrefix are the two
-// PLAYER-AUTHORED roots the publish ACL guards (world-publish, gate-subscribe-only). PresenceSubject
-// is the per-shard heartbeat fan-in (slice 8.4) — engine mechanism, not player-authored, so it is
-// NOT under the chan/tell ACL (a shard publishing its own residents' presence is not impersonation).
+// SubjectRoot is the namespace prefix for every comms subject — AND the boundary the publish ACL
+// guards: a gate is subscribe-only on the whole space, world-publish-only (#554). ChanPrefix/TellPrefix
+// are the two PLAYER-AUTHORED roots (the impersonation surface). PresenceSubject is the per-shard
+// heartbeat fan-in (slice 8.4) — engine mechanism, not player-authored, so a WORLD publishing it is not
+// impersonation; it is still gate-forbidden like every comms subject (a shard, not a gate, heartbeats).
 const (
 	SubjectRoot     = "telos.comms."
 	ChanPrefix      = SubjectRoot + "chan." // telos.comms.chan.<channelRef>
@@ -64,16 +67,18 @@ const (
 	// channel hear-set, the ignore list, the AFK flag — to their personal config subject; the player's
 	// GATE subscribes to its OWN config subject and re-subscribes its concrete channel subjects + caches
 	// the ignore funnel from it. Like presence (and unlike chan/tell) it is engine mechanism, NOT
-	// player-authored, so it is deliberately NOT under the chan/tell publish ACL (a world publishing a
-	// player's own derived config is not impersonation). A gate subscribes ONLY its own concrete
-	// config.<self> subject — never a config.* wildcard — so no config can leak across players.
+	// player-authored, so a WORLD publishing a player's own derived config is not impersonation. It is
+	// still GATE-forbidden like every comms subject (#554): a forged config.<playerId> would silently
+	// rewrite that player's hear-set + ignore list, so only a world may author it. A gate subscribes
+	// ONLY its own concrete config.<self> subject — never a config.* wildcard — so no config leaks across players.
 	ConfigPrefix = SubjectRoot + "config." // telos.comms.config.<playerId>
 	// RosterPrefix is the per-CHANNEL roster root (#90): telos.comms.roster.<channelRef>. The director's
 	// channel-roster aggregator publishes each channel's current listener set (its Comm.Channel.Players
 	// membership, aggregated cross-shard from the presence roster) to this subject; a player's GATE
 	// subscribes ONLY the concrete roster.<ref> subjects for channels it hears (the same HEAR-filter it
 	// applies to chan.<ref>), so a non-hearer never receives a roster. Engine mechanism (director-authored,
-	// like presence/config), so NOT under the chan/tell publish ACL.
+	// like presence/config), so a director publishing it is not impersonation — but it is still
+	// GATE-forbidden like every comms subject (#554): a forged roster.<ref> misreports a channel's listener set.
 	RosterPrefix = SubjectRoot + "roster." // telos.comms.roster.<channelRef>
 )
 
@@ -94,11 +99,21 @@ func ConfigSubject(playerID string) string { return ConfigPrefix + playerID }
 // the caller passes a known channel ref, never free-form client text.
 func RosterSubject(channelRef string) string { return RosterPrefix + channelRef }
 
-// isACLGuarded reports whether subj is a player-authored subject the publish ACL protects (chan/tell).
-// These are the subjects a GATE may subscribe to but must NEVER publish to (P8-A2). Presence and any
-// future engine-mechanism subject are deliberately NOT guarded.
+// isACLGuarded reports whether subj is a comms subject the publish ACL protects — i.e. one a GATE may
+// subscribe to but must NEVER publish to (P8-A2). It guards the ENTIRE comms subject space
+// (SubjectRoot), not just chan/tell: the gate binary makes ZERO Publish calls on this bus (it is
+// subscribe-only on every comms subject — chan, tell, presence, config, roster), so the tightest
+// correct rule is a blanket one on the root.
+//
+// This deliberately supersedes the earlier chan/tell-only enumeration (#554). Enumerating specific
+// roots re-opened the hole every time a subject was added — config.* and roster.* both landed
+// gate-publishable because the guard was never widened past chan/tell. A forged config.<playerId>
+// silently rewrites a player's hear-set + ignore list; a forged roster.<ref> misreports who is
+// hearing a channel. Guarding the root makes every present AND future comms subject gate-forbidden by
+// default; a legitimate gate publisher (there is none today) would require an explicit, reviewed
+// carve-out here rather than silently inheriting publish rights.
 func isACLGuarded(subj string) bool {
-	return strings.HasPrefix(subj, ChanPrefix) || strings.HasPrefix(subj, TellPrefix)
+	return strings.HasPrefix(subj, SubjectRoot)
 }
 
 // errors returned by the bus.
@@ -107,11 +122,11 @@ var (
 	ErrBusClosed = errors.New("commbus: bus is closed")
 
 	// ErrPublishForbidden is the ACL refusal (P8-A2, the impersonation gate): a GATE-role handle
-	// tried to Publish on a chan/tell subject. The gate is subscribe-only on those subjects; only a
-	// WORLD-role handle (which sets the author from the live *Entity) may publish them. This is the
-	// single most security-sensitive error in the package — a returned ErrPublishForbidden is the
-	// impersonation gate doing its job.
-	ErrPublishForbidden = errors.New("commbus: publish forbidden on this subject for this role (gates are subscribe-only on chan/tell)")
+	// tried to Publish on a comms subject. The gate is subscribe-only on the ENTIRE comms subject
+	// space (chan, tell, presence, config, roster); only a WORLD-role handle (which sets the author
+	// from the live *Entity) may publish. This is the single most security-sensitive error in the
+	// package — a returned ErrPublishForbidden is the impersonation gate doing its job.
+	ErrPublishForbidden = errors.New("commbus: publish forbidden on this subject for this role (gates are subscribe-only on all comms subjects)")
 )
 
 // Role is the publish capability of a bus handle — the structural half of the ACL (P8-A2). A handle
