@@ -218,7 +218,7 @@ func TestGateCommsRoleIsGate(t *testing.T) {
 
 	srv := newServer(":0", directory.Static{Addr: "addr-a"}, newPool(), gateBus)
 	if got := srv.comms.Role(); got != commbus.RoleGate {
-		t.Fatalf("gate comms role = %v, want %v (the gate must be subscribe-only on chan/tell)", got, commbus.RoleGate)
+		t.Fatalf("gate comms role = %v, want %v (the gate must be subscribe-only on all comms subjects)", got, commbus.RoleGate)
 	}
 	// Defense in depth: a gate handle's publish on a chan/tell subject is refused (the impersonation
 	// gate). This is what makes a gate handed a world handle a detectable wiring bug.

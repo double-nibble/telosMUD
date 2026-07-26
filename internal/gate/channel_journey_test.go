@@ -65,7 +65,7 @@ func TestCrossShardChannelDelivery(t *testing.T) {
 	}
 	// Shard A (midgaard) — also wired with the WORLD comms handle.
 	h.addShardWithComms("midgaard", "addr-a", dir, peers, core.WorldHandle())
-	// The gate subscribes through the GATE handle (subscribe-only on chan/tell — the impersonation gate).
+	// The gate subscribes through the GATE handle (subscribe-only on all comms subjects — the impersonation gate).
 	h.serveGateWithComms(homeZoneDir{redis: dir, zone: "midgaard"}, core.GateHandle())
 
 	// Two players: Stayer remains on shard A; Walker walks A→B so they end up on different shards.

@@ -66,8 +66,8 @@ func TestNATSPublishSubscribeParity(t *testing.T) {
 	}
 }
 
-// TestNATSGateACL proves the publish ACL holds over the REAL transport too: a gate handle's chan/tell
-// publish is refused in-process (ErrPublishForbidden) and never reaches the broker.
+// TestNATSGateACL proves the publish ACL holds over the REAL transport too: a gate handle's publish on
+// ANY comms subject is refused in-process (ErrPublishForbidden) and never reaches the broker (#554).
 func TestNATSGateACL(t *testing.T) {
 	url := natsURL(t)
 	gate, err := NewGate(url)
@@ -76,6 +76,9 @@ func TestNATSGateACL(t *testing.T) {
 
 	require.ErrorIs(t, gate.Publish(context.Background(), ChanSubject("gossip"), Message{AuthorID: "m", Body: "forged"}), ErrPublishForbidden)
 	require.ErrorIs(t, gate.Publish(context.Background(), TellSubject("bob"), Message{AuthorID: "m", Body: "forged"}), ErrPublishForbidden)
+	require.ErrorIs(t, gate.Publish(context.Background(), ConfigSubject("bob"), Message{Body: "forged config"}), ErrPublishForbidden)
+	require.ErrorIs(t, gate.Publish(context.Background(), RosterSubject("gossip"), Message{Body: "forged roster"}), ErrPublishForbidden)
+	require.ErrorIs(t, gate.Publish(context.Background(), PresenceSubject, Message{Body: "forged presence"}), ErrPublishForbidden)
 }
 
 // TestNATSDisabledFallback proves an unreachable broker fails fast into an error (the caller's

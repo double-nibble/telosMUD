@@ -24,7 +24,7 @@ func (d disabledBus) Role() Role { return d.role }
 
 // Publish is a no-op on a disabled bus — BUT it still honors the ACL so a gate's forbidden publish is
 // reported consistently whether or not the broker is up (a gate must never believe it published a
-// chan/tell). It returns ErrPublishForbidden for a RoleGate chan/tell publish, nil otherwise.
+// comms subject). It returns ErrPublishForbidden for a RoleGate publish on any comms subject, nil otherwise.
 func (d disabledBus) Publish(_ context.Context, subj string, _ Message) error {
 	if d.role == RoleGate && isACLGuarded(subj) {
 		return ErrPublishForbidden
