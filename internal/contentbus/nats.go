@@ -35,15 +35,18 @@ type NATSBus struct {
 // Connect dials url and returns a NATSBus, or an error if the broker is unreachable. The caller
 // treats an error as "hot reload disabled" (a nil Bus), never fatal — so a world boots without a
 // broker. A short connect timeout keeps an unreachable NATS from stalling boot.
-func Connect(url string) (*NATSBus, error) {
-	nc, err := nats.Connect(url,
+func Connect(url string, opts ...DialOption) (*NATSBus, error) {
+	natsOpts := []nats.Option{
 		nats.Timeout(connectTimeout),
 		nats.Name("telos-contentbus"),
 		// Reconnect quietly in the background: a NATS blip should not permanently disable hot
 		// reload, and a missed invalidation during a blip is re-published by the next edit.
 		nats.RetryOnFailedConnect(false),
 		nats.MaxReconnects(-1),
-	)
+	}
+	// #552: per-identity credentials, if configured (else anonymous — today's no-auth default).
+	natsOpts = append(natsOpts, buildDialConfig(opts).natsOptions()...)
+	nc, err := nats.Connect(url, natsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("contentbus: connect %q: %w", url, err)
 	}

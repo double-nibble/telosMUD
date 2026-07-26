@@ -59,7 +59,7 @@ func main() {
 	// re-imported pack so any RUNNING shard reloads it without a restart. OPTIONAL and non-fatal:
 	// if NATS is unreachable the seed still succeeded (the rows are written) — running shards just
 	// won't hot-reload until their next boot. Mirrors the rest of the optional-dependency posture.
-	bus, err := contentbus.Connect(cfg.NATS.URL)
+	bus, err := contentbus.Connect(cfg.NATS.URL, contentbus.WithUserPassword(cfg.NATS.User, cfg.NATS.Password)) // #552: seed/operator creds
 	if err != nil {
 		slog.Warn("content bus unreachable; rows seeded but running shards not hot-reloaded", "err", err)
 		return

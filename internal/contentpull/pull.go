@@ -22,14 +22,21 @@ import (
 // store; Token is an optional PAT for a private repo; CacheDir is the on-disk checkout cache. PostgresDSN
 // is the import target; NATSURL is the hot-reload broadcast bus (both empty on a Check dry run). Check
 // runs the validation pre-flight only — no import, no broadcast (the content-repo CI merge gate).
+//
+// NATSUser/NATSPassword are the broker credentials for the broadcast connection (#552). This process is
+// a content.invalidate PUBLISHER — the same identity role as telos-seed — so under the eventual per-role
+// broker matrix it must present publish-capable credentials or its hot-reload broadcast is denied. Both
+// empty = anonymous (today's no-auth default), so this is inert until the broker enforces.
 type Options struct {
-	ContentURL  string
-	Version     string
-	Token       string
-	CacheDir    string
-	PostgresDSN string
-	NATSURL     string
-	Check       bool
+	ContentURL   string
+	Version      string
+	Token        string
+	CacheDir     string
+	PostgresDSN  string
+	NATSURL      string
+	NATSUser     string
+	NATSPassword string
+	Check        bool
 
 	// PruneGuard, when set (the director-coordinated path), is consulted before the import with the packs
 	// this version would PRUNE. A non-empty result REFUSES the pull before any DB change — the veto that
@@ -176,15 +183,15 @@ func Pull(ctx context.Context, opts Options) (Result, error) {
 	// 8. Broadcast the hot-reload (stamped with the authoritative version), then the version-complete
 	//    sentinel. Best-effort — a NATS failure is non-fatal (rows are durable; shards catch up on
 	//    reconnect via reconcile-on-join).
-	base.Published = broadcast(ctx, opts.NATSURL, packs, version)
+	base.Published = broadcast(ctx, opts.NATSURL, opts.NATSUser, opts.NATSPassword, packs, version)
 	return base, nil
 }
 
 // broadcast publishes per-ref invalidations for each pack, then the trailing version-complete sentinel,
 // stamped with the authoritative version. Best-effort: a bus failure is logged, never fatal. Returns the
-// count of invalidations published.
-func broadcast(ctx context.Context, natsURL string, packs []content.Pack, version uint64) int {
-	bus, err := contentbus.Connect(natsURL)
+// count of invalidations published. user/password are the #552 broker credentials (empty = anonymous).
+func broadcast(ctx context.Context, natsURL, user, password string, packs []content.Pack, version uint64) int {
+	bus, err := contentbus.Connect(natsURL, contentbus.WithUserPassword(user, password))
 	if err != nil {
 		slog.Warn("content bus unreachable; imported but running shards not hot-reloaded", "err", err)
 		return 0

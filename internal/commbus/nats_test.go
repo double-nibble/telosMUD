@@ -94,3 +94,37 @@ func TestNATSDisabledFallback(t *testing.T) {
 		t.Fatalf("connect took %v; should fail fast", elapsed)
 	}
 }
+
+// TestNATSCredentialedDialIsInert proves the #552 slice-1 inertness claim over the REAL transport: a
+// credentialed dial still connects to today's NO-AUTH broker (the CI NATS container has no
+// authorization block yet), so shipping credentials ahead of the broker-side matrix (slices 2-3) does
+// not disrupt a running stack. A world publish + gate subscribe round-trip completes exactly as the
+// uncredentialed path does. When the broker later enforces the matrix, these same credentials are what
+// authenticate each identity — but nothing here depends on that being on yet.
+func TestNATSCredentialedDialIsInert(t *testing.T) {
+	url := natsURL(t)
+
+	world, err := NewWorld(url, WithUserPassword("world", "ignored-by-noauth-broker"))
+	require.NoError(t, err, "a credentialed dial must still connect to a no-auth broker")
+	defer world.Close()
+	require.True(t, world.Available())
+
+	gate, err := NewGate(url, WithUserPassword("gate", "ignored-by-noauth-broker"))
+	require.NoError(t, err)
+	defer gate.Close()
+
+	subj := ChanSubject("gossip")
+	got := make(chan Message, 1)
+	sub, err := gate.Subscribe(subj, func(m Message) { got <- m })
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+	time.Sleep(100 * time.Millisecond) // let the subscription register on the broker (mirrors the parity test)
+
+	require.NoError(t, world.Publish(context.Background(), subj, Message{AuthorID: "a", AuthorName: "Alice", Body: "hi"}))
+	select {
+	case m := <-got:
+		assert.Equal(t, "Alice", m.AuthorName)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for delivery over the credentialed connection")
+	}
+}
