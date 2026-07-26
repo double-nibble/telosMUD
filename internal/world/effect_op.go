@@ -274,6 +274,15 @@ type effectOp struct {
 	// the looped per-target ctx). Same-zone-contained (areaTargets never dereferences a cross-zone room).
 	area string
 
+	// #516 movement ops. moveRoom / moveDest select the TELEPORT destination (a same-zone room): moveRoom is
+	// a literal room ref; moveDest is a selector — "actor" (the caster's room — the summon/pull-to-me shape)
+	// or "start" (the zone's login room — a same-zone recall). moveDir is the PUSH direction — a forced
+	// one-step move along that exit of the target's current room (an instance-entrance direction is not an
+	// exit, so it is refused by construction). All same-zone-only; a cross-zone destination is a clean no-op.
+	moveRoom string
+	moveDest string
+	moveDir  string
+
 	// ifResource + ifResourceMin are the `if` flow op's RESOURCE-threshold condition ([G9] reaction
 	// budget): `if <ifResource> <ifCmp> <threshold>` over the CURRENT of the ctx subject's pool (the actor
 	// by default; `target: other` selects the counterpart). This is what lets a content reaction guard on
@@ -363,6 +372,12 @@ func init() {
 		"craft_recipe": opCraftRecipe,
 		// #34 discovery: list the recipes the actor can craft, printing the exact names `craft <name>` accepts.
 		"list_recipes": opListRecipes,
+		// #516 movement ops: same-zone relocation authored as data (C10 spell bucket D). teleport blinks the
+		// target to a room (Misty Step / Dimension Door / pull-to-caster); push forces it one step along an
+		// exit (Thunderwave). Both funnel z.relocateEntity (the reviewed combat discipline) and gate a forced
+		// move of a non-consenting PLAYER through the harm funnel. Cross-zone/spawn/summon-of-remote deferred.
+		"teleport": opTeleport,
+		"push":     opPush,
 	}
 }
 
