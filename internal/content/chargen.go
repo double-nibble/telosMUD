@@ -2,6 +2,7 @@ package content
 
 import (
 	"fmt"
+	"math/rand"
 	"strconv"
 )
 
@@ -24,7 +25,9 @@ type ChargenBundleOption struct {
 // maps a bundle ref -> its kind (the legality check, so a forged ref of the wrong kind is rejected). On a
 // rule violation it returns a non-empty user-facing reason (bundles/attrs nil); a valid submission returns the
 // chosen bundles + attribute base values with an empty reason.
-func ValidateChargen(flow ChargenDTO, picks map[string]string, allocs map[string]map[string]int, bundleKind map[string]string) (bundles []string, attrs map[string]float64, reason string) {
+// rng rolls a `roll` step's scores server-side (never a client value). It must be non-nil when the flow
+// contains a roll step; callers that know their flow has none may pass nil.
+func ValidateChargen(flow ChargenDTO, picks map[string]string, allocs map[string]map[string]int, bundleKind map[string]string, rng *rand.Rand) (bundles []string, attrs map[string]float64, reason string) {
 	attrs = map[string]float64{}
 	for _, st := range flow.Steps {
 		switch st.Kind {
@@ -56,6 +59,42 @@ func ValidateChargen(flow ChargenDTO, picks map[string]string, allocs map[string
 			}
 			if spent > st.Points {
 				return nil, nil, fmt.Sprintf("That allocation costs %d of %d points.", spent, st.Points)
+			}
+		case "array_assign":
+			// The player assigns the FIXED Array multiset across Attributes (via allocs, exactly like
+			// point_buy). Accept iff the submitted values are a PERMUTATION of Array — each array value used
+			// once. A remaining-count multiset both rejects an off-array value and enforces no-reuse.
+			if len(st.Attributes) != len(st.Array) {
+				return nil, nil, "This character sheet is misconfigured (array size)."
+			}
+			remaining := map[int]int{}
+			for _, v := range st.Array {
+				remaining[v]++
+			}
+			for _, a := range st.Attributes {
+				v, ok := allocs[st.ID][a]
+				if !ok {
+					return nil, nil, fmt.Sprintf("Assign a value to %s.", a)
+				}
+				if remaining[v] <= 0 {
+					return nil, nil, fmt.Sprintf("%d is not an available value for %s.", v, a)
+				}
+				remaining[v]--
+				attrs[a] = float64(v)
+			}
+		case "roll":
+			// Each attribute gets an INDEPENDENT server-rolled score (4d6-drop-lowest by default). The roll
+			// is authoritative — rng is the server's, run here at submit — so a roll step takes no client
+			// input and cannot be forged. A nil rng on a roll step is a caller bug, reported not panicked.
+			if rng == nil {
+				return nil, nil, "This world cannot roll ability scores right now."
+			}
+			for _, a := range st.Attributes {
+				score, err := rollAbilityScore(rng, st.RollDice)
+				if err != nil {
+					return nil, nil, "This character sheet is misconfigured (roll dice)."
+				}
+				attrs[a] = float64(score)
 			}
 		default:
 			return nil, nil, "Unsupported chargen step: " + st.Kind

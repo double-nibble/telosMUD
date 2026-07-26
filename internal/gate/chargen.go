@@ -132,9 +132,69 @@ func walkSteps(tc *telnet.Conn, steps []ChargenStep, options []ChargenBundleOpti
 				return false
 			}
 			allocs[step.ID] = vals
+		case "array_assign":
+			vals, ok := promptArrayAssign(tc, step)
+			if !ok {
+				return false
+			}
+			allocs[step.ID] = vals
+		case "roll":
+			// A roll step takes NO player input — the account service rolls each score authoritatively at
+			// submit (a client value would be a forgery). Just tell the player their scores will be rolled;
+			// the results apply on first spawn and show in-game.
+			if step.Prompt != "" {
+				_ = tc.Write("\r\n" + step.Prompt + "\r\n")
+			}
+			dice := step.RollDice
+			if dice == "" {
+				dice = "4d6 (drop lowest)"
+			}
+			_ = tc.Write("Your ability scores will be rolled (" + dice + ").\r\n")
 		}
 	}
 	return true
+}
+
+// promptArrayAssign walks the fixed standard-array (#518): for each attribute, the player picks one of the
+// REMAINING array values, so the final assignment is exactly a permutation of the array. telos-account
+// re-validates the same rule.
+func promptArrayAssign(tc *telnet.Conn, step ChargenStep) (map[string]int, bool) {
+	vals := map[string]int{}
+	remaining := append([]int(nil), step.Array...)
+	// Defense in depth (content-lint LintChargen catches this at load): a step whose array has fewer values
+	// than attributes can never be completed and would otherwise loop the prompt forever. Refuse cleanly so
+	// the player is dropped with a message rather than hung on a misconfigured flow.
+	if len(step.Array) != len(step.Attributes) {
+		_ = tc.Write("\r\nThis character sheet is misconfigured; ask an administrator.\r\n")
+		return nil, false
+	}
+	if step.Prompt != "" {
+		_ = tc.Write("\r\n" + step.Prompt + "\r\n")
+	}
+	for _, attr := range step.Attributes {
+		for {
+			var b strings.Builder
+			b.WriteString("  Assign to " + attr + " — remaining:")
+			for i, v := range remaining {
+				fmt.Fprintf(&b, " %d)%d", i+1, v)
+			}
+			b.WriteString("\r\n> ")
+			_ = tc.Write(b.String())
+			line, err := tc.ReadLine()
+			if err != nil {
+				return nil, false
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(line))
+			if err != nil || n < 1 || n > len(remaining) {
+				_ = tc.Write(fmt.Sprintf("    Pick a number from 1 to %d.\r\n", len(remaining)))
+				continue
+			}
+			vals[attr] = remaining[n-1]
+			remaining = append(remaining[:n-1], remaining[n:]...)
+			break
+		}
+	}
+	return vals, true
 }
 
 func promptBundleChoice(tc *telnet.Conn, step ChargenStep, options []ChargenBundleOption) (string, bool) {

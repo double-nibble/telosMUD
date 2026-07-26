@@ -102,15 +102,17 @@ message GetChargenFlowResponse {
 // ChargenStep is one step the gate renders (a tagged union over kind). The gate shows the choices; the account
 // VALIDATES the submission (the point-buy cost curve lives server-side, not on the wire).
 message ChargenStep {
-  string kind = 1; // "bundle_choice" | "point_buy"
+  string kind = 1; // "bundle_choice" | "point_buy" | "array_assign" | "roll"
   string id = 2;
   string prompt = 3;
   string bundle_kind = 4; // bundle_choice: filter options by this kind
-  repeated string attributes = 5; // point_buy: the attributes to allocate
+  repeated string attributes = 5; // point_buy / array_assign / roll: the attributes to fill
   int32 points = 6;
   int32 base = 7;
   int32 min = 8;
   int32 max = 9;
+  repeated int32 array = 10; // array_assign (#518): the fixed multiset the player assigns across attributes
+  string roll_dice = 11; // roll (#518): the ability dice spec ("" => 4d6dl1); the roll itself runs server-side
 }
 message ChargenBundleOption {
   string ref = 1;

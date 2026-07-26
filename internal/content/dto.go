@@ -312,13 +312,25 @@ type ChargenStepDTO struct {
 	BundleKind string `json:"bundle_kind,omitempty" yaml:"bundle_kind,omitempty"`
 	Pick       int    `json:"pick,omitempty" yaml:"pick,omitempty"`
 
-	// point_buy
+	// point_buy (and, for array_assign/roll below, the shared Attributes list — the six abilities to fill)
 	Attributes []string       `json:"attributes,omitempty" yaml:"attributes,omitempty"`
 	Points     int            `json:"points,omitempty" yaml:"points,omitempty"`
 	Base       int            `json:"base,omitempty" yaml:"base,omitempty"`
 	Min        int            `json:"min,omitempty" yaml:"min,omitempty"`
 	Max        int            `json:"max,omitempty" yaml:"max,omitempty"`
 	Cost       map[string]int `json:"cost,omitempty" yaml:"cost,omitempty"` // target value (as string) -> cumulative cost from Base
+
+	// array_assign (#518): a FIXED multiset the player assigns across Attributes (the 5e standard array
+	// 15/14/13/12/10/8). The player submits an assignment (attribute -> chosen value) exactly as point_buy
+	// submits allocs; the validator accepts it iff the submitted values are a PERMUTATION of Array — every
+	// array value used exactly once. Pure content, no dice.
+	Array []int `json:"array,omitempty" yaml:"array,omitempty"`
+
+	// roll (#518): each attribute in Attributes gets an INDEPENDENT server-rolled score (the classic 5e
+	// 4d6-drop-lowest). The roll is authoritative — it runs in the account service at submit with a
+	// server rng, never trusts a client value — so a roll step takes no player input. RollDice overrides the
+	// default "4d6dl1" (roll 4, drop the lowest 1). Roll visibility is a separate display config.
+	RollDice string `json:"roll_dice,omitempty" yaml:"roll_dice,omitempty"`
 }
 
 // RarityTierDTO is one content-defined rarity tier (Phase 12.1, docs/LOOT-AND-SPAWNS.md §2): an ordered,
