@@ -64,7 +64,8 @@ func registerCommands() []*Command {
 	// particular `o` still resolves to `open`, not `out` (the earlier-registered command wins the prefix; an
 	// exact `out`/`enter`/`exit` still matches via byExact). `move()` already dispatches any exit key; these
 	// just make the words typeable. A room with no such exit gets the normal "You can't go that way."
-	base = append(base,
+	base = append(
+		base,
 		&Command{Name: "enter", Run: mv("enter")},
 		&Command{Name: "exit", Run: mv("exit")},
 		&Command{Name: "out", Run: mv("out")},
@@ -88,6 +89,9 @@ func registerCommands() []*Command {
 	// Screen utilities (#31): `clear` — engine-owned raw-ANSI output, universal. Low-priority so `cl` still
 	// abbreviates to `close`.
 	base = append(base, screenCommands()...)
+	// Content credits (#519): `credits`/`license` — the loaded packs' license/attribution metadata,
+	// universal + read-only. Low-priority so it never shadows a movement/look/say verb.
+	base = append(base, creditsCommands()...)
 	// Command aliases (#353): `alias`/`unalias`. Registered last (lowest priority) with the other QoL verbs
 	// so they never shadow or abbreviate a movement/look/say verb; both names are RESERVED (an alias can
 	// never be defined over them). Expansion itself runs earlier, at the dispatch split step (aliases.go).

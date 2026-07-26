@@ -121,6 +121,12 @@ func mergePacks(parts []Pack) Pack {
 		if p.WorldScript != "" {
 			out.WorldScript = p.WorldScript // #47: last non-empty file/pack wins
 		}
+		if p.License != "" {
+			out.License = p.License // #519: last non-empty file wins (within ONE pack's tree)
+		}
+		if p.Attribution != "" {
+			out.Attribution = p.Attribution // #519: last non-empty file wins
+		}
 		for name, body := range p.Formulas {
 			if out.Formulas == nil {
 				out.Formulas = map[string]string{}

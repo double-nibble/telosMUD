@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/double-nibble/telosmud/internal/content"
 )
 
 // defs.go holds the per-shard registries for the pack-GLOBAL definition kinds (attributes,
@@ -171,6 +173,11 @@ type defRegistries struct {
 	// render body that returns the sheet string. Consulted by the surface's command (e.g. `score`), which
 	// runs the body with `self` bound and sends the result. Built once at construction, then read-only.
 	displayDefs map[string]string
+
+	// packCredits is the accumulated per-pack license/attribution metadata (#519), copied from
+	// LoadedContent.Credits at build. Read-only after construction; the `credits` verb renders it. Empty
+	// => no pack declared credits (the `credits` verb then reports a clean "no credits" notice).
+	packCredits []content.PackCredit
 }
 
 // newDefRegistries builds an empty bundle (all three registries empty/published). A bare zone gets

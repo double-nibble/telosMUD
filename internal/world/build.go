@@ -242,6 +242,7 @@ func defineGlobals(d *defRegistries, lc *content.LoadedContent) {
 		d.help.register(hd.Ref, buildHelpDef(hd))
 	}
 	d.defaultCombat = lc.DefaultCombat
+	d.packCredits = lc.Credits // #519: per-pack license/attribution for the `credits` verb
 	// Trust ladder (#27/#29, Round 9 Slice 0): build the content-defined tier→rank+flags ladder. An empty
 	// list leaves d.trust nil so z.trustLadder() falls back to the engine default (round-8 mapping).
 	d.trust = buildTrustLadder(lc.TrustTiers)

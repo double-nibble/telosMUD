@@ -45,6 +45,17 @@ type Pack struct {
 	// no combat profile (a `kill` then auto-hits with weapon-only damage — the degenerate bare case).
 	DefaultCombat string `json:"default_combat" yaml:"default_combat"`
 
+	// License / Attribution are the pack's OPTIONAL machine-visible credit metadata (#519): License is a
+	// short identifier (e.g. "CC-BY-4.0", "MIT") and Attribution is the human-readable notice a license
+	// requires (e.g. "SRD 5.1 © Wizards of the Coast, CC-BY-4.0"). Unlike DefaultCombat/PvpLua (one-per-
+	// world last-wins singletons) these are inherently PER-PACK — every pack ships its own copyright — so
+	// they persist per-pack in pack_meta and the loader ACCUMULATES them into LoadedContent.Credits rather
+	// than last-wins (a later pack must not erase an earlier pack's attribution). Surfaced in-game by the
+	// `credits` verb. Pure metadata: names no mechanic, changes no gameplay. Both empty => the pack
+	// contributes no credit line (an empty world's `credits` is a clean "no credits" notice).
+	License     string `json:"license,omitempty" yaml:"license,omitempty"`
+	Attribution string `json:"attribution,omitempty" yaml:"attribution,omitempty"`
+
 	// Commands are pack-GLOBAL custom verbs implemented in Lua (Phase 7.4e). Each registers a new
 	// verb into the command table — consulted AFTER the built-in baseTable AND content abilities, by
 	// EXACT match only, so a custom verb can never shadow or abbreviate a core/movement/ability verb.

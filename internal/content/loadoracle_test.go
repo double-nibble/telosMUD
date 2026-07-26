@@ -106,6 +106,9 @@ func loadOLD(ctx context.Context, src Source, enabled []string) (*LoadedContent,
 		if p.WorldScript != "" {
 			lc.WorldScript = p.WorldScript // last non-empty pack wins (#47: one world orchestrator)
 		}
+		if p.License != "" || p.Attribution != "" { // #519: ACCUMULATE per-pack credits (not last-wins)
+			lc.Credits = append(lc.Credits, PackCredit{Pack: p.Pack, License: p.License, Attribution: p.Attribution})
+		}
 		for name, body := range p.Formulas { // 7.4f: last-write-wins by name
 			if lc.Formulas == nil {
 				lc.Formulas = map[string]string{}
