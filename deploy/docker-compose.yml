@@ -15,6 +15,21 @@ x-otel-env: &otel-env
   OTEL_EXPORTER_OTLP_INSECURE: "true"
   OTEL_METRIC_EXPORT_INTERVAL: "5000"
 
+# #552: per-identity NATS credentials. Each app service merges the anchor for its BROKER IDENTITY so the
+# nats service (deploy/nats.conf) can enforce a per-role publish/subscribe matrix. The same
+# ${TELOS_NATS_*_PASSWORD} default is interpolated into BOTH the nats service's env and each identity's
+# TELOS_NATS_PASSWORD here, so the two sides always agree (dev defaults; override via a .env for a real
+# deploy). Absent/wrong creds degrade a client to a Disabled no-op bus, never a boot failure (#552).
+x-nats-world-creds: &nats-world-creds
+  TELOS_NATS_USER: world
+  TELOS_NATS_PASSWORD: ${TELOS_NATS_WORLD_PASSWORD:-worldpass}
+x-nats-gate-creds: &nats-gate-creds
+  TELOS_NATS_USER: gate
+  TELOS_NATS_PASSWORD: ${TELOS_NATS_GATE_PASSWORD:-gatepass}
+x-nats-seed-creds: &nats-seed-creds
+  TELOS_NATS_USER: seed
+  TELOS_NATS_PASSWORD: ${TELOS_NATS_SEED_PASSWORD:-seedpass}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -64,11 +79,21 @@ services:
 
   nats:
     image: nats:2.10-alpine
-    # -js enables JetStream (durable cross-scope events); -m exposes monitoring. SINGLE INSTANCE = demo
-    # only: the whole stack (every world publishes, every gate subscribes) rendezvous here, so at scale
-    # this becomes a fan-out/availability chokepoint — prod shards/CLUSTERS NATS (and JetStream needs a
-    # cluster for HA). Fine for the single-box demo.
-    command: ["-js", "-m", "8222"]
+    # #552: run with a CONFIG FILE (not bare CLI args) so an authorization{} block can constrain each
+    # identity to its role's subjects — CLI args cannot express that. nats.conf enables JetStream
+    # (was -js) and the monitoring port (was -m 8222). SINGLE INSTANCE = demo only: the whole stack
+    # (every world publishes, every gate subscribes) rendezvous here, so at scale this becomes a
+    # fan-out/availability chokepoint — prod shards/CLUSTERS NATS (and JetStream needs a cluster for HA).
+    command: ["-c", "/etc/nats.conf"]
+    environment:
+      # The broker side of the #552 credentials — nats.conf interpolates these $VARs into the users list.
+      # Same defaults as the app-service anchors above, so both sides agree without a shared .env.
+      TELOS_NATS_WORLD_PASSWORD: ${TELOS_NATS_WORLD_PASSWORD:-worldpass}
+      TELOS_NATS_GATE_PASSWORD: ${TELOS_NATS_GATE_PASSWORD:-gatepass}
+      TELOS_NATS_DIRECTOR_PASSWORD: ${TELOS_NATS_DIRECTOR_PASSWORD:-dirpass}
+      TELOS_NATS_SEED_PASSWORD: ${TELOS_NATS_SEED_PASSWORD:-seedpass}
+    volumes:
+      - ./nats.conf:/etc/nats.conf:ro
     ports:
       # Publish BOTH NATS ports to HOST LOOPBACK only — this server runs with no auth (dev stack). Off-host
       # the client port (4222) is a full unauthenticated data-plane: subscribe to telos.comms.tell.<playerId>
@@ -125,6 +150,7 @@ services:
       args:
         SERVICE: telos-seed
     environment:
+      <<: *nats-seed-creds # #552: seed is a content.invalidate publisher — carries the seed broker identity
       TELOS_POSTGRES_DSN: postgres://${POSTGRES_USER:-telos}:${POSTGRES_PASSWORD:-telos}@postgres:5432/${POSTGRES_DB:-telosmud}?sslmode=disable
     depends_on:
       migrate:
@@ -138,7 +164,7 @@ services:
       args:
         SERVICE: telos-world
     environment:
-      <<: *otel-env
+      <<: [*otel-env, *nats-world-creds]
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
       TELOS_ALLOW_INSECURE: "1" # dev cluster runs handoffs UNSIGNED (#251); prod sets the handoff keypair instead
@@ -172,7 +198,7 @@ services:
       args:
         SERVICE: telos-world
     environment:
-      <<: *otel-env
+      <<: [*otel-env, *nats-world-creds]
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
       TELOS_ALLOW_INSECURE: "1" # dev cluster runs handoffs UNSIGNED (#251); prod sets the handoff keypair instead
@@ -204,7 +230,7 @@ services:
       args:
         SERVICE: telos-world
     environment:
-      <<: *otel-env
+      <<: [*otel-env, *nats-world-creds]
       TELOS_SERVICE: telos-world
       TELOS_ENV: dev
       TELOS_ALLOW_INSECURE: "1" # dev cluster runs handoffs UNSIGNED (#251); prod sets the handoff keypair instead
@@ -286,7 +312,7 @@ services:
         # works. A production image builds with no BUILD_TAGS and the bypass is physically absent.
         BUILD_TAGS: telos_devauth
     environment:
-      <<: *otel-env
+      <<: [*otel-env, *nats-gate-creds]
       TELOS_SERVICE: telos-gate
       TELOS_ENV: dev
       TELOS_GATE_LISTEN: ":4000"
@@ -327,7 +353,7 @@ services:
       args:
         SERVICE: telos-gate
     environment:
-      <<: *otel-env
+      <<: [*otel-env, *nats-gate-creds]
       TELOS_SERVICE: telos-gate
       TELOS_ENV: dev
       TELOS_GATE_LISTEN: ":4001"
