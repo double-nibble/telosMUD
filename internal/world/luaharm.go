@@ -300,6 +300,29 @@ func (rt *luaRuntime) hMove(l *lua.LState) int {
 		l.Push(lua.LFalse)
 		return 1
 	}
+	// SECURITY (#548 safe co-move): forcing a NON-CONSENTING player to walk — a mount carrying its rider, a
+	// grappler dragging the grappled — is harm, so it routes the SAME movement-grief gate h:teleport uses.
+	// Self (a scripted wanderer moving itself), a mob, or a consenting/gate-permitted player is ungated. This
+	// is what makes h:move a safe co-move PRIMITIVE: a content mount/grapple-drag hook relocates the linked
+	// entity through here, and a cross-player drag can't grief a non-consenting player. (The full mount/follow
+	// LINK model — allegiance, command routing, a follower registry — stays content's / a later epic's job;
+	// the engine provides only this safe relocation funnel.)
+	if !rt.mayRelocate(e) {
+		l.Push(lua.LFalse)
+		return 1
+	}
+	// HELD FAST (#548): h:move is a WALK — using your own movement. So an entity moving ITSELF honors
+	// `prevents: move` exactly as the typed walk (attemptMove) and flee do: a rooted / webbed / grappled
+	// entity cannot walk itself out, and a player cannot escape a root by casting a self-relocate ability
+	// (the can't-forget property — the walk gate must live at EVERY walk entry, not just the command).
+	// A FORCED move of ANOTHER (a grapple-drag: e is not the invocation actor) IGNORES the target's root —
+	// correct 5e forced movement (the grappler drags the grappled regardless). Keyed on the invocation actor
+	// so co-move stays possible. (The push/teleport OPS bypass prevents:move too: 5e forced-movement and
+	// teleport both bypass the speed-0 of restrained/grappled — only WALKING consumes speed.)
+	if rt.inv != nil && e == rt.inv.actor && preventsTag(e, "move") {
+		l.Push(lua.LFalse)
+		return 1
+	}
 	// h:move is a WALK-like relocation — it fires the OnLeaveRoom checkpoint (provokes opportunity
 	// attacks), mirroring the engine move's combat discipline. A scripted walk should not be a free
 	// pass past the foes the leaver is engaged with.
@@ -394,13 +417,21 @@ func (rt *luaRuntime) hRecall(l *lua.LState) int {
 //     is NOT sufficient for any primitive whose destination leaves observable space. See
 //     luainstance.go, where mud.send_to_instance is self-only for exactly this reason.
 func (rt *luaRuntime) mayRelocate(e *Entity) bool {
+	// A NON-PLAYER (a mob/item) is always relocatable — self-moving wanderers, chasers, and forced drags of
+	// mobs. Checked FIRST, before the invocation-nil guard, because a trigger/timer-driven self-move (a
+	// wander loop, #548 co-move) legitimately has NO invocation actor, and it must not fail closed on that.
+	if !isPlayer(e) {
+		return true
+	}
+	// A PLAYER target needs an authorizing invocation actor. Nil => fail closed (no one to attribute the
+	// forced move to).
 	if rt.inv == nil || rt.inv.actor == nil {
 		return false
 	}
-	if e == rt.inv.actor || !isPlayer(e) {
-		return true
+	if e == rt.inv.actor {
+		return true // moving oneself
 	}
-	return guardHarmful(rt.harmCtx(e), e)
+	return guardHarmful(rt.harmCtx(e), e) // forcing ANOTHER player is harm — gate it
 }
 
 // destIsLocalRoom reports whether dest is one of this zone's registered room entities (so a

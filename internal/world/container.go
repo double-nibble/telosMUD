@@ -166,6 +166,12 @@ func cmdGet(c *Context) error {
 		c.Send("You can't get yourself.")
 		return nil
 	}
+	// Carrying capacity (#548): refuse a pickup that would exceed the actor's carry_capacity. A no-op when
+	// the pack models no encumbrance (canCarry).
+	if !canCarry(c.Actor, itemWeight(target)) {
+		c.z.act("You can't carry any more — $p is too heavy.", c.Actor, target, nil, "", "", ToActor)
+		return nil
+	}
 	Move(target, c.Actor)
 	// #443: audit a pickup that crossed a character boundary (a different player dropped this). BEFORE the
 	// stack merge below, which may detach `target` — the marker + stack count must be read off it while live.
@@ -214,6 +220,12 @@ func (z *Zone) getFrom(c *Context, item, cont string) error {
 		return nil
 	}
 	for _, m := range matches {
+		// Carrying capacity (#548): skip an item that would exceed the actor's carry_capacity (a `get all`
+		// takes what fits and leaves the rest). Re-checked per item, since each pickup adds to the load.
+		if !canCarry(c.Actor, itemWeight(m)) {
+			c.z.act2("You can't carry any more — $p stays in $P.", c.Actor, m, box, nil, "", "", ToActor)
+			continue
+		}
 		Move(m, c.Actor)
 		c.z.recordCrossCharTransfer(c.Actor, m) // #443: audit a pickup that crossed a character boundary
 		c.z.act2("You get $p from $P.", c.Actor, m, box, nil, "", "", ToActor)
