@@ -2,6 +2,7 @@ package world
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -129,5 +130,168 @@ func TestDealDamageFormulaParse(t *testing.T) {
 	// 1 (1d1) + 3 (str_bonus) = 4 -> hp 96.
 	if hp := resourceCurrent(mob, "hp"); hp != 96 {
 		t.Fatalf("parsed formula-damage: hp = %d, want 96 (1d1 + str_bonus 3)", hp)
+	}
+}
+
+// TestDealDamageDiceNumFormula (#517): the natural `dice_num` key accepts a FORMULA, not just an int
+// literal — the canonical 5e cantrip scaler (fire-bolt: 1 die at L1..4, ceil(level/2) here as a size-1
+// proxy). Authored end-to-end from a content op map through parseOp; a size-1 die makes the total equal
+// the count so the formula is asserted exactly. Pins that dice_num-as-formula routes to the dice-count
+// slot instead of the silent-0 that int(mapFloat(...)) would produce for a non-numeric value.
+func TestDealDamageDiceNumFormula(t *testing.T) {
+	z, caster, mob := damageZone(t)
+	setAttrBase(caster.entity, "level", 7) // ceil(7/2) = 4
+
+	raw := map[string]any{
+		"op":        "deal_damage",
+		"type":      "fire",
+		"dice_num":  []any{"ceil", []any{"/", []any{"attr", "$actor.level"}, 2}},
+		"dice_size": 1,
+	}
+	op, err := parseOp(raw)
+	if err != nil {
+		t.Fatalf("parseOp: %v", err)
+	}
+	if op.diceCount == nil {
+		t.Fatal("dice_num formula did not populate op.diceCount")
+	}
+	if op.diceNum != 0 {
+		t.Fatalf("dice_num formula should not set the literal diceNum, got %d", op.diceNum)
+	}
+	c := dmgCtx(z, caster.entity, mob)
+	if err := opDealDamage(c, &op); err != nil {
+		t.Fatalf("opDealDamage: %v", err)
+	}
+	// ceil(7/2)=4 dice of size 1 -> 4 damage -> hp 96.
+	if hp := resourceCurrent(mob, "hp"); hp != 96 {
+		t.Fatalf("dice_num-formula damage: hp = %d, want 96 (ceil(level/2)=4 d1)", hp)
+	}
+}
+
+// TestDiceNumLiteralStillWorks (#517): a numeric dice_num remains the literal count (no regression from
+// the polymorphic key).
+func TestDiceNumLiteralStillWorks(t *testing.T) {
+	z, caster, mob := damageZone(t)
+	raw := map[string]any{"op": "deal_damage", "type": "fire", "dice_num": 3, "dice_size": 1}
+	op, err := parseOp(raw)
+	if err != nil {
+		t.Fatalf("parseOp: %v", err)
+	}
+	if op.diceNum != 3 || op.diceCount != nil {
+		t.Fatalf("literal dice_num: diceNum=%d diceCount=%v, want 3/nil", op.diceNum, op.diceCount)
+	}
+	c := dmgCtx(z, caster.entity, mob)
+	if err := opDealDamage(c, &op); err != nil {
+		t.Fatalf("opDealDamage: %v", err)
+	}
+	if hp := resourceCurrent(mob, "hp"); hp != 97 { // 3 d1
+		t.Fatalf("literal dice_num damage: hp = %d, want 97 (3 d1)", hp)
+	}
+}
+
+// TestDiceCountSourceConflicts (#517): the die count may be set EXACTLY ONE way — `dice` / `dice_num` /
+// `dice_count`. Every pairing is contradictory content and must be REJECTED at parse, not silently
+// resolved by dropping one source (the silent-precedence footgun). Covers the whole matrix, including
+// the natural cantrip mistake `dice: "1d10"` + a scaling `dice_num`, which the old code silently ignored.
+func TestDiceCountSourceConflicts(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+	}{
+		{"formula dice_num + dice_count", map[string]any{
+			"dice_num": []any{"attr", "$actor.level"}, "dice_count": []any{"attr", "$actor.level"}, "dice_size": 6,
+		}},
+		{"literal dice_num + dice_count", map[string]any{ // the silent-precedence case (dice_count would win)
+			"dice_num": 3, "dice_count": []any{"attr", "$actor.level"}, "dice_size": 6}},
+		{"dice shorthand + formula dice_num", map[string]any{ // the natural cantrip mistake
+			"dice": "1d10", "dice_num": []any{"attr", "$actor.level"}}},
+		{"dice shorthand + literal dice_num", map[string]any{
+			"dice": "2d6", "dice_num": 3,
+		}},
+		{"dice shorthand + dice_count", map[string]any{
+			"dice": "1d10", "dice_count": []any{"attr", "$actor.level"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.raw["op"] = "deal_damage"
+			tc.raw["type"] = "fire"
+			_, err := parseOp(tc.raw)
+			if err == nil {
+				t.Fatalf("expected parseOp to reject a doubly-set die count (%s)", tc.name)
+			}
+			if !strings.Contains(err.Error(), "die count") {
+				t.Fatalf("error should name the die-count conflict, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestDiceNumUnparseableFormula (#517): a present-but-unparseable dice_num now surfaces a parse error
+// (fail-at-boot), not the pre-change loud-log silent-0 — the footgun the polymorphic key closes.
+func TestDiceNumUnparseableFormula(t *testing.T) {
+	raw := map[string]any{"op": "deal_damage", "type": "fire", "dice_num": []any{"bogus_head", 1}, "dice_size": 6}
+	_, err := parseOp(raw)
+	if err == nil {
+		t.Fatal("expected parseOp to reject an unparseable dice_num formula")
+	}
+	if !strings.Contains(err.Error(), "dice_num") {
+		t.Fatalf("error should be attributed to dice_num, got: %v", err)
+	}
+}
+
+// TestHealDiceCountFormula (#517): the dice-count formula also drives the HEAL/restore path (rollOpAmount
+// is shared) — the upcast case: a cure spell rolling `slot_level` d1 heals more per slot spent.
+func TestHealDiceCountFormula(t *testing.T) {
+	z, caster, mob := damageZone(t)
+	z.defs.attr.register("slot_level", &attributeDef{ref: "slot_level"})
+	setAttrBase(caster.entity, "slot_level", 5) // a 5th-level slot
+	setResourceCurrent(mob, "hp", 10)
+
+	raw := map[string]any{
+		"op":        "heal",
+		"resource":  "hp",
+		"dice_num":  []any{"attr", "$actor.slot_level"},
+		"dice_size": 1,
+	}
+	op, err := parseOp(raw)
+	if err != nil {
+		t.Fatalf("parseOp: %v", err)
+	}
+	c := dmgCtx(z, caster.entity, mob)
+	if err := opHeal(c, &op); err != nil {
+		t.Fatalf("opHeal: %v", err)
+	}
+	// 5 (slot_level) d1 = 5 healing -> hp 15.
+	if hp := resourceCurrent(mob, "hp"); hp != 15 {
+		t.Fatalf("heal dice-count formula: hp = %d, want 15 (slot_level=5 d1)", hp)
+	}
+}
+
+// TestRestoreDiceCountFormula (#517): `restore` shares rollOpAmount with heal/deal_damage, so a formula
+// dice count drives it too. Pins the `restore` op directly (the issue names deal_damage/heal/restore).
+func TestRestoreDiceCountFormula(t *testing.T) {
+	z, caster, mob := damageZone(t)
+	z.defs.attr.register("slot_level", &attributeDef{ref: "slot_level"})
+	setAttrBase(caster.entity, "slot_level", 4)
+	setResourceCurrent(mob, "hp", 10)
+
+	raw := map[string]any{
+		"op":        "restore",
+		"resource":  "hp",
+		"dice_num":  []any{"attr", "$actor.slot_level"},
+		"dice_size": 1,
+	}
+	op, err := parseOp(raw)
+	if err != nil {
+		t.Fatalf("parseOp: %v", err)
+	}
+	c := dmgCtx(z, caster.entity, mob)
+	if err := opRestore(c, &op); err != nil {
+		t.Fatalf("opRestore: %v", err)
+	}
+	// 4 (slot_level) d1 = 4 restored -> hp 14.
+	if hp := resourceCurrent(mob, "hp"); hp != 14 {
+		t.Fatalf("restore dice-count formula: hp = %d, want 14 (slot_level=4 d1)", hp)
 	}
 }
