@@ -90,6 +90,28 @@ func fillOneDef(ptr any, counter *int) {
 // TestStoreDTOReflectRoundTrip is the Track-0 regression net: a fully-populated synthetic pack proves every
 // field of every persisted global-def kind survives the Postgres import/load path — closing the "field no demo
 // content sets drops invisibly" blind spot of TestStorePackRoundTrip.
+// TestStoreCreditsOnlyPackRoundTrip (#519) pins the pack_meta write-guard's INDEPENDENT License/Attribution
+// terms. TestStoreDTOReflectRoundTrip's probe pack always sets DefaultCombat, so the guard's OR still fires
+// and the row is written even if the License/Attribution terms are dropped from the guard — a credits-ONLY
+// pack (a plausible NOTICE-only pack) is the only case that exercises those terms. Here the pack sets ONLY
+// license/attribution and no other pack scalar, so dropping either guard term skips the whole pack_meta row
+// and this test goes red.
+func TestStoreCreditsOnlyPackRoundTrip(t *testing.T) {
+	p := helpers.OpenTestPool(t)
+	ctx := context.Background()
+
+	pk := content.Pack{Pack: "creditsonly", License: "CC-BY-4.0", Attribution: "credits-only pack, CC-BY-4.0"}
+	require.NoError(t, p.ImportPack(ctx, pk), "import credits-only pack")
+	lc, err := content.Load(ctx, p, []string{pk.Pack})
+	require.NoError(t, err, "load credits-only pack from postgres")
+
+	require.Len(t, lc.Credits, 1, "a credits-only pack should still persist its pack_meta row")
+	require.Equal(t, pk.License, lc.Credits[0].License,
+		"credits-only pack: License dropped (the pack_meta write-guard likely skipped the row)")
+	require.Equal(t, pk.Attribution, lc.Credits[0].Attribution,
+		"credits-only pack: Attribution dropped (the pack_meta write-guard likely skipped the row)")
+}
+
 func TestStoreDTOReflectRoundTrip(t *testing.T) {
 	p := helpers.OpenTestPool(t)
 	ctx := context.Background()
@@ -129,6 +151,10 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 	pk.PvpLua = sentinelString(counter)
 	counter++
 	pk.WorldScript = sentinelString(counter)
+	counter++
+	pk.License = sentinelString(counter) // #519: per-pack credit metadata (pack_meta)
+	counter++
+	pk.Attribution = sentinelString(counter)
 	counter++
 	formulaName := sentinelString(counter)
 	counter++
@@ -192,6 +218,17 @@ func TestStoreDTOReflectRoundTrip(t *testing.T) {
 		require.Equal(t, pk.WorldScript, lc.WorldScript,
 			"reflect round-trip: WorldScript was dropped on the store import/load path (pack_meta body)")
 	})
+	// License/Attribution (#519) are per-pack scalars in pack_meta; the loader ACCUMULATES them into
+	// lc.Credits (not a last-wins scalar), so assert them through the single credit the synthetic pack
+	// contributes. A store-path drop of either shows as an empty field on the loaded PackCredit.
+	t.Run("license_attribution", func(t *testing.T) {
+		require.Len(t, lc.Credits, 1,
+			"reflect round-trip: the synthetic crediting pack should yield exactly one PackCredit")
+		require.Equal(t, pk.License, lc.Credits[0].License,
+			"reflect round-trip: License was dropped on the store import/load path (pack_meta body)")
+		require.Equal(t, pk.Attribution, lc.Credits[0].Attribution,
+			"reflect round-trip: Attribution was dropped on the store import/load path (pack_meta body)")
+	})
 	t.Run("formulas", func(t *testing.T) {
 		require.Equal(t, pk.Formulas, lc.Formulas,
 			"reflect round-trip: a Formulas entry was dropped on the store import/load path (formula_defs)")
@@ -247,6 +284,7 @@ func TestStoreReflectNetCoversEveryDefSlice(t *testing.T) {
 // kinds. These ride pack_meta (DefaultCombat, PvpLua) or a keyed def table (Formulas → formula_defs).
 var reflectNetScalarCovered = map[string]bool{
 	"DefaultCombat": true, "PvpLua": true, "Formulas": true, "WorldScript": true,
+	"License": true, "Attribution": true, // #519: per-pack credit metadata (pack_meta)
 }
 
 // reflectNetScalarExcluded lists content.Pack scalar/map fields deliberately NOT round-tripped, with reasons.

@@ -18,6 +18,12 @@
 pack: demo
 default_combat: melee
 
+# Machine-visible credit metadata (#519), surfaced in-game by the `credits` verb. Pure metadata — names no
+# mechanic. A real pack carrying a licensed SRD ships the license's required attribution here (e.g. the 5e
+# SRD's CC-BY notice) so it is visible in-game, not only in a repo NOTICE file.
+license: CC0-1.0
+attribution: The demo world is dedicated to the public domain by the TelosMUD authors.
+
 # The WORLD-DIRECTOR script (#47, Phase 10.4): sandboxed Lua run in telos-director. It defines on_signal,
 # invoked per signal-up event a zone emits. This demo reacts to a "boss_slain" signal by recording the fallen
 # boss in world state (director.set — a DERIVED, idempotent write; NOT a blind increment, so the durable

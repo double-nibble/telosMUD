@@ -237,7 +237,8 @@ func (p *Pool) loadProtoDefinition(ctx context.Context, table, kind, ref, pack s
 	var d content.ProtoDTO
 	var body []byte
 	err := p.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT ref, short, long, keywords, body FROM %s WHERE ref = $1 AND pack = $2`, table),
+		`SELECT ref, short, long, keywords, body FROM %s WHERE ref = $1 AND pack = $2`, table,
+	),
 		ref, pack).Scan(&d.Ref, &d.Short, &d.Long, &d.Keywords, &body)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return content.Definition{Kind: kind, Ref: ref, Found: false}, nil
@@ -374,7 +375,8 @@ func (p *Pool) loadPrototypes(ctx context.Context, enabled []string, zones map[s
 	load := func(table string, mob bool) error {
 		rows, err := p.pool.Query(ctx, fmt.Sprintf(
 			`SELECT ref, COALESCE(zone_ref, ''), short, long, keywords, body
-			   FROM %s WHERE pack = ANY($1) ORDER BY zone_ref, ref`, table), enabled)
+			   FROM %s WHERE pack = ANY($1) ORDER BY zone_ref, ref`, table,
+		), enabled)
 		if err != nil {
 			return fmt.Errorf("store: query %s: %w", table, err)
 		}
@@ -689,6 +691,8 @@ type packMetaBody struct {
 	DefaultCombat string `json:"default_combat,omitempty"`
 	PvpLua        string `json:"pvp_lua,omitempty"`
 	WorldScript   string `json:"world_script,omitempty"` // #47: the world-director Lua signal-handler body
+	License       string `json:"license,omitempty"`      // #519: short license id (per-pack credit metadata)
+	Attribution   string `json:"attribution,omitempty"`  // #519: human-readable attribution notice
 }
 
 // loadGlobalDefs reads the pack-global attribute/resource/damage-type rows for the enabled packs
@@ -1468,6 +1472,8 @@ func (p *Pool) loadGlobalDefs(ctx context.Context, enabled []string, pack func(s
 			pack(pk).DefaultCombat = b.DefaultCombat
 			pack(pk).PvpLua = b.PvpLua
 			pack(pk).WorldScript = b.WorldScript
+			pack(pk).License = b.License
+			pack(pk).Attribution = b.Attribution
 		}
 	}
 	return mRows.Err()

@@ -117,6 +117,20 @@ type LoadedContent struct {
 	// (there is one world orchestrator). Empty => the director reacts to no signals. The telos-director
 	// service reads it (not the world/zone) to build its sandboxed Lua signal handler.
 	WorldScript string
+	// Credits is the ACCUMULATED per-pack license/attribution metadata (#519): one PackCredit per loaded
+	// pack that declares a License or Attribution, in pack-load order. Unlike the last-wins scalars above,
+	// credits accumulate — every pack keeps its own copyright line — so a multi-pack world surfaces all
+	// of them via the `credits` verb. Empty => no pack declared credits.
+	Credits []PackCredit
+}
+
+// PackCredit is one pack's machine-visible credit line (#519): its identity plus the optional License id
+// and Attribution notice it ships. The loader builds one per crediting pack; the world stamps the slice
+// onto the per-shard bundle and the `credits` verb renders it.
+type PackCredit struct {
+	Pack        string
+	License     string
+	Attribution string
 }
 
 // Zone returns the loaded zone with the given ref, or nil.
@@ -263,6 +277,11 @@ func Merge(packs []Pack) *LoadedContent {
 		}
 		if p.WorldScript != "" {
 			lc.WorldScript = p.WorldScript // last non-empty pack wins (#47: one world orchestrator)
+		}
+		if p.License != "" || p.Attribution != "" {
+			// #519: ACCUMULATE (not last-wins) — every crediting pack keeps its own line so a later pack
+			// cannot erase an earlier pack's attribution.
+			lc.Credits = append(lc.Credits, PackCredit{Pack: p.Pack, License: p.License, Attribution: p.Attribution})
 		}
 		for name, body := range p.Formulas { // 7.4f: last-write-wins by name
 			if lc.Formulas == nil {

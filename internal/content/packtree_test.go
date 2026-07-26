@@ -49,6 +49,8 @@ func TestLoadPackFS_TreeMerge(t *testing.T) {
 		"packs/city/pack.yaml": &fstest.MapFile{Data: []byte(`
 pack: city
 default_combat: unarmed
+license: CC-BY-4.0
+attribution: City pack, CC-BY-4.0
 `)},
 		"packs/city/attributes.yaml": &fstest.MapFile{Data: []byte(`
 attributes:
@@ -110,6 +112,14 @@ zones:
 	}
 	if p.DefaultCombat != "unarmed" {
 		t.Fatalf("default_combat = %q, want unarmed", p.DefaultCombat)
+	}
+	// #519: the license/attribution manifest scalars must survive the mergePacks fold (the file→Pack path
+	// the store reflect-net does NOT cover — this is where they were first silently dropped).
+	if p.License != "CC-BY-4.0" {
+		t.Fatalf("license = %q, want CC-BY-4.0 (dropped in the mergePacks scalar fold)", p.License)
+	}
+	if p.Attribution != "City pack, CC-BY-4.0" {
+		t.Fatalf("attribution = %q, want %q (dropped in the mergePacks scalar fold)", p.Attribution, "City pack, CC-BY-4.0")
 	}
 	if len(p.Attributes) != 2 {
 		t.Fatalf("attributes = %d, want 2", len(p.Attributes))

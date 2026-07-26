@@ -572,7 +572,8 @@ func insertProtos(ctx context.Context, tx pgx.Tx, table, pack, zoneRef string, p
 		}
 		if _, err := tx.Exec(ctx, fmt.Sprintf(
 			`INSERT INTO %s (ref, pack, zone_ref, short, long, keywords, body)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7)`, table),
+			 VALUES ($1,$2,$3,$4,$5,$6,$7)`, table,
+		),
 			d.Ref, pack, zoneRef, d.Short, d.Long, kw, body); err != nil {
 			return fmt.Errorf("store: insert %s %s: %w", table, d.Ref, err)
 		}
@@ -930,8 +931,8 @@ func insertGlobalDefs(ctx context.Context, tx pgx.Tx, pk content.Pack) error {
 	// Pack-level scalars (Phase 6.3a: default_combat; #20/Phase 7.4f: pvp_lua; #47: world_script) in the
 	// pack_meta row. Only written when a scalar is set, so a pack that names none leaves no row (the loader
 	// then leaves them empty).
-	if pk.DefaultCombat != "" || pk.PvpLua != "" || pk.WorldScript != "" {
-		body, err := json.Marshal(packMetaBody{DefaultCombat: pk.DefaultCombat, PvpLua: pk.PvpLua, WorldScript: pk.WorldScript})
+	if pk.DefaultCombat != "" || pk.PvpLua != "" || pk.WorldScript != "" || pk.License != "" || pk.Attribution != "" {
+		body, err := json.Marshal(packMetaBody{DefaultCombat: pk.DefaultCombat, PvpLua: pk.PvpLua, WorldScript: pk.WorldScript, License: pk.License, Attribution: pk.Attribution})
 		if err != nil {
 			return fmt.Errorf("store: marshal pack_meta %s: %w", pk.Pack, err)
 		}

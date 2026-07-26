@@ -144,6 +144,8 @@ func richMergeFixture() []Pack {
 		Formulas:       map[string]string{"hit": "return 1"},
 		PvpLua:         "return false",
 		WorldScript:    "-- base",
+		License:        "MIT",
+		Attribution:    "base pack © the authors",
 	}
 	// override re-declares a subset by the SAME refs (last write wins), adds new refs (accumulate), and
 	// re-sets the last-non-empty scalars — so ordering bugs in the extraction surface as a wrong winner.
@@ -162,6 +164,31 @@ func richMergeFixture() []Pack {
 		Formulas:    map[string]string{"hit": "return 2", "dodge": "return 3"},
 		PvpLua:      "return true",
 		WorldScript: "-- override",
+		License:     "CC-BY-4.0",
+		Attribution: "override pack, CC-BY-4.0",
 	}
 	return []Pack{base, override}
+}
+
+// TestMergeAccumulatesCredits (#519): pack license/attribution ACCUMULATE across packs (unlike the
+// last-wins scalars) — every crediting pack keeps its own line, in load order — and a pack declaring
+// neither contributes nothing.
+func TestMergeAccumulatesCredits(t *testing.T) {
+	packs := []Pack{
+		{Pack: "base", License: "MIT", Attribution: "base © authors"},
+		{Pack: "nocredit"}, // declares neither → contributes no credit line
+		{Pack: "srd", License: "CC-BY-4.0", Attribution: "SRD 5.1 © WotC, CC-BY-4.0"},
+	}
+	lc := Merge(packs)
+	want := []PackCredit{
+		{Pack: "base", License: "MIT", Attribution: "base © authors"},
+		{Pack: "srd", License: "CC-BY-4.0", Attribution: "SRD 5.1 © WotC, CC-BY-4.0"},
+	}
+	require.Equal(t, want, lc.Credits, "credits should accumulate per crediting pack in load order (no last-wins, no empty line)")
+}
+
+// TestMergeNoCreditsIsNil (#519): a world whose packs declare no credits yields no credit lines.
+func TestMergeNoCreditsIsNil(t *testing.T) {
+	lc := Merge([]Pack{{Pack: "a"}, {Pack: "b"}})
+	require.Empty(t, lc.Credits, "no pack declared credits => empty Credits")
 }
