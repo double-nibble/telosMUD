@@ -301,6 +301,73 @@ assert_gate_auth_reachable() {
   done
 }
 
+# assert_nats_authz verifies the broker actually ENFORCES the #552 per-identity permission matrix — the
+# one layer no other automated test covers. CI's `comms` job runs a NO-AUTH NATS (so the anonymous
+# integration tests pass), and the rest of this smoke only proves comms *work*; neither proves a
+# forbidden publish is *refused*. Without this, loosening the matrix (e.g. the gate deny) would pass all
+# of CI. It uses the `nats` CLI (nats-box) on the compose network — the CLI has no in-process ACL, so a
+# refusal is unambiguously the broker (this is #63's acceptance, automated). NB: NATS distinguishes a
+# "Permissions Violation" (authenticated, then denied by the matrix) from an "Authorization Violation"
+# (bad/absent credential) — the denied-publish checks key on "permissions violation" SPECIFICALLY so a
+# wrong password can't make them pass for the wrong reason; the allowed-publish check keys on the
+# positive "Published" so it can't pass on an unreachable broker.
+assert_nats_authz() {
+  local cid net box world_pw gate_pw out
+  cid="$($COMPOSE ps -q nats 2>/dev/null || true)"
+  [[ -n "$cid" ]] || fail "nats container not found for the authz check"
+  # The nats container is on exactly ONE (default) network — the compose file declares no top-level
+  # `networks:` block. The range concatenates network names with no separator, so if nats is ever
+  # attached to a second network this yields a garbage name and the docker runs below fail loudly (a
+  # docker error, not a false pass). Guard against the empty case explicitly.
+  net="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$cid" 2>/dev/null || true)"
+  [[ -n "$net" ]] || fail "could not determine the nats container network for the authz check"
+  # The compose defaults (overridable, same value on both the broker and app sides — see docker-compose.yml).
+  world_pw="${TELOS_NATS_WORLD_PASSWORD:-worldpass}"
+  gate_pw="${TELOS_NATS_GATE_PASSWORD:-gatepass}"
+  box="natsio/nats-box:0.14.5" # pinned: this check greps the CLI's exact violation strings
+
+  # (1) #63: a GATE credential publishing a player's config subject MUST be refused by the broker.
+  # Match "permissions violation" specifically, NOT a bare "violation": a WRONG gate password yields an
+  # "Authorization Violation" (which also contains "violation") and would make this pass for the wrong
+  # reason while the permission matrix could be wide open. NATS emits "Permissions Violation" ONLY for a
+  # credential that authenticated and was then denied by the matrix — so keying on it self-proves the gate
+  # creds are valid AND the subject was refused by permissions (not the auth layer).
+  out="$(docker run --rm --network "$net" "$box" nats -s nats://nats:4222 --user gate --password "$gate_pw" \
+    pub telos.comms.config.smoketest forged 2>&1 || true)"
+  printf '%s' "$out" | grep -qi 'permissions violation' \
+    || fail "AUTHZ (#63): a GATE credential was NOT denied (by permissions) publishing telos.comms.config.* at the broker; got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
+
+  # (1b) The gate is deny-ALL publish (`deny=[">"]`), not a denylist of known roots — specifically so it
+  # cannot forge a $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.* advisory the world's park monitor trusts
+  # (jetstream_nats.go handleParkAdvisory). A config-only check (1) cannot tell `deny=[">"]` from the naive
+  # regression `deny=["telos.comms.config.*"]`, which would re-open advisory forging. Assert a JetStream
+  # advisory is ALSO refused, so this pins the deny-all posture. Single-quote the subject so the host shell
+  # does not expand $JS.
+  out="$(docker run --rm --network "$net" "$box" nats -s nats://nats:4222 --user gate --password "$gate_pw" \
+    pub '$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.COMMS_TELL.forged' x 2>&1 || true)"
+  printf '%s' "$out" | grep -qi 'permissions violation' \
+    || fail "AUTHZ: a GATE credential was NOT denied forging a JetStream advisory (deny-all regressed to a denylist?); got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
+
+  # (2) a WORLD credential publishing a channel subject MUST be allowed (the matrix is not deny-all).
+  # Assert the POSITIVE "Published" — not merely the absence of a violation, which would also pass on an
+  # unreachable broker or a connect error (a dial failure prints no "violation"). A "Published" line
+  # additionally proves the world credential authenticated (a bad world pw yields an Authorization
+  # Violation and no "Published"), so this row doubly guards against a broken/misconfigured broker.
+  out="$(docker run --rm --network "$net" "$box" nats -s nats://nats:4222 --user world --password "$world_pw" \
+    pub telos.comms.chan.gossip hi 2>&1 || true)"
+  printf '%s' "$out" | grep -qi 'published' \
+    || fail "AUTHZ: a WORLD credential did NOT publish telos.comms.chan.* (matrix too strict, or broker unreachable/bad creds); got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
+
+  # (3) an anonymous (no-credential) connection MUST be rejected — proves auth is actually enforced, so
+  # rows (1)/(2) can't pass vacuously against a no-auth server.
+  out="$(docker run --rm --network "$net" "$box" nats -s nats://nats:4222 \
+    pub telos.comms.chan.gossip x 2>&1 || true)"
+  printf '%s' "$out" | grep -qi 'authorization violation' \
+    || fail "AUTHZ: an anonymous publish was NOT rejected — is broker auth even on?; got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
+
+  log "nats authz enforced at the broker: gate DENIED config.* (#63) + JS advisory + anon rejected; world ALLOWED chan.* (#552)"
+}
+
 for run in $(seq 1 "$RUNS"); do
   if (( RUNS > 1 )); then log "RUN $run of $RUNS (same Postgres volume; run 2 exercises the re-seed)"; fi
   log "make up (build + start full stack)"
@@ -310,6 +377,7 @@ for run in $(seq 1 "$RUNS"); do
   assert_telnet_look
   assert_gate_auth_reachable
   assert_cross_shard_reconnect
+  assert_nats_authz
   if (( run < RUNS )); then
     # Stop the long-running services but KEEP the volume so run 2 re-seeds a populated DB.
     log "stopping services (keeping the Postgres volume for the re-seed run)"
