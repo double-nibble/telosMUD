@@ -301,6 +301,74 @@ func TestLuaTeleportCrossZoneNoOps(t *testing.T) {
 	}
 }
 
+// TestLuaMoveSelfHonorsPreventsMove (#548): h:move is a WALK, so an entity moving ITSELF honors prevents:move
+// (a rooted entity can't self-relocate out — the can't-forget property across every walk entry). But a FORCED
+// move of ANOTHER (a drag of a rooted mob) IGNORES the target's root, which is correct 5e forced movement.
+func TestLuaMoveSelfHonorsPreventsMove(t *testing.T) {
+	z, rt, room := harmZone(t)
+	room2 := z.newEntity("harm:room:cell")
+	Add(room2, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["harm:room:cell"] = room2
+	rc, _ := Get[*Room](room)
+	rc.exits["east"] = "harm:room:cell"
+	z.defs.affect.register("root", &affectDef{ref: "root", name: "Rooted", indefinite: true, prevents: []string{"move"}})
+
+	actor := harmPlayer(z, room, "Rooted")
+	applyAffect(actor, "root", attachOpts{}, nil)
+	rt.L.SetGlobal("me", rt.newHandle(actor))
+	if err := rt.runChunkWithSelf("selfwalk", `assert(me:move("east") == false)`, actor); err != nil {
+		t.Fatal(err)
+	}
+	if actor.location != room {
+		t.Fatal("a rooted entity walked itself out via h:move (prevents:move not honored on the self-walk)")
+	}
+
+	// A drag of ANOTHER, rooted entity (a mob) succeeds — forced movement bypasses the target's root.
+	mob := z.newEntity("harm:mob:dummy")
+	Add(mob, &Living{})
+	Move(mob, room)
+	applyAffect(mob, "root", attachOpts{}, nil)
+	rt.L.SetGlobal("mob", rt.newHandle(mob))
+	if err := rt.runChunkWithSelf("drag", `assert(mob:move("east") == true)`, actor); err != nil {
+		t.Fatal(err)
+	}
+	if mob.location != room2 {
+		t.Fatal("a forced drag of a rooted mob should succeed (forced movement ignores the root)")
+	}
+}
+
+// TestLuaMoveDragGriefGated (#548): forcing a NON-CONSENTING player to WALK (a mount/grapple co-move via
+// h:move) is now gated through the same movement-grief funnel — h:move used to relocate a player with no
+// gate at all. A mob or self co-move stays ungated (the wander loop / self-walk), covered elsewhere.
+func TestLuaMoveDragGriefGated(t *testing.T) {
+	z, rt, room := harmZone(t)
+	room2 := z.newEntity("harm:room:cell")
+	Add(room2, &Room{exits: map[string]ProtoRef{}})
+	z.rooms["harm:room:cell"] = room2
+	rc, _ := Get[*Room](room)
+	rc.exits["east"] = "harm:room:cell" // an intra-zone exit the drag would use
+
+	actor := harmPlayer(z, room, "Dragger")
+	victim := harmPlayer(z, room, "Victim")
+	setFlag(actor, flagPvP, true) // victim does NOT consent
+	rt.L.SetGlobal("victim", rt.newHandle(victim))
+
+	if err := rt.runChunkWithSelf("drag", `assert(victim:move("east") == false)`, actor); err != nil {
+		t.Fatal(err)
+	}
+	if victim.location != room {
+		t.Fatal("a non-consenting player was force-moved (co-move grief gate failed)")
+	}
+	// The actor CAN walk itself.
+	rt.L.SetGlobal("me", rt.newHandle(actor))
+	if err := rt.runChunkWithSelf("walk", `assert(me:move("east") == true)`, actor); err != nil {
+		t.Fatal(err)
+	}
+	if actor.location != room2 {
+		t.Fatal("the actor could not walk itself east")
+	}
+}
+
 // TestLuaTeleportGriefGated asserts teleporting a NON-CONSENTING player is gated (movement-grief
 // vector): the actor cannot force-relocate a protected player.
 func TestLuaTeleportGriefGated(t *testing.T) {

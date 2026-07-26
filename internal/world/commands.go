@@ -544,6 +544,17 @@ func (z *Zone) attemptMove(s *session, dir string, redirectsLeft int) bool {
 		s.send(textFrame("You can't leave while fighting! Flee first."))
 		return false
 	}
+	// Held fast (#548): a `prevents: move` affect (root / web / entangle / grapple) bars a WALK exactly as it
+	// already bars a `flee` (combat_commands.go). This was the gap the whole immobilize half of the affect
+	// system rested on — attemptMove never consulted it, so a rooted/webbed/grappled player walked out freely.
+	// Refused HERE — before the auto-stand, the exit resolution, the traverse hook (fireCanExit), and the
+	// instance-entrance branch — so a held player is never stood up, never fires a content move-hook, and can
+	// never mint a dungeon for a move that physically cannot happen. Global preventsTag (an absolute bar,
+	// mirroring flee), not source-relative. Returns false (ownership not released), so dispatch re-prompts.
+	if preventsTag(s.entity, "move") {
+		s.send(textFrame("You are held fast and can't move!"))
+		return false
+	}
 	// Auto-stand: a resting player gets to their feet before walking (rest.go, #39). Standing here (not
 	// refusing the move) keeps movement frictionless — you don't have to `stand` then walk.
 	if position(s.entity) == posResting {
