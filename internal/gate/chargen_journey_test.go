@@ -31,6 +31,8 @@ func (chargenFakeAccount) GetChargenFlow(context.Context) (bool, []ChargenStep, 
 		[]ChargenStep{
 			{Kind: "bundle_choice", ID: "race", Prompt: "Choose your race", BundleKind: "race"},
 			{Kind: "point_buy", ID: "attrs", Prompt: "Allocate your attributes", Attributes: []string{"strength"}, Points: 9, Base: 8, Min: 8, Max: 15},
+			{Kind: "array_assign", ID: "arr", Prompt: "Assign your array", Attributes: []string{"dexterity", "wisdom"}, Array: []int{15, 10}},
+			{Kind: "roll", ID: "rolled", Prompt: "Rolling the rest", Attributes: []string{"charisma"}},
 		},
 		[]ChargenBundleOption{{Ref: "elf", Kind: "race", Label: "Elf"}, {Ref: "dwarf", Kind: "race", Label: "Dwarf"}},
 		3, // max characters
@@ -95,6 +97,18 @@ func TestChargenCreateJourney(t *testing.T) {
 	term.expect(t, "Allocate your attributes")
 	term.expect(t, "strength")
 	term.send(t, "15")
+
+	// array_assign (#518): assign the fixed [15,10] array across dexterity + wisdom.
+	term.expect(t, "Assign your array")
+	term.expect(t, "Assign to dexterity")
+	term.expect(t, "1)15") // both array values offered for the first attribute
+	term.send(t, "1")      // dexterity gets 15
+	term.expect(t, "Assign to wisdom")
+	term.expect(t, "remaining: 1)10") // 15 was consumed — only 10 remains (pins the remaining-value tracking)
+	term.send(t, "1")                 // wisdom gets the remaining 10
+
+	// roll (#518): a server-side roll — no input, just a notice.
+	term.expect(t, "will be rolled")
 
 	term.expect(t, "Name your character")
 	term.send(t, "Newbie")

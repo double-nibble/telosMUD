@@ -228,6 +228,13 @@ func LintPacks(packs []Pack) {
 			"the engine will screen it to a bounded value and mark the attribute degraded — fix the literal",
 			"pack", v.Pack, "ref", logcap.Value(v.Ref), "field", v.Field)
 	}
+	// Content-lint (#518): a mis-authored chargen step (an array whose size doesn't match its attributes, a
+	// bad roll_dice spec) would otherwise surface only when a player hits that step — a stuck gate prompt or
+	// a "misconfigured" refusal. Name it at load instead.
+	for _, v := range LintChargen(packs) {
+		slog.Error("content: mis-authored chargen step — fix "+v.Field+" ("+v.Msg+")",
+			"pack", v.Pack, "flow", logcap.Value(v.Ref), "step", logcap.Value(v.Step))
+	}
 }
 
 // Merge assembles already-read packs into a LoadedContent, applying the last-write-wins-by-ref

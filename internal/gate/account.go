@@ -62,6 +62,8 @@ type ChargenStep struct {
 	Kind, ID, Prompt, BundleKind string
 	Attributes                   []string
 	Points, Base, Min, Max       int
+	Array                        []int  // array_assign (#518): the fixed multiset to assign
+	RollDice                     string // roll (#518): the ability dice spec (display only; the roll runs server-side)
 }
 
 // ChargenBundleOption is a selectable bundle the gate lists for a bundle_choice step.
@@ -202,10 +204,15 @@ func (g *grpcAccountClient) GetChargenFlow(ctx context.Context) (bool, []Chargen
 	}
 	steps := make([]ChargenStep, 0, len(resp.GetSteps()))
 	for _, s := range resp.GetSteps() {
+		array := make([]int, 0, len(s.GetArray()))
+		for _, v := range s.GetArray() {
+			array = append(array, int(v))
+		}
 		steps = append(steps, ChargenStep{
 			Kind: s.GetKind(), ID: s.GetId(), Prompt: s.GetPrompt(), BundleKind: s.GetBundleKind(),
 			Attributes: s.GetAttributes(),
 			Points:     int(s.GetPoints()), Base: int(s.GetBase()), Min: int(s.GetMin()), Max: int(s.GetMax()),
+			Array: array, RollDice: s.GetRollDice(),
 		})
 	}
 	opts := make([]ChargenBundleOption, 0, len(resp.GetOptions()))

@@ -30,6 +30,10 @@ type fakeStore struct {
 	// the check→write race the CAS exists to close (#165): mutate f.tiers here to simulate a concurrent
 	// promote landing after the service read the target's tier but before it wrote.
 	beforeSetTier func()
+	// lastBundles / lastAttrs capture the last chargen result the service built (#518), so a test can assert
+	// the applied bundles/attributes (e.g. a server-rolled ability score).
+	lastBundles []string
+	lastAttrs   map[string]float64
 }
 
 func newFakeStore() *fakeStore {
@@ -103,7 +107,9 @@ func (f *fakeStore) CreateAccountCharacter(_ context.Context, accountID, name, _
 	return "id-" + name, nil
 }
 
-func (f *fakeStore) CreateCharacterWithChargen(ctx context.Context, accountID, name, zoneRef, roomRef string, _ []string, _ map[string]float64) (string, error) {
+func (f *fakeStore) CreateCharacterWithChargen(ctx context.Context, accountID, name, zoneRef, roomRef string, bundles []string, attrs map[string]float64) (string, error) {
+	f.lastBundles = bundles
+	f.lastAttrs = attrs
 	return f.CreateAccountCharacter(ctx, accountID, name, zoneRef, roomRef, nil, nil)
 }
 
@@ -228,6 +234,62 @@ func TestBuildCharacter(t *testing.T) {
 	if _, reason, _ := svc.BuildCharacter(ctx, "acct1", "Legolas",
 		map[string]string{"race": "elf"}, map[string]map[string]int{"attrs": {"strength": 15}}); reason == "" {
 		t.Fatal("duplicate name should return a 'name taken' reason")
+	}
+}
+
+// TestBuildCharacterArrayAndRoll (#518) covers the new chargen step kinds end-to-end through the account
+// service: array_assign applies the player's permutation of the fixed array, and a roll step gets a
+// SERVER-rolled score (the service passes a real rng — a nil would break roll flows) in the 4d6-drop-lowest
+// range. Also asserts the roll ignores any client-submitted value for the rolled attribute.
+func TestBuildCharacterArrayAndRoll(t *testing.T) {
+	fs := newFakeStore()
+	svc := New(fs, nil, "midgaard", "midgaard:room:temple")
+	svc.WithChargen(content.ChargenDTO{Steps: []content.ChargenStepDTO{
+		{Kind: "array_assign", ID: "arr", Attributes: []string{"strength", "intellect"}, Array: []int{15, 10}},
+		{Kind: "roll", ID: "rolled", Attributes: []string{"constitution"}},
+	}}, nil)
+	ctx := context.Background()
+
+	id, reason, err := svc.BuildCharacter(ctx, "acct1", "Rolla",
+		map[string]string{},
+		map[string]map[string]int{
+			"arr":    {"strength": 15, "intellect": 10},
+			"rolled": {"constitution": 999}, // a forged value the server must IGNORE (it rolls its own)
+		})
+	if err != nil || reason != "" || id == "" {
+		t.Fatalf("array+roll build: id=%q reason=%q err=%v", id, reason, err)
+	}
+	if fs.lastAttrs["strength"] != 15 || fs.lastAttrs["intellect"] != 10 {
+		t.Fatalf("array_assign applied wrong: %v", fs.lastAttrs)
+	}
+	con := fs.lastAttrs["constitution"]
+	if con < 3 || con > 18 {
+		t.Fatalf("rolled constitution = %v, want a server roll in [3,18] (not the forged 999)", con)
+	}
+}
+
+// TestGetChargenFlowCarriesNewFields (#518): the array + roll_dice step fields survive the proto mapping in
+// GetChargenFlow, so the gate can render an array_assign / roll step.
+func TestGetChargenFlowCarriesNewFields(t *testing.T) {
+	svc := New(newFakeStore(), nil, "midgaard", "midgaard:room:temple")
+	svc.WithChargen(content.ChargenDTO{Steps: []content.ChargenStepDTO{
+		{Kind: "array_assign", ID: "arr", Attributes: []string{"strength"}, Array: []int{15, 14, 13}},
+		{Kind: "roll", ID: "rolled", Attributes: []string{"dexterity"}, RollDice: "3d6"},
+	}}, nil)
+
+	resp, err := svc.GetChargenFlow(context.Background(), &accountv1.GetChargenFlowRequest{})
+	if err != nil {
+		t.Fatalf("GetChargenFlow: %v", err)
+	}
+	steps := resp.GetSteps()
+	if len(steps) != 2 {
+		t.Fatalf("got %d steps, want 2", len(steps))
+	}
+	if got := steps[0].GetArray(); len(got) != 3 || got[0] != 15 || got[2] != 13 {
+		t.Fatalf("array step lost its array over the wire: %v", got)
+	}
+	if got := steps[1].GetRollDice(); got != "3d6" {
+		t.Fatalf("roll step lost roll_dice over the wire: %q", got)
 	}
 }
 

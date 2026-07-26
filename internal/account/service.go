@@ -8,9 +8,12 @@ package account
 import (
 	"context"
 	"crypto/ed25519"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sort"
 	"strings"
 	"time"
@@ -125,6 +128,18 @@ func (s *Service) WithMaxCharacters(n int) *Service {
 	return s
 }
 
+// newChargenRNG returns a per-request math/rand seeded from crypto/rand (#518): unpredictable so a player
+// cannot foresee or influence a roll-step's dice, and unshared so concurrent chargen requests never race a
+// common *rand.Rand. Falls back to a time seed only if the OS CSPRNG is unavailable (never, in practice) —
+// a degraded but still-functional roll rather than a panic during character creation.
+func newChargenRNG() *rand.Rand {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // fallback only; game dice, not a secret
+	}
+	return rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(b[:])))) //nolint:gosec // game dice, not a secret
+}
+
 // WithChargen wires the content chargen flow + selectable bundle options (Phase 14.8). The gate reads them
 // (via GetChargenFlow) to drive the prompt-driven chargen. Without it, the gate offers a bare name-only create.
 func (s *Service) WithChargen(flow content.ChargenDTO, options []content.ChargenBundleOption) *Service {
@@ -196,7 +211,10 @@ func (s *Service) BuildCharacter(ctx context.Context, accountID, name string, pi
 	if existing, err := s.store.AccountCharacters(ctx, accountID); err == nil && len(existing) >= s.maxCharacters {
 		return "", capMessage(s.maxCharacters), nil
 	}
-	bundles, attrs, r := content.ValidateChargen(s.chargenFlow, picks, allocs, s.chargenKind)
+	// A `roll` chargen step is rolled SERVER-SIDE here (never a client value). Seed a fresh per-request rng
+	// from crypto/rand: unpredictable (a player can't foresee or influence the roll) and race-free (no
+	// shared *rand.Rand across concurrent chargen requests).
+	bundles, attrs, r := content.ValidateChargen(s.chargenFlow, picks, allocs, s.chargenKind, newChargenRNG())
 	if r != "" {
 		return "", r, nil
 	}
@@ -293,11 +311,16 @@ func (s *Service) GetChargenFlow(_ context.Context, _ *accountv1.GetChargenFlowR
 	}
 	steps := make([]*accountv1.ChargenStep, 0, len(s.chargenFlow.Steps))
 	for _, st := range s.chargenFlow.Steps {
+		array := make([]int32, 0, len(st.Array))
+		for _, v := range st.Array {
+			array = append(array, int32(v)) //nolint:gosec // array values are small content-authored ability scores.
+		}
 		steps = append(steps, &accountv1.ChargenStep{
 			Kind: st.Kind, Id: st.ID, Prompt: st.Prompt, BundleKind: st.BundleKind,
 			Attributes: st.Attributes,
 			//nolint:gosec // chargen point-buy bounds are small content-authored ints; no overflow.
 			Points: int32(st.Points), Base: int32(st.Base), Min: int32(st.Min), Max: int32(st.Max),
+			Array: array, RollDice: st.RollDice,
 		})
 	}
 	opts := make([]*accountv1.ChargenBundleOption, 0, len(s.chargenOptions))
